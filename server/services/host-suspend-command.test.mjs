@@ -23,10 +23,11 @@ test('spawns the detached SetSuspendState call and unrefs it', () => {
   const result = runHostSuspendToRam({
     platform: 'win32',
     dryRun: false,
+    systemToolPath: (name) => `C:\\Windows\\System32\\${name}`,
     spawnImpl: (file, args, opts) => { spawned.push({ file, args, opts }); return { unref() { unrefd = true; } }; },
   });
   assert.equal(result.ok, true);
-  assert.equal(spawned[0].file, 'rundll32.exe');
+  assert.equal(spawned[0].file, 'C:\\Windows\\System32\\rundll32.exe', 'by full path, as on a Windows host');
   assert.deepEqual(spawned[0].args, ['powrprof.dll,SetSuspendState', '0,0,0']);
   assert.equal(spawned[0].opts.detached, true);
   assert.equal(unrefd, true);

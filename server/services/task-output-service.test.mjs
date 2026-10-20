@@ -6,9 +6,12 @@ import test from 'node:test';
 
 import { createBackgroundTaskStore } from './background-task-store.mjs';
 import {
+  advanceRunnerScan,
+  createRunnerScan,
   createTaskHealthPoller,
   createTaskOutputSnapshots,
   healthOfWindow,
+  healthWithScan,
   inspectOutputFile,
   readBefore,
   readRange,
@@ -287,4 +290,278 @@ test('poke runs a tick soon, once per burst', async () => {
   timers[0].fn();
   poller.poke();
   assert.equal(timers.length, 2);
+});
+
+// ─── Runs past the 64 KB window ──────────────────────────────────────────────
+
+// A vitest run still going: its header, then `files` file lines of 5 tests
+// (every 50th with one failure), padded so the log passes 64 KB early.
+function vitestLiveLog(files) {
+  const lines = [' RUN  v2.1.8 /work/lantern-app', ''];
+  for (let index = 1; index <= files; index += 1) {
+    const name = `src/lantern/module-${String(index).padStart(4, '0')}-with-a-longer-name.test.ts`;
+    lines.push(index % 50 === 0 ? ` ❯ ${name} (5 tests | 1 failed) 12ms` : ` ✓ ${name} (5 tests) 3ms`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+test('a live vitest run past 64 KB keeps its runner and counts every file', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'vitest-live.log');
+  const text = vitestLiveLog(1500);
+  fs.writeFileSync(file, text);
+  assert.ok(Buffer.byteLength(text) > 64 * 1024 + 20_000, 'the header is well out of the window');
+  // The window alone: the header is gone, so no runner and no chip.
+  const buffer = fs.readFileSync(file);
+  assert.equal(healthOfWindow(buffer.subarray(buffer.length - 64 * 1024), buffer.length - 64 * 1024).counts, null);
+
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: file }]);
+  const emitted = [];
+  const poller = createTaskHealthPoller({ store, io: { emit: (event, payload) => emitted.push(payload) }, logger: null });
+  await poller.tick();
+  const reading = emitted[0].health.t1;
+  assert.deepEqual([reading.runner, reading.counts, reading.final], ['vitest', { passed: 1500 * 5 - 30, failed: 30, skipped: 0 }, false]);
+  // The first failure is a file offset, far before the window.
+  assert.match(buffer.subarray(reading.firstFailureOffset, reading.firstFailureOffset + 40).toString('utf8'), /^ ❯ src\/lantern\/module-0050/);
+
+  // It grows: only the new bytes are read, the counts go on.
+  fs.appendFileSync(file, ' ✓ src/lantern/late.test.ts (7 tests) 2ms\n');
+  await poller.tick();
+  assert.deepEqual(emitted[1].health.t1.counts, { passed: 1500 * 5 - 30 + 7, failed: 30, skipped: 0 });
+
+  // The closing summary wins, as before.
+  fs.appendFileSync(file, '\n Test Files  30 failed | 1471 passed (1501)\n      Tests  30 failed | 7477 passed (7507)\n   Duration  41.2s\n');
+  await poller.tick();
+  const final = emitted[2].health.t1;
+  assert.deepEqual([final.final, final.counts.passed, final.counts.failed], [true, 7477, 30]);
+  assert.equal(final.firstFailureOffset, reading.firstFailureOffset, 'the first failure before the window comes from the scan');
+});
+
+test('a live node:test run past 64 KB is counted from its first line on', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'node-test-live.log');
+  const lines = [];
+  for (let index = 1; index <= 2500; index += 1) {
+    lines.push(index === 7 ? `✖ lantern case ${index} keeps its wick trimmed (2.1ms)` : `✔ lantern case ${index} keeps its wick trimmed (1.0ms)`);
+  }
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  assert.ok(fs.statSync(file).size > 64 * 1024);
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: file }]);
+  const emitted = [];
+  const poller = createTaskHealthPoller({ store, io: { emit: (event, payload) => emitted.push(payload) }, logger: null });
+  await poller.tick();
+  const reading = emitted[0].health.t1;
+  assert.deepEqual([reading.runner, reading.counts, reading.final], ['node:test', { passed: 2499, failed: 1, skipped: 0 }, false]);
+  assert.equal(reading.firstFailureOffset, Buffer.byteLength(`${lines.slice(0, 6).join('\n')}\n`));
+});
+
+test('the scan catches up within its budget per tick, then reads only what is new', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'vitest-big.log');
+  fs.writeFileSync(file, vitestLiveLog(3000));
+  const size = fs.statSync(file).size;
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: file }]);
+  const emitted = [];
+  const poller = createTaskHealthPoller({ store, io: { emit: (event, payload) => emitted.push(payload) }, logger: null, scanBytesPerTick: 64 * 1024 });
+  const ticks = Math.ceil(size / (64 * 1024));
+  for (let tick = 1; tick < ticks; tick += 1) {
+    await poller.tick();
+    // While it catches up, the window alone: no header in it, no counts.
+    assert.equal(store.health('sess-1', 't1').counts, null, `tick ${tick}`);
+  }
+  await poller.tick();
+  assert.deepEqual(store.health('sess-1', 't1').counts, { passed: 3000 * 5 - 60, failed: 60, skipped: 0 }, 'caught up without the file changing');
+  assert.equal(emitted.length, 2, 'the quiet reading, then the counts');
+});
+
+test('the runner scan holds an open line, skips an endless one, and starts over on a shorter file', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'scan.log');
+  fs.writeFileSync(file, 'TAP version 13\nok 1 - spins\nok 2 - st');
+  const scan = createRunnerScan(file);
+  assert.equal(await advanceRunnerScan(scan, fs.statSync(file).size, { pieceBytes: 5 }), true);
+  assert.deepEqual([scan.tally.result().passed, scan.tally.result().failed], [1, 0], 'the open line waits');
+  fs.appendFileSync(file, `ops\n${'x'.repeat(70 * 1024)}\nnot ok 3 - falls\n`);
+  await advanceRunnerScan(scan, fs.statSync(file).size);
+  assert.deepEqual([scan.tally.result().passed, scan.tally.result().failed], [2, 1]);
+  assert.equal(scan.carry, null);
+  fs.writeFileSync(file, 'TAP version 13\nnot ok 1 - fresh\n');
+  await advanceRunnerScan(scan, fs.statSync(file).size);
+  assert.deepEqual([scan.tally.result().passed, scan.tally.result().failed, scan.tally.result().firstFailureLine], [0, 1, 15]);
+});
+
+test('the window decides a whole file and a final summary; the scan a run still going', () => {
+  const whole = { runner: 'vitest', passed: 90, failed: 2, skipped: 1, firstFailureLine: 400, final: false };
+  const live = { counts: { passed: 4, failed: 0, skipped: 0 }, runner: 'vitest', final: false, firstFailureOffset: null };
+  assert.equal(healthWithScan(live, 0, whole), live, 'the window holds the whole file');
+  assert.equal(healthWithScan(live, 100, null), live, 'no scan yet');
+  assert.deepEqual(healthWithScan(live, 100, whole), { counts: { passed: 90, failed: 2, skipped: 1 }, runner: 'vitest', final: false, firstFailureOffset: 400 });
+  const final = { counts: { passed: 91, failed: 2, skipped: 1 }, runner: 'vitest', final: true, firstFailureOffset: null };
+  assert.deepEqual(healthWithScan(final, 100, whole), { ...final, firstFailureOffset: 400 });
+  const finalClean = { ...final, counts: { passed: 93, failed: 0, skipped: 1 } };
+  assert.equal(healthWithScan(finalClean, 100, whole), finalClean);
+});
+
+// An fs whose reads are counted, for what a tick costs.
+function countingFs() {
+  const counter = { bytes: 0 };
+  const promises = {
+    ...fs.promises,
+    open: async (...args) => {
+      const handle = await fs.promises.open(...args);
+      return {
+        stat: () => handle.stat(),
+        read: async (...readArgs) => {
+          const result = await handle.read(...readArgs);
+          counter.bytes += result.bytesRead;
+          return result;
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+  counter.fsImpl = { ...fs, promises, constants: fs.constants };
+  return counter;
+}
+
+test('an ended row after a restart is read in its window only, never scanned from the start', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'vitest-ended.log');
+  fs.writeFileSync(file, vitestLiveLog(4000));
+  const size = fs.statSync(file).size;
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: file }]);
+  store.replace('sess-1', []);
+  const counter = countingFs();
+  const poller = createTaskHealthPoller({ store, io: null, logger: null, fsImpl: counter.fsImpl });
+  await poller.tick();
+  assert.ok(counter.bytes <= 64 * 1024, `read ${counter.bytes} of ${size} bytes`);
+  counter.bytes = 0;
+  await poller.tick();
+  assert.equal(counter.bytes, 0, 'settled: not read again');
+});
+
+test('the scans of a tick share one byte budget', async (t) => {
+  const dir = tempDir(t);
+  const files = ['a', 'b', 'c'].map((name) => {
+    const file = path.join(dir, `${name}.log`);
+    fs.writeFileSync(file, vitestLiveLog(3000));
+    return file;
+  });
+  const size = fs.statSync(files[0]).size;
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', files.map((file, index) => ({ taskId: `t${index}`, taskType: 'local_bash', outputPath: file })));
+  const counter = countingFs();
+  const budget = 256 * 1024;
+  const poller = createTaskHealthPoller({ store, io: null, logger: null, fsImpl: counter.fsImpl, scanBytesPerTick: budget });
+  await poller.tick();
+  // Each task: its window and a look at the file's start; the scans together: the budget.
+  assert.ok(counter.bytes <= budget + 3 * 2 * 64 * 1024, `read ${counter.bytes}`);
+  let ticks = 1;
+  while (files.some((_, index) => !store.health('sess-1', `t${index}`)?.counts) && ticks < 20) {
+    await poller.tick();
+    ticks += 1;
+  }
+  assert.ok(ticks >= Math.ceil((3 * size) / budget), `caught up over ${ticks} ticks`);
+  for (const [index] of files.entries()) assert.equal(store.health('sess-1', `t${index}`).counts.failed, 60);
+});
+
+test('a long log that is no test run is read once, then only what is new', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'server.log');
+  fs.writeFileSync(file, Array.from({ length: 6000 }, (_, index) => `GET /lantern/${index} 200 3ms`).join('\n') + '\n');
+  const size = fs.statSync(file).size;
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: file }]);
+  const counter = countingFs();
+  const poller = createTaskHealthPoller({ store, io: null, logger: null, fsImpl: counter.fsImpl });
+  await poller.tick();
+  assert.ok(counter.bytes <= size + 64 * 1024, `the window and the file once: ${counter.bytes}`);
+  const late = 'GET /lantern/late 200 1ms\n';
+  fs.appendFileSync(file, late);
+  counter.bytes = 0;
+  await poller.tick();
+  assert.ok(counter.bytes <= 64 * 1024 + late.length, `then the window and the new line: ${counter.bytes}`);
+  assert.equal(store.health('sess-1', 't1').counts, null);
+});
+
+// 120 KB of install and build output, then a vitest run of 7,500 tests whose
+// header comes after it (it prints it once).
+function buildThenVitest() {
+  const build = [];
+  for (let index = 0; build.join('\n').length < 120 * 1024; index += 1) {
+    build.push(`[build] compiling src/lantern/part-${String(index).padStart(5, '0')}.ts (ok)`);
+  }
+  return `${build.join('\n')}\n${vitestLiveLog(1500)}`;
+}
+
+test('a test run whose header comes after 120 KB of build output is counted, live and after a restart', async (t) => {
+  const dir = tempDir(t);
+  const expected = { passed: 1500 * 5 - 30, failed: 30, skipped: 0 };
+  // Live, the build first, then the whole run within one tick.
+  const live = path.join(dir, 'live.log');
+  const text = buildThenVitest();
+  const at = text.indexOf(' RUN ');
+  assert.ok(at > 120 * 1024 && text.length - at > 64 * 1024, 'header past the first 64 KB, and out of the last');
+  fs.writeFileSync(live, text.slice(0, at));
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', [{ taskId: 't1', taskType: 'local_bash', outputPath: live }]);
+  const poller = createTaskHealthPoller({ store, io: null, logger: null });
+  await poller.tick();
+  assert.equal(store.health('sess-1', 't1').counts, null, 'the build has no counts');
+  fs.appendFileSync(live, text.slice(at));
+  await poller.tick();
+  assert.deepEqual(store.health('sess-1', 't1').counts, expected);
+
+  // After a restart: a new poller meets the whole file at once.
+  const restarted = path.join(dir, 'restarted.log');
+  fs.writeFileSync(restarted, text);
+  const fresh = createBackgroundTaskStore();
+  fresh.replace('sess-2', [{ taskId: 't2', taskType: 'local_bash', outputPath: restarted }]);
+  await createTaskHealthPoller({ store: fresh, io: null, logger: null }).tick();
+  assert.deepEqual(fresh.health('sess-2', 't2').counts, expected);
+});
+
+test('each tick starts its scans at another task, so a busy log cannot starve the others', async (t) => {
+  const dir = tempDir(t);
+  const files = ['a', 'b'].map((name) => {
+    const file = path.join(dir, `${name}.log`);
+    fs.writeFileSync(file, vitestLiveLog(3000));
+    return file;
+  });
+  const store = createBackgroundTaskStore();
+  store.replace('sess-1', files.map((file, index) => ({ taskId: `t${index}`, taskType: 'local_bash', outputPath: file })));
+  const size = fs.statSync(files[0]).size;
+  // One tick's budget reads one file whole and no more.
+  const poller = createTaskHealthPoller({ store, io: null, logger: null, scanBytesPerTick: size });
+  await poller.tick();
+  // The first task keeps growing, so it always has bytes to read.
+  fs.appendFileSync(files[0], ' ✓ src/lantern/late-0.test.ts (5 tests) 1ms\n'.repeat(4000));
+  await poller.tick();
+  assert.ok(store.health('sess-1', 't0').counts, 'the first');
+  assert.ok(store.health('sess-1', 't1').counts, 'and the other, on the next tick');
+});
+
+test('a scan starts over on a file replaced under the same path', async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, 'scan.log');
+  fs.writeFileSync(file, 'TAP version 13\nok 1 - spins\nok 2 - stops\n');
+  const scan = createRunnerScan(file);
+  let stats = fs.statSync(file);
+  await advanceRunnerScan(scan, stats.size, { ino: stats.ino, mtimeMs: stats.mtimeMs });
+  assert.equal(scan.tally.result().passed, 2);
+  // Another file, as long or longer: a new inode.
+  const other = path.join(dir, 'scan.next');
+  fs.writeFileSync(other, 'TAP version 13\nnot ok 1 - fresh one\nok 2 - and this\n');
+  fs.renameSync(other, file);
+  stats = fs.statSync(file);
+  await advanceRunnerScan(scan, stats.size, { ino: stats.ino, mtimeMs: stats.mtimeMs });
+  assert.deepEqual([scan.tally.result().passed, scan.tally.result().failed], [1, 1]);
+  // An mtime that went back: also a new file.
+  await advanceRunnerScan(scan, stats.size + 0, { ino: stats.ino, mtimeMs: stats.mtimeMs - 5_000 });
+  assert.equal(scan.offset, stats.size);
+  assert.deepEqual([scan.tally.result().passed, scan.tally.result().failed], [1, 1], 'read again from the start');
 });

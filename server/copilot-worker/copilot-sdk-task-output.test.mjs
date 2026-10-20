@@ -145,6 +145,8 @@ test('the card carries the spool path, the last window is taken when the shell e
   const card = lastTasks(stub)[0];
   assert.equal(card.outputPath, spool.pathFor('1'));
   assert.equal(card.taskType, 'local_bash');
+  // The shell tool's command line rides the card, for the console's `| tail` marker.
+  assert.equal(card.command, 'npm test');
 
   // The shell finishes: its card goes, its last window still lands.
   client.session.taskList[0].status = 'completed';
@@ -153,6 +155,8 @@ test('the card carries the spool path, the last window is taken when the shell e
   await waitFor(() => (lastTasks(stub) || []).length === 0, { label: 'the card is gone' });
   assert.equal(spool.files.get('1'), 'step 1\nstep 2\ndone\n');
   assert.deepEqual(spool.ended, ['1']);
+  await waitFor(() => stub.bodiesFor('/api/background-task-settled').length, { label: 'the settle post' });
+  assert.equal(stub.bodiesFor('/api/background-task-settled')[0].command, 'npm test');
   await runner.dispose();
 });
 

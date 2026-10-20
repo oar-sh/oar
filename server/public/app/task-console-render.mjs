@@ -1,7 +1,9 @@
 // Pure pieces of the task console and the task rows: the pass/fail chip, the
-// stall hint, the ✓/✘ of an ended task, the console's line rows and the
-// search for the first failure. DOM nodes are built with createElement and
-// textContent only: every string here comes from a worker's output.
+// stall hint, the ✓/✘ of an ended task, the console's line rows, the search
+// for the first failure, the "output stops here" marker of a command piped
+// into tail, and the texts for a task without output (the relay's answer
+// uses them too). DOM nodes are built with createElement and textContent
+// only: every string here comes from a worker's output.
 
 import { ansiToSegments, stallMinutes } from './task-output-text.mjs';
 
@@ -58,19 +60,26 @@ export function stallHint(lastOutputAt, thresholdMinutes, now = Date.now()) {
   };
 }
 
-/** ✓ or ✘ for an ended task, from its status and exit code. */
+/**
+ * ✓, ✘, ■ or ? for an ended task, from its status and exit code. `unknown`
+ * (a task whose worker did not come back after a relay restart) is neither a
+ * success nor a failure: a neutral ?, not a green ✓.
+ */
 export function endedOutcome(task) {
   const status = String(task?.status || '').trim().toLowerCase();
   const exitCode = task?.exitCode;
   const hasExit = exitCode !== null && exitCode !== undefined && exitCode !== '' && Number.isFinite(Number(exitCode));
   const failed = status === 'failed' || (hasExit && Number(exitCode) !== 0);
   const stopped = status === 'stopped' || status === 'killed' || status === 'cancelled';
+  const unknown = !failed && !stopped && !hasExit && status === 'unknown';
   const label = failed
     ? (hasExit ? `failed, exit code ${Number(exitCode)}` : 'failed')
-    : stopped ? 'stopped' : status === 'completed' || (hasExit && Number(exitCode) === 0) ? 'completed' : 'ended';
+    : stopped ? 'stopped'
+      : unknown ? 'ended, result unknown'
+        : status === 'completed' || (hasExit && Number(exitCode) === 0) ? 'completed' : 'ended';
   return {
-    icon: failed ? '✘' : stopped ? '■' : '✓',
-    ok: !failed && !stopped,
+    icon: failed ? '✘' : stopped ? '■' : unknown ? '?' : '✓',
+    ok: !failed && !stopped && !unknown,
     failed,
     label,
   };
@@ -98,12 +107,165 @@ export function taskOutputUnavailable(task) {
   return String(task?.outputKind || '').trim() === 'none';
 }
 
+/**
+ * Why a task has no output to show: the console's `none` answer (the relay's
+ * output route imports these) and the row's hover title, in one wording.
+ */
+export const TASK_OUTPUT_NONE_MESSAGES = Object.freeze({
+  provider: 'Output is not available for this provider.',
+  subagent: 'Sub-agents have no shell output; open the sub-agent view.',
+  noOutputFile: 'This session did not report an output file for this task. Sessions started before the task console need a restart to show output.',
+  noPath: 'Output is not available for this task.',
+});
+
+// ─── Commands piped into tail ────────────────────────────────────────────────
+
+// A command line as its pipeline stages: `{ words, piped }` per simple
+// command, `piped` when a `|` (or `|&`) feeds it. Quotes and backslashes are
+// honoured, `||`, `&&`, `;`, `&` and newlines end a stage without a pipe;
+// `2>&1` and `&>` are redirections, not separators, and a `#` that starts a
+// word comments out the rest of its line. Not a shell: enough to tell where
+// a `| tail` sits.
+function pipelineStages(command) {
+  const text = String(command ?? '');
+  const stages = [];
+  let words = [];
+  let word = '';
+  let inWord = false;
+  let quote = '';
+  let piped = false;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = '';
+    inWord = false;
+  };
+  const endStage = (nextPiped) => {
+    endWord();
+    if (words.length) stages.push({ words, piped });
+    words = [];
+    piped = nextPiped;
+  };
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      if (char === quote) quote = '';
+      else if (char === '\\' && quote === '"' && index + 1 < text.length) word += text[++index];
+      else word += char;
+      continue;
+    }
+    if (char === '\\') {
+      word += text[index + 1] ?? '';
+      inWord = true;
+      index += 1;
+      continue;
+    }
+    if (char === '#' && !inWord) {
+      while (index + 1 < text.length && text[index + 1] !== '\n') index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      inWord = true;
+      continue;
+    }
+    if (char === '|') {
+      if (text[index + 1] === '|') {
+        index += 1;
+        endStage(false);
+        continue;
+      }
+      if (text[index + 1] === '&') index += 1;
+      endStage(true);
+      continue;
+    }
+    if (char === '&') {
+      const redirect = text[index - 1] === '>' || text[index - 1] === '<' || text[index + 1] === '>';
+      if (!redirect) {
+        if (text[index + 1] === '&') index += 1;
+        endStage(false);
+        continue;
+      }
+    }
+    if (char === ';' || char === '\n' || char === '(' || char === ')') {
+      endStage(false);
+      continue;
+    }
+    if (/\s/.test(char)) {
+      endWord();
+      continue;
+    }
+    word += char;
+    inWord = true;
+  }
+  endStage(false);
+  return stages;
+}
+
+// tail -f / -F / --follow streams; so does tail from a line (`-n +2`, `+2`).
+function tailStreams(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (/^--follow\b/.test(arg) || /^-[A-Za-z0-9]*[fF]/.test(arg)) return true;
+    if (/^\+\d/.test(arg) || /^-[nc]\+\d/.test(arg) || /^--(?:lines|bytes)=\+/.test(arg)) return true;
+    if ((arg === '-n' || arg === '-c' || arg === '--lines' || arg === '--bytes') && /^\+\d/.test(args[index + 1] || '')) return true;
+  }
+  return false;
+}
+
+/**
+ * 'tail' when the command line pipes into a tail that holds the output back
+ * until the command ends (`npm test 2>&1 | tail -40`), else ''. `tail -f`
+ * and `tail -n +N` stream and do not count; neither does a `|` inside quotes
+ * or a comment. `head` passes its lines on as they come (and ends the
+ * command early), so it holds nothing back.
+ */
+export function pipeHoldProgram(command) {
+  for (const { words, piped } of pipelineStages(command)) {
+    if (!piped) continue;
+    let at = 0;
+    while (at < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[at])) at += 1;
+    const program = String(words[at] || '').split('/').pop();
+    if (program === 'tail' && !tailStreams(words.slice(at + 1))) return 'tail';
+  }
+  return '';
+}
+
+/** 'tail' when a task's command line (its `command`, else its description) pipes into a holding tail. */
+export function taskPipeHold(task) {
+  return pipeHoldProgram(task?.command) || pipeHoldProgram(task?.description);
+}
+
+/** What the console and the quiet row say about a command piped into `program`. */
+export function pipeHoldNotice(program) {
+  if (!program) return null;
+  const hint = 'Logging to a file instead (> run.log 2>&1) and following that file shows it live.';
+  return {
+    text: `Output stops here: this command pipes into ${program}, so the rest arrives when it ends.`,
+    hint,
+    title: `This command pipes into ${program}, so its output arrives when it ends. ${hint}`,
+  };
+}
+
+/**
+ * Whether the console shows the "output stops here" marker: a live task
+ * whose command pipes into tail, as long as nothing came in since
+ * the console opened (`openedAt` the end offset of the first read).
+ */
+export function showPipeHoldMarker({ program, ended, kind, openedAt, nextOffset }) {
+  if (!program || ended || kind === 'none' || !kind) return false;
+  return !Number.isFinite(Number(openedAt)) || Number(nextOffset) <= Number(openedAt);
+}
+
 // ─── Line rows ───────────────────────────────────────────────────────────────
 
+// Inverse text arrives with its colours swapped (task-output-text.mjs); a
+// side left unset takes the console's own colour of the other side.
 function segmentClass(segment) {
   const classes = [];
   if (Number.isInteger(segment.fg)) classes.push(`tc-fg-${segment.fg}`);
+  else if (segment.inverse) classes.push('tc-fg-inverse');
   if (Number.isInteger(segment.bg)) classes.push(`tc-bg-${segment.bg}`);
+  else if (segment.inverse) classes.push('tc-bg-inverse');
   if (segment.bold) classes.push('tc-bold');
   if (segment.dim) classes.push('tc-dim');
   if (segment.italic) classes.push('tc-italic');
@@ -188,6 +350,8 @@ export function consoleMetaParts({ task, elapsed, ended, status, exitCode, kind 
   parts.push(type === 'monitor' ? 'Monitor' : type === 'local_bash' ? 'Shell' : (type || 'Task'));
   if (elapsed) parts.push(elapsed);
   if (ended) parts.push(endedOutcome({ status, exitCode }).label);
+  // Held since a relay restart until its worker reports.
+  else if (status === 'held') parts.push('waiting for its worker after the relay restart');
   else parts.push('running');
   if (kind === 'snapshot') parts.push('last 8 KB, read again every 3 s');
   if (kind === 'spool' && task?.mirrored) parts.push("output mirrored from the runtime's recent window");

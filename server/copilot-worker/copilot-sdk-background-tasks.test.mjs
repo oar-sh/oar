@@ -121,6 +121,8 @@ test('background agents and shells from the registry become stoppable cards with
     taskId: '0',
     taskType: 'local_bash',
     description: 'timer',
+    // The shell tool's command line, for the console's `| tail` marker.
+    command: 'sleep 40 && echo timer-fired',
     startedAt: shell.startedAt,
     stoppable: true,
     // A detached shell's console is its own log.
@@ -355,7 +357,7 @@ test('a runtime without rpc.tasks keeps the event-scraped shell cards (not stopp
   const { runner } = makeRunner({ stub, client, taskPublishThrottleMs: 1 });
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
   await waitFor(() => (lastTasks(stub) || []).length === 1, { label: 'shell card' });
-  assert.deepEqual(lastTasks(stub)[0], { taskId: '7', taskType: 'local_bash', description: 'timer', startedAt: lastTasks(stub)[0].startedAt, stoppable: false });
+  assert.deepEqual(lastTasks(stub)[0], { taskId: '7', taskType: 'local_bash', description: 'timer', command: 'sleep 40', startedAt: lastTasks(stub)[0].startedAt, stoppable: false });
   assert.equal(runner._getState().sessionRpc.tasks, false);
   assert.equal(await runner.stopBackgroundTask('7'), false);
   await runner.dispose();

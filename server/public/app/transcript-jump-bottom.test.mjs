@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   HELD_BACK_ROWS_BADGE,
+  baselineBeforeUpdate,
   JUMP_BUTTON_SHOW_SCREENS,
   JUMP_SMOOTH_MAX_SCREENS,
   countNewRows,
@@ -159,6 +160,20 @@ test('a new row shows the button at any distance from the end', () => {
   assert.equal(state.visible, true);
   assert.equal(state.count, 1);
   assert.equal(jumpButtonPresentation(state).state, 'new');
+});
+
+test('a row that lands before the first frame away from the end is counted', () => {
+  // The reader scrolled up; before the frame that notes it, a row arrives
+  // and is not followed. Taken then, the baseline would hold the row.
+  assert.equal(nextJumpButtonState(null, at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c'])).count, 0);
+  let state = baselineBeforeUpdate(null, ['msg:a', 'msg:b']);
+  state = nextJumpButtonState(state, at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c']));
+  assert.equal(state.count, 1);
+  state = nextJumpButtonState(baselineBeforeUpdate(state, ['msg:a', 'msg:b', 'msg:c']), at(SCREEN * 2, ['msg:a', 'msg:b', 'msg:c', 'msg:d']));
+  assert.equal(state.count, 2, 'a baseline already taken stays');
+  assert.deepEqual(baselineBeforeUpdate({ visible: true, baseline: null, count: 0, unseen: true, question: false }, ['msg:a']), {
+    visible: true, baseline: ['msg:a'], count: 0, unseen: true, question: false, waiting: 0,
+  });
 });
 
 test('an update that was not followed marks the button until the bottom, without a row to count', () => {

@@ -223,6 +223,8 @@ test('a detached bash opens a tracked shell and its notification settles it', ()
   // The description comes off the `tool.execution_start` arguments — the
   // completion event has no room for it.
   assert.equal(started.opened[0].description, 'Wait one minute for the requested timer');
+  // So does its command line, for the row (the console reads a `| tail` off it).
+  assert.equal(started.opened[0].command, "sleep 60 && printf '%s\\n' 'Timer fired after 1 minute.'");
   assert.equal(tracker.size(), 1);
 
   const settled = tracker.observe(shellSettledNotification);

@@ -254,10 +254,18 @@ test('a POSIX spawn without a pid names the command and the reason', async () =>
   const logs = [];
   const child = new EventEmitter();
   child.unref = () => {};
+  // A POSIX Node, not the host's: on a Windows host process.execPath has no
+  // POSIX folder, and the launch is POSIX here whatever runs the test.
+  const posixNode = '/home/dev/node/bin/node';
   const launched = launchSessionCli({
     targetSessionId: SESSION,
     cwd: '/home/dev/repo',
-    env: { PATH: '/home/dev/bin', COPILOT_WEB_RELAY_WORKER_KIND: 'claude', COPILOT_WEB_RELAY_ROOT: '/home/dev/oar' },
+    env: {
+      PATH: '/home/dev/bin',
+      COPILOT_WEB_RELAY_NODE: posixNode,
+      COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+      COPILOT_WEB_RELAY_ROOT: '/home/dev/oar',
+    },
     platform: 'linux',
     allowProcessReuse: false,
     execFileSyncImpl() { throw new Error('no tmux'); },
@@ -268,7 +276,7 @@ test('a POSIX spawn without a pid names the command and the reason', async () =>
       return child;
     },
   });
-  await assert.rejects(launched, new RegExp(`^Error: worker-spawn-unhealthy:missing-pid \\(${process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: ENOENT\\)$`));
+  await assert.rejects(launched, /^Error: worker-spawn-unhealthy:missing-pid \(\/home\/dev\/node\/bin\/node: ENOENT\)$/);
   assert.equal(logs.length, 1);
-  assert.ok(logs[0].endsWith(`could not start ${process.execPath} (ENOENT); PATH=/home/dev/bin:${path.dirname(process.execPath)}`), logs[0]);
+  assert.ok(logs[0].endsWith(`could not start ${posixNode} (ENOENT); PATH=/home/dev/bin:/home/dev/node/bin`), logs[0]);
 });

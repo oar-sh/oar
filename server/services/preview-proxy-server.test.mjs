@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
@@ -22,6 +22,47 @@ import {
 const BASE_PATH = `/test_${'a'.repeat(32)}/`;
 const silentLogger = { log() {}, warn() {}, error() {} };
 
+// The socket tests are bounded, and so is their cleanup: a side that is never
+// torn down fails its own test by name instead of holding the file open, and
+// with it the whole suite (the runner prints nothing until a file ends).
+const SOCKET_TEST = { timeout: 15_000 };
+
+function cleanup(t, fn) {
+  t.after(fn, { timeout: 5_000 });
+}
+
+function within(promise, what, ms = 5_000) {
+  let timer = null;
+  const expired = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+// The net under the bounded tests: every listener this file starts and every
+// connection one accepts is closed once the file is done, whatever a failed
+// test left open. One leaked socket would otherwise keep the file's process
+// alive after the failure was already reported.
+const liveServers = new Set();
+const liveSockets = new Set();
+
+function trackServer(server) {
+  liveServers.add(server);
+  server.once('close', () => liveServers.delete(server));
+  server.on('connection', (socket) => {
+    liveSockets.add(socket);
+    socket.once('close', () => liveSockets.delete(socket));
+  });
+  return server;
+}
+
+const trackedHttp = { ...http, createServer: (...args) => trackServer(http.createServer(...args)) };
+
+after(() => {
+  for (const socket of liveSockets) socket.destroy();
+  for (const server of liveServers) server.close();
+});
+
 function previewConfig(overrides = {}) {
   return normalizePreviewsConfig({
     enabled: true,
@@ -37,7 +78,7 @@ function previewConfig(overrides = {}) {
 // to answer with.
 async function startUpstream(handler) {
   const received = [];
-  const server = http.createServer((req, res) => {
+  const server = trackedHttp.createServer((req, res) => {
     received.push({ method: req.method, url: req.url, headers: { ...req.headers } });
     handler(req, res, received);
   });
@@ -61,7 +102,7 @@ async function startUpstream(handler) {
 // closeAllConnections() can reach them at teardown.
 async function startEchoUpstream() {
   const sockets = new Set();
-  const server = http.createServer((_req, res) => res.end('http'));
+  const server = trackedHttp.createServer((_req, res) => res.end('http'));
   server.on('upgrade', (req, socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
@@ -90,7 +131,12 @@ async function startEchoUpstream() {
 
 async function startLane(config = previewConfig()) {
   const registry = createPreviewRegistry({ config });
-  const proxy = createPreviewProxyServer({ registry, logger: silentLogger, relayBearerTokens: ['relay-token'] });
+  const proxy = createPreviewProxyServer({
+    registry,
+    logger: silentLogger,
+    httpImpl: trackedHttp,
+    relayBearerTokens: ['relay-token'],
+  });
   const address = await proxy.start();
   return {
     registry,
@@ -438,12 +484,12 @@ test('a request with a body is not sent a second time', async (t) => {
   assert.deepEqual(upstream.received.map((entry) => `${entry.method} ${entry.url}`), ['GET /one', 'POST /order']);
 });
 
-test('websocket upgrades are proxied through the prefix', async (t) => {
+test('websocket upgrades are proxied through the prefix', SOCKET_TEST, async (t) => {
   // A minimal echo upgrade handler — enough to prove the handshake and both
   // pipe directions without pulling in a websocket library.
   const upstream = await startEchoUpstream();
   const lane = await startLane();
-  t.after(async () => {
+  cleanup(t, async () => {
     await lane.close();
     await upstream.close();
   });
@@ -475,7 +521,7 @@ async function startHeldUpgradeUpstream() {
   const sockets = new Set();
   const pending = [];
   let notify = null;
-  const server = http.createServer((_req, res) => res.end('http'));
+  const server = trackedHttp.createServer((_req, res) => res.end('http'));
   server.on('upgrade', (_req, socket) => {
     sockets.add(socket);
     socket.on('error', () => {});
@@ -523,9 +569,10 @@ function captureUncaught(t) {
   return caught;
 }
 
-function openRawUpgrade(port, path) {
+function openRawUpgrade(t, port, path) {
   const client = net.connect(port, '127.0.0.1');
   client.on('error', () => {});
+  cleanup(t, () => client.destroy());
   client.write([
     `GET ${path} HTTP/1.1`,
     'Host: preview.example.com',
@@ -540,55 +587,78 @@ function settle(ms = 100) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-test('a client reset before the upstream answers an upgrade tears down both sides', async (t) => {
+test('a client reset before the upstream answers an upgrade tears down both sides', SOCKET_TEST, async (t) => {
   const caught = captureUncaught(t);
   const upstream = await startHeldUpgradeUpstream();
   const lane = await startLane();
-  t.after(async () => {
+  cleanup(t, async () => {
     await lane.close();
     await upstream.close();
   });
   const { preview } = lane.registry.create({ port: upstream.port });
 
-  const client = openRawUpgrade(lane.proxy.address.port, `${preview.basePath}hmr`);
-  const held = await upstream.next();
+  const client = openRawUpgrade(t, lane.proxy.address.port, `${preview.basePath}hmr`);
+  const held = await within(upstream.next(), 'the upgrade to reach the upstream');
   client.resetAndDestroy();
 
   // The upstream leg is dropped instead of being upgraded into a dead client.
-  await held.closed;
+  await within(held.closed, 'the upstream leg to be dropped');
   await settle();
   assert.deepEqual(caught, []);
 });
 
-test('a client reset after the upstream answered an upgrade tears down both sides', async (t) => {
+test('a client that hangs up before the upstream answers an upgrade tears down both sides', SOCKET_TEST, async (t) => {
+  // A bare FIN leaves the lane's half-open socket waiting for good, and a
+  // reset after the FIN goes unnoticed, since nothing reads the socket again.
   const caught = captureUncaught(t);
   const upstream = await startHeldUpgradeUpstream();
   const lane = await startLane();
-  t.after(async () => {
+  cleanup(t, async () => {
     await lane.close();
     await upstream.close();
   });
   const { preview } = lane.registry.create({ port: upstream.port });
 
-  const client = openRawUpgrade(lane.proxy.address.port, `${preview.basePath}hmr`);
-  const held = await upstream.next();
+  const client = openRawUpgrade(t, lane.proxy.address.port, `${preview.basePath}hmr`);
+  const clientClosed = once(client, 'close');
+  client.resume();
+  const held = await within(upstream.next(), 'the upgrade to reach the upstream');
+  client.end();
+
+  await within(held.closed, 'the upstream leg to be dropped');
+  await within(clientClosed, 'the lane to close the client side');
+  assert.deepEqual(caught, []);
+});
+
+test('a client reset after the upstream answered an upgrade tears down both sides', SOCKET_TEST, async (t) => {
+  const caught = captureUncaught(t);
+  const upstream = await startHeldUpgradeUpstream();
+  const lane = await startLane();
+  cleanup(t, async () => {
+    await lane.close();
+    await upstream.close();
+  });
+  const { preview } = lane.registry.create({ port: upstream.port });
+
+  const client = openRawUpgrade(t, lane.proxy.address.port, `${preview.basePath}hmr`);
+  const held = await within(upstream.next(), 'the upgrade to reach the upstream');
   held.answer();
-  const [handshake] = await once(client, 'data');
+  const [handshake] = await within(once(client, 'data'), 'the 101 to reach the client');
   assert.match(handshake.toString('utf8'), /^HTTP\/1\.1 101/);
   client.resetAndDestroy();
 
-  await held.closed;
+  await within(held.closed, 'the upstream leg to be dropped');
   await settle();
   assert.deepEqual(caught, []);
 });
 
-test('a client socket that errors inside the upgrade handler is torn down with the upstream', async (t) => {
+test('a client socket that errors inside the upgrade handler is torn down with the upstream', SOCKET_TEST, async (t) => {
   // The window the wire tests cannot time: the error lands while the handler
   // is still waiting for the upstream, on a socket Node no longer guards.
   const caught = captureUncaught(t);
   const upstream = await startHeldUpgradeUpstream();
   const lane = await startLane();
-  t.after(async () => {
+  cleanup(t, async () => {
     await lane.close();
     await upstream.close();
   });
@@ -609,23 +679,23 @@ test('a client socket that errors inside the upgrade handler is torn down with t
       headers: { host: 'preview.example.com', connection: 'Upgrade', upgrade: 'websocket' },
       socket: { remoteAddress: '127.0.0.1' },
     }, clientSocket, Buffer.alloc(0));
-    const held = await upstream.next();
+    const held = await within(upstream.next(), 'the upgrade to reach the upstream');
     if (answered) {
       held.answer();
       while (!written.length) await settle(10);
       assert.match(written[0], /^HTTP\/1\.1 101/);
     }
     clientSocket.destroy(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
-    await held.closed;
+    await within(held.closed, 'the upstream leg to be dropped');
     await settle();
     assert.equal(clientSocket.destroyed, true);
   }
   assert.deepEqual(caught, []);
 });
 
-test('an upgrade on an unknown token is refused without reaching any upstream', async (t) => {
+test('an upgrade on an unknown token is refused without reaching any upstream', SOCKET_TEST, async (t) => {
   const lane = await startLane();
-  t.after(() => lane.close());
+  cleanup(t, () => lane.close());
 
   const request = http.request({
     host: '127.0.0.1',
@@ -686,13 +756,13 @@ test('a static preview serves its directory through the lane', async (t) => {
   res.resume();
 });
 
-test('stop() completes while a websocket is still open', async (t) => {
+test('stop() completes while a websocket is still open', SOCKET_TEST, async (t) => {
   // An upgraded socket is detached from the http.Server, so a shutdown that
   // relied on close()/closeAllConnections() alone would hang for as long as a
   // browser held an HMR connection.
   const upstream = await startEchoUpstream();
   const lane = await startLane();
-  t.after(() => upstream.close());
+  cleanup(t, () => upstream.close());
 
   const { preview } = lane.registry.create({ port: upstream.port });
   const request = http.request({
@@ -702,11 +772,29 @@ test('stop() completes while a websocket is still open', async (t) => {
     headers: { connection: 'Upgrade', upgrade: 'websocket' },
   });
   request.end();
-  const [, socket] = await once(request, 'upgrade');
-  t.after(() => socket.destroy());
+  const [, socket] = await within(once(request, 'upgrade'), 'the upgrade');
+  cleanup(t, () => socket.destroy());
 
-  await lane.close();
+  await within(lane.close(), 'stop() to complete');
   assert.equal(lane.proxy.listening, false);
+});
+
+test('stop() completes while an upgrade still waits on the upstream', SOCKET_TEST, async (t) => {
+  // The client socket leaves the http.Server's bookkeeping when the upgrade
+  // starts, so close() would wait on it until the dev server answered.
+  const upstream = await startHeldUpgradeUpstream();
+  const lane = await startLane();
+  cleanup(t, () => upstream.close());
+  const { preview } = lane.registry.create({ port: upstream.port });
+
+  const client = openRawUpgrade(t, lane.proxy.address.port, `${preview.basePath}hmr`);
+  const clientClosed = once(client, 'close');
+  const held = await within(upstream.next(), 'the upgrade to reach the upstream');
+
+  await within(lane.close(), 'stop() to complete');
+  assert.equal(lane.proxy.listening, false);
+  await within(held.closed, 'the upstream leg to be dropped');
+  await within(clientClosed, 'the client to be dropped');
 });
 
 test('start() is a no-op while the lane is disabled', async () => {

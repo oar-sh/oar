@@ -89,11 +89,14 @@ function normalizeEffortList(efforts = []) {
  *   3. else the lowest supported rung ABOVE it, ignoring 'none'
  *      (a remembered 'minimal' on a model whose floor is 'low' → low);
  *   4. else the next candidate.
- * With no candidate usable: the lowest non-'none' rung the model offers, or
- * 'none' when that is all there is. Effort names off the ladder (image
- * quality values, unknown providers) only ever match exactly.
+ * With no candidate usable: the lowest non-'none' rung the model offers (by
+ * rung, whatever the list order), or 'none' when that is all there is; a
+ * list with names off the ladder keeps its own order there. A caller with a
+ * default of its own passes `fallback`, returned instead in that case.
+ * Effort names off the ladder (image quality values, unknown providers) only
+ * ever match exactly.
  */
-export function nearestSupportedReasoningEffort(candidates = [], supportedEfforts = []) {
+export function nearestSupportedReasoningEffort(candidates = [], supportedEfforts = [], { fallback } = {}) {
   const options = normalizeEffortList(supportedEfforts);
   if (!options.length) return '';
   const rungOf = (effort) => REASONING_EFFORT_LADDER.indexOf(effort);
@@ -109,6 +112,9 @@ export function nearestSupportedReasoningEffort(candidates = [], supportedEffort
     const above = ranked.find((option) => rungOf(option) > rung && option !== 'ultracode');
     if (above) return above;
   }
+  if (fallback !== undefined) return fallback;
+  const lowest = ranked.find((option) => option !== 'ultracode');
+  if (lowest && options.every((option) => rungOf(option) >= 0)) return lowest;
   return options.find((option) => option !== 'none') || options[0];
 }
 

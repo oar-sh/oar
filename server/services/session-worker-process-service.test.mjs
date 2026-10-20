@@ -123,8 +123,9 @@ test('process inspector never matches the shared tmux server for a session id', 
 test('process inspector ignores relay server process on windows path form', () => {
   const inspector = createSessionWorkerProcessInspector({
     platform: 'win32',
+    systemToolPath: (name) => `C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\${name}`,
     execFileSyncImpl(command, args) {
-      assert.equal(command, 'powershell.exe');
+      assert.equal(command, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
       assert.deepEqual(args, ['-NoProfile', '-Command', [
         '$list = Get-CimInstance Win32_Process | ForEach-Object {',
         '  [pscustomobject]@{',
@@ -433,8 +434,9 @@ test('process inspector windows stop command expands descendants before stopping
   let stopScript = '';
   const inspector = createSessionWorkerProcessInspector({
     platform: 'win32',
+    systemToolPath: (name) => `C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\${name}`,
     execFileSyncImpl(command, args) {
-      assert.equal(command, 'powershell.exe');
+      assert.equal(command, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
       stopScript = String(args?.[2] || '');
       return Buffer.from('');
     },
@@ -535,7 +537,9 @@ test('the async read keeps the event loop running and records what it did', asyn
   let clock = 5_000;
   const warnings = [];
   const { inspector, calls } = asyncWindowsInspector({
-    delayMs: 60,
+    // Long enough for three ticks of a 5 ms interval at Windows' 15.6 ms
+    // timer granularity, with room to spare on a loaded machine.
+    delayMs: 200,
     nowMs: () => clock,
     slowReadMs: 2_000,
     logger: { warn: (line) => warnings.push(line) },

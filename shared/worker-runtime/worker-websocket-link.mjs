@@ -69,6 +69,15 @@ export function createWorkerWebSocketLink({
   minBackoffMs = 1000,
   maxBackoffMs = 8_000,
   jitterMs = 250,
+  // A connection counts as made only at the relay's first server.hello (the
+  // relay sends it as soon as it accepts the socket). One still connecting,
+  // or open but silent, when this runs out is given up and retried: a relay
+  // that hangs in its shutdown can hold a socket in either state without
+  // ever ending it.
+  connectTimeoutMs = 15_000,
+  // Failed attempts after the first few are logged at most once per this
+  // interval, with a count of the ones in between.
+  failureLogIntervalMs = 60_000,
   readyRefreshMs = 10_000,
   staleConnectionMs = 30_000,
   WebSocketImpl = globalThis.WebSocket,
@@ -84,6 +93,10 @@ export function createWorkerWebSocketLink({
   let readyRefreshTimer = null;
   let reconnectAttempt = 0;
   let reconnectDelayMs = 0;
+  // The current socket's connect deadline (see connectTimeoutMs).
+  let connectDeadlineTimer = null;
+  let lastFailureLoggedAt = null;
+  let failuresNotLogged = 0;
   // Ends the current socket's connection (see connect).
   let endCurrentSocket = null;
   // Insertion-ordered: the first entry is the oldest in-flight delivery, which
@@ -239,6 +252,12 @@ export function createWorkerWebSocketLink({
     reconnectTimer = null;
   }
 
+  function clearConnectDeadline() {
+    if (!connectDeadlineTimer) return;
+    clearTimeoutImpl(connectDeadlineTimer);
+    connectDeadlineTimer = null;
+  }
+
   function clearReadyRefreshTimer() {
     if (!readyRefreshTimer) return;
     clearIntervalImpl(readyRefreshTimer);
@@ -290,7 +309,23 @@ export function createWorkerWebSocketLink({
     if (typeof readyRefreshTimer?.unref === "function") readyRefreshTimer.unref();
   }
 
-  function scheduleReconnect() {
+  // One line per failed attempt for the first few, then at most one per
+  // failureLogIntervalMs: a relay that stays away for an hour must not fill
+  // the worker log with a line every 8 seconds.
+  function logFailedAttempt(reason) {
+    const nowMs = getNowMs();
+    const intervalMs = Math.max(0, Number(failureLogIntervalMs) || 0);
+    if (reconnectAttempt > 3 && lastFailureLoggedAt !== null && (nowMs - lastFailureLoggedAt) < intervalMs) {
+      failuresNotLogged += 1;
+      return;
+    }
+    const notLogged = failuresNotLogged ? [`notLogged=${failuresNotLogged}`] : [];
+    dbg("worker ws disconnected", reason, `attempt=${reconnectAttempt}`, `retryInMs=${reconnectDelayMs}`, ...notLogged);
+    lastFailureLoggedAt = nowMs;
+    failuresNotLogged = 0;
+  }
+
+  function scheduleReconnect(reason) {
     if (stopped) return;
     // One timer at a time: a second end reported for the same outage must not
     // stack another attempt or push the backoff up.
@@ -299,7 +334,7 @@ export function createWorkerWebSocketLink({
     const backoff = Math.min(maxBackoffMs, minBackoffMs * (2 ** Math.max(0, reconnectAttempt - 1)));
     const jitter = Math.floor(Math.random() * Math.max(0, jitterMs));
     reconnectDelayMs = Math.min(maxBackoffMs, backoff + jitter);
-    dbg("worker ws reconnect scheduled", `attempt=${reconnectAttempt}`, `delayMs=${reconnectDelayMs}`);
+    logFailedAttempt(reason);
     reconnectTimer = setTimeoutImpl(() => {
       reconnectTimer = null;
       connect();
@@ -312,42 +347,70 @@ export function createWorkerWebSocketLink({
       const openState = resolveSocketStateValue(ws, "OPEN", 1);
       const connectingState = resolveSocketStateValue(ws, "CONNECTING", 0);
       if (ws.readyState === openState || ws.readyState === connectingState) return;
+      // A socket left closing whose end was never reported: give it up
+      // quietly, this connect is its reconnect.
+      endCurrentSocket?.("replaced", { reconnect: false });
     }
     if (typeof WebSocketImpl !== "function") {
       dbg("worker ws unavailable: global WebSocket is missing");
       return;
     }
     clearReconnectTimer();
-    const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
-    const socket = new WebSocketImpl(url);
+    let socket = null;
+    try {
+      const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
+      socket = new WebSocketImpl(url);
+    } catch (error) {
+      // A socket that fails in its constructor raises no events: nothing but
+      // this would ever try again.
+      scheduleReconnect(`connect-failed: ${error?.message || String(error)}`);
+      return;
+    }
     ws = socket;
     let serverHelloSeen = false;
-    // Set once this socket's end has been handled, by whichever of error and
-    // close comes first; every later event from it is ignored. Node 22 fires
-    // no close for a socket closed while still connecting, and closing it
-    // from its own error handler raised the error again, so the reconnect
-    // has to be scheduled from the error as well, and only once.
+    // Set once this socket's end has been handled, by whichever of error,
+    // close, the connect deadline or a stale/draining close comes first;
+    // every later event from it is ignored. Node 22 fires no close for a
+    // socket closed while still connecting, and closing it from its own
+    // error handler raised the error again, so the reconnect has to be
+    // scheduled from the error as well, and only once.
     let ended = false;
-    function endSocket(reason) {
+    function endSocket(reason, { reconnect = true } = {}) {
       if (ended) return false;
       ended = true;
+      if (endCurrentSocket === endSocket) {
+        endCurrentSocket = null;
+        clearConnectDeadline();
+      }
       if (ws === socket) {
         ws = null;
         clearReadyRefreshTimer();
         // The next connection may reach a different (restarted) relay.
         serverCapabilities = new Set();
       }
-      if (stopped) return true;
-      dbg("worker ws disconnected", reason);
-      scheduleReconnect();
+      if (stopped || !reconnect) return true;
+      // A newer socket is already under way and owns the reconnect.
+      if (ws) return true;
+      scheduleReconnect(reason);
       return true;
     }
     endCurrentSocket = endSocket;
+    clearConnectDeadline();
+    const deadlineMs = Math.max(0, Number(connectTimeoutMs) || 0);
+    if (deadlineMs > 0) {
+      connectDeadlineTimer = setTimeoutImpl(() => {
+        connectDeadlineTimer = null;
+        if (ended) return;
+        const opened = socket.readyState === resolveSocketStateValue(socket, "OPEN", 1);
+        // Ended before the close call, as in the error handler below.
+        endSocket(opened ? "no-server-hello" : "connect-timeout");
+        try { socket.close?.(); } catch {}
+      }, deadlineMs);
+      if (typeof connectDeadlineTimer?.unref === "function") connectDeadlineTimer.unref();
+    }
     socket.addEventListener("open", () => {
       if (ended) return;
       const openedAt = getNowMs();
-      reconnectAttempt = 0;
-      reconnectDelayMs = 0;
       lastOpenAt = openedAt;
       lastMessageAt = openedAt;
       dbg("worker ws connected");
@@ -373,6 +436,14 @@ export function createWorkerWebSocketLink({
         serverCapabilities = new Set(Array.isArray(payload.capabilities) ? payload.capabilities.map(String) : []);
         if (!serverHelloSeen) {
           serverHelloSeen = true;
+          // The handshake is complete: only now does the backoff start over.
+          // A relay that accepts the socket and drops it before its hello
+          // keeps backing off instead of being retried every second.
+          clearConnectDeadline();
+          reconnectAttempt = 0;
+          reconnectDelayMs = 0;
+          lastFailureLoggedAt = null;
+          failuresNotLogged = 0;
           try {
             onServerHello(String(payload.reason || "server-hello"));
           } catch (error) {
@@ -388,6 +459,9 @@ export function createWorkerWebSocketLink({
       }
       if (payload?.type === "server.draining") {
         dbg("worker ws draining", payload.reason || "relay-shutdown");
+        // A relay stuck in its shutdown may never complete the close
+        // handshake: the reconnect does not wait for the close event.
+        endSocket("draining");
         try { socket.close?.(); } catch {}
         return;
       }
@@ -408,15 +482,16 @@ export function createWorkerWebSocketLink({
         dbg("worker ws blocked", payload.reason || "blocked");
       }
     });
-    socket.addEventListener("close", () => {
-      endSocket("close");
+    socket.addEventListener("close", (event) => {
+      const code = Number(event?.code);
+      endSocket(Number.isFinite(code) && code > 0 ? `close code=${code}` : "close");
     });
-    socket.addEventListener("error", (error) => {
+    socket.addEventListener("error", (event) => {
       if (ended) return;
-      dbg("worker ws error", error?.message || String(error));
+      const detail = event?.message || event?.error?.message || "unknown";
       // Ended before the close call, so an error or close it raises
       // (synchronously on some runtimes) finds the socket already handled.
-      endSocket("error");
+      endSocket(`error: ${detail}`);
       try { socket.close?.(); } catch {}
     });
   }
@@ -429,6 +504,7 @@ export function createWorkerWebSocketLink({
   function stop() {
     stopped = true;
     clearReconnectTimer();
+    clearConnectDeadline();
     clearReadyRefreshTimer();
     if (ws) {
       try { ws.close(); } catch {}

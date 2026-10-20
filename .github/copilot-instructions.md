@@ -13,6 +13,7 @@ When changing anything related to the web relay (`server/` or `.github/extension
       - Include `restart: true` in the request body for an intentional self-restart; omit it for a plain shutdown.
       - Preferred restart request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.
       - `POST /api/relay/shutdown` is queued and only actually exits once the current turn is idle, so do not wait for it to "interrupt" an in-flight turn.
+      - Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide (**Restart now** in the web UI).
 4. Keep the main Copilot CLI session running so extension polling can continue.
 5. Verify relay health after changes:
    - `GET /api/status` reports `cliOnline: true`

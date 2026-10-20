@@ -29,6 +29,7 @@ import {
   shouldHoldFocusOnJump,
 } from './composer-keyboard.mjs';
 import {
+  baselineBeforeUpdate,
   isScrollOnSendEnabled,
   followsEndThroughResize,
   isNearBottom,
@@ -197,13 +198,16 @@ export function followsTranscriptEnd() {
   if (!isConversationWindowAtTail()) return false;
   const el = scroller();
   const height = jump ? null : observedClientHeight;
-  return followsEndThroughResize({
+  const follows = followsEndThroughResize({
     nearBottomNow: isMessagesNearBottom(),
     clientHeight: el?.clientHeight,
     observedClientHeight: height,
     distanceAtObservedHeight: el && height !== null ? Math.max(0, el.scrollHeight - height - el.scrollTop) : null,
     nearBottomPxAtObservedHeight: height !== null ? resolveNearBottomThresholdPx(height) : 0,
   });
+  // What the update adds is counted against the rows on the page before it.
+  if (!follows && el && !jump && syncStateConversation()) state = baselineBeforeUpdate(state, rowKeys(el));
+  return follows;
 }
 
 /**

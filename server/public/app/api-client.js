@@ -45,7 +45,7 @@ export function areNetworkRequestsEnabled() {
   return networkRequestsEnabled;
 }
 
-export async function apiFetch(url, opts = {}) {
+export async function apiFetch(url, { onErrorResponse, ...opts } = {}) {
   // A keepalive request is a page's last word; it goes out even when the
   // page's regular network work is already suspended.
   if (!networkRequestsEnabled && !opts.keepalive) return null;
@@ -61,6 +61,9 @@ export async function apiFetch(url, opts = {}) {
     });
     if (!response.ok) {
       console.error('API error', response.status, url);
+      // A caller that shows why a request failed reads the answer here; the
+      // result is still null.
+      if (typeof onErrorResponse === 'function') await onErrorResponse(response);
       return null;
     }
     noteFetchSuccess();
@@ -582,6 +585,18 @@ export async function updateTaskStallMinutesSetting(minutes) {
   return apiFetch('/api/settings/task-stall-minutes', {
     method: 'POST',
     body: JSON.stringify({ minutes: Number(minutes) }),
+  });
+}
+
+// "After a relay restart, tell interrupted sessions to carry on" (off by default).
+export async function loadRestartResumeSetting() {
+  return apiFetch('/api/settings/restart-resume');
+}
+
+export async function updateRestartResumeSetting(enabled) {
+  return apiFetch('/api/settings/restart-resume', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: enabled === true }),
   });
 }
 
@@ -1425,6 +1440,31 @@ export async function cancelRelayRestart(body = {}) {
   });
 }
 
+// The queued restart's state, and the picture for a restart asked now: the
+// sessions it would wait for, the messages it would hold, the background
+// tasks and whether they survive (routes/relay-restart-routes.mjs).
+export async function loadRelayRestartPreview(action = 'restart') {
+  return apiFetchOrThrow(`/api/relay/shutdown?action=${encodeURIComponent(action)}`);
+}
+
+export async function keepWaitingForRelayRestart(body = {}) {
+  return apiFetchOrThrow('/api/relay/shutdown/keep-waiting', {
+    method: 'POST',
+    body: JSON.stringify({ requestedBy: 'localhost-api', ...(body || {}) }),
+  });
+}
+
+export async function loadRelayRestartMaxWaitSetting() {
+  return apiFetch('/api/settings/relay-restart-max-wait');
+}
+
+export async function updateRelayRestartMaxWaitSetting(maxWaitMinutes) {
+  return apiFetchOrThrow('/api/settings/relay-restart-max-wait', {
+    method: 'POST',
+    body: JSON.stringify({ maxWaitMinutes: Number(maxWaitMinutes) }),
+  });
+}
+
 export async function requestQueueEmpty(body = {}) {
   return apiFetchOrThrow('/api/queue/empty', {
     method: 'POST',
@@ -1436,8 +1476,22 @@ export async function requestQueueEmpty(body = {}) {
   });
 }
 
-export async function sendMessage(body) {
-  return apiFetch('/api/message', { method: 'POST', body: JSON.stringify(body) });
+// Null on any failure, like apiFetch. A send the relay refused for a reason
+// the user can act on (a 409 such as "this conversation's model is no longer
+// available") hands that reason to onRefused first, so the composer can say
+// it instead of "could not be sent". A replayed send that already landed
+// (DUPLICATE_MESSAGE_ID) is not a refusal.
+export async function sendMessage(body, { onRefused } = {}) {
+  return apiFetch('/api/message', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    onErrorResponse: async (response) => {
+      if (response.status !== 409 || typeof onRefused !== 'function') return;
+      const payload = await response.json().catch(() => null);
+      const reason = readableServerError(payload?.error);
+      if (reason && payload?.code !== 'DUPLICATE_MESSAGE_ID') onRefused(reason, payload);
+    },
+  });
 }
 
 // Raw fetch instead of apiFetch: a rejected bootstrap (bad CWD, unavailable

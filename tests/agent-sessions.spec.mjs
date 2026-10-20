@@ -212,6 +212,19 @@ test.describe.serial("agent sessions on this relay", () => {
     expect(sessions.payload.sessions.map((session) => session.id)).toEqual([orchestrator]);
   });
 
+  test("a create with a model the provider does not list is refused before any card, and nothing is created", async () => {
+    const models = await api("/api/models");
+    expect(models.payload.models).toContain("gpt-5.4-mini");
+    const refused = await tool(orchestrator, "create_session", { relay: "this", provider: "github", model: "gpt-5-4-mini", text: "sidebar polish, part zero", wait_seconds: 0 });
+    expect(refused.status, JSON.stringify(refused.payload)).toBe(400);
+    expect(refused.payload.code).toBe("REMOTE_RELAY_UNKNOWN_MODEL");
+    expect(refused.payload.error).toContain("Unknown model 'gpt-5-4-mini' for Copilot on relay \"win-test\"; did you mean 'gpt-5.4-mini'");
+    expect(refused.payload.error).toContain("No session was created.");
+    expect(refused.payload.suggestions[0]).toBe("gpt-5.4-mini");
+    expect(await pendingCards(api, orchestrator)).toEqual([]);
+    expect((await api("/api/conversations")).payload.conversations).toHaveLength(1);
+  });
+
   test("the first create shows the approval card; Allow creates a session that carries the local origin", async () => {
     const prompt = "sidebar polish, part one: list the open work";
     const call = tool(orchestrator, "create_session", { relay: "this", text: prompt, title: "sidebar polish one", wait_seconds: 0 });

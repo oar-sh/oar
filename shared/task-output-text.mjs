@@ -32,6 +32,8 @@ export const TASK_OUTPUT_LIMITS = Object.freeze({
   healthBytes: 64 * 1024,
   lineCharsMax: 4000,
   outputPathMax: 1024,
+  // A shell task's command line on its row.
+  commandCharsMax: 2000,
   // Ended rows: kept this long, at most this many per conversation.
   endedKeepMs: 60 * 60 * 1000,
   endedMax: 20,
@@ -269,7 +271,7 @@ function clampByte(value) {
 }
 
 function plainStyle() {
-  return { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false };
+  return { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false, inverse: false };
 }
 
 function applySgr(state, params) {
@@ -281,11 +283,13 @@ function applySgr(state, params) {
     else if (code === 2) state.dim = true;
     else if (code === 3) state.italic = true;
     else if (code === 4) state.underline = true;
+    else if (code === 7) state.inverse = true;
     else if (code === 22) {
       state.bold = false;
       state.dim = false;
     } else if (code === 23) state.italic = false;
     else if (code === 24) state.underline = false;
+    else if (code === 27) state.inverse = false;
     else if (code >= 30 && code <= 37) state.fg = code - 30;
     else if (code === 39) state.fg = null;
     else if (code >= 40 && code <= 47) state.bg = code - 40;
@@ -310,8 +314,11 @@ function applySgr(state, params) {
 /**
  * One line as styled segments `{ text, fg, bg, bold, dim, italic, underline }`,
  * colours 0–15 or null (256 and truecolor mapped to the nearest of the 16).
- * Adjacent segments never share a style. Any escape that is not SGR is
- * dropped from the text.
+ * Inverse text (SGR 7, until 27 or 0) comes with its colours already swapped
+ * and `inverse: true`: a null `fg` then means the default background as the
+ * text colour, a null `bg` the default text colour as the background (the
+ * filled RUN / PASS / FAIL badges of vitest). Adjacent segments never share a
+ * style. Any escape that is not SGR is dropped from the text.
  */
 export function ansiToSegments(lineText) {
   const text = String(lineText ?? '');
@@ -320,13 +327,17 @@ export function ansiToSegments(lineText) {
   const pushText = (value) => {
     const clean = stripControlKeepSgr(value).replace(/\x1b/g, '');
     if (!clean) return;
+    const fg = state.inverse ? state.bg : state.fg;
+    const bg = state.inverse ? state.fg : state.bg;
     const last = segments[segments.length - 1];
-    if (last && last.fg === state.fg && last.bg === state.bg && last.bold === state.bold
-      && last.dim === state.dim && last.italic === state.italic && last.underline === state.underline) {
+    if (last && last.fg === fg && last.bg === bg && last.bold === state.bold && last.dim === state.dim
+      && last.italic === state.italic && last.underline === state.underline && !!last.inverse === state.inverse) {
       last.text += clean;
       return;
     }
-    segments.push({ text: clean, ...state });
+    const segment = { text: clean, fg, bg, bold: state.bold, dim: state.dim, italic: state.italic, underline: state.underline };
+    if (state.inverse) segment.inverse = true;
+    segments.push(segment);
   };
   let at = 0;
   const pattern = new RegExp(SGR_PATTERN.source, 'g');
@@ -389,15 +400,38 @@ const KNOWN_TOKEN_RULES = Object.freeze([
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 [redacted]'],
   // A password in a URL: scheme://user:password@host.
   [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, '$1[redacted]@'],
+  // A Slack incoming webhook: the path is the credential.
+  [/\b(hooks\.slack\.com\/services\/)[A-Za-z0-9_/-]+/g, '$1[redacted]'],
+  // Credentials in a query string: ?key=…, &sig=…, &token=…
+  [/([?&](?:key|api_?key|sig|signature|token|access_token|auth|password|secret)=)(?!\[redacted\])[^&\s#"'`]+/gi, '$1[redacted]'],
+  // An `Authorization:` header, any case (`AUTHORIZATION: basic …` in a git
+  // http.extraheader), any scheme word (`token <hex>`, `Bot …`): the word
+  // stays, the value goes. Bearer/Basic outside a header stay case-exact
+  // above, so prose ("basic functionality") is left alone.
+  [/\b(authorization["']?\s*[:=]\s*["']?(?:token|bot|digest|apikey|bearer|basic)\s+)(?!\[redacted\])[^\s"',;]+/gi, '$1[redacted]'],
+  // curl -u / --user name:password, also attached (-ualice:pw). Only on a
+  // curl line: `docker run -u node:node`, `ps -u alice:staff` are no secret.
+  [/\b(curl\b[^\n|;&]*?\s(?:-u|--user)(?:\s+|=)?["']?[^\s:"']+:)(?!\[redacted\]|\$)[^\s"']+/g, '$1[redacted]'],
+  // A secret flag's value: --password x, --token=x, --secret x, --api-key x.
+  [/((?:^|\s)--(?:password|passwd|token|secret|api-key|access-token|client-secret)(?:\s+|=)["']?)(?!\[redacted\]|\$|-)[^\s"']+/gi, '$1[redacted]'],
+  // mysql -p<password> (attached), docker login -p <password>.
+  [/\b(mysql\w*\b[^\n|;&]*?\s-p)(?!\[redacted\])([^\s"']+)/g, '$1[redacted]'],
+  [/\b(docker\s+login\b[^\n|;&]*?\s-p\s+)(?!\[redacted\]|\$)[^\s"']+/g, '$1[redacted]'],
+  // sshpass -p <password> (or attached), redis-cli -a <password>.
+  [/\b(sshpass\b[^\n|;&]*?\s-p\s*)(?!\[redacted\]|\$)[^\s"']+/g, '$1[redacted]'],
+  [/\b(redis-cli\b[^\n|;&]*?\s-a\s+)(?!\[redacted\]|\$)[^\s"']+/g, '$1[redacted]'],
+  // An AWS credentials file or ini line (aws_secret_access_key = …), or
+  // `aws configure set aws_secret_access_key <value>`.
+  [/\b(aws_secret_access_key|aws_session_token)(\s*[:=]\s*["']?|\s+)(?!\[redacted\]|\$)[^\s"',;]{4,}/gi, '$1$2[redacted]'],
 ]);
 
 // NAME=value with a secret-sounding environment name (API_TOKEN=…,
 // DB_PASSWORD="…"); the name stays. A value without a letter (a count, a
 // port) or a placeholder (true, null, ***) is no secret.
-const ENV_ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?|AUTH(?!OR))[A-Za-z0-9_]*)=(["']?)(?!\[redacted\]|(?:true|false|null|none|undefined)\b|\*+)(?=[^\s"'`]*[A-Za-z])([^\s"'`]{4,})/gi;
+const ENV_ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?|AUTH(?!OR))[A-Za-z0-9_]*)=(["']?)(?!\[redacted\]|(?:true|false|null|none|undefined)\b|\*+|\$)(?=[^\s"'`]*[A-Za-z])([^\s"'`]{4,})/gi;
 // `token: value`, `"password": "value"`, `api_key = value`, Authorization: …
 // A Bearer/Basic value was handled above and keeps its scheme word.
-const KEY_VALUE_PATTERN = /\b(token|secret|password|passwd|passphrase|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)(["']?\s*[:=]\s*["']?)(?!(?:Bearer|Basic)\b|\[redacted\]|(?:true|false|null|none|undefined)\b|\*+)(?=[^\s"',;]*[A-Za-z])([^\s"',;]{4,})/gi;
+const KEY_VALUE_PATTERN = /\b(token|secret|password|passwd|passphrase|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)(["']?\s*[:=]\s*["']?)(?!(?:Bearer|Basic|token|bot|digest|apikey)\s|(?:Bearer|Basic)\b|\[redacted\]|(?:true|false|null|none|undefined)\b|\*+|\$)(?=[^\s"',;]*[A-Za-z])([^\s"',;]{4,})/gi;
 // Anything else token-shaped: 32 or more of [A-Za-z0-9_-] with an upper-case
 // letter, a lower-case letter and a digit. Random keys have all three; test
 // names, paths and hex commit ids rarely do.
@@ -431,6 +465,25 @@ export function scrubTaskOutput(text) {
 /** What leaves the relay: control codes out (SGR kept), then credentials out. */
 export function cleanTaskOutput(text) {
   return scrubTaskOutput(stripControlKeepSgr(text));
+}
+
+/**
+ * A worker's text about a task as the relay keeps it on the row (its
+ * description, summary, last tool call, command line): no colour or control
+ * codes, credentials scrubbed as in the output (before the cut, so a cut
+ * never leaves half a secret unrecognised), at most `max` characters. ''
+ * when there is none. A description can be the command line itself (Grok's
+ * terminals, a Copilot shell without one).
+ */
+export function cleanTaskText(value, max) {
+  if (typeof value !== 'string' || !value) return '';
+  const plain = stripSgr(stripControlKeepSgr(value.slice(0, Math.max(1, max) * 4)));
+  return scrubTaskOutput(plain).trim().slice(0, max);
+}
+
+/** A shell task's command line as the relay keeps it: cleanTaskText at 2,000 characters. */
+export function normalizeTaskCommand(value) {
+  return cleanTaskText(value, TASK_OUTPUT_LIMITS.commandCharsMax);
 }
 
 // ─── Test runners ────────────────────────────────────────────────────────────
@@ -594,91 +647,98 @@ const RUNNER_HEADERS = [
   ['turbo', /^\s*•\s+Running \S+ in \d+ packages?/],
 ];
 
-function liveCounts(runner, texts) {
-  let passed = 0;
-  let failed = 0;
-  let skipped = 0;
-  let firstFailureLine = null;
-  const fail = (index, amount = 1) => {
-    failed += amount;
-    if (firstFailureLine === null) firstFailureLine = index;
+function newTally() {
+  return { passed: 0, failed: 0, skipped: 0, firstFailureLine: null };
+}
+
+// One log line of a run of `runner` into `tally`; `at` names the line for
+// `firstFailureLine` (an index into the lines, or a byte offset).
+function countRunnerLine(runner, text, repeat, tally, at) {
+  const markFirst = () => {
+    if (tally.firstFailureLine === null) tally.firstFailureLine = at;
   };
-  texts.forEach((text, index) => {
-    const repeat = texts.counts[index];
-    if (runner === 'pytest') {
-      const verbose = /\s(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)(?:\s+\[\s*\d+%\])?\s*$/.exec(text);
-      if (verbose) {
-        if (verbose[1] === 'PASSED' || verbose[1] === 'XPASS') passed += repeat;
-        else if (verbose[1] === 'FAILED' || verbose[1] === 'ERROR') fail(index, repeat);
-        else skipped += repeat;
-        return;
-      }
-      // Progress lines: "tests/test_a.py ..F.s   [ 40%]"
-      // and their wrapped continuations ("........  [ 56%]").
-      const dots = /^\S+\.py\s+([.FEsxX]+)(?:\s+\[\s*\d+%\])?\s*$/.exec(text)
-        || /^([.FEsxX]+)\s*\[\s*\d+%\]\s*$/.exec(text);
-      if (dots) {
-        for (const mark of dots[1]) {
-          if (mark === '.' || mark === 'X') passed += 1;
-          else if (mark === 'F' || mark === 'E') fail(index);
-          else skipped += 1;
-        }
-      }
+  const fail = (amount = 1) => {
+    tally.failed += amount;
+    markFirst();
+  };
+  if (runner === 'pytest') {
+    const verbose = /\s(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)(?:\s+\[\s*\d+%\])?\s*$/.exec(text);
+    if (verbose) {
+      if (verbose[1] === 'PASSED' || verbose[1] === 'XPASS') tally.passed += repeat;
+      else if (verbose[1] === 'FAILED' || verbose[1] === 'ERROR') fail(repeat);
+      else tally.skipped += repeat;
       return;
     }
-    if (runner === 'tap' || (runner === 'node:test' && /^\s*(?:not )?ok \d+ /.test(text))) {
-      const tap = /^\s*(not )?ok \d+\b(.*)$/.exec(text);
-      if (!tap) return;
-      // A subtest line is indented; only top-level results count.
-      if (/^\s/.test(text)) return;
-      if (/#\s*(?:SKIP|TODO)\b/i.test(tap[2])) skipped += repeat;
-      else if (tap[1]) fail(index, repeat);
-      else passed += repeat;
-      return;
-    }
-    if (runner === 'vitest') {
-      // File lines: " ✓ src/a.test.ts (12 tests) 34ms", " ❯ src/b.test.ts (5 tests | 2 failed) 20ms".
-      // The × lines under a failed file repeat its failures.
-      const file = /^\s*[✓❯×]\s+\S+\s+\((\d+) tests?(?: \| (\d+) failed)?(?: \| (\d+) skipped)?\)/.exec(text);
-      if (file) {
-        const total = Number(file[1]);
-        const failedHere = Number(file[2] || 0);
-        const skippedHere = Number(file[3] || 0);
-        passed += Math.max(0, total - failedHere - skippedHere);
-        skipped += skippedHere;
-        if (failedHere) fail(index, failedHere);
-        return;
+    // Progress lines: "tests/test_a.py ..F.s   [ 40%]"
+    // and their wrapped continuations ("........  [ 56%]").
+    const dots = /^\S+\.py\s+([.FEsxX]+)(?:\s+\[\s*\d+%\])?\s*$/.exec(text)
+      || /^([.FEsxX]+)\s*\[\s*\d+%\]\s*$/.exec(text);
+    if (dots) {
+      for (const mark of dots[1]) {
+        if (mark === '.' || mark === 'X') tally.passed += 1;
+        else if (mark === 'F' || mark === 'E') fail();
+        else tally.skipped += 1;
       }
-      if (FAIL_MARK.test(text) && firstFailureLine === null) firstFailureLine = index;
+    }
+    return;
+  }
+  if (runner === 'tap' || (runner === 'node:test' && /^\s*(?:not )?ok \d+ /.test(text))) {
+    const tap = /^\s*(not )?ok \d+\b(.*)$/.exec(text);
+    if (!tap) return;
+    // A subtest line is indented; only top-level results count.
+    if (/^\s/.test(text)) return;
+    if (/#\s*(?:SKIP|TODO)\b/i.test(tap[2])) tally.skipped += repeat;
+    else if (tap[1]) fail(repeat);
+    else tally.passed += repeat;
+    return;
+  }
+  if (runner === 'vitest') {
+    // File lines: " ✓ src/a.test.ts (12 tests) 34ms", " ❯ src/b.test.ts (5 tests | 2 failed) 20ms".
+    // The × lines under a failed file repeat its failures.
+    const file = /^\s*[✓❯×]\s+\S+\s+\((\d+) tests?(?: \| (\d+) failed)?(?: \| (\d+) skipped)?\)/.exec(text);
+    if (file) {
+      const total = Number(file[1]);
+      const failedHere = Number(file[2] || 0);
+      const skippedHere = Number(file[3] || 0);
+      tally.passed += Math.max(0, total - failedHere - skippedHere);
+      tally.skipped += skippedHere;
+      if (failedHere) fail(failedHere);
       return;
     }
-    if (runner === 'jest') {
-      // Without --verbose jest marks files only; each failed test gets a
-      // "● suite › test" block (but "● Console" is a log block).
-      if (/^\s*FAIL\s/.test(text)) {
-        if (firstFailureLine === null) firstFailureLine = index;
-        return;
-      }
-      if (/^\s*●\s(?!Console\b)/.test(text)) {
-        fail(index, repeat);
-        return;
-      }
-      if (PASS_MARK.test(text)) passed += repeat;
-      else if (FAIL_MARK.test(text) && firstFailureLine === null) firstFailureLine = index;
+    if (FAIL_MARK.test(text)) markFirst();
+    return;
+  }
+  if (runner === 'jest') {
+    // Without --verbose jest marks files only; each failed test gets a
+    // "● suite › test" block (but "● Console" is a log block).
+    if (/^\s*FAIL\s/.test(text)) {
+      markFirst();
       return;
     }
-    if (runner === 'playwright' && /^\s*-\s+\d+\s/.test(text)) {
-      skipped += repeat;
+    if (/^\s*●\s(?!Console\b)/.test(text)) {
+      fail(repeat);
       return;
     }
-    if (PASS_MARK.test(text)) passed += repeat;
-    else if (FAIL_MARK.test(text)) {
-      // node:test's "✖ failing tests:" heads the repeat of the failures.
-      if (/failing tests:\s*$/.test(text)) return;
-      fail(index, repeat);
-    }
-  });
-  return { passed, failed, skipped, firstFailureLine };
+    if (PASS_MARK.test(text)) tally.passed += repeat;
+    else if (FAIL_MARK.test(text)) markFirst();
+    return;
+  }
+  if (runner === 'playwright' && /^\s*-\s+\d+\s/.test(text)) {
+    tally.skipped += repeat;
+    return;
+  }
+  if (PASS_MARK.test(text)) tally.passed += repeat;
+  else if (FAIL_MARK.test(text)) {
+    // node:test's "✖ failing tests:" heads the repeat of the failures.
+    if (/failing tests:\s*$/.test(text)) return;
+    fail(repeat);
+  }
+}
+
+function liveCounts(runner, texts) {
+  const tally = newTally();
+  texts.forEach((text, index) => countRunnerLine(runner, text, texts.counts[index], tally, index));
+  return tally;
 }
 
 // Where the first failure is told in detail, for a run that has its final
@@ -734,4 +794,57 @@ export function parseRunnerSummary(lines) {
   }
   if (!runner) return null;
   return { runner, ...liveCounts(runner, texts), final: false };
+}
+
+// One-line closing summaries (jest, vitest, pytest, turbo, node:test's
+// last line, Playwright's timed count).
+const CLOSING_LINES = [
+  /^\s*Tests:\s+.*\b\d+\s+total\s*$/,
+  /^\s*Tests\s{2,}.*\(\d+\)\s*$/,
+  /^=+ .*\bin [\d.]+s(?: \([^)]*\))? =+\s*$/,
+  /^\s*Tasks:\s+\d+ successful/,
+  /^\s*(?:ℹ|#)\s+duration_ms\s+[\d.]+\s*$/,
+  /^\s{2}\d+ passed \([\dhms.\s]+\)\s*$/,
+];
+
+// Headers that open a new run: a second run in the same log (a watch rerun,
+// `npm test` twice) counts from its own start. A jest or node:test file line
+// is a header too, but every file of a run prints one.
+function opensRun(runner, text) {
+  if (runner === 'node:test') return /^TAP version \d+/.test(text);
+  return runner === 'playwright' || runner === 'vitest' || runner === 'pytest' || runner === 'turbo';
+}
+
+/**
+ * The live counts of a whole log fed one line at a time, for a log too long
+ * to parse at once (the health poller keeps one per task as the file grows).
+ * `push(line, at)` takes a completed line (a string or `{ text, count }`) and
+ * what names it (a byte offset); `result()` is what parseRunnerSummary says
+ * of a run still going, `{ runner, passed, failed, skipped, firstFailureLine,
+ * final: false }` with `firstFailureLine` the `at` of the first failure, or
+ * null while no runner's header has been seen. Counting starts at the
+ * header: marks before it (a build's ✓ lines) are not a test run's.
+ */
+export function createRunnerTally() {
+  let runner = null;
+  let tally = newTally();
+  // A closing summary was seen: the next header (a jest file line too)
+  // starts the next run.
+  let closed = false;
+  return {
+    push(line, at) {
+      const text = lineTextOf(line);
+      const header = RUNNER_HEADERS.find(([, pattern]) => pattern.test(text));
+      if (header && (!runner || closed || opensRun(header[0], text))) {
+        runner = header[0];
+        tally = newTally();
+        closed = false;
+      }
+      if (runner) countRunnerLine(runner, text, countOf(line), tally, at);
+      if (runner && CLOSING_LINES.some((pattern) => pattern.test(text))) closed = true;
+    },
+    result() {
+      return runner ? { runner, ...tally, final: false } : null;
+    },
+  };
 }

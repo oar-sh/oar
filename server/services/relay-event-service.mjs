@@ -57,13 +57,18 @@ import {
   RELAY_EVENT_LINK_LOST_TYPE,
   RELAY_EVENT_LINK_RESTORED_TYPE,
   RELAY_EVENT_MESSAGE_KIND,
+  RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
+  RELAY_EVENT_SUBSCRIBABLE_TYPES,
   RELAY_EVENT_TYPES,
   RELAY_EVENT_VERSION,
   buildRelayEventMessageText,
   compileRelayEventMatch,
+  effectiveRelayEventTypes,
+  isLegacyDefaultRelayEventTypes,
   isRelayEventType,
   isUrgentRelayEventType,
   relayEventMatchText,
+  relayEventTypesTake,
 } from '../../shared/relay-events.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
@@ -403,6 +408,11 @@ export function createRelayEventService({
     return !!row && Number(row.archived || 0) !== 1 && toText(row.status) !== 'deleted';
   }
 
+  /** A subscription's events; the old default list counts as today's default. */
+  function storedTypes(row) {
+    return effectiveRelayEventTypes(parseJson(row?.events_json, []));
+  }
+
   function shapeSubscription(row) {
     if (!row) return null;
     const scope = toText(row.scope) === 'all' ? 'all' : 'sessions';
@@ -431,7 +441,10 @@ export function createRelayEventService({
       sessions: scope === 'all'
         ? 'all'
         : sessionIds.map((id) => ({ id, title: mirror ? (remoteTitles.get(id) || null) : (toText(conversation(id)?.title) || null) })),
-      events: parseJson(row.events_json, []).filter((type) => RELAY_EVENT_TYPES.includes(type)),
+      // A mirror shows what the paired relay applies; a subscription here,
+      // stored with the old default, the default that applies now.
+      events: (mirror ? parseJson(row.events_json, []) : storedTypes(row))
+        .filter((type) => RELAY_EVENT_SUBSCRIBABLE_TYPES.includes(type)),
       once: Number(row.once || 0) === 1,
       ...(toText(row.match) ? { match: row.match } : {}),
       stalledMinutes: Number(row.stalled_minutes) || RELAY_EVENT_LIMITS.stalledMinutesDefault,
@@ -504,9 +517,13 @@ export function createRelayEventService({
       throw new RelayEventError('notFound', `No live session with id ${missing.join(', ')} on this relay (archived sessions cannot be watched).`, { sessions: missing });
     }
     const types = Array.isArray(events) && events.length
-      ? [...new Set(events.map(toText).filter((type) => RELAY_EVENT_TYPES.includes(type)))]
+      ? [...new Set(events.map(toText).filter((type) => RELAY_EVENT_SUBSCRIBABLE_TYPES.includes(type)))]
       : [...RELAY_EVENT_DEFAULT_TYPES];
-    if (!types.length) throw new RelayEventError('invalid', `events must name some of: ${RELAY_EVENT_TYPES.join(', ')}`);
+    if (!types.length) throw new RelayEventError('invalid', `events must name some of: ${RELAY_EVENT_SUBSCRIBABLE_TYPES.join(', ')}`);
+    // Named exactly as the old default was stored, this list would be read
+    // as today's default and lose its task_finished (effectiveRelayEventTypes);
+    // subagent_finished beside it changes nothing it takes and keeps it named.
+    if (isLegacyDefaultRelayEventTypes(types)) types.push(RELAY_EVENT_SUBAGENT_FINISHED_TYPE);
     const compiled = compileRelayEventMatch(match);
     if (!compiled.ok) throw new RelayEventError('invalid', compiled.error);
     const stalled = Number.isFinite(Number(stalledMinutes)) && stalledMinutes !== null && stalledMinutes !== ''
@@ -771,8 +788,9 @@ export function createRelayEventService({
     return parseJson(row.session_ids_json, []).map(toText).includes(sessionId);
   }
 
-  function wants(row, type) {
-    return parseJson(row.events_json, []).includes(type);
+  /** `event` is `{ type, detail }`: a task_finished's kind decides under subagent_finished. */
+  function wants(row, event) {
+    return relayEventTypesTake(storedTypes(row), event);
   }
 
   /** `match` filters the events it can be tried on; the others pass. */
@@ -807,7 +825,7 @@ export function createRelayEventService({
     if (!available || !RELAY_EVENT_TYPES.includes(type)) return 0;
     const id = toText(sessionId);
     if (!id) return 0;
-    const rows = localWatchRows().filter((row) => wants(row, type) && subscriptionCovers(row, id));
+    const rows = localWatchRows().filter((row) => wants(row, { type, detail }) && subscriptionCovers(row, id));
     if (!rows.length) return 0;
     const event = buildEvent(type, id, detail);
     return enqueueForRows(rows, event, id);
@@ -1271,7 +1289,7 @@ export function createRelayEventService({
     const sessions = all ? [] : (Array.isArray(remote.sessions) ? remote.sessions : [])
       .map((session) => ({ id: toText(session?.id), title: toText(session?.title) || null }))
       .filter((session) => session.id);
-    const types = (Array.isArray(remote.events) ? remote.events : []).filter((type) => RELAY_EVENT_TYPES.includes(type));
+    const types = (Array.isArray(remote.events) ? remote.events : []).filter((type) => RELAY_EVENT_SUBSCRIBABLE_TYPES.includes(type));
     const id = `sub_${randomBytes(5).toString('hex')}`;
     const at = isoNow();
     remoteSql.insertMirror.run(
@@ -1814,7 +1832,7 @@ export function createRelayEventService({
       }
       busyBySubscription.set(row.id, false);
       idleSinceBySubscription.delete(row.id);
-      if (!wants(row, 'all_idle')) continue;
+      if (!wants(row, { type: 'all_idle' })) continue;
       const count = toText(row.scope) === 'all' ? null : parseJson(row.session_ids_json, []).length;
       const event = buildEvent('all_idle', '', { scope: toText(row.scope), sessionCount: count, subscriptionId: row.id });
       enqueueForRows([row], event, '');
@@ -1832,7 +1850,7 @@ export function createRelayEventService({
   function evaluateStalled() {
     const at = now();
     for (const row of localWatchRows()) {
-      if (!wants(row, 'stalled')) continue;
+      if (!wants(row, { type: 'stalled' })) continue;
       const limitMs = (Number(row.stalled_minutes) || RELAY_EVENT_LIMITS.stalledMinutesDefault) * 60_000;
       for (const sessionId of candidateSessions(row)) {
         const view = describe(sessionId);

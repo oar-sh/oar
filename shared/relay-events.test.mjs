@@ -10,7 +10,12 @@ import {
   formatRelayEventLine,
   isUrgentRelayEventType,
   parseRelayEventMessageText,
+  RELAY_EVENT_SUBSCRIBABLE_TYPES,
+  RELAY_EVENT_TYPES,
   relayEventMatchText,
+  relayEventTypesTake,
+  effectiveRelayEventTypes,
+  RELAY_EVENT_LEGACY_DEFAULT_TYPES,
 } from './relay-events.mjs';
 
 const SESSION = { id: 'conv-fixture-orbit', title: 'Orbit camera' };
@@ -22,6 +27,36 @@ test('task_started is opt-in; question_asked and error are urgent', () => {
   assert.ok(isUrgentRelayEventType('question_asked'));
   assert.ok(isUrgentRelayEventType('error'));
   assert.ok(!isUrgentRelayEventType('turn_end'));
+});
+
+test('the default takes sub-agent ends, not every task end; task_finished is opt-in like task_started', () => {
+  assert.deepEqual([...RELAY_EVENT_DEFAULT_TYPES], ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle']);
+  assert.deepEqual([...RELAY_EVENT_SUBSCRIBABLE_TYPES], [
+    'question_asked', 'error', 'turn_end', 'task_started', 'task_finished', 'subagent_finished', 'task_failed', 'stalled', 'all_idle',
+  ]);
+  assert.ok(!RELAY_EVENT_TYPES.includes('subagent_finished'), 'never an event of its own');
+  const finished = (kind) => event('task_finished', { kind, description: 'x', status: 'completed' });
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, finished('shell')), false);
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, finished('subagent')), true);
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, finished('unknown')), true);
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, event('task_failed', { kind: 'shell', exitCode: 2 })), true);
+  assert.equal(relayEventTypesTake(['task_finished'], finished('shell')), true);
+  assert.equal(relayEventTypesTake(['subagent_finished'], event('task_failed', { kind: 'subagent' })), false);
+  assert.equal(relayEventTypesTake(['turn_end'], { type: 'turn_end' }), true);
+  assert.equal(relayEventTypesTake(null, { type: 'turn_end' }), false);
+});
+
+test('a stored list that is exactly the old default reads as the new default; others stay as named', () => {
+  const OLD = ['question_asked', 'error', 'turn_end', 'task_finished', 'task_failed', 'stalled', 'all_idle'];
+  assert.deepEqual([...RELAY_EVENT_LEGACY_DEFAULT_TYPES], OLD);
+  assert.deepEqual(effectiveRelayEventTypes(OLD), [...RELAY_EVENT_DEFAULT_TYPES]);
+  assert.deepEqual(effectiveRelayEventTypes([...OLD].reverse()), [...RELAY_EVENT_DEFAULT_TYPES], 'any order');
+  assert.deepEqual(effectiveRelayEventTypes([...OLD, 'turn_end']), [...RELAY_EVENT_DEFAULT_TYPES], 'a repeat changes nothing');
+  assert.deepEqual(effectiveRelayEventTypes(effectiveRelayEventTypes(OLD)), [...RELAY_EVENT_DEFAULT_TYPES], 'idempotent');
+  assert.deepEqual(effectiveRelayEventTypes([...OLD, 'task_started']), [...OLD, 'task_started'], 'more than the old default: named');
+  assert.deepEqual(effectiveRelayEventTypes(OLD.slice(1)), OLD.slice(1), 'less: named');
+  assert.deepEqual(effectiveRelayEventTypes(['task_finished']), ['task_finished']);
+  assert.deepEqual(effectiveRelayEventTypes(null), []);
 });
 
 test('each event type reads as one line naming the session and its id', () => {

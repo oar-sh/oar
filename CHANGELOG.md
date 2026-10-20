@@ -3,6 +3,212 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.13] — 2026-10-20
+
+Highlights: a queued relay restart now shows every page what it waits for,
+which messages it holds and which background tasks keep running, and after a
+time you set it asks instead of waiting forever; it never restarts by itself
+while turns run, and can tell the sessions a restart cut off to carry on
+(opt-in). The task console survives a relay restart, marks where a `| tail`
+holds output back, keeps the task's row in view, and counts a test run over
+its whole log. A message
+sent without a model keeps the conversation's model, effort and mode,
+`remote_relay` refuses a model the provider does not list, watching agents
+are no longer woken by every finished shell command, workers reconnect after
+a hung restart, and the unit suite passes on Windows again.
+
+### Upgrade notes
+
+- Migration 0018 (the table `background_task_rows`) runs by itself on the
+  first start. Rows the runtime before this update held in memory are lost
+  one last time at the restart into it. The Node.js requirement is unchanged
+  (22.13 or newer).
+- New settings in **Settings › General**: **Ask after a queued relay restart
+  has waited** (30 minutes by default) and **After a relay restart, tell
+  interrupted sessions to carry on** (off by default); a new push event,
+  **Queued relay restart waited its maximum time** (Settings › Notifications),
+  is on by default.
+- **Watching agents:** a subscription that named no events now leaves out
+  successful shell commands (sub-agent ends and failures still wake it); one
+  that named its events keeps them. Name `task_finished` to get every task end.
+- **Scripts that post `/api/message` without a model** to an existing
+  conversation now get the conversation's own model, effort and mode, or a
+  `409 CONVERSATION_MODEL_UNAVAILABLE` when that model left the catalog,
+  instead of the relay's first model.
+- The npm package guard allows 7.75 MiB unpacked and 520 entries (was 7.5
+  MiB and 510); the restart queue, the stored task rows and the restart note
+  grew the server and the app to about 7.57 MiB and 514 entries.
+
+### Added
+
+- **After a relay restart, tell interrupted sessions to carry on** (Settings
+  › General, off by default, a setting of the relay). A turn a restart cut
+  off for good (the agent had already taken the message, so it cannot run
+  again) used to stop without the agent ever hearing of it. With the setting
+  on, its session gets one compact **relay** note once the relay is back:
+  when the relay restarted, and to check what it was doing and carry on.
+  The user's message is never sent again, and nothing goes to idle sessions,
+  to turns the relay requeues (they run again by themselves), to archived
+  conversations or while a usage-limit pause holds the session; a message
+  queued meanwhile goes first.
+- **The task console marks where a `| tail` holds the output back.** A
+  command piped into `tail` (`npm test 2>&1 | tail -40`) writes nothing
+  until it ends, so its console looked stuck. When the task's command line
+  shows such a pipe (`tail -f` and `head` pass lines on and are left
+  alone), the console marks where the output stops, with a hint to log to a
+  file instead, until more output comes or the task ends; the row's quiet
+  hint says the same on hover. The Claude, Copilot and Grok workers now report a
+  shell task's command line on its row (scrubbed of credentials by the relay
+  and cut at 2,000 characters; `read_session` passes it on).
+- **Load earlier in the console's header.** It sat only above the first
+  line, out of reach while following the end of a long log; the header now
+  has it too whenever there is earlier output.
+
+- **A queued relay restart shows what it waits for, and asks instead of
+  waiting forever.** **🌄 Restart web relay** first lists the sessions with
+  a running turn it would wait for, the messages it would hold, and the
+  sessions with background tasks (commands, monitors, sub-agents), each with
+  whether it keeps running; **Restart when idle** queues the restart,
+  **Restart now** does not wait. While a restart is queued every page shows a
+  banner: *Relay restart queued — waiting for N sessions*, the sessions as
+  links, how long it has waited, that new messages are held until then, the
+  background tasks, and **Restart now** (it asks first and names the
+  sessions it does not wait for) and **Cancel restart**. A new setting,
+  **Ask after a queued relay restart has waited** (Settings › General,
+  30 minutes by default, 5 minutes to 4 hours or no limit), bounds the wait:
+  after it the banner asks *restart now, keep waiting or cancel?* and a push
+  notification (a new event, on by default) asks the same. It never
+  restarts while the turns run, and still restarts as soon as they end;
+  **Keep waiting** waits another period.
+  `POST /api/relay/shutdown` answers with the same picture (`waitingFor`,
+  `held`, `backgroundTasks` with `survives`), so an agent that requests a
+  restart can tell the user, and takes `immediate: true`; `GET
+  /api/relay/shutdown` and `POST /api/relay/shutdown/keep-waiting` are new.
+
+### Changed
+
+- **The open console leaves the task's row in view.** On a screen wider
+  than a phone the console now ends above the task's row in the composer
+  panel, so the row's ✓/✘ chip, clock and **Stop** stay visible and live
+  beside it; on a phone it stays full-screen, with the same chip in its
+  header.
+- **One wording for a task without output.** The row's hover title said
+  "output not available for this provider" and the console "Output is not
+  available for this provider."; both now use the sentence, from the same
+  text the relay answers with.
+- **A watching agent is no longer woken for every shell command that ended
+  well.** A relay event subscription that names no `events` now gets
+  `subagent_finished` instead of `task_finished`: a background sub-agent that
+  finished still wakes the watcher, and so does any task that failed or
+  exited non-zero (`task_failed`), but a shell command that ended well does
+  not. A busy worker ends one every minute or so, and each was a turn of the
+  watcher on its whole context (35 during one 20-minute wait were seen).
+  Name `task_finished` in `events` to get every task end, as before.
+  Existing subscriptions that named no events switch to the new default by
+  themselves; those that named their events keep them. A paired relay on an
+  older OAR applies its own default and refuses `subagent_finished` by name.
+
+### Fixed
+
+- **A message sent without a model keeps the conversation's model and
+  effort.** A message to an existing Copilot conversation that named no model
+  (sent by a script or an agent, not by the composer) ran on the first model
+  of the catalog with effort `none`, which some models refuse, and then saved
+  that model and effort as the conversation's own, so the composer showed
+  them from then on. Such a message now runs on the conversation's model and
+  effort, and saves nothing it did not name. If the conversation's model has
+  left the catalog, the send is refused with a message saying so instead of
+  switching to another model. OpenAI, Claude, Cursor and Grok conversations
+  keep their effort the same way, and so does the follow-up of a plan
+  board's action. A message that names no mode runs in the conversation's
+  mode instead of agent mode, and no longer switches a plan-mode
+  conversation to agent. A message whose turn failed can be sent again at
+  once: it no longer counts as a duplicate of itself.
+- **Test counts of a long run no longer drop out.** The relay counted a
+  test run from the last 64 KB of its output only, so a live run that wrote
+  more lost its runner's first line: the chip disappeared or undercounted.
+  A run still going is now counted over its whole log, read on as it grows
+  (and read again in bounded steps after a relay restart); the closing
+  summary still decides once it is there.
+- **Credentials in background-task rows are blanked.** A task's
+  description, summary and last tool call went to the pages, `read_session`
+  and the stored console rows as the worker sent them, and a Grok terminal's
+  (or a Copilot shell's) description is its command line. The relay now
+  scrubs them like the console output. The scrubber also catches `curl -u
+  name:password` (also attached), `--password`/`--token`/`--secret`
+  values, `mysql -p…`, `docker login -p`, `sshpass -p`, `redis-cli -a`,
+  `aws_secret_access_key` in a file or `aws configure set`, Slack webhook
+  paths, `?key=`/`&sig=`/`&token=` query values and an `Authorization`
+  header in any case and with any scheme word, and leaves a reference such
+  as `$(cat ~/.token)` or `$API_TOKEN` alone.
+- **Inverse text in the task console.** vitest's RUN, PASS and FAIL badges
+  (SGR 7) showed as plain words; inverse text now swaps its colours, so
+  they show filled.
+- **The task console survives a relay restart.** Its rows lived in the
+  relay's memory: after a restart a running command came back to the panel
+  once its worker reported, but the dimmed rows of commands that had
+  finished within the hour were gone, and a console open at the time said
+  the output was no longer available. The rows are now kept in the database
+  (migration 0018): finished rows come back with their ✓ or ✘ for the rest
+  of their hour, and a running command's console reads its output at once.
+  Such a command is shown as running again only when its worker says so
+  (until then its console says it waits for the worker, without **Stop**);
+  one whose worker did not survive the restart is marked finished with an
+  unknown result (a neutral ? instead of ✓ or ✘) after about a minute and a
+  half, its output still readable.
+- **A scroll right after older messages load is no longer undone.** The page
+  put the reader back where they were when the older page arrived, a frame
+  later: scrolling in that frame (up again after the jump-to-bottom button,
+  for instance) was reverted, and could leave you at the end, following new
+  rows you meant to read later.
+- **The jump-to-bottom badge counts a message that arrives just as you scroll
+  up.** One that landed before the page had noted the scroll, a frame and on
+  a busy page up to a tenth of a second, was taken as already seen.
+- **The background-task panel no longer shrinks back for a moment.** While
+  the agent works the page re-reads the conversation, and an answer read
+  before the panel grew put the smaller set of tasks back until the next
+  read. The panel jumped, and a reader following the newest messages could be
+  left above them.
+- **A worker reconnects after a relay restart even when its connect hangs.**
+  A worker's link to the relay was retried only once the socket reported an
+  error or a close. A connect that never finished, a socket the relay
+  accepted but never greeted, or a close that never completed while the
+  relay hung in its shutdown left the worker without a connection and
+  without a next attempt, and messages to its session stayed queued; the
+  relay's replacement of such a worker does not step in while the session
+  is working. The link now gives up a socket that has not completed its
+  handshake within 15 seconds, does not wait for a close after the relay
+  says it is shutting down, and retries a socket that fails to construct.
+  There is always exactly one next attempt, with the usual backoff of up to
+  8 seconds, which now starts over only after a completed handshake. Failed
+  attempts log one line each in the worker log, at most one a minute after
+  the first three.
+- **`remote_relay` refuses a model the provider does not list.**
+  `create_session` passed any model id on, so a Copilot id written with a
+  hyphen ("gpt-5-4" for "gpt-5.4") created a session on another model, which
+  every later `send` with that id failed to reach. A model in
+  `create_session` or `send` is now checked against the list New Chat offers
+  for the provider on the target relay, before any approval card: an unknown
+  one is refused with the close matches and the valid ids ("Unknown model
+  'gpt-5-4' for Copilot on relay …; did you mean 'gpt-5.4'?"), and nothing is created
+  or sent. Claude also takes `opus`, `sonnet` and `haiku` (the newest listed
+  model of that name), and a Copilot id with its effort (`gpt-5.4-high`) runs
+  as that model with that effort. When the relay has no list for the provider yet, the
+  model goes on unchecked and the answer says so. A relay also refuses an
+  unknown Copilot model when another relay's agent starts a session on it.
+- **A preview's websocket is dropped when the browser hangs up before the dev
+  server answers.** A browser that closed its connection with a plain FIN
+  while the upgrade was still waiting on the dev server left both sides
+  open, even when a reset followed: the request
+  to the dev server stayed pending, and the preview lane could not stop
+  until the dev server answered. Both sides are now dropped, and stopping
+  the lane also drops upgrades still waiting on the dev server.
+- **The unit test suite passes and finishes on Windows again.** A preview
+  test waited forever for a websocket hang-up (fixed in the product, above),
+  and several tests expected bare program names or Unix paths where Windows
+  resolves the full path of its own tools; two unlocks recorded in the same
+  millisecond are now listed in the order they were recorded.
+
 ## [0.9.12] — 2026-10-18
 
 Highlights: a background command or monitor in the task panel opens a

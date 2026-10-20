@@ -633,7 +633,7 @@ export async function connectSocket(overrideDeps) {
     applyRelayEventSubscriptions(subscriptions);
   });
   socket.on('background_tasks', ({ conversationId, tasks, endedTasks }) => {
-    setConversationBackgroundTasks(conversationId, tasks, { endedTasks });
+    setConversationBackgroundTasks(conversationId, tasks, { endedTasks, event: true });
     // The sidebar's row (and its group's head) count background work as
     // running; the set arrives under the conversation or its session id.
     const id = String(conversationId || '').trim();

@@ -429,6 +429,7 @@ test('event actions default to this relay and validate their arguments', () => {
   assert.match(validate({ action: 'subscribe' }).error, /needs sessions/);
   assert.match(validate({ action: 'subscribe', sessions: ['all', 'conv-a'] }).error, /not both/);
   assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['nope'] }).error, /events must be some of/);
+  assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['subagent_finished', 'task_finished'] }).args.events, ['subagent_finished', 'task_finished']);
   assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], match: '(' }).error, /not a valid regular expression/);
   assert.match(validate({ action: 'unsubscribe' }).error, /subscription_id/);
   assert.deepEqual(validate({ action: 'list_subscriptions', watcher: 'conv-old' }).args, { relay: 'this', watcher: 'conv-old' });

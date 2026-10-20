@@ -119,35 +119,44 @@ function fakeFs(files) {
   };
 }
 
-test('the commit is read from the checkout without running git', () => {
-  const root = path.join(path.sep, 'home', 'dev', 'demo');
-  const gitDir = path.join(root, '.git');
-  const packedRefs = path.join(gitDir, 'packed-refs');
-  // A branch with a loose ref.
-  assert.equal(readGitCommit(root, { fsImpl: fakeFs({
-    [path.join(gitDir, 'HEAD')]: 'ref: refs/heads/main\n',
-    [path.join(gitDir, 'refs', 'heads', 'main')]: `${COMMIT_A}\n`,
-  }) }), COMMIT_A);
-  // A packed ref.
-  assert.equal(readGitCommit(root, { fsImpl: fakeFs({
-    [path.join(gitDir, 'HEAD')]: 'ref: refs/heads/feature/export\n',
-    [packedRefs]: `# pack-refs with: peeled fully-peeled sorted\n${COMMIT_B} refs/heads/feature/export\n`,
-  }) }), COMMIT_B);
-  // A detached HEAD.
-  assert.equal(readGitCommit(root, { fsImpl: fakeFs({ [path.join(gitDir, 'HEAD')]: `${COMMIT_B.toUpperCase()}\n` }) }), COMMIT_B);
-  // A linked worktree: .git is a file, the branch ref is in the common dir.
-  const linkedRoot = path.join(path.sep, 'home', 'dev', 'demo-wt');
-  const linkedGitDir = path.join(gitDir, 'worktrees', 'demo-wt');
-  assert.equal(readGitCommit(linkedRoot, { fsImpl: fakeFs({
-    [path.join(linkedRoot, '.git')]: `gitdir: ${linkedGitDir}\n`,
-    [path.join(linkedGitDir, 'HEAD')]: 'ref: refs/heads/feature/export\n',
-    [path.join(linkedGitDir, 'commondir')]: '../..\n',
-    [path.join(gitDir, 'refs', 'heads', 'feature', 'export')]: `${COMMIT_A}\n`,
-  }) }), COMMIT_A);
-  // No checkout, or a ref that does not resolve.
-  assert.equal(readGitCommit(root, { fsImpl: fakeFs({}) }), null);
-  assert.equal(readGitCommit(root, { fsImpl: fakeFs({ [path.join(gitDir, 'HEAD')]: 'ref: refs/heads/missing\n' }) }), null);
-});
+// Both path flavours run on every machine: a linked worktree's gitdir is
+// resolved, and on Windows that puts a drive letter in front of a rooted path.
+for (const [flavour, pathImpl, demoRoot, gitdirOf] of [
+  ['posix', path.posix, '/home/dev', (dir) => dir],
+  // Git for Windows writes the gitdir pointer with forward slashes.
+  ['win32', path.win32, 'C:\\Users\\dev', (dir) => dir.replaceAll('\\', '/')],
+]) {
+  test(`the commit is read from the checkout without running git (${flavour})`, () => {
+    const read = (root, files) => readGitCommit(root, { fsImpl: fakeFs(files), pathImpl });
+    const root = pathImpl.join(demoRoot, 'demo');
+    const gitDir = pathImpl.join(root, '.git');
+    const packedRefs = pathImpl.join(gitDir, 'packed-refs');
+    // A branch with a loose ref.
+    assert.equal(read(root, {
+      [pathImpl.join(gitDir, 'HEAD')]: 'ref: refs/heads/main\n',
+      [pathImpl.join(gitDir, 'refs', 'heads', 'main')]: `${COMMIT_A}\n`,
+    }), COMMIT_A);
+    // A packed ref.
+    assert.equal(read(root, {
+      [pathImpl.join(gitDir, 'HEAD')]: 'ref: refs/heads/feature/export\n',
+      [packedRefs]: `# pack-refs with: peeled fully-peeled sorted\n${COMMIT_B} refs/heads/feature/export\n`,
+    }), COMMIT_B);
+    // A detached HEAD.
+    assert.equal(read(root, { [pathImpl.join(gitDir, 'HEAD')]: `${COMMIT_B.toUpperCase()}\n` }), COMMIT_B);
+    // A linked worktree: .git is a file, the branch ref is in the common dir.
+    const linkedRoot = pathImpl.join(demoRoot, 'demo-wt');
+    const linkedGitDir = pathImpl.join(gitDir, 'worktrees', 'demo-wt');
+    assert.equal(read(linkedRoot, {
+      [pathImpl.join(linkedRoot, '.git')]: `gitdir: ${gitdirOf(linkedGitDir)}\n`,
+      [pathImpl.join(linkedGitDir, 'HEAD')]: 'ref: refs/heads/feature/export\n',
+      [pathImpl.join(linkedGitDir, 'commondir')]: '../..\n',
+      [pathImpl.join(gitDir, 'refs', 'heads', 'feature', 'export')]: `${COMMIT_A}\n`,
+    }), COMMIT_A);
+    // No checkout, or a ref that does not resolve.
+    assert.equal(read(root, {}), null);
+    assert.equal(read(root, { [pathImpl.join(gitDir, 'HEAD')]: 'ref: refs/heads/missing\n' }), null);
+  });
+}
 
 test('an installed package falls back to a gitHead stamp, and to nothing', () => {
   const root = path.join(path.sep, 'home', 'dev', 'install');

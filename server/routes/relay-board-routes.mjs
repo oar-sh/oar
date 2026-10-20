@@ -1,6 +1,7 @@
 'use strict';
 
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { fallbackReasoningEffort } from '../services/conversation-model-fallback.mjs';
 
 function normalizeId(value) {
   const text = String(value || '').trim();
@@ -93,11 +94,27 @@ export function registerRelayBoardRoutes(app, deps) {
     uuidv4,
     normalizeRelayMode,
     resolveRequestedModel,
+    resolveRequestedReasoningEffort,
     DEFAULT_RELAY_MODE,
     DEFAULT_MODEL,
     formatRelayBoardRow,
     pushDispatchService,
   } = deps;
+
+  /**
+   * The effort the follow-up runs with when the model id carries none: the
+   * conversation's own, clamped to the levels the model has. A model the
+   * catalog cannot check (another provider's) takes it as it is.
+   */
+  function conversationEffortFor(conversationId, model) {
+    const preferred = String(stmts.getConvAnyStatus?.get?.(conversationId)?.preferred_reasoning_effort || '').trim().toLowerCase();
+    if (!preferred) return null;
+    if (typeof resolveRequestedReasoningEffort !== 'function') return preferred;
+    const check = resolveRequestedReasoningEffort(model, preferred);
+    if (check?.ok) return String(check.effort || '').trim() || null;
+    const supported = Array.isArray(check?.supported) ? check.supported : [];
+    return supported.length ? (fallbackReasoningEffort([preferred], supported) || null) : preferred;
+  }
 
   /**
    * The session goes on in the mode that was chosen on the board: after
@@ -250,9 +267,9 @@ export function registerRelayBoardRoutes(app, deps) {
         const resolvedVariantModel = modelResolution?.ok
           ? String(modelResolution.modelVariantId || latestModel || resolvedBaseModel).trim()
           : String(latestModel || resolvedBaseModel).trim();
-        const resolvedReasoningEffort = modelResolution?.ok
+        const resolvedReasoningEffort = (modelResolution?.ok
           ? String(modelResolution.reasoningEffort || '').trim() || null
-          : null;
+          : null) || conversationEffortFor(convId, resolvedBaseModel);
         queuedMessageId = uuidv4();
         stmts.insertMsg.run(
           queuedMessageId,

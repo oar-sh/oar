@@ -75,6 +75,8 @@ test('a terminal is a shell row naming its spool file, and its output lands ther
   assert.equal(row.taskId, terminalId);
   assert.equal(row.taskType, 'local_bash');
   assert.equal(row.description, 'npm test -- --watch=false');
+  // The command line, for the console's `| tail` marker.
+  assert.equal(row.command, 'npm test -- --watch=false');
   assert.equal(row.stoppable, true);
   assert.equal(row.outputKind, 'spool');
   assert.equal(row.outputPath, spool.pathFor(terminalId));
@@ -88,11 +90,15 @@ test('a terminal is a shell row naming its spool file, and its output lands ther
   assert.equal(services.handlers['terminal/output']({ terminalId }).output, '✓ adds\nwarn: slow\n');
 });
 
-test('a long command line is cut to 500 characters for the row', async (t) => {
+test('a long command line is cut to 500 characters for the description, 8,000 for the command (the relay cuts it after scrubbing)', async (t) => {
   const { stub, services } = setup(t);
   await services.handlers['terminal/create']({ command: `echo ${'x'.repeat(800)}` });
+  await services.handlers['terminal/create']({ command: `echo ${'y'.repeat(9000)}` });
   await flush();
-  assert.equal(lastSet(stub).tasks[0].description.length, 500);
+  const [short, long] = lastSet(stub).tasks;
+  assert.equal(short.description.length, 500);
+  assert.equal(short.command.length, 805);
+  assert.equal(long.command.length, 8000);
 });
 
 test('an exit settles the task with its exit code and file, then the set drops it', async (t) => {
@@ -110,6 +116,7 @@ test('an exit settles the task with its exit code and file, then the set drops i
   assert.equal(settle.outputKind, 'spool');
   assert.equal(settle.taskType, 'local_bash');
   assert.equal(settle.description, 'npm test');
+  assert.equal(settle.command, 'npm test');
   assert.deepEqual(lastSet(stub).tasks, []);
   assert.deepEqual(publisher.backgroundTaskIds(), []);
   const order = stub.calls.map((call) => call.routePath);

@@ -24,6 +24,7 @@ const SAMPLES = [
   '\x1b[32m✓ green\x1b[0m and \x1b[1;31mbold red\x1b[0m\n',
   '\x1b[38;5;196mpalette\x1b[39m \x1b[48;2;10;200;30mtrue\x1b[49m\n',
   '\x1b]0;window title\x07\x1b[2Kcleared \x1b[3mitalic\x1b[23m\n',
+  '\x1b[7m\x1b[1m\x1b[36m RUN \x1b[39m\x1b[22m\x1b[27m v2.1.8 \x1b[31;42;7mboth\x1b[0m\n',
   `${'x'.repeat(4100)}\n`,
   '',
 ];

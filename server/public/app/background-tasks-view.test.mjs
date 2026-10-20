@@ -106,6 +106,7 @@ const {
   setConversationTaskHealth,
   setConversationTaskStallMinutes,
   setConversationEndedBackgroundTasks,
+  onBackgroundTasksPanelRendered,
   dismissEndedBackgroundTask,
   findBackgroundTask,
   setSubagentStepCounter,
@@ -514,9 +515,37 @@ test('shell and Monitor rows open the console; a provider without output keeps a
   assert.match(rowHtml('monitor-b'), /data-task-console="monitor-b"/);
   const none = rowHtml('shell-c');
   assert.doesNotMatch(none, /data-task-console/);
-  assert.match(none, /<span class="bg-task-desc bg-task-desc-no-output" title="output not available for this provider">cloud shell<\/span>/);
+  // The relay's `none` answer says the same sentence (TASK_OUTPUT_NONE_MESSAGES).
+  assert.match(none, /<span class="bg-task-desc bg-task-desc-no-output" title="Output is not available for this provider\.">cloud shell<\/span>/);
   assert.doesNotMatch(rowHtml('agent-d'), /data-task-console/, 'a sub-agent opens its record instead');
   assert.match(rowHtml('agent-d'), /data-subagent-open="toolu_fixture_d"/);
+});
+
+test('a command piped into tail says on its quiet hint why it is quiet', () => {
+  setBackgroundTasksConversation('conv-tail');
+  setConversationBackgroundTasks('conv-tail', [
+    { taskId: 'tail-a', taskType: 'local_bash', description: 'npm test 2>&1 | tail -40', startedAt: Date.now(), outputKind: 'file' },
+    { taskId: 'follow-b', taskType: 'local_bash', description: 'tail -f server.log | grep error', startedAt: Date.now(), outputKind: 'file' },
+    { taskId: 'cmd-c', taskType: 'local_bash', description: 'Run the unit tests', command: 'npm test 2>&1 | tail -n 20', startedAt: Date.now(), outputKind: 'file' },
+  ]);
+  assert.match(rowHtml('tail-a'), /<span class="bg-task-stall" title="This command pipes into tail, so its output arrives when it ends\. Logging to a file instead \(&gt; run\.log 2&gt;&amp;1\) and following that file shows it live\." hidden><\/span>/);
+  assert.doesNotMatch(rowHtml('follow-b'), /bg-task-stall" title=/, 'tail -f streams');
+  assert.match(rowHtml('cmd-c'), /bg-task-stall" title="This command pipes into tail,/, 'the command line, not the prose description');
+  setConversationBackgroundTasks('conv-tail', []);
+});
+
+test('the panel tells its listeners when it drew its rows, and when it went away', () => {
+  let renders = 0;
+  const stop = onBackgroundTasksPanelRendered(() => { renders += 1; });
+  setBackgroundTasksConversation('conv-render');
+  const drawnEmpty = renders;
+  assert.ok(drawnEmpty >= 1, 'an empty panel hides, and says so');
+  setConversationBackgroundTasks('conv-render', [{ taskId: 'r1', taskType: 'local_bash', description: 'npm test', startedAt: Date.now() }]);
+  assert.ok(renders > drawnEmpty);
+  stop();
+  const before = renders;
+  setConversationBackgroundTasks('conv-render', []);
+  assert.equal(renders, before, 'an unsubscribed listener hears nothing');
 });
 
 test('ended rows stay dimmed with ✓/✘, no Stop, a dismiss ×, and still open', () => {

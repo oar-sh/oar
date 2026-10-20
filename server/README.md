@@ -216,7 +216,8 @@ reports both the actual suspend and such a drop. For the first 45 seconds after
 a relay start the check lists one more blocker, "the relay just started,
 sessions are still reporting": the workers that outlived the previous runtime
 may not have reported their background work yet. A queued **🌄 Restart web relay**
-gets the same banner and can be cancelled from it too.
+gets a banner of its own, with the sessions it waits for, **Restart now** and
+**Cancel restart** (see [Manual relay shutdown / self-restart](#manual-relay-shutdown--self-restart)).
 
 API: `GET /api/host/suspend` (state plus current blockers), `POST /api/host/suspend`,
 `POST /api/host/suspend/cancel`, and `POST /api/relay/shutdown/cancel`
@@ -253,6 +254,47 @@ Behavior notes:
   model state and shows a warning banner.
 - In extension-managed mode, the relay still switches model per message and
   reports the active model used in the response.
+
+### A message without a model, an effort or a mode
+
+The composer always sends all three. A client that leaves one out of
+`POST /api/message` (a script, an agent on this relay) gets the conversation's
+own, never the relay-wide default:
+
+- **Model**, for an existing Copilot conversation: the conversation's saved
+  `preferred_model`, then the runtime session's `provider_model`, then its
+  `model`, then the model of the latest user message (`auto` skipped in each);
+  only a conversation with none of these runs on the catalog's current model.
+  A saved model the catalog no longer lists is refused with
+  `409 CONVERSATION_MODEL_UNAVAILABLE` (`model`, `supportedModels`) instead of
+  being replaced; the composer shows that text in its banner. An explicit
+  `auto` is unchanged (new conversations only). Claude, Cursor, Grok, Claude
+  Cloud and OpenAI conversations keep their pinned `provider_model`, as before.
+- **Effort**: for Copilot, an effort the model's variant id carries, else the
+  conversation's `preferred_reasoning_effort`, clamped to the nearest level the
+  model offers (`nearestSupportedReasoningEffort`, the composer's rule); with
+  nothing to keep, the model's lowest level that is not `none`, so `none` is
+  chosen only when the conversation asked for it or the model has no other
+  level. OpenAI, Claude, Cursor and Grok conversations take the conversation's
+  effort the same way; with no effort stored, or one that neither matches nor
+  clamps (an `ultracode` on a model without it), they keep the provider's own
+  default as before (`none`, which for Claude, Cursor and Grok means the
+  model's default). A Claude Cloud conversation always runs with `none`: the
+  cloud takes no effort. A board action's follow-up takes the conversation's
+  effort as well.
+- **Mode**: a send that names no `relayMode`/`mode` runs in the
+  conversation's saved `preferred_relay_mode`, not the relay default.
+- **Preferences**: a send to an existing conversation saves only what it named.
+  A model it named is saved (with its effort only when that was named too, else
+  the stored effort stays); an effort alone is saved against the stored model,
+  and a conversation with no saved model runs with that effort but saves
+  nothing; a send that named neither writes nothing. The mode saved with them
+  is the one the turn runs in, so a send without a mode leaves the stored mode
+  as it is. A send from another relay's agent never writes them, as before.
+
+A text repeat inside the duplicate window answers `200` with `duplicate: true`
+and `queued: false`, and nothing runs. A message whose turn **failed** no
+longer counts: sending it again queues it.
 
 ### OpenAI API key
 
@@ -375,10 +417,14 @@ cached in the worker after the server accepts it, so a failed persist is retried
 The worker keeps one persistent CLI process per conversation, so background tasks survive the reply
 that started them. The live task set is posted to `POST /api/background-tasks` (REPLACE semantics)
 and broadcast as the `background_tasks` socket event; the composer's task panel renders it and can
-stop an individual task over a `worker.control` push.
+stop an individual task over a `worker.control` push. The conversation payload carries the set too
+(`backgroundTasks`, `endedBackgroundTasks`); the page's live poll and refresh leave it out when a
+`background_tasks` event for the conversation arrived while their request was on its way, as the
+event's set is at least as new.
 
 The relay holds the task sets in memory (`services/background-task-store.mjs`), so a relay restart
-starts without them while the workers and their tasks keep running. The worker is the source of
+starts without them while the workers and their tasks keep running (the console rows are stored;
+see below). The worker is the source of
 truth, and the relay asks:
 
 - **Digest and resync.** A worker's heartbeat carries `backgroundTasks: { count, digest }`, a digest
@@ -407,6 +453,43 @@ truth, and the relay asks:
 - **Ends.** The Claude worker keeps a settle notice whose post failed (the newest 20, for 10
   minutes) and sends it again after the next heartbeat the relay answers; such a post is given up
   after 10 s without an answer.
+- **The console rows.** What the task console needs of a shell or Monitor task (its `outputPath`
+  and `outputKind`, the ended row with status, exit code and `endedAt`, how a task ended when the
+  settle came before the set dropped it) is kept in `background_task_rows` (migration 0018,
+  `services/background-task-persistence.mjs`), written only when that part of a set changes, not on
+  every progress post. At boot the store restores the ended rows still inside their hour, and holds
+  the live ones (`restored`): the output route and the console's live room find a held task (the
+  route answers it with `status: 'held'`, `held: true` and `stoppable: false`; the console says it
+  waits for its worker), but `get()` and with it the panel, the session state and the suspend check
+  do not count it as running, and the stop route only pushes the stop to the worker. The worker's next set settles it (a task in the set is live again, with the
+  path it had; one not in it becomes an ended row, with the status the runtime before was told), a
+  settle sent again for it ends it, and while a key has held tasks its heartbeat digest never
+  counts as in step, so the relay asks for the set. Tasks of a worker that sends no set within twice
+  the boot reporting window (at least 15 s; 90 s by default) are ended with status `unknown` and the
+  pages get the `background_tasks` event (`endUnconfirmed`); a later set that lists one brings it
+  back. A held task's end time is when the runtime before last knew it running: a stored live row's
+  `updated_at` is written with the set and confirmed at most every 30 minutes while the worker's
+  digest agrees, and a live row not confirmed for 6 hours (a worker that went away in an earlier
+  runtime without an empty set) is deleted at boot instead of restored. Health readings are not
+  stored: the poller reads the files again within 10 s, the ended rows once. A runner's counts come
+  from the last 64 KB when its closing summary is there. A live log that outgrew that window is read
+  whole by a per-task runner scan (`services/task-output-service.mjs`): it looks for a runner's
+  header (a test run after a long install or build prints its header once) and counts from there,
+  reads on from where it stopped as the file grows, and starts over on a new file under the path
+  (shorter, another inode, an older mtime). The scans live in memory and share 4 MB per tick, each
+  tick starting at another task, so after a restart a long log is caught up over a few ticks (the
+  window's reading stands until then) and one busy log cannot keep the others waiting. An ended row
+  never starts a scan, so the rows a restart brings back are read in their window only. What a
+  worker says about a task (description, summary, last tool call, and a shell row's `command`, which
+  the Claude worker takes from the Bash or Monitor call that started the task, Copilot from the
+  shell tool's arguments or the task registry, Grok from the terminal) goes through `cleanTaskText`
+  on the publish and settle routes: control codes and colours out, credentials scrubbed as in the
+  output, then cut (a command at 2,000 characters; a Grok description is its command line). It is
+  stored with the console rows, so a held or ended row keeps it; share links carry no task rows. The
+  `none` answers of the output route use the page's texts (`TASK_OUTPUT_NONE_MESSAGES` in
+  `public/app/task-console-render.mjs`). Rows go with their hour, the 20-per-key limit, a set that
+  drops them or the conversation's delete. Without the table (a failed migration) the store works in
+  memory as before.
 - **Run rows left `running`.** A background sub-agent's row whose end was never written would count
   as running work for a day. For a Claude worker that has reported its task set in this runtime, a
   `running` background row that the set does not list and that nothing has updated for 15 minutes
@@ -773,10 +856,22 @@ be on, as for every local action; a paired relay: see [Across paired relays](#ac
 **Events** (`shared/relay-events.mjs`): `question_asked` (prompt, options, question id; an approval
 card is marked as one only the user can answer), `error` (`turn_failed`, `usage_limit`,
 `worker_died`), `turn_end` (status `done` or `stopped`, reply preview), `task_finished` /
-`task_failed` (background sub-agents and shell tasks: kind, status, exit code where known),
-`stalled` (no activity for `stalled_minutes`, default 15, while a turn or task runs and no
-question waits for an answer), `all_idle`
-(nothing runs in the watched set any more). `task_started` only when named in `events`. With
+`task_failed` (background sub-agents and shell tasks: kind, status, exit code where known; a
+non-zero exit is `task_failed`), `stalled` (no activity for `stalled_minutes`, default 15, while a
+turn or task runs and no question waits for an answer), `all_idle`
+(nothing runs in the watched set any more). `task_started` only when named in `events`.
+`subagent_finished` is no event of its own but a narrower `task_finished` a subscription can name
+(`RELAY_EVENT_SUBSCRIBABLE_TYPES`): the end of a task that is not a shell command, delivered as a
+`task_finished` line. The default (`events` left out) is every type but `task_started` and
+`task_finished`, with `subagent_finished`: a shell command that ended well wakes only a watcher
+that names `task_finished`, which takes every task end. A busy worker ends a shell command every
+minute or so, and each was a wake-up, a model turn on the watcher's whole context. A subscription
+whose stored list is exactly the old default (every type but `task_started`, in any order) named no
+events and is read as the new default (`effectiveRelayEventTypes`, at read time, the row is never
+rewritten, so an older relay reading the same database sees what it stored); any other list,
+including the old default plus more, is the watcher's choice and stays. A subscribe that names
+exactly the old default list stores `subagent_finished` with it, so it is never read as the default. A mirror shows the paired
+relay's list as that relay returned it. With
 `heartbeat_minutes` a `heartbeat` event comes at that interval while the watched set has work
 running, none while it is idle. `match` (a case-insensitive regular expression) filters `turn_end`
 and task events by their text; other events pass. `once` ends a subscription after its first event,
@@ -900,8 +995,10 @@ turn processing, or queued and not held by a usage-limit pause; `background_only
 `completed` | `failed` | `stopped`, `exitCode`, `summary`, `endedAt`) and `lastActivityAt`.
 `remote_relay`'s `list_sessions` and `read_session` pass them on as `state`, `tasks` and
 `lastActivityAt`; `active` stays and is true for background work too. `read_session` adds to each
-task its `taskId`, `output` (whether it has output to read) and, for a task with an output file,
-`health` (`minutesSinceOutput`, `quiet`, `quietAfterMinutes`, test-run `counts`);
+task its `taskId`, `output` (whether it has output to read), a shell task's `command` (its command
+line where the worker reports one, scrubbed of credentials and cut at 2,000 characters by the relay
+when the worker posts it, shown to at most 500) and, for a task with an output file, `health`
+(`minutesSinceOutput`, `quiet`, `quietAfterMinutes`, test-run `counts`);
 `read_task_output {session, task_id, lines?}` (read permission; default 200 lines, at most 500 or
 32 KB) reads the end of that output through `GET /api/conversation/:id/background-task/:taskId/output`,
 scrubbed of credentials.
@@ -1163,6 +1260,7 @@ After launching the server, the CLI opens a worker WebSocket link:
 - Identifies itself with the bound SDK session id and worker pid
 - Receives queued turns over `ws(s)://.../api/session-worker/ws`
 - Reconnects starting at 1 second, with exponential backoff capped at 8 seconds
+  (see [Worker link reconnects](#worker-link-reconnects))
 - Falls back to `GET /api/pending` only while the worker socket is unavailable
 - Processes any message with full PC access (file system, commands, etc.)
 - Posts the response back
@@ -1176,6 +1274,33 @@ After launching the server, the CLI opens a worker WebSocket link:
   question cards in the conversation; answering the card resumes the waiting turn.
 - Answered relay question cards stay visible in the conversation journal, including
   the answer you submitted.
+
+### Worker link reconnects
+
+Every session worker (Copilot SDK, Claude, Claude Cloud, Cursor, Grok) and the Copilot CLI extension
+use the same link, `shared/worker-runtime/worker-websocket-link.mjs`. Its reconnect rules:
+
+- A connection counts as made at the relay's first `server.hello`, which the relay sends as soon as it
+  accepts the socket. A socket still connecting, or open without that hello, after 15 seconds
+  (`connectTimeoutMs`) is given up and retried: a relay hung in its shutdown can hold a socket in
+  either state without ever ending it.
+- The link ends a socket on whichever comes first of an error, a close, that deadline, a stale
+  connection (30 seconds without a server frame) and the relay's `server.draining`, and schedules
+  the next attempt from there; later events from the same socket are ignored. It never waits for a
+  close event, which Node 22 does not fire for a socket closed while connecting, and a socket whose
+  constructor throws is retried too.
+- There is at most one pending reconnect and one socket at a time. The delay starts at 1 second and
+  doubles up to 8 seconds, plus up to 250 ms of jitter; it starts over only after a completed
+  handshake, so a relay that accepts and drops the socket is not retried every second.
+- Each failed attempt logs one `worker ws disconnected <reason> attempt=<n> retryInMs=<ms>` line in
+  the worker log for the first three, then at most one a minute, with `notLogged=<n>` counting the
+  ones in between.
+- `stop()` (worker shutdown) clears the pending reconnect and the deadline and closes the socket
+  without scheduling another attempt.
+
+The relay's detached-worker watch (`services/detached-worker-watch-service.mjs`) is the safety net
+behind this: it replaces a worker that has had no socket for 60 seconds while a message waits, but
+never while a turn or background work of that session runs, so the link has to reconnect by itself.
 
 ### Session activation behavior (important)
 
@@ -1290,6 +1415,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
 | POST | `/api/relay/resume` | Resume dequeueing after pause |
 | POST | `/api/relay/shutdown` | Queue an authenticated relay shutdown or self-restart |
+| GET | `/api/relay/shutdown` | The queued request's state (as `relay_shutdown_state`), plus `preview`: what a restart asked now would wait for and leave running (`?action=shutdown` for a shutdown). See [Manual relay shutdown / self-restart](#manual-relay-shutdown--self-restart) |
+| POST | `/api/relay/shutdown/keep-waiting` | Answer to the max-wait question: the queued request waits another full period, counted from now → `{ ok, extended, …state }` |
+| POST | `/api/relay/shutdown/cancel` | Withdraw a queued (not yet started) shutdown or restart; held messages go out at once |
 | GET | `/api/relay-questions` | (CLI/UI) List relay questions by `status` (for example `pending` or `answered`) |
 | GET | `/api/relay-question/:id` | (CLI) Fetch a single relay question |
 | POST | `/api/relay-question` | (CLI) Create a relay question for the browser |
@@ -1314,6 +1442,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
+| GET | `/api/settings/relay-restart-max-wait` | How long a queued relay restart waits before it asks: `{ maxWaitMinutes, choices: [5, 10, 15, 30, 60, 120, 240, 0], defaultMinutes: 30, overrideMs }`; `0` = no limit; `overrideMs` is `OAR_RELAY_RESTART_MAX_WAIT_MS` when set |
+| POST | `/api/settings/relay-restart-max-wait` | `{ maxWaitMinutes }` → the GET body; anything but one of `choices` is `400`. A queued request measures its current period against the new value at once |
 | GET | `/api/settings/subagent-record-retention` | How long sub-agent records keep tool inputs and output: `{ retentionDays, choices: [0, 7, 14, 30, 90], defaultDays: 90 }`; `0` = keep for good |
 | POST | `/api/settings/subagent-record-retention` | `{ retentionDays }` → the GET body; anything but one of `choices` is `400`. Runs a retention sweep 5 s later |
 | POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
@@ -1346,7 +1476,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/remote-relays/:id/check` | Probe a paired relay now |
 | POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
 | GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `remote_relay` when `count` is above zero or `localEnabled` is `true` |
-| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
+| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
 | GET | `/api/relay-events/subscriptions` | Every active [relay event subscription](#relay-event-subscriptions) (`{ available, subscriptions }`); refused to other relays' agents |
 | DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
 | POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
@@ -1365,6 +1495,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `reason` (optional string)
   - `requestedBy` (optional string)
   - `restart` (optional boolean-ish flag; `true` queues self-restart instead of plain shutdown)
+  - `immediate` (optional boolean-ish flag; `true` does not wait for the running turns)
 - Example restart request:
 
 ```json
@@ -1381,10 +1512,47 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `restart`: boolean mirror of the action
   - `requestedAt`, `reason`, `requestedBy`
   - `queue`: current `pendingCount` / `processingCount` / `parkedCount`
-- The relay waits until no turn is processing before acting; this API is not an interrupt or cancel mechanism. While the request is queued no pending message is handed to a worker (a turn started meanwhile would postpone the restart again); pending and parked rows stay in the database and run after the restart.
+  - `waitingFor`, `held`, `backgroundTasks`, `survival`, `maxWaitMs`, `deadlineAt`, `immediate` (below)
+- The relay waits until no turn is processing before acting. While the request is queued no pending message is handed to a worker (a turn started meanwhile would postpone the restart again); pending and parked rows stay in the database and run after the restart.
+- `immediate: true` (boolean-ish, like `restart`) starts it at once, running turns or not: the banner's **Restart now**. The answer still names what it did not wait for.
+- Maximum wait (`services/relay-restart-queue.mjs`): after **Ask after a queued relay restart has waited** (`relay_restart_max_wait_minutes`, 30 by default, 5–240 or `0` = no limit; `OAR_RELAY_RESTART_MAX_WAIT_MS` overrides it in ms, for test relays) the request stays queued and sets `question: { askedAt }`; the relay pushes one notification (titled *Relay restart waiting*; switch **Queued relay restart waited its maximum time**, `relayRestart`) and never restarts while turns run; it still goes ahead as soon as the last turn ends, question or not. A raised maximum (or none) that moves the deadline into the future withdraws the question; `/keep-waiting` without a question does nothing (`extended: false`). An `immediate` request may name the queued request it was shown (`expectRequestedAt`, its `requestedAt`); when that request is gone the answer is `accepted: false, stale: true` and nothing starts. Agents are told never to send `immediate` (`relay-tools.md`). The user answers with `immediate`, `/keep-waiting` (another full period from now; counted in `keptWaiting`) or `/cancel`. With no limit the request, and the messages it holds, wait until the turns end or someone decides.
+- What it waits for, holds and leaves running (`services/relay-restart-picture.mjs`), in the answer, in `GET /api/relay/shutdown`, in `/api/status` → `relayShutdown` and in the `relay_shutdown_state` socket event (sent on every change and on connect):
+  - `waitingFor`: `[{ conversationId, title, turns }]`, the sessions with a processing turn
+  - `held`: `{ count, conversations: [{ conversationId, title, count }] }`, pending and parked messages
+  - `backgroundTasks`: `[{ conversationId, title, count, detail, survives, why }]`, sessions with running background work of a live worker (the task panel's sets and running sub-agent runs, through `background-work-view.mjs`), then sessions with console tasks held since the last restart (`background-task-store.mjs` `listRestored`), which no worker has confirmed yet: `survives: null`
+  - `survival`: `{ action, workersSurvive, summary }`. Workers are separate processes (tmux, detached, a console window) and outlive a restart, which the relay's supervisor or the CLI extension takes; they outlive a shutdown too, except under a systemd service (detected from `INVOCATION_ID` and a `.service` cgroup), whose stop may take the workers with it (`survives: false`, shown as "may stop"; a worker in a tmux session the service did not start survives, which the relay cannot tell). A Claude Cloud session runs at Anthropic and always survives
+  - while queued also `holdsNewTurns`, `maxWaitMs`, `waitingSince` (start of the current period), `deadlineAt` (`null` without a limit), `question`, `keptWaiting`
 - Ownership after an intentional restart follows the argv role, so exactly one supervisor acts on exit 75:
   - `server.js --supervised` exits 75 and relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
   - bare `node server/server.js` keeps its supervisor attached, respawns the `--relay-runtime` child, and keeps the same terminal session alive
+
+### Interrupted turns after a restart
+
+`services/restart-resume-service.mjs` implements **After a relay restart, tell interrupted sessions
+to carry on** (`app_settings` `restart_resume_notes`, `'1'` on, off when absent; `GET/POST
+/api/settings/restart-resume` `{ enabled }`, a boolean, 400 otherwise). At boot it notes the queue
+rows that are `processing` (the turns the runtime before left) and follows them through the
+recovery paths, which report each outcome (`noteRestartTurnOutcome`):
+
+| Path | `cut` (cannot run again) | `requeued` | `failed` |
+| --- | --- | --- | --- |
+| stale sweep (`recoverProcessingOlderThan`) | stale continuation dropped; consumed row failed | requeued | over the retry budget |
+| dead worker (`recoverDeadWorkerProcessingRows`) | continuation dropped; consumed row failed | requeued | over the retry budget |
+| owner heartbeat idle (`recoverOwnedProcessingRowsForSession`) | continuation dropped; consumed row failed; a started turn failed as `turn-replay-blocked` | requeued | |
+
+A heartbeat that lists a row (`activeQueueMessageId(s)`) claims it: its worker lived through the
+restart and has the turn, so whatever ends it later is not put down to the restart, and the
+session gets no note. A row that leaves `processing` another way is read from the queue: back in `pending` or `parked` is
+`requeued`, anything else (a reply from a worker that lived through the restart) is settled. Once
+none of a conversation's rows of the boot is processing, it gets a note when one was `cut` and none
+was `requeued`, `claimed` or `failed`; the stale sweep's 15 s tick decides the ones that settled on their own,
+and the watch ends 30 minutes after the boot. The note is a message of the relay's (role `user`,
+`kind = 'relay-restart-resume'`) with a pending queue row on the interrupted turn's model, mode and
+owner, queued at the time it is written (behind a message the user queued meanwhile), as the
+usage-limit follow-up is; the primer then starts the worker. No note when the setting is off at
+that moment, for a deleted or archived conversation, while the conversation holds a usage-limit
+follow-up, or a second time in the same runtime. The browser renders it as a compact relay row
+(`relay-restart-note-view.mjs`).
 
 ### Upload storage model
 
@@ -1950,6 +2118,13 @@ relay the fetch cursor and the link's health). See [Across paired relays](#acros
 any length. A conversation with a row whose timestamp is not the relay's ISO form
 (`YYYY-MM-DDTHH:MM:SS.mmmZ`) or whose id is not lowercase letters, digits and dashes is paged the
 old way: every row loaded, the page cut afterwards.
+
+`0018-background-task-rows.mjs` adds `background_task_rows` (`store_key`, `task_id`, `state`
+`live` | `ended`, `row_json`, `ended_at`, `updated_at`; one row per key and task): the task
+console's rows across a relay restart (see
+[Background tasks and workflow progress](#background-tasks-and-workflow-progress)). Additive and
+idempotent; a failure is logged and retried on the next boot, and the store keeps its rows in
+memory meanwhile. An older build ignores the table.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next

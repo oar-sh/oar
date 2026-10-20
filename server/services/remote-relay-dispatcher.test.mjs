@@ -329,7 +329,8 @@ function createFakeRemote() {
         return {
           ok: true,
           conversationId: id,
-          selectedModel: body.model,
+          // A relay that predates the model checks swaps an unknown Copilot id.
+          selectedModel: remote.bootstrapBinds || body.model,
           selectedProviderType: body.providerType,
           preferredRelayMode: body.relayMode,
           preferredReasoningEffort: effort,
@@ -1510,6 +1511,152 @@ test('create_session refuses a provider the remote lacks and lists the ones it h
   assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
 });
 
+const CREATE_ARGS = Object.freeze({ relay: 'linux-test', text: PROMPT, wait_seconds: 0 });
+const SEND_ARGS = Object.freeze({ relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+
+test('create_session refuses a model its provider does not list, with the close matches, before any card', async () => {
+  const { run, remote, approvals } = setup({ caller: { provider: 'github', model: 'gpt-5.6-luna', mode: 'ask' } });
+  const result = await run('create_session', { relay: 'linux-test', text: PROMPT, model: 'gpt-5-6-luna', wait_seconds: 0 });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, CODES.unknownModel);
+  assert.equal(result.body.error,
+    'Unknown model \'gpt-5-6-luna\' for Copilot on relay "linux-test"; did you mean \'gpt-5.6-luna\'? '
+    + 'Valid ids: gpt-5.6-luna, claude-sonnet-5. No session was created.');
+  assert.deepEqual(result.body.suggestions, ['gpt-5.6-luna']);
+  assert.deepEqual(result.body.models, ['gpt-5.6-luna', 'claude-sonnet-5']);
+  assert.equal(result.body.provider, 'github');
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0, 'nothing is created');
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+  assert.equal(approvals.length, 0, 'the user is not asked about a call that cannot run');
+
+  // Each provider is checked against its own list: a Cursor id is no Claude model.
+  const claude = await run('create_session', { relay: 'linux-test', text: PROMPT, provider: 'claude', model: 'composer-2.5' });
+  assert.equal(claude.body.code, CODES.unknownModel);
+  assert.match(claude.body.error, /^Unknown model 'composer-2\.5' for Claude on relay "linux-test"\. Valid ids: claude-sonnet-5, claude-opus-5\./);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+});
+
+test('create_session takes listed ids in any casing, Claude aliases and the "[1m]" tier, and auto', async () => {
+  const cases = [
+    // Another casing is the same id: no word about it.
+    { args: { provider: 'claude', model: 'Claude-Opus-5' }, model: 'claude-opus-5', note: null },
+    { args: { provider: 'claude', model: 'opus' }, model: 'claude-opus-5', note: /'opus' was taken as claude-opus-5, the newest Claude model of that name/ },
+    { args: { provider: 'claude', model: 'sonnet' }, model: 'claude-sonnet-5', note: /'sonnet' was taken as claude-sonnet-5/ },
+    { args: { provider: 'claude', model: 'claude-opus-5[1m]' }, model: 'claude-opus-5', note: /'claude-opus-5\[1m\]' was taken as claude-opus-5\. Claude on relay "linux-test" lists no "\[1m\]" id/ },
+    // The effort in a Copilot id goes to the bootstrap and the first prompt apart.
+    { args: { provider: 'github', model: 'GPT-5.6-luna-high' }, model: 'gpt-5.6-luna', effort: 'high', note: /'GPT-5\.6-luna-high' was taken as gpt-5\.6-luna with effort high\./ },
+    { args: { provider: 'github', model: 'auto' }, model: 'auto', note: null },
+  ];
+  for (const { args, model, effort, note } of cases) {
+    const { run, remote } = setup();
+    remote.models.reasoningByModel = { 'gpt-5.6-luna': ['low', 'medium', 'high'] };
+    const result = await run('create_session', { ...CREATE_ARGS, ...args });
+    assert.equal(result.status, 200, `${args.model}: ${JSON.stringify(result.body)}`);
+    const bootstrap = remote.callsTo('POST', '/api/conversation/bootstrap')[0].body;
+    assert.equal(bootstrap.model, model, args.model);
+    assert.equal(result.body.model, model, `${args.model}: the bound model`);
+    if (effort) {
+      assert.equal(bootstrap.reasoningEffort, effort);
+      assert.equal(remote.callsTo('POST', '/api/message')[0].body.reasoningEffort, effort);
+    }
+    if (note) assert.match(result.body.modelNote, note);
+    else assert.equal(result.body.modelNote, undefined, args.model);
+  }
+  // An effort the model does not list is no effort: the id is unknown, its base suggested.
+  const { run, remote } = setup();
+  remote.models.reasoningByModel = { 'gpt-5.6-luna': ['low', 'medium', 'high'] };
+  const maxed = await run('create_session', { ...CREATE_ARGS, provider: 'github', model: 'gpt-5.6-luna-max' });
+  assert.equal(maxed.body.code, CODES.unknownModel);
+  assert.deepEqual(maxed.body.suggestions.slice(0, 1), ['gpt-5.6-luna']);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  // No family of that name: refused, with the ids that contain it.
+  const unknown = await run('create_session', { ...CREATE_ARGS, provider: 'claude', model: 'haiku' });
+  assert.equal(unknown.body.code, CODES.unknownModel);
+});
+
+test('create_session goes on with a model it cannot check, and says so', async () => {
+  // Cursor set up, but its model list not discovered yet.
+  const cursor = setup();
+  cursor.remote.settings.cursor = { configured: true, enabled: true, model: '', models: [], availableModels: [] };
+  const unchecked = await cursor.run('create_session', { ...CREATE_ARGS, provider: 'cursor', model: 'gpt-5-4' });
+  assert.equal(unchecked.status, 200, JSON.stringify(unchecked.body));
+  assert.equal(cursor.remote.callsTo('POST', '/api/conversation/bootstrap')[0].body.model, 'gpt-5-4');
+  assert.equal(unchecked.body.modelNote,
+    'Model \'gpt-5-4\' could not be checked: Cursor on relay "linux-test" has no model list yet (its model discovery has not run or failed), so the session was created with it as asked.');
+
+  // Copilot without a catalogue (the models route failed).
+  const copilot = setup();
+  copilot.remote.fail('GET', '/api/models', remoteError(`${CODES.httpPrefix}500`, 'Relay "linux-test" answered HTTP 500', 500));
+  const blind = await copilot.run('create_session', { ...CREATE_ARGS, provider: 'github', model: 'gpt-5-4' });
+  assert.equal(blind.status, 200);
+  assert.match(blind.body.modelNote, /could not be checked: Copilot on relay "linux-test" has no model list yet/);
+});
+
+test('a relay that binds another model than the one asked is named in the answer', async () => {
+  const { run, remote } = setup();
+  remote.bootstrapBinds = 'gpt-5.6-luna';
+  const result = await run('create_session', { ...CREATE_ARGS, provider: 'github', model: 'claude-sonnet-5' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.model, 'gpt-5.6-luna');
+  assert.match(result.body.modelNote, /Relay "linux-test" started the session on gpt-5\.6-luna, not on claude-sonnet-5 as asked\./);
+});
+
+test('a provider not set up there answers as such, before its model is looked at', async () => {
+  const { run } = setup();
+  const result = await run('create_session', { ...CREATE_ARGS, provider: 'cursor', model: 'whatever-1' });
+  assert.equal(result.body.code, CODES.providerUnavailable);
+});
+
+test('send checks a model before any approval card, and takes the provider\'s whole list and the session\'s own model', async () => {
+  const { run, remote, approvals } = setup({ caller: { mode: 'ask' } });
+  withSession(remote, { model: 'claude-sonnet-4-5-20250929' });
+  remote.settings.claude.availableModels = ['claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5'];
+  const refused = await run('send', { ...SEND_ARGS, model: 'claude-sonet-5' });
+  assert.equal(refused.body.code, CODES.unknownModel);
+  assert.equal(approvals.length, 0, 'no card for a send that cannot run');
+  for (const model of ['claude-haiku-4-5', 'claude-sonnet-4-5-20250929']) {
+    const sent = await run('send', { ...SEND_ARGS, model });
+    assert.equal(sent.status, 200, `${model}: ${JSON.stringify(sent.body)}`);
+    assert.equal(remote.callsTo('POST', '/api/message').at(-1).body.model, model);
+  }
+  assert.equal(approvals.length, 2);
+});
+
+test('the local target checks the model before its once-per-conversation card', async () => {
+  const { run, local, approvals } = setupLocal();
+  const refused = await run('create_session', { relay: 'this', text: PROMPT, model: 'gpt-5-6-luna', provider: 'github', wait_seconds: 0 });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, CODES.unknownModel);
+  assert.match(refused.body.error, /did you mean 'gpt-5\.6-luna'\?/);
+  assert.equal(approvals.length, 0);
+  assert.equal(local.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  const created = await run('create_session', { relay: 'this', text: PROMPT, model: 'gpt-5.6-luna', provider: 'github', wait_seconds: 0 });
+  assert.equal(created.status, 200);
+  assert.equal(approvals.length, 1);
+});
+
+test('send refuses a model override the session\'s provider does not list; nothing is sent', async () => {
+  const { run, remote } = setup();
+  withSession(remote);
+  const refused = await run('send', { ...SEND_ARGS, model: 'claude-sonet-5' });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, CODES.unknownModel);
+  assert.match(refused.body.error, /^Unknown model 'claude-sonet-5' for Claude on relay "linux-test"; did you mean 'claude-sonnet-5'\?.* Nothing was sent\.$/);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+
+  const alias = await run('send', { ...SEND_ARGS, model: 'opus' });
+  assert.equal(alias.status, 200);
+  assert.equal(remote.callsTo('POST', '/api/message')[0].body.model, 'claude-opus-5');
+  assert.match(alias.body.modelNote, /'opus' was taken as claude-opus-5/);
+
+  // Without an override nothing is checked and no catalogue is read.
+  const modelsRead = remote.callsTo('GET', '/api/models').length;
+  const plain = await run('send', SEND_ARGS);
+  assert.equal(plain.status, 200);
+  assert.equal(remote.callsTo('GET', '/api/models').length, modelsRead);
+  assert.equal(plain.body.modelNote, undefined);
+});
+
 // ─── Reasoning effort ────────────────────────────────────────────────────────
 
 const CREATE = Object.freeze({ relay: 'linux-test', text: PROMPT, wait_seconds: 0 });
@@ -2196,13 +2343,15 @@ test('remote failures map to the contract codes and statuses', async () => {
   assert.deepEqual([missing.status, missing.body.code], [404, CODES.notFound]);
   assert.equal(missing.body.error, 'Session conv-gone was not found on relay "linux-test".');
 
+  // A model the remote's list offered when it was read, refused by its
+  // bootstrap all the same: its own code and list are passed on.
   const conflict = setup();
-  conflict.remote.fail('POST', '/api/conversation/bootstrap', remoteError(`${CODES.httpPrefix}400`, 'Relay "linux-test" answered HTTP 400: Claude model "x" is not available', 400, {
-    error: 'Claude model "x" is not available',
+  conflict.remote.fail('POST', '/api/conversation/bootstrap', remoteError(`${CODES.httpPrefix}400`, 'Relay "linux-test" answered HTTP 400: Claude model "claude-opus-5" is not available', 400, {
+    error: 'Claude model "claude-opus-5" is not available',
     code: 'CLAUDE_MODEL_UNAVAILABLE',
     supportedModels: ['claude-sonnet-5'],
   }));
-  const refused = await conflict.run('create_session', { relay: 'linux-test', text: PROMPT, model: 'x' });
+  const refused = await conflict.run('create_session', { relay: 'linux-test', text: PROMPT, model: 'claude-opus-5' });
   assert.equal(refused.status, 400);
   assert.equal(refused.body.code, `${CODES.httpPrefix}400`);
   assert.equal(refused.body.remoteCode, 'CLAUDE_MODEL_UNAVAILABLE');
@@ -3282,7 +3431,7 @@ test('read_session gives each task its taskId, whether it has output, and its he
       { id: 'agent-d9', kind: 'subagent', description: 'review', status: 'running' },
     ],
     backgroundTasks: [
-      { taskId: 'task-b7', outputPath: '/tmp/out/task-b7.log', outputKind: 'file', health: RUNNING_OUTPUT.health },
+      { taskId: 'task-b7', outputPath: '/tmp/out/task-b7.log', outputKind: 'file', command: 'npm test 2>&1 | tail -40', health: RUNNING_OUTPUT.health },
       { taskId: 'agent-d9', outputKind: 'none' },
     ],
   });
@@ -3299,6 +3448,8 @@ test('read_session gives each task its taskId, whether it has output, and its he
   const [running, built, agent] = read.body.session.tasks;
   assert.equal(running.taskId, 'task-b7');
   assert.equal(running.output, true);
+  // The relay scrubbed the command line when the worker posted it.
+  assert.equal(running.command, 'npm test 2>&1 | tail -40');
   assert.deepEqual(running.health, {
     minutesSinceOutput: 12,
     quiet: false,
@@ -3306,7 +3457,7 @@ test('read_session gives each task its taskId, whether it has output, and its he
     counts: { runner: 'vitest', passed: 412, failed: 2, skipped: 0 },
   });
   assert.deepEqual([built.taskId, built.output, built.health], ['task-c8', true, undefined]);
-  assert.deepEqual([agent.taskId, agent.output], ['agent-d9', false]);
+  assert.deepEqual([agent.taskId, agent.output, agent.command], ['agent-d9', false, undefined]);
   // list_sessions stays as it was.
   const listed = await run('list_sessions', { relay: 'this' });
   assert.equal(listed.body.sessions[0].tasks[0].taskId, undefined);

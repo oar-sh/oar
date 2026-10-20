@@ -190,6 +190,35 @@ for (const profile of [
       }).catch(() => {});
     }
 
+    // A send the relay refuses for a reason the user can act on says that
+    // reason, and gives the text back to the composer.
+    test("a refused send shows the relay's reason and keeps the text", async ({ page, request }) => {
+      const token = relayToken();
+      const headers = { Authorization: `Bearer ${token}` };
+      const stamp = `${profile.name}-${Date.now()}`;
+      const seeded = await seedConversation(request, headers, "Check the bird feeder log", stamp);
+      const text = `Count the sparrows ${stamp}`;
+      const reason = 'This conversation\'s model "gpt-4.9-retired" is no longer available. Choose a model and send again.';
+      try {
+        await page.route("**/api/message", (route) => (route.request().method() !== "POST"
+          ? route.continue()
+          : route.fulfill({
+              status: 409,
+              contentType: "application/json",
+              body: JSON.stringify({ error: reason, code: "CONVERSATION_MODEL_UNAVAILABLE", model: "gpt-4.9-retired" }),
+            })));
+        await openPage(page, token, seeded.conversationId);
+        await expect(page.locator("#chat-title")).toHaveText(seeded.title);
+        await page.fill("#msg-input", text);
+        if (profile.touch) await page.locator("#send-btn").tap(); else await page.locator("#send-btn").click();
+        await expect(page.locator("#model-banner")).toHaveText(`⚠️ ${reason}`);
+        await expect(page.locator("#msg-input")).toHaveValue(text);
+        await expect(page.locator("#messages .msg.user", { hasText: text })).toHaveCount(0);
+      } finally {
+        await request.delete(`/api/conversation/${seeded.conversationId}`, { headers }).catch(() => {});
+      }
+    });
+
     test("a quick run through several conversations sends in the last one clicked", async ({ page, request }) => {
       const token = relayToken();
       const headers = { Authorization: `Bearer ${token}` };

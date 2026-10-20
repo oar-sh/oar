@@ -91,3 +91,21 @@ test('display cleanup leaves ordinary text alone', () => {
     assert.equal(stripRemoteRelayDisplayArtifacts(text, { origin: ORIGIN }), text);
   }
 });
+
+// The guidance gained a line about `immediate`; prompts stored before carry
+// it without that line, and both are stripped.
+test('the relay tool guidance is stripped with and without the immediate line', () => {
+  const lines = [
+    '# Relay Tool Guidance',
+    'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
+    'When using ask_user, ALWAYS include a `choices` array with 2-6 answer options so the web relay can render clickable buttons. Only omit choices when the question genuinely requires freeform text input.',
+    'In autopilot, still call ask_user when user input is truly blocking, because the relay bridge can surface the question even when the direct SDK question hook is bypassed.',
+    'For relay restarts in extension-managed mode, require explicit user permission first, then use the authenticated localhost API `POST /api/relay/shutdown`. Do not restart by killing processes or using respawn scripts.',
+    'Note: shutdown is queued and only completes when the current turn finishes, so it is pointless to wait for it to interrupt an active turn.',
+    'Use `restart: true` in the request body when the user wants a real relay restart rather than a plain shutdown. Example request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.',
+  ];
+  const immediate = 'Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide, with Restart now in the web UI.';
+  const mode = '[Relay mode: autopilot] Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.';
+  assert.equal(stripRelayPromptContext(`${mode} ${[...lines, immediate].join(' ')} tidy the docs`, 'autopilot'), 'tidy the docs');
+  assert.equal(stripRelayPromptContext(`${mode} ${lines.join(' ')} tidy the docs`, 'autopilot'), 'tidy the docs');
+});

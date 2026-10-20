@@ -31,6 +31,8 @@ import {
   updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
   loadTaskStallMinutesSetting,
   updateTaskStallMinutesSetting as requestTaskStallMinutesSetting,
+  loadRestartResumeSetting,
+  updateRestartResumeSetting as requestRestartResumeSetting,
   loadSubagentRecordRetentionSetting,
   updateSubagentRecordRetentionSetting as requestSubagentRecordRetentionSetting,
   loadFeatureFlagSettings,
@@ -45,6 +47,7 @@ import {
 import { DEFAULT_TASK_STALL_MINUTES } from './task-console-render.mjs';
 import { setTaskStallThreshold } from './background-tasks-view.mjs';
 import { describeRelayRestartError } from './relay-restart-error.mjs';
+import { refreshRelayRestartMaxWaitSetting } from './relay-restart-ui.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
@@ -276,6 +279,52 @@ export async function updateTaskStallMinutesSetting(value) {
   } finally {
     taskStallMinutesUpdateInFlight = false;
     syncTaskStallMinutesSlider();
+  }
+}
+
+// "After a relay restart, tell interrupted sessions to carry on": a relay
+// setting, off by default (server/services/restart-resume-service.mjs).
+let restartResumeEnabled = false;
+let restartResumeUpdateInFlight = false;
+
+function syncRestartResumeToggle() {
+  const toggle = document.getElementById('restart-resume-toggle');
+  if (!(toggle instanceof HTMLInputElement)) return;
+  toggle.checked = restartResumeEnabled;
+  toggle.disabled = restartResumeUpdateInFlight;
+}
+
+export async function refreshRestartResumeSetting() {
+  syncRestartResumeToggle();
+  try {
+    const result = await loadRestartResumeSetting();
+    if (result && typeof result.enabled === 'boolean') restartResumeEnabled = result.enabled;
+  } catch {
+    // Keep the last known value; the toggle shows it.
+  } finally {
+    syncRestartResumeToggle();
+  }
+}
+
+export async function updateRestartResumeSettingFromToggle(checked) {
+  if (restartResumeUpdateInFlight) {
+    syncRestartResumeToggle();
+    return;
+  }
+  restartResumeUpdateInFlight = true;
+  syncRestartResumeToggle();
+  try {
+    const result = await requestRestartResumeSetting(checked === true);
+    if (!result || typeof result.enabled !== 'boolean') throw new Error('Failed to update the restart setting.');
+    restartResumeEnabled = result.enabled;
+    showTransientRelayNotice(restartResumeEnabled
+      ? 'After a relay restart, sessions whose turn it cut off are told to carry on.'
+      : 'After a relay restart, interrupted sessions are left as they are.');
+  } catch (error) {
+    alert(error?.message || 'Failed to update the restart setting.');
+  } finally {
+    restartResumeUpdateInFlight = false;
+    syncRestartResumeToggle();
   }
 }
 
@@ -1897,8 +1946,11 @@ export function openSettingsModal(tab, providerTab) {
   void refreshBackgroundTaskTimeoutSetting();
   syncTaskStallMinutesSlider();
   void refreshTaskStallMinutesSetting();
+  syncRestartResumeToggle();
+  void refreshRestartResumeSetting();
   syncSubagentRecordRetentionSelect();
   void refreshSubagentRecordRetentionSetting();
+  void refreshRelayRestartMaxWaitSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();
   void refreshSharedConversationsSection();

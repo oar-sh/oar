@@ -72,6 +72,7 @@ test('normalizePushPreferences fills safe defaults', () => {
     board: true,
     cliOffline: false,
     hostSuspend: true,
+    relayRestart: true,
   });
   assert.deepEqual(prefs.content, { includeTitle: false, preview: 'none', previewChars: 80 });
 });
@@ -240,6 +241,20 @@ test('dispatch honors per-event toggles and the enabled flag per device', async 
   sends.length = 0;
   await service.dispatch({ type: 'turnComplete', body: 'done' });
   assert.deepEqual(sends, ['https://push.example/no-questions']);
+});
+
+test('a queued relay restart that waited its maximum pushes its own text, on by default', async () => {
+  const db = makeDb();
+  const sends = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (subscription, payload) => { sends.push(JSON.parse(payload)); } },
+  });
+  subscribeDevice(service, { deviceId: 'defaults' });
+  await service.notifyRelayRestart({ body: 'The queued relay restart has waited 30 min for 1 session. Restart now, keep waiting or cancel it.' });
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].title, 'Relay restart waiting');
+  assert.match(sends[0].body, /waited 30 min for 1 session/);
+  assert.equal(sends[0].data.type, 'relayRestart');
 });
 
 test('cliOffline is opt-in: default preferences do not receive it', async () => {

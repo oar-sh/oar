@@ -22,9 +22,11 @@ import {
   waitFor,
 } from './claude-session-test-harness.mjs';
 import {
+  MAX_TASK_COMMAND_CHARS,
   discoverTaskOutputPaths,
   exitCodeFromSummary,
   parseOutputAnnouncement,
+  shellCommandsOf,
   usableOutputPath,
 } from './task-output-discovery.mjs';
 
@@ -113,7 +115,7 @@ test('the structured result names the task when one call is answered; array cont
     message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: 'Output is being written to: /tmp/fixture/custom.log.' }] }] },
     tool_use_result: { backgroundTaskId: 'b9zz8yy7x' },
   });
-  assert.deepEqual(found, [{ taskId: 'b9zz8yy7x', outputPath: '/tmp/fixture/custom.log' }]);
+  assert.deepEqual(found, [{ taskId: 'b9zz8yy7x', outputPath: '/tmp/fixture/custom.log', toolUseId: 'toolu_1' }]);
   assert.deepEqual(discoverTaskOutputPaths(assistantText('Output is being written to: /tmp/x/b1.output.')), []);
 });
 
@@ -127,7 +129,7 @@ test('a foreground command that prints the phrase binds nothing; the MCP note do
   assert.deepEqual(discoverTaskOutputPaths(printed('Output is being written to: /tmp/fixture/tasks/b8k2m4x7q.output.')), []);
   assert.deepEqual(
     discoverTaskOutputPaths(printed('Output is being written to /tmp/fixture/tasks/k1a2b3c4d.output; use Read on that path for interim output.')),
-    [{ taskId: 'k1a2b3c4d', outputPath: '/tmp/fixture/tasks/k1a2b3c4d.output' }],
+    [{ taskId: 'k1a2b3c4d', outputPath: '/tmp/fixture/tasks/k1a2b3c4d.output', toolUseId: 'toolu_fg' }],
   );
 });
 
@@ -135,6 +137,23 @@ test('the exit code comes from the settle summary, last mention first', () => {
   assert.equal(exitCodeFromSummary('Background command "npm test" failed with exit code 2'), 2);
   assert.equal(exitCodeFromSummary('Background command "check exit code 7 handling" completed (exit code 0)'), 0);
   assert.equal(exitCodeFromSummary('Background command "npm test" was stopped'), null);
+});
+
+/** The assistant message whose tool_use starts a shell task. */
+function shellCall(toolUseId, command, name = 'Bash') {
+  return {
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: toolUseId, name, input: { command, description: 'Run the checks', run_in_background: true } }] },
+  };
+}
+
+test('the command lines of Bash and Monitor calls, by tool_use id, bounded at 8,000 characters', () => {
+  assert.deepEqual(shellCommandsOf(shellCall('toolu_a', 'npm test 2>&1 | tail -40')), [{ toolUseId: 'toolu_a', command: 'npm test 2>&1 | tail -40' }]);
+  assert.deepEqual(shellCommandsOf(shellCall('toolu_m', 'tail -f /tmp/dev.log', 'Monitor')), [{ toolUseId: 'toolu_m', command: 'tail -f /tmp/dev.log' }]);
+  assert.deepEqual(shellCommandsOf(shellCall('toolu_r', 'not a shell', 'Read')), []);
+  assert.deepEqual(shellCommandsOf({ ...shellCall('toolu_u', 'x'), type: 'user' }), []);
+  assert.equal(shellCommandsOf(shellCall('toolu_l', `echo ${'x'.repeat(9000)}`))[0].command.length, MAX_TASK_COMMAND_CHARS);
 });
 
 // --- the runner -----------------------------------------------------------------
@@ -154,6 +173,59 @@ test('a shell row carries the file its Bash result announced, and a snapshot kin
   assert.equal(rowOf(stub, 'b8k2m4x7q').outputPath, file);
   await endTurn();
   await finish();
+});
+
+test('a shell row and its settle carry the command line of the Bash call that started it', async () => {
+  const file = `${TASKS_DIR}/b7c6d5e4f.output`;
+  const { stub, turn, runner, endTurn } = await withRunner();
+  turn.emit(shellCall('toolu_b7c6', 'npm test 2>&1 | tail -40'));
+  turn.emit(backgroundBashResult('b7c6d5e4f', file, { toolUseId: 'toolu_b7c6' }));
+  turn.emit(backgroundTasksMessage([{ task_id: 'b7c6d5e4f', task_type: 'local_bash', description: 'Run the unit tests' }]));
+  await waitFor(() => rowOf(stub, 'b7c6d5e4f')?.command, { label: 'the row names the command' });
+  assert.equal(rowOf(stub, 'b7c6d5e4f').command, 'npm test 2>&1 | tail -40');
+  assert.equal(rowOf(stub, 'b7c6d5e4f').description, 'Run the unit tests');
+  await endTurn();
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit({ type: 'system', subtype: 'task_notification', task_id: 'b7c6d5e4f', status: 'completed', summary: 'Background command "npm test" completed (exit code 0)', skip_transcript: true });
+  await waitFor(() => postsTo(stub, '/api/background-task-settled').length === 1, { label: 'the settle post' });
+  assert.equal(postsTo(stub, '/api/background-task-settled')[0].command, 'npm test 2>&1 | tail -40');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a Monitor row takes its command from task_started\'s tool_use id; an agent row has none', async () => {
+  const { stub, turn, endTurn, finish } = await withRunner({
+    tasks: [
+      { task_id: 'm1n2o3p4q', task_type: 'local_bash', description: 'watch the dev log' },
+      { task_id: 'a9b8c7d6e', task_type: 'local_agent', description: 'review the diff' },
+    ],
+  });
+  turn.emit(shellCall('toolu_mon1', 'tail -f /tmp/dev.log | grep --line-buffered ERROR', 'Monitor'));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: 'm1n2o3p4q', task_type: 'local_bash', description: 'watch the dev log', tool_use_id: 'toolu_mon1' });
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: 'a9b8c7d6e', task_type: 'local_agent', description: 'review the diff', tool_use_id: 'toolu_mon1' });
+  await waitFor(() => rowOf(stub, 'm1n2o3p4q')?.command, { label: 'the monitor row names its command', timeoutMs: 5000 });
+  assert.equal(rowOf(stub, 'm1n2o3p4q').command, 'tail -f /tmp/dev.log | grep --line-buffered ERROR');
+  assert.equal('command' in rowOf(stub, 'a9b8c7d6e'), false, 'only shell rows');
+  await endTurn();
+  await finish();
+});
+
+test('a live task keeps its command when 200 newer Bash calls have come and gone', async () => {
+  const { stub, turn, runner, endTurn } = await withRunner();
+  turn.emit(shellCall('toolu_long', 'npm run soak 2>&1 | tail -20'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'b0l1o2n3g', task_type: 'local_bash', description: 'soak' }]));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: 'b0l1o2n3g', task_type: 'local_bash', description: 'soak', tool_use_id: 'toolu_long' });
+  await waitFor(() => rowOf(stub, 'b0l1o2n3g')?.command, { label: 'the row names its command', timeoutMs: 5000 });
+  for (let index = 0; index < 250; index += 1) turn.emit(shellCall(`toolu_n${index}`, `echo ${index}`));
+  await runner.resyncBackgroundTasks();
+  assert.equal(rowOf(stub, 'b0l1o2n3g').command, 'npm run soak 2>&1 | tail -20');
+  await endTurn();
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit({ type: 'system', subtype: 'task_notification', task_id: 'b0l1o2n3g', status: 'completed', summary: 'done (exit code 0)', skip_transcript: true });
+  await waitFor(() => postsTo(stub, '/api/background-task-settled').length === 1, { label: 'the settle post' });
+  assert.equal(postsTo(stub, '/api/background-task-settled')[0].command, 'npm run soak 2>&1 | tail -20');
+  turn.endInput();
+  await settled(runner);
 });
 
 test('a path announced before the task joins the set is used when it does', async () => {

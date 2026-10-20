@@ -27,7 +27,9 @@ function parseOrigin(json) {
 
 export function createRemoteRelayRepository(db) {
   const hasUnlock = db.prepare(`SELECT 1 FROM conversation_remote_relay_unlocks WHERE conversation_id = ? AND remote_relay_id = ?`);
-  const listUnlocks = db.prepare(`SELECT remote_relay_id, message_id, created_at FROM conversation_remote_relay_unlocks WHERE conversation_id = ? ORDER BY created_at ASC`);
+  // Two unlocks can share a millisecond (Windows' clock is coarse); the rowid
+  // keeps them in the order they were recorded rather than by relay id.
+  const listUnlocks = db.prepare(`SELECT remote_relay_id, message_id, created_at FROM conversation_remote_relay_unlocks WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC`);
   const insertUnlock = db.prepare(`INSERT OR IGNORE INTO conversation_remote_relay_unlocks (conversation_id, remote_relay_id, message_id, created_at) VALUES (?, ?, ?, ?)`);
   // The relay's unlocks and the approvals stored under its id (`<id>:watch`).
   const deleteUnlocksForRelay = db.prepare(`
@@ -64,7 +66,7 @@ export function createRemoteRelayRepository(db) {
     hasUnlock(conversationId, remoteRelayId) {
       return !!hasUnlock.get(String(conversationId || ''), String(remoteRelayId || ''));
     },
-    /** `[{ remoteRelayId, messageId, createdAt }]`, oldest first. */
+    /** `[{ remoteRelayId, messageId, createdAt }]`, oldest first, ties in the order recorded. */
     listUnlocks(conversationId) {
       return listUnlocks.all(String(conversationId || '')).map((row) => ({
         remoteRelayId: row.remote_relay_id,

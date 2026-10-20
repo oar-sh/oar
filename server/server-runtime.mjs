@@ -75,6 +75,13 @@ import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';
 import { createSessionActivityTracker, resolveBootReportingWindowMs } from './services/session-activity-tracker.mjs';
 import { createBackgroundTaskStore } from './services/background-task-store.mjs';
+import { createSqliteBackgroundTaskPersistence } from './services/background-task-persistence.mjs';
+import {
+  RESTART_RESUME_SETTING_KEY,
+  createRestartResumeService,
+  parseRestartResumeUpdate,
+  readRestartResumeSetting,
+} from './services/restart-resume-service.mjs';
 import { createBackgroundWorkView } from './services/background-work-view.mjs';
 import { createRelayEventService } from './services/relay-event-service.mjs';
 import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
@@ -90,6 +97,7 @@ import { runHostSuspendToRam } from './services/host-suspend-command.mjs';
 import { createActiveDeviceTracker } from './services/push-active-device-service.mjs';
 import { registerPushRoutes } from './routes/push-routes.mjs';
 import { registerAboutRoutes } from './routes/about-routes.mjs';
+import { registerRelayRestartRoutes } from './routes/relay-restart-routes.mjs';
 import { createAboutService, resolveBuildCommit } from './services/about-service.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
@@ -183,7 +191,15 @@ import {
   parseSharePathPrivacyUpdate,
   readSharePathPrivacySetting,
 } from '../shared/share-path-privacy.mjs';
-import { isRelayShutdownQueued, queuedShutdownCanProceed, relayShutdownGateReply } from './services/relay-shutdown-gate.mjs';
+import { isRelayShutdownQueued, relayShutdownGateReply } from './services/relay-shutdown-gate.mjs';
+import {
+  createRelayRestartQueue,
+  parseRelayRestartMaxWaitUpdate,
+  readRelayRestartMaxWaitSetting,
+  resolveRelayRestartMaxWaitOverrideMs,
+  RELAY_RESTART_MAX_WAIT_SETTING_KEY,
+} from './services/relay-restart-queue.mjs';
+import { createRestartPictureCollector } from './services/relay-restart-picture.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
 import {
   STALE_SUBAGENT_RUN_BOOT_DELAY_MS,
@@ -1877,7 +1893,7 @@ const runtimeTimers = {
   questionExpiry: null,
   pendingWorkerPrime: null,
   sharedViewerPrune: null,
-  shutdownDrain: null,
+  restoredTaskSettle: null,
 };
 
 function normalizeRemotePath(value) {
@@ -2200,6 +2216,21 @@ function setTaskStallMinutes(value) {
   if (!parsed.ok) return parsed;
   stmts.upsertAppSetting.run(TASK_STALL_MINUTES_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
   return { ok: true, minutes: parsed.minutes };
+}
+
+// "After a relay restart, tell interrupted sessions to carry on" (off by default).
+function getRestartResumeEnabled() {
+  return readRestartResumeSetting(readAppSettingValue(RESTART_RESUME_SETTING_KEY));
+}
+
+function setRestartResumeEnabled(value) {
+  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+    return { ok: false, error: 'Restart settings are unavailable' };
+  }
+  const parsed = parseRestartResumeUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(RESTART_RESUME_SETTING_KEY, parsed.enabled ? '1' : '0', new Date().toISOString());
+  return { ok: true, enabled: parsed.enabled };
 }
 
 function resolveDefaultSessionWorkspaceRootState() {
@@ -3451,140 +3482,87 @@ function attachTtyConsoleRuntimeTitle(runtime) {
 }
 attachTtyConsoleRuntimeTitle(ttyConsoleRuntime);
 
-let pendingRelayShutdownRequest = null;
-function normalizeRestartRequestFlag(value) {
-  if (value === true || value === 1) return true;
-  if (value === false || value === 0 || value == null) return false;
-  const normalized = String(value).trim().toLowerCase();
-  return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+// ─── Queued relay restart / shutdown ─────────────────────────────────────────
+// A request waits until no turn is processing and holds new turns meanwhile
+// (services/relay-shutdown-gate.mjs); past the maximum wait it asks instead
+// of acting (services/relay-restart-queue.mjs). Every client shows a banner
+// with what it waits for, from `relay_shutdown_state` (sent on each change
+// and on connect).
+const relayRestartMaxWaitOverrideMs = resolveRelayRestartMaxWaitOverrideMs(process.env);
+if (relayRestartMaxWaitOverrideMs !== null) {
+  console.log(`${runtimeLogPrefix()}Relay restart max wait pinned to ${relayRestartMaxWaitOverrideMs} ms (OAR_RELAY_RESTART_MAX_WAIT_MS)`);
 }
-
-function getRelayShutdownState() {
-  const pending = pendingRelayShutdownRequest;
-  if (!pending) {
-    return {
-      status: runtimeShutdownStarted ? 'shutting_down' : 'idle',
-      action: runtimeShutdownStarted ? 'shutdown' : null,
-      restart: false,
-      reason: null,
-      requestedBy: null,
-      requestedAt: null,
-    };
+function getRelayRestartMaxWaitMinutes() {
+  return readRelayRestartMaxWaitSetting(readAppSettingValue(RELAY_RESTART_MAX_WAIT_SETTING_KEY));
+}
+function setRelayRestartMaxWaitMinutes(value) {
+  if (!stmts.upsertAppSetting) return { ok: false, error: 'Relay restart settings are unavailable' };
+  const parsed = parseRelayRestartMaxWaitUpdate(value);
+  if (!parsed.ok) return parsed;
+  stmts.upsertAppSetting.run(RELAY_RESTART_MAX_WAIT_SETTING_KEY, String(parsed.minutes), new Date().toISOString());
+  // A queued request measures its current period against the new value.
+  relayRestartQueue.refresh();
+  return { ok: true, maxWaitMinutes: parsed.minutes };
+}
+let restartPictureCollector = null;
+// What a restart would wait for, hold and leave running (the confirmation
+// asks before anything is queued). Built on first use: the background-work
+// view is set up further down.
+function collectRestartPicture({ action = 'restart' } = {}) {
+  if (!restartPictureCollector) {
+    restartPictureCollector = createRestartPictureCollector({
+      db,
+      backgroundWorkView,
+      listHeldTasks: () => backgroundTaskStore.listRestored().map(({ key, task }) => ({
+        conversationId: resolveConversationRecord({ conversationId: key, sdkSessionId: key })?.id || key,
+        description: task?.description || task?.taskType || '',
+      })),
+      providerOf: (conversationId) => stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.provider_type,
+      titleOf: (conversationId) => hostActivityTitle(conversationId),
+    });
   }
-  return {
-    status: runtimeShutdownStarted ? 'shutting_down' : 'queued',
-    action: pending.action || 'shutdown',
-    restart: pending.action === 'restart',
-    reason: pending.reason || null,
-    requestedBy: pending.requestedBy || null,
-    requestedAt: pending.requestedAt || null,
-  };
+  return restartPictureCollector({ action });
 }
+const relayRestartQueue = createRelayRestartQueue({
+  getCounts: () => queueCounts(),
+  collectPicture: collectRestartPicture,
+  startShutdown: ({ action, reason }) => {
+    const exitCode = action === 'restart' ? RELAY_RESTART_EXIT_CODE : 0;
+    sessionWorkerWebSocketService.emitDraining(`api-${action}:${reason}`);
+    void shutdownRuntime(`api-${action}:${reason}`, { exitCode });
+  },
+  getMaxWaitMs: () => (relayRestartMaxWaitOverrideMs !== null
+    ? relayRestartMaxWaitOverrideMs
+    : getRelayRestartMaxWaitMinutes() * 60_000),
+  isShuttingDown: () => runtimeShutdownStarted,
+  onStateChange: (state) => {
+    try { io.emit('relay_shutdown_state', state); } catch {}
+  },
+  onMaxWaitReached: (state) => {
+    const sessions = Array.isArray(state.waitingFor) ? state.waitingFor.length : 0;
+    const minutes = Math.max(1, Math.round(Number(state.maxWaitMs || 0) / 60_000));
+    void pushDispatchService.notifyRelayRestart({
+      body: `The queued relay ${state.action} has waited ${minutes} min for ${sessions} session${sessions === 1 ? '' : 's'}. Restart now, keep waiting or cancel it.`,
+    });
+  },
+  logger: console,
+  logPrefix: () => runtimeLogPrefix(),
+});
 
-// Every client shows a banner while a shutdown/restart is queued, so the
-// state goes out on each transition (request, cancel, drain) and on connect.
 function relayShutdownStatePayload() {
-  return { ...getRelayShutdownState(), queue: queueCounts() };
-}
-function emitRelayShutdownState() {
-  try { io.emit('relay_shutdown_state', relayShutdownStatePayload()); } catch {}
+  return relayRestartQueue.getState();
 }
 
 function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
-  if (runtimeShutdownStarted) {
-    return { cancelled: false, status: 'shutting_down', ...relayShutdownStatePayload() };
-  }
-  if (!pendingRelayShutdownRequest) {
-    return { cancelled: false, ...relayShutdownStatePayload() };
-  }
-  const dropped = pendingRelayShutdownRequest;
-  pendingRelayShutdownRequest = null;
-  if (runtimeTimers.shutdownDrain) {
-    try { clearInterval(runtimeTimers.shutdownDrain); } catch {}
-    runtimeTimers.shutdownDrain = null;
-  }
-  console.log(
-    `${runtimeLogPrefix()}Relay ${dropped.action || 'shutdown'} request cancelled by `
-    + `${String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api'}`,
-  );
-  emitRelayShutdownState();
-  return { cancelled: true, dropped, ...relayShutdownStatePayload() };
+  return relayRestartQueue.cancel({ requestedBy });
 }
 
-function requestRelayShutdown({ reason = 'manual-request', requestedBy = 'localhost-api', restart = false } = {}) {
-  const safeReason = String(reason || 'manual-request').trim().slice(0, 140) || 'manual-request';
-  const safeRequestedBy = String(requestedBy || 'localhost-api').trim().slice(0, 80) || 'localhost-api';
-  const restartRequested = normalizeRestartRequestFlag(restart);
-  const requestedAction = restartRequested ? 'restart' : 'shutdown';
-  if (runtimeShutdownStarted) {
-    return {
-      accepted: false,
-      status: 'shutting_down',
-      action: requestedAction,
-      restart: restartRequested,
-      reason: safeReason,
-    };
-  }
+function keepWaitingForRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
+  return relayRestartQueue.keepWaiting({ requestedBy });
+}
 
-  // Shutdown is deferred until no turn is processing; it never interrupts an
-  // active turn. From here on no pending row is handed out (the dequeue paths
-  // read relayShutdownQueued): a turn started meanwhile would postpone the
-  // restart again. Pending and parked rows wait in the database and run
-  // after the restart.
-  if (!pendingRelayShutdownRequest) {
-    pendingRelayShutdownRequest = {
-      action: requestedAction,
-      reason: safeReason,
-      requestedBy: safeRequestedBy,
-      requestedAt: new Date().toISOString(),
-    };
-  } else if (restartRequested && pendingRelayShutdownRequest.action !== 'restart') {
-    pendingRelayShutdownRequest = {
-      ...pendingRelayShutdownRequest,
-      action: 'restart',
-      reason: safeReason,
-      requestedBy: safeRequestedBy,
-      requestedAt: new Date().toISOString(),
-    };
-  }
-
-  const tryShutdownWhenIdle = () => {
-    if (runtimeShutdownStarted) return;
-    const counts = queueCounts();
-    if (!queuedShutdownCanProceed(counts)) return;
-    const requestInfo = pendingRelayShutdownRequest;
-    pendingRelayShutdownRequest = null;
-    if (runtimeTimers.shutdownDrain) {
-      try { clearInterval(runtimeTimers.shutdownDrain); } catch {}
-      runtimeTimers.shutdownDrain = null;
-    }
-    const action = requestInfo?.action === 'restart' ? 'restart' : 'shutdown';
-    const exitCode = action === 'restart' ? RELAY_RESTART_EXIT_CODE : 0;
-    console.log(
-      `${runtimeLogPrefix()}Relay ${action} request accepted by ${requestInfo?.requestedBy || 'unknown'}`
-      + `; no turn is processing (${counts.pendingCount} pending, ${counts.parkedCount} parked wait), exiting now (reason=${requestInfo?.reason || 'manual-request'})`,
-    );
-    sessionWorkerWebSocketService.emitDraining(`api-${action}:${requestInfo?.reason || 'manual-request'}`);
-    void shutdownRuntime(`api-${action}:${requestInfo?.reason || 'manual-request'}`, { exitCode });
-    emitRelayShutdownState();
-  };
-
-  if (!runtimeTimers.shutdownDrain) {
-    runtimeTimers.shutdownDrain = setInterval(tryShutdownWhenIdle, 1000);
-  }
-  tryShutdownWhenIdle();
-  if (pendingRelayShutdownRequest) emitRelayShutdownState();
-  const counts = queueCounts();
-  return {
-    accepted: true,
-    status: 'queued',
-    action: pendingRelayShutdownRequest?.action || requestedAction,
-    restart: (pendingRelayShutdownRequest?.action || requestedAction) === 'restart',
-    requestedAt: pendingRelayShutdownRequest?.requestedAt || new Date().toISOString(),
-    reason: pendingRelayShutdownRequest?.reason || safeReason,
-    requestedBy: pendingRelayShutdownRequest?.requestedBy || safeRequestedBy,
-    queue: counts,
-  };
+function requestRelayShutdown(options = {}) {
+  return relayRestartQueue.request(options);
 }
 
 function toNullableInt(value) {
@@ -5248,10 +5226,14 @@ function previewCardsForResponse(responseMessageId) {
     .slice(0, 5);
 }
 
-// Live background-task sets, as the session workers publish them. Memory
-// only: after a runtime start the heartbeat's digest brings each set back
-// (services/background-task-store.mjs).
-const backgroundTaskStore = createBackgroundTaskStore();
+// Live background-task sets, as the session workers publish them. The sets
+// are memory only: after a runtime start the heartbeat's digest brings each
+// set back. The console rows (the output file of a running shell, the ended
+// rows of the last hour) are stored (migration 0018) and restored here; a
+// running one is held until its worker reports (services/background-task-store.mjs).
+const backgroundTaskStore = createBackgroundTaskStore({
+  persistence: createSqliteBackgroundTaskPersistence(db, { logger: console }),
+});
 // The output a worker posts for a task with no output file (the console's
 // fallback); memory only, an hour.
 const taskOutputSnapshots = createTaskOutputSnapshots();
@@ -5365,6 +5347,29 @@ const usageLimitPauseService = createUsageLimitPauseService({
   onQueueChanged: (reason) => { void primePendingSessionWorkers(reason); },
   logger: console,
 });
+
+// Turns a restart cut off for good (their worker went with the relay, and a
+// second delivery would run the prompt twice): with the setting on, their
+// session gets one note to carry on. The rows processing right now are the
+// ones the runtime before left; the recovery paths below report what became
+// of each (services/restart-resume-service.mjs).
+const restartResumeService = createRestartResumeService({
+  db,
+  stmts,
+  isEnabled: getRestartResumeEnabled,
+  emit: (event, payload) => io.emit(event, payload),
+  // The note is an ordinary pending message: the primer starts a stopped
+  // worker, the socket service hands it to a running one.
+  wake: () => {
+    void primePendingSessionWorkers('restart-resume');
+    sessionWorkerWebSocketService?.emitQueueChanged?.('restart-resume');
+  },
+  logger: console,
+});
+restartResumeService.captureBoot();
+function noteRestartTurnOutcome(row, outcome) {
+  try { restartResumeService.noteOutcome(row, outcome); } catch {}
+}
 
 // ─── Relay events ─────────────────────────────────────────────────────────────
 // What each session is doing (state, tasks, quiet time) and the subscriptions
@@ -5539,6 +5544,7 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
   for (const row of staleContinuations) {
     stmts.dropStaleContinuation?.run?.(row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+    noteRestartTurnOutcome(row, 'cut');
     // A teardown is a turn ending with no reply; it must be visible in the
     // console log (the only trace of a silent one was `ignored=already_failed`
     // hours later, when the worker's reply arrived for the dead row).
@@ -5547,13 +5553,19 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
     console.warn(`${runtimeLogPrefix()}STALE CONTINUATION ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} dropped: ${reason}`);
   }
   const listedRows = stmts.listRecoverableProcessing.all(params);
-  for (const row of listedRows.filter((entry) => entry?.consumed_at)) failConsumedRowTerminally(row, 'stale-recovery');
+  for (const row of listedRows.filter((entry) => entry?.consumed_at)) {
+    failConsumedRowTerminally(row, 'stale-recovery');
+    noteRestartTurnOutcome(row, 'cut');
+  }
   const allRows = listedRows.filter((entry) => !entry?.consumed_at);
   if (!allRows.length) return [];
   // Enforce the retry budget before requeueing: failing these rows first
   // flips them out of 'processing' so the recovery UPDATE below skips them.
   const overBudget = allRows.filter((row) => Number(row?.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES);
-  for (const row of overBudget) failRecoveredRowTerminally(row, 'stale-recovery');
+  for (const row of overBudget) {
+    failRecoveredRowTerminally(row, 'stale-recovery');
+    noteRestartTurnOutcome(row, 'failed');
+  }
   const rows = allRows.filter((row) => Number(row?.retry_count || 0) + 1 < MAX_REQUEUE_RETRIES);
   if (!rows.length) return [];
 
@@ -5578,6 +5590,7 @@ function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso 
 
   for (const row of rows) {
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    noteRestartTurnOutcome(row, 'requeued');
   }
   io.emit('queue_updated', { recovered: rows.length });
   return rows;
@@ -6442,14 +6455,17 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
       // No user prompt to replay: a dead worker's continuation is torn down.
       stmts.dropStaleContinuation?.run?.(row.id);
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+      noteRestartTurnOutcome(row, 'cut');
       continue;
     }
     if (row.consumed_at) {
       failConsumedRowTerminally(row, `worker-died-${reason}`);
+      noteRestartTurnOutcome(row, 'cut');
       continue;
     }
     if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {
       failRecoveredRowTerminally(row, `worker-died-${reason}`);
+      noteRestartTurnOutcome(row, 'failed');
       continue;
     }
     // The dead worker's subagent runs can never be terminated by the replay
@@ -6457,6 +6473,7 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
     closeStrandedSubagentRuns(stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [], row.id);
     stmts.recoverProcessingRowKeepOwner?.run?.(requeueAt, row.id);
     io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+    noteRestartTurnOutcome(row, 'requeued');
     recovered += 1;
   }
   if (recovered > 0) {
@@ -6569,7 +6586,7 @@ function sessionHasBackgroundWork(sid) {
 const detachedWorkerWatch = createDetachedWorkerWatch({
   isEnabled: () => featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
     && !runtimeShutdownStarted
-    && !pendingRelayShutdownRequest,
+    && !relayRestartQueue.isQueued(),
   listWaitingSessionIds: () => (stmts.listPendingWorkerOwnerSessionIds?.all?.(25) || [])
     .map((row) => row?.sdk_session_id),
   hasWorkerSocket: (sid) => sessionWorkerWebSocketService.hasWorkerSocket(sid) === true,
@@ -6766,10 +6783,10 @@ const runtimeState = {
   get relayPaused() { return relayPaused; },
   set relayPaused(value) { relayPaused = value; },
   get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
-  get relayShutdown() { return getRelayShutdownState(); },
+  get relayShutdown() { return relayRestartQueue.getState(); },
   // A shutdown or restart waits for the processing turns: no pending row
-  // goes out meanwhile (see requestRelayShutdown).
-  get relayShutdownQueued() { return !!pendingRelayShutdownRequest && !runtimeShutdownStarted; },
+  // goes out meanwhile (services/relay-restart-queue.mjs).
+  get relayShutdownQueued() { return relayRestartQueue.isQueued(); },
   get hostSuspend() { return hostSuspendService.getState(); },
   get usageLimit() {
     return { account: usageLimitPauseService.getAccountState(), pauses: usageLimitPauseService.listPauses() };
@@ -7017,6 +7034,9 @@ const sharedRouteDeps = {
   pokeTaskHealth: () => taskHealthPoller.poke(),
   getTaskStallMinutes,
   setTaskStallMinutes,
+  getRestartResumeEnabled,
+  setRestartResumeEnabled,
+  noteRestartTurnOutcome,
   // A closure, not the registry itself: this deps object is built before the
   // preview lane is constructed further down the file.
   listConversationPreviews: (conversationId) => previewRegistry.listForConversation(conversationId),
@@ -7146,6 +7166,16 @@ registerRelayEventRoutes(app, {
   relayEventService,
   remoteRelayInbound,
 });
+registerRelayRestartRoutes(app, {
+  auth,
+  // Read only: a GET neither fires the restart nor asks the question.
+  getState: () => relayRestartQueue.getState(),
+  collectRestartPicture,
+  keepWaiting: keepWaitingForRelayShutdown,
+  getMaxWaitMinutes: getRelayRestartMaxWaitMinutes,
+  setMaxWaitMinutes: setRelayRestartMaxWaitMinutes,
+  maxWaitOverrideMs: relayRestartMaxWaitOverrideMs,
+});
 registerAboutRoutes(app, {
   auth,
   aboutService: createAboutService({
@@ -7236,6 +7266,8 @@ function recoverStaleMessages() {
   const ceilingBeforeIso = ceilingMs > 0 ? new Date(Date.now() - ceilingMs).toISOString() : null;
   const requeueAt = addMsIso(cliOnline ? 30_000 : 2_000);
   const recoveredRows = recoverProcessingOlderThan(cutoff, requeueAt, { ceilingBeforeIso });
+  // Turns of the start that ended on their own decide their session's note.
+  try { restartResumeService.tick(); } catch {}
   if (recoveredRows.length > 0) {
     const ceilingNote = ceilingBeforeIso ? `, ceiling ${Math.round(ceilingMs / 60_000)}min` : '';
     console.log(
@@ -7561,6 +7593,27 @@ const taskOutputRooms = createTaskOutputRooms({
 // the live tasks with an output file.
 const taskHealthPoller = createTaskHealthPoller({ store: backgroundTaskStore, io });
 taskHealthPoller.start();
+// Console tasks held since the restart whose worker has not reported within
+// twice the boot window (at least 15 s: a test relay has none): that worker
+// did not survive the restart. They are marked ended (their output stays
+// readable for the hour), never running.
+runtimeTimers.restoredTaskSettle = setTimeout(() => {
+  runtimeTimers.restoredTaskSettle = null;
+  const keys = backgroundTaskStore.endUnconfirmed();
+  if (!keys.length) return;
+  console.log(`${runtimeLogPrefix()}BG-TASKS ${keys.length} session(s) did not report after the restart; their console tasks are marked ended`);
+  for (const key of keys) {
+    try {
+      io.emit('background_tasks', {
+        conversationId: key,
+        tasks: backgroundTaskStore.withHealth(backgroundTaskStore.get(key), key),
+        endedTasks: backgroundTaskStore.ended(key),
+      });
+    } catch {}
+  }
+  taskHealthPoller.poke();
+}, Math.max(15_000, 2 * resolveBootReportingWindowMs(process.env)));
+runtimeTimers.restoredTaskSettle?.unref?.();
 // The handshake presents the token as `auth.token` or the cookie; a query
 // `token` is not read (see services/relay-auth.mjs).
 io.use(relayAuth.socketMiddleware);
@@ -7729,6 +7782,7 @@ function clearRuntimeTimers() {
   for (const timer of Object.values(runtimeTimers)) {
     if (!timer) continue;
     try { clearInterval(timer); } catch {}
+    try { clearTimeout(timer); } catch {}
   }
   subagentRecordRetention?.stop();
   try { taskHealthPoller.stop(); } catch {}
@@ -7739,7 +7793,8 @@ function clearRuntimeTimers() {
   runtimeTimers.questionExpiry = null;
   runtimeTimers.pendingWorkerPrime = null;
   runtimeTimers.sharedViewerPrune = null;
-  runtimeTimers.shutdownDrain = null;
+  runtimeTimers.restoredTaskSettle = null;
+  try { relayRestartQueue.dispose(); } catch {}
 }
 
 let runtimeShutdownPromise = null;

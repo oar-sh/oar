@@ -296,6 +296,8 @@ export function createSessionWorkerProcessInspector({
   platform = process.platform,
   execFileSyncImpl = execFileSync,
   execFileImpl = execFile,
+  // Where Windows keeps PowerShell (the bare name when it is not there).
+  systemToolPath = windowsSystemToolPath,
   now = () => Date.now(),
   snapshotCacheMs = SNAPSHOT_CACHE_MS,
   slowReadMs = SLOW_READ_MS,
@@ -320,7 +322,7 @@ export function createSessionWorkerProcessInspector({
 
   function getWindowsProcessSnapshot() {
     if (platform !== 'win32') return [];
-    const output = execFileSyncImpl(windowsSystemToolPath('powershell.exe'), ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT], {
+    const output = execFileSyncImpl(systemToolPath('powershell.exe'), ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT], {
       // stderr is kept (not shown): a failed read reports it.
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -376,7 +378,7 @@ export function createSessionWorkerProcessInspector({
     if (platform !== 'win32') return Promise.resolve([]);
     return new Promise((resolve, reject) => {
       execFileImpl(
-        windowsSystemToolPath('powershell.exe'),
+        systemToolPath('powershell.exe'),
         ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT],
         { windowsHide: true, timeout: WINDOWS_PROCESS_SNAPSHOT_TIMEOUT_MS, maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
         (error, stdout, stderr) => {
@@ -545,7 +547,7 @@ export function createSessionWorkerProcessInspector({
   function stopWindowsPids(pids) {
     const ids = uniquePids(pids);
     if (!ids.length) return [];
-    execFileSyncImpl(windowsSystemToolPath('powershell.exe'), ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)], {
+    execFileSyncImpl(systemToolPath('powershell.exe'), ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)], {
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     return ids;
@@ -557,7 +559,7 @@ export function createSessionWorkerProcessInspector({
     if (!ids.length) return Promise.resolve([]);
     return new Promise((resolve, reject) => {
       execFileImpl(
-        windowsSystemToolPath('powershell.exe'),
+        systemToolPath('powershell.exe'),
         ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)],
         { windowsHide: true, timeout: WINDOWS_STOP_TIMEOUT_MS, maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
         (error) => {

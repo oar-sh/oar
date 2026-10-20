@@ -15,8 +15,10 @@
  *    getTaskOutput), cached per task.
  *  - the health poller: every 10 s, for live tasks with an output file (and
  *    ended ones, read once more after the end), the time of the last output
- *    and the test runner's counts from the last 64 KB, sent to the pages as
- *    `background_tasks_health` when they change.
+ *    and the test runner's counts, sent to the pages as
+ *    `background_tasks_health` when they change. A runner's closing summary
+ *    comes from the last 64 KB; the counts of a run still going come from the
+ *    whole file, read on per task as it grows (the runner scan).
  *
  * The worker is trusted (it runs on this host as this user); the guard stops
  * accidents, not an attacker.
@@ -27,6 +29,7 @@ import fs from 'node:fs';
 import {
   TASK_OUTPUT_LIMITS,
   cleanTaskOutput,
+  createRunnerTally,
   foldTaskOutput,
   normalizeTaskOutputKind,
   normalizeTaskOutputPath,
@@ -71,7 +74,7 @@ export async function inspectOutputFile(filePath, { fsImpl = fs } = {}) {
   }
   if (stats.isSymbolicLink()) return { ok: false, code: 'symlink' };
   if (!stats.isFile()) return { ok: false, code: 'not-file' };
-  return { ok: true, size: stats.size, mtimeMs: stats.mtimeMs };
+  return { ok: true, size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino };
 }
 
 // Reads [start, end) of the file. Opened without following a symlink where
@@ -341,6 +344,13 @@ export function shapeSnapshot(snapshot) {
 
 // ─── Health ──────────────────────────────────────────────────────────────────
 
+// A log line as the console shows it: a `\r` redraw keeps its last state,
+// control codes go (colours stay, the runner parser ignores them).
+function healthLineText(raw) {
+  const body = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+  return stripControlKeepSgr(body.slice(body.lastIndexOf('\r') + 1));
+}
+
 /**
  * Runner counts of the window `buffer` that starts at byte `windowStart` of
  * the file: `{ counts, runner, final, firstFailureOffset }`, the offset the
@@ -359,10 +369,7 @@ export function healthOfWindow(buffer, windowStart) {
   while (position < buffer.length) {
     const at = buffer.indexOf(NEWLINE, position);
     const end = at === -1 ? buffer.length : at;
-    const raw = buffer.subarray(position, end).toString('utf8');
-    // A `\r` redraw keeps its last state, as the console shows it.
-    const body = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-    texts.push(stripControlKeepSgr(body.slice(body.lastIndexOf('\r') + 1)));
+    texts.push(healthLineText(buffer.subarray(position, end).toString('utf8')));
     offsets.push(windowStart + position);
     position = end + 1;
   }
@@ -376,6 +383,144 @@ export function healthOfWindow(buffer, windowStart) {
   };
 }
 
+// ─── The runner scan ─────────────────────────────────────────────────────────
+
+// A line longer than this is no test runner's; it is skipped, not held.
+const SCAN_LINE_BYTES_MAX = 64 * 1024;
+
+/**
+ * The runner counts of a whole output file, read on from where the last read
+ * stopped as the file grows: a live run whose output passed 64 KB keeps its
+ * runner (named in its first lines) and every test counted. One per live
+ * task whose output outgrew the window, in the health poller's memory
+ * (lines before a runner's header are only looked at): after a
+ * relay restart it is built again from the start of the file, within the
+ * poller's byte budget per tick, so a multi-MB log costs a few ticks, not
+ * one long one.
+ */
+export function createRunnerScan(filePath) {
+  return {
+    path: filePath,
+    offset: 0,
+    size: 0,
+    ino: null,
+    mtimeMs: null,
+    lastReadBytes: 0,
+    // It has read the whole file once: behind by a tick's new bytes, its
+    // counts are still the run's (a few tests short), not a partial rebuild.
+    caughtUpOnce: false,
+    carry: null,
+    carryStart: 0,
+    skipping: false,
+    tally: createRunnerTally(),
+  };
+}
+
+/** Whether the scan has read all of the file as its last read found it. */
+export function runnerScanCaughtUp(scan) {
+  return !!scan && scan.offset >= scan.size;
+}
+
+function holdOpenLine(scan, piece, pieceStart) {
+  if (scan.skipping || !piece.length) return;
+  if (!scan.carry) {
+    scan.carry = Buffer.from(piece);
+    scan.carryStart = pieceStart;
+  } else {
+    scan.carry = Buffer.concat([scan.carry, piece]);
+  }
+  if (scan.carry.length > SCAN_LINE_BYTES_MAX) {
+    scan.carry = null;
+    scan.skipping = true;
+  }
+}
+
+function scanLines(scan, buffer, bufferStart) {
+  let position = 0;
+  while (position < buffer.length) {
+    const at = buffer.indexOf(NEWLINE, position);
+    if (at === -1) {
+      holdOpenLine(scan, buffer.subarray(position), bufferStart + position);
+      return;
+    }
+    let line = buffer.subarray(position, at);
+    let lineStart = bufferStart + position;
+    if (scan.carry) {
+      line = Buffer.concat([scan.carry, line]);
+      lineStart = scan.carryStart;
+      scan.carry = null;
+    }
+    if (scan.skipping) scan.skipping = false;
+    else if (line.length <= SCAN_LINE_BYTES_MAX) scan.tally.push(healthLineText(line.toString('utf8')), lineStart);
+    position = at + 1;
+  }
+}
+
+/**
+ * Reads the file on to `size` (its current size), at most `budgetBytes` in
+ * pieces of `pieceBytes`; `scan.lastReadBytes` says how many it read. A new
+ * file under the path (shorter than what was read, another inode, an older
+ * mtime) starts the scan over. Returns whether it caught up.
+ */
+export async function advanceRunnerScan(scan, size, {
+  budgetBytes = 4 * 1024 * 1024,
+  pieceBytes = 1024 * 1024,
+  ino = null,
+  mtimeMs = null,
+  fsImpl = fs,
+} = {}) {
+  const replaced = size < scan.offset
+    || (ino !== null && scan.ino !== null && ino !== scan.ino)
+    || (Number.isFinite(mtimeMs) && Number.isFinite(scan.mtimeMs) && mtimeMs < scan.mtimeMs);
+  if (replaced) Object.assign(scan, createRunnerScan(scan.path));
+  scan.size = size;
+  if (ino !== null) scan.ino = ino;
+  if (Number.isFinite(mtimeMs)) scan.mtimeMs = mtimeMs;
+  scan.lastReadBytes = 0;
+  let budget = Math.max(0, budgetBytes);
+  while (scan.offset < size && budget > 0) {
+    const want = Math.min(pieceBytes, budget, size - scan.offset);
+    const read = await readBytes(scan.path, scan.offset, scan.offset + want, { fsImpl });
+    if (!read.ok || !read.buffer.length) break;
+    scanLines(scan, read.buffer, read.start);
+    scan.offset = read.start + read.buffer.length;
+    budget -= read.buffer.length;
+    scan.lastReadBytes += read.buffer.length;
+  }
+  if (runnerScanCaughtUp(scan)) scan.caughtUpOnce = true;
+  return runnerScanCaughtUp(scan);
+}
+
+/**
+ * The window's reading with what the whole file says: a run still going is
+ * counted from the scan when the window does not hold the whole file (its
+ * header may be gone, its early tests are), and a final summary whose first
+ * failure lies before the window gets the scan's.
+ */
+export function healthWithScan(windowHealth, windowStart, whole) {
+  if (!whole) return windowHealth;
+  if (windowHealth.final) {
+    if (windowHealth.firstFailureOffset === null && windowHealth.counts?.failed > 0 && whole.firstFailureLine !== null) {
+      return { ...windowHealth, firstFailureOffset: whole.firstFailureLine };
+    }
+    return windowHealth;
+  }
+  if (windowStart === 0) return windowHealth;
+  return {
+    counts: { passed: whole.passed, failed: whole.failed, skipped: whole.skipped },
+    runner: whole.runner,
+    final: false,
+    firstFailureOffset: whole.firstFailureLine,
+  };
+}
+
+// The list starting at `turn` modulo its length.
+function rotate(list, turn) {
+  if (list.length < 2) return list;
+  const at = turn % list.length;
+  return [...list.slice(at), ...list.slice(0, at)];
+}
+
 function sameHealthFacts(a, b) {
   if (!a || !b) return false;
   return a.runner === b.runner
@@ -387,10 +532,15 @@ function sameHealthFacts(a, b) {
 /**
  * Every `intervalMs` (10 s) over the live tasks with an output file: `stat`,
  * and when the size or time changed, the last 64 KB parsed for runner
- * counts. Readings go into the store (`setHealth`); a key's readings go to
- * the pages as `background_tasks_health { conversationId, health }` when the
- * counts change, and when the last output moved on by a minute or more (the
- * stall hint counts minutes). `conversationId` is the store key, as in
+ * counts. A live task whose output outgrew that window gets a runner scan,
+ * read on as the file grows (until it has caught up even when the file did
+ * not change): it looks for a runner's header and counts from there. All
+ * scans of a tick share `scanBytesPerTick`, each tick starting at another
+ * task; ended rows never start one, and only read on one they had. Readings go
+ * into the store (`setHealth`); a key's readings go to the pages as
+ * `background_tasks_health { conversationId, health }` when the counts
+ * change, and when the last output moved on by a minute or more (the stall
+ * hint counts minutes). `conversationId` is the store key, as in
  * `background_tasks`.
  *
  * Ended rows are read too, until a reading finds the file as the last one
@@ -403,6 +553,7 @@ export function createTaskHealthPoller({
   io,
   intervalMs = 10_000,
   windowBytes = TASK_OUTPUT_LIMITS.healthBytes,
+  scanBytesPerTick = 4 * 1024 * 1024,
   fsImpl = fs,
   logger = console,
   setIntervalImpl = setInterval,
@@ -419,10 +570,31 @@ export function createTaskHealthPoller({
   // key → taskId → the `endedAt` of the ended row whose file was read after
   // the end and found unchanged: nothing more to read for it.
   const settledEnded = new Map();
+  // key \u0000 taskId → the task's runner scan; those no tick reads go.
+  const scans = new Map();
+  let scansRead = new Set();
+  // What the scans of this tick may still read, and the tick's number: each
+  // tick starts its round at another task, so one busy log cannot take the
+  // budget from the others every time.
+  let budgetLeft = scanBytesPerTick;
+  let tickNumber = 0;
 
-  async function readHealth(task, previous) {
+  // The task's scan, if it has one (a scan of another path goes).
+  function existingScan(id, path) {
+    scansRead.add(id);
+    const scan = scans.get(id);
+    if (scan && scan.path !== path) {
+      scans.delete(id);
+      return null;
+    }
+    return scan || null;
+  }
+
+  async function readHealth(key, task, previous, { ended = false } = {}) {
     const { path } = taskOutputSource(task);
     if (!path) return null;
+    const id = `${key}\u0000${String(task?.taskId || '').trim()}`;
+    let scan = existingScan(id, path);
     const info = await inspectOutputFile(path, { fsImpl });
     // A file not there yet (a spool is named before its first byte): no
     // output yet, quiet since the task started.
@@ -431,14 +603,36 @@ export function createTaskHealthPoller({
       return { lastOutputAt: startedAt, size: 0, counts: null, runner: null, final: false, firstFailureOffset: null };
     }
     if (!info.ok) return previous || null;
-    if (previous && previous.size === info.size && previous.lastOutputAt === info.mtimeMs) return previous;
+    const unchanged = previous && previous.size === info.size && previous.lastOutputAt === info.mtimeMs;
+    if (unchanged && (ended || !scan || (scan.size === info.size && runnerScanCaughtUp(scan)))) return previous;
     const windowStart = Math.max(0, info.size - windowBytes);
     const read = await readBytes(path, windowStart, info.size, { fsImpl });
     if (!read.ok) return previous || null;
+    const windowHealth = healthOfWindow(read.buffer, read.start);
+    // A live log that outgrew the window gets a scan: it only looks for a
+    // runner's header (a test run after a long build or install prints its
+    // header once) and counts from there. A closing summary needs none.
+    if (!scan && !ended && !windowHealth.final && read.start > 0) {
+      scans.set(id, scan = createRunnerScan(path));
+    }
+    let caughtUp = false;
+    if (scan && !windowHealth.final) {
+      caughtUp = await advanceRunnerScan(scan, info.size, { budgetBytes: budgetLeft, ino: info.ino ?? null, mtimeMs: info.mtimeMs, fsImpl });
+      budgetLeft = Math.max(0, budgetLeft - scan.lastReadBytes);
+    } else if (scan) {
+      // The summary decides now; a scan still behind is of no more use.
+      caughtUp = runnerScanCaughtUp(scan);
+      if (!caughtUp) {
+        scans.delete(id);
+        scan = null;
+      }
+    }
     return {
       lastOutputAt: info.mtimeMs,
       size: info.size,
-      ...healthOfWindow(read.buffer, read.start),
+      // While the scan catches up the first time (a restart, a big file),
+      // the window alone; one that had and is behind this tick, its counts.
+      ...healthWithScan(windowHealth, read.start, caughtUp || scan?.caughtUpOnce ? scan.tally.result() : null),
     };
   }
 
@@ -464,7 +658,7 @@ export function createTaskHealthPoller({
       }
       let reading = null;
       try {
-        reading = await readHealth(row, row.health || null);
+        reading = await readHealth(key, row, row.health || null, { ended: true });
       } catch (error) {
         logger?.warn?.(`[task-output] health read failed for ended task ${taskId.slice(0, 12)}: ${error?.message || error}`);
       }
@@ -487,12 +681,16 @@ export function createTaskHealthPoller({
       return;
     }
     running = true;
+    scansRead = new Set();
+    budgetLeft = scanBytesPerTick;
+    const turn = tickNumber;
+    tickNumber += 1;
     try {
       // Ended rows of conversations nobody opens again expire here.
       store.pruneAll?.();
       const keys = new Set([...store.sets.keys(), ...(store.endedKeys?.() || [])]);
-      for (const key of keys) {
-        const tasks = Array.isArray(store.sets.get(key)?.tasks) ? store.sets.get(key).tasks : [];
+      for (const key of rotate([...keys], turn)) {
+        const tasks = rotate(Array.isArray(store.sets.get(key)?.tasks) ? store.sets.get(key).tasks : [], turn);
         const changed = {};
         let anyChange = false;
         const current = {};
@@ -501,7 +699,7 @@ export function createTaskHealthPoller({
           if (!taskId || !taskOutputSource(task).path) continue;
           let reading = null;
           try {
-            reading = await readHealth(task, store.health(key, taskId));
+            reading = await readHealth(key, task, store.health(key, taskId));
           } catch (error) {
             logger?.warn?.(`[task-output] health read failed for task ${taskId.slice(0, 12)}: ${error?.message || error}`);
           }
@@ -528,6 +726,7 @@ export function createTaskHealthPoller({
       }
       for (const key of [...sent.keys()]) if (!store.sets.has(key)) sent.delete(key);
       for (const key of [...settledEnded.keys()]) if (!keys.has(key)) settledEnded.delete(key);
+      for (const id of [...scans.keys()]) if (!scansRead.has(id)) scans.delete(id);
     } finally {
       running = false;
     }

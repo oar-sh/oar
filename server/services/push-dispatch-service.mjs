@@ -10,7 +10,7 @@
  * reports outcomes through the status-events store instead.
  */
 
-export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline', 'hostSuspend']);
+export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline', 'hostSuspend', 'relayRestart']);
 
 export const VAPID_PUBLIC_KEY_SETTING = 'push_vapid_public_key';
 export const VAPID_PRIVATE_KEY_SETTING = 'push_vapid_private_key';
@@ -35,11 +35,12 @@ const EVENT_LABELS = Object.freeze({
   board: { title: 'Plan ready for review', generic: 'The agent posted a board for review.' },
   cliOffline: { title: 'CLI offline', generic: 'The relay lost its connection to the CLI host.' },
   hostSuspend: { title: 'Host suspend', generic: 'The queued host suspend changed state.' },
+  relayRestart: { title: 'Relay restart waiting', generic: 'The queued relay restart has waited its maximum time.' },
 });
 
 // System events carry their own body: no conversation text to preview, and
 // the body is the message itself regardless of the preview preference.
-const SYSTEM_BODY_TYPES = new Set(['hostSuspend']);
+const SYSTEM_BODY_TYPES = new Set(['hostSuspend', 'relayRestart']);
 
 function clampInt(value, min, max, fallback) {
   const numeric = Number(value);
@@ -493,8 +494,14 @@ export function createPushDispatchService({
     return dispatch({ type: 'hostSuspend', body: body || null, data: { hostSuspendAt: Date.now() } });
   }
 
+  // The queued restart's maximum wait ran out: it asks, it does not restart.
+  function notifyRelayRestart({ body = null } = {}) {
+    return dispatch({ type: 'relayRestart', body: body || null, data: { relayRestartAt: Date.now() } });
+  }
+
   return {
     notifyHostSuspend,
+    notifyRelayRestart,
     listDevices,
     getDevice,
     upsertSubscription,

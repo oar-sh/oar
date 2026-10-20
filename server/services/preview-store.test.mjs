@@ -94,9 +94,16 @@ for (const [name, makeStore] of [
 
 test('a flush on a locked database returns within the shutdown\'s time, and the connection keeps its own wait', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preview-store-lock-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'relay.db');
   const db = new Database(file);
+  let other = null;
+  // Closed before the folder goes: Windows refuses to delete a database file
+  // a connection still holds open.
+  t.after(() => {
+    other?.close();
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   applySchema(db);
   const registry = createPreviewRegistry({
     config: normalizePreviewsConfig({ enabled: true, publicBaseUrl: 'https://preview.example.com' }, { env: {}, relayPort: 3333 }),
@@ -109,8 +116,7 @@ test('a flush on a locked database returns within the shutdown\'s time, and the 
   const waitBefore = db.pragma('busy_timeout', { simple: true });
   assert.ok(waitBefore >= 2_000, 'the driver waits seconds by default');
 
-  const other = new Database(file);
-  t.after(() => { other.close(); db.close(); });
+  other = new Database(file);
   other.exec('BEGIN EXCLUSIVE');
   const startedAt = Date.now();
   registry.flushHits();

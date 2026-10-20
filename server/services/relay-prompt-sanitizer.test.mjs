@@ -80,3 +80,21 @@ test('the slash-command guard the Claude worker puts in front of a "/x" is strip
   assert.equal(stripRelayPromptContext(`${SLASH_COMMAND_GUARD}hello`), `${SLASH_COMMAND_GUARD}hello`);
   assert.equal(stripRelayPromptContext('/review this'), '/review this');
 });
+
+// The guidance (relay-tools.md, joined) gained a line about `immediate`;
+// prompts stored before carry it without that line, and both are stripped.
+test('the relay tool guidance is stripped with and without the immediate line', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const file = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'relay-tools.md');
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  const guidance = lines.join(' ');
+  const line = lines.find((entry) => entry.startsWith('Never pass `immediate`'));
+  assert.ok(line, 'relay-tools.md tells agents not to pass immediate');
+  const before = guidance.replace(` ${line}`, '');
+  assert.notEqual(before, guidance);
+  const mode = '[Relay mode: autopilot] Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.';
+  assert.equal(stripRelayPromptContext(`${mode} ${guidance} tidy the docs`, 'autopilot'), 'tidy the docs');
+  assert.equal(stripRelayPromptContext(`${mode} ${before} tidy the docs`, 'autopilot'), 'tidy the docs');
+});

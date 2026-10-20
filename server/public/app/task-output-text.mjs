@@ -163,7 +163,7 @@ function clampByte(value) {
 }
 
 function plainStyle() {
-  return { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false };
+  return { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false, inverse: false };
 }
 
 function applySgr(state, params) {
@@ -175,11 +175,13 @@ function applySgr(state, params) {
     else if (code === 2) state.dim = true;
     else if (code === 3) state.italic = true;
     else if (code === 4) state.underline = true;
+    else if (code === 7) state.inverse = true;
     else if (code === 22) {
       state.bold = false;
       state.dim = false;
     } else if (code === 23) state.italic = false;
     else if (code === 24) state.underline = false;
+    else if (code === 27) state.inverse = false;
     else if (code >= 30 && code <= 37) state.fg = code - 30;
     else if (code === 39) state.fg = null;
     else if (code >= 40 && code <= 47) state.bg = code - 40;
@@ -204,8 +206,11 @@ function applySgr(state, params) {
 /**
  * One line as styled segments `{ text, fg, bg, bold, dim, italic, underline }`,
  * colours 0–15 or null (256 and truecolor mapped to the nearest of the 16).
- * Adjacent segments never share a style. Any escape that is not SGR is
- * dropped from the text.
+ * Inverse text (SGR 7, until 27 or 0) comes with its colours already swapped
+ * and `inverse: true`: a null `fg` then means the default background as the
+ * text colour, a null `bg` the default text colour as the background (the
+ * filled RUN / PASS / FAIL badges of vitest). Adjacent segments never share a
+ * style. Any escape that is not SGR is dropped from the text.
  */
 export function ansiToSegments(lineText) {
   const text = String(lineText ?? '');
@@ -214,13 +219,17 @@ export function ansiToSegments(lineText) {
   const pushText = (value) => {
     const clean = stripControlKeepSgr(value).replace(/\x1b/g, '');
     if (!clean) return;
+    const fg = state.inverse ? state.bg : state.fg;
+    const bg = state.inverse ? state.fg : state.bg;
     const last = segments[segments.length - 1];
-    if (last && last.fg === state.fg && last.bg === state.bg && last.bold === state.bold
-      && last.dim === state.dim && last.italic === state.italic && last.underline === state.underline) {
+    if (last && last.fg === fg && last.bg === bg && last.bold === state.bold && last.dim === state.dim
+      && last.italic === state.italic && last.underline === state.underline && !!last.inverse === state.inverse) {
       last.text += clean;
       return;
     }
-    segments.push({ text: clean, ...state });
+    const segment = { text: clean, fg, bg, bold: state.bold, dim: state.dim, italic: state.italic, underline: state.underline };
+    if (state.inverse) segment.inverse = true;
+    segments.push(segment);
   };
   let at = 0;
   const pattern = new RegExp(SGR_PATTERN.source, 'g');

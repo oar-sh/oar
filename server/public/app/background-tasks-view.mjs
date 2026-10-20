@@ -12,13 +12,16 @@ import { apiFetch } from './api-client.js';
 import { formatTaskModelLabel, formatTaskTokens } from './task-row-format.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
 import {
+  TASK_OUTPUT_NONE_MESSAGES,
   endedOutcome,
   normalizeStallThreshold,
+  pipeHoldNotice,
   runnerChip,
   stallHint,
   stepsLabel,
   taskHasConsole,
   taskOutputUnavailable,
+  taskPipeHold,
 } from './task-console-render.mjs';
 
 // Shared with the sub-agent rows (subagent-row.mjs); re-exported for the
@@ -52,6 +55,12 @@ const stopsInFlight = new Set();
 const workflowFoldState = new Map();
 let currentConversationId = null;
 let elapsedTimer = null;
+// Counts the `background_tasks` events per conversation. A reload's payload
+// is the set as the relay had it when the request was answered; one that was
+// asked for before the latest event can land after it and would put the
+// older set back (the panel shrinking under the reader, then growing again
+// with the next poll).
+const taskEventCounts = new Map();
 
 const TASK_TYPE_ICONS = {
   local_bash: '⌨️',
@@ -364,13 +373,34 @@ function notifyChange(conversationId) {
 }
 
 /**
+ * Taken before a reload of the conversation is asked for, and handed to
+ * isBackgroundTasksSnapshotCurrent() with its answer.
+ */
+export function backgroundTasksSnapshotMark(conversationId) {
+  return taskEventCounts.get(String(conversationId || '').trim()) || 0;
+}
+
+/**
+ * Whether a reload's sets (`backgroundTasks`, `endedBackgroundTasks`) may
+ * replace the conversation's on the page: no `background_tasks` event for it
+ * arrived since `mark` was taken. Otherwise the event's set is at least as
+ * new, and the next reload brings whatever came after it. Without a mark:
+ * always.
+ */
+export function isBackgroundTasksSnapshotCurrent(conversationId, mark) {
+  return mark === undefined || mark === null || mark === backgroundTasksSnapshotMark(conversationId);
+}
+
+/**
  * The live set (REPLACE semantics). `endedTasks`, when the event or payload
  * carries it, replaces the ended set too; an older relay's event without it
- * leaves the ended rows alone.
+ * leaves the ended rows alone. `event`: it came as a `background_tasks`
+ * event (see isBackgroundTasksSnapshotCurrent).
  */
-export function setConversationBackgroundTasks(conversationId, tasks, { endedTasks } = {}) {
+export function setConversationBackgroundTasks(conversationId, tasks, { endedTasks, event = false } = {}) {
   const id = String(conversationId || '').trim();
   if (!id) return;
+  if (event) taskEventCounts.set(id, backgroundTasksSnapshotMark(id) + 1);
   const normalized = normalizeTaskList(tasks);
   // Drop fold choices for tasks that left this conversation's set so the map
   // cannot grow across long sessions.
@@ -460,6 +490,20 @@ export function findBackgroundTask(conversationId, taskId) {
   return ended ? { task: ended, ended: true } : null;
 }
 
+const panelRenderListeners = new Set();
+
+/** Called after the panel drew its rows (the task console keeps above its row). */
+export function onBackgroundTasksPanelRendered(listener) {
+  panelRenderListeners.add(listener);
+  return () => panelRenderListeners.delete(listener);
+}
+
+function notifyPanelRendered() {
+  for (const listener of panelRenderListeners) {
+    try { listener(); } catch (error) { console.warn('background task panel listener failed', error?.message || error); }
+  }
+}
+
 /** Called with the conversation id after any change of tasks or health. */
 export function subscribeBackgroundTasks(listener) {
   changeListeners.add(listener);
@@ -538,7 +582,7 @@ function taskTitleHtml(task) {
     return `<button type="button" class="subagent-open bg-task-desc" data-subagent-open="${escHtml(runId)}" title="Open this sub-agent's thoughts, tool calls and reply">${text}</button>`;
   }
   if (taskOutputUnavailable(task)) {
-    return `<span class="bg-task-desc bg-task-desc-no-output" title="output not available for this provider">${text}</span>`;
+    return `<span class="bg-task-desc bg-task-desc-no-output" title="${escHtml(TASK_OUTPUT_NONE_MESSAGES.provider)}">${text}</span>`;
   }
   if (taskHasConsole(task)) {
     return `<button type="button" class="task-console-open bg-task-desc" data-task-console="${escHtml(task.taskId)}" title="Open this task's output">${text}</button>`;
@@ -553,10 +597,13 @@ function chipHtml(health) {
 }
 
 // Always present on a live row (hidden while output is fresh) so the 1 s
-// timer can update it in place.
-function stallHtml(hint) {
+// timer can update it in place. A command piped into tail is quiet
+// until it ends: its hover title says so.
+function stallHtml(hint, task) {
   const classes = `bg-task-stall${hint?.warn ? ' bg-task-stall-warn' : ''}`;
-  return `<span class="${classes}"${hint ? '' : ' hidden'}>${hint ? escHtml(hint.text) : ''}</span>`;
+  const notice = pipeHoldNotice(taskPipeHold(task));
+  const title = notice ? ` title="${escHtml(notice.title)}"` : '';
+  return `<span class="${classes}"${title}${hint ? '' : ' hidden'}>${hint ? escHtml(hint.text) : ''}</span>`;
 }
 
 function taskSteps(task) {
@@ -613,7 +660,7 @@ export function renderTaskRow(conversationId, task) {
           ${tokens ? `<span class="bg-task-tokens">${escHtml(tokens)}</span>` : ''}
           ${steps ? `<span class="bg-task-steps">${escHtml(steps)}</span>` : ''}
           ${chipHtml(health)}
-          ${taskHasConsole(task) ? stallHtml(stall) : ''}
+          ${taskHasConsole(task) ? stallHtml(stall, task) : ''}
           <span class="bg-task-elapsed">${escHtml(elapsed)}</span>
           ${task.stoppable === false ? '' : `<button type="button" class="bg-task-stop" data-task-id="${escHtml(task.taskId)}" ${stopping ? 'disabled' : ''}>${stopping ? 'Stopping…' : 'Stop'}</button>`}
         </span>
@@ -684,6 +731,7 @@ export function renderBackgroundTasksPanel() {
     const staleList = panel.querySelector('#background-tasks-list');
     if (staleList) staleList.innerHTML = '';
     stopElapsedTimer();
+    notifyPanelRendered();
     return;
   }
   const wasOpen = panel.hasAttribute('open');
@@ -733,6 +781,7 @@ export function renderBackgroundTasksPanel() {
   if (wasOpen) panel.setAttribute('open', '');
   if (tasks.length) startElapsedTimer();
   else stopElapsedTimer();
+  notifyPanelRendered();
 }
 
 // A preview created, closed, or flipping online/offline re-renders the panel;

@@ -145,6 +145,7 @@ test('windows: the list comes from the inspector, read without holding the threa
   const calls = [];
   const lister = createProcessLister({
     platform: 'win32',
+    systemToolPath: (name) => `C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\${name}`,
     readdirSyncImpl: () => { throw new Error('there is no /proc to read'); },
     execFileImpl: (command, args, options, done) => {
       calls.push({ command, args, options });
@@ -162,7 +163,7 @@ test('windows: the list comes from the inspector, read without holding the threa
   ]);
   assert.equal(list[1].commandLine, 'pwsh -Command npm test');
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].command, 'powershell.exe');
+  assert.equal(calls[0].command, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
   assert.match(calls[0].args.at(-1), /Get-CimInstance Win32_Process/);
   assert.match(calls[0].args.at(-1), /CreationDate/);
   assert.equal(calls[0].options.windowsHide, true);

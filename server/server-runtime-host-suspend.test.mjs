@@ -62,10 +62,16 @@ test('routes, status, socket connect and shutdown are wired', () => {
 });
 
 test('relay shutdown state is announced on request, drain and cancel', () => {
-  const body = sliceBetween(runtimeSource, 'function cancelRelayShutdown(', '\nfunction toNullableInt');
-  assert.match(body, /pendingRelayShutdownRequest = null;[\s\S]*emitRelayShutdownState\(\);/);
-  assert.match(body, /void shutdownRuntime\([\s\S]*?\);\s*emitRelayShutdownState\(\);/);
-  assert.match(body, /if \(pendingRelayShutdownRequest\) emitRelayShutdownState\(\);/);
+  // The queue (services/relay-restart-queue.mjs) emits on every change; the
+  // runtime sends each one to every client.
+  const wiring = sliceBetween(runtimeSource, 'const relayRestartQueue = createRelayRestartQueue({', '\n});');
+  assert.match(wiring, /onStateChange: \(state\) => \{\s*try \{ io\.emit\('relay_shutdown_state', state\); \} catch \{\}/);
+  assert.match(wiring, /onMaxWaitReached: \(state\) => \{[\s\S]*pushDispatchService\.notifyRelayRestart\(/);
+  const queueSource = fs.readFileSync(path.join(__dirname, 'services', 'relay-restart-queue.mjs'), 'utf8');
+  for (const fn of ['function fire(', 'function cancel(', 'function requestShutdown(', 'function keepWaiting(']) {
+    const body = sliceBetween(queueSource, fn, '\n  }\n');
+    assert.match(body, /emit\(true\);/, `${fn} announces the new state`);
+  }
 });
 
 test('HTTP surface: GET/POST/cancel for host suspend, cancel for relay shutdown, status field', () => {

@@ -48,7 +48,7 @@ function createMockApp() {
   };
 }
 
-function setup({ withRemoteRelays = true } = {}) {
+function setup({ withRemoteRelays = true, modelCatalog = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
@@ -84,11 +84,11 @@ function setup({ withRemoteRelays = true } = {}) {
     collectOrphanedUploadsFromConversation: () => [],
     deleteOrphanedUploads: () => ({ deletedCount: 0 }),
     queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
-    getModelCatalogState: () => ({
+    getModelCatalogState: () => modelCatalog || ({
       models: ['gpt-5.4-mini'],
       currentModel: 'gpt-5.4-mini',
       defaultModel: 'gpt-5.4-mini',
-      reasoningByModel: { 'gpt-5.4-mini': ['none'] },
+      reasoningByModel: { 'gpt-5.4-mini': ['none', 'high'] },
       providersByModel: { 'gpt-5.4-mini': ['github-copilot'] },
     }),
     updateModelCatalog: () => ({}),
@@ -299,4 +299,54 @@ test('deleting a conversation forgets its remote relay unlocks', async () => {
   assert.equal(deleted.status, 200, JSON.stringify(deleted.body));
   assert.deepEqual(fx.repository.listUnlocks(conversationId), []);
   assert.equal(fx.repository.listUnlocks('conv-other').length, 1);
+});
+
+test('an agent\'s bootstrap with a Copilot model the catalogue lacks is refused; the user\'s falls back as before', async () => {
+  const fx = setup();
+  const refused = await fx.bootstrap({ origin: ORIGIN, model: 'gpt-5-4-mini' }, agentHeaders);
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.equal(refused.body.error, 'Unknown model \'gpt-5-4-mini\' for Copilot; did you mean \'gpt-5.4-mini\'? Valid ids: gpt-5.4-mini.');
+  assert.deepEqual(refused.body.supportedModels, ['gpt-5.4-mini']);
+  assert.deepEqual(refused.body.suggestedModels, ['gpt-5.4-mini']);
+  assert.equal(fx.db.prepare(`SELECT COUNT(*) AS n FROM conversations`).get().n, 0, 'nothing is created');
+
+  const listed = await fx.bootstrap({ origin: ORIGIN, model: 'GPT-5.4-mini' }, agentHeaders);
+  assert.equal(listed.status, 200);
+  assert.equal(listed.body.selectedModel, 'gpt-5.4-mini', 'bound in the list\'s casing');
+  // A listed id with its effort: the listed id, and the effort apart.
+  const variant = await fx.bootstrap({ origin: ORIGIN, model: 'gpt-5.4-mini-high' }, agentHeaders);
+  assert.equal(variant.status, 200, JSON.stringify(variant.body));
+  assert.equal(variant.body.selectedModel, 'gpt-5.4-mini');
+  assert.equal(variant.body.preferredReasoningEffort, 'high');
+  // An effort the catalogue does not list for it: refused, the base suggested.
+  const maxed = await fx.bootstrap({ origin: ORIGIN, model: 'gpt-5.4-mini-max' }, agentHeaders);
+  assert.equal(maxed.body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.equal(maxed.body.suggestedModels[0], 'gpt-5.4-mini');
+  const auto = await fx.bootstrap({ origin: ORIGIN, model: 'auto' }, agentHeaders);
+  assert.equal(auto.status, 200);
+
+  const human = await fx.bootstrap({ model: 'gpt-5-4-mini' });
+  assert.equal(human.status, 200);
+  assert.equal(human.body.selectedModel, 'gpt-5.4-mini');
+});
+
+test('before Copilot discovery ("auto" only) an agent\'s model is not refused; another provider\'s model is answered as such', async () => {
+  const early = setup({ modelCatalog: { models: ['auto'], currentModel: 'auto', defaultModel: 'auto', providersByModel: {} } });
+  const unchecked = await early.bootstrap({ origin: ORIGIN, model: 'gpt-5.4' }, agentHeaders);
+  assert.notEqual(unchecked.body.code, 'COPILOT_MODEL_UNAVAILABLE');
+
+  const merged = setup({
+    modelCatalog: {
+      models: ['gpt-5.4-mini', 'claude-sonnet-5'],
+      currentModel: 'gpt-5.4-mini',
+      defaultModel: 'gpt-5.4-mini',
+      providersByModel: { 'gpt-5.4-mini': ['github-copilot'], 'claude-sonnet-5': ['claude'] },
+    },
+  });
+  const claudeOnly = await merged.bootstrap({ origin: ORIGIN, model: 'claude-sonnet-5', providerType: 'github' }, agentHeaders);
+  assert.equal(claudeOnly.body.code, 'CLAUDE_PROVIDER_REQUIRED');
+  const typo = await merged.bootstrap({ origin: ORIGIN, model: 'gpt-5-4-mini' }, agentHeaders);
+  assert.equal(typo.body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.deepEqual(typo.body.supportedModels, ['gpt-5.4-mini'], 'Copilot\'s own models only');
 });

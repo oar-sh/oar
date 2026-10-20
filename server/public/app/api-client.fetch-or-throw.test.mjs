@@ -17,6 +17,7 @@ const {
   relaunchSessionWorkerWithWorkspaceRoot,
   requestQueueEmpty,
   requestRelayRestart,
+  sendMessage,
 } = await import('./api-client.js');
 
 function answer(status, body) {
@@ -111,4 +112,32 @@ test('restart, cancel restart and empty queue throw on a refusal instead of retu
   await withFetch(answer(200, { ok: true, accepted: true }), async () => {
     assert.deepEqual(await requestRelayRestart(), { ok: true, accepted: true });
   });
+});
+
+test('a send the relay refuses with 409 hands its reason to the composer and still returns null', async () => {
+  const refusals = [];
+  await withFetch(answer(409, {
+    error: 'This conversation\'s model "gpt-4.9-retired" is no longer available. Choose a model and send again.',
+    code: 'CONVERSATION_MODEL_UNAVAILABLE',
+  }), async () => {
+    const result = await sendMessage({ text: 'hi' }, { onRefused: (reason) => refusals.push(reason) });
+    assert.equal(result, null);
+  });
+  assert.deepEqual(refusals, ['This conversation\'s model "gpt-4.9-retired" is no longer available. Choose a model and send again.']);
+});
+
+test('a replayed send that already landed, and other failures, are no refusal', async () => {
+  const refusals = [];
+  const onRefused = (reason) => refusals.push(reason);
+  await withFetch(answer(409, { error: 'Message already exists', code: 'DUPLICATE_MESSAGE_ID' }), async () => {
+    assert.equal(await sendMessage({ text: 'hi' }, { onRefused }), null);
+  });
+  await withFetch(answer(500, { error: 'boom' }), async () => {
+    assert.equal(await sendMessage({ text: 'hi' }, { onRefused }), null);
+  });
+  await withFetch(answer(409, new Error('not json')), async () => {
+    assert.equal(await sendMessage({ text: 'hi' }), null);
+    assert.equal(await sendMessage({ text: 'hi' }, { onRefused }), null);
+  });
+  assert.deepEqual(refusals, []);
 });

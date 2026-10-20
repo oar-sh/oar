@@ -4,9 +4,13 @@
 // as `task_output_chunk`, which the relay sends only to pages watching the
 // task (task-console-watch.mjs). A chunk that does not continue where the
 // view stands (a dropped chunk, a rewritten file) reads the tail again.
-// "Load earlier" pages back up to 5 MB. A provider that can only give a
-// snapshot is read again every 3 s instead. Full-screen on phones; Escape,
-// ×, a click outside and the system back close it.
+// "Load earlier" pages back up to 5 MB (from the top of the output, or the
+// header while following the end). A provider that can only give a snapshot
+// is read again every 3 s instead. A command piped into tail gets a
+// marker where its output stops until it ends. On wider screens the console
+// ends above the task's row in the composer panel, so the row's chip stays
+// in view; full-screen on phones. Escape, ×, a click outside and the system
+// back close it.
 
 import { apiFetchOrThrow } from './api-client.js';
 import { currentConvId } from './store.js';
@@ -19,22 +23,32 @@ import {
   getBackgroundTaskHealth,
   getTaskStallMinutes,
   isBackgroundTaskStopping,
+  onBackgroundTasksPanelRendered,
   stopBackgroundTask,
   subscribeBackgroundTasks,
 } from './background-tasks-view.mjs';
 import {
+  TASK_OUTPUT_NONE_MESSAGES,
   buildLineNode,
   chunkAction,
   chunkEndOffset,
   consoleMetaParts,
   findFirstFailureIndex,
   loadEarlierState,
+  pipeHoldNotice,
   runnerChip,
+  showPipeHoldMarker,
   stallHint,
+  taskPipeHold,
 } from './task-console-render.mjs';
 
 const TAIL_LINES = 2000;
 const SNAPSHOT_POLL_MS = 3000;
+// Wider than a phone, the console stops above the task's row when the row's
+// top is at least this far down the window (the console keeps about 320 px
+// of it); otherwise it covers the page as before.
+const PHONE_MAX_WIDTH = 680;
+const ABOVE_ROW_MIN_TOP = 360;
 
 const tc = {
   open: false,
@@ -56,6 +70,8 @@ const tc = {
   partialNode: null,
   startOffset: 0,
   nextOffset: 0,
+  // Where the output stood at the first read: past it, output came in.
+  openedAt: null,
   size: 0,
   hasMoreBefore: false,
   loadedBytes: 0,
@@ -86,7 +102,9 @@ function elements() {
     stop: document.getElementById('task-console-stop'),
     scroll: document.getElementById('task-console-scroll'),
     earlier: document.getElementById('task-console-earlier'),
+    earlierTop: document.getElementById('task-console-earlier-top'),
     body: document.getElementById('task-console-body'),
+    hold: document.getElementById('task-console-hold'),
     status: document.getElementById('task-console-status'),
     jump: document.getElementById('task-console-jump'),
   };
@@ -139,11 +157,13 @@ function renderHeader() {
     }).join(' · ');
   }
   const health = getBackgroundTaskHealth(tc.conversationId, tc.taskId) || tc.health;
+  const holdNotice = pipeHoldNotice(taskPipeHold(task));
   if (stall) {
     const hint = ended ? null : stallHint(health?.lastOutputAt, getTaskStallMinutes(tc.conversationId));
     stall.hidden = !hint;
     stall.textContent = hint ? hint.text : '';
     stall.className = hint?.warn ? 'tc-stall tc-stall-warn' : 'tc-stall';
+    stall.title = holdNotice ? holdNotice.title : '';
   }
   const chipInfo = runnerChip(health);
   if (chip) {
@@ -160,6 +180,56 @@ function renderHeader() {
     stop.disabled = stopping;
     stop.textContent = stopping ? 'Stopping…' : 'Stop';
   }
+  renderHold();
+  syncLayout();
+}
+
+/** The "output stops here" marker under the last line, while nothing new came. */
+function renderHold() {
+  const { hold } = elements();
+  if (!hold) return;
+  const found = currentTask();
+  const program = taskPipeHold(found?.task || tc.answerTask);
+  const notice = pipeHoldNotice(program);
+  const show = !!notice && !tc.loading && showPipeHoldMarker({
+    program,
+    ended: tc.ended || !!found?.ended,
+    kind: tc.kind,
+    openedAt: tc.openedAt,
+    nextOffset: tc.nextOffset,
+  });
+  hold.hidden = !show;
+  if (!show) return;
+  hold.querySelector('.tc-hold-text').textContent = notice.text;
+  hold.querySelector('.tc-hold-hint').textContent = notice.hint;
+}
+
+/**
+ * Wider than a phone, the modal ends above the task's row in the composer
+ * panel, so the row (its ✓/✘ chip, clock and Stop) stays in view and live.
+ * Without the row on screen, or with too little room above it, the console
+ * covers the page as before.
+ */
+function syncLayout() {
+  const { modal } = elements();
+  if (!modal) return;
+  let bottom = 0;
+  if (tc.open && window.innerWidth > PHONE_MAX_WIDTH) {
+    const panel = document.getElementById('background-tasks-panel');
+    const row = panel && !panel.hidden && panel.hasAttribute('open')
+      ? panel.querySelector(`.bg-task-row[data-task-id="${CSS.escape(tc.taskId)}"]`)
+      : null;
+    const rect = row?.getBoundingClientRect?.();
+    if (rect && rect.height > 0 && rect.top >= ABOVE_ROW_MIN_TOP && rect.top < window.innerHeight) {
+      bottom = Math.ceil(window.innerHeight - rect.top + 6);
+    }
+  }
+  modal.classList.toggle('tc-above-panel', bottom > 0);
+  modal.style.bottom = bottom > 0 ? `${bottom}px` : '';
+  // Above the panel the page below stays usable: the console is no modal then.
+  const dialog = modal.querySelector('[role="dialog"]');
+  if (bottom > 0) dialog?.removeAttribute('aria-modal');
+  else dialog?.setAttribute('aria-modal', 'true');
 }
 
 function renderStatus() {
@@ -168,7 +238,7 @@ function renderStatus() {
   const hasLines = tc.earlierLines.length || tc.folded.lines.length || tc.folded.partial;
   let text = '';
   if (tc.error) text = tc.error;
-  else if (tc.kind === 'none') text = tc.message || 'output not available for this provider';
+  else if (tc.kind === 'none') text = tc.message || TASK_OUTPUT_NONE_MESSAGES.provider;
   else if (tc.loading && !hasLines) text = 'Loading…';
   else if (!hasLines && !tc.note) text = tc.ended ? 'This task wrote no output.' : 'No output yet. Lines appear as the task writes them.';
   if (tc.note) text = text ? `${text} ${tc.note}` : tc.note;
@@ -176,13 +246,17 @@ function renderStatus() {
   status.hidden = !text;
 }
 
+// Both "Load earlier" buttons: the one above the first line, and the
+// header's, which is in reach while following the end.
 function renderEarlierButton() {
-  const { earlier } = elements();
-  if (!earlier) return;
+  const { earlier, earlierTop } = elements();
   const state = loadEarlierState({ hasMoreBefore: tc.hasMoreBefore, loadedBytes: tc.loadedBytes, loading: tc.loadingEarlier });
-  earlier.hidden = state.hidden;
-  earlier.disabled = state.disabled;
-  earlier.textContent = state.text;
+  for (const button of [earlier, earlierTop]) {
+    if (!button) continue;
+    button.hidden = state.hidden;
+    button.disabled = state.disabled;
+    button.textContent = state.text;
+  }
 }
 
 // ─── Lines ───────────────────────────────────────────────────────────────────
@@ -202,6 +276,7 @@ function clearLines() {
 function afterContentChange(appended) {
   const { scroll, jump } = elements();
   renderStatus();
+  renderHold();
   if (!scroll) return;
   if (tc.following) {
     scroll.scrollTop = scroll.scrollHeight;
@@ -340,6 +415,7 @@ async function fetchTail({ before = null } = {}) {
   tc.nextOffset = Number.isFinite(Number(data.endOffset)) ? Number(data.endOffset) : Number(data.size) || 0;
   tc.size = Number(data.size) || tc.nextOffset;
   tc.hasMoreBefore = data.hasMoreBefore === true;
+  if (tc.openedAt === null) tc.openedAt = tc.nextOffset;
   if (typeof data.text === 'string') {
     feed(data.text);
     tc.loadedBytes = Math.max(0, tc.nextOffset - tc.startOffset) || data.text.length;
@@ -357,7 +433,11 @@ async function fetchTail({ before = null } = {}) {
   for (const chunk of pending) applyChunk(chunk);
 }
 
-async function loadEarlier() {
+/**
+ * Pages back. `reveal` (the header's button): the view goes to the lines
+ * just loaded, at the top, instead of staying where the reader was.
+ */
+async function loadEarlier({ reveal = false } = {}) {
   if (!tc.open || tc.loadingEarlier || !tc.hasMoreBefore) return;
   if (loadEarlierState({ hasMoreBefore: true, loadedBytes: tc.loadedBytes }).disabled) return;
   const token = tc.fetchToken;
@@ -372,6 +452,11 @@ async function loadEarlier() {
     if (Number.isFinite(start)) tc.startOffset = start;
     tc.hasMoreBefore = data.hasMoreBefore === true;
     prependEarlier(lines);
+    const { scroll } = elements();
+    if (reveal && scroll && lines.length) {
+      tc.following = false;
+      scroll.scrollTop = 0;
+    }
   } catch (error) {
     if (token === tc.fetchToken) {
       tc.note = errorText(error);
@@ -452,6 +537,7 @@ function resetState() {
   tc.loadingEarlier = false;
   tc.startOffset = 0;
   tc.nextOffset = 0;
+  tc.openedAt = null;
   tc.size = 0;
   tc.hasMoreBefore = false;
   tc.loadedBytes = 0;
@@ -505,6 +591,8 @@ export function closeTaskConsole({ fromHistory = false } = {}) {
   consoleWatch.unwatch();
   clearLines();
   resetState();
+  syncLayout();
+  renderHold();
   syncSnapshotPoll();
   syncTicker();
   if (!fromHistory) consoleHistory?.closed();
@@ -604,13 +692,17 @@ export function initTaskConsole() {
     renderHeader();
   });
 
-  const { modal, stop, scroll, jump, earlier, failure, chip } = elements();
+  const { modal, stop, scroll, jump, earlier, earlierTop, failure, chip } = elements();
   modal?.addEventListener('click', (event) => {
     if (event.target === modal) closeTaskConsole();
   });
   modal?.querySelector('.task-console-close')?.addEventListener('click', () => closeTaskConsole());
   stop?.addEventListener('click', () => void stopTask());
   earlier?.addEventListener('click', () => void loadEarlier());
+  earlierTop?.addEventListener('click', () => void loadEarlier({ reveal: true }));
+  window.addEventListener('resize', () => {
+    if (tc.open) syncLayout();
+  });
   failure?.addEventListener('click', () => jumpToFirstFailure());
   chip?.addEventListener('click', () => jumpToFirstFailure());
   jump?.addEventListener('click', () => {
@@ -624,7 +716,15 @@ export function initTaskConsole() {
   }, { passive: true });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape' || !tc.open) return;
+    // Above the panel, Escape in the composer (or any field outside the
+    // console) is that field's own.
+    if (modal?.classList.contains('tc-above-panel') && !modal.contains(event.target)
+      && event.target?.closest?.('input, textarea, select, [contenteditable="true"], [contenteditable=""]')) return;
     event.preventDefault();
     closeTaskConsole();
+  });
+  // The panel drew its rows again (a fold, a task set): the row may have moved.
+  onBackgroundTasksPanelRendered(() => {
+    if (tc.open) syncLayout();
   });
 }

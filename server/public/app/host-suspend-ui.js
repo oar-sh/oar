@@ -6,8 +6,19 @@
 // host action" setting on purpose: a device with the action hidden must still
 // be able to see and cancel a queued suspend.
 
-import { escHtml, showTransientRelayNotice } from './store.js';
-import { cancelHostSuspend, cancelRelayRestart } from './api-client.js';
+import { showTransientRelayNotice } from './store.js';
+import { cancelHostSuspend } from './api-client.js';
+import {
+  cancelQueuedRelayRestart,
+  isRelayRestartRequestInFlight,
+  keepWaitingForQueuedRelayRestart,
+  noteRelayRestartStateForDialogs,
+  openRestartNowConfirmation,
+  refreshRelayRestartWaitedLabels,
+  relayRestartHeadline,
+  renderRelayRestartRow,
+  setRelayRestartStateSink,
+} from './relay-restart-ui.js';
 
 const BANNER_ID = 'pending-action-banner';
 const SUSPEND_MENU_ID = 'chat-menu-suspend-host';
@@ -20,6 +31,7 @@ const RESTART_MENU_PENDING_LABEL = '🌄 Restart pending…';
 let hostSuspendState = null;
 let relayShutdownState = null;
 let countdownTimer = null;
+let waitedTimer = null;
 let cancelInFlight = false;
 
 export function getHostSuspendState() {
@@ -96,20 +108,10 @@ export function hostSuspendBannerText(state, nowMs = Date.now()) {
     : '💤 Suspend queued — waiting for running agents to finish';
 }
 
+/** The restart row's headline (relay-restart-ui.js renders the whole row). */
 export function relayShutdownBannerText(state) {
   if (!isRelayShutdownPending(state)) return '';
-  const action = state.action === 'restart' || state.restart ? 'restart' : 'shutdown';
-  const icon = action === 'restart' ? '🌄' : '⏻';
-  if (String(state.status || '') === 'shutting_down') {
-    return `${icon} Relay ${action === 'restart' ? 'restarting' : 'shutting down'} now…`;
-  }
-  // Only the processing turns hold it; queued messages wait for the restart.
-  const queue = state.queue || {};
-  const turns = Number(queue.processingCount || 0);
-  const held = Number(queue.pendingCount || 0) + Number(queue.parkedCount || 0);
-  const waiting = turns > 0 ? `waiting for ${turns} running turn${turns === 1 ? '' : 's'} to finish` : 'nothing is running, going down now';
-  const queued = held > 0 ? `; ${held} queued message${held === 1 ? '' : 's'} wait${held === 1 ? 's' : ''} for it` : '';
-  return `${icon} Relay ${action} queued — ${waiting}${queued}`;
+  return relayRestartHeadline(state);
 }
 
 function ensureBanner() {
@@ -165,30 +167,6 @@ async function runCancelHostSuspend() {
   }
 }
 
-async function runCancelRelayShutdown() {
-  if (cancelInFlight) return;
-  cancelInFlight = true;
-  renderPendingActionBanner();
-  try {
-    let result = null;
-    try {
-      result = await cancelRelayRestart();
-    } catch (error) {
-      showTransientRelayNotice(`Failed to cancel the queued relay restart: ${error?.message || 'unknown error'}`, 6000);
-      return;
-    }
-    if (!result?.ok) {
-      showTransientRelayNotice('Failed to cancel the queued relay restart.', 5000);
-      return;
-    }
-    applyRelayShutdownState(result);
-    showTransientRelayNotice(result.cancelled ? 'Queued relay restart cancelled.' : 'No relay restart was pending.', 4000);
-  } finally {
-    cancelInFlight = false;
-    renderPendingActionBanner();
-  }
-}
-
 function syncCountdownTimer() {
   const needsTicker = isHostSuspendPending() && String(hostSuspendState?.status || '') === 'countdown' && hostSuspendState?.fireAt;
   if (needsTicker && !countdownTimer) {
@@ -197,7 +175,26 @@ function syncCountdownTimer() {
     clearInterval(countdownTimer);
     countdownTimer = null;
   }
+  // The restart's waited time ticks in place: rebuilding the row every
+  // second would swallow a click on its buttons.
+  const needsWaitedTicker = String(relayShutdownState?.status || '') === 'queued';
+  if (needsWaitedTicker && !waitedTimer) {
+    waitedTimer = setInterval(() => refreshRelayRestartWaitedLabels(relayShutdownState), 15_000);
+    waitedTimer?.unref?.();
+  } else if (!needsWaitedTicker && waitedTimer) {
+    clearInterval(waitedTimer);
+    waitedTimer = null;
+  }
 }
+
+const relayRestartHandlers = {
+  onOpen: (conversationId) => {
+    if (conversationId && typeof window.openConversation === 'function') void window.openConversation(conversationId);
+  },
+  onRestartNow: () => openRestartNowConfirmation(relayShutdownState),
+  onKeepWaiting: () => keepWaitingForQueuedRelayRestart(),
+  onCancel: () => cancelQueuedRelayRestart(),
+};
 
 export function renderPendingActionBanner() {
   if (typeof document === 'undefined') return;
@@ -211,12 +208,9 @@ export function renderPendingActionBanner() {
     }));
   }
   if (isRelayShutdownPending()) {
-    const restarting = String(relayShutdownState?.status || '') === 'shutting_down';
-    rows.push(bannerRow({
-      key: 'relay-shutdown',
-      text: relayShutdownBannerText(relayShutdownState),
-      cancelLabel: restarting ? '' : 'Cancel',
-      onCancel: runCancelRelayShutdown,
+    rows.push(renderRelayRestartRow(relayShutdownState, {
+      handlers: relayRestartHandlers,
+      busy: isRelayRestartRequestInFlight(),
     }));
   }
   const banner = document.getElementById(BANNER_ID) || (rows.length ? ensureBanner() : null);
@@ -246,6 +240,7 @@ export function applyHostSuspendState(state) {
 
 export function applyRelayShutdownState(state) {
   relayShutdownState = state && typeof state === 'object' ? state : null;
+  noteRelayRestartStateForDialogs(relayShutdownState);
   renderPendingActionBanner();
 }
 
@@ -268,6 +263,11 @@ export function applyPendingActionsFromStatus(status) {
 }
 
 export function initHostSuspendUi() {
+  // A cancel, keep-waiting or restart-now answer carries the new state.
+  setRelayRestartStateSink((state, { rerenderOnly = false } = {}) => {
+    if (rerenderOnly) renderPendingActionBanner();
+    else applyRelayShutdownState(state);
+  });
   renderPendingActionBanner();
 }
 
@@ -276,6 +276,7 @@ export function __resetHostSuspendUiForTests() {
   relayShutdownState = null;
   cancelInFlight = false;
   if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  if (waitedTimer) { clearInterval(waitedTimer); waitedTimer = null; }
   document.getElementById(BANNER_ID)?.remove();
   syncMenuLabels();
 }

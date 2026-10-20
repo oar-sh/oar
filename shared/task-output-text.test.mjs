@@ -8,7 +8,9 @@ import {
   ansiToSegments,
   cleanTaskOutput,
   createLineFolder,
+  createRunnerTally,
   foldTaskOutput,
+  normalizeTaskCommand,
   normalizeTaskOutputKind,
   normalizeTaskOutputPath,
   parseRunnerSummary,
@@ -133,6 +135,24 @@ test('256-colour and truecolor map to the nearest of the 16', () => {
   assert.equal(ansiToSegments('\x1b[38;5mx')[0].fg, null);
 });
 
+test('inverse text swaps its colours until SGR 27 or a reset', () => {
+  // vitest's badge: inverse, bold, a colour; then the colour, bold and inverse end.
+  assert.deepEqual(ansiToSegments('\x1b[7m\x1b[1m\x1b[36m RUN \x1b[39m\x1b[22m\x1b[27m v2.1.8'), [
+    { text: ' RUN ', fg: null, bg: 6, bold: true, dim: false, italic: false, underline: false, inverse: true },
+    { text: ' v2.1.8', fg: null, bg: null, bold: false, dim: false, italic: false, underline: false },
+  ]);
+  // Both colours set: swapped. 0 ends it as well.
+  assert.deepEqual(ansiToSegments('\x1b[31;42;7mx\x1b[0my').map(({ text, fg, bg, inverse }) => ({ text, fg, bg, inverse })), [
+    { text: 'x', fg: 2, bg: 1, inverse: true },
+    { text: 'y', fg: null, bg: null, inverse: undefined },
+  ]);
+  // Neither set: the console's own colours, swapped (fg and bg stay null).
+  const [plain] = ansiToSegments('\x1b[7m FAIL \x1b[27m');
+  assert.deepEqual([plain.fg, plain.bg, plain.inverse], [null, null, true]);
+  // Inverse and plain text with the same colours stay apart.
+  assert.deepEqual(ansiToSegments('a\x1b[7mb\x1b[27mc').map((segment) => segment.text), ['a', 'b', 'c']);
+});
+
 test('adjacent text with the same style is one segment, and other escapes vanish', () => {
   assert.deepEqual(ansiToSegments('\x1b[33ma\x1b[33mb\x1b[2Kc').map((segment) => segment.text), ['abc']);
   assert.deepEqual(ansiToSegments(''), []);
@@ -164,6 +184,43 @@ test('scrubTaskOutput removes the known credential shapes', () => {
     [fake('-----BEGIN RSA PRIVATE', ' KEY-----\nMIIEow\n-----END RSA PRIVATE', ' KEY-----'), '[redacted private key]'],
   ];
   for (const [input, expected] of cases) assert.equal(scrubTaskOutput(input), expected, input);
+});
+
+test('scrubTaskOutput: flags, query strings, webhooks, other Authorization schemes and AWS files', () => {
+  const cases = [
+    ['curl -u builder:s3cr3tpass https://example.com/api', 'curl -u builder:[redacted] https://example.com/api'],
+    ['curl --user=builder:s3cr3tpass https://example.com', 'curl --user=builder:[redacted] https://example.com'],
+    ['deploy --password hunter22 --verbose', 'deploy --password [redacted] --verbose'],
+    ['deploy --token=abcd1234 && echo ok', 'deploy --token=[redacted] && echo ok'],
+    ['vault write --secret "lantern-key-9" x', 'vault write --secret "[redacted]" x'],
+    ['mysql -u app -phunter22 lantern', 'mysql -u app -p[redacted] lantern'],
+    ['docker login -u builder -p hunter22 registry.example.com', 'docker login -u builder -p [redacted] registry.example.com'],
+    ['aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCY', 'aws_secret_access_key = [redacted]'],
+    [`post ${fake('https://hooks.slack', '.com/services/', 'T0000/B0000/XXXXXXXX')} done`, 'post https://hooks.slack.com/services/[redacted] done'],
+    ['GET https://example.com/a?key=abc123&page=2', 'GET https://example.com/a?key=[redacted]&page=2'],
+    ['blob https://store.example.com/f?sv=2024&sig=Zx9%2Bqw', 'blob https://store.example.com/f?sv=2024&sig=[redacted]'],
+    ['curl -H "Authorization: token 0123456789abcdef0123"', 'curl -H "Authorization: token [redacted]"'],
+    ['curl -ualice:s3cr3tpass https://example.com', 'curl -ualice:[redacted] https://example.com'],
+    ['aws configure set aws_secret_access_key wJalrXUtnFEMIK7MDENGbPxRfiCY', 'aws configure set aws_secret_access_key [redacted]'],
+    ['sshpass -p hunter22 ssh builder@192.0.2.10', 'sshpass -p [redacted] ssh builder@192.0.2.10'],
+    ['redis-cli -h 192.0.2.10 -a hunter22 ping', 'redis-cli -h 192.0.2.10 -a [redacted] ping'],
+    ['git -c http.extraheader="AUTHORIZATION: basic YWxpY2U6czNjcmV0" fetch', 'git -c http.extraheader="AUTHORIZATION: basic [redacted]" fetch'],
+  ];
+  for (const [input, expected] of cases) assert.equal(scrubTaskOutput(input), expected, input);
+  // A reference to a secret is no secret: the command stays readable.
+  for (const line of [
+    'API_TOKEN=$(cat ~/.lantern-token) npm run deploy',
+    'deploy --token $LANTERN_TOKEN',
+    'token: $LANTERN_TOKEN',
+    'docker login -u builder --password-stdin registry.example.com',
+    'docker run -u 1000:1000 lantern',
+    'docker run -u node:node lantern',
+    'ps -u alice:staff',
+    'The basic functionality works; Bearer tokens are explained below.',
+    'mkdir -p build/lantern && cp -pr src dist',
+    'gcc -pthread -pedantic -o lantern main.c',
+    'GET /lantern?page=2&sort=asc 200',
+  ]) assert.equal(scrubTaskOutput(line), line, line);
 });
 
 test('scrubTaskOutput leaves ordinary test output alone', () => {
@@ -234,6 +291,19 @@ test('turbo task summary (pnpm running turbo)', () => {
   assert.deepEqual(parseRunnerSummary([' Tasks:    3 successful, 1 failed, 4 total']).failed, 1);
 });
 
+test('a task command line: controls and colours out, credentials scrubbed, cut at 2,000 characters', () => {
+  assert.equal(normalizeTaskCommand('  npm test 2>&1 | tail -40  '), 'npm test 2>&1 | tail -40');
+  assert.equal(normalizeTaskCommand(`\x1b[1mGITHUB_TOKEN=${GH_TOKEN} gh pr list\x1b[0m`), 'GITHUB_TOKEN=[redacted] gh pr list');
+  assert.equal(normalizeTaskCommand('curl -H "Authorization: Bearer abc.def.ghi.jkl" https://example.com | head'), 'curl -H "Authorization: Bearer [redacted]" https://example.com | head');
+  assert.equal(normalizeTaskCommand(`echo ${'x'.repeat(9000)}`).length, TASK_OUTPUT_LIMITS.commandCharsMax);
+  // Colours go before the scrub: a value split by an SGR code is still caught.
+  assert.equal(normalizeTaskCommand('DB_PASSWORD=\x1b[1mhunter22lantern\x1b[0m npm start'), 'DB_PASSWORD=[redacted] npm start');
+  // A secret that straddles the 2,000-character cut is scrubbed before the cut.
+  const straddle = normalizeTaskCommand(`${'x'.repeat(1990)} API_TOKEN=abcdefghij0123456789`);
+  assert.doesNotMatch(straddle, /abcdef/);
+  for (const value of [undefined, null, 42, {}, '   ']) assert.equal(normalizeTaskCommand(value), '', String(value));
+});
+
 // ─── Runners: counting while the run goes on ─────────────────────────────────
 
 test('runs still going are counted from their per-test marks', () => {
@@ -252,6 +322,58 @@ test('runs still going are counted from their per-test marks', () => {
     assert.deepEqual([result.passed, result.failed], [passed, failed], name);
     assert.ok(Number.isInteger(result.firstFailureLine), name);
   }
+});
+
+test('the runner tally, fed line by line, counts as the live parse does', () => {
+  for (const [name, marker] of [
+    ['node-test-spec.txt', 'ℹ tests'],
+    ['node-test-tap.txt', '1..2'],
+    ['playwright-list.txt', '  1) '],
+    ['vitest.txt', '⎯⎯⎯⎯⎯⎯⎯ Failed'],
+    ['jest.txt', 'Test Suites'],
+    ['pytest.txt', '====== FAILURES'],
+  ]) {
+    const lines = linesOf(before(fixture(name), marker));
+    const expected = parseRunnerSummary(lines);
+    const tally = createRunnerTally();
+    lines.forEach((line, index) => tally.push(line, index * 100));
+    const result = tally.result();
+    assert.deepEqual(
+      [result.runner, result.passed, result.failed, result.skipped, result.final],
+      [expected.runner, expected.passed, expected.failed, expected.skipped, false],
+      name,
+    );
+    // `at` of the line, not its index.
+    assert.equal(result.firstFailureLine, expected.firstFailureLine * 100, name);
+  }
+});
+
+test('the runner tally starts at the header and again at a new run', () => {
+  const tally = createRunnerTally();
+  tally.push('✓ 123 modules transformed.', 0);
+  assert.equal(tally.result(), null, 'build marks before any runner');
+  tally.push(' RUN  v2.1.8 /work/app', 1);
+  tally.push(' ✓ src/a.test.ts (12 tests) 4ms', 2);
+  tally.push(' ❯ src/b.test.ts (5 tests | 2 failed) 9ms', 3);
+  assert.deepEqual(tally.result(), { runner: 'vitest', passed: 15, failed: 2, skipped: 0, firstFailureLine: 3, final: false });
+  // A second run in the same log counts from its own start.
+  tally.push(' RUN  v2.1.8 /work/app', 4);
+  tally.push(' ✓ src/a.test.ts (12 tests) 4ms', 5);
+  assert.deepEqual(tally.result(), { runner: 'vitest', passed: 12, failed: 0, skipped: 0, firstFailureLine: null, final: false });
+  // jest: its file lines are headers; after a closing summary the next one starts a new run.
+  const jest = createRunnerTally();
+  jest.push('PASS src/wick.test.js', 0);
+  jest.push('  ● flame › keeps its colour', 1);
+  jest.push('Tests:       1 failed, 3 passed, 4 total', 2);
+  jest.push('PASS src/wick.test.js', 3);
+  assert.deepEqual([jest.result().failed, jest.result().firstFailureLine], [0, null]);
+  jest.push('FAIL src/flame.test.js', 4);
+  assert.equal(jest.result().firstFailureLine, 4, 'a file line within the run does not start it over');
+  // Every node:test spec line is a header; none of them starts the count again.
+  const spec = createRunnerTally();
+  for (let index = 0; index < 5; index += 1) spec.push(`✔ case ${index} (1.0ms)`, index);
+  spec.push('✖ case 5 (2.0ms)', 5);
+  assert.deepEqual([spec.result().passed, spec.result().failed, spec.result().firstFailureLine], [5, 1, 5]);
 });
 
 test('a folded repeat counts every time', () => {

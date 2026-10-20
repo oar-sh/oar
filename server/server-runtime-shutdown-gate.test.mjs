@@ -22,9 +22,14 @@ function sliceBetween(source, start, end) {
 }
 
 test('a queued shutdown fires once nothing is processing, whatever is pending or parked', () => {
-  const body = sliceBetween(runtimeSource, 'function requestRelayShutdown(', '\nfunction toNullableInt');
-  assert.match(body, /const tryShutdownWhenIdle = \(\) => \{[\s\S]*?if \(!queuedShutdownCanProceed\(counts\)\) return;/);
-  assert.doesNotMatch(body, /pendingCount[^\n]*processingCount[^\n]*parkedCount[^\n]*<= 0/, 'pending and parked rows no longer hold the restart');
+  // The state machine (services/relay-restart-queue.mjs, unit-tested there)
+  // asks the gate; the runtime only wires it.
+  const queueSource = fs.readFileSync(path.join(__dirname, 'services', 'relay-restart-queue.mjs'), 'utf8');
+  const evaluate = sliceBetween(queueSource, 'function evaluate() {', '\n  function ensurePolling');
+  assert.match(evaluate, /if \(queuedShutdownCanProceed\(queue\)\) \{\s*fire\(\);/);
+  assert.doesNotMatch(evaluate, /pendingCount[^\n]*processingCount[^\n]*parkedCount[^\n]*<= 0/, 'pending and parked rows no longer hold the restart');
+  assert.match(runtimeSource, /const relayRestartQueue = createRelayRestartQueue\(\{\s*getCounts: \(\) => queueCounts\(\),/);
+  assert.match(runtimeSource, /function requestRelayShutdown\(options = \{\}\) \{\s*return relayRestartQueue\.request\(options\);/);
   assert.doesNotMatch(runtimeSource, /countPendingRowsOfStoppedSessions/);
 });
 
@@ -38,5 +43,5 @@ test('the socket delivery path refuses rows while a shutdown is queued, before a
 });
 
 test('the runtime state tells the routes whether a shutdown is queued', () => {
-  assert.match(runtimeSource, /get relayShutdownQueued\(\) \{ return !!pendingRelayShutdownRequest && !runtimeShutdownStarted; \}/);
+  assert.match(runtimeSource, /get relayShutdownQueued\(\) \{ return relayRestartQueue\.isQueued\(\); \}/);
 });

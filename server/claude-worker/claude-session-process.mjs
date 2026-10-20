@@ -60,6 +60,7 @@ import {
 import { createUsageLimitTracker } from '../../shared/claude-usage-limit.mjs';
 import {
   discoverTaskOutputPaths,
+  shellCommandsOf,
   exitCodeFromSummary,
   isShellTaskType,
   outputDirOf,
@@ -1783,8 +1784,10 @@ export function createClaudeSessionRunner({
           // sanitizer whitelists and re-clamps it before storing.
           ...(task.workflowProgress ? { workflowProgress: task.workflowProgress } : {}),
           ...(agentLike && Number.isInteger(task.steps) ? { steps: task.steps } : {}),
-          // Where the relay reads the task's console from.
+          // Where the relay reads the task's console from, and the command
+          // line the console reads a `| tail` off.
           ...(isShellTaskType(task.taskType) ? taskOutputFields(processRef, taskId) : {}),
+          ...(isShellTaskType(task.taskType) && taskCommand(processRef, taskId, task) ? { command: taskCommand(processRef, taskId, task) } : {}),
         };
       });
       return postTaskSet({ tasks, ...(resync ? { resync: true } : {}) }).catch((error) => {
@@ -1846,10 +1849,47 @@ export function createClaudeSessionRunner({
   /** A backgrounded Bash/Monitor result: note its file, and show it on the live row. */
   function recordTaskOutputPaths(sdkMessage) {
     let liveChanged = false;
-    for (const { taskId, outputPath } of discoverTaskOutputPaths(sdkMessage)) {
+    for (const { taskId, outputPath, toolUseId } of discoverTaskOutputPaths(sdkMessage)) {
+      if (toolUseId && !proc.taskToolUses.has(taskId)) {
+        proc.taskToolUses.set(taskId, toolUseId);
+        capMap(proc.taskToolUses, MAX_TASK_OUTPUT_PATHS);
+        if (proc.liveTasks.has(taskId) && proc.shellCommands.has(toolUseId)) liveChanged = true;
+      }
       if (rememberTaskOutputPath(proc, taskId, outputPath) && proc.liveTasks.has(taskId)) liveChanged = true;
     }
     if (liveChanged) publishBackgroundTasks();
+  }
+
+  function capMap(map, max) {
+    while (map.size > max) map.delete(map.keys().next().value);
+  }
+
+  // The command line of each Bash or Monitor call, by its tool_use id: a
+  // shell task's row names it (task_started's tool_use_id, or the call whose
+  // result announced the task's file).
+  function recordShellCommands(sdkMessage) {
+    for (const { toolUseId, command } of shellCommandsOf(sdkMessage)) {
+      proc.shellCommands.set(toolUseId, command);
+      capMap(proc.shellCommands, MAX_TASK_OUTPUT_PATHS);
+    }
+  }
+
+  // A task's command, pinned to its id once found: the 200 newest calls
+  // the map by tool_use id keeps may move past a long-running task's call.
+  function taskCommand(processRef, taskId, task) {
+    const pinned = processRef.taskCommands.get(taskId);
+    if (pinned) return pinned;
+    const toolUseId = task?.toolUseId || processRef.taskToolUses.get(taskId) || '';
+    const command = (toolUseId && processRef.shellCommands.get(toolUseId)) || '';
+    if (command && (processRef.liveTasks.has(taskId) || processRef.departedTasks.has(taskId))) processRef.taskCommands.set(taskId, command);
+    return command;
+  }
+
+  // Pinned commands go with their task: live or departed until its settle.
+  function prunePinnedCommands(processRef) {
+    for (const taskId of [...processRef.taskCommands.keys()]) {
+      if (!processRef.liveTasks.has(taskId) && !processRef.departedTasks.has(taskId)) processRef.taskCommands.delete(taskId);
+    }
   }
 
   /**
@@ -2321,6 +2361,7 @@ export function createClaudeSessionRunner({
   function observeProcessLevel(sdkMessage) {
     const type = String(sdkMessage?.type || '');
     if (type === 'assistant') {
+      recordShellCommands(sdkMessage);
       recordSubagentSpawns(sdkMessage);
       recordSubagentActivity(sdkMessage);
       return;
@@ -2596,6 +2637,7 @@ export function createClaudeSessionRunner({
       }
       syncWorkflowPoller(proc);
       publishBackgroundTasks();
+      prunePinnedCommands(proc);
       evaluateLifecycle();
       return;
     }
@@ -2655,6 +2697,8 @@ export function createClaudeSessionRunner({
         rememberTaskOutputPath(proc, taskId, sdkMessage.output_file);
         const shellLike = isShellTaskType(published?.taskType);
         const outputPath = shellLike ? (proc.taskOutputPaths.get(taskId) || '') : '';
+        const command = shellLike ? taskCommand(proc, taskId, { toolUseId: String(sdkMessage.tool_use_id || published?.toolUseId || '').trim() }) : '';
+        proc.taskCommands.delete(taskId);
         const exitCode = shellLike ? exitCodeFromSummary(sdkMessage.summary) : null;
         const toolUses = Number(sdkMessage.usage?.tool_uses);
         const steps = AGENT_TASK_TYPES.has(String(published?.taskType || '')) && Number.isFinite(toolUses) && toolUses >= 0
@@ -2673,6 +2717,7 @@ export function createClaudeSessionRunner({
             startedAt: published.startedAt || null,
           } : {}),
           ...(outputPath ? { outputPath } : {}),
+          ...(command ? { command } : {}),
           ...(exitCode !== null ? { exitCode } : {}),
           ...(steps !== null ? { steps } : {}),
         });
@@ -3517,6 +3562,12 @@ export function createClaudeSessionRunner({
       // next to it.
       taskOutputPaths: new Map(),
       taskOutputDir: '',
+      // tool_use id → the command line of a Bash or Monitor call, and taskId
+      // → the call whose result announced the task: a shell row's command.
+      shellCommands: new Map(),
+      taskToolUses: new Map(),
+      // taskId → its command, pinned while the task is live or departed.
+      taskCommands: new Map(),
       // taskId → { runId, labels, digestJson } for live local_workflow tasks;
       // pruned by syncWorkflowPoller when a task leaves the live set.
       workflowStates: new Map(),

@@ -15,6 +15,8 @@ import { createKeptPosts } from '../../shared/worker-runtime/kept-posts.mjs';
 import { createTaskOutputSpool } from '../../shared/worker-runtime/task-output-spool.mjs';
 
 const MAX_DESCRIPTION_CHARS = 500;
+// A bound on the post: the relay scrubs the command, then cuts it to 2,000.
+const MAX_COMMAND_CHARS = 8000;
 const SPOOL_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 // Ended terminals remembered for a late exit after their release.
 const MAX_TRACKED_TERMINALS = 200;
@@ -68,6 +70,7 @@ export function createGrokTaskPublisher({
       taskId: entry.taskId,
       taskType: 'local_bash',
       description: entry.description,
+      ...(entry.command ? { command: entry.command } : {}),
       startedAt: entry.startedAt,
       stoppable: true,
       ...(outputPath ? { outputPath, outputKind: 'spool' } : {}),
@@ -117,6 +120,9 @@ export function createGrokTaskPublisher({
     const entry = {
       taskId,
       description: String(command || '').trim().slice(0, MAX_DESCRIPTION_CHARS) || 'Terminal',
+      // The whole command line (the description is cut shorter), for the
+      // console's `| tail` marker.
+      command: String(command || '').trim().slice(0, MAX_COMMAND_CHARS),
       startedAt,
       kill,
       live: false,
@@ -196,6 +202,7 @@ export function createGrokTaskPublisher({
       status,
       summary: exitCode !== null ? `exit code ${exitCode}` : (signal ? `killed by ${signal}` : null),
       description: entry.description,
+      ...(entry.command ? { command: entry.command } : {}),
       taskType: 'local_bash',
       startedAt: entry.startedAt,
       // Absent rather than null: a killed process has no exit code.

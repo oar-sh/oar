@@ -37,6 +37,9 @@ export function createMessageRepository(db) {
         listPinnedMessages: messagePins.listPinnedMessages,
         countPinnedMessages: messagePins.countPinnedMessages,
         getLatestConversationModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
+        // The model of the conversation's latest user turn: one of the
+        // fallbacks for a send that names no model.
+        getLatestUserMessageModel: db.prepare(`SELECT model FROM messages WHERE conversation_id = ? AND role = 'user' AND model IS NOT NULL AND model != '' ORDER BY timestamp DESC LIMIT 1`),
         getRecentMessagesDesc: db.prepare(`SELECT id, role, text, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT ?`),
         insertMsg:      db.prepare(`INSERT INTO messages (id, conversation_id, role, text, model, mode, attachments, timestamp, model_requested, model_actual, model_origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
         // Provenance is derived from the authenticated responder identity at

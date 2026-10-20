@@ -67,10 +67,11 @@ export function createProcessLister({
   readdirSyncImpl = fs.readdirSync,
   readFileSyncImpl = fs.readFileSync,
   execFileImpl = execFile,
+  systemToolPath,
   inspector = null,
 } = {}) {
   if (platform === 'win32') {
-    const windows = inspector || createSessionWorkerProcessInspector({ platform, execFileImpl });
+    const windows = inspector || createSessionWorkerProcessInspector({ platform, execFileImpl, systemToolPath });
     return {
       // A child keeps the pid of its parent after the parent has ended.
       orphansKeepParent: true,

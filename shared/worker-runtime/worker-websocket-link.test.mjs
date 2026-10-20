@@ -167,6 +167,7 @@ test("worker websocket link refreshes readiness and reconnects stale sockets", a
     WebSocketImpl: FakeWebSocket,
     readyRefreshMs: 1000,
     staleConnectionMs: 5000,
+    connectTimeoutMs: 0,
     jitterMs: 0,
     now: () => nowMs,
     setIntervalImpl: (fn, delay) => {
@@ -209,6 +210,7 @@ test("worker websocket link reconnect backoff caps at 8 seconds", () => {
     WebSocketImpl: FakeWebSocket,
     minBackoffMs: 1000,
     maxBackoffMs: 8_000,
+    connectTimeoutMs: 0,
     jitterMs: 0,
     setTimeoutImpl: (fn, delay) => {
       scheduled.push({ fn, delay });
@@ -220,12 +222,15 @@ test("worker websocket link reconnect backoff caps at 8 seconds", () => {
   link.start();
   const first = FakeWebSocket.instances[0];
   first.open();
+  first.receive({ type: "server.hello", reason: "connected" });
   first.close();
   assert.equal(scheduled[0]?.delay, 1000);
   scheduled.shift()?.fn();
 
+  // A completed handshake starts the backoff over.
   const second = FakeWebSocket.instances[1];
   second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
   second.close();
   assert.equal(scheduled[0]?.delay, 1000);
   scheduled.shift()?.fn();
@@ -506,6 +511,7 @@ test("the relay's first hello on each connection is reported, its acks are not",
     getSessionId: () => "sdk-hello",
     onServerHello: (reason) => hellos.push(reason),
     WebSocketImpl: FakeWebSocket,
+    connectTimeoutMs: 0,
     jitterMs: 0,
     setTimeoutImpl: (fn) => { fn(); return {}; },
     clearTimeoutImpl: () => {},
@@ -629,6 +635,8 @@ class FakeWebSocketCloseWhileConnectingErrors extends FakeWebSocket {
   }
 }
 
+const CONNECT_TIMEOUT_MS = 15_000;
+
 function createReconnectHarness(WebSocketImpl, overrides = {}) {
   WebSocketImpl.instances = [];
   const timers = [];
@@ -641,6 +649,7 @@ function createReconnectHarness(WebSocketImpl, overrides = {}) {
     WebSocketImpl,
     minBackoffMs: 1000,
     maxBackoffMs: 8_000,
+    connectTimeoutMs: CONNECT_TIMEOUT_MS,
     jitterMs: 0,
     dbg: (...args) => logs.push(args.join(" ")),
     setTimeoutImpl: (fn, delay) => {
@@ -653,24 +662,33 @@ function createReconnectHarness(WebSocketImpl, overrides = {}) {
     clearIntervalImpl: () => {},
     ...overrides,
   });
-  const pending = () => timers.filter((timer) => !timer.cleared && !timer.fired);
+  const live = () => timers.filter((timer) => !timer.cleared && !timer.fired);
+  // Reconnect delays stay under the connect deadline (backoff caps at 8s).
+  const pending = () => live().filter((timer) => timer.delay !== CONNECT_TIMEOUT_MS);
+  const deadlines = () => live().filter((timer) => timer.delay === CONNECT_TIMEOUT_MS);
+  const fireDeadline = () => {
+    const [timer] = deadlines();
+    assert.ok(timer, "a connect deadline is pending");
+    timer.fired = true;
+    timer.fn();
+  };
   const fireNext = () => {
     const [timer] = pending();
     assert.ok(timer, "a reconnect timer is pending");
     timer.fired = true;
     timer.fn();
   };
-  return { link, timers, logs, pending, fireNext };
+  return { link, timers, logs, pending, deadlines, fireNext, fireDeadline };
 }
 
 test("a connect that fails without a close event still leaves one reconnect timer (Node 22)", () => {
-  const { link, logs, pending, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
+  const { link, logs, pending, deadlines, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
   link.start();
   const first = FakeWebSocketCloseWhileConnectingErrors.instances[0];
   first.fail();
 
   assert.equal(first.closeCalls, 1, "the socket is closed once, not from every error it raises");
-  assert.equal(logs.filter((line) => line.startsWith("worker ws error")).length, 1);
+  assert.equal(logs.filter((line) => line.startsWith("worker ws disconnected")).length, 1);
   assert.equal(pending().length, 1);
   assert.equal(pending()[0].delay, 1000);
   assert.equal(link.status().connected, false);
@@ -684,9 +702,11 @@ test("a connect that fails without a close event still leaves one reconnect time
   const second = FakeWebSocketCloseWhileConnectingErrors.instances[1];
   assert.ok(second, "the link connected again");
   second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
   assert.equal(link.status().connected, true);
   assert.equal(link.status().reconnectAttempt, 0);
   assert.equal(pending().length, 0);
+  assert.equal(deadlines().length, 0, "the hello ends the connect deadline");
   link.stop();
 });
 
@@ -746,5 +766,190 @@ test("a link stopped during a failing connect schedules nothing", () => {
   const socket = FakeWebSocketCloseWhileConnectingErrors.instances[0];
   link.stop();
   socket.fail();
+  assert.equal(pending().length, 0);
+});
+
+test("a rejected handshake (error, then close) leaves one reconnect timer and one log line", () => {
+  const { link, logs, pending, deadlines } = createReconnectHarness(FakeWebSocket);
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  assert.equal(deadlines().length, 1, "a connect deadline runs while connecting");
+  // A non-101 answer (a 401, a relay not listening yet): error, then close.
+  socket.emit("error", { message: "Received network error or non-101 status code." });
+  socket.emit("close", { code: 1006 });
+  assert.equal(pending().length, 1);
+  assert.equal(pending()[0].delay, 1000);
+  assert.equal(deadlines().length, 0, "the deadline ends with the socket");
+  assert.deepEqual(logs.filter((line) => line.startsWith("worker ws disconnected")), [
+    "worker ws disconnected error: Received network error or non-101 status code. attempt=1 retryInMs=1000",
+  ]);
+  link.stop();
+});
+
+test("a connect that never finishes is given up at the deadline and retried", () => {
+  class FakeWebSocketSilent extends FakeWebSocket {
+    // A relay hung in its shutdown: the close handshake never completes.
+    close() { this.readyState = 2; this.closeCalls = (this.closeCalls || 0) + 1; }
+  }
+  const { link, logs, pending, deadlines, fireNext, fireDeadline } = createReconnectHarness(FakeWebSocketSilent);
+  link.start();
+  const first = FakeWebSocketSilent.instances[0];
+  assert.equal(deadlines()[0].delay, CONNECT_TIMEOUT_MS);
+  assert.equal(pending().length, 0);
+
+  fireDeadline();
+  assert.equal(first.closeCalls, 1);
+  assert.equal(pending().length, 1);
+  assert.equal(link.status().connected, false);
+  assert.match(logs.at(-1), /^worker ws disconnected connect-timeout attempt=1/);
+
+  // Late events from the abandoned socket do not add a second timer.
+  first.emit("error", { message: "late" });
+  first.emit("close", { code: 1006 });
+  assert.equal(pending().length, 1);
+
+  fireNext();
+  assert.equal(FakeWebSocketSilent.instances.length, 2, "exactly one new socket");
+  const second = FakeWebSocketSilent.instances[1];
+  assert.equal(deadlines().length, 1, "the new socket has its own deadline");
+  second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
+  assert.equal(deadlines().length, 0);
+  assert.equal(link.status().reconnectAttempt, 0);
+  link.stop();
+});
+
+test("a socket that opens but never gets the relay's hello is a failed handshake", () => {
+  const { link, logs, pending, fireNext, fireDeadline } = createReconnectHarness(FakeWebSocket);
+  link.start();
+  FakeWebSocket.instances[0].open();
+  fireDeadline();
+  assert.equal(FakeWebSocket.instances[0].readyState, FakeWebSocket.instances[0].CLOSED);
+  assert.equal(pending().length, 1, "close after the deadline adds nothing");
+  assert.equal(pending()[0].delay, 1000);
+  assert.match(logs.at(-1), /^worker ws disconnected no-server-hello attempt=1/);
+
+  // An open without a hello does not reset the backoff: a relay that accepts
+  // and drops the socket is not retried every second.
+  fireNext();
+  const second = FakeWebSocket.instances[1];
+  second.open();
+  second.close();
+  assert.equal(pending().length, 1);
+  assert.equal(pending()[0].delay, 2000);
+  link.stop();
+});
+
+test("a socket constructor that throws still schedules the next attempt", () => {
+  let failures = 1;
+  class FakeWebSocketThrows extends FakeWebSocket {
+    constructor(url) {
+      if (failures > 0) {
+        failures -= 1;
+        throw new SyntaxError("Invalid URL");
+      }
+      super(url);
+    }
+  }
+  const { link, logs, pending, fireNext } = createReconnectHarness(FakeWebSocketThrows);
+  assert.doesNotThrow(() => link.start());
+  assert.equal(pending().length, 1);
+  assert.match(logs.at(-1), /^worker ws disconnected connect-failed: Invalid URL attempt=1/);
+  fireNext();
+  assert.equal(FakeWebSocketThrows.instances.length, 1);
+  link.stop();
+});
+
+test("a draining relay whose close never completes is reconnected to", () => {
+  class FakeWebSocketSilentClose extends FakeWebSocket {
+    close() { this.readyState = 2; }
+  }
+  const { link, pending } = createReconnectHarness(FakeWebSocketSilentClose);
+  link.start();
+  const socket = FakeWebSocketSilentClose.instances[0];
+  socket.open();
+  socket.receive({ type: "server.hello", reason: "connected" });
+  socket.receive({ type: "server.draining", reason: "relay-shutdown" });
+  assert.equal(pending().length, 1);
+  assert.equal(link.status().connected, false);
+  // The close that finally lands (the relay force-exited) changes nothing.
+  socket.emit("close", { code: 1006 });
+  assert.equal(pending().length, 1);
+  link.stop();
+});
+
+test("a successful reconnect clears the backoff, the deadline and the log throttle", () => {
+  const { link, logs, pending, deadlines, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors);
+  link.start();
+  for (let index = 0; index < 3; index += 1) {
+    FakeWebSocketCloseWhileConnectingErrors.instances.at(-1).fail();
+    fireNext();
+  }
+  assert.equal(link.status().reconnectAttempt, 3);
+  const socket = FakeWebSocketCloseWhileConnectingErrors.instances.at(-1);
+  socket.open();
+  assert.equal(link.status().reconnectAttempt, 3, "an open alone is not a completed handshake");
+  socket.receive({ type: "server.hello", reason: "connected" });
+  assert.equal(link.status().reconnectAttempt, 0);
+  assert.equal(link.status().reconnectDelayMs, 0);
+  assert.equal(pending().length, 0);
+  assert.equal(deadlines().length, 0);
+
+  // The next outage starts again at the shortest delay, and is logged.
+  const logged = logs.length;
+  socket.close();
+  assert.equal(pending().length, 1);
+  assert.equal(pending()[0].delay, 1000);
+  assert.equal(logs.length, logged + 1);
+  link.stop();
+});
+
+test("failed attempts are logged one line each at first, then at most once a minute", () => {
+  let nowMs = 0;
+  const { link, logs, fireNext } = createReconnectHarness(FakeWebSocketCloseWhileConnectingErrors, {
+    now: () => nowMs,
+  });
+  link.start();
+  const failAndRetry = () => {
+    FakeWebSocketCloseWhileConnectingErrors.instances.at(-1).fail();
+    nowMs += 8000;
+    fireNext();
+  };
+  const disconnectLines = () => logs.filter((line) => line.startsWith("worker ws disconnected"));
+  for (let index = 0; index < 3; index += 1) failAndRetry();
+  assert.equal(disconnectLines().length, 3);
+  // Attempts 4 to 10 fall within the minute after the third line.
+  for (let index = 0; index < 7; index += 1) failAndRetry();
+  assert.equal(disconnectLines().length, 3);
+  failAndRetry();
+  assert.equal(disconnectLines().length, 4);
+  assert.match(disconnectLines().at(-1), /attempt=11 retryInMs=8000 notLogged=7$/);
+  assert.equal(logs.length, disconnectLines().length, "no other line per attempt");
+  link.stop();
+});
+
+test("stop ends reconnecting for good: no timer, no deadline, no new socket", () => {
+  const { link, timers, pending, deadlines } = createReconnectHarness(FakeWebSocket);
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.emit("error", { message: "connect ECONNREFUSED 192.0.2.1:3333" });
+  assert.equal(pending().length, 1);
+  const reconnect = pending()[0];
+  link.stop();
+  assert.equal(pending().length, 0);
+  assert.equal(deadlines().length, 0);
+  // A timer callback already on its way when stop ran does nothing.
+  reconnect.fn();
+  assert.equal(FakeWebSocket.instances.length, 1);
+
+  // Stopping a connected link closes it without a reconnect.
+  link.start();
+  const second = FakeWebSocket.instances[1];
+  second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
+  const timersBefore = timers.length;
+  link.stop();
+  assert.equal(second.readyState, second.CLOSED);
+  assert.equal(timers.length, timersBefore);
   assert.equal(pending().length, 0);
 });

@@ -304,3 +304,44 @@ test('a row deleted while away leaves the page and the kept window on the switch
     lantern.splice(at, 0, deleted);
   }
 });
+
+// JSDOM lays nothing out: each row measures 100 px here, the transcript 600.
+function layOutRows(box) {
+  let top = 0;
+  const height = () => box.querySelectorAll(':scope > .msg').length * 100;
+  Object.defineProperty(box, 'clientHeight', { configurable: true, get: () => 600 });
+  Object.defineProperty(box, 'scrollHeight', { configurable: true, get: height });
+  Object.defineProperty(box, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (value) => { top = Math.max(0, Math.min(height() - 600, Number(value) || 0)); },
+  });
+  return () => {
+    delete box.clientHeight;
+    delete box.scrollHeight;
+    delete box.scrollTop;
+  };
+}
+
+test('an older page keeps the place read as it lands, and a scroll right after it stands', async () => {
+  await journal.openConversation('conv-ferry');
+  await settle();
+  const box = el('messages');
+  const restore = layOutRows(box);
+  try {
+    await journal.openConversation('conv-lantern');
+    await settle();
+    assert.equal(shownIds().length, 20);
+    // At the end, as after the jump-to-bottom button.
+    assert.equal(box.scrollTop, 1400);
+    await conversationView.loadOlderConversationMessages();
+    assert.equal(shownIds().length, 40, 'the older page is on the page');
+    assert.equal(box.scrollTop, 3400, 'the rows read stay where they were');
+    // The reader scrolls up before the next frame: that is where they stay.
+    box.scrollTop = 2100;
+    await settle();
+    assert.equal(box.scrollTop, 2100);
+  } finally {
+    restore();
+  }
+});

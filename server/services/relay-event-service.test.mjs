@@ -254,8 +254,99 @@ test('a one-shot subscription with match fires on the matching reply only, then 
 test('a one-shot subscription without match ends with its first event', () => {
   const { service } = setup();
   service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], once: true });
-  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'shell', description: 'npm test', status: 'completed' } });
+  // A shell command that ended well is no event of the default set.
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'shell', description: 'npm test', status: 'completed', exitCode: 0 } });
+  assert.equal(service.listActive().length, 1);
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'subagent', description: 'Proofread', status: 'completed' } });
   assert.equal(service.listActive().length, 0);
+});
+
+test('by default a shell command that ended well wakes no one; sub-agent ends and failures do', () => {
+  const { db, service, tracker, clock } = setup();
+  const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  assert.ok(sub.events.includes('subagent_finished'));
+  assert.ok(!sub.events.includes('task_finished'));
+  for (let index = 0; index < 5; index += 1) {
+    tracker.noteTaskSet(BUILDER, [{ taskId: `shell-${index}`, taskType: 'local_bash', description: `npm run step-${index}` }]);
+    tracker.noteTaskSettled(BUILDER, { taskId: `shell-${index}`, status: 'completed', summary: 'exited with 0' });
+    clock.advance(60_000);
+  }
+  assert.equal(eventMessages(db).length, 0, 'five shell commands, no wake-up');
+
+  tracker.noteTaskSet(BUILDER, [{ taskId: 'shell-bad', taskType: 'local_bash', description: 'npm run lint' }]);
+  tracker.noteTaskSettled(BUILDER, { taskId: 'shell-bad', status: 'completed', summary: 'Exit code 1' });
+  tracker.noteTaskSet(BUILDER, [{ taskId: 'agent-1', taskType: 'local_agent', description: 'Proofread' }]);
+  tracker.noteTaskSettled(BUILDER, { taskId: 'agent-1', status: 'completed', summary: 'All pages read.' });
+  clock.advance(30_000);
+  const messages = eventMessages(db);
+  assert.equal(messages.length, 1, 'one wake-up for both');
+  assert.match(messages[0].text, /task_failed "npm run lint" \(shell, exit 1\)/);
+  assert.match(messages[0].text, /task_finished "Proofread" \(subagent, exit ok\): All pages read\./);
+  assert.doesNotMatch(messages[0].text, /step-/);
+});
+
+test('a watcher that names task_finished gets every task end, shell commands included', () => {
+  const { db, service, tracker, clock } = setup();
+  const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['task_started', 'task_finished', 'task_failed'] });
+  assert.deepEqual(sub.events, ['task_started', 'task_finished', 'task_failed']);
+  tracker.noteTaskSet(BUILDER, [{ taskId: 'shell-ok', taskType: 'local_bash', description: 'npm run build' }]);
+  tracker.noteTaskSettled(BUILDER, { taskId: 'shell-ok', status: 'completed', summary: 'exited with 0' });
+  clock.advance(30_000);
+  const [message] = eventMessages(db);
+  assert.match(message.text, /task_started "npm run build" \(shell\)/);
+  assert.match(message.text, /task_finished "npm run build" \(shell, exit 0\)/);
+});
+
+test('a subscription stored with exactly the old default gets the new one; lists the watcher named stay', () => {
+  const { db, service, clock } = setup();
+  const OLD_DEFAULT = ['question_asked', 'error', 'turn_end', 'task_finished', 'task_failed', 'stalled', 'all_idle'];
+  const store = (sub, events) => db.prepare(`UPDATE relay_event_subscriptions SET events_json = ? WHERE id = ?`).run(JSON.stringify(events), sub.id);
+  // Made before subagent_finished, without events: the old default, here in another order.
+  const legacy = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  const legacyJson = JSON.stringify([...OLD_DEFAULT].reverse());
+  db.prepare(`UPDATE relay_event_subscriptions SET events_json = ? WHERE id = ?`).run(legacyJson, legacy.id);
+  // Named: the old default plus task_started, and a short list with task_finished.
+  const OTHER = 'conv-fixture-other';
+  seedConversation(db, OTHER, 'Release notes');
+  const superset = service.subscribe({ watcherConversationId: DOCS, sessionIds: [BUILDER] });
+  store(superset, [...OLD_DEFAULT, 'task_started']);
+  const named = service.subscribe({ watcherConversationId: OTHER, sessionIds: [BUILDER], events: ['task_finished', 'turn_end'] });
+
+  const listed = service.listSubscriptions({ watcherConversationId: WATCHER })[0];
+  assert.deepEqual(listed.events, ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle']);
+  assert.ok(service.listSubscriptions({ watcherConversationId: DOCS })[0].events.includes('task_finished'));
+  assert.deepEqual(service.listSubscriptions({ watcherConversationId: OTHER })[0].events, ['task_finished', 'turn_end']);
+
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'shell', description: 'make', status: 'completed', exitCode: 0 } });
+  clock.advance(30_000);
+  assert.equal(eventMessages(db).length, 0, 'the old default takes no shell command end any more');
+  assert.match(eventMessages(db, DOCS)[0].text, /task_finished "make" \(shell, exit 0\)/);
+  assert.match(eventMessages(db, OTHER)[0].text, /task_finished "make" \(shell, exit 0\)/);
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'subagent', description: 'Proofread', status: 'completed' } });
+  clock.advance(30_000);
+  assert.match(eventMessages(db)[0].text, /task_finished "Proofread" \(subagent, exit ok\)/);
+  // Read, never rewritten: the stored row is as it was.
+  assert.equal(db.prepare(`SELECT events_json FROM relay_event_subscriptions WHERE id = ?`).get(legacy.id).events_json, legacyJson);
+});
+
+test('a watcher that names exactly the old default list keeps shell command ends', () => {
+  const { db, service, clock } = setup();
+  const OLD_DEFAULT = ['question_asked', 'error', 'turn_end', 'task_finished', 'task_failed', 'stalled', 'all_idle'];
+  const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: [...OLD_DEFAULT].reverse() });
+  assert.ok(sub.events.includes('task_finished'));
+  assert.ok(sub.events.includes('subagent_finished'), 'stored with it, so it never reads as the old default');
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'shell', description: 'make', status: 'completed', exitCode: 0 } });
+  clock.advance(30_000);
+  assert.match(eventMessages(db)[0].text, /task_finished "make" \(shell, exit 0\)/);
+});
+
+test('subagent_finished alone takes no shell command end; an unknown event name is refused', () => {
+  const { db, service, clock } = setup();
+  service.subscribe({ watcherConversationId: DOCS, sessionIds: [BUILDER], events: ['subagent_finished'] });
+  service.noteTaskEdge({ type: 'task_finished', conversationId: BUILDER, task: { kind: 'shell', description: 'make', status: 'completed', exitCode: 0 } });
+  clock.advance(30_000);
+  assert.equal(eventMessages(db, DOCS).length, 0);
+  assert.throws(() => service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['shell_finished'] }), (error) => error.code === 'invalid');
 });
 
 test('task_started only when asked for; task ends with kind and exit', () => {
@@ -475,7 +566,7 @@ test('all_idle fires once the boot window is over when nothing was reported', ()
 
 test('a task that ended while the relay was away ends with one event', () => {
   const { db, service, tracker, clock } = setup();
-  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['task_finished'] });
   // The worker's kept settle notice, sent again after the restart, twice.
   const settle = { taskId: 'task_fixture_shell', status: 'completed', summary: 'exited with 0', description: 'npm run soak', taskType: 'local_bash', startedAt: T0 - 60_000 };
   tracker.noteTaskSettled(BUILDER, settle);

@@ -618,6 +618,61 @@ test("a row that arrives while a reload is on its way stays on the page", async 
   }
 });
 
+// While the agent works the page polls the conversation, and the answer
+// carries the background tasks. One read before the panel grew and handed
+// over after it put the smaller set back: the panel shrank under the reader
+// and grew again with the next poll, and that second resize could find the
+// reader short of the end.
+test("a poll answer read before the background-task panel grew does not shrink it back", async ({ page, request }) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize(DEVICES.desktop.viewport);
+  const relay = createRelay(request);
+  const isConversationLoad = (url) => url.pathname === `/api/conversation/${relay.conversationId}`;
+  try {
+    for (let index = 0; index < 4; index += 1) await relay.turn(`Question ${index}. ${FILLER}`);
+    await openConversation(page, relay.conversationId);
+    await expect(page.locator("#messages .msg[data-message-id]")).toHaveCount(8);
+    const rows = page.locator("#background-tasks-list .bg-task-row");
+    await relay.backgroundTasks(3);
+    await expect(rows).toHaveCount(3);
+    const running = await relay.queue("Build the report");
+    await relay.dequeue(running.messageId);
+    await expect(page.locator("#thinking-indicator")).toHaveCount(1);
+
+    // As in the test above: each answer is read at once and handed over once
+    // the gate opens.
+    const held = [];
+    let release = () => {};
+    const gate = new Promise((resolve) => { release = resolve; });
+    await page.route(isConversationLoad, async (route) => {
+      const response = await route.fetch();
+      held.push(route.request().url());
+      await gate;
+      await route.fulfill({ response });
+    });
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await relay.backgroundTasks(5);
+    await expect(rows).toHaveCount(5);
+    // The fewest rows the panel shows from here on.
+    await page.evaluate(() => {
+      const list = document.getElementById("background-tasks-list");
+      const count = () => list.querySelectorAll(".bg-task-row").length;
+      window.__fewestTaskRows = count();
+      new MutationObserver(() => { window.__fewestTaskRows = Math.min(window.__fewestTaskRows, count()); })
+        .observe(list, { childList: true });
+    });
+    release();
+    // The held answer, and a poll round after it.
+    await expect.poll(() => held.length).toBeGreaterThan(1);
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => window.__fewestTaskRows)).toBe(5);
+    await expect(rows).toHaveCount(5);
+  } finally {
+    await page.unroute(isConversationLoad).catch(() => {});
+    await relay.cleanup();
+  }
+});
+
 test("a jump into the history comes back to the conversation's end", async ({ page, request }) => {
   test.setTimeout(180_000);
   await page.setViewportSize(DEVICES.desktop.viewport);

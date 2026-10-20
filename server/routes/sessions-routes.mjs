@@ -24,7 +24,13 @@ import {
 } from '../../shared/claude-background-command-limit.mjs';
 import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode, resolveClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
 import { parseThinkingDisplay, parseThinkingEnabled } from '../../shared/claude-thinking.mjs';
-import { isProviderModelAvailable, resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
+import {
+  checkRequestedProviderModel,
+  isAutoModelId,
+  isProviderModelAvailable,
+  resolveProviderModelSelection,
+  unknownProviderModelText,
+} from '../services/provider-model-selection.mjs';
 import {
   DEFAULT_CLAUDE_REASONING_EFFORTS,
   resolveProviderReasoningEffort,
@@ -117,6 +123,7 @@ import {
   PWA_APP_NAME_MAX_LENGTH,
   derivePwaShortName,
 } from '../../shared/pwa-app-name.mjs';
+import { parseRestartResumeUpdate } from '../services/restart-resume-service.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -2139,6 +2146,8 @@ export function registerSessionsRoutes(app, deps) {
     setBackgroundTaskTimeoutMinutes = () => ({ ok: false, error: 'Background task timeout settings are unavailable' }),
     getTaskStallMinutes = () => DEFAULT_TASK_STALL_MINUTES,
     setTaskStallMinutes = () => ({ ok: false, error: 'Task stall settings are unavailable' }),
+    getRestartResumeEnabled = () => false,
+    setRestartResumeEnabled = () => ({ ok: false, error: 'Restart settings are unavailable' }),
     markSharedViewerPresence,
     getSharedWatcherCount,
     statusEventService,
@@ -5792,6 +5801,55 @@ export function registerSessionsRoutes(app, deps) {
         supportedModels: providerModelSelection.availableModels || [],
       });
     }
+    // Copilot falls back to the catalogue's current model for an id it does
+    // not list, which New Chat (it only offers listed ids) never meets. An
+    // agent naming a mistyped id ("gpt-5-4") would get a session on another
+    // model than it asked for, or one its next send cannot reach: refused.
+    // A listed id is bound in the list's casing, and one with its effort
+    // ("gpt-5.4-high") as the listed id plus that effort: the catalogue
+    // lookup below knows exact base ids only and would fall back too.
+    let copilotBoundModel = '';
+    let copilotVariantEffort = '';
+    if (
+      remoteRequest.remote
+      && !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider
+    ) {
+      const mergedModels = Array.isArray(modelState?.models) ? modelState.models : [];
+      const providersByModel = modelState?.providersByModel && typeof modelState.providersByModel === 'object'
+        ? modelState.providersByModel
+        : {};
+      // Copilot's own: listed for it, or for no provider in particular.
+      const copilotModels = mergedModels.filter((modelId) => {
+        const providers = providersByModel[String(modelId || '').trim().toLowerCase()];
+        return !Array.isArray(providers) || providers.length === 0
+          || providers.some((provider) => String(provider || '').trim().toLowerCase() === 'github-copilot');
+      });
+      const reasoningByModel = modelState?.reasoningByModel && typeof modelState.reasoningByModel === 'object'
+        ? modelState.reasoningByModel
+        : {};
+      const copilotCheck = checkRequestedProviderModel({
+        requestedModel: requestedBootstrapModel,
+        provider: 'github',
+        models: copilotModels,
+        effortsFor: (base) => reasoningByModel[base] || reasoningByModel[String(base).toLowerCase()] || null,
+      });
+      // Another provider's model is answered by the checks below ("requires
+      // the Claude provider"), not as an unknown one.
+      const otherProviders = mergedModels.some((modelId) => String(modelId || '').trim().toLowerCase() === requestedBootstrapModel.toLowerCase());
+      if (copilotCheck.status === 'known' && copilotCheck.model && !isAutoModelId(copilotCheck.model)) {
+        copilotBoundModel = copilotCheck.base || copilotCheck.model;
+        copilotVariantEffort = copilotCheck.effort || '';
+      }
+      if (copilotCheck.status === 'unknown' && !otherProviders) {
+        return res.status(400).json({
+          ok: false,
+          error: unknownProviderModelText({ model: copilotCheck.model, provider: 'github', suggestions: copilotCheck.suggestions, models: copilotCheck.models }),
+          code: 'COPILOT_MODEL_UNAVAILABLE',
+          supportedModels: copilotCheck.models,
+          ...(copilotCheck.suggestions.length ? { suggestedModels: copilotCheck.suggestions } : {}),
+        });
+      }
+    }
     if (useOpenAIProvider && openAISettings?.configured !== true) {
       return res.status(400).json({
         ok: false,
@@ -5842,7 +5900,7 @@ export function registerSessionsRoutes(app, deps) {
       bootstrapWorkspaceRootPath = validatedRoot.realPath;
     }
 
-    const selectedModel = providerModelSelection ? providerModelSelection.model : catalogSelectedModel;
+    const selectedModel = providerModelSelection ? providerModelSelection.model : (copilotBoundModel || catalogSelectedModel);
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -5914,7 +5972,7 @@ export function registerSessionsRoutes(app, deps) {
     // first send would apply, so the composer can restore it from the server
     // instead of guessing from localStorage.
     const bootstrapReasoning = resolveProviderReasoningEffort({
-      requestedEffort: req.body?.reasoningEffort,
+      requestedEffort: req.body?.reasoningEffort || copilotVariantEffort,
       strict: bootstrapProviderType === 'openai',
       supportedEfforts: supportedReasoningEffortsForProviderModel({
         providerType: bootstrapProviderType,
@@ -7143,6 +7201,20 @@ export function registerSessionsRoutes(app, deps) {
     const result = setTaskStallMinutes(parsed.minutes);
     if (!result.ok) return res.status(500).json({ error: result.error });
     return res.json(taskStallMinutesPayload(result.minutes));
+  });
+
+  // "After a relay restart, tell interrupted sessions to carry on"
+  // (restart_resume_notes, off by default; services/restart-resume-service.mjs).
+  app.get('/api/settings/restart-resume', auth, (_req, res) => {
+    res.json({ enabled: getRestartResumeEnabled() === true, default: false });
+  });
+
+  app.post('/api/settings/restart-resume', auth, (req, res) => {
+    const parsed = parseRestartResumeUpdate(req.body?.enabled);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const result = setRestartResumeEnabled(parsed.enabled);
+    if (!result.ok) return res.status(500).json({ error: result.error });
+    return res.json({ enabled: result.enabled, default: false });
   });
 
   const pwaAppNamePayload = (appName) => ({

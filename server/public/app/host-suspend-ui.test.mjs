@@ -46,18 +46,24 @@ test('banner text: queued lists the first two blockers, countdown shows the cloc
   assert.equal(ui.hostSuspendBannerText({ status: 'idle' }), '');
 });
 
-test('relay shutdown banner text counts the running turns it waits for and the messages that wait for it', () => {
+test('relay shutdown banner text names how many sessions it waits for', () => {
+  const sessions = [{ conversationId: 'c1', title: 'a', turns: 1 }, { conversationId: 'c2', title: 'b', turns: 2 }];
   assert.equal(
-    ui.relayShutdownBannerText({ status: 'queued', action: 'restart', queue: { pendingCount: 1, processingCount: 2, parkedCount: 0 } }),
-    '🌄 Relay restart queued — waiting for 2 running turns to finish; 1 queued message waits for it',
+    ui.relayShutdownBannerText({ status: 'queued', action: 'restart', waitingFor: sessions, queue: { pendingCount: 1, processingCount: 3, parkedCount: 0 } }),
+    '🌄 Relay restart queued — waiting for 2 sessions',
   );
+  // A state without the list (an older relay) still counts the turns.
   assert.equal(
     ui.relayShutdownBannerText({ status: 'queued', action: 'restart', queue: { pendingCount: 0, processingCount: 1, parkedCount: 0 } }),
-    '🌄 Relay restart queued — waiting for 1 running turn to finish',
+    '🌄 Relay restart queued — waiting for 1 running turn',
   );
   assert.equal(
     ui.relayShutdownBannerText({ status: 'queued', action: 'shutdown', queue: { pendingCount: 2, processingCount: 0, parkedCount: 1 } }),
-    '⏻ Relay shutdown queued — nothing is running, going down now; 3 queued messages wait for it',
+    '⏻ Relay shutdown queued — nothing is running, going ahead now',
+  );
+  assert.equal(
+    ui.relayShutdownBannerText({ status: 'queued', action: 'restart', waitingFor: sessions, maxWaitMs: 30 * 60_000, question: { askedAt: '2026-10-19T08:30:00Z' } }),
+    '🌄 The relay restart has waited 30 min for 2 sessions — restart now, keep waiting or cancel?',
   );
   assert.equal(ui.relayShutdownBannerText({ status: 'shutting_down', action: 'restart' }), '🌄 Relay restarting now…');
   assert.equal(ui.relayShutdownBannerText({ status: 'idle' }), '');

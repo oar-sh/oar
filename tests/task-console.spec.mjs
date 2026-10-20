@@ -69,6 +69,28 @@ function lanternLog() {
   return `${lines.join("\n")}`;
 }
 
+// A vitest run still going, far past the health poller's 64 KB window: the
+// header (with vitest's inverse " RUN " badge) at the top, then `files` file
+// lines of 5 tests, every 50th with one failure.
+function longVitestLog(files) {
+  const lines = ["\x1b[7m\x1b[1m\x1b[36m RUN \x1b[39m\x1b[22m\x1b[27m \x1b[36mv2.1.8 \x1b[39m\x1b[90m/work/lantern-app\x1b[39m", ""];
+  for (let index = 1; index <= files; index += 1) {
+    const name = `src/lantern/module-${String(index).padStart(4, "0")}.test.ts`;
+    lines.push(index % 50 === 0 ? ` ❯ ${name} (5 tests | 1 failed) 12ms` : ` ✓ ${name} (5 tests) 3ms`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// Whether the element's centre is the element itself on screen (nothing,
+// such as the console's backdrop, lies over it).
+async function isUncovered(locator) {
+  return locator.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return !!hit && (hit === element || element.contains(hit));
+  });
+}
+
 test.describe("task console", () => {
   test("a shell task opens its console: tail, live lines, earlier pages, chip, first failure, Stop", async ({ page, request }) => {
     const token = relayToken();
@@ -90,7 +112,7 @@ test.describe("task console", () => {
       // A provider without output keeps a plain title that says so.
       const quietRow = page.locator(`.bg-task-row[data-task-id="cloud-${stamp}"]`);
       await expect(quietRow.locator("[data-task-console]")).toHaveCount(0);
-      await expect(quietRow.locator(".bg-task-desc")).toHaveAttribute("title", "output not available for this provider");
+      await expect(quietRow.locator(".bg-task-desc")).toHaveAttribute("title", "Output is not available for this provider.");
 
       await page.locator(`[data-task-console="${taskId}"]`).click();
       const modal = page.locator("#task-console-modal");
@@ -111,6 +133,9 @@ test.describe("task console", () => {
       // Appended bytes arrive live.
       fs.appendFileSync(outputPath, `lantern live line ${stamp}\n`);
       await expect(body).toContainText(`lantern live line ${stamp}`, { timeout: 5_000 });
+
+      // Nothing pipes into tail here: no "stops here" marker.
+      await expect(page.locator("#task-console-hold")).toBeHidden();
 
       // "Load earlier" prepends the older lines.
       const earlier = page.locator("#task-console-earlier");
@@ -251,6 +276,142 @@ test.describe("task console", () => {
       await expect(page.locator("#background-tasks-panel")).toBeHidden();
     } finally {
       if (conversationId) {
+        await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("a command piped into tail (as the worker reports it): the marker where its output stops, until more comes", async ({ page, request }) => {
+    const token = relayToken();
+    const headers = { Authorization: `Bearer ${token}` };
+    const stamp = Date.now();
+    const dir = tempDir();
+    const outputPath = path.join(dir, "lantern-tail.log");
+    fs.writeFileSync(outputPath, "building the lantern bundle\n");
+    const taskId = `tail-${stamp}`;
+    let conversationId = "";
+    try {
+      conversationId = await startConversation(request, headers, `Run the lantern tests ${stamp}`);
+      await publishTasks(request, headers, conversationId, [
+        // As a worker posts it: the agent's prose as the description, the
+        // command line beside it (with a credential the relay scrubs).
+        {
+          taskId,
+          taskType: "local_bash",
+          description: "Run the lantern tests",
+          command: "LANTERN_API_TOKEN=lan7ernS3cretValue npm run build && npm test 2>&1 | tail -40",
+          startedAt: stamp - 60_000,
+          outputPath,
+          outputKind: "file",
+        },
+        // As Grok posts a terminal: the description is the command line.
+        {
+          taskId: `${taskId}-grok`,
+          taskType: "local_bash",
+          description: "LANTERN_API_TOKEN=lan7ernS3cretValue npm run lint 2>&1 | tail -5",
+          command: "LANTERN_API_TOKEN=lan7ernS3cretValue npm run lint 2>&1 | tail -5",
+          startedAt: stamp - 30_000,
+          outputPath,
+          outputKind: "file",
+        },
+      ]);
+      await openPanel(page, token, conversationId);
+      await expect(page.locator(`.bg-task-row[data-task-id="${taskId}-grok"] .bg-task-desc`)).toHaveText("LANTERN_API_TOKEN=[redacted] npm run lint 2>&1 | tail -5");
+      const conversation = await request.get(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers });
+      const row = ((await conversation.json())?.backgroundTasks || []).find((task) => task.taskId === taskId);
+      expect(row?.command).toBe("LANTERN_API_TOKEN=[redacted] npm run build && npm test 2>&1 | tail -40");
+      // The row's quiet hint carries the reason on hover.
+      await expect(page.locator(`.bg-task-row[data-task-id="${taskId}"] .bg-task-stall`)).toHaveAttribute("title", /^This command pipes into tail, so its output arrives when it ends\./);
+
+      await page.locator(`[data-task-console="${taskId}"]`).click();
+      const body = page.locator("#task-console-body");
+      await expect(body).toContainText("building the lantern bundle");
+      const hold = page.locator("#task-console-hold");
+      await expect(hold).toBeVisible();
+      await expect(hold).toContainText("Output stops here: this command pipes into tail, so the rest arrives when it ends.");
+      await expect(hold).toContainText("> run.log 2>&1");
+      await expect(page.locator("#task-console-stall")).toHaveAttribute("title", /pipes into tail/);
+      expect(await page.content()).not.toContain("lan7ernS3cretValue");
+
+      // More output: the marker goes.
+      fs.appendFileSync(outputPath, ` Tests  12 passed (12) ${stamp}\n`);
+      await expect(body).toContainText(`Tests  12 passed (12) ${stamp}`, { timeout: 5_000 });
+      await expect(hold).toBeHidden();
+    } finally {
+      if (conversationId) {
+        await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } }).catch(() => {});
+        await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a long vitest run: counted past 64 KB, its row chip beside the console, Load earlier from the header", async ({ page, request }) => {
+    const token = relayToken();
+    const headers = { Authorization: `Bearer ${token}` };
+    const stamp = Date.now();
+    const dir = tempDir();
+    const outputPath = path.join(dir, "lantern-vitest.log");
+    const files = 2600;
+    fs.writeFileSync(outputPath, longVitestLog(files));
+    expect(fs.statSync(outputPath).size).toBeGreaterThan(2 * 64 * 1024);
+    const taskId = `vitest-${stamp}`;
+    let conversationId = "";
+    try {
+      await page.setViewportSize({ width: 1280, height: 800 });
+      conversationId = await startConversation(request, headers, `Run the long lantern suite ${stamp}`);
+      await publishTasks(request, headers, conversationId, [
+        { taskId, taskType: "local_bash", description: "Run the long lantern suite", startedAt: stamp - 120_000, outputPath, outputKind: "file" },
+      ]);
+      await openPanel(page, token, conversationId);
+
+      // The header line is far out of the last 64 KB; every file still counts.
+      const failed = files / 50;
+      const chipText = `✓ ${files * 5 - failed} ✘ ${failed}`;
+      const row = page.locator(`.bg-task-row[data-task-id="${taskId}"]`);
+      const rowChip = row.locator(".bg-task-chip");
+      await expect(rowChip).toHaveText(chipText, { timeout: HEALTH_POLL_WAIT_MS });
+
+      // Open, the console stops above the row: its chip, clock and Stop stay in view.
+      await page.locator(`[data-task-console="${taskId}"]`).click();
+      const modal = page.locator("#task-console-modal");
+      await expect(modal).toHaveClass(/visible/);
+      await expect(modal).toHaveClass(/tc-above-panel/);
+      await expect(page.locator("#task-console-chip")).toHaveText(chipText);
+      expect(await isUncovered(rowChip)).toBe(true);
+      expect(await isUncovered(row.locator(".bg-task-stop"))).toBe(true);
+      expect(await isUncovered(page.locator("#task-console-title"))).toBe(true);
+      // Not a modal above the panel: Escape in the composer stays the composer's.
+      await expect(page.locator(".task-console-dialog")).not.toHaveAttribute("aria-modal", "true");
+      await page.locator("#msg-input").focus();
+      await page.keyboard.press("Escape");
+      await expect(modal).toHaveClass(/visible/);
+
+      // Following the end, "Load earlier" is in the header, in view; the one
+      // above the first line is not.
+      const body = page.locator("#task-console-body");
+      await expect(body).toContainText(`module-${files}.test.ts`);
+      const earlierTop = page.locator("#task-console-earlier-top");
+      await expect(earlierTop).toBeVisible();
+      await expect(earlierTop).toBeInViewport();
+      await expect(page.locator("#task-console-earlier")).not.toBeInViewport();
+      await earlierTop.click();
+      // The lines just loaded are in view, with the header's filled badge.
+      const runLine = body.locator(".tc-line").first();
+      await expect(runLine).toContainText(/RUN\s+v2\.1\.8 \/work\/lantern-app/);
+      await expect(runLine).toBeInViewport();
+      await expect(runLine.locator(".tc-fg-inverse.tc-bg-6")).toHaveText(" RUN ");
+      await expect(earlierTop).toBeHidden();
+
+      // A phone: the console is full-screen again; its header chip carries the counts.
+      await page.setViewportSize({ width: 390, height: 844 });
+      await expect(modal).not.toHaveClass(/tc-above-panel/);
+      await expect(page.locator(".task-console-dialog")).toHaveAttribute("aria-modal", "true");
+      await expect(page.locator("#task-console-chip")).toBeVisible();
+      expect(await isUncovered(page.locator("#task-console-chip"))).toBe(true);
+    } finally {
+      if (conversationId) {
+        await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } }).catch(() => {});
         await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
       }
       fs.rmSync(dir, { recursive: true, force: true });

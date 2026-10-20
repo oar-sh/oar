@@ -261,6 +261,10 @@ export function createPreviewProxyServer({
   // open HMR connection would therefore hang shutdown forever unless the lane
   // tracks the pairs itself.
   const upgradedSockets = new Set();
+  // Upgrades still waiting on the dev server's answer, by their teardown: the
+  // client socket is detached from the http.Server already, so it would hold
+  // close() open just the same.
+  const pendingUpgrades = new Set();
 
   function trackUpgradedSocket(socket) {
     if (!socket) return;
@@ -411,14 +415,20 @@ export function createPreviewProxyServer({
     let upstreamReq = null;
     let upstreamSocket = null;
     const teardown = () => {
+      pendingUpgrades.delete(teardown);
       try { socket.destroy(); } catch {}
       try { upstreamSocket?.destroy(); } catch {}
       try { upstreamReq?.destroy(); } catch {}
     };
+    pendingUpgrades.add(teardown);
     socket.on('error', teardown);
     // A client that leaves before the dev server answers abandons the
     // handshake. Once both sides are piped, an orderly close travels through
-    // the pipes, so the pending writes still reach the other side.
+    // the pipes, so the pending writes still reach the other side. Leaving
+    // can arrive as a bare FIN: the server's sockets allow half-open
+    // connections, so 'end' alone never closes this one, and nothing reads
+    // it again to notice a reset that follows the FIN.
+    socket.once('end', teardown);
     socket.once('close', teardown);
     const reply = (text) => {
       if (socket.destroyed) return;
@@ -477,7 +487,9 @@ export function createPreviewProxyServer({
       reply(`${lines.join('\r\n')}\r\n\r\n`);
       if (upstreamHead?.length) reply(upstreamHead);
       if (head?.length) upstreamSocket.write(head);
+      socket.removeListener('end', teardown);
       socket.removeListener('close', teardown);
+      pendingUpgrades.delete(teardown);
       trackUpgradedSocket(socket);
       trackUpgradedSocket(upstreamSocket);
       upstreamSocket.pipe(socket);
@@ -527,6 +539,7 @@ export function createPreviewProxyServer({
       try { socket.destroy(); } catch {}
     }
     upgradedSockets.clear();
+    for (const teardown of [...pendingUpgrades]) teardown();
     return new Promise((resolve) => {
       if (!server) return resolve();
       const current = server;

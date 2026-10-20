@@ -103,6 +103,26 @@ export function nextJumpButtonState(previous, {
   };
 }
 
+/**
+ * The state before a live update that does not follow the end changes the
+ * transcript: the baseline is taken now, from the rows before it, if there
+ * is none yet. Otherwise it is taken by the next frame's nextJumpButtonState,
+ * by then with the update's row in it, and a row that lands between the
+ * reader's scroll away and that frame (one frame, or a tenth of a second on
+ * a busy page) is not counted.
+ */
+export function baselineBeforeUpdate(previous, rowKeys = []) {
+  if (Array.isArray(previous?.baseline)) return previous;
+  return {
+    visible: previous?.visible === true,
+    baseline: rowKeys.slice(),
+    count: 0,
+    unseen: previous?.unseen === true,
+    question: previous?.question === true,
+    waiting: 0,
+  };
+}
+
 export const JUMP_BUTTON_LABEL = 'Jump to the latest message';
 export const JUMP_BUTTON_QUESTION_LABEL = 'A question is waiting for your answer. Jump to it';
 export const JUMP_QUESTION_BADGE = '?';

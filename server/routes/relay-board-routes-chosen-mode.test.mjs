@@ -6,7 +6,7 @@ import { makeRouteDeps, captureRoutes, invokeRoute } from './messages-routes-tes
 
 // A board of a plan turn, a conversation that is in plan mode, and fakes that
 // keep what the route writes.
-function setup({ conversation = {}, actions } = {}) {
+function setup({ conversation = {}, actions, deps: extraDeps = {} } = {}) {
   const state = {
     conversation: {
       id: 'conv-1',
@@ -43,6 +43,7 @@ function setup({ conversation = {}, actions } = {}) {
     },
     resolveRequestedModel: (model) => ({ ok: true, model, modelVariantId: model, reasoningEffort: null }),
     formatRelayBoardRow: (row) => row,
+    ...extraDeps,
     stmts: {
       getBoard: { get: () => state.board },
       markBoardAction: { run: settle('acted') },
@@ -120,4 +121,37 @@ test('the follow-up is queued when the conversation row cannot be read', async (
   assert.equal(body.queuedMessageId, 'follow-up-1');
   assert.equal(state.queued.length, 1);
   assert.equal(preferenceEvents().length, 0);
+});
+
+// The queue insert's reasoning-effort argument.
+const queuedEffort = (state) => state.queued[0][6];
+
+test('the follow-up runs with the conversation\'s effort when the model id carries none', async () => {
+  const { state, act } = setup();
+  const { status } = await act('autopilot');
+  assert.equal(status, 200);
+  assert.equal(queuedEffort(state), 'low');
+});
+
+test('a conversation effort the model lacks is clamped to its nearest level', async () => {
+  const { state, act } = setup({
+    conversation: { preferred_reasoning_effort: 'max' },
+    deps: {
+      resolveRequestedReasoningEffort: (_model, effort) => (['low', 'medium', 'high'].includes(effort)
+        ? { ok: true, effort, supported: ['low', 'medium', 'high'] }
+        : { ok: false, error: 'Unsupported reasoning effort', supported: ['none', 'low', 'medium', 'high'] }),
+    },
+  });
+  await act('autopilot');
+  assert.equal(queuedEffort(state), 'high');
+});
+
+test('an effort carried by the model\'s variant id still wins', async () => {
+  const { state, act } = setup({
+    deps: {
+      resolveRequestedModel: (model) => ({ ok: true, model, modelVariantId: `${model}-medium`, reasoningEffort: 'medium' }),
+    },
+  });
+  await act('autopilot');
+  assert.equal(queuedEffort(state), 'medium');
 });

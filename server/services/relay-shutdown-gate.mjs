@@ -11,7 +11,10 @@ export const RELAY_SHUTDOWN_QUEUED_REASON = 'relay_shutdown_queued';
 /** Whether the runtime holds a shutdown or restart request that has not started yet. */
 export function isRelayShutdownQueued(runtimeState) {
   if (!runtimeState) return false;
-  if (runtimeState.relayShutdownQueued === true) return true;
+  // The runtime answers this from memory; only a state without the flag
+  // (older wiring, tests) reads the whole shutdown state, which counts the
+  // queue in the database.
+  if (typeof runtimeState.relayShutdownQueued === 'boolean') return runtimeState.relayShutdownQueued;
   return String(runtimeState.relayShutdown?.status || '') === 'queued';
 }
 

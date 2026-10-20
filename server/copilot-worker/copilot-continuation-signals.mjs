@@ -249,9 +249,13 @@ export function createReplayGate() {
  * `observe(event)` returns what the event changed, so the caller can pin the
  * runtime's lifecycle and note that a continuation is due without re-parsing.
  */
+// A shell row's command line: a bound on the post. The relay scrubs it, then
+// cuts it to 2,000 characters.
+const SHELL_COMMAND_CHARS_MAX = 8000;
+
 export function createBackgroundShellTracker({ now = () => Date.now() } = {}) {
-  const shells = new Map(); // shellId -> { shellId, description, startedAt }
-  const toolCalls = new Map(); // toolCallId -> { toolName, shellId, description }
+  const shells = new Map(); // shellId -> { shellId, description, command, startedAt }
+  const toolCalls = new Map(); // toolCallId -> { toolName, shellId, description, command }
 
   function rememberToolCall(toolCallId, entry) {
     if (!toolCallId) return;
@@ -264,10 +268,10 @@ export function createBackgroundShellTracker({ now = () => Date.now() } = {}) {
     }
   }
 
-  function open(shellId, description) {
+  function open(shellId, description, command = '') {
     const id = normalizeShellId(shellId);
     if (!id || shells.has(id)) return null;
-    const shell = { shellId: id, description: String(description || '').trim(), startedAt: now() };
+    const shell = { shellId: id, description: String(description || '').trim(), command: String(command || '').trim(), startedAt: now() };
     shells.set(id, shell);
     return shell;
   }
@@ -308,6 +312,8 @@ export function createBackgroundShellTracker({ now = () => Date.now() } = {}) {
         toolName,
         shellId: normalizeShellId(args.shellId),
         description: String(args.description || '').trim(),
+        // The shell tool's command line, for the row.
+        command: typeof args.command === 'string' ? args.command.trim().slice(0, SHELL_COMMAND_CHARS_MAX) : '',
       });
       return { opened, settled, heralded };
     }
@@ -337,7 +343,7 @@ export function createBackgroundShellTracker({ now = () => Date.now() } = {}) {
 
       const started = SHELL_OPENED_RE.exec(text);
       if (started && data.success !== false) {
-        const shell = open(started[1], call?.description);
+        const shell = open(started[1], call?.description, call?.command);
         if (shell) opened.push(shell);
         return { opened, settled, heralded };
       }

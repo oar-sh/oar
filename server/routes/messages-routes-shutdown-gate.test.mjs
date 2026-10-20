@@ -110,4 +110,7 @@ test('the gate reads the runtime flag or the shutdown state', () => {
   assert.equal(isRelayShutdownQueued({ relayShutdown: { status: 'shutting_down' } }), false);
   assert.equal(isRelayShutdownQueued({ relayShutdown: { status: 'idle' } }), false);
   assert.equal(isRelayShutdownQueued(null), false);
+  // With the flag the shutdown state (which counts the queue) is never read.
+  const flagged = { relayShutdownQueued: false, get relayShutdown() { throw new Error('read the state'); } };
+  assert.equal(isRelayShutdownQueued(flagged), false);
 });

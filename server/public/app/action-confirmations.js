@@ -20,6 +20,7 @@ import {
 } from './api-client.js';
 import { isSuspendHostActionVisible } from './settings-modal.js';
 import { describeRelayRestartError } from './relay-restart-error.mjs';
+import { initRelayRestartUi, openRestartRelayConfirmation } from './relay-restart-ui.js';
 import {
   applyHostSuspendState,
   describeHostSuspendBlocker,
@@ -106,21 +107,10 @@ export async function confirmKillCurrentSession() {
   }
 }
 
-export function openRestartRelayConfirmation() {
-  openSummaryModal({
-    title: 'Restart web relay',
-    subtitle: 'Queues restart via /api/relay/shutdown',
-    kind: 'restart-relay',
-    bodyHtml: `
-      <p>Queue a manual relay restart now?</p>
-      <p>The restart waits until the current turn is idle, so it does not interrupt an in-flight turn immediately.</p>
-      <div class="summary-modal-actions">
-        <button class="chat-title-action-btn" type="button" onclick="confirmRestartWebRelay()">🌄 Restart web relay</button>
-        <button class="chat-title-action-btn" type="button" onclick="closeSummaryModal()">Cancel</button>
-      </div>
-    `,
-  });
-}
+// ⋯ → Restart web relay first shows what the restart would wait for and
+// leave running (relay-restart-ui.js); its buttons land in
+// confirmRestartWebRelay below or in confirmRestartRelayNow.
+export { openRestartRelayConfirmation };
 
 export function openEmptyQueueConfirmation() {
   menuDeps.lockChatActionsMenuShield(350);
@@ -375,6 +365,10 @@ export async function confirmRestartWebRelay() {
       showTransientRelayNotice('Relay is already shutting down/restarting.', 7000);
       return;
     }
+    if (result.status === 'shutting_down') {
+      showTransientRelayNotice('Nothing was running: the relay is restarting now.', 7000);
+      return;
+    }
     const queue = result.queue || {};
     showTransientRelayNotice(
       `Relay restart queued (pending=${Number(queue.pendingCount || 0)}, processing=${Number(queue.processingCount || 0)}).`,
@@ -399,6 +393,9 @@ export function initActionConfirmations({
     syncQueueStatusMenuEntry: typeof syncQueueStatusMenuEntry === 'function' ? syncQueueStatusMenuEntry : menuDeps.syncQueueStatusMenuEntry,
     refreshSessionWorkerStatus: typeof refreshSessionWorkerStatus === 'function' ? refreshSessionWorkerStatus : menuDeps.refreshSessionWorkerStatus,
   };
+  // The restart confirmations' and banner's inline handlers live on window
+  // either way (bootstrap exposes this module's own).
+  initRelayRestartUi();
   if (!exposeOnWindow) return;
   window.openKillSessionConfirmation = openKillSessionConfirmation;
   window.openRestartRelayConfirmation = openRestartRelayConfirmation;

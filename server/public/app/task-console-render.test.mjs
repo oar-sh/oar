@@ -6,6 +6,7 @@ import { JSDOM } from 'jsdom';
 import {
   DEFAULT_TASK_STALL_MINUTES,
   TASK_CONSOLE_MAX_LOADED_BYTES,
+  TASK_OUTPUT_NONE_MESSAGES,
   TASK_STALL_MINUTES_MAX,
   TASK_STALL_MINUTES_MIN,
   buildLineNode,
@@ -17,11 +18,15 @@ import {
   lineText,
   loadEarlierState,
   normalizeStallThreshold,
+  pipeHoldNotice,
+  pipeHoldProgram,
   runnerChip,
+  showPipeHoldMarker,
   stallHint,
   stepsLabel,
   taskHasConsole,
   taskOutputUnavailable,
+  taskPipeHold,
 } from './task-console-render.mjs';
 import { createLineFolder } from './task-output-text.mjs';
 import * as shared from '../../../shared/task-output-text.mjs';
@@ -71,13 +76,16 @@ test('the chip takes the counts of every runner the relay parses', () => {
   }
 });
 
-test('an ended task reads ✓, ✘ or ■ from its status and exit code', () => {
+test('an ended task reads ✓, ✘, ■ or ? from its status and exit code', () => {
   assert.deepEqual(endedOutcome({ status: 'completed', exitCode: 0 }), { icon: '✓', ok: true, failed: false, label: 'completed' });
   assert.deepEqual(endedOutcome({ status: 'failed', exitCode: 2 }), { icon: '✘', ok: false, failed: true, label: 'failed, exit code 2' });
   assert.equal(endedOutcome({ status: 'unknown', exitCode: 1 }).icon, '✘', 'a non-zero exit is a failure');
   assert.equal(endedOutcome({ status: 'failed', exitCode: null }).label, 'failed');
   assert.equal(endedOutcome({ status: 'stopped' }).icon, '■');
-  assert.deepEqual(endedOutcome({ status: 'unknown' }), { icon: '✓', ok: true, failed: false, label: 'ended' });
+  // No report of how it ended (its worker was lost in a relay restart): not a success.
+  assert.deepEqual(endedOutcome({ status: 'unknown' }), { icon: '?', ok: false, failed: false, label: 'ended, result unknown' });
+  assert.deepEqual(endedOutcome({ status: 'unknown', exitCode: 0 }), { icon: '✓', ok: true, failed: false, label: 'completed' });
+  assert.deepEqual(endedOutcome({}), { icon: '✓', ok: true, failed: false, label: 'ended' });
 });
 
 test('steps read "22 steps", "1 step", or nothing', () => {
@@ -115,6 +123,19 @@ test('a line row carries colour spans and the ×N of a folded repeat, never mark
   const empty = buildLineNode(document, { text: '', count: 1 });
   assert.ok(empty.textContent.length > 0, 'an empty line keeps its height');
   assert.equal(buildLineNode(document, { text: 'still writing' }, { partial: true }).className, 'tc-line tc-line-partial');
+});
+
+test('inverse text is a filled badge: swapped colours, the console\'s own for a side left unset', () => {
+  // vitest's " RUN " badge: inverse cyan, so cyan fills it and the text takes the background colour.
+  const badge = buildLineNode(document, { text: '\x1b[7m\x1b[1m\x1b[36m RUN \x1b[39m\x1b[22m\x1b[27m v2.1.8', count: 1 });
+  const [filled, rest] = badge.childNodes;
+  assert.equal(filled.className, 'tc-fg-inverse tc-bg-6 tc-bold');
+  assert.equal(filled.textContent, ' RUN ');
+  assert.equal(rest.nodeType, 3, 'plain text after SGR 27');
+  const both = buildLineNode(document, { text: '\x1b[31;42;7mx', count: 1 });
+  assert.equal(both.querySelector('span').className, 'tc-fg-2 tc-bg-1');
+  const bare = buildLineNode(document, { text: '\x1b[7m FAIL \x1b[0m', count: 1 });
+  assert.equal(bare.querySelector('span').className, 'tc-fg-inverse tc-bg-inverse');
 });
 
 test('the folder feeds the rows: a progress redraw collapses, repeats fold', () => {
@@ -165,6 +186,70 @@ test('"Load earlier" hides at the start of the file and stops at the 5 MB cap', 
 
 test('the header meta names the kind, the time and the outcome', () => {
   assert.deepEqual(consoleMetaParts({ task: { taskType: 'local_bash' }, elapsed: '4m 2s', ended: false }), ['Shell', '4m 2s', 'running']);
+  assert.deepEqual(consoleMetaParts({ task: { taskType: 'local_bash' }, elapsed: '4m 2s', ended: false, status: 'held' }),
+    ['Shell', '4m 2s', 'waiting for its worker after the relay restart'], 'held since a relay restart');
   assert.deepEqual(consoleMetaParts({ task: { taskType: 'monitor' }, elapsed: '', ended: true, status: 'failed', exitCode: 1 }), ['Monitor', 'failed, exit code 1']);
   assert.deepEqual(consoleMetaParts({ task: { taskType: 'local_bash' }, ended: false, kind: 'snapshot' }), ['Shell', 'running', 'last 8 KB, read again every 3 s']);
+});
+
+test('a command piped into tail holds its output; head, tail -f, tail +N, quoted pipes and comments do not', () => {
+  for (const [command, program] of [
+    ['npm test 2>&1 | tail -40', 'tail'],
+    ['npm test | tail', 'tail'],
+    ['npm test 2>&1 |& tail -n 20', 'tail'],
+    ['npm test | LC_ALL=C /usr/bin/tail -n40', 'tail'],
+    ['npm run build && npm test 2>&1 | tail -40', 'tail'],
+    ['pytest -q | head -n 50', ''],
+    ['npm test # then | tail -5', ''],
+    ['npm test 2>&1 | tail -5 # keep the end', 'tail'],
+    ['grep -c "#x" log | tail -1', 'tail'],
+    ['echo a#b | tail', 'tail'],
+    ['cmd &> /dev/null | tail -1', 'tail'],
+    ['npm test 2>&1 | tail -f', ''],
+    ['npm test | tail -F -n 40', ''],
+    ['npm test | tail --follow=name', ''],
+    ['npm test | tail -fn 5', ''],
+    ['npm test | tail -n +2', ''],
+    ['npm test | tail +2', ''],
+    ['tail -40 build.log', ''],
+    ['tail -f server.log | grep error', ''],
+    ['echo "a | tail -5"', ''],
+    ["grep 'x|tail' notes.txt", ''],
+    ['echo a \\| tail', ''],
+    ['npm test || tail -5 err.log', ''],
+    ['npm test > run.log 2>&1', ''],
+    ['Run the unit tests', ''],
+    ['', ''],
+    [null, ''],
+  ]) {
+    assert.equal(pipeHoldProgram(command), program, JSON.stringify(command));
+  }
+  assert.equal(taskPipeHold({ description: 'npm test | tail -3' }), 'tail');
+  assert.equal(taskPipeHold({ description: 'Run tests', command: 'npm test 2>&1 | tail -n 30' }), 'tail');
+  assert.equal(taskPipeHold({ description: 'npm test | tail', command: 'npm test | head' }), 'tail', 'the description still counts');
+  assert.equal(taskPipeHold(null), '');
+  assert.equal(pipeHoldNotice(''), null);
+  assert.deepEqual(pipeHoldNotice('tail'), {
+    text: 'Output stops here: this command pipes into tail, so the rest arrives when it ends.',
+    hint: 'Logging to a file instead (> run.log 2>&1) and following that file shows it live.',
+    title: 'This command pipes into tail, so its output arrives when it ends. Logging to a file instead (> run.log 2>&1) and following that file shows it live.',
+  });
+});
+
+test('the stops-here marker shows on a live piped task until output comes in', () => {
+  const base = { program: 'tail', ended: false, kind: 'file', openedAt: 120, nextOffset: 120 };
+  assert.equal(showPipeHoldMarker(base), true);
+  assert.equal(showPipeHoldMarker({ ...base, nextOffset: 180 }), false, 'more output arrived');
+  assert.equal(showPipeHoldMarker({ ...base, ended: true }), false, 'the task ended');
+  assert.equal(showPipeHoldMarker({ ...base, program: '' }), false, 'no tail in the command');
+  assert.equal(showPipeHoldMarker({ ...base, kind: 'none' }), false, 'no output at all');
+  assert.equal(showPipeHoldMarker({ ...base, kind: '' }), false, 'not read yet');
+  assert.equal(showPipeHoldMarker({ ...base, kind: 'snapshot', openedAt: 0, nextOffset: 0 }), true, 'a snapshot that has not grown');
+});
+
+test('one wording for a task without output, sentences all', () => {
+  assert.equal(TASK_OUTPUT_NONE_MESSAGES.provider, 'Output is not available for this provider.');
+  for (const [name, text] of Object.entries(TASK_OUTPUT_NONE_MESSAGES)) {
+    assert.match(text, /^[A-Z].*\.$/, name);
+  }
 });

@@ -1,6 +1,6 @@
 import { stripRemotePromptHeader } from './remote-relay-shared.mjs';
 
-const RELAY_TOOL_GUIDANCE = [
+const RELAY_TOOL_GUIDANCE_LINES = [
   '# Relay Tool Guidance',
   'For any user-facing question or clarification, use the ask_user tool so the web relay can render question cards and buttons. Never ask questions in plain assistant text.',
   'When using ask_user, ALWAYS include a `choices` array with 2-6 answer options so the web relay can render clickable buttons. Only omit choices when the question genuinely requires freeform text input.',
@@ -8,7 +8,12 @@ const RELAY_TOOL_GUIDANCE = [
   'For relay restarts in extension-managed mode, require explicit user permission first, then use the authenticated localhost API `POST /api/relay/shutdown`. Do not restart by killing processes or using respawn scripts.',
   'Note: shutdown is queued and only completes when the current turn finishes, so it is pointless to wait for it to interrupt an active turn.',
   'Use `restart: true` in the request body when the user wants a real relay restart rather than a plain shutdown. Example request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.',
-].join(' ');
+  'Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide, with Restart now in the web UI.',
+];
+const RELAY_TOOL_GUIDANCE = RELAY_TOOL_GUIDANCE_LINES.join(' ');
+// Prompts stored before the `immediate` line was added carry the guidance
+// without it.
+const PREVIOUS_RELAY_TOOL_GUIDANCE = RELAY_TOOL_GUIDANCE_LINES.slice(0, -1).join(' ');
 
 const MODE_MARKERS = {
   plan: '[Relay mode: plan]',
@@ -94,6 +99,8 @@ function buildPromptPrefixPatterns(mode) {
     return [
       new RegExp(`^${whitespaceFlexiblePattern(currentFullPrefix)}\\s*`, 'i'),
       new RegExp(`^${whitespaceFlexiblePattern(legacyFullPrefix)}\\s*`, 'i'),
+      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
+      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
       new RegExp(`^${whitespaceFlexiblePattern(marker)}\\s*`, 'i'),
     ];
   });

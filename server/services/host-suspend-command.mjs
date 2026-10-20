@@ -14,6 +14,7 @@ import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
 export function runHostSuspendToRam({
   platform = process.platform,
   spawnImpl = spawn,
+  systemToolPath = windowsSystemToolPath,
   dryRun = /^(1|true|yes|on)$/i.test(String(process.env.OAR_HOST_SUSPEND_DRY_RUN || '')),
   logger = console,
 } = {}) {
@@ -26,7 +27,7 @@ export function runHostSuspendToRam({
     return { ok: true, command, dryRun: true };
   }
   try {
-    const child = spawnImpl(windowsSystemToolPath('rundll32.exe'), ['powrprof.dll,SetSuspendState', '0,0,0'], {
+    const child = spawnImpl(systemToolPath('rundll32.exe'), ['powrprof.dll,SetSuspendState', '0,0,0'], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,

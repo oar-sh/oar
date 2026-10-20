@@ -37,6 +37,9 @@ export function createAcpHostServices({
   platform = process.platform,
   spawnImpl = spawn,
   spawnSyncImpl = spawnSync,
+  // Full path of a program Windows ships (taskkill, Windows PowerShell), or
+  // its bare name when it is not where Windows keeps it.
+  systemToolPath = windowsSystemToolPath,
   fsImpl = fs,
   // Told about every terminal's life (grok-background-tasks.mjs publishes
   // them as background tasks): `started`, `output`, `killed`, `released`,
@@ -65,9 +68,9 @@ export function createAcpHostServices({
         timeout: 10_000,
         stdio: 'ignore',
       });
-      cachedWindowsShell = probe && probe.status === 0 ? 'pwsh' : windowsSystemToolPath('powershell');
+      cachedWindowsShell = probe && probe.status === 0 ? 'pwsh' : systemToolPath('powershell');
     } catch {
-      cachedWindowsShell = windowsSystemToolPath('powershell');
+      cachedWindowsShell = systemToolPath('powershell');
     }
     return cachedWindowsShell;
   }
@@ -210,7 +213,7 @@ export function createAcpHostServices({
     if (platform === 'win32' && entry.proc.pid) {
       // proc.kill() only reaches the shell; shells leave grandchildren behind.
       try {
-        spawnImpl(windowsSystemToolPath('taskkill'), ['/pid', String(entry.proc.pid), '/t', '/f'], {
+        spawnImpl(systemToolPath('taskkill'), ['/pid', String(entry.proc.pid), '/t', '/f'], {
           stdio: 'ignore',
           windowsHide: true,
         });

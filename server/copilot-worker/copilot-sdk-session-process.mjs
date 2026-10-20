@@ -1567,6 +1567,7 @@ export function createCopilotSdkSessionRunner({
       taskId: shell.shellId,
       taskType: 'local_bash',
       description: shell.description || 'Detached shell',
+      ...(shell.command ? { command: shell.command } : {}),
       startedAt: shell.startedAt || null,
       stoppable: false,
     }));
@@ -1587,6 +1588,7 @@ export function createCopilotSdkSessionRunner({
           taskId: task.id,
           taskType: 'local_bash',
           description: task.description || task.command || 'Background shell',
+          ...shellCommandField(task),
           startedAt,
           stoppable: true,
           ...(task.progressSummary ? { summary: task.progressSummary } : {}),
@@ -1614,6 +1616,12 @@ export function createCopilotSdkSessionRunner({
       });
     }
     return cards;
+  }
+
+  /** A registry shell's command line, bounded (the relay scrubs, then cuts it to 2,000). */
+  function shellCommandField(task) {
+    const command = typeof task?.command === 'string' ? task.command.trim().slice(0, 8000) : '';
+    return command ? { command } : {};
   }
 
   /** Where the task console reads a shell's output: its own log, or the spool mirror. */
@@ -1869,6 +1877,7 @@ export function createCopilotSdkSessionRunner({
       postTaskSettle(task.id, {
         ...settleForTask(finished, { exitCode: shell ? (shellExitCodes.get(task.id) ?? null) : null }),
         description: task.description || task.displayName || task.command || (shell ? 'Background shell' : 'Background agent'),
+        ...(shell ? shellCommandField(task) : {}),
         taskType: shell ? 'local_bash' : 'local_agent',
         startedAt: Date.parse(String(task.startedAt || '')) || null,
         ...(task.toolCallId ? { toolUseId: String(task.toolCallId) } : {}),
@@ -2135,6 +2144,7 @@ export function createCopilotSdkSessionRunner({
         postTaskSettle(shell.shellId, {
           ...settleForTask({ type: 'shell', status: '' }, { exitCode: shellExitCodes.get(shell.shellId) ?? null }),
           description: shell.description || 'Detached shell',
+          ...(shell.command ? { command: shell.command } : {}),
           taskType: 'local_bash',
           startedAt: shell.startedAt || null,
         });

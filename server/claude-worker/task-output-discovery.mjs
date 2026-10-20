@@ -13,6 +13,13 @@ import nodePath from 'node:path';
 /** Task types whose output is a shell's stdout/stderr (getTaskOutput serves these too). */
 export const SHELL_TASK_TYPES = new Set(['local_bash', 'monitor', 'monitor_mcp', 'monitor_ws']);
 export const MAX_OUTPUT_PATH_CHARS = 1024;
+// The command line a shell row carries. The relay scrubs it, then cuts it
+// to 2,000 characters: a cut here first could split a credential it would
+// no longer recognise, so this one is only a bound on the post.
+export const MAX_TASK_COMMAND_CHARS = 8000;
+// The tools whose call starts a shell task: their input's `command` is the
+// task's command line (the console marks a `| tail` from it).
+const SHELL_TOOL_NAMES = new Set(['Bash', 'Monitor']);
 
 const OUTPUT_MARKER = 'Output is being written to';
 // The CLI's own file name: a path with spaces (a Windows profile dir) still
@@ -90,8 +97,27 @@ function isBackgroundNote(text) {
 }
 
 /**
+ * `{ toolUseId, command }` of each Bash or Monitor call in an `assistant` SDK
+ * message: the command line of the task such a call starts in the
+ * background, cut at 8,000 characters (the relay cuts after scrubbing).
+ */
+export function shellCommandsOf(sdkMessage) {
+  if (String(sdkMessage?.type || '') !== 'assistant') return [];
+  const blocks = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
+  const found = [];
+  for (const block of blocks) {
+    if (block?.type !== 'tool_use' || !SHELL_TOOL_NAMES.has(String(block.name || ''))) continue;
+    const toolUseId = String(block.id || '').trim();
+    const command = typeof block.input?.command === 'string' ? block.input.command.trim().slice(0, MAX_TASK_COMMAND_CHARS) : '';
+    if (toolUseId && command) found.push({ toolUseId, command });
+  }
+  return found;
+}
+
+/**
  * Every task output file a `user` SDK message announces: the tool_result
- * blocks of backgrounded Bash (and Monitor) calls. The structured result's
+ * blocks of backgrounded Bash (and Monitor) calls, with the id of the call
+ * (`toolUseId`, '' when the block names none). The structured result's
  * `backgroundTaskId` names the task when the message answers a single call.
  */
 export function discoverTaskOutputPaths(sdkMessage) {
@@ -108,7 +134,7 @@ export function discoverTaskOutputPaths(sdkMessage) {
     const text = toolResultText(block);
     if (!structuredTaskId && !isBackgroundNote(text)) continue;
     const announced = parseOutputAnnouncement(text, structuredTaskId);
-    if (announced) found.push(announced);
+    if (announced) found.push({ ...announced, toolUseId: String(block.tool_use_id || '').trim() });
   }
   return found;
 }

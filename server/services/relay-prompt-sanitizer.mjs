@@ -14,6 +14,7 @@ const DEFAULT_RELAY_TOOL_GUIDANCE = [
   'For relay restarts in extension-managed mode, require explicit user permission first, then use the authenticated localhost API `POST /api/relay/shutdown`. Do not restart by killing processes or using respawn scripts.',
   'Note: shutdown is queued and only completes when the current turn finishes, so it is pointless to wait for it to interrupt an active turn.',
   'Use `restart: true` in the request body when the user wants a real relay restart rather than a plain shutdown. Example request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.',
+  'Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide, with Restart now in the web UI.',
 ].join(' ');
 
 function loadRelayToolGuidance() {
@@ -32,6 +33,10 @@ function loadRelayToolGuidance() {
 }
 
 const RELAY_TOOL_GUIDANCE = loadRelayToolGuidance();
+// Prompts stored before the `immediate` line was added carry the guidance
+// without it.
+const IMMEDIATE_GUIDANCE_LINE = 'Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide, with Restart now in the web UI.';
+const PREVIOUS_RELAY_TOOL_GUIDANCE = RELAY_TOOL_GUIDANCE.replace(` ${IMMEDIATE_GUIDANCE_LINE}`, '');
 
 const MODE_MARKERS = {
   plan: '[Relay mode: plan]',
@@ -117,6 +122,8 @@ function buildPromptPrefixPatterns(mode) {
     return [
       new RegExp(`^${whitespaceFlexiblePattern(currentFullPrefix)}\\s*`, 'i'),
       new RegExp(`^${whitespaceFlexiblePattern(legacyFullPrefix)}\\s*`, 'i'),
+      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
+      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
       new RegExp(`^${whitespaceFlexiblePattern(marker)}\\s*`, 'i'),
     ];
   });

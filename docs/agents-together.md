@@ -47,7 +47,13 @@ relay, **Agents may** limits it to *read only*, *read and prompt* (existing sess
 (also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
-session it works in, as far as the other relay offers it. A [Claude Cloud](providers.md#claude-cloud) session
+session it works in, as far as the other relay offers it. A model the provider does not list there
+(the list New Chat offers) is refused before anything is created or sent, with the close matches
+("Unknown model 'gpt-5-4' for Copilot on relay …; did you mean 'gpt-5.4'?"); for Claude, `opus`, `sonnet` and
+`haiku` stand for the newest listed model of that name, and a Copilot model named with its effort
+(`gpt-5.4-high`) runs as that model with that effort. When the relay has no list for the
+provider yet (its model discovery has not run), the model is passed on unchecked and the answer
+says so. A [Claude Cloud](providers.md#claude-cloud) session
 is started with `provider: "claude-cloud"`, a `repo` (a GitHub URL or `owner/repo`, for example
 `example-org/sample-repo`) and an optional `branch` instead of a folder; without a model it gets
 the default model of the other relay's Claude Cloud tab. Claude Cloud must be switched on there.
@@ -145,12 +151,19 @@ asks to be woken when something happens there. It works for every provider, on t
 [agent sessions](#agent-sessions) switched on) and on a paired one.
 
 **What wakes it.** A question waiting for an answer (with its options), an error (a failed turn,
-the usage limit, a worker that died), a reply (with a preview), a background agent or shell task
-that finished or failed, a session that went quiet while working (15 minutes by default), and the
-moment nothing runs any more in the watched sessions. A subscription names sessions, or `all`
+the usage limit, a worker that died), a reply (with a preview), a background agent that finished,
+a background agent or shell task that failed (a shell command that exits non-zero counts), a
+session that went quiet while working (15 minutes by default), and the moment nothing runs any
+more in the watched sessions. A shell command that ended well wakes the watcher only when it asks
+for every task end (`task_finished` in `events`, with `task_started` for the starts): a busy session
+runs many, and each would cost the watcher a turn. A subscription names sessions, or `all`
 for every session, later ones included; the watcher's own conversation is never watched. It can
 filter replies and task results by a regular expression, end after it fired once, and add a
 heartbeat while work runs.
+
+Subscriptions made before this default changed without naming events get the new default by
+themselves; those that named their events keep them. A paired relay that runs an older OAR applies its own
+default and refuses `subagent_finished` by name.
 
 **What it looks like.** OAR writes a short message into the watcher's conversation: a new turn
 when the watcher is idle, a steer into the running turn on Claude and Copilot's SDK engine, the

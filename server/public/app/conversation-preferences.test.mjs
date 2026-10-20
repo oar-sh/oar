@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   firstDefinedPreference,
+  nearestSupportedReasoningEffort,
   normalizePreferenceValue,
   resolveComposerReasoningEffort,
   resolveConversationComposerSelection,
@@ -64,6 +65,20 @@ test('with nothing usable the first non-off tier is chosen', () => {
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['none', 'low', 'high'] }), 'low');
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['none'] }), 'none');
   assert.equal(resolveComposerReasoningEffort({ supportedEfforts: [] }), '');
+});
+
+test('the fallback tier is the lowest by rung, whatever order the list comes in', () => {
+  assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['high', 'medium', 'none', 'low'] }), 'low');
+  assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['max', 'xhigh'] }), 'xhigh');
+  // Off-ladder names (image qualities) keep the list's own order.
+  assert.equal(resolveComposerReasoningEffort({ supportedEfforts: ['auto', 'low', 'high'] }), 'auto');
+});
+
+test('a caller\'s own fallback replaces the default when no candidate matches', () => {
+  assert.equal(nearestSupportedReasoningEffort(['ultracode'], ['none', 'low', 'high'], { fallback: '' }), '');
+  assert.equal(nearestSupportedReasoningEffort([], ['none', 'low'], { fallback: 'none' }), 'none');
+  // A candidate that clamps still wins over it.
+  assert.equal(nearestSupportedReasoningEffort(['max'], ['none', 'low', 'high'], { fallback: '' }), 'high');
 });
 
 test('a dropped rung clamps to the highest supported level below it', () => {

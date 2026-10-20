@@ -25,6 +25,22 @@ test('an unlock is recorded once and listed', () => {
   assert.equal(repo.recordUnlock('', 'r-1'), false);
 });
 
+test('unlocks recorded in the same millisecond list in the order they were recorded', () => {
+  // Windows' clock often gives two sends in a row the same timestamp; the
+  // later relay must not move ahead because its id sorts first.
+  const { repo } = setup();
+  const at = '2026-09-20T10:00:01.000Z';
+  repo.recordUnlock('c-1', 'r-linux', 'm-1', at);
+  repo.recordUnlock('c-1', 'r-lab', 'm-2', at);
+  repo.recordUnlock('c-1', 'r-bench', 'm-3', '2026-09-20T10:00:00.000Z');
+  repo.recordUnlock('c-1', 'r-linux', 'm-4', at);
+  assert.deepEqual(repo.listUnlocks('c-1').map((row) => [row.remoteRelayId, row.messageId]), [
+    ['r-bench', 'm-3'],
+    ['r-linux', 'm-1'],
+    ['r-lab', 'm-2'],
+  ]);
+});
+
 test('removing a relay or a conversation forgets its unlocks', () => {
   const { repo } = setup();
   repo.recordUnlock('c-1', 'r-1');

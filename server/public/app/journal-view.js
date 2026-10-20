@@ -82,6 +82,7 @@ import { mergeTailPage } from './transcript-reading-anchor.mjs';
 import { readWindowRetention } from './conversation-window-retention.mjs';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
 import {
+  isBackgroundTasksSnapshotCurrent,
   setBackgroundTasksConversation,
   setConversationBackgroundTasks,
   setConversationEndedBackgroundTasks,
@@ -777,6 +778,8 @@ export function toggleConversationGroupFold(event, groupId) {
 // rather than drawn anew (mergeMessagesIntoTranscript).
 // windowPayload: with keepTranscript, the window the page keeps, kept for
 // the next visit in place of nothing.
+// backgroundTasksAsOf: backgroundTasksSnapshotMark(id) as the request left;
+// the payload's task sets are left out when an event brought newer ones since.
 export function applyLoadedConversationState(id, response, {
   restoreScroll = false,
   savedScrollTop = null,
@@ -786,6 +789,7 @@ export function applyLoadedConversationState(id, response, {
   fromCache = false,
   mergeFrom = null,
   windowPayload = null,
+  backgroundTasksAsOf = null,
 } = {}) {
   if (!response) {
     if (!IS_SHARED_VIEW) conversationPayloadCache.forget(id);
@@ -892,9 +896,11 @@ export function applyLoadedConversationState(id, response, {
   setBackgroundTasksConversation(id);
   // Absent from an older relay's payload: the threshold keeps its default.
   if ('taskStallMinutes' in response) setConversationTaskStallMinutes(id, response.taskStallMinutes);
-  setConversationBackgroundTasks(id, response.backgroundTasks || []);
-  // Absent from an older relay's payload: keep what the socket said.
-  if (Array.isArray(response.endedBackgroundTasks)) setConversationEndedBackgroundTasks(id, response.endedBackgroundTasks);
+  if (isBackgroundTasksSnapshotCurrent(id, backgroundTasksAsOf)) {
+    setConversationBackgroundTasks(id, response.backgroundTasks || []);
+    // Absent from an older relay's payload: keep what the socket said.
+    if (Array.isArray(response.endedBackgroundTasks)) setConversationEndedBackgroundTasks(id, response.endedBackgroundTasks);
+  }
   setUsageLimitConversation(id, {
     // Absent from an older relay's payload: keep what the socket said.
     pause: 'usageLimitPause' in response ? response.usageLimitPause : undefined,

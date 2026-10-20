@@ -14,6 +14,10 @@ function createFakeTermProc(pid = 111) {
   return proc;
 }
 
+// Where a Windows host keeps its own programs: the tests resolve them through
+// this fake, so a win32 case asserts the same path on every machine.
+const systemToolPath = (name) => `C:\\Windows\\System32\\${name}.exe`;
+
 function createServices(overrides = {}) {
   const spawns = [];
   const procs = [];
@@ -21,6 +25,7 @@ function createServices(overrides = {}) {
     cwd: '/work',
     env: {},
     platform: 'linux',
+    systemToolPath,
     spawnImpl: (file, args, opts) => {
       spawns.push({ file, args, opts });
       const proc = createFakeTermProc(100 + procs.length);
@@ -83,7 +88,7 @@ test('windows commands run through pwsh when available, powershell otherwise', a
     spawnSyncImpl: () => { throw new Error('ENOENT'); },
   });
   await legacyHost.services.handlers['terminal/create']({ command: 'Get-Location' });
-  assert.equal(legacyHost.spawns[0].file, 'powershell');
+  assert.equal(legacyHost.spawns[0].file, 'C:\\Windows\\System32\\powershell.exe');
 });
 
 test('explicit args bypass the shell entirely', async () => {
@@ -101,7 +106,7 @@ test('terminal/kill escalates to taskkill on win32 and release forgets the termi
   const { terminalId } = await services.handlers['terminal/create']({ command: 'sleep 100' });
   assert.equal(services.handlers['terminal/kill']({ terminalId }), null);
   assert.equal(procs[0].killed, true);
-  const taskkill = spawns.find((s) => s.file === 'taskkill');
+  const taskkill = spawns.find((s) => s.file === 'C:\\Windows\\System32\\taskkill.exe');
   assert.ok(taskkill, 'kill should sweep the process tree on win32');
   assert.deepEqual(taskkill.args, ['/pid', String(procs[0].pid), '/t', '/f']);
 

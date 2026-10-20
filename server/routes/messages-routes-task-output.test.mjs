@@ -102,6 +102,56 @@ test('a settle post: its exit code only when sent, steps kept, and an ended row 
   assert.equal(fx.emitted.filter((entry) => entry.event === 'background_tasks').at(-1).payload.endedTasks.length, 2);
 });
 
+test('a shell row\'s command line is kept scrubbed and cut, on the live row, the ended row and the output answer', async (t) => {
+  const fx = boot(t);
+  fs.writeFileSync(fx.file, 'building\n');
+  const secret = 'API_TOKEN=s3cretValue42 npm test 2>&1 | tail -40';
+  await fx.post('/api/background-tasks', { conversationId: 'sess-1', tasks: [
+    { taskId: 'task-b7', taskType: 'local_bash', description: 'Run the tests', command: `\x1b[31m${secret}\x1b[0m`, outputPath: fx.file },
+    { taskId: 'task-c8', taskType: 'local_bash', command: `echo ${'x'.repeat(5000)}` },
+    { taskId: 'task-d9', taskType: 'local_bash', command: { not: 'a string' } },
+  ] });
+  const [shell, long, odd] = fx.store.get('sess-1');
+  assert.equal(shell.command, 'API_TOKEN=[redacted] npm test 2>&1 | tail -40');
+  assert.equal(long.command.length, 2000);
+  assert.equal('command' in odd && odd.command !== undefined, false);
+  const event = fx.emitted.filter((entry) => entry.event === 'background_tasks').at(-1).payload;
+  assert.doesNotMatch(JSON.stringify(event), /s3cretValue42/, 'the pages never see it');
+
+  const answer = await fx.output('conv-1', 'task-b7');
+  assert.equal(answer.body.task.command, 'API_TOKEN=[redacted] npm test 2>&1 | tail -40');
+
+  // The ended row keeps it; an end this runtime never saw live brings its own, scrubbed too.
+  await fx.post('/api/background-tasks', { conversationId: 'sess-1', tasks: [] });
+  assert.equal(fx.store.ended('sess-1').find((row) => row.taskId === 'task-b7').command, 'API_TOKEN=[redacted] npm test 2>&1 | tail -40');
+  await fx.post('/api/background-task-settled', { conversationId: 'sess-1', taskId: 'task-z1', status: 'failed', exitCode: 2, outputPath: fx.file, description: 'lint', command: 'PASSWORD=hunter2hunter npm run lint | head' });
+  assert.equal(fx.store.ended('sess-1').find((row) => row.taskId === 'task-z1').command, 'PASSWORD=[redacted] npm run lint | head');
+});
+
+test('a description, summary and tool call are scrubbed too: a Grok row\'s description is its command line', async (t) => {
+  const fx = boot(t);
+  await fx.post('/api/background-tasks', { conversationId: 'sess-1', tasks: [
+    {
+      taskId: 'term-1',
+      taskType: 'local_bash',
+      description: 'DB_PASSWORD=hunter22lantern npm run migrate',
+      command: 'DB_PASSWORD=hunter22lantern npm run migrate',
+      summary: 'ran curl -u builder:s3cr3tpass https://example.com',
+      lastToolCall: 'Bash: deploy --token=abcd1234wxyz',
+      outputPath: fx.file,
+    },
+  ] });
+  const [row] = fx.store.get('sess-1');
+  assert.equal(row.description, 'DB_PASSWORD=[redacted] npm run migrate');
+  assert.equal(row.summary, 'ran curl -u builder:[redacted] https://example.com');
+  assert.equal(row.lastToolCall, 'Bash: deploy --token=[redacted]');
+  const sent = JSON.stringify(fx.emitted);
+  for (const secret of ['hunter22lantern', 's3cr3tpass', 'abcd1234wxyz']) assert.doesNotMatch(sent, new RegExp(secret));
+
+  await fx.post('/api/background-task-settled', { conversationId: 'sess-1', taskId: 'term-9', status: 'failed', exitCode: 1, outputPath: fx.file, description: 'API_TOKEN=lan7ernS3cretValue make', summary: 'exit code 1' });
+  assert.equal(fx.store.ended('sess-1').find((entry) => entry.taskId === 'term-9').description, 'API_TOKEN=[redacted] make');
+});
+
 test('a task with a console that ends has the health poller read soon', async (t) => {
   const fx = boot(t);
   await fx.post('/api/background-tasks', { conversationId: 'sess-1', tasks: [

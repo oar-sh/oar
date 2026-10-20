@@ -22,6 +22,17 @@
  * Health: the health poller's last reading per live task (`setHealth`), served
  * with the task rows (`withHealth`) and carried onto the ended row, where the
  * poller's reading after the end replaces it (`setEndedHealth`).
+ *
+ * Across a restart (`persistence`, the `background_task_rows` table): the
+ * console rows survive, the live sets do not. Ended rows come back as they
+ * were, for the rest of their hour. A live task with a console comes back
+ * held (`restored`): its console stays readable, but no panel, state or
+ * suspend check counts it as running, because only the worker can say that.
+ * The worker's next set settles it: a task in the set is live again, one not
+ * in it ended while the relay was away. A worker that never reports (it died
+ * with the relay) has its held tasks marked ended (`endUnconfirmed`), never
+ * running again. Health readings are not stored: the poller reads the files
+ * again. Sub-agent rows have no console and are not stored either.
  */
 
 import { backgroundTaskDigest, sameBackgroundTaskDigest } from '../../shared/worker-runtime/background-task-digest.mjs';
@@ -52,10 +63,29 @@ function exitCodeOf(value) {
   return Number.isInteger(number) ? number : null;
 }
 
+// A stored live row is confirmed at most this often while its worker's
+// digest agrees (its `updated_at`), and one not confirmed for this long is a
+// leftover of a worker that went away without a word: not restored.
+const LIVE_TOUCH_EVERY_MS = 30 * 60_000;
+const LIVE_STALE_MS = 6 * 60 * 60_000;
+
+// What of a live console task is stored: what the console and an ended row
+// need, not what changes with every progress post.
+const STORED_LIVE_FIELDS = ['taskId', 'taskType', 'description', 'command', 'startedAt', 'outputPath', 'outputKind', 'stoppable', 'toolUseId'];
+
+function storedLiveRow(task, ahead) {
+  const row = {};
+  for (const field of STORED_LIVE_FIELDS) if (task?.[field] !== undefined && task?.[field] !== null) row[field] = task[field];
+  // How it ended, told before the set dropped it.
+  if (ahead) row.settled = { status: ahead.status, exitCode: ahead.exitCode, ...(ahead.steps !== undefined ? { steps: ahead.steps } : {}) };
+  return row;
+}
+
 export function createBackgroundTaskStore({
   now = () => Date.now(),
   endedKeepMs = TASK_OUTPUT_LIMITS.endedKeepMs,
   endedMax = TASK_OUTPUT_LIMITS.endedMax,
+  persistence = null,
 } = {}) {
   const sets = new Map();
   // key → Map(taskId → ended row), newest last.
@@ -75,6 +105,18 @@ export function createBackgroundTaskStore({
   const holders = new Map();
   // Keys whose pages were told of the placeholder for unreported work.
   const announced = new Set();
+  // key → Map(taskId → row): live console tasks of the runtime before, held
+  // until the worker's set says what became of them.
+  const restored = new Map();
+  // key → what was stored of its live console tasks last, to write only on change.
+  const storedLive = new Map();
+  // key → when its stored live rows were last written or confirmed.
+  const touchedAt = new Map();
+  // key → Map(taskId → when the runtime before last knew the held task running).
+  const heldSince = new Map();
+  const store = persistence && persistence.available !== false ? persistence : null;
+
+  restore();
 
   return {
     sets,
@@ -97,9 +139,33 @@ export function createBackgroundTaskStore({
           health: healthByKey.get(id)?.get(taskId) || task.health || undefined,
         });
       }
+      // Tasks held since the restart: the worker's set says which still run
+      // (their console is the one they had; the first path a task names
+      // wins), and the others ended while the relay was away.
+      const held = restored.get(id);
+      if (held) {
+        restored.delete(id);
+        for (const [taskId, row] of held) {
+          const live = next.find((task) => keyOf(task?.taskId) === taskId);
+          if (live) {
+            if (row.outputPath && live.outputPath !== row.outputPath) {
+              live.outputPath = row.outputPath;
+              live.outputKind = row.outputKind;
+            }
+            if (row.settled && !settledAhead.get(id)?.has(taskId)) {
+              let ahead = settledAhead.get(id);
+              if (!ahead) settledAhead.set(id, ahead = new Map());
+              ahead.set(taskId, { ...row.settled, at: now() });
+            }
+            continue;
+          }
+          endRestored(id, row);
+        }
+        heldSince.delete(id);
+      }
       // A task back in the set (a resync after a restart) is not ended.
       for (const taskId of nextIds) {
-        endedRows.get(id)?.delete(taskId);
+        if (endedRows.get(id)?.delete(taskId)) store?.remove(id, taskId);
         settledAhead.get(id)?.delete(taskId);
       }
       const health = healthByKey.get(id);
@@ -107,11 +173,9 @@ export function createBackgroundTaskStore({
         for (const taskId of [...health.keys()]) if (!nextIds.has(taskId)) health.delete(taskId);
         if (!health.size) healthByKey.delete(id);
       }
-      if (next.length === 0) {
-        sets.delete(id);
-        return;
-      }
-      sets.set(id, { tasks: next, updatedAt: now() });
+      if (next.length === 0) sets.delete(id);
+      else sets.set(id, { tasks: next, updatedAt: now() });
+      storeLive(id);
     },
     /**
      * How a task ended (`/api/background-task-settled`): updates its ended
@@ -119,7 +183,7 @@ export function createBackgroundTaskStore({
      * runtime never saw live that names its output, becomes an ended row of
      * its own. Returns the ended row when there is one.
      */
-    settle(conversationId, taskId, { status, exitCode, outputPath, description, taskType, startedAt, outputKind, steps } = {}) {
+    settle(conversationId, taskId, { status, exitCode, outputPath, description, command, taskType, startedAt, outputKind, steps } = {}) {
       const id = keyOf(conversationId);
       const task = keyOf(taskId);
       if (!id || !task) return null;
@@ -136,7 +200,20 @@ export function createBackgroundTaskStore({
           if (existing.outputKind !== 'file' && existing.outputKind !== 'spool') existing.outputKind = outputKind === 'spool' ? 'spool' : 'file';
         }
         if (stepCount !== undefined) existing.steps = stepCount;
+        store?.saveEnded(id, existing);
         return existing;
+      }
+      // A task held since the restart that ended while the relay was away
+      // (the worker sends the settle again): it is not running any more.
+      const heldRow = restored.get(id)?.get(task);
+      if (heldRow) {
+        restored.get(id).delete(task);
+        if (!restored.get(id).size) restored.delete(id);
+        return endRestored(id, {
+          ...heldRow,
+          settled: { status: normalized, exitCode: code, ...(stepCount !== undefined ? { steps: stepCount } : {}) },
+          ...(!heldRow.outputPath && outputPath ? { outputPath, outputKind: outputKind === 'spool' ? 'spool' : 'file' } : {}),
+        });
       }
       const live = (sets.get(id)?.tasks || []).find((entry) => keyOf(entry?.taskId) === task);
       if (live) {
@@ -149,6 +226,7 @@ export function createBackgroundTaskStore({
           live.outputPath = outputPath;
           if (live.outputKind !== 'file' && live.outputKind !== 'spool') live.outputKind = outputKind === 'spool' ? 'spool' : 'file';
         }
+        storeLive(id);
         return null;
       }
       if (!outputPath) return null;
@@ -156,6 +234,7 @@ export function createBackgroundTaskStore({
         taskId: task,
         taskType: keyOf(taskType) || 'local_bash',
         description: String(description || '').trim().slice(0, 500),
+        ...(command ? { command } : {}),
         startedAt: Number(startedAt) || null,
         outputPath,
         outputKind: outputKind || 'file',
@@ -202,6 +281,7 @@ export function createBackgroundTaskStore({
     setEndedHealth(conversationId, taskId, value) {
       const row = endedRows.get(keyOf(conversationId))?.get(keyOf(taskId));
       if (!row || !value) return false;
+      // Not stored: the poller reads the file again after a restart.
       row.health = value;
       return true;
     },
@@ -234,6 +314,15 @@ export function createBackgroundTaskStore({
         const row = endedRows.get(id)?.get(task);
         if (row) return { key: id, task: { ...row }, ended: true };
       }
+      // Held since the restart: its console is readable while the worker
+      // has not reported yet.
+      for (const id of ids) {
+        const row = restored.get(id)?.get(task);
+        if (row) {
+          const { settled: _settled, ...rest } = row;
+          return { key: id, task: { ...rest }, ended: false, restored: true };
+        }
+      }
       return null;
     },
     get(conversationId) {
@@ -249,8 +338,20 @@ export function createBackgroundTaskStore({
      * they agree. Agreement counts as a report, an empty set included.
      */
     matches(digest, ...keys) {
+      // Tasks held since the restart are settled only by a set the worker
+      // sends: until then the worker is asked for it, whatever its digest.
+      if (keys.map(keyOf).some((key) => key && restored.has(key))) return false;
       const same = sameBackgroundTaskDigest(digest, this.digestFor(...keys));
-      if (same) for (const key of keys.map(keyOf).filter(Boolean)) reported.add(key);
+      if (same) {
+        for (const key of keys.map(keyOf).filter(Boolean)) {
+          reported.add(key);
+          // Its stored rows are still running: say so now and then, so a
+          // restart can tell them from a dead worker's leftovers.
+          if (store && storedLive.get(key) && now() - (touchedAt.get(key) || 0) >= LIVE_TOUCH_EVERY_MS) {
+            if (store.touchLive?.(key)) touchedAt.set(key, now());
+          }
+        }
+      }
       return same;
     },
     /** Whether this runtime has heard from the worker about its tasks. */
@@ -305,7 +406,40 @@ export function createBackgroundTaskStore({
       else announced.delete(id);
       return true;
     },
-    /** The conversation is gone: everything held for these keys goes. */
+    /**
+     * Read only: every task held since the restart, as `{ key, task }`
+     * (the stored row). Not running for any panel or check until the
+     * worker's set confirms it.
+     */
+    listRestored() {
+      const rows = [];
+      for (const [key, held] of restored) {
+        for (const row of held.values()) {
+          const { settled, ...task } = row;
+          rows.push({ key, task });
+        }
+      }
+      return rows;
+    },
+    /** Whether tasks of these keys are held since the restart. */
+    hasRestored(...keys) {
+      return keys.map(keyOf).some((key) => key && restored.has(key));
+    },
+    /**
+     * The workers that did not report since the restart: their held tasks
+     * are marked ended (how is unknown), never running again. Returns the
+     * keys whose ended rows changed.
+     */
+    endUnconfirmed() {
+      const changed = [];
+      for (const [id, held] of [...restored]) {
+        restored.delete(id);
+        for (const row of held.values()) endRestored(id, row);
+        storeLive(id);
+        changed.push(id);
+      }
+      return changed;
+    },
     /**
      * Drops expired ended rows and pending settles of every key, also of
      * conversations nobody reads again (the per-key prune runs on reads).
@@ -313,9 +447,17 @@ export function createBackgroundTaskStore({
      */
     pruneAll() {
       for (const id of new Set([...endedRows.keys(), ...settledAhead.keys()])) prune(id);
+      store?.pruneEnded(now() - endedKeepMs);
     },
+    /** The conversation is gone: everything held for these keys goes. */
     forget(...keys) {
-      for (const id of keys.map(keyOf).filter(Boolean)) {
+      const ids = keys.map(keyOf).filter(Boolean);
+      if (ids.length) store?.forget(ids);
+      for (const id of ids) {
+        restored.delete(id);
+        heldSince.delete(id);
+        touchedAt.delete(id);
+        storedLive.delete(id);
         sets.delete(id);
         reported.delete(id);
         applied.delete(id);
@@ -327,6 +469,86 @@ export function createBackgroundTaskStore({
       }
     },
   };
+
+  // The rows the runtime before kept: ended rows for the rest of their
+  // hour, live console tasks held for the worker's word.
+  function restore() {
+    if (!store) return;
+    const cutoff = now() - endedKeepMs;
+    const ended = [];
+    for (const entry of store.load()) {
+      const id = keyOf(entry.key);
+      const taskId = keyOf(entry.taskId);
+      if (!id || !taskId) continue;
+      if (entry.state === 'ended') {
+        const endedAt = Number(entry.endedAt ?? entry.row.endedAt);
+        if (!Number.isFinite(endedAt) || endedAt < cutoff) continue;
+        ended.push({ id, row: { ...entry.row, taskId, endedAt, stoppable: false } });
+        continue;
+      }
+      if (entry.state !== 'live') continue;
+      // Not confirmed for hours: its worker went away in a runtime before
+      // without a word. Nothing to show, now or as an ended row.
+      const since = Number(entry.updatedAt);
+      if (!Number.isFinite(since) || now() - since > LIVE_STALE_MS) {
+        store.remove(id, taskId);
+        continue;
+      }
+      let held = restored.get(id);
+      if (!held) restored.set(id, held = new Map());
+      held.set(taskId, { ...entry.row, taskId });
+      let sinceOf = heldSince.get(id);
+      if (!sinceOf) heldSince.set(id, sinceOf = new Map());
+      sinceOf.set(taskId, Math.min(since, now()));
+      storedLive.set(id, null);
+    }
+    // Oldest first, as `addEnded` keeps them.
+    ended.sort((a, b) => a.row.endedAt - b.row.endedAt);
+    for (const { id, row } of ended) {
+      let rows = endedRows.get(id);
+      if (!rows) endedRows.set(id, rows = new Map());
+      rows.set(row.taskId, row);
+      while (rows.size > endedMax) rows.delete(rows.keys().next().value);
+    }
+    store.pruneEnded(cutoff);
+  }
+
+  // A held task that is not running any more becomes an ended row, with how
+  // it ended when the runtime before was told.
+  // It ended at the latest when the runtime before last knew it running, so
+  // that is its end time: a leftover from long ago does not count as fresh.
+  function endRestored(id, row) {
+    const { settled, ...task } = row;
+    const since = heldSince.get(id)?.get(keyOf(task.taskId));
+    heldSince.get(id)?.delete(keyOf(task.taskId));
+    if (!heldSince.get(id)?.size) heldSince.delete(id);
+    return addEnded(id, {
+      ...task,
+      ...(settled?.steps !== undefined ? { steps: settled.steps } : {}),
+      status: settled?.status || 'unknown',
+      exitCode: settled ? settled.exitCode : null,
+    }, { endedAt: Number.isFinite(since) ? since : undefined });
+  }
+
+  // Stores the key's live console tasks when they changed (what is stored,
+  // not every progress post).
+  function storeLive(id) {
+    if (!store) return;
+    const ahead = settledAhead.get(id);
+    const rows = (sets.get(id)?.tasks || [])
+      .filter((task) => task?.outputPath && keyOf(task?.taskId))
+      .map((task) => storedLiveRow(task, ahead?.get(keyOf(task.taskId))));
+    // Held tasks stay stored until the worker's set settles them.
+    for (const row of restored.get(id)?.values() || []) rows.push(row);
+    const signature = JSON.stringify(rows);
+    if (storedLive.get(id) === signature) return;
+    if (!rows.length && !storedLive.has(id)) return;
+    if (store.saveLive(id, rows)) {
+      touchedAt.set(id, now());
+      if (rows.length) storedLive.set(id, signature);
+      else storedLive.delete(id);
+    }
+  }
 
   function prune(id) {
     const cutoff = now() - endedKeepMs;
@@ -342,7 +564,7 @@ export function createBackgroundTaskStore({
     }
   }
 
-  function addEnded(id, task) {
+  function addEnded(id, task, { endedAt = now() } = {}) {
     let rows = endedRows.get(id);
     if (!rows) endedRows.set(id, rows = new Map());
     const taskId = keyOf(task.taskId);
@@ -352,13 +574,18 @@ export function createBackgroundTaskStore({
       taskId,
       status: normalizeEndedTaskStatus(task.status, exitCodeOf(task.exitCode)),
       exitCode: exitCodeOf(task.exitCode),
-      endedAt: now(),
+      endedAt,
       stoppable: false,
     };
     if (!row.health) delete row.health;
     rows.set(taskId, row);
     settledAhead.get(id)?.delete(taskId);
-    while (rows.size > endedMax) rows.delete(rows.keys().next().value);
+    store?.saveEnded(id, row);
+    while (rows.size > endedMax) {
+      const oldest = rows.keys().next().value;
+      rows.delete(oldest);
+      store?.remove(id, oldest);
+    }
     prune(id);
     return row;
   }

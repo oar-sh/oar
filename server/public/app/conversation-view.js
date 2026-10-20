@@ -67,6 +67,7 @@ import { closeSlashAutocomplete, handleSlashAutocompleteKey, updateSlashAutocomp
 import { closeMentionAutocomplete, handleMentionAutocompleteKey, updateMentionAutocomplete } from './mention-autocomplete.mjs';
 import { renderRemoteOriginBadgeHtml } from './remote-relay-origin-view.mjs';
 import { isRelayEventMessage, renderRelayEventRowHtml } from './relay-event-view.mjs';
+import { isRestartResumeNote, renderRestartResumeNoteHtml } from './relay-restart-note-view.mjs';
 import {
   AGENT_EXCHANGE_CLOSED_CLASS,
   AGENT_EXCHANGE_HEAD_CLASS,
@@ -398,14 +399,18 @@ const conversationHistoryLoader = createInfiniteLoader({
     syncSteeredTurnMerge(el);
     // The page's agent exchanges fold before the height delta is measured.
     syncAgentExchangeFolds(el);
+    // Here, not a frame later: the position taken above is the reader's only
+    // until they scroll again, and a scroll in that frame (a jump to the end
+    // and up again) was undone by it.
+    el.scrollTop = previousScrollTop + (el.scrollHeight - previousScrollHeight);
+    // The page's images have no height yet: the place read is held while
+    // they come in, as after a restore.
+    const place = captureConversationReadingAnchor();
+    if (place?.conversationId === currentId) holdReadingAnchorWhileMediaLoads(el, place.anchor);
+    // Once the loader has taken this page's cursor: still near the top, the
+    // next page loads.
     requestAnimationFrame(() => {
-      if (!el || String(currentConvId || '').trim() !== currentId) return;
-      const nextScrollHeight = el.scrollHeight;
-      el.scrollTop = previousScrollTop + (nextScrollHeight - previousScrollHeight);
-      // The page's images have no height yet: the place read is held while
-      // they come in, as after a restore.
-      const place = captureConversationReadingAnchor();
-      if (place?.conversationId === currentId) holdReadingAnchorWhileMediaLoads(el, place.anchor);
+      if (String(currentConvId || '').trim() !== currentId) return;
       void conversationHistoryLoader.handleBoundaryDistance(el.scrollTop);
     });
   },
@@ -1336,6 +1341,21 @@ function createRelayEventNode(msg, msgId) {
   return div;
 }
 
+// The relay's note to carry on after a restart cut a turn off: a folded row
+// like an event row (relay-restart-note-view.mjs).
+function createRestartResumeNoteNode(msg, msgId) {
+  const div = document.createElement('div');
+  div.className = 'msg relay-event relay-restart-resume';
+  if (msgId) div.dataset.messageId = msgId;
+  const fingerprint = buildLiveMessageFingerprint({ ...msg, id: msgId || msg?.id || '' });
+  div.dataset.messageRole = fingerprint.role || '';
+  div.dataset.messageTextFingerprint = fingerprint.text || '';
+  div.dataset.messageTimestamp = String(msg?.timestamp || '').trim();
+  div.innerHTML = renderRestartResumeNoteHtml(msg, { escHtml, timeText: msg?.timestamp ? fmtDate(msg.timestamp) : '' });
+  setAgentExchangeRow(div, msg, msgId);
+  return div;
+}
+
 // Agent exchanges (agent-exchange-fold-view.mjs): an agent's prompt folds
 // into one row; this session's reply to it always shows. What the fold pass
 // needs of a message is kept on its node when the row is built, so the pass
@@ -1469,6 +1489,7 @@ function createMessageNode(msg, msgId = null, force = false) {
   // An event message the relay wrote into a watcher's conversation: a
   // compact, foldable row, never a bubble of the user's.
   if (isRelayEventMessage(msg)) return createRelayEventNode(msg, msgId);
+  if (isRestartResumeNote(msg)) return createRestartResumeNoteNode(msg, msgId);
 
   // A prompt another relay's agent sent carries `origin`: its header line is
   // hidden (the badge below says the same), and a stray remote-relay mention
@@ -4602,7 +4623,10 @@ export async function sendMessage() {
         : undefined,
     };
 
-    const r = await sendMessageApi(body);
+    // A refusal the user can act on (the conversation's model left the
+    // catalog) is shown as the relay words it.
+    let refusal = '';
+    const r = await sendMessageApi(body, { onRefused: (reason) => { refusal = reason; } });
     if (!r) {
       // Offline: park the send in the durable outbox instead of bouncing it
       // back into the composer. The client-generated messageId makes a replay
@@ -4636,7 +4660,7 @@ export async function sendMessage() {
         sendLanded,
       });
       if (!mobileSend && viewingSendConversation()) input.focus();
-      setModelBanner('⚠️ Message could not be sent. Please try again.');
+      setModelBanner(refusal ? `⚠️ ${refusal}` : '⚠️ Message could not be sent. Please try again.');
       return;
     }
 

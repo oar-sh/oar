@@ -149,6 +149,7 @@ import {
   canMergeIntoTranscript,
 } from './conversation-view.js';
 import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
+import { backgroundTasksSnapshotMark } from './background-tasks-view.mjs';
 import { newerPageReachesEnd } from './transcript-island.mjs';
 import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
 import { initHiddenMessagesView, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
@@ -339,6 +340,7 @@ import {
   updateBackgroundTaskTimeoutSetting,
   previewTaskStallMinutesSetting,
   updateTaskStallMinutesSetting,
+  updateRestartResumeSettingFromToggle,
   updateSubagentRecordRetentionSetting,
 } from './settings-modal.js';
 import {
@@ -3758,6 +3760,7 @@ async function pollAuthenticatedCurrentConversationLive() {
     const savedScrollTop = messagesEl?.scrollTop || 0;
     const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+    const tasksMark = backgroundTasksSnapshotMark(currentId);
     const jumpEpoch = getTranscriptJumpEpoch();
     const { response, stale } = await loadKeepingLiveRows(
       () => loadConversation(currentId, { limit: requestLimit }),
@@ -3783,6 +3786,7 @@ async function pollAuthenticatedCurrentConversationLive() {
       savedScrollTop: preserveBottom ? null : stableSavedScrollTop,
       followLiveUpdates: preserveBottom,
       mergeFrom: merge?.mergeFrom || null,
+      backgroundTasksAsOf: tasksMark,
     });
     // A merge does not scroll as the full render does: a reader at the end
     // is taken to the new end here.
@@ -4061,6 +4065,7 @@ async function refreshCurrentView() {
 
   const savedLoadedCount = loadConversationLoadedMessageCount(currentId);
   const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
+  const tasksMark = backgroundTasksSnapshotMark(currentId);
   const { response: r, stale } = await loadKeepingLiveRows(
     () => loadConversation(currentId, { limit: requestLimit }),
     getTranscriptLiveRowEpoch,
@@ -4085,6 +4090,7 @@ async function refreshCurrentView() {
       followLiveUpdates: preserveBottom && !keepTranscript,
       keepTranscript,
       mergeFrom: merge?.mergeFrom || null,
+      backgroundTasksAsOf: tasksMark,
     });
     // As in the live poll: a merge leaves the scrolling to the caller.
     if (merge && preserveBottom && messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -5102,6 +5108,7 @@ window.previewBackgroundTaskTimeoutSetting = previewBackgroundTaskTimeoutSetting
 window.updateBackgroundTaskTimeoutSetting = updateBackgroundTaskTimeoutSetting;
 window.previewTaskStallMinutesSetting = previewTaskStallMinutesSetting;
 window.updateTaskStallMinutesSetting = updateTaskStallMinutesSetting;
+window.updateRestartResumeSettingFromToggle = updateRestartResumeSettingFromToggle;
 window.updateSubagentRecordRetentionSetting = updateSubagentRecordRetentionSetting;
 window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;

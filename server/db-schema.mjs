@@ -23,6 +23,7 @@ import { migrateConversationGroups } from './migrations/0014-conversation-groups
 import { migrateConversationGroupPosition } from './migrations/0015-conversation-group-position.mjs';
 import { migrateShareAccessLog } from './migrations/0016-share-access-log.mjs';
 import { migrateConversationHistoryIndexes } from './migrations/0017-conversation-history-indexes.mjs';
+import { migrateBackgroundTaskRows } from './migrations/0018-background-task-rows.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -843,6 +844,15 @@ try {
   migrateConversationHistoryIndexes(db);
 } catch (error) {
   console.warn(`[history] migration 0017 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The task console's rows across a restart: one new table. The task store
+// checks for it and keeps its rows in memory only without it, so a failure is
+// logged and retried next boot like 0017.
+try {
+  migrateBackgroundTaskRows(db);
+} catch (error) {
+  console.warn(`[background-tasks] migration 0018 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

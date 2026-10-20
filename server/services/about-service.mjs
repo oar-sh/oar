@@ -68,32 +68,33 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
  * The commit a git checkout has checked out, read from its .git files rather
  * than from a `git` process: HEAD, then the loose ref, then packed-refs. A
  * linked worktree's .git is a file naming its git dir, whose refs live in the
- * common dir. Anything unexpected reads as null.
+ * common dir. Anything unexpected reads as null. `pathImpl` is the host's path
+ * module; tests pass path.posix and path.win32.
  */
-export function readGitCommit(root, { fsImpl = fs } = {}) {
+export function readGitCommit(root, { fsImpl = fs, pathImpl = path } = {}) {
   if (!root) return null;
-  const dotGit = path.join(root, '.git');
+  const dotGit = pathImpl.join(root, '.git');
   let gitDir = dotGit;
   const pointer = readFileText(fsImpl, dotGit);
   if (pointer !== null) {
     const match = pointer.match(/^gitdir:\s*(.+)$/m);
     if (!match) return null;
-    gitDir = path.resolve(root, match[1].trim());
+    gitDir = pathImpl.resolve(root, match[1].trim());
   }
-  const head = readFileText(fsImpl, path.join(gitDir, 'HEAD'));
+  const head = readFileText(fsImpl, pathImpl.join(gitDir, 'HEAD'));
   if (head === null) return null;
   const headText = head.trim();
   if (COMMIT_PATTERN.test(headText)) return headText.toLowerCase();
   const refMatch = headText.match(/^ref:\s*(\S+)$/);
   if (!refMatch) return null;
   const ref = refMatch[1];
-  const commonDirText = readFileText(fsImpl, path.join(gitDir, 'commondir'));
-  const commonDir = commonDirText ? path.resolve(gitDir, commonDirText.trim()) : gitDir;
+  const commonDirText = readFileText(fsImpl, pathImpl.join(gitDir, 'commondir'));
+  const commonDir = commonDirText ? pathImpl.resolve(gitDir, commonDirText.trim()) : gitDir;
   for (const dir of new Set([gitDir, commonDir])) {
-    const loose = readFileText(fsImpl, path.join(dir, ...ref.split('/')));
+    const loose = readFileText(fsImpl, pathImpl.join(dir, ...ref.split('/')));
     if (loose && COMMIT_PATTERN.test(loose.trim())) return loose.trim().toLowerCase();
   }
-  const packed = readFileText(fsImpl, path.join(commonDir, 'packed-refs')) || '';
+  const packed = readFileText(fsImpl, pathImpl.join(commonDir, 'packed-refs')) || '';
   for (const line of packed.split(/\r?\n/)) {
     const [hash, name] = line.trim().split(/\s+/);
     if (name === ref && COMMIT_PATTERN.test(hash || '')) return hash.toLowerCase();
@@ -102,11 +103,11 @@ export function readGitCommit(root, { fsImpl = fs } = {}) {
 }
 
 /** The commit this build came from: the checkout's HEAD, else a `gitHead` stamp in package.json. */
-export function resolveBuildCommit(packageRoot, { fsImpl = fs } = {}) {
-  const fromGit = readGitCommit(packageRoot, { fsImpl });
+export function resolveBuildCommit(packageRoot, { fsImpl = fs, pathImpl = path } = {}) {
+  const fromGit = readGitCommit(packageRoot, { fsImpl, pathImpl });
   if (fromGit) return fromGit;
   try {
-    const stamp = String(JSON.parse(readFileText(fsImpl, path.join(packageRoot, 'package.json')) || '{}')?.gitHead || '').trim();
+    const stamp = String(JSON.parse(readFileText(fsImpl, pathImpl.join(packageRoot, 'package.json')) || '{}')?.gitHead || '').trim();
     return COMMIT_PATTERN.test(stamp) ? stamp.toLowerCase() : null;
   } catch {
     return null;

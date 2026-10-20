@@ -39,9 +39,62 @@ export const RELAY_EVENT_LINK_RESTORED_TYPE = 'link_restored';
 const LINK_EVENT_TYPES = Object.freeze([RELAY_EVENT_LINK_LOST_TYPE, RELAY_EVENT_LINK_RESTORED_TYPE]);
 const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBEAT_TYPE, ...LINK_EVENT_TYPES]);
 
+// Not an event of its own but a narrower task_finished a subscription can
+// name: the end of a task other than a shell command (a sub-agent's). Its
+// events are task_finished lines. A busy worker ends shell commands every
+// minute or so, and each was a wake-up of the watcher, a model turn on its
+// whole context; a failed one is still a task_failed.
+export const RELAY_EVENT_SUBAGENT_FINISHED_TYPE = 'subagent_finished';
+
+// What `events` may name: the event types and the narrower subagent_finished.
+export const RELAY_EVENT_SUBSCRIBABLE_TYPES = Object.freeze([
+  ...RELAY_EVENT_TYPES.slice(0, RELAY_EVENT_TYPES.indexOf('task_finished') + 1),
+  RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
+  ...RELAY_EVENT_TYPES.slice(RELAY_EVENT_TYPES.indexOf('task_finished') + 1),
+]);
+
 // What a subscription gets when it names no events: everything but the
-// start of a task, which a watcher asks for explicitly.
-export const RELAY_EVENT_DEFAULT_TYPES = Object.freeze(RELAY_EVENT_TYPES.filter((type) => type !== 'task_started'));
+// start of a task, and of the task ends that went well only a sub-agent's
+// (subagent_finished, not task_finished): the start of a task and every
+// shell command's end a watcher asks for explicitly.
+export const RELAY_EVENT_DEFAULT_TYPES = Object.freeze(RELAY_EVENT_SUBSCRIBABLE_TYPES
+  .filter((type) => type !== 'task_started' && type !== 'task_finished'));
+
+// The default before subagent_finished: every type but task_started. A
+// subscription made without events stored exactly this list.
+export const RELAY_EVENT_LEGACY_DEFAULT_TYPES = Object.freeze(RELAY_EVENT_TYPES.filter((type) => type !== 'task_started'));
+
+/**
+ * The events a stored subscription takes. A list that is exactly the old
+ * default (any order, no more, no less) was the default, not a choice, and
+ * means today's; any other list is what the watcher named and stays. Read,
+ * never written back: applying it twice changes nothing, and the stored row
+ * is as it was should an older relay read it again.
+ */
+export function effectiveRelayEventTypes(types) {
+  const list = Array.isArray(types) ? types.map(toText).filter(Boolean) : [];
+  return isLegacyDefaultRelayEventTypes(list) ? [...RELAY_EVENT_DEFAULT_TYPES] : list;
+}
+
+/** Whether a list is exactly the old default as a set (any order, repeats ignored). */
+export function isLegacyDefaultRelayEventTypes(types) {
+  const unique = new Set((Array.isArray(types) ? types : []).map(toText).filter(Boolean));
+  return unique.size === RELAY_EVENT_LEGACY_DEFAULT_TYPES.length
+    && RELAY_EVENT_LEGACY_DEFAULT_TYPES.every((type) => unique.has(type));
+}
+
+/**
+ * Whether a subscription's `events` take this event: its type named, or a
+ * task_finished of anything but a shell command under subagent_finished.
+ */
+export function relayEventTypesTake(types, event) {
+  const list = Array.isArray(types) ? types : [];
+  const type = toText(event?.type);
+  if (list.includes(type)) return true;
+  return type === 'task_finished'
+    && list.includes(RELAY_EVENT_SUBAGENT_FINISHED_TYPE)
+    && toText(event?.detail?.kind) !== 'shell';
+}
 
 // Never held back: not by the 30 s coalescing, not by the digest past the
 // hourly cap (they still count toward it).

@@ -16,6 +16,7 @@ import {
 import {
   persistConversationModelPreference as persistConversationModelPreferenceTx,
 } from '../services/conversation-preferences-service.mjs';
+import { fallbackReasoningEffort, inheritedConversationModel } from '../services/conversation-model-fallback.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
 import { normalizeWorkerSteeringSnapshot } from '../services/session-worker-registry-service.mjs';
 import {
@@ -45,6 +46,8 @@ import { normalizeBackgroundTaskDigest } from '../../shared/worker-runtime/backg
 import {
   DEFAULT_TASK_STALL_MINUTES,
   TASK_OUTPUT_LIMITS,
+  cleanTaskText,
+  normalizeTaskCommand,
   normalizeTaskOutputKind,
   normalizeTaskOutputPath,
 } from '../../shared/task-output-text.mjs';
@@ -68,6 +71,7 @@ import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limi
 import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
 import { createLocalRequestCheck } from '../services/request-boundary.mjs';
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
+import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
 import {
   admitRemoteRelayRequest,
   readRemoteRelayRequest,
@@ -244,9 +248,17 @@ function findRecentDuplicateUserMessage({
   const exempt = new Set((Array.isArray(exemptMessageIds) ? exemptMessageIds : [])
     .map((id) => String(id || '').trim()).filter(Boolean));
   const isExempt = (row) => exempt.has(String(row?.id || '').trim());
+  // A message whose turn failed never ran, so sending it again is a retry,
+  // not a double submit. Only failed rows: a cancelled or finished turn stays
+  // a duplicate, as before.
+  const failedTurnIds = new Set((Array.isArray(recentQueueRows) ? recentQueueRows : [])
+    .filter((row) => String(row?.status || '').trim().toLowerCase() === 'failed')
+    .map((row) => String(row?.id || '').trim())
+    .filter(Boolean));
 
   for (const row of Array.isArray(recentUserMessages) ? recentUserMessages : []) {
     if (isExempt(row)) continue;
+    if (failedTurnIds.has(String(row?.id || '').trim())) continue;
     const rowText = normalizeDuplicateMessageText(row?.text || '');
     if (!rowText || rowText !== fingerprint) continue;
     const rowTime = Date.parse(row?.timestamp || '');
@@ -1792,6 +1804,9 @@ export function registerMessagesRoutes(app, deps) {
     taskOutputSnapshots = null,
     // Has the health poller read soon (a task with a console ended).
     pokeTaskHealth = null,
+    // What a recovery did with a turn that was running when the relay
+    // started (services/restart-resume-service.mjs noteOutcome).
+    noteRestartTurnOutcome = () => {},
     getTaskStallMinutes = () => DEFAULT_TASK_STALL_MINUTES,
     sendWorkerControl,
     ensureSessionId,
@@ -2727,10 +2742,12 @@ export function registerMessagesRoutes(app, deps) {
         // quietly.
         stmts.dropStaleContinuation?.run?.(row.id);
         io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+        noteRestartTurnOutcome(row, 'cut');
         continue;
       }
       if (row.consumed_at) {
         failConsumedQueueRow(row, { reason });
+        noteRestartTurnOutcome(row, 'cut');
         continue;
       }
       const relayActivityRows = stmts.listActivityByQueueMessage?.all?.(row.id);
@@ -2767,6 +2784,7 @@ export function registerMessagesRoutes(app, deps) {
         error: reason,
       });
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
+      noteRestartTurnOutcome(row, 'requeued');
     }
     for (const row of rowsToFail) {
       const failureRecord = buildHeartbeatIdleReplayFailure({
@@ -2792,6 +2810,8 @@ export function registerMessagesRoutes(app, deps) {
           ok: false,
           error: failureRecord.code,
         });
+        // Started, so not replayed: a turn the agent never heard the end of.
+        noteRestartTurnOutcome(row, 'cut');
       }
     }
     if (rowsToRecover.length || rowsToFail.length) {
@@ -4429,7 +4449,17 @@ export function registerMessagesRoutes(app, deps) {
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
     const sessionWorkerRoutingEnabled = isSessionWorkerRoutingEnabled(featureFlags);
     let conversationSdkSessionId = null;
-    const requestedRelayMode = normalizeRelayMode(relayMode || mode);
+    // The conversation's saved choices, for a send that leaves one out: a
+    // send to an existing conversation that names no mode runs in the mode
+    // the conversation is in, not the relay default.
+    const existingConversation = (!newConversation && conversationId)
+      ? (stmts.getConvAnyStatus?.get?.(conversationId) || null)
+      : null;
+    const explicitRelayModeGiven = !!String(relayMode || mode || '').trim();
+    const savedRelayMode = !explicitRelayModeGiven && existingConversation?.preferred_relay_mode
+      ? normalizeRelayMode(existingConversation.preferred_relay_mode)
+      : null;
+    const requestedRelayMode = savedRelayMode || normalizeRelayMode(relayMode || mode);
     const trimmedText = stripRelayPromptContext(text, requestedRelayMode || relayMode || mode);
     const normalizedAttachments = normalizeAttachments(rawAttachments);
     const requestedAttachmentCount = Math.min(
@@ -4786,6 +4816,34 @@ export function registerMessagesRoutes(app, deps) {
     // sends set_model before the message), so a changed model is taken as
     // for a local Claude chat.
     const claudeCloudModel = claudeCloudModelSelection ? claudeCloudModelSelection.model : '';
+    // What the request itself chose. Only these are saved as the
+    // conversation's preference; a value filled in below never is.
+    const explicitModelGiven = !!requestedOpenAIModel;
+    const conversationReasoningEffort = String(existingConversation?.preferred_reasoning_effort || '').trim().toLowerCase();
+    // A Copilot conversation sent no model keeps its own: the saved
+    // preference, the runtime session's model, the latest user message's,
+    // and the catalog default only when it has none of these. A model the
+    // catalog no longer lists is refused rather than swapped for another.
+    const usesGitHubCatalog = !useOpenAIProvider && !runtimeBoundToExplicitProvider;
+    const inheritedModel = usesGitHubCatalog && !shouldCreateConversation && !explicitModelGiven
+      ? inheritedConversationModel({
+          conversation: existingConversation,
+          runtimeSession: existingRuntimeSession,
+          latestUserMessageModel: stmts.getLatestUserMessageModel?.get?.(conversationId)?.model || '',
+        })
+      : null;
+    const githubModelResolution = usesGitHubCatalog
+      ? resolveRequestedModel(inheritedModel ? inheritedModel.model : model)
+      : null;
+    if (inheritedModel && !githubModelResolution?.ok) {
+      return res.status(409).json({
+        error: `This conversation's model "${inheritedModel.model}" is no longer available. Choose a model and send again.`,
+        code: 'CONVERSATION_MODEL_UNAVAILABLE',
+        conversationId,
+        model: inheritedModel.model,
+        supportedModels: githubModelResolution?.available || [],
+      });
+    }
     const modelResolution = useOpenAIProvider
       ? {
           ok: !!openAIModel,
@@ -4826,7 +4884,7 @@ export function registerMessagesRoutes(app, deps) {
                   reasoningEffort: null,
                   error: claudeCloudModel ? null : 'Claude Cloud model is not configured',
                 }
-              : resolveRequestedModel(model)))));
+              : githubModelResolution))));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -4851,6 +4909,15 @@ export function registerMessagesRoutes(app, deps) {
         code: 'IMAGE_TARGET_REQUIRES_IMAGE_MODEL',
       });
     }
+    // A send that names no effort runs with the conversation's own, clamped
+    // to the nearest level the model has. Null when there is nothing to keep
+    // or it neither matches nor clamps (an ultracode on a model without it):
+    // the provider's own default applies then.
+    const conversationEffortFor = (supported) => (
+      !explicitReasoningEffort && conversationReasoningEffort
+        ? (fallbackReasoningEffort([conversationReasoningEffort], supported, { fallback: '' }) || null)
+        : null
+    );
     // Claude conversations validate effort against the Claude provider's
     // per-model levels ('none' = SDK default). Effort is per-turn: each Claude
     // turn is a fresh query(), so it can change between messages.
@@ -4859,6 +4926,8 @@ export function registerMessagesRoutes(app, deps) {
       const supported = Array.isArray(configuredClaude?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
         ? configuredClaude.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
         : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
+      const kept = conversationEffortFor(supported);
+      if (kept) return { ok: true, effort: kept, supported };
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort: effort === 'none' ? 'none' : effort, supported };
     };
@@ -4874,8 +4943,11 @@ export function registerMessagesRoutes(app, deps) {
         // the worker validates it against the resolved model's live params
         // and falls back to the model default on any mismatch. Clamping to
         // 'none' here would actively disable thinking on the resolved model.
-        return { ok: true, effort: requestedEffort, supported: [] };
+        // The conversation's own effort goes through the same way.
+        return { ok: true, effort: requestedEffort || conversationReasoningEffort, supported: [] };
       }
+      const kept = conversationEffortFor(discovered);
+      if (kept) return { ok: true, effort: kept, supported: discovered };
       const effort = discovered.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort, supported: discovered };
     };
@@ -4884,11 +4956,16 @@ export function registerMessagesRoutes(app, deps) {
       const supported = Array.isArray(configuredGrok?.effortsByModel?.[String(requestedModel || '').trim().toLowerCase()])
         ? configuredGrok.effortsByModel[String(requestedModel || '').trim().toLowerCase()]
         : ['none', 'low', 'medium', 'high'];
+      const kept = conversationEffortFor(supported);
+      if (kept) return { ok: true, effort: kept, supported };
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort, supported };
     };
     let reasoningResolution = useOpenAIProvider
-      ? resolveOpenAIReasoningEffort(explicitReasoningEffort, openAIModel)
+      ? resolveOpenAIReasoningEffort(
+          explicitReasoningEffort || conversationEffortFor(openAIReasoningEffortsForModel(openAIModel)) || '',
+          openAIModel,
+        )
       : (runtimeUsesClaude
         ? resolveClaudeReasoningEffort()
         : (runtimeUsesCursor
@@ -4902,15 +4979,21 @@ export function registerMessagesRoutes(app, deps) {
                   requestedModel,
                   explicitReasoningEffort || modelResolution.reasoningEffort || null,
                 )))));
+    // No effort sent (or the model's variant carried one it lacks): the
+    // conversation's own effort, clamped to the model's levels, else its
+    // lowest level that is not 'none'. Some models list 'none' and the API
+    // still refuses it, so it is taken only when the conversation chose it or
+    // the model has nothing else.
     if (!reasoningResolution?.ok && !explicitReasoningEffort) {
       const supportedEfforts = Array.isArray(reasoningResolution?.supported)
         ? reasoningResolution.supported.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
         : [];
-      const fallbackReasoningEffort = supportedEfforts.includes('none')
-        ? 'none'
-        : (supportedEfforts[0] || null);
-      if (fallbackReasoningEffort) {
-        reasoningResolution = resolveRequestedReasoningEffort(requestedModel, fallbackReasoningEffort);
+      const fallbackEffort = fallbackReasoningEffort(
+        [modelResolution.reasoningEffort, conversationReasoningEffort],
+        supportedEfforts,
+      );
+      if (fallbackEffort) {
+        reasoningResolution = resolveRequestedReasoningEffort(requestedModel, fallbackEffort);
       }
     }
     if (!reasoningResolution?.ok) {
@@ -4920,6 +5003,9 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const requestedReasoningEffort = reasoningResolution.effort || null;
+    // The request's own effort: sent as such, or carried by the variant id of
+    // a model it named.
+    const explicitEffortGiven = !!explicitReasoningEffort || (explicitModelGiven && !!modelResolution.reasoningEffort);
     let normalizedContextTier = requestedContextTier;
     if (openAIImageModel) {
       normalizedContextTier = normalizeOpenAIImageSize(requestedContextTier) || 'auto';
@@ -4964,6 +5050,7 @@ export function registerMessagesRoutes(app, deps) {
       return res.json({
         ok: true,
         duplicate: true,
+        queued: false,
         alreadyResent: true,
         duplicateOfMessageId: resend.alreadyResentAs,
         conversationId,
@@ -4994,6 +5081,8 @@ export function registerMessagesRoutes(app, deps) {
         return res.json({
           ok: true,
           duplicate: true,
+          // Said outright for a caller that reads only `ok`: nothing new runs.
+          queued: false,
           duplicateWindowMs: DUPLICATE_USER_MESSAGE_WINDOW_MS,
           duplicateSource: duplicateMessage.source,
           duplicateOfMessageId: duplicateMessage.messageId,
@@ -5175,15 +5264,25 @@ export function registerMessagesRoutes(app, deps) {
       }
       // Another relay's agent picks the model and mode of its own turn; the
       // composer keeps restoring the user's choice for this conversation.
-      conversationPreferences = remoteRequest.remote && !shouldCreateConversation
-        ? readConversationModelPreference(convId, requestedRelayMode)
-        : persistConversationModelPreference(
+      // Any other send to an existing conversation saves only what it named:
+      // a model or an effort filled in from a fallback is never written back
+      // as the conversation's choice (an empty effort keeps the stored one).
+      const savedModel = String(existingConversation?.preferred_model || '').trim();
+      if (shouldCreateConversation) {
+        conversationPreferences = persistConversationModelPreference(
+          convId, requestedRelayMode, requestedModel, requestedReasoningEffort, now,
+        );
+      } else if (remoteRequest.remote || (!explicitModelGiven && !(explicitEffortGiven && savedModel))) {
+        conversationPreferences = readConversationModelPreference(convId, requestedRelayMode);
+      } else {
+        conversationPreferences = persistConversationModelPreference(
           convId,
           requestedRelayMode,
-          requestedModel,
-          requestedReasoningEffort,
+          explicitModelGiven ? requestedModel : savedModel,
+          explicitEffortGiven ? requestedReasoningEffort : '',
           now,
         );
+      }
       stmts.insertQ.run(
         msgId,
         convId,
@@ -5527,6 +5626,9 @@ export function registerMessagesRoutes(app, deps) {
         const leaseExpiresAt = addMsToIso(now, SESSION_WORKER_OWNER_LEASE_MS);
         for (const id of activeQueueMessageIds) {
           refreshProcessingLeaseForOwnedMessage.run(leaseExpiresAt, now, id, requesterSessionId);
+          // The worker has the turn: if it was running when the relay
+          // started, the restart did not cut it off.
+          noteRestartTurnOutcome({ id }, 'claimed');
         }
         recoverOwnedProcessingRowsForSession(requesterSessionId, {
           excludeMessageIds: activeQueueMessageIds,
@@ -6570,7 +6672,17 @@ export function registerMessagesRoutes(app, deps) {
       || rawRestart === 1
       || String(rawRestart || '').trim().toLowerCase() === 'true'
       || String(rawRestart || '').trim() === '1';
-    const result = requestRelayShutdown({ reason, requestedBy, restart });
+    // `immediate` starts it now, without waiting for the running turns (the
+    // banner's "Restart now"); the answer names what it did not wait for.
+    const rawImmediate = req.body?.immediate;
+    const immediate = rawImmediate === true
+      || rawImmediate === 1
+      || String(rawImmediate || '').trim().toLowerCase() === 'true'
+      || String(rawImmediate || '').trim() === '1';
+    // The banner's "Restart now" names the queued request it saw (see
+    // services/relay-restart-queue.mjs); a stale one is refused.
+    const expectRequestedAt = String(req.body?.expectRequestedAt || '').trim().slice(0, 40) || null;
+    const result = requestRelayShutdown({ reason, requestedBy, restart, immediate, expectRequestedAt });
     return res.json({ ok: true, ...result });
   });
 
@@ -7694,7 +7806,8 @@ export function registerMessagesRoutes(app, deps) {
     // Only a number the worker sent: a missing or null exit code stays null
     // (Number(null) would read as a clean exit).
     const exitCode = wholeNumber(req.body?.exitCode);
-    const settledDescription = String(req.body?.description || '').trim().slice(0, 500);
+    // Scrubbed like the output: a description can be the command line.
+    const settledDescription = cleanTaskText(String(req.body?.description || ''), 500);
     // The store is keyed as the worker posts. A task with a console stays
     // viewable as an ended row; one that ended while this runtime was away
     // becomes one when the post names its output.
@@ -7706,6 +7819,7 @@ export function registerMessagesRoutes(app, deps) {
       outputPath: settledOutputPath || undefined,
       outputKind: settledOutputPath ? normalizeTaskOutputKind(req.body?.outputKind, settledOutputPath) : undefined,
       description: settledDescription,
+      command: normalizeTaskCommand(req.body?.command) || undefined,
       taskType: String(req.body?.taskType || '').trim().slice(0, 80),
       startedAt: Number(req.body?.startedAt) || null,
     }) || null;
@@ -7717,7 +7831,7 @@ export function registerMessagesRoutes(app, deps) {
       taskId,
       toolUseId: sanitizeSubagentRunId(req.body?.toolUseId) || null,
       status: String(req.body?.status || '').trim().slice(0, 40) || 'completed',
-      summary: String(req.body?.summary || '').trim().slice(0, 500) || null,
+      summary: cleanTaskText(String(req.body?.summary || ''), 500) || null,
       exitCode: exitCode ?? null,
       // What the task was, from a worker that sends it: the end of a task
       // this runtime never knew (it ended while the relay was away) is
@@ -7747,11 +7861,18 @@ export function registerMessagesRoutes(app, deps) {
       .map((task) => ({
         taskId: String(task?.taskId || '').trim(),
         taskType: String(task?.taskType || '').trim(),
-        description: String(task?.description || '').trim().slice(0, 500),
+        // Scrubbed like the output before anything keeps or sends them: a
+        // description can be the command line (Grok's terminals, a Copilot
+        // shell without one), a summary or tool call can quote one.
+        description: cleanTaskText(String(task?.description || ''), 500),
+        // A shell task's command line, where the worker knows it: scrubbed
+        // like the output and cut at 2,000 characters before it is kept, so
+        // every reader (the pages, read_session, the stored row) gets it so.
+        command: normalizeTaskCommand(task?.command) || undefined,
         startedAt: Number(task?.startedAt) || null,
-        summary: String(task?.summary || '').trim().slice(0, 500) || null,
+        summary: cleanTaskText(String(task?.summary || ''), 500) || null,
         lastToolName: String(task?.lastToolName || '').trim() || null,
-        lastToolCall: String(task?.lastToolCall || '').replace(/\s+/g, ' ').trim().slice(0, 300) || null,
+        lastToolCall: cleanTaskText(String(task?.lastToolCall || '').replace(/\s+/g, ' '), 300) || null,
         totalTokens: Number.isFinite(Number(task?.totalTokens)) ? Number(task.totalTokens) : null,
         subagentType: String(task?.subagentType || '').trim().slice(0, 120) || null,
         model: String(task?.model || '').trim().slice(0, 120) || null,
@@ -7870,9 +7991,11 @@ export function registerMessagesRoutes(app, deps) {
   // or a snapshot). A task of theirs without one comes from a worker that
   // started before the console existed.
   const TASK_OUTPUT_PROVIDERS = new Set(['claude', 'github', 'copilot', 'grok']);
-  const SUBAGENT_OUTPUT_MESSAGE = 'Sub-agents have no shell output; open the sub-agent view.';
+  const SUBAGENT_OUTPUT_MESSAGE = TASK_OUTPUT_NONE_MESSAGES.subagent;
 
-  // Why a task has no output to show, for the console's `none` answer.
+  // Why a task has no output to show, for the console's `none` answer. The
+  // texts are the page's own (task-console-render.mjs), so the row's hover
+  // title and the console say the same.
   function noOutputMessage(conversationId, task) {
     if (taskKindOf(task?.taskType) === 'subagent') return SUBAGENT_OUTPUT_MESSAGE;
     let provider = '';
@@ -7880,9 +8003,9 @@ export function registerMessagesRoutes(app, deps) {
       provider = String(stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.provider_type || '').trim().toLowerCase();
     } catch {}
     if (!provider || TASK_OUTPUT_PROVIDERS.has(provider)) {
-      return 'This session did not report an output file for this task. Sessions started before the task console need a restart to show output.';
+      return TASK_OUTPUT_NONE_MESSAGES.noOutputFile;
     }
-    return 'Output is not available for this provider.';
+    return TASK_OUTPUT_NONE_MESSAGES.provider;
   }
 
   // A task the session's task list shows that the task store does not hold:
@@ -7949,13 +8072,17 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const { task, ended, key } = found;
+    // Held since a relay restart: its worker has not said yet whether it
+    // still runs, so it is neither running nor stoppable.
+    const held = !ended && found.restored === true;
     const { kind, path } = taskOutputSource(task);
     const head = {
       ok: true,
       taskId,
       kind,
       ended,
-      status: ended ? task.status : 'running',
+      status: ended ? task.status : (held ? 'held' : 'running'),
+      ...(held ? { held: true } : {}),
       exitCode: ended ? (task.exitCode ?? null) : null,
       health: task.health || null,
       taskStallMinutes: taskStallMinutes(),
@@ -7963,9 +8090,10 @@ export function registerMessagesRoutes(app, deps) {
         taskId,
         taskType: task.taskType || null,
         description: task.description || '',
+        ...(task.command ? { command: task.command } : {}),
         startedAt: task.startedAt || null,
         endedAt: task.endedAt || null,
-        stoppable: !ended && task.stoppable !== false,
+        stoppable: !ended && !held && task.stoppable !== false,
       },
     };
     if (kind === 'none') {
@@ -7982,7 +8110,7 @@ export function registerMessagesRoutes(app, deps) {
       if (!cached) return res.json({ ...head, pending: true, text: '', lines: [], startOffset: 0, endOffset: 0, size: 0, mtime: null, hasMoreBefore: false });
       return res.json({ ...head, ...shapeSnapshot(cached) });
     }
-    if (!path) return res.json({ ...head, kind: 'none', message: 'Output is not available for this task.' });
+    if (!path) return res.json({ ...head, kind: 'none', message: TASK_OUTPUT_NONE_MESSAGES.noPath });
     const lines = req.query?.lines;
     const before = req.query?.before;
     const read = before !== undefined && before !== ''

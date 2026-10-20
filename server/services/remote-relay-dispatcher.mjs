@@ -27,7 +27,9 @@ import {
 import { schemaFields } from '../../shared/question-schema.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES } from '../../shared/relay-events.mjs';
+import { checkRequestedProviderModel, isAutoModelId, providerModelLabel, unknownProviderModelText } from './provider-model-selection.mjs';
 import { cleanTaskOutput, parseRunnerSummary, stallMinutes, stripSgr } from '../../shared/task-output-text.mjs';
+import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
 import {
   RELAY_EVENT_REMOTE_PULL_PATH,
   RELAY_EVENT_REMOTE_SUBSCRIBE_PATH,
@@ -130,6 +132,8 @@ const FAILURE_TEXT_PATTERNS = Object.freeze([
   /^relay timeout after \d+ attempts/i,
 ]);
 const CLAUDE_LONG_CONTEXT_SUFFIX = /\[1m\]$/i;
+// How many of a provider's model ids an unknown-model refusal carries.
+const UNKNOWN_MODEL_LIST_MAX = 50;
 // POST /api/conversation/bootstrap refuses an effort its model does not take
 // with this code (400); POST /api/message sends the same 400 without a code,
 // but with the list below.
@@ -267,6 +271,45 @@ function matchOfferedModel(candidate, offered = []) {
   if (exact) return exact;
   const wantedBase = wanted.replace(CLAUDE_LONG_CONTEXT_SUFFIX, '');
   return offered.find((model) => model.toLowerCase().replace(CLAUDE_LONG_CONTEXT_SUFFIX, '') === wantedBase) || '';
+}
+
+/** The models /api/models lists for a provider label ("openai-byok"). */
+function catalogModelsLabelled(catalog, label) {
+  const providersByModel = isPlainObject(catalog?.models?.providersByModel) ? catalog.models.providersByModel : {};
+  return Object.entries(providersByModel)
+    .filter(([, providers]) => Array.isArray(providers) && providers.some((entry) => toText(entry).toLowerCase() === label))
+    .map(([model]) => model);
+}
+
+/** Copilot's catalogue: every model of /api/models no other provider claims alone. */
+function catalogGithubModels(catalog) {
+  const models = catalog?.models || {};
+  const providersByModel = isPlainObject(models.providersByModel) ? models.providersByModel : {};
+  const catalogModels = Array.isArray(models.models) ? models.models.map(toText).filter(Boolean) : [];
+  return catalogModels.filter((model) => {
+    const providers = catalogProvidersFor(providersByModel, model);
+    return providers.length === 0 || providers.includes(CATALOG_PROVIDER_LABELS.github);
+  });
+}
+
+/**
+ * The models a provider's New Chat list offers on the target, which its
+ * bootstrap and message routes accept, or null when the target has no list
+ * for it yet (discovery has not run or failed, the route did not answer):
+ * then a requested model cannot be checked here.
+ */
+function offeredModelList(catalog, provider) {
+  if (provider === 'github') {
+    const listed = catalogGithubModels(catalog);
+    return listed.length ? listed : null;
+  }
+  if (provider === 'openai') {
+    const listed = catalogModelsLabelled(catalog, CATALOG_PROVIDER_LABELS.openai);
+    return listed.length ? listed : null;
+  }
+  const settings = catalog?.settings?.[provider];
+  const listed = Array.isArray(settings?.models) ? settings.models.map(toText).filter(Boolean) : [];
+  return listed.length ? listed : null;
 }
 
 /** A reasoning effort as the relays write it, or '' when the value is not one. */
@@ -1016,19 +1059,9 @@ export function createRemoteRelayDispatcher({
 
   function listProviders(catalog) {
     const models = catalog.models || {};
-    const providersByModel = isPlainObject(models.providersByModel) ? models.providersByModel : {};
-    const catalogModels = Array.isArray(models.models) ? models.models.map(toText).filter(Boolean) : [];
-    const modelsLabelled = (label) => Object.entries(providersByModel)
-      .filter(([, providers]) => Array.isArray(providers) && providers.some((entry) => toText(entry).toLowerCase() === label))
-      .map(([model]) => model);
-
     return REMOTE_RELAY_PROVIDERS.map((provider) => {
       if (provider === 'github') {
-        // Copilot's catalogue is every model no other provider claims alone.
-        const githubModels = catalogModels.filter((model) => {
-          const providers = catalogProvidersFor(providersByModel, model);
-          return providers.length === 0 || providers.includes(CATALOG_PROVIDER_LABELS.github);
-        });
+        const githubModels = catalogGithubModels(catalog);
         const defaultModel = toText(catalog.status.defaultModel) || toText(models.defaultModel) || toText(models.currentModel) || null;
         return {
           provider,
@@ -1060,7 +1093,7 @@ export function createRemoteRelayDispatcher({
         && (provider === 'claude' || provider === 'grok' || settings.configured === true);
       const defaultModel = toText(settings.model) || null;
       const listed = provider === 'openai'
-        ? modelsLabelled(CATALOG_PROVIDER_LABELS.openai)
+        ? catalogModelsLabelled(catalog, CATALOG_PROVIDER_LABELS.openai)
         : (Array.isArray(settings.models) ? settings.models : []);
       return {
         provider,
@@ -1299,9 +1332,12 @@ export function createRemoteRelayDispatcher({
     const health = isPlainObject(task.health) ? task.health : null;
     const quietAfter = Number(row.taskStallMinutes) || null;
     const minutes = live && health ? stallMinutes(health.lastOutputAt, now()) : null;
+    // The command line comes scrubbed: the relay cleans it when the worker posts it.
+    const command = toText(task.command);
     return {
       taskId,
       output: kind !== 'none',
+      ...(command ? { command: clipLine(command, 500) } : {}),
       ...(health ? {
         health: {
           ...(minutes !== null ? { minutesSinceOutput: minutes } : {}),
@@ -1595,7 +1631,7 @@ export function createRemoteRelayDispatcher({
     }
     const kind = toText(answer?.kind) || 'file';
     let note = null;
-    if (kind === 'none') note = toText(answer?.message) || 'Output is not available for this provider.';
+    if (kind === 'none') note = toText(answer?.message) || TASK_OUTPUT_NONE_MESSAGES.provider;
     else if (answer?.pending) note = 'The session\'s worker was asked for the output; call again in a few seconds.';
     else if (answer?.unavailable) note = 'The output file is not there any more (the provider cleaned it up).';
     else if (kind === 'snapshot') note = 'Only the end of this task\'s output is available (its provider keeps no file).';
@@ -1785,16 +1821,24 @@ export function createRemoteRelayDispatcher({
     }
     const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
     const provider = toText(runtime.providerType).toLowerCase() || 'github';
+    // Checked before any approval card (runRelayAction) when the session
+    // could be read there; here otherwise.
+    const settled = args.model
+      ? (ctx.settledModel || await settleSendModel(ctx, conversation, args.model))
+      : null;
+    const requestedModel = settled?.model || '';
+    const modelNote = settled?.note || null;
     // Without a model the remote falls back to its catalogue's current one and
     // silently switches the session; keep the model the session already uses.
     // Grok pins its model at bootstrap and refuses any other, so it gets none.
-    const model = args.model
+    const model = requestedModel
       || (provider === 'grok' ? '' : (toText(conversation?.preferredModel) || toText(runtime.providerModel) || toText(runtime.model)));
     const mode = args.mode || ctx.caller.mode || toText(conversation?.preferredRelayMode) || '';
     // The remote runs a prompt that names no effort with its provider's
     // default, not with the one the session is set to: pass that one on, so
     // the session keeps its own. This session's effort is never mirrored here.
-    const requested = normalizeEffort(args.effort);
+    // A Copilot model named with its effort ("gpt-5.4-high") brings that effort.
+    const requested = normalizeEffort(args.effort) || normalizeEffort(settled?.effort);
     const own = requested ? '' : normalizeEffort(conversation?.preferredReasoningEffort);
     const origin = await buildOrigin(ctx);
     const { sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model, mode }, {
@@ -1802,11 +1846,91 @@ export function createRemoteRelayDispatcher({
       source: requested ? EFFORT_SOURCES.requested : (own ? EFFORT_SOURCES.remote : ''),
       note: null,
     });
-    return deliverAndWait('send', ctx, { session, sent, waitSeconds: args.wait_seconds, extra: effortResult(choice) });
+    return deliverAndWait('send', ctx, {
+      session,
+      sent,
+      waitSeconds: args.wait_seconds,
+      extra: { ...(modelNote ? { modelNote } : {}), ...effortResult(choice) },
+    });
+  }
+
+  /**
+   * A model the agent named, checked against the list New Chat offers for
+   * `provider` on the target (offeredModelList). Throws a DispatchFailure
+   * (unknownModel) for one it does not offer, before anything is created or
+   * sent. Returns `{ model, note }`: the id to use (the provider's casing, a
+   * Claude alias resolved) and what the agent should know about it, the
+   * model left unchecked for want of a list included.
+   */
+  function settleRequestedModel(ctx, catalog, provider, requested, { creating, extraModels = [] }) {
+    const entry = catalog ? listProviders(catalog).find((candidate) => candidate.provider === provider) : null;
+    const offered = catalog ? offeredModelList(catalog, provider) : null;
+    const check = checkRequestedProviderModel({
+      requestedModel: requested,
+      provider,
+      // What the message route accepts besides (send): the provider's whole
+      // discovered list and the session's own model. Never a list by itself.
+      models: offered ? [...offered, ...extraModels.map(toText).filter(Boolean)] : null,
+      defaultModel: entry?.defaultModel || '',
+      effortsFor: (base) => catalogEffortsFor(catalog?.models, provider, base),
+    });
+    const where = `on relay "${ctx.relay.name}"`;
+    const label = providerModelLabel(provider);
+    if (check.status === 'unknown') {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unknownModel,
+        `${unknownProviderModelText({ model: requested, provider, suggestions: check.suggestions, models: check.models, where })} ${creating ? 'No session was created.' : 'Nothing was sent.'}`,
+        {
+          provider,
+          model: requested,
+          suggestions: check.suggestions,
+          models: check.models.slice(0, UNKNOWN_MODEL_LIST_MAX),
+          note: 'Pass one of these ids (relay_info lists them per provider), or leave model out.',
+        });
+    }
+    if (check.status === 'unchecked') {
+      return {
+        model: requested,
+        note: `Model '${requested}' could not be checked: ${label} ${where} has no model list yet (its model discovery has not run or failed), so ${creating ? 'the session was created' : 'the prompt was sent'} with it as asked.`,
+      };
+    }
+    const tierNote = check.tierDropped ? ` ${label} ${where} lists no "[1m]" id for it, so it runs with the standard context.` : '';
+    if (check.status === 'alias') {
+      return { model: check.model, note: `'${requested}' was taken as ${check.model}, the newest ${label} model of that name ${where}.${tierNote}` };
+    }
+    // A Copilot model with its effort: the bootstrap and the message route
+    // know the listed id, so the effort goes on apart.
+    if (check.base) return { model: check.base, effort: check.effort, note: `'${requested}' was taken as ${check.base} with effort ${check.effort}.` };
+    if (check.tierDropped) return { model: check.model, note: `'${requested}' was taken as ${check.model}.${tierNote}` };
+    // The same id in the provider's casing needs no word; another one does.
+    if (check.model.toLowerCase() !== requested.toLowerCase()) {
+      return { model: check.model, note: `'${requested}' is listed as ${check.model} ${where}; that is the model used.` };
+    }
+    return { model: check.model, note: null };
+  }
+
+  /** settleRequestedModel for a send to `conversation` (its detail payload); an unread catalogue leaves it unchecked. */
+  async function settleSendModel(ctx, conversation, requested) {
+    const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
+    const provider = toText(runtime.providerType).toLowerCase() || 'github';
+    let catalog = null;
+    try {
+      catalog = await loadCatalog(ctx);
+    } catch {
+      // No catalogue: the model goes unchecked, and the note says so.
+    }
+    const settings = catalog?.settings?.[provider];
+    return settleRequestedModel(ctx, catalog, provider, requested, {
+      creating: false,
+      extraModels: [
+        ...(Array.isArray(settings?.availableModels) ? settings.availableModels : []),
+        runtime.providerModel,
+        runtime.model,
+      ],
+    });
   }
 
   async function createSession(ctx, args) {
-    const catalog = await loadCatalog(ctx);
+    const catalog = ctx.catalog || await loadCatalog(ctx);
     const providers = buildProviders(catalog);
     const configured = providers.filter((entry) => entry.configured).map((entry) => entry.provider);
     const provider = createProvider(ctx.caller, args);
@@ -1821,6 +1945,16 @@ export function createRemoteRelayDispatcher({
     let model = args.model || '';
     let modelSource = model ? 'requested' : '';
     let note = null;
+    let variantEffort = '';
+    if (model) {
+      // Refused here when the provider does not offer it: a session created
+      // with an id its provider never runs stays empty, and every send to it
+      // fails.
+      const settled = settleRequestedModel(ctx, catalog, provider, model, { creating: true });
+      model = settled.model;
+      note = settled.note;
+      variantEffort = normalizeEffort(settled.effort);
+    }
     // A cloud session without a requested model gets the Claude Cloud tab's
     // default, as New Chat does: the bootstrap picks it, nothing is mirrored.
     if (!model && cloud) {
@@ -1842,7 +1976,7 @@ export function createRemoteRelayDispatcher({
 
     // The effort mirrors the caller like the model does: this session's when
     // the remote lists it for the model (or lists nothing), else the remote's.
-    let choice = { effort: normalizeEffort(args.effort), source: EFFORT_SOURCES.requested, note: null };
+    let choice = { effort: normalizeEffort(args.effort) || variantEffort, source: EFFORT_SOURCES.requested, note: null };
     if (!choice.effort && cloud) {
       // A cloud session takes no effort: none is mirrored, none is reported.
       choice = { effort: '', source: '', note: null };
@@ -1898,6 +2032,11 @@ export function createRemoteRelayDispatcher({
         `Relay "${ctx.relay.name}" did not return the new session's id.`);
     }
     const boundModel = toText(bootstrap?.selectedModel) || model;
+    // A relay that swapped the asked model for another (one that predates
+    // these checks does for Copilot) is named, never passed over in silence.
+    if (modelSource === 'requested' && model && !isAutoModelId(model) && boundModel.toLowerCase() !== model.toLowerCase()) {
+      note = [note, `Relay "${ctx.relay.name}" started the session on ${boundModel}, not on ${model} as asked.`].filter(Boolean).join(' ');
+    }
     let sent;
     try {
       const posted = await postPromptWithEffort(ctx, { session, text: args.text, origin, model: boundModel, mode }, choice);
@@ -2679,9 +2818,38 @@ export function createRemoteRelayDispatcher({
         { relay: relay.name, retryAfterSeconds }));
     }
 
+    // The target's catalogue, loaded before anyone is asked for approval when
+    // the agent names a model: a card for a model that does not exist there
+    // would be a question about nothing. createSession reuses it.
+    let catalog = null;
+    let settledModel = null;
     if (action === 'create_session') {
       const problem = createSessionProblem(caller, args);
       if (problem) return finish(failure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, problem, { relay: relay.name }));
+    }
+    if ((action === 'create_session' || action === 'send') && args.model) {
+      const early = { relay, caller, hops, conversationId, signal };
+      try {
+        if (action === 'create_session') {
+          catalog = await loadCatalog(early);
+          const provider = createProvider(caller, args);
+          // A provider not set up there answers as such (createSession), not
+          // with a model it has no list for.
+          if (listProviders(catalog).find((entry) => entry.provider === provider)?.configured) {
+            settleRequestedModel(early, catalog, provider, args.model, { creating: true });
+          }
+        } else {
+          const conversation = await call(early, 'GET', sessionPath(args.session), { query: { limit: 1 } });
+          settledModel = await settleSendModel(early, conversation, args.model);
+        }
+      } catch (error) {
+        if (error instanceof DispatchFailure) {
+          return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
+        }
+        // The target did not answer: the call itself reports that.
+        catalog = null;
+        settledModel = null;
+      }
     }
 
     const localCreate = local && action === 'create_session';
@@ -2756,7 +2924,7 @@ export function createRemoteRelayDispatcher({
         }
       }
 
-      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate };
+      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate, ...(catalog ? { catalog } : {}), ...(settledModel ? { settledModel } : {}) };
       const body = await ACTIONS[action](ctx, args);
       if (prompting) agentPrompts(conversationId).count += 1;
       const { summary, ...rest } = body;
