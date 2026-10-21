@@ -25,8 +25,9 @@ import {
   withRemotePromptHeader,
 } from '../../shared/remote-relay-contract.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
+import { matchQuestionChoice } from '../../shared/question-answer-rule.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
-import { RELAY_EVENT_DEFAULT_TYPES } from '../../shared/relay-events.mjs';
+import { RELAY_EVENT_DEFAULT_TYPES, RELAY_EVENT_RELAY_LEVEL_TYPES } from '../../shared/relay-events.mjs';
 import { checkRequestedProviderModel, isAutoModelId, providerModelLabel, unknownProviderModelText } from './provider-model-selection.mjs';
 import { cleanTaskOutput, parseRunnerSummary, stallMinutes, stripSgr } from '../../shared/task-output-text.mjs';
 import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
@@ -2132,7 +2133,14 @@ export function createRemoteRelayDispatcher({
       if (!labels.includes(label)) labels.push(label);
     }
     // The card's own format: the picked labels, then any typed text, ", "-joined.
-    const extra = toText(args.answer);
+    // A card that takes no typed text gets an option or nothing.
+    let extra = toText(args.answer);
+    if (extra && question.allowFreeform === false) {
+      extra = matchQuestionChoice(extra, options);
+      if (!extra) {
+        throw invalidInput(`This question takes only its options (${options.join(', ')}), no typed answer; pass one of them in choices.`);
+      }
+    }
     if (extra && !labels.includes(extra)) labels.push(extra);
     const text = labels.join(', ');
     return { answer: text, text };
@@ -2332,7 +2340,7 @@ export function createRemoteRelayDispatcher({
     if (!ctx.relay.local) return subscribeRemoteAction(ctx, args);
     const service = eventService(ctx);
     const all = args.scope === 'all';
-    const ids = all ? [] : args.sessions;
+    const ids = all ? [] : (args.sessions || []);
     // Refused before anyone is asked: the conversation itself, unknown ids.
     if (!all && ids.includes(ctx.conversationId)) {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.ownSession,
@@ -2349,11 +2357,15 @@ export function createRemoteRelayDispatcher({
       titles.push({ id, title: toText(page.title) || null });
     }
     const events = Array.isArray(args.events) && args.events.length ? args.events : [...RELAY_EVENT_DEFAULT_TYPES];
-    const decision = await ensureWatchApproval(ctx, {
-      all,
-      watch: { kind: 'subscribe', all, sessions: titles, events, once: args.once === true, heartbeatMinutes: args.heartbeat_minutes ?? null },
-    });
-    if (!decision.approved) throw new DispatchFailure(403, decision.code, decision.error);
+    // Only relay_restarted, no session: nothing of another conversation is
+    // watched, so there is nothing to ask the user about.
+    if (all || ids.length) {
+      const decision = await ensureWatchApproval(ctx, {
+        all,
+        watch: { kind: 'subscribe', all, sessions: titles, events, once: args.once === true, heartbeatMinutes: args.heartbeat_minutes ?? null },
+      });
+      if (!decision.approved) throw new DispatchFailure(403, decision.code, decision.error);
+    }
     const subscription = relayEventCall(() => service.subscribe({
       watcherConversationId: ctx.conversationId,
       scope: all ? 'all' : 'sessions',
@@ -2364,8 +2376,9 @@ export function createRemoteRelayDispatcher({
       stalledMinutes: args.stalled_minutes ?? null,
       heartbeatMinutes: args.heartbeat_minutes ?? null,
     }));
+    const what = all ? 'all sessions' : (ids.length ? `${ids.length} session${ids.length === 1 ? '' : 's'}` : 'relay_restarted');
     return {
-      summary: `subscribe → ${ctx.relay.name}: ${all ? 'all sessions' : `${ids.length} session${ids.length === 1 ? '' : 's'}`} (${subscription.id})`,
+      summary: `subscribe → ${ctx.relay.name}: ${what} (${subscription.id})`,
       subscription,
       note: EVENT_NOTE,
     };
@@ -2378,6 +2391,14 @@ export function createRemoteRelayDispatcher({
    * mirror; the link fetches the events from then on.
    */
   async function subscribeRemoteAction(ctx, args) {
+    const relayLevel = (args.events || []).filter((type) => RELAY_EVENT_RELAY_LEVEL_TYPES.includes(type));
+    if (relayLevel.length) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+        `${relayLevel.join(', ')} is about the relay you run on: subscribe to it on "${REMOTE_RELAY_LOCAL_ALIAS}". An outage of relay "${ctx.relay.name}" shows as link_lost and link_restored.`);
+    }
+    if (!args.sessions?.length && args.scope !== 'all') {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, 'subscribe on a paired relay needs sessions (ids from list_sessions) or ["all"].');
+    }
     const service = eventService(ctx);
     const all = args.scope === 'all';
     relayEventCall(() => service.checkWatcherCapacity(ctx.conversationId));

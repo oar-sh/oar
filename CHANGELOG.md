@@ -3,6 +3,308 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.14] — 2026-10-21
+
+Highlights: a relay started by Windows autostart, or by a plain
+`gh copilot`, now runs on the same data folder as `oar start`, outside the
+installed package, so an update no longer takes its conversations with it;
+the update copies that data before npm removes the old version, and the
+relay takes it over at its next start (read the upgrade note first). A
+relay never moves to another database unannounced, a lock an unclean end
+left no longer blocks the next start, autostart waits for a late drive, and
+Cursor conversations keep their agent across updates. An agent can ask to
+be woken when the relay runs again (`relay_restarted`), its preview tool
+reaches only its own conversation's previews, approval cards take a choice
+instead of typed text, and a conversation whose folder is gone says so.
+
+### Upgrade notes
+
+- **Windows autostart users, and anyone whose relay a plain `gh copilot`
+  started: save your data before this update.** Before 0.9.14, those relays
+  ran on the database and uploads inside the installed package, and
+  `npm i -g` deletes them with the old version. This update copies them
+  first, while it installs, to `rescued-package-data/<time>/` in the OAR
+  data folder (`%APPDATA%\oar\data`, `~/.oar/data`), and the relay takes
+  the copy over at its next start. npm 10 and 11 run that copy (11.21 with
+  a warning), and if it fails they put the old version back with its data.
+  npm 12 skips it unless `@oar-sh/oar` is allowed: the install then
+  succeeds and the old data is gone. With `strict-allow-scripts`, npm 11
+  and 12 refuse the install and change nothing; `--ignore-scripts` skips
+  the copy everywhere, and the native modules (better-sqlite3, koffi) too,
+  so the relay cannot start afterwards: never update OAR with
+  `--ignore-scripts`. On npm 12, update with the relay stopped:
+  `npm i -g @oar-sh/oar --allow-scripts=@oar-sh/oar,better-sqlite3,koffi`.
+  An `allow-scripts` entry in `.npmrc` does not help the **Update** button
+  or `oar update` of 0.9.13: their own `--allow-scripts` replaces it. To be
+  safe, do this update by hand:
+  1. Close every `gh copilot` session (its extension starts the relay
+     again), then `oar stop`, and wait until `oar status` says it is not
+     running. If 0.9.13's `oar stop` does not stop a relay the
+     system-startup launcher started, end the relay before installing:
+     end the relay's processes in Task Manager (node.exe running OAR).
+  2. Run `npm root -g` and open `<that folder>/@oar-sh/oar/server`
+     (usually `%APPDATA%\npm\node_modules\@oar-sh\oar\server`). Copy
+     **both** the `data` and the `uploads` folders, with every file in
+     them, to a safe place.
+  3. `npm i -g @oar-sh/oar --allow-scripts=@oar-sh/oar,better-sqlite3,koffi`.
+  4. Before starting the relay, copy both folders back into the same
+     `server` folder.
+  5. `oar start`. In `relay-console.log` in the OAR `logs` folder, look
+     for `[data] Brought over the database …`: your conversations should
+     be back. A database that was already in the OAR data folder is kept
+     in `backups/<time>/` beside it. The folder brought over keeps its
+     database as `copilot.db.adopted-<time>`; the others looked at keep
+     theirs as `copilot.db.older-<time>` (if a rescue copy was used, the
+     package's own database ends up `.older-`).
+  6. If the relay stops with `[data] Not starting: each database has
+     changes newer than the other's`, both hold work; the error line names
+     both folders, and one may be under
+     `rescued-package-data/<time>/data`. Pick the one to keep, and move
+     the other one's `copilot.db`, `copilot.db-wal` and `copilot.db-shm`
+     into a folder of your own (do not delete them). Then `oar start`
+     again.
+  7. If you already updated without saving and nothing was copied, the
+     database from the package can't be recovered by OAR.
+- The npm package guard allows 8 MiB unpacked and 530 entries (was 7.75
+  MiB and 520); the take-over of earlier databases, the install-time copy
+  and the lock checks grew the package to about 7.75 MiB and 521 entries.
+
+### Added
+
+- **Woken when the relay runs again** (`relay_restarted`, opt-in per
+  conversation). A conversation that queued a relay restart, or watched
+  sessions, slept after the restart until someone wrote, because the timers
+  its CLI had scheduled might not survive it. An agent can now subscribe to
+  `relay_restarted` through `remote_relay` (no sessions needed, no approval
+  card, this relay only); after each start it gets one relay event with when
+  the relay came back and how it stopped (who requested the restart, when
+  and why, or that it did not record how it stopped). Never part of the
+  default events. A restart requested while a turn it woke still runs does
+  not wake that conversation (a one-shot subscription held back so ends),
+  archived and deleted conversations are not woken, and each start is told
+  once.
+
+### Changed
+
+- **Help texts and CLI messages say what the relay does.** **Accept prompts
+  from other relays' agents** lists everything it refuses when off, watching
+  sessions included; **Show Suspend host action** says it is a switch of this
+  browser and suspend works on Windows relays only; the Cursor session token
+  names the real usage bars; the Copilot engine applies whenever a
+  conversation's worker starts. `oar` points to **Settings → General →
+  Autostart (Windows)**, says the service starts again at boot with
+  lingering, sends a failed start or restart through the service to
+  `journalctl --user -u oar` instead of `server-err.log`, words a busy port
+  one way, and says an already running relay keeps its version and settings
+  until `oar restart`.
+- **Agent guidance.** The ask_user example in the Copilot engines' relay
+  guidance is a real question instead of quiz placeholders, the guidance and
+  the Cursor and Copilot ask_user descriptions give the choice counts the
+  relay accepts (it keeps the first 8), the remote relay section names every
+  subscription action and `usage`, and the restart note says a queued
+  restart waits for every running turn and holds new messages.
+- **Docs brought in line with the code**: the paired-relay switch, watch
+  approvals per relay, no push for agent-started turns, provider rebinding of
+  unstarted chats, OpenAI key removal, `oar stop`/`oar restart` under the
+  systemd service (they end running turns and workers), Claude turns on the
+  bundled Claude Code, the config keys and environment variables, which
+  variables reach workers started under tmux, the worker supervisor and the
+  database migrations.
+- **Uploads follow the config's `dataDir`.** It moved the database but
+  left uploads in `server/uploads` unless `COPILOT_WEB_RELAY_DATA_DIR` was
+  set; they now go to `<dataDir>/uploads` as well. Uploads earlier versions
+  left in `server/uploads`, or that a state migration copied into the state
+  root's `uploads/`, are still read from there in place: every attachment
+  opens after the update, and nothing in those folders is moved or deleted.
+- `@anthropic-ai/claude-agent-sdk` 0.3.304 (was 0.3.292; bundled Claude Code
+  2.1.304). Claude now forks sub-agents that inherit the conversation
+  (`subagent_type: "fork"`) by default. With thinking turned off, a model that
+  cannot run without thinking now uses adaptive thinking. A full disk during a
+  login refresh is reported as a failed request instead of a sign-in error.
+  Fixes include an approved tool call that could run twice on resume, model
+  switches and interrupts waiting behind a context-usage check, and
+  `hook_progress` messages piling up in memory.
+- `@cursor/sdk` 1.0.38 (was 1.0.36), which uses the relay's own `zod`
+  instead of carrying a copy of zod 3.
+- `@github/copilot-sdk` 1.0.23 (was 1.0.17; bundled Copilot CLI 1.0.100).
+  The Copilot workers and the web-relay extension are unchanged: under the
+  Copilot CLI both run the SDK that comes with the installed CLI. **About
+  OAR** shows the new version.
+
+### Fixed
+
+- **Windows autostart starts the relay on the same data as `oar start`.**
+  The sign-in entry and the system-startup launcher set only the config
+  file, so a relay they started kept its database, uploads and log inside
+  the installed package: other conversations and settings than with
+  `oar start`, and gone with the next update. Both now also set the data
+  and log folders `oar start` uses (`%APPDATA%\oar\data` and
+  `%APPDATA%\oar\logs` on a global install). Once it runs, the relay brings
+  an entry or launcher that an earlier version (0.9.0 on) generated for
+  this install and its config up to date, the pre-rebrand
+  `copilot-remote-web-relay.cmd` under its own name, so the first start
+  after the update (by `oar start`, `oar update` or the autostart itself)
+  repairs it. An entry edited by hand, one that points at another config
+  file, and one of a relay started on data folders of its own are left
+  alone: switch autostart off and on in Settings to replace those. Rewriting
+  a launcher while the relay it started still runs is safe: its cmd window
+  ends with the relay instead of starting it a second time. The launchers
+  now switch cmd to UTF-8, so a user folder with non-ASCII characters in its
+  name no longer garbles the paths in them. Conversations a relay started
+  by autostart kept inside the package folder are not carried over.
+- **A relay never moves to another database unannounced.** Before its own
+  database opens, a global install's relay pinned to the OAR data folder
+  looks once at each database it may have run on until now (the one inside
+  the package, the install-time copies of it): a newer one is copied in
+  after a `quick_check` of the copy, with the uploads and Cursor agent
+  stores (never over a file there), the older one in place is kept in
+  `backups/<time>/`, and one line says so. Each one looked at is renamed
+  in place to `copilot.db.adopted-<time>` or `copilot.db.older-<time>`,
+  never deleted. When neither is clearly newer, or a relay may still run
+  on the other, the relay stops with one line naming both and exit code
+  78, which its supervisors, and a systemd unit written by this version's
+  `oar service install`, do not retry. The swap survives a kill. A global
+  install always runs on the state root's data folder, however it is
+  started; a `dataDir` in config.json that an earlier autostart relay used
+  is copied from once and left exactly as it is. A git checkout and a
+  relay on another state root are left alone. A first start that finds an earlier launcher
+  but no database of it says the update may have removed it. A large
+  database takes minutes: the relay logs its size at the start, progress
+  at least once a minute and each step's time at the end, and `oar start`
+  meanwhile says it is still bringing it over. A second `oar start` then
+  no longer removes the relay's lock and starts a second relay.
+- **A relay lock an unclean end left no longer blocks the next start.** A
+  lock from before the last boot, or whose pid now belongs to a process
+  started after it, is stale; a lock still held stops the start with one
+  line naming it and exit code 78. A lock is never seen half written, and
+  one that cannot be read is read again and held unless its time is more
+  than 10 s off (an empty one a power loss left). Two starts recovering
+  the same stale lock no longer both run.
+- **A `TEMP` or `TMP` set with quotes, or naming a missing folder, is fixed
+  for the relay** on Windows (quotes off, else the user's temp folder).
+- **The relay a plain `gh copilot` starts keeps its data outside the
+  package.** After `oar copilot` installed the Copilot CLI extension for
+  every folder, a plain `gh copilot` ran its relay on `server/data` and
+  `server/config.json` inside the installed package, on every platform. A
+  global install's extension now starts it on the OAR state root's
+  config, data and logs, as `oar start` does, and copies a config the
+  package held there once. The database from the package is saved only
+  where the install-time copy ran (see the upgrade note).
+- **Windows autostart waits for a late drive.** Both the sign-in entry and
+  the system-startup launcher now wait up to 5 minutes in all for the
+  `%TEMP%` folder and the drive of the data folder (a RAM disk or a drive a
+  startup script mounts later), where the system-startup launcher waited
+  2 minutes for `%TEMP%` only and the sign-in entry not at all. A wait that
+  runs out writes one line naming what is still missing, then starts the
+  relay anyway: `oar-web-relay-launcher.log` beside the system-startup
+  launcher, `oar-web-relay.log` in the OAR folder (`%APPDATA%\oar`) for the
+  sign-in entry. A data folder on a network share is not waited for. The
+  first start after the update brings a generated entry or launcher up to
+  date without an admin confirmation; edited ones stay as they are. A relay
+  whose data or upload folder cannot be created (its drive still missing, a
+  file in its place) now stops with one line naming the folder and exit
+  code 78 instead of an error trace. A `TEMP`
+  set with quotes (`"D:\My Temp"`) no longer stops the system-startup
+  launcher before it starts the relay.
+- **Cursor conversations keep their agent across updates.** The Cursor
+  worker kept its per-conversation agent stores in
+  `server/data/cursor-agents` inside the installed package, so an update
+  deleted them and a Cursor conversation went on with a new agent that knew
+  nothing of the earlier turns. The stores now live in `cursor-agents` in
+  the relay's data folder (`~/.oar/data` on a global install, unchanged
+  `server/data` in a checkout); `CURSOR_AGENT_STORE_DIR` still overrides
+  it. The copies the state migration made there are read again, as they
+  were at the migration. A conversation with a store in both places uses
+  the one changed last, and one with a store only at the old place keeps
+  using it there; nothing is moved or deleted.
+- **`oar setup --migrate-from` works after the installer has run.** The
+  state migration wrote its marker even when it found nothing to bring
+  over, and every later `--migrate-from <dir>` then did nothing without a
+  word. The marker is now written only after a real copy, and a folder
+  named with `--migrate-from` is always migrated, with a line saying what
+  was copied or why nothing was. It still never overwrites: a `config.json`
+  already in the state root is kept; the empty database the installer's
+  relay created is moved into `backups/` (the relay has to be stopped
+  first, `oar stop`), and a database with conversations makes it refuse
+  with what to do instead.
+  The same folder again only says it is already migrated, and a refused
+  `oar copilot --migrate-from` warns and starts the session anyway. While
+  the migration copies a database it holds the relay's lock, so no relay
+  starts on it in between. Migrated uploads now land in `data/uploads`,
+  where a global install's relay reads them (they went to an `uploads`
+  folder nothing read); uploads an earlier migration left in
+  `~/.oar/uploads` are merged into `data/uploads` at the next relay start
+  (nothing is overwritten or deleted). A migration that fails its check
+  removes only what it copied, no longer the whole state folder, and never
+  a link or file that was there before; a database it moved aside and
+  cannot put back stays in `backups/`. Symlinked folders in the checkout
+  are copied as real folders.
+- **An agent's preview tool reaches only its own conversation's previews.**
+  The tool's `list` showed every live preview of the relay with its token,
+  the only credential of a preview, and `close` closed any of them. `list`
+  now shows the calling conversation's previews, and `close` of another
+  conversation's preview is refused with a message saying so. Copilot and
+  Grok sessions that use the HTTP API are taught the calls with their
+  conversation written in. The relay enforces this for every preview
+  request that names a conversation (the `conversationId` query or the
+  worker's conversation header); the web UI's Settings › Previews and
+  `/preview list` still show and close every preview. Agents present the
+  same relay token as the owner, so an agent that calls the API by hand
+  without naming a conversation still sees them all; see
+  docs/preview-servers.md.
+- **A conversation whose working directory is gone says so.** A Claude turn
+  in a folder that had been deleted or renamed failed with "native binary …
+  exists but failed to launch", blaming the system's libc; a Grok turn said
+  the Grok CLI was not installed, a Copilot (SDK engine) turn showed the
+  spawn's `ENOENT`. Claude, Copilot, Cursor and Grok workers now check the
+  folder before they start their CLI or agent in it, and the turn fails with
+  the folder's path and what to do: restore it, or choose another one with
+  **⋯ → Change CWD**, then send the message again. A worker that cannot be
+  started at all for that reason (a launch without tmux, as on Windows)
+  names the folder in its launch note instead of a missing `node` or
+  `cmd.exe`.
+- **Answering a question no longer gets a long turn requeued by Max turn
+  duration.** Answering one of a turn's questions restarts the max turn
+  duration's clock, but only when the relay picked the turns to requeue; the
+  requeue itself still counted from the turn's start and took every turn
+  past it whenever another turn was due. Such a turn was sent again
+  mid-answer, without the retry limit and without the page hearing of it.
+  The relay now requeues exactly the turns it picked, by the same rule. The
+  settings help and the docs now say where the limit counts from, and that
+  Grok also enforces it itself, counted from the start of the prompt and
+  without pausing for a remote relay approval card.
+- **A resumed sub-agent shows its record and is listed while it runs.** When
+  a Claude session sent a finished background agent a new message, the task
+  panel showed it running, but opening it said "This agent's record could
+  not be loaded", and the session's task list (`read_session`,
+  `list_sessions`) did not list it at all: the relay took it for the
+  agent's first run, which had ended. The resumed agent now
+  opens its own record, which goes on where the first run ended (a note
+  marks where it resumed) and reads running again until it ends; it is a
+  running task of the session again, with a start and an end of its own.
+- **Approval cards take a choice, not typed text, and every one reads it the
+  same way.** OAR's own Allow / Deny cards (agent sessions, watching
+  sessions, write actions in the ask and plan modes) and Claude Cloud's
+  permission cards showed a reply box, and whatever was typed there ("yes",
+  "ok", "allow it") counted as a denial; Claude Cloud even denied a typed
+  "allow". These cards have no reply box now, the relay refuses typed text
+  for any card that does not take it (the card stays open), and a choice
+  counts however it is typed. A card created through the API with choices
+  and no `allowFreeform` is such a card too (the flag defaults to `false`
+  when choices are given). Copilot's permission card keeps its reply box,
+  and now says that a typed reply refuses and tells Copilot why. A card's
+  header (**Agent sessions**, **Relay events**, **Remote relay**, Claude's
+  question headers) is shown above the question, and a question's push
+  notification names the provider that asks instead of always saying
+  "Copilot needs your input".
+- **Reasoning effort reaches every Cursor model that takes one.** Cursor
+  models whose effort parameter is named `reasoning_effort` (Claude Haiku 5.5,
+  Claude Sonnet 5.5, Grok 4.7, Gemini 4 Argon, Gemini 3.8 Flash, Muse Wonder
+  1.0) offered only None in the composer and could not be sent an effort.
+  They now list their tiers once the Cursor models are discovered again
+  (**Refresh** in **Select Models**, or saving the Cursor key), and the
+  chosen effort is sent with the turn.
+
 ## [0.9.13] — 2026-10-20
 
 Highlights: a queued relay restart now shows every page what it waits for,

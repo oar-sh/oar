@@ -188,6 +188,15 @@ test('a tool approval offers approve/deny and reads a plain approval', async () 
   // The prompt has to name what is about to run, or the card is unanswerable.
   assert.match(created.prompt, /shell: rm -rf build/);
   assert.equal(created.context.source, 'onPermissionRequest');
+  // The card takes typed text on purpose (it is the reason the model gets), so
+  // it says that typed text refuses.
+  assert.match(created.context.rationale, /typed reply refuses it/);
+});
+
+test('a tool approval reads the approve choice trimmed and in any case', async () => {
+  const bridge = makeBridge(makeRelay({ answerWith: '  approve ' }));
+  const result = await bridge.askToolApproval({ kind: 'shell', fullCommandText: 'rm -rf build' });
+  assert.equal(result.approved, true);
 });
 
 test('a freeform denial becomes the feedback the model sees', async () => {

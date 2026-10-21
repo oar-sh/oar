@@ -172,6 +172,45 @@ test('a live lock alone does not count as a running relay: the server is started
   assert.equal(lockExists, false, 'the leftover lock is removed before the server starts');
 });
 
+test('a relay it started that is bringing over its database is left running at the deadline, and no session starts', async (t) => {
+  const root = makeCheckout(t, { authToken: 'test-token', port: 4568 });
+  const dataDir = path.join(root, 'server', 'data');
+  const spawned = [];
+  const kills = [];
+  const lines = [];
+  const result = await launchRelay({
+    argv: ['--no-install-extension'],
+    cwd: root,
+    packageRoot: root,
+    nodeBin: 'node',
+    spawnImpl: (cmd, args) => {
+      spawned.push(cmd);
+      if (cmd === 'gh') return fakeProcess({ exitWith: 0 });
+      // The relay takes its lock and starts bringing over its database.
+      fs.writeFileSync(path.join(dataDir, 'relay-server.lock'), JSON.stringify({ format: 2, pid: 4949, tokenHash: 'x', holder: null }));
+      fs.writeFileSync(path.join(dataDir, 'earlier-database-progress.json'), JSON.stringify({ pid: 4949, from: 'copilot.db', bytes: 1048576, step: 'copy' }));
+      const proc = fakeProcess();
+      proc.kill = () => { kills.push('node'); proc.exitCode = 0; };
+      return proc;
+    },
+    spawnSyncImpl: ghInstalled,
+    fetchImpl: async () => { throw new Error('connect ECONNREFUSED'); },
+    isProcessAliveImpl: (pid) => pid === 4949,
+    lockGraceMs: 20,
+    readyWaitMs: 200,
+    env: {
+      COPILOT_WEB_RELAY_LOG_DIR: path.join(root, 'logs'),
+      XDG_CONFIG_HOME: path.join(root, 'xdg'),
+      LOCALAPPDATA: path.join(root, 'localappdata'),
+    },
+    logger: { log: (line) => lines.push(String(line)), error: (line) => lines.push(String(line)) },
+  });
+  assert.equal(result.reason, 'bringing-over');
+  assert.deepEqual(kills, [], 'not killed');
+  assert.deepEqual(spawned, ['node']);
+  assert.match(lines.join('\n'), /The relay \(process 4949\) is bringing over the database/);
+});
+
 test('on a --port other than the config\'s the lock is left alone', async (t) => {
   const { spawned, lockExists } = await runBesideLock(t, { argv: ['--port', '5678'], relayPort: 4567 });
   assert.equal(spawned[0].args.at(-1), '5678');

@@ -5905,6 +5905,10 @@
     color: var(--muted);
     font-size: var(--fs-meta-xs);
   }
+  .relay-question-header {
+    font-weight: 600;
+    color: var(--text);
+  }
   .relay-question-body {
     line-height: 1.5;
     color: var(--text);
@@ -7190,7 +7194,7 @@
             checked
           >
         </div>
-        <div class="settings-help" style="margin-top: 6px;">Hide the menu action when host suspend is unsupported or not needed on this device.</div>
+        <div class="settings-help" style="margin-top: 6px;">Shows or hides the menu action in this browser only. Suspend works only when the relay runs on Windows; a queued suspend still shows its banner here either way.</div>
         <div class="settings-row" style="margin-top: 12px; margin-bottom: 0;">
           <label for="scroll-on-send-toggle">Jump to the end when I send a message</label>
           <input
@@ -7232,7 +7236,7 @@
             onchange="updateTurnCeilingSetting(this.value)"
           >
         </div>
-        <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it. Turns are already kept alive by worker heartbeats, and a turn waiting on your answer to a question is never cut off — so this only catches a worker that has hung. Set to 0 for no limit.</div>
+        <div class="settings-help" style="margin-top: 6px;">A hard cap on how long one turn may run before the relay requeues it, counted from the start of the turn or from your last answer to one of its questions. Turns are already kept alive by worker heartbeats, and the relay never cuts off a turn waiting on your answer to a question — so this only catches a worker that has hung. Grok also enforces the limit itself, counted from the start of the prompt and without pausing for questions (remote relay approvals). Set to 0 for no limit.</div>
         <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
           <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">4 h</span></label>
           <input
@@ -7489,7 +7493,7 @@
             <div style="display: flex; gap: 8px; margin-top: 8px;">
               <button id="copilot-save-btn" type="button" class="summary-btn" onclick="saveCopilotSettings()">Save Copilot settings</button>
             </div>
-            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>SDK</strong> is the default: a headless worker per conversation with mid-turn steering and background task cards — no CLI extension to install, but no tmux inspector for those sessions. <strong>Extension</strong> runs the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. A relay that cannot run the SDK engine uses Extension. Applies to newly started conversations; sessions already running keep their engine until their worker restarts.</div>
+            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>SDK</strong> is the default: a headless worker per conversation with mid-turn steering and background task cards — no CLI extension to install, but no tmux inspector for those sessions. <strong>Extension</strong> runs the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. A relay where no engine was saved and that cannot run the SDK engine uses Extension. Applies whenever a conversation's worker starts; sessions already running keep their engine until their worker restarts.</div>
           </div>
         </div>
         <div
@@ -7883,7 +7887,7 @@
               <button id="cursor-dashboard-token-save-btn" type="button" class="summary-btn" onclick="saveCursorDashboardToken()">Save token</button>
               <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
             </div>
-            <div class="settings-help">Unlocks the live "Included in plan" percentage bars on Check Usage. Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
+            <div class="settings-help">Unlocks the live percentage bars on Check Usage: "Plan usage (total)", "Auto + Composer" and "API". Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
           </div>
         </div>
       </div>
@@ -7929,7 +7933,7 @@
             checked
           >
         </div>
-        <div class="settings-help" style="margin-top: 6px;">When off, agents on paired relays can still read sessions here, but cannot send prompts, start sessions, answer questions or stop turns. The relay token stays the real boundary: anyone holding it has full access.</div>
+        <div class="settings-help" style="margin-top: 6px;">When off, agents on paired relays can still list, read and wait on sessions here, but cannot send prompts, start sessions, answer questions, stop turns, cancel queued turns, archive or unarchive sessions, or watch sessions here for events. The relay token stays the real boundary: anyone holding it has full access.</div>
         <!-- Agent sessions (agent-sessions-settings-ui.js). Hidden until the relay
              answers with settings; a relay without the route never shows it. -->
         <div id="agent-sessions-section" hidden>

@@ -509,6 +509,84 @@ test('another relay\'s agent can neither see nor answer this relay\'s remote rel
   assert.deepEqual(await decision, { approved: true });
 });
 
+test('an approval card takes no typed text: anything but Allow or Deny is refused and the card stays open', async () => {
+  const fx = boot();
+  const turn = await fx.send('please ask @linux-test to rebuild the sidebar', { relayMode: 'ask' });
+  assert.equal(deliver(fx).id, turn.body.messageId);
+  let release = () => {};
+  const approvals = createRemoteRelayCallerContext({
+    db: fx.db,
+    repository: fx.repository,
+    uuid: () => 'approval-1',
+    sleep: () => new Promise((resolve) => { release = resolve; }),
+    logger: { log() {}, warn() {} },
+  });
+  const decision = approvals.requestApproval({
+    conversationId: CONV,
+    callerContext: approvals.getCallerContext(CONV),
+    relay: { id: 'r-linux', name: 'linux-test', url: 'https://relay-b.example.test' },
+    action: 'send',
+    args: { session: 'conv-b-1', text: 'Rebuild the sidebar' },
+  });
+  const answer = (text) => fx.post('/api/relay-question/:id/answer', { answer: text }, { params: { id: 'approval-1' } });
+
+  for (const typed of ['yes', 'ok', 'allow it']) {
+    const refused = await answer(typed);
+    assert.equal(refused.status, 400, typed);
+    assert.deepEqual(refused.body.choices, ['Allow', 'Deny']);
+    assert.equal(fx.stmts.getQuestion.get('approval-1').status, 'pending', `"${typed}" leaves the card open`);
+  }
+
+  // The choice itself counts however it is typed, and is stored as the card's label.
+  const allowed = await answer('  allow ');
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
+  assert.equal(fx.stmts.getQuestion.get('approval-1').answer, 'Allow');
+  release();
+  assert.deepEqual(await decision, { approved: true });
+});
+
+test('a card with choices and no stored flag takes only its choices, as the card view reads it', async () => {
+  const fx = boot();
+  const turn = await fx.send('pick a theme');
+  assert.equal(deliver(fx).id, turn.body.messageId);
+  // This fixture stores no request envelope: the row has choices and no flag.
+  const asked = await fx.post('/api/relay-question', { queueId: turn.body.messageId, prompt: 'Which theme?', choices: ['Light', 'Dark'] });
+  const id = asked.body.question.id;
+  assert.equal(fx.stmts.getQuestion.get(id).request, null);
+
+  const typed = await fx.post('/api/relay-question/:id/answer', { answer: 'something darker' }, { params: { id } });
+  assert.equal(typed.status, 400);
+  assert.deepEqual(typed.body.choices, ['Light', 'Dark']);
+  assert.equal(fx.stmts.getQuestion.get(id).status, 'pending');
+  const picked = await fx.post('/api/relay-question/:id/answer', { answer: 'dark' }, { params: { id } });
+  assert.equal(picked.status, 200, JSON.stringify(picked.body));
+  assert.equal(fx.stmts.getQuestion.get(id).answer, 'Dark');
+});
+
+test('a closed multi-select card takes several of its choices and nothing typed', async () => {
+  const fx = boot();
+  const turn = await fx.send('pick the controls');
+  const row = deliver(fx);
+  assert.equal(row.id, turn.body.messageId);
+  const now = new Date().toISOString();
+  fx.stmts.insertQuestion.run(
+    'multi-1', row.id, CONV, row.id, 'agent', 'Which controls? Select all that apply.',
+    JSON.stringify(['Search', 'Filters', 'Export']),
+    JSON.stringify({ request: null, context: { multiSelect: true }, allowFreeform: false }),
+    null, null, null, null, null, now, questionExpiresAt(now, 120000), row.attemptId || null,
+  );
+  const answer = (text) => fx.post('/api/relay-question/:id/answer', { answer: text }, { params: { id: 'multi-1' } });
+
+  for (const typed of ['Search, and a note', 'all of them']) {
+    const refused = await answer(typed);
+    assert.equal(refused.status, 400, typed);
+    assert.equal(fx.stmts.getQuestion.get('multi-1').status, 'pending', typed);
+  }
+  const picked = await answer('search, EXPORT');
+  assert.equal(picked.status, 200, JSON.stringify(picked.body));
+  assert.equal(fx.stmts.getQuestion.get('multi-1').answer, 'Search, Export');
+});
+
 // ─── Push ────────────────────────────────────────────────────────────────────
 
 test('a turn an agent started pushes no "reply ready"; the user\'s own turn still does', async () => {

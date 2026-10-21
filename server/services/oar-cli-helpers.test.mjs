@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 
+import { RELAY_STOP_EXIT_CODE } from '../relay-exit-codes.mjs';
+
 import {
   buildDefaultConfig,
   buildServicePath,
@@ -69,6 +71,10 @@ test('systemd unit points at server.js with the state env pinned', () => {
   assert.match(unit, /Environment=COPILOT_WEB_RELAY_DATA_DIR=\/home\/dev\/\.oar\/data/);
   assert.match(unit, /WantedBy=default\.target/);
   assert.doesNotMatch(unit, /PATH=/);
+  // A relay that stopped on purpose (exit 78) is not restarted by systemd.
+  assert.match(unit, /^Restart=on-failure$/m);
+  assert.equal(RELAY_STOP_EXIT_CODE, 78);
+  assert.match(unit, new RegExp(`^RestartPreventExitStatus=${RELAY_STOP_EXIT_CODE}$`, 'm'));
 });
 
 test('systemd unit carries the given PATH, quoted and escaped', () => {

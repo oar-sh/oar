@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { displayToolName, isBackgroundLaunch, isSubagentToolName } from './sdk-message-normalizer.mjs';
 import {
+  SUBAGENT_TASK_TYPES,
   SUBAGENT_TIMELINE_ENTRY_MAX_CHARS,
   SUBAGENT_TIMELINE_MAX_ENTRIES,
   cutSubagentTimelineText,
@@ -8,6 +9,8 @@ import {
 } from '../../shared/subagent-timeline.mjs';
 
 const MAX_TRACKED_RUNS = 200;
+// Task ids and resume ids remembered to find a resumed agent's run.
+const MAX_TRACKED_TASKS = 500;
 
 export function toolResultText(content) {
   if (typeof content === 'string') return content;
@@ -53,6 +56,16 @@ function capText(text) {
  *
  * It also answers which turn owns a run's live lanes (`ownsRun`): only the
  * turn that spawned an agent shows its frames in its in-turn lanes.
+ *
+ * A finished background agent that the session sends a new message
+ * (SendMessage) runs again as the same task: task_started names its task id
+ * again, with the SendMessage call as its tool_use_id. That id leads to the
+ * run of the task's first start (`runIdFor`), so the record goes on under the
+ * agent's run, running again, with a note where it resumed. A start the
+ * recorder already saw (same run id) adds nothing, and an event of an
+ * earlier run (a lower run id) is late and left out. Every post names
+ * the run's task id too: a relay that knows the run by the task alone (this
+ * recorder did not see the first start) places it there.
  */
 export function createSubagentTimelineRecorder({
   api,
@@ -66,6 +79,9 @@ export function createSubagentTimelineRecorder({
   writerId = crypto.randomBytes(4).toString('hex'),
 } = {}) {
   const runs = new Map(); // runId -> run state, in registration order
+  const taskRuns = new Map(); // taskId -> the run its first start named
+  const resumeRuns = new Map(); // tool_use_id of a later start -> that run
+  const latestRuns = new Map(); // taskId -> the SDK run id of its latest start
   let flushTimer = null;
   let flushing = null;
   let localCounter = 0;
@@ -73,6 +89,26 @@ export function createSubagentTimelineRecorder({
   function newKey() {
     localCounter += 1;
     return `${writerId}:${localCounter}`;
+  }
+
+  /** The run an id belongs to: a resumed agent's later tool use leads to its first run. */
+  function runIdFor(id) {
+    const key = String(id || '').trim();
+    return resumeRuns.get(key) || key;
+  }
+
+  // An event of an earlier run of a task than its latest start: late (the
+  // run ids of one task sort in the order the runs opened). Without run ids,
+  // every event counts.
+  function isEarlierRun(taskId, sdkRunId) {
+    const latest = taskId ? latestRuns.get(taskId) : '';
+    return !!sdkRunId && !!latest && sdkRunId < latest;
+  }
+
+  function remember(map, key, value) {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > MAX_TRACKED_TASKS) map.delete(map.keys().next().value);
   }
 
   function ensureRun(runId, { parentId = null, displayName = '', subagentType = '' } = {}) {
@@ -221,7 +257,7 @@ export function createSubagentTimelineRecorder({
   }
 
   function observeAssistant(sdkMessage) {
-    const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
+    const parentId = runIdFor(sdkMessage?.parent_tool_use_id);
     const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
     if (!parentId) {
       // The main thread: only the agents it spawns matter here.
@@ -261,7 +297,7 @@ export function createSubagentTimelineRecorder({
   }
 
   function observeStreamEvent(sdkMessage) {
-    const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
+    const parentId = runIdFor(sdkMessage?.parent_tool_use_id);
     if (!parentId) return;
     const run = ensureRun(parentId);
     const event = sdkMessage?.event || {};
@@ -309,7 +345,7 @@ export function createSubagentTimelineRecorder({
   }
 
   function observeUser(sdkMessage) {
-    const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
+    const parentId = runIdFor(sdkMessage?.parent_tool_use_id);
     const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
     for (const block of content) {
       if (block?.type !== 'tool_result') continue;
@@ -346,17 +382,46 @@ export function createSubagentTimelineRecorder({
     const subtype = String(sdkMessage?.subtype || '');
     const toolUseId = String(sdkMessage?.tool_use_id || '').trim();
     if (!toolUseId) return;
+    const taskId = String(sdkMessage?.task_id || '').trim();
+    const sdkRunId = String(sdkMessage?.run_id || '').trim();
     if (subtype === 'task_started') {
-      const run = ensureRun(toolUseId, { subagentType: String(sdkMessage.subagent_type || '').trim() });
+      // Only sub-agents are resumed; shells and the rest are not remembered.
+      const taskType = String(sdkMessage.task_type || '').trim();
+      const agent = !!taskId && (!taskType || SUBAGENT_TASK_TYPES.has(taskType));
+      if (agent && sdkRunId) {
+        // The same start again, or an earlier run's start arriving late.
+        const latest = latestRuns.get(taskId);
+        if (latest && sdkRunId <= latest) return;
+        remember(latestRuns, taskId, sdkRunId);
+      }
+      const firstRun = agent ? taskRuns.get(taskId) : '';
+      if (firstRun && firstRun !== toolUseId) remember(resumeRuns, toolUseId, firstRun);
+      else if (agent && !firstRun) remember(taskRuns, taskId, toolUseId);
+      const run = ensureRun(runIdFor(toolUseId), { subagentType: String(sdkMessage.subagent_type || '').trim() });
+      // The same task started again (under another tool use, or after it
+      // ended): resumed.
+      const resumed = !!firstRun && (firstRun !== toolUseId || run.settled);
+      run.settled = false;
       if (sdkMessage.is_backgrounded === true) run.background = true;
+      if (resumed) {
+        const prompt = String(sdkMessage.prompt || '').trim();
+        addEntry(run, {
+          kind: 'note',
+          text: capText(prompt ? `Resumed with a new message: ${prompt}` : 'Resumed with a new message'),
+          metadata: { resumed: true },
+        });
+      }
+      // Running: a start, and for a resumed agent its return from the end.
       patchHeader(run, {
-        taskId: String(sdkMessage.task_id || '').trim() || null,
+        status: 'running',
+        taskId: taskId || null,
         subagentType: String(sdkMessage.subagent_type || '').trim() || null,
         background: sdkMessage.is_backgrounded === true ? true : null,
       });
       return;
     }
-    const run = runs.get(toolUseId);
+    if (isEarlierRun(taskId, sdkRunId)) return;
+    const run = runs.get(runIdFor(toolUseId));
     if (!run) return;
     if (subtype === 'task_updated') {
       if (sdkMessage?.patch?.is_backgrounded === true) {
@@ -413,7 +478,7 @@ export function createSubagentTimelineRecorder({
   }
 
   function ownsRun(runId, owner) {
-    const run = runs.get(String(runId || '').trim());
+    const run = runs.get(runIdFor(runId));
     if (!run || !owner) return false;
     if (!run.owner && run.parentId) run.owner = runs.get(run.parentId)?.owner || null;
     return run.owner === owner;
@@ -426,7 +491,7 @@ export function createSubagentTimelineRecorder({
    * carries it now; an unknown run keeps the old behaviour.
    */
   function isForeignRun(runId, owner) {
-    let run = runs.get(String(runId || '').trim());
+    let run = runs.get(runIdFor(runId));
     if (!run) return false;
     const spawnOwner = run.owner || null;
     let background = false;
@@ -469,6 +534,7 @@ export function createSubagentTimelineRecorder({
       await api('POST', '/api/subagent-timeline', {
         conversationId,
         subagentRunId: run.id,
+        ...(run.header.taskId ? { taskId: run.header.taskId } : {}),
         entries,
         ...(header ? { header } : {}),
       });
@@ -566,6 +632,7 @@ export function createSubagentTimelineRecorder({
     flush,
     processEnded,
     hasPending,
+    runIdFor,
     // For tests and diagnostics.
     runState: (runId) => runs.get(String(runId || '').trim()) || null,
   };

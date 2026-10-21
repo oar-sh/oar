@@ -311,11 +311,13 @@ test('a pending approval card exempts the turn from stale recovery', async () =>
   assert.deepEqual(result, { approved: false }, 'Deny');
 });
 
-test('a timed-out or cancelled card denies, and so does any answer but Allow', async () => {
+test('a timed-out or cancelled card denies, and an answer that is no choice is not taken for a plain Deny', async () => {
+  // The answer route refuses such an answer; one that got into the row anyway
+  // fails the call with a reason instead of passing for the user's Deny.
   for (const [status, answer, pattern] of [
     ['timed_out', null, /timed out/],
     ['cancelled', null, /cancelled/],
-    ['answered', 'allow it I guess', null],
+    ['answered', 'allow it I guess', /neither Allow nor Deny\. Go on without it, or ask the user first\./],
   ]) {
     let harness;
     harness = setup({

@@ -6,12 +6,26 @@ import { AcpClient, extractGrokModelsFromInitialize, pickAllowOnceOptionId } fro
 import { createAcpHostServices } from './acp-host-services.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
 
 export { extractGrokModelsFromInitialize };
 
 export function classifyGrokError(error) {
   const message = String(error?.message || error || '').trim();
   const lower = message.toLowerCase();
+  // First, and above all before the ENOENT branch: a spawn in a folder that
+  // is gone fails with ENOENT too, and the runner puts it down to the folder,
+  // whose path may hold any of the words matched below.
+  if (isWorkingDirectoryMissingError(error)) {
+    return {
+      code: `grok.${WORKING_DIRECTORY_MISSING_CODE}`,
+      message,
+      text: message,
+      guidance: error.guidance,
+      isAuth: false,
+      isBusy: false,
+    };
+  }
   // No bare 'auth' token: it would match unrelated words ("author…") in
   // arbitrary agent error text and misclassify them as login failures.
   if (

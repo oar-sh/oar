@@ -116,6 +116,7 @@ test('tmux shell command for cursor workers runs node without the script PTY wra
     CURSOR_AGENT_STORE_DIR: '/home/dev/.cursor-agent-store',
     COPILOT_WEB_RELAY_ROOT: '/repo',
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
+    COPILOT_WEB_RELAY_DATA_DIR: '/home/dev/.oar/data',
   };
   const command = buildTmuxWorkerShellCommand('session-1', env);
   const workerScript = path.join('/repo', 'server', 'cursor-worker', 'cursor-session-worker.mjs')
@@ -125,6 +126,8 @@ test('tmux shell command for cursor workers runs node without the script PTY wra
   assert.match(command, /export COPILOT_WEB_RELAY_WORKER_KIND='cursor';/);
   assert.match(command, /export CURSOR_RELAY_MODEL='cursor-fast-1';/);
   assert.match(command, /export CURSOR_AGENT_STORE_DIR='\/home\/dev\/\.cursor-agent-store';/);
+  // The worker finds its agent store in the relay's data dir.
+  assert.match(command, /export COPILOT_WEB_RELAY_DATA_DIR='\/home\/dev\/\.oar\/data';/);
 });
 
 test('tmux shell command never embeds the cursor api key', () => {
@@ -365,4 +368,17 @@ test('claude tmux command output is byte-identical to the pre-cursor expectation
     + `case ":$PATH:" in *:'/opt/node/bin':*) ;; *) PATH="$PATH:"'/opt/node/bin';; esac; export PATH; `
     + `exec '/opt/node/bin/node' '${workerScript}' --session-id 'session-1'`,
   );
+});
+
+test('a Cursor worker gets the relay\'s data dir as an absolute path', () => {
+  const env = applyCursorProviderEnvironment({ COPILOT_WEB_RELAY_DATA_DIR: 'relative-data' }, {
+    enabled: true,
+    apiKey: 'cursor-test-key',
+    dataDir: '/home/dev/.oar/data',
+  });
+  // Resolved (on Windows onto the current drive).
+  assert.equal(env.COPILOT_WEB_RELAY_DATA_DIR, path.resolve('/home/dev/.oar/data'));
+  // Off, the variable the relay itself has is left as it is.
+  const off = applyCursorProviderEnvironment({ COPILOT_WEB_RELAY_DATA_DIR: '/home/dev/.oar/data' }, { enabled: false, dataDir: '/x' });
+  assert.equal(off.COPILOT_WEB_RELAY_DATA_DIR, '/home/dev/.oar/data');
 });

@@ -77,7 +77,10 @@ export function createQuestionBridge({
       mode: activeMsg?.relayMode || "agent",
       prompt: extractQuestionPrompt(request),
       choices,
-      allowFreeform: allowFreeform ?? !choices.length,
+      // Free text unless the request says otherwise, as the runtime's ask_user
+      // and the SDK engine's bridge read it: the relay refuses typed text on a
+      // card sent with allowFreeform:false.
+      allowFreeform: allowFreeform ?? true,
       requestedSchema: requestedSchema || undefined,
       sdk_session_id: activeSession?.sdkSessionId || undefined,
       timeout_ms: questionTimeoutMs,

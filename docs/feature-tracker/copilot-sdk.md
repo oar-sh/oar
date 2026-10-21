@@ -4,8 +4,8 @@ Updated: 2026-08-16 · Part of the [SDK Feature Tracker](README.md) — legend, 
 provider-agnostic relay rows live there.
 
 Three integration paths consume this SDK. This file tracks the first two — the third, the headless
-per-conversation worker behind the experimental **SDK engine**, has its own file
-([copilot-sdk-worker.md](copilot-sdk-worker.md)):
+per-conversation worker behind the **SDK engine** (the default engine since 0.9.2 on a relay that
+can run it, `getCopilotEngine()`), has its own file ([copilot-sdk-worker.md](copilot-sdk-worker.md)):
 
 - **Extension mode** — `.github/extensions/web-relay/extension.mjs` is the only static import site
   in scope (`joinSession` from `@github/copilot-sdk/extension`).

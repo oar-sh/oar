@@ -16,6 +16,10 @@ export const SUBAGENT_TIMELINE_ENTRY_MAX_CHARS = 256 * 1024;
 
 export const SUBAGENT_TIMELINE_TOOL_NAME_MAX_CHARS = 200;
 
+// Background task types that are a sub-agent run, with a model of its own
+// (vs. a shell, monitor or workflow): the run a task panel row opens.
+export const SUBAGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
+
 export function isSubagentTimelineKind(kind) {
   return SUBAGENT_TIMELINE_KINDS.includes(String(kind || ''));
 }

@@ -8,6 +8,7 @@ import {
   REMOTE_RELAY_PROVIDERS,
 } from '../../shared/remote-relay-contract.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../../shared/question-timeout.mjs';
+import { readApprovalAnswer } from '../../shared/question-answer-rule.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
 import { pickLiveTurnRowId } from './live-turn-picker.mjs';
 import { sanitizeRelayQuestionContext } from './relay-question-context.mjs';
@@ -427,8 +428,12 @@ export function createRemoteRelayCallerContext({
       const current = questionStatements.getQuestion.get(questionId);
       if (!current) return { approved: false, error: 'The approval question was removed.' };
       if (current.status === 'answered') {
-        const approved = toText(current.answer).toLowerCase() === APPROVAL_ALLOW.toLowerCase();
-        return approved ? { approved: true } : { approved: false };
+        const decision = readApprovalAnswer(current.answer, { approve: APPROVAL_ALLOW, deny: APPROVAL_DENY });
+        if (decision === 'approve') return { approved: true };
+        if (decision === 'deny') return { approved: false };
+        // The answer route takes only the choices; anything else in the row
+        // is no decision of the user's, so it is not passed off as their Deny.
+        return { approved: false, error: 'The approval question was answered with neither Allow nor Deny. Go on without it, or ask the user first.' };
       }
       if (current.status !== 'pending') {
         return {

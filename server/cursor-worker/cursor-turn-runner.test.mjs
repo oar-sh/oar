@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload, cursorModeNudge } from './cursor-turn-runner.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
 function makeApiStub({ failRoutes = new Set() } = {}) {
   const calls = [];
@@ -64,6 +68,8 @@ function baseRunnerOptions(stub, overrides = {}) {
     api: stub.api,
     sdkSessionId: 'sess-1',
     cwd: '/home/dev',
+    // The fixture folder exists on no host; the folder check has its own tests.
+    checkWorkingDirectoryImpl: () => null,
     apiKey: 'cursor-test-key',
     storeDir: '/home/dev/.cursor-agents',
     defaultModel: 'default-cursor-model',
@@ -141,9 +147,11 @@ test('the preview tool is registered beside ask_user and runs on the active conv
   assert.equal(preview.inputSchema.properties.action.enum.join(','), 'create,list,close');
   assert.ok(createCalls[0].customTools?.ask_user?.execute, 'ask_user must still be registered');
 
+  // Between turns the worker's own session is the conversation it lists.
   const result = await preview.execute({ action: 'list' });
   const listCall = stub.calls.find((call) => call.routePath.startsWith('/api/previews'));
   assert.equal(listCall.method, 'GET');
+  assert.equal(listCall.routePath, '/api/previews?conversationId=sess-1');
   assert.equal(result.structuredContent.ok, true);
 });
 
@@ -936,4 +944,57 @@ test('a mode nudge swallowed by a failed turn is re-injected on the next attempt
     /^## Embedding media in replies[\s\S]*\[Relay mode: ask\]/,
     'the failed turn must not consume the mode change; guidance and nudge are re-injected',
   );
+});
+
+test('a missing working directory fails the turn with the folder, before an agent is created', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-cursor-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const gone = path.join(root, 'deleted');
+  const stub = makeApiStub();
+  const createCalls = [];
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    cwd: gone,
+    checkWorkingDirectoryImpl: missingWorkingDirectoryError,
+    createAgentHandleImpl: recordingHandleFactory({ createCalls, closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('never'), evFinished()]]),
+  }));
+
+  await runner.handlePendingPayload({ message: { ...baseMessage } });
+
+  assert.equal(createCalls.length, 0, 'no agent is created in a folder that is not there');
+  const failure = stub.calls.find((call) => call.routePath === '/api/response')?.body?.terminalError;
+  assert.equal(failure?.stableCode, 'cursor.working-directory-missing');
+  assert.equal(failure.message, `The working directory of this conversation no longer exists: ${gone}.`);
+  assert.match(failure.guidance || '', /Change CWD/);
+});
+
+test('an agent that fails to start because the folder went away meanwhile is put down to the folder', async (t) => {
+  // Both paths: a fresh agent, and a durable one whose resume fails before
+  // the fresh fallback fails too.
+  for (const cursorAgentId of ['', 'agent-durable']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-cursor-cwd-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const folder = path.join(root, 'project');
+    fs.mkdirSync(folder);
+    const stub = makeApiStub();
+    const createCalls = [];
+    const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+      cwd: folder,
+      checkWorkingDirectoryImpl: missingWorkingDirectoryError,
+      createAgentHandleImpl: async (options) => {
+        createCalls.push(options);
+        fs.rmSync(folder, { recursive: true, force: true });
+        throw Object.assign(new Error('spawn /bin/sh ENOENT'), { code: 'ENOENT' });
+      },
+      startCursorRunImpl: queuedTurns([[evInit(), evDelta('never'), evFinished()]]),
+    }));
+
+    await runner.handlePendingPayload({ message: { ...baseMessage, cursorAgentId } });
+
+    assert.equal(createCalls.length, cursorAgentId ? 2 : 1, cursorAgentId || 'fresh');
+    const failure = stub.calls.find((call) => call.routePath === '/api/response')?.body?.terminalError;
+    assert.equal(failure?.stableCode, 'cursor.working-directory-missing', cursorAgentId || 'fresh');
+    assert.equal(failure.message, `The working directory of this conversation no longer exists: ${folder}.`);
+    assert.match(failure.guidance || '', /Change CWD/);
+  }
 });

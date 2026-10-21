@@ -1,5 +1,7 @@
 'use strict';
 
+import { providerDisplayName } from '../public/app/conversation-provider-indicator.mjs';
+
 /**
  * Web Push dispatch: decides whether a push should go out at all (suppressed
  * while any device is actively foregrounded), renders the notification per
@@ -29,7 +31,8 @@ const FAILURE_PRUNE_THRESHOLD = 8;
 const PUSH_TTL_SECONDS = 12 * 60 * 60;
 
 const EVENT_LABELS = Object.freeze({
-  question: { title: 'Copilot needs your input', generic: 'The agent asked a question.' },
+  // A question's title names the provider that asks (questionTitle).
+  question: { title: 'An agent needs your input', generic: 'The agent asked a question.' },
   turnComplete: { title: 'Turn completed', generic: 'The agent finished its turn.' },
   turnFailed: { title: 'Turn failed', generic: 'The agent turn failed.' },
   board: { title: 'Plan ready for review', generic: 'The agent posted a board for review.' },
@@ -37,6 +40,12 @@ const EVENT_LABELS = Object.freeze({
   hostSuspend: { title: 'Host suspend', generic: 'The queued host suspend changed state.' },
   relayRestart: { title: 'Relay restart waiting', generic: 'The queued relay restart has waited its maximum time.' },
 });
+
+function eventTitle(type, providerName) {
+  const name = String(providerName || '').trim();
+  if (type === 'question' && name) return `${name} needs your input`;
+  return EVENT_LABELS[type].title;
+}
 
 // System events carry their own body: no conversation text to preview, and
 // the body is the message itself regardless of the preview preference.
@@ -79,7 +88,7 @@ export function normalizePushPreferences(raw) {
  * Render the notification payload for one subscription. Pure so every content
  * preference combination is unit-testable.
  *
- * @param {{ type: string, conversationTitle?: string|null, body?: string|null, data?: object }} event
+ * @param {{ type: string, conversationTitle?: string|null, providerName?: string|null, body?: string|null, data?: object }} event
  * @param {object} preferences canonical shape from normalizePushPreferences
  */
 export function renderPushNotification(event, preferences) {
@@ -87,10 +96,11 @@ export function renderPushNotification(event, preferences) {
   const prefs = normalizePushPreferences(preferences);
   const labels = EVENT_LABELS[type];
 
-  let title = labels.title;
+  const baseTitle = eventTitle(type, event?.providerName);
+  let title = baseTitle;
   const conversationTitle = String(event?.conversationTitle || '').trim();
   if (prefs.content.includeTitle && conversationTitle) {
-    title = `${labels.title} — ${conversationTitle}`.slice(0, MAX_TITLE_CHARS);
+    title = `${baseTitle} — ${conversationTitle}`.slice(0, MAX_TITLE_CHARS);
   }
 
   let body = labels.generic;
@@ -116,7 +126,7 @@ export function renderPushNotification(event, preferences) {
   return {
     title,
     body,
-    tag: `copilot-${type}-${tagSeed}`,
+    tag: `oar-${type}-${tagSeed}`,
     timestamp: Date.now(),
     data,
   };
@@ -341,6 +351,21 @@ export function createPushDispatchService({
     }
   }
 
+  // The provider of a question's conversation, for the push title. Prepared
+  // lazily: a schema without runtime sessions just means "not known".
+  let providerTypeStatement = null;
+  function conversationProviderName(conversationId) {
+    const id = String(conversationId || '').trim();
+    if (!id) return null;
+    try {
+      providerTypeStatement ??= db.prepare(`SELECT provider_type FROM runtime_sessions WHERE conversation_id = ?`);
+      // Named as the question card's head names it; unknown stays neutral.
+      return providerDisplayName(providerTypeStatement.get(id)?.provider_type) || null;
+    } catch {
+      return null;
+    }
+  }
+
   async function sendToSubscription(row, event) {
     const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
     const payload = renderPushNotification(event, preferences);
@@ -384,7 +409,7 @@ export function createPushDispatchService({
    * Fire-and-forget push for one event. Never throws; suppression failures
    * fail closed (no push when the active-device state is unknown).
    */
-  async function dispatch({ type, conversationId = null, body = null, data = {} }) {
+  async function dispatch({ type, conversationId = null, body = null, data = {}, providerName = null }) {
     try {
       if (!PUSH_EVENT_TYPES.includes(type)) return { outcome: 'invalid-type' };
 
@@ -410,6 +435,7 @@ export function createPushDispatchService({
       const event = {
         type,
         conversationTitle: conversationTitle(conversationId),
+        providerName,
         body,
         data: { ...data, conversationId: conversationId || undefined },
       };
@@ -445,6 +471,7 @@ export function createPushDispatchService({
     return dispatch({
       type: 'question',
       conversationId: question?.conversationId || null,
+      providerName: conversationProviderName(question?.conversationId),
       body: question?.prompt || null,
       data: {
         questionId: question?.id || undefined,

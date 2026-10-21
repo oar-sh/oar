@@ -47,6 +47,8 @@ export function createSubagentTimelineStatements(db) {
     // The column list every run read uses, so the header travels with the
     // run wherever runs are listed (conversation payload, in-flight snapshot).
     subagentRunSelectColumns,
+    // A run that runs again (a resumed agent): no end time while it runs.
+    reopenSubagentRun: db.prepare(`UPDATE subagent_runs SET status = 'running', updated_at = ?, completed_at = NULL WHERE id = ?`),
     updateSubagentRunHeader: null,
     setSubagentRunTruncated: null,
     listChildSubagentRuns: null,

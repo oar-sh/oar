@@ -202,6 +202,8 @@ test('a resuming spawn relocates the transcript into the current CWD first', asy
     // A worker respawned by the CWD relaunch runs in the new workspace root,
     // while the session id still points at the old root's transcript.
     cwd: '/tmp/new-root',
+    // The fixture folder exists on no host.
+    checkWorkingDirectoryImpl: () => null,
     relocateTranscriptImpl: (params) => {
       relocations.push(params);
       order.push('relocate');
@@ -4670,7 +4672,7 @@ test('a pending AskUserQuestion pins the process past the idle window', async ()
   const runner = createClaudeSessionRunner({
     api,
     sdkSessionId: 'conv-1',
-    cwd: '/tmp',
+    cwd: osModule.tmpdir(),
     relocateTranscriptImpl: noopRelocate,
     startClaudeSessionImpl: (params) => {
       capturedCanUseTool = params.canUseTool;
@@ -4925,7 +4927,7 @@ test('an AskUserQuestion between turns attaches to a fresh continuation turn ins
   const runner = createClaudeSessionRunner({
     api,
     sdkSessionId: 'conv-1',
-    cwd: '/tmp',
+    cwd: osModule.tmpdir(),
     relocateTranscriptImpl: noopRelocate,
     startClaudeSessionImpl: (params) => {
       capturedCanUseTool = params.canUseTool;

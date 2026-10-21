@@ -4032,8 +4032,10 @@ export function registerSessionsRoutes(app, deps) {
   // then nothing is shared.
   function collectSharePreviewTokens(conversationId) {
     const tokens = new Set();
-    // Every preview of the relay, not only this conversation's: the preview
-    // tool's list covers them all, and a reply may quote any of its tokens.
+    // Every preview of the relay, not only this conversation's: a reply may
+    // quote any token its agent got hold of — one the user pasted from
+    // Settings → Previews, or a relay-wide list fetched by hand with the relay
+    // token (the preview tool's own list is scoped to its conversation).
     try {
       for (const knownToken of listKnownPreviewTokens?.() || []) tokens.add(String(knownToken));
     } catch {

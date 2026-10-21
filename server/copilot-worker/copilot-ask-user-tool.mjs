@@ -40,7 +40,7 @@ export const RELAY_ASK_USER_TOOL_PARAMETERS = Object.freeze({
     choices: {
       type: 'array',
       items: { type: 'string' },
-      description: 'Optional list of choices for a multiple choice question. Prefer providing choices when possible.',
+      description: 'Optional list of choices for a multiple choice question. Prefer providing choices when possible. The relay keeps the first 8 choices and drops the rest.',
     },
     multi_select: {
       type: 'boolean',

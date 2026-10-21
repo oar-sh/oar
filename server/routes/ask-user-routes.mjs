@@ -3,6 +3,7 @@
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
+import { closedQuestionAnswer, questionAcceptsFreeText } from '../../shared/question-answer-rule.mjs';
 import {
   extractRequestedSchema,
   normalizeSchema,
@@ -35,19 +36,39 @@ function firstKnownValue(source, keyPaths = []) {
   return null;
 }
 
+function parseRowJson(value) {
+  try {
+    return JSON.parse(String(value || ''));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * A stored question row that is this relay's Allow / Deny card for one of its
  * own agent's calls to another relay (remote-relay-caller-context.mjs). The
  * context lives in the row's request envelope.
  */
 function isRemoteRelayApprovalRow(row) {
-  let envelope = null;
-  try {
-    envelope = JSON.parse(String(row?.request || ''));
-  } catch {
-    return false;
-  }
-  return isRemoteRelayApprovalQuestion(envelope);
+  const envelope = parseRowJson(row?.request);
+  return envelope ? isRemoteRelayApprovalQuestion(envelope) : false;
+}
+
+/**
+ * The choices of a stored card that takes no typed text (approval and
+ * permission cards, and a card with choices that stored no flag, as the
+ * runtime's formatQuestionRow reads it for the card view), or null for a
+ * card that takes any reply.
+ */
+function closedQuestionOfRow(row) {
+  const envelope = parseRowJson(row?.request);
+  const parsedChoices = parseRowJson(row?.choices);
+  const choices = Array.isArray(parsedChoices) ? parsedChoices.map((choice) => String(choice ?? '')) : [];
+  const allowFreeform = envelope && typeof envelope === 'object' && typeof envelope.allowFreeform === 'boolean'
+    ? envelope.allowFreeform
+    : null;
+  if (questionAcceptsFreeText({ allowFreeform, choices })) return null;
+  return { choices, multiSelect: envelope?.context?.multiSelect === true };
 }
 
 function extractContinuationOwnership(rawRequest) {
@@ -297,6 +318,19 @@ export function registerAskUserRoutes(app, deps) {
       flatText = summarizeStructuredAnswer(schema, structured) || flatText;
     } else if (!flatText) {
       return res.status(400).json({ error: 'Empty answer' });
+    } else {
+      // A card that takes no typed text is answered by its choices only.
+      // Anything else is refused and the card stays open: it must not pass
+      // for an answer (an approval reader would take it for a denial).
+      const closed = closedQuestionOfRow(row);
+      if (closed) {
+        const accepted = closedQuestionAnswer(closed, flatText);
+        if (!accepted) {
+          console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=not-a-choice`);
+          return res.status(400).json({ error: 'This question takes one of its choices, not typed text', choices: closed.choices });
+        }
+        flatText = accepted;
+      }
     }
 
     const result = askUserRoutingService.routeAnswer({

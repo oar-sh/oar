@@ -93,8 +93,8 @@ export function createRelayRestartQueue({
   // ({ action }) => { waitingFor, held, backgroundTasks, survival }; see
   // relay-restart-picture.mjs. Optional: without it the state names nothing.
   collectPicture = null,
-  // ({ action, reason, requestedBy, immediate, counts }) => void: exits the
-  // runtime. Called at most once per request.
+  // ({ action, reason, requestedBy, requestedAt, immediate, counts }) => void:
+  // exits the runtime. Called at most once per request.
   startShutdown,
   // () => the maximum wait in ms, 0 for no limit.
   getMaxWaitMs = () => DEFAULT_RELAY_RESTART_MAX_WAIT_MINUTES * 60_000,
@@ -231,7 +231,14 @@ export function createRelayRestartQueue({
       );
     }
     try {
-      startShutdown({ action, reason: info?.reason || 'manual-request', requestedBy: info?.requestedBy || 'unknown', immediate, counts: queue });
+      startShutdown({
+        action,
+        reason: info?.reason || 'manual-request',
+        requestedBy: info?.requestedBy || 'unknown',
+        requestedAt: iso(info?.requestedAt),
+        immediate,
+        counts: queue,
+      });
     } catch (error) {
       log(`Relay ${action} failed to start: ${error?.message || error}`);
     }

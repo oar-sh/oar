@@ -259,6 +259,9 @@ test('registry enforces maxLive', () => {
   const third = registry.create({ port: 5003 });
   assert.equal(third.ok, false);
   assert.equal(third.status, 429);
+  // An agent's tool reaches only its own conversation's previews; the
+  // relay-wide close is the owner's.
+  assert.match(third.error, /Settings → Previews; an agent can close its own conversation's/);
   assert.equal(registry.size, 2);
 });
 
@@ -659,7 +662,7 @@ test('the limit error names the oldest previews and how to close them', () => {
   assert.match(refused.error, /"docs" \(folder site, published 3 h ago, last opened 3 h ago\)/);
   assert.match(refused.error, /"web app" \(port 5173, published 3 h ago, never opened\)/);
   assert.match(refused.error, /Settings → Previews/);
-  assert.match(refused.error, /DELETE \/api\/previews\/:token/);
+  assert.match(refused.error, /DELETE \/api\/previews\/:token\?conversationId=<conv>/);
   assert.ok(!refused.error.includes(site.token));
 });
 

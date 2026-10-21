@@ -109,7 +109,7 @@ test('execute list maps previews to a compact model-facing shape', async () => {
       ],
     },
   });
-  const result = await executePreviewTool({ action: 'list' }, { api });
+  const result = await executePreviewTool({ action: 'list' }, { api, conversationId: 'conv-1' });
   assert.equal(result.ok, true);
   assert.deepEqual(result.previews.map((entry) => entry.target), ['localhost:5173', '/repo/dist']);
   assert.ok(result.previews.every((entry) => !('unverified' in entry)));
@@ -124,7 +124,7 @@ test('execute list marks a preview the relay could not check yet', async () => {
       ],
     },
   });
-  const result = await executePreviewTool({ action: 'list' }, { api });
+  const result = await executePreviewTool({ action: 'list' }, { api, conversationId: 'conv-1' });
   assert.equal(result.previews[0].unverified, true);
 });
 
@@ -136,6 +136,50 @@ test('execute close with no token resolves the single live preview', async () =>
   const result = await executePreviewTool({ action: 'close' }, { api, conversationId: 'conv-1' });
   assert.deepEqual(result, { ok: true, closed: { token: TOKEN, label: 'app' } });
   assert.match(calls[0].path, /conversationId=conv-1/);
+});
+
+test('execute list asks for the calling conversation only, never the relay-wide list', async () => {
+  const { api, calls } = fakeApi({ 'GET /api/previews': { enabled: true, previews: [] } });
+  await executePreviewTool({ action: 'list' }, { api, conversationId: 'conv 1' });
+  assert.deepEqual(calls.map((call) => call.path), ['/api/previews?conversationId=conv%201']);
+
+  // Without a conversation there is nothing it may list.
+  const unbound = fakeApi({ 'GET /api/previews': { enabled: true, previews: [] } });
+  const result = await executePreviewTool({ action: 'list' }, { api: unbound.api });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not bound to a conversation/);
+  assert.equal(unbound.calls.length, 0);
+});
+
+test('execute close names the calling conversation, and a refusal reads as an answer', async () => {
+  const { api, calls } = fakeApi({
+    'DELETE /api/previews/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': { ok: true, preview: { label: 'app' } },
+  });
+  const closed = await executePreviewTool({ action: 'close', token: TOKEN }, { api, conversationId: 'conv-1' });
+  assert.deepEqual(closed, { ok: true, closed: { token: TOKEN, label: 'app' } });
+  assert.equal(calls[0].path, `/api/previews/${TOKEN}?conversationId=conv-1`);
+
+  const refused = fakeApi({
+    'DELETE /api/previews/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': () => {
+      const error = new Error(`HTTP 403 /api/previews/${TOKEN}?conversationId=conv-1: This preview belongs to another conversation`);
+      error.status = 403;
+      error.detail = 'This preview belongs to another conversation';
+      throw error;
+    },
+  });
+  const result = await executePreviewTool({ action: 'close', token: TOKEN }, { api: refused.api, conversationId: 'conv-1' });
+  assert.deepEqual(result, { ok: false, error: 'This preview belongs to another conversation' });
+
+  const unbound = await executePreviewTool({ action: 'close', token: TOKEN }, { api });
+  assert.match(unbound.error, /not bound to a conversation/);
+});
+
+test('execute create is refused without a conversation, so no preview lands unowned', async () => {
+  const { api, calls } = fakeApi({ 'POST /api/previews': { url: 'x', preview: { token: TOKEN } } });
+  const result = await executePreviewTool({ action: 'create', port: 5173 }, { api });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not bound to a conversation/);
+  assert.equal(calls.length, 0);
 });
 
 test('execute close is explicit when zero or many previews are live', async () => {
@@ -160,10 +204,10 @@ test('execute reports API failures as answers, not throws', async () => {
   const { api } = fakeApi({
     'POST /api/previews': () => { throw new Error('Preview lane is disabled'); },
   });
-  const result = await executePreviewTool({ action: 'create', port: 5173 }, { api });
+  const result = await executePreviewTool({ action: 'create', port: 5173 }, { api, conversationId: 'conv-1' });
   assert.deepEqual(result, { ok: false, error: 'Preview lane is disabled' });
 
-  const missing = await executePreviewTool({ action: 'list' }, {});
+  const missing = await executePreviewTool({ action: 'list' }, { conversationId: 'conv-1' });
   assert.equal(missing.ok, false);
 });
 
@@ -178,6 +222,16 @@ test('the instruction block is generated from the tool description', () => {
   assert.match(block, /DELETE \/api\/previews\/:token/);
   assert.match(block, /https:\/\/p\.example\.com\/test_<token>\//);
   assert.match(block, /workspace root/);
+});
+
+test('the instruction block names the conversation it is sent to', () => {
+  const block = renderPreviewInstructionBlock({ publicBaseUrl: 'https://p.example.com', conversationId: 'conv-9' });
+  assert.match(block, /GET \/api\/previews\?conversationId=conv-9/);
+  assert.match(block, /DELETE \/api\/previews\/:token\?conversationId=conv-9/);
+  assert.match(block, /"conversationId": "conv-9"/);
+  assert.doesNotMatch(block, /<conv>/);
+  // Without one (the static reference copy) the placeholder stays.
+  assert.match(renderPreviewInstructionBlock({}), /conversationId=<conv>/);
 });
 
 test('schema and name stay in the shape adapters rely on', () => {

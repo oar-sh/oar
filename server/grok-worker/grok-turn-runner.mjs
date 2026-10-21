@@ -12,6 +12,7 @@ import { fetchRemoteRelayInflight } from '../../shared/remote-relay-tool-core.mj
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
+import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -64,6 +65,7 @@ function buildGrokTerminalError(classified, message) {
     code: classified.code,
     stableCode: classified.code,
     message: classified.text || classified.message,
+    ...(classified.guidance ? { guidance: classified.guidance } : {}),
     // A stalled turn was cancelled and its agent is restarted for the next
     // message, so sending the message again is all it takes.
     ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
@@ -115,6 +117,9 @@ export function createGrokTurnRunner({
   createAgentHandleImpl = createGrokAgentHandle,
   startGrokTurnImpl = startGrokTurn,
   classifyErrorImpl = classifyGrokError,
+  // The error a Grok CLI started in `cwd` fails with up front, or null
+  // (shared/worker-runtime/working-directory.mjs).
+  checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   getPreviewInstructions = createPreviewInstructionsProvider({ api }),
   env = process.env,
   nodePath = process.execPath,
@@ -200,6 +205,11 @@ export function createGrokTurnRunner({
 
   async function ensureAgentHandle(message, model) {
     if (agentHandle) return agentHandle;
+    // The CLI is spawned in the conversation's folder; a folder that is gone
+    // fails with ENOENT, which would otherwise read as a CLI that is not
+    // installed (classifyGrokError).
+    const missingFolder = checkWorkingDirectoryImpl(cwd);
+    if (missingFolder) throw missingFolder;
     const resumeId = String(message.grokNativeSessionId || grokNativeSessionId || '').trim();
     agentHandle = await createAgentHandleImpl({
       command,
@@ -215,7 +225,7 @@ export function createGrokTurnRunner({
         ? { AcpClientImpl: withAcpMcpServers(AcpClient, acpMcpServers), mcpServers: acpMcpServers }
         : {}),
       dbg,
-    });
+    }).catch((error) => { throw explainLaunchFailure(error, cwd, { check: checkWorkingDirectoryImpl }); });
     if (agentHandle.sessionId) {
       await persistNativeSessionId(message, agentHandle.sessionId);
     }
@@ -427,7 +437,7 @@ export function createGrokTurnRunner({
     const previewBlock = previewInstructionsSent || acpMcpServers.length
       ? ''
       : await Promise.resolve()
-        .then(() => getPreviewInstructions?.())
+        .then(() => getPreviewInstructions?.({ conversationId: message.conversationId || sdkSessionId || '' }))
         .catch(() => '');
     const mediaBlock = mediaInstructionsSent ? '' : renderMediaEmbedInstructionBlock();
     const promptText = [previewBlock, mediaBlock, modeNudge, userText].filter(Boolean).join('\n\n');
@@ -594,7 +604,7 @@ export function createGrokTurnRunner({
         : classified.isStalled
           ? classified.text
             || `System note: the Grok turn stalled and was stopped (${classified.message}). Send a new message to retry.`
-          : `System note: the Grok turn failed (${classified.message}).`;
+          : classified.text || `System note: the Grok turn failed (${classified.message}).`;
       await publishResponse(message, {
         text: noteText,
         model: message.providerModel || defaultModel || null,

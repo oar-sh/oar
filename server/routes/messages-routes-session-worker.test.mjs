@@ -193,6 +193,31 @@ test('resolveOpenAIImageEditAttachment parses first image attachment data URL', 
   assert.equal(image.bytes.toString('utf8'), 'hello');
 });
 
+test('resolveOpenAIImageEditAttachment takes a blob of an older upload folder, nothing else in it', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-image-edit-'));
+  try {
+    const uploadRoot = path.join(tempRoot, 'data', 'uploads');
+    const oldRoot = path.join(tempRoot, 'server', 'uploads');
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(path.join(oldRoot, 'nested'), { recursive: true });
+    const blob = path.join(oldRoot, 'a'.repeat(64));
+    fs.writeFileSync(blob, Buffer.from('hello'));
+    fs.writeFileSync(path.join(oldRoot, 'notes.png'), Buffer.from('hello'));
+    fs.writeFileSync(path.join(oldRoot, 'nested', 'b'.repeat(64)), Buffer.from('hello'));
+    const options = { maxImageBytes: 1024, allowedRootPath: uploadRoot, allowedBlobRootPaths: [oldRoot] };
+    const image = resolveOpenAIImageEditAttachment([{ name: 'photo.png', type: 'image/png', path: blob }], options);
+    assert.equal(image.bytes.toString('utf8'), 'hello');
+    for (const other of [path.join(oldRoot, 'notes.png'), path.join(oldRoot, 'nested', 'b'.repeat(64))]) {
+      assert.throws(
+        () => resolveOpenAIImageEditAttachment([{ name: 'photo.png', type: 'image/png', path: other }], options),
+        /outside the upload directory/i,
+      );
+    }
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('resolveOpenAIImageEditAttachment rejects paths outside allowed upload root', () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-image-edit-'));
   const uploadRoot = path.join(tempRoot, 'uploads');

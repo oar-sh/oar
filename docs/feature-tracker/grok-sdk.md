@@ -7,7 +7,9 @@ the **Grok CLI Agent Client Protocol** (`grok agent --no-leader stdio`). The wor
 lives in `server/grok-worker/`.
 
 Authentication uses the **relay host's Grok CLI login** (`grok login` or `XAI_API_KEY` in the
-host environment). The relay stores no API key — enablement is a settings toggle (Claude-style).
+host environment; under tmux the worker gets `XAI_API_KEY` only from the tmux server's environment
+or the login profile, since the launcher does not export it, see
+[Session workers under tmux](../configuration.md#environment-variables)). The relay stores no API key — enablement is a settings toggle (Claude-style).
 Since 2026-08-31 both halves of "get a working Grok on the host" are drivable from the web UI:
 the CLI can be **installed and updated** from the provider panel, and the account can be
 **signed in and out** there — see [Account authentication](#account-authentication) and

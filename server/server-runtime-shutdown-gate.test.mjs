@@ -29,8 +29,27 @@ test('a queued shutdown fires once nothing is processing, whatever is pending or
   assert.match(evaluate, /if \(queuedShutdownCanProceed\(queue\)\) \{\s*fire\(\);/);
   assert.doesNotMatch(evaluate, /pendingCount[^\n]*processingCount[^\n]*parkedCount[^\n]*<= 0/, 'pending and parked rows no longer hold the restart');
   assert.match(runtimeSource, /const relayRestartQueue = createRelayRestartQueue\(\{\s*getCounts: \(\) => queueCounts\(\),/);
-  assert.match(runtimeSource, /function requestRelayShutdown\(options = \{\}\) \{\s*return relayRestartQueue\.request\(options\);/);
+  const request = sliceBetween(runtimeSource, 'function requestRelayShutdown(options = {}) {', '\n}\n');
+  assert.match(request, /const result = relayRestartQueue\.request\(options\);[\s\S]*return result;/);
   assert.doesNotMatch(runtimeSource, /countPendingRowsOfStoppedSessions/);
+});
+
+test('relay_restarted is wired: the loop guard before the request, the end on the way out, the start at boot', () => {
+  const request = sliceBetween(runtimeSource, 'function requestRelayShutdown(options = {}) {', '\n}\n');
+  const guard = request.indexOf('relayEventService?.noteRestartRequested()');
+  assert.notEqual(guard, -1);
+  assert.ok(guard < request.indexOf('relayRestartQueue.request('), 'noted first: an immediate request exits inside the call');
+  assert.match(request, /if \(!relayRestartQueue\.isQueued\(\) && !runtimeShutdownStarted\) relayEventService\?\.noteRestartCancelled\(\);/);
+  const cancel = sliceBetween(runtimeSource, 'function cancelRelayShutdown(', '\n}\n');
+  assert.match(cancel, /if \(result\?\.cancelled\) relayEventService\?\.noteRestartCancelled\(\);/);
+  const startShutdown = sliceBetween(runtimeSource, 'startShutdown: ({ action, reason, requestedBy, requestedAt }) => {', 'void shutdownRuntime(');
+  assert.match(startShutdown, /relayEventService\?\.noteRelayExit\(\{ action, reason, requestedBy, requestedAt \}\)/);
+  const shutdown = sliceBetween(runtimeSource, 'function shutdownRuntime(', 'runtimeShutdownPromise = new Promise(');
+  assert.ok(shutdown.indexOf('relayEventService.noteRelayExit(') !== -1 && shutdown.indexOf('relayEventService.noteRelayExit(') < shutdown.indexOf('relayEventService.stop()'),
+    'the generic end is written before the service stops');
+  const listening = sliceBetween(runtimeSource, 'httpServer.listen(config.port, listenHost, () => {', 'buildRelayReadyBannerData();');
+  assert.match(listening, /relayEventService\.noteRelayStarted\(\);/, 'the start is noted once the relay listens');
+  assert.equal(runtimeSource.split('relayEventService.noteRelayStarted();').length, 2, 'and only there');
 });
 
 test('the socket delivery path refuses rows while a shutdown is queued, before any dequeue', () => {

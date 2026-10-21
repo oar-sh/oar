@@ -10,6 +10,7 @@ import {
   PUSH_EVENT_TYPES,
 } from './push-dispatch-service.mjs';
 import { PUSH_SUBSCRIPTIONS_SCHEMA } from '../migrations/0003-push-subscriptions.mjs';
+import { questionCardHeadLabel } from '../public/app/conversation-provider-indicator.mjs';
 
 function makeDb() {
   const db = new Database(':memory:');
@@ -97,7 +98,7 @@ const RENDER_EVENT = {
 
 test('render: generic body and no title by default', () => {
   const payload = renderPushNotification(RENDER_EVENT, normalizePushPreferences(null));
-  assert.equal(payload.title, 'Copilot needs your input');
+  assert.equal(payload.title, 'An agent needs your input');
   assert.equal(payload.body, 'The agent asked a question.');
   assert.equal(payload.data.type, 'question');
   assert.equal(payload.data.questionId, 'q-1');
@@ -109,7 +110,7 @@ test('render: conversation title is appended when includeTitle is on', () => {
   const payload = renderPushNotification(RENDER_EVENT, {
     content: { includeTitle: true, preview: 'none' },
   });
-  assert.equal(payload.title, 'Copilot needs your input — Fix the login flow');
+  assert.equal(payload.title, 'An agent needs your input — Fix the login flow');
   assert.equal(payload.body, 'The agent asked a question.');
 });
 
@@ -145,7 +146,7 @@ test('render: title and full preview combine', () => {
   const payload = renderPushNotification(RENDER_EVENT, {
     content: { includeTitle: true, preview: 'full' },
   });
-  assert.equal(payload.title, 'Copilot needs your input — Fix the login flow');
+  assert.equal(payload.title, 'An agent needs your input — Fix the login flow');
   assert.equal(payload.body, RENDER_EVENT.body);
 });
 
@@ -161,6 +162,22 @@ test('render: distinct tags per event so notifications stack', () => {
   const first = renderPushNotification({ type: 'question', data: { questionId: 'q-1' } }, null);
   const second = renderPushNotification({ type: 'question', data: { questionId: 'q-2' } }, null);
   assert.notEqual(first.tag, second.tag);
+});
+
+test('render: a question names the provider that asks, or no provider at all', () => {
+  const prefs = normalizePushPreferences(null);
+  for (const [providerName, title] of [
+    ['Claude', 'Claude needs your input'],
+    ['Cursor', 'Cursor needs your input'],
+    ['Copilot', 'Copilot needs your input'],
+    [null, 'An agent needs your input'],
+  ]) {
+    assert.equal(renderPushNotification({ ...RENDER_EVENT, providerName }, prefs).title, title);
+  }
+  const titled = renderPushNotification({ ...RENDER_EVENT, providerName: 'Grok' }, { content: { includeTitle: true } });
+  assert.equal(titled.title, 'Grok needs your input — Fix the login flow');
+  // The tag names the relay, not one provider.
+  assert.match(renderPushNotification(RENDER_EVENT, prefs).tag, /^oar-question-q-1$/);
 });
 
 test('render: every event type has a label', () => {
@@ -292,11 +309,11 @@ test('the same event renders differently per device content preferences', async 
   await service.dispatch({ type: 'question', conversationId: 'conv-1', body: 'Which database should I use?' });
 
   const generic = payloads.get('https://push.example/generic');
-  assert.equal(generic.title, 'Copilot needs your input');
+  assert.equal(generic.title, 'An agent needs your input');
   assert.equal(generic.body, 'The agent asked a question.');
 
   const full = payloads.get('https://push.example/full');
-  assert.equal(full.title, 'Copilot needs your input — Refactor auth');
+  assert.equal(full.title, 'An agent needs your input — Refactor auth');
   assert.equal(full.body, 'Which database should I use?');
 });
 
@@ -515,4 +532,44 @@ test('updateDevice renames and updates preferences; deleteDevice revokes', () =>
   assert.equal(service.deleteDevice(device.id).ok, true);
   assert.equal(service.listDevices().length, 0);
   assert.equal(service.deleteDevice(device.id).ok, false);
+});
+
+test('a question push names the conversation\'s provider, and stays neutral without one', async () => {
+  const db = makeDb();
+  db.exec(`CREATE TABLE runtime_sessions (conversation_id TEXT PRIMARY KEY, provider_type TEXT)`);
+  db.prepare(`INSERT INTO runtime_sessions (conversation_id, provider_type) VALUES ('conv-claude', 'claude'), ('conv-cloud', 'claude-cloud'), ('conv-copilot', 'github')`).run();
+  const titles = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { titles.push(JSON.parse(body).title); } },
+  });
+  subscribeDevice(service);
+  for (const conversationId of ['conv-claude', 'conv-cloud', 'conv-copilot', 'conv-unbound']) {
+    await service.notifyQuestion({ id: `q-${conversationId}`, conversationId, prompt: 'Which one?', choices: [] });
+  }
+  assert.deepEqual(titles, [
+    'Claude needs your input',
+    'Claude Cloud needs your input',
+    'Copilot needs your input',
+    'An agent needs your input',
+  ]);
+});
+
+test('a question push names each provider as its question card does', async () => {
+  const providers = ['github', 'openai', 'claude', 'claude-cloud', 'cursor', 'grok'];
+  const db = makeDb();
+  db.exec(`CREATE TABLE runtime_sessions (conversation_id TEXT PRIMARY KEY, provider_type TEXT)`);
+  const insert = db.prepare(`INSERT INTO runtime_sessions (conversation_id, provider_type) VALUES (?, ?)`);
+  for (const provider of providers) insert.run(`conv-${provider}`, provider);
+  const titles = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { titles.push(JSON.parse(body).title); } },
+  });
+  subscribeDevice(service);
+  for (const provider of providers) {
+    await service.notifyQuestion({ id: `q-${provider}`, conversationId: `conv-${provider}`, prompt: 'Which one?', choices: [] });
+  }
+  assert.deepEqual(
+    titles,
+    providers.map((provider) => questionCardHeadLabel({ runtimeProviderType: provider }).replace(/ question$/, ' needs your input')),
+  );
 });

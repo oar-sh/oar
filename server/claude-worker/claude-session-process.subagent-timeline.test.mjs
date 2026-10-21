@@ -106,3 +106,66 @@ test('a background agent\'s frames go to its own run, between turns and during a
 
   turn.endInput();
 });
+
+// A later turn sends the finished agent a new message (SendMessage). The CLI
+// runs it again as the same task: the task id stays, a new run id, and
+// task_started names the SendMessage call as the task's tool use, while the
+// agent's own frames keep naming its spawn (CLI 2.1.x, SDK 0.3.x).
+const SEND = 'toolu_fixture_send';
+const AGENT_TASK = 'agent-fixture';
+
+test('a resumed agent is published as its first run: the panel opens it, its activity and its end are its run\'s', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const recorder = createSubagentTimelineRecorder({ api: stub.api, conversationId: 'conv-1', flushIntervalMs: 5, writerId: 'w' });
+  const runner = makeRunner({ stub, startImpl: () => turn, subagentTimelineRecorder: recorder });
+  const agentRow = (runId) => ({ task_id: AGENT_TASK, run_id: runId, task_type: 'local_agent', description: 'Survey the widget parser' });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-1', text: 'hello' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(spawnFrame());
+  turn.emit(backgroundTasksMessage([agentRow('run-fixture-1')]));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: AGENT_TASK, run_id: 'run-fixture-1', tool_use_id: RUN, subagent_type: 'general-purpose', is_backgrounded: true });
+  turn.emit(launchReceipt());
+  turn.emit(assistantText('Started it.'));
+  turn.emit(resultMessage('Started it.', 'native-1'));
+  await first;
+  turn.emit({ type: 'system', subtype: 'task_notification', task_id: AGENT_TASK, run_id: 'run-fixture-1', tool_use_id: RUN, status: 'completed', summary: 'Parser checked', output_file: '', usage: { total_tokens: 900, tool_uses: 3, duration_ms: 1000 } });
+  turn.emit(backgroundTasksMessage([]));
+  await waitFor(() => stub.calls.find((call) => call.routePath === '/api/background-task-settled'), { label: 'first settle' });
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'ask it about the tests' } });
+  await waitFor(() => turn.pushed.length >= 2, { label: 'turn 2 pushed' });
+  turn.emit(userReplay('ask it about the tests'));
+  turn.emit({ type: 'assistant', parent_tool_use_id: null, message: { id: 'msg-main-2', content: [{ type: 'tool_use', id: SEND, name: 'SendMessage', input: { to: AGENT_TASK, message: 'Now check the tests too.' } }] } });
+  turn.emit(backgroundTasksMessage([agentRow('run-fixture-2')]));
+  turn.emit({ type: 'system', subtype: 'task_started', task_id: AGENT_TASK, run_id: 'run-fixture-2', tool_use_id: SEND, subagent_type: 'general-purpose', is_backgrounded: true, prompt: 'Now check the tests too.' });
+  turn.emit({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: SEND, content: 'Message sent; the agent resumed in the background.' }] } });
+  turn.emit({ type: 'assistant', parent_tool_use_id: RUN, message: { id: 'msg-sub-9', model: 'claude-fixture-model', content: [{ type: 'tool_use', id: 'toolu_bash_9', name: 'Bash', input: { command: 'npm test' } }] } });
+  turn.emit({ type: 'system', subtype: 'task_progress', task_id: AGENT_TASK, run_id: 'run-fixture-2', tool_use_id: SEND, description: 'Survey the widget parser', last_tool_name: 'Bash', usage: { total_tokens: 1200, tool_uses: 1, duration_ms: 500 } });
+
+  const panelRow = () => stub.calls.filter((call) => call.routePath === '/api/background-tasks')
+    .map((call) => call.body.tasks?.[0]).filter((task) => task?.taskRunId === 'run-fixture-2' && task.toolUseId).at(-1);
+  await waitFor(() => panelRow()?.lastToolCall, { label: 'resumed panel row', timeoutMs: 5000 });
+  const row = panelRow();
+  assert.equal(row.toolUseId, RUN, 'the row opens the agent\'s run');
+  assert.equal(row.taskId, AGENT_TASK);
+  assert.match(row.lastToolCall, /npm test/, 'the agent\'s own frames feed its row');
+
+  turn.emit({ type: 'system', subtype: 'task_notification', task_id: AGENT_TASK, run_id: 'run-fixture-2', tool_use_id: SEND, status: 'completed', summary: 'Tests checked', output_file: '', usage: { total_tokens: 1500, tool_uses: 2, duration_ms: 2000 } });
+  turn.emit(backgroundTasksMessage([]));
+  turn.emit(assistantText('Asked.'));
+  turn.emit(resultMessage('Asked.', 'native-1'));
+  await second;
+  const settles = await waitFor(() => {
+    const found = stub.calls.filter((call) => call.routePath === '/api/background-task-settled');
+    return found.length >= 2 ? found : null;
+  }, { label: 'second settle' });
+  assert.deepEqual(settles.map((call) => [call.body.toolUseId, call.body.taskRunId]), [[RUN, 'run-fixture-1'], [RUN, 'run-fixture-2']]);
+
+  await recorder.flush();
+  const timeline = stub.calls.filter((call) => call.routePath === '/api/subagent-timeline');
+  assert.ok(timeline.every((call) => call.body.subagentRunId === RUN), 'one run');
+  turn.endInput();
+});

@@ -687,8 +687,9 @@ export function createPreviewRegistry({
       ok: false,
       status: 429,
       error: `Too many live previews (max ${settings.maxLive}); previews stay until closed. `
-        + `Oldest: ${oldest.join('; ')}. Close ${toClose === 1 ? 'one' : toClose} in Settings → Previews, with the preview tool's `
-        + `close action (list shows the tokens), or with DELETE /api/previews/:token.`,
+        + `Oldest: ${oldest.join('; ')}. Close ${toClose === 1 ? 'one' : toClose} in Settings → Previews; an agent can close `
+        + `its own conversation's with the preview tool's close action (list shows their tokens) or with `
+        + `DELETE /api/previews/:token?conversationId=<conv>.`,
     };
   }
 

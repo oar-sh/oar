@@ -25,7 +25,9 @@
  *  - `noteTaskSet` — every POST /api/background-tasks (REPLACE semantics):
  *    a new task id is a start, a task gone from the set has ended, a changed
  *    task (tool call, summary, tokens) is activity. A task that started
- *    before this runtime did was announced by the runtime before it.
+ *    before this runtime did was announced by the runtime before it. A task
+ *    that ended and is listed under another run (`taskRunId`: a resumed
+ *    Claude sub-agent keeps its task id) is a start again.
  *  - `noteTaskSettled` — how a task ended, where the worker says so (the
  *    Claude worker's task_notification). A task this runtime never knew
  *    still gets its end event when the worker describes it.
@@ -168,6 +170,11 @@ export function createSessionActivityTracker({
   const sessions = new Map();
   // Edges already reported for an end, by `${conversationId}:${key}`.
   const endedKeys = new Map();
+  // `${conversationId}:${taskId}` → the run of the task that ended (the
+  // SDK's run id, `taskRunId`), where the worker names one. A resumed Claude
+  // sub-agent keeps its task id and runs again under a new run id: a set
+  // that lists it with another run is a new start, not a late set.
+  const endedRuns = new Map();
   // `${conversationId}:${taskId}` of the ends nobody reported: the task was
   // only missing from a set for the grace. A later set that lists it again
   // says it never ended.
@@ -216,14 +223,23 @@ export function createSessionActivityTracker({
     for (const key of [task.taskId, task.toolUseId ? `run:${task.toolUseId}` : '']) {
       if (key) endedKeys.set(`${conversationId}:${key}`, at);
     }
+    if (task.taskRunId) endedRuns.set(`${conversationId}:${task.taskId}`, task.taskRunId);
+    else endedRuns.delete(`${conversationId}:${task.taskId}`);
     if (endedKeys.size > 2000) {
       for (const [key, when] of endedKeys) {
         if (at - when > RECENT_TASK_TTL_MS) {
           endedKeys.delete(key);
           endedByAbsence.delete(key);
+          endedRuns.delete(key);
         }
       }
     }
+  }
+
+  /** The set lists an ended task under another run: it was resumed. */
+  function isNewRun(conversationId, taskId, taskRunId) {
+    const ended = endedRuns.get(`${conversationId}:${taskId}`);
+    return !!taskRunId && !!ended && ended !== taskRunId;
   }
 
   function wasEnded(conversationId, task) {
@@ -308,6 +324,7 @@ export function createSessionActivityTracker({
   /** Takes back an end that was only an absence; the task's old row goes from the recent ones. */
   function unEnd(conversationId, entry, taskId, toolUseId) {
     endedByAbsence.delete(`${conversationId}:${taskId}`);
+    endedRuns.delete(`${conversationId}:${taskId}`);
     const index = entry.recent.findIndex((task) => task.taskId === taskId);
     const [old] = index >= 0 ? entry.recent.splice(index, 1) : [null];
     for (const key of [taskId, toolUseId ? `run:${toolUseId}` : '', old?.toolUseId ? `run:${old.toolUseId}` : '']) {
@@ -332,6 +349,7 @@ export function createSessionActivityTracker({
       seen.add(taskId);
       const signature = taskSignature(raw);
       const known = entry.live.get(taskId);
+      const taskRunId = toText(raw.taskRunId);
       if (known && !known.leftAtMs) {
         if (known.signature !== signature) {
           known.signature = signature;
@@ -340,32 +358,45 @@ export function createSessionActivityTracker({
         }
         known.description = toText(raw.description) || known.description;
         known.toolUseId = toText(raw.toolUseId) || known.toolUseId;
+        known.taskRunId = taskRunId || known.taskRunId;
         known.summary = toText(raw.summary) || known.summary;
         known.model = toText(raw.model) || known.model;
         continue;
       }
       if (known?.leftAtMs) {
-        // Back in the set after it left: it did not end after all.
-        if (known.graceTimer) clearTimer(known.graceTimer);
-        known.graceTimer = null;
-        known.leftAtMs = 0;
-        continue;
+        if (!taskRunId || !known.taskRunId || known.taskRunId === taskRunId) {
+          // Back in the set after it left: it did not end after all.
+          if (known.graceTimer) clearTimer(known.graceTimer);
+          known.graceTimer = null;
+          known.leftAtMs = 0;
+          continue;
+        }
+        // Back under another run (resumed within the grace): the run that
+        // left ended, how is not known; the new one starts below.
+        finishTask(id, known, { status: 'completed', reported: false });
       }
       let revived = null;
       if (wasEnded(id, { taskId, toolUseId: toText(raw.toolUseId) })) {
-        // Settled already (its notice came before the set dropped it).
-        if (!endedByAbsence.has(`${id}:${taskId}`)) continue;
-        // Ended only because a set did not list it (a set that arrived out
-        // of turn, a worker that left it out for a moment) and listed
-        // again: it never ended. It comes back as the task it was, with no
-        // second start. The end that was reported for it stays reported;
-        // its real end will be another.
-        revived = unEnd(id, entry, taskId, toText(raw.toolUseId)) || {};
+        if (isNewRun(id, taskId, taskRunId)) {
+          // Resumed: the same task, a new run. Its first run's end stays
+          // reported; this run starts (and will end) on its own.
+          unEnd(id, entry, taskId, toText(raw.toolUseId));
+        } else {
+          // Settled already (its notice came before the set dropped it).
+          if (!endedByAbsence.has(`${id}:${taskId}`)) continue;
+          // Ended only because a set did not list it (a set that arrived out
+          // of turn, a worker that left it out for a moment) and listed
+          // again: it never ended. It comes back as the task it was, with no
+          // second start. The end that was reported for it stays reported;
+          // its real end will be another.
+          revived = unEnd(id, entry, taskId, toText(raw.toolUseId)) || {};
+        }
       }
       const taskStartedAtMs = msOf(raw.startedAt);
       const task = {
         taskId,
         toolUseId: toText(raw.toolUseId) || null,
+        taskRunId: taskRunId || null,
         taskType: toText(raw.taskType),
         kind: taskKindOf(raw.taskType),
         description: toText(raw.description).slice(0, 500),
@@ -395,16 +426,21 @@ export function createSessionActivityTracker({
   }
 
   function noteTaskSettled(conversationId, {
-    taskId, toolUseId, status, summary, exitCode, description, taskType, startedAt,
+    taskId, toolUseId, taskRunId, status, summary, exitCode, description, taskType, startedAt,
   } = {}) {
     const id = toText(conversationId);
     if (!id) return;
     const entry = session(id);
     const key = toText(taskId);
     const run = toText(toolUseId);
+    const settledRun = toText(taskRunId);
     const task = (key && entry.live.get(key))
       || [...entry.live.values()].find((candidate) => run && candidate.toolUseId === run)
       || null;
+    // The end of an earlier run of a task that was resumed since (a notice
+    // the worker sent again late): the run that is live now goes on.
+    if (task && settledRun && task.taskRunId && task.taskRunId !== settledRun) return;
+    if (task && settledRun) task.taskRunId = settledRun;
     const settled = {
       status: normalizeTaskStatus(status || 'completed'),
       summary: toText(summary) || null,
@@ -439,6 +475,7 @@ export function createSessionActivityTracker({
       const unknown = {
         taskId: key,
         toolUseId: runId || null,
+        taskRunId: settledRun || null,
         taskType: toText(taskType),
         kind: taskKindOf(taskType),
         description: toText(description).slice(0, 500),

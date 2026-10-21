@@ -39,11 +39,13 @@ import {
   isStaleAttemptError,
 } from './claude-turn-publisher.mjs';
 import { createSubagentTimelineRecorder } from './subagent-timeline-recorder.mjs';
+import { SUBAGENT_TASK_TYPES } from '../../shared/subagent-timeline.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 import { buildRelayStopFailure } from '../../shared/relay-stop-failure.mjs';
 import { createTurnLiveness, resolveTurnStallWindows } from '../../shared/worker-runtime/turn-liveness.mjs';
 import { createKeptPosts } from '../../shared/worker-runtime/kept-posts.mjs';
+import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 import {
   ANSWERED_ELSEWHERE_KIND,
   DELIVERY_ANSWERED_ELSEWHERE_TEXT,
@@ -82,8 +84,6 @@ function modeAppendClass(relayMode) {
 
 export { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT };
 
-/** Task types that run a model of their own (vs. bash/monitor/workflow). */
-const AGENT_TASK_TYPES = new Set(['local_agent', 'agent', 'subagent']);
 const MAX_TASK_TOOL_CALL_CHARS = 300;
 /** Output paths remembered per process (one per backgrounded shell). */
 const MAX_TASK_OUTPUT_PATHS = 200;
@@ -459,6 +459,9 @@ export function createClaudeSessionRunner({
   readContextUsageImpl = readContextUsage,
   readPlanUsageImpl = readPlanUsage,
   relocateTranscriptImpl = relocateClaudeTranscriptForCwd,
+  // The error a spawn in `cwd` fails with up front, or null
+  // (shared/worker-runtime/working-directory.mjs).
+  checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   idleShutdownMs = 10 * 60_000,
   getBackgroundTaskTimeoutMs = () => 0,
   // The per-conversation auto-compact window (token count, null = Auto). Read
@@ -1763,7 +1766,7 @@ export function createClaudeSessionRunner({
         // agent-like task runs on the session model. Resolved at publish
         // time so the spawn block landing after task_started still heals on
         // the next publish. Bash & co. get no model at all.
-        const agentLike = AGENT_TASK_TYPES.has(String(task.taskType || ''));
+        const agentLike = SUBAGENT_TASK_TYPES.has(String(task.taskType || ''));
         const pinnedModel = (task.toolUseId && processRef.subagentSpawns.get(task.toolUseId)) || '';
         const activity = (task.toolUseId && processRef.subagentActivity.get(task.toolUseId)) || {};
         const model = agentLike ? (activity.model || pinnedModel || processRef.initModel || null) : null;
@@ -1777,6 +1780,7 @@ export function createClaudeSessionRunner({
           lastToolCall: (agentLike && activity.lastToolCall) || null,
           totalTokens: task.totalTokens ?? null,
           toolUseId: task.toolUseId || null,
+          ...(task.taskRunId ? { taskRunId: task.taskRunId } : {}),
           subagentType: task.subagentType || null,
           model,
           modelInherited: Boolean(model && !pinnedModel && !activity.model),
@@ -2215,7 +2219,7 @@ export function createClaudeSessionRunner({
   // alias like "opus") and the full input of the tool it is calling now.
   // Single-lined and capped: the panel crops it to its width.
   function recordSubagentActivity(sdkMessage) {
-    const parentId = String(sdkMessage?.parent_tool_use_id || '').trim();
+    const parentId = timelineRecorder.runIdFor(sdkMessage?.parent_tool_use_id);
     if (!parentId) return;
     const entry = proc.subagentActivity.get(parentId) || {};
     const before = `${entry.model || ''}\n${entry.lastToolCall || ''}`;
@@ -2591,11 +2595,15 @@ export function createClaudeSessionRunner({
         .filter((task) => String(task?.task_id || '').trim())
         .map((task) => {
           const taskId = String(task.task_id).trim();
-          const known = previous.get(taskId) || {};
+          const runId = String(task?.run_id || '').trim();
+          // Another run of a task still listed (resumed at once): its own row.
+          const listed = previous.get(taskId) || {};
+          const known = runId && listed.taskRunId && listed.taskRunId !== runId ? {} : listed;
           return [taskId, {
             ...known,
             taskType: String(task?.task_type || '').trim() || known.taskType || '',
             description: String(task?.description || '').trim() || known.description || '',
+            taskRunId: runId || known.taskRunId || '',
             startedAt: known.startedAt || Date.now(),
           }];
         }));
@@ -2651,8 +2659,14 @@ export function createClaudeSessionRunner({
         known.subagentType = String(sdkMessage.subagent_type || '').trim() || known.subagentType || '';
         // The task's spawning tool_use id is the same identity the subagent
         // bubbles key on — recorded so the panel and the bubbles can be
-        // correlated (and a targeted stop can find its task).
-        known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
+        // correlated (and a targeted stop can find its task). A resumed agent
+        // names the call that resumed it (SendMessage); the recorder leads
+        // that back to the agent's run.
+        const toolUseId = String(sdkMessage.tool_use_id || '').trim();
+        known.toolUseId = timelineRecorder.runIdFor(toolUseId) || known.toolUseId || '';
+        // Which run of the task this is: the SDK's run id, else (an older
+        // CLI) the tool use that started it, which differs per run too.
+        known.taskRunId = String(sdkMessage.run_id || '').trim() || known.taskRunId || toolUseId;
         // task_started can be the first event carrying the task_type; a
         // workflow revealed here must start its poller too.
         syncWorkflowPoller(proc);
@@ -2667,7 +2681,7 @@ export function createClaudeSessionRunner({
         known.summary = String(sdkMessage.summary || '').trim() || known.summary;
         known.lastToolName = String(sdkMessage.last_tool_name || '').trim() || known.lastToolName;
         known.subagentType = String(sdkMessage.subagent_type || '').trim() || known.subagentType || '';
-        known.toolUseId = String(sdkMessage.tool_use_id || '').trim() || known.toolUseId || '';
+        known.toolUseId = timelineRecorder.runIdFor(sdkMessage.tool_use_id) || known.toolUseId || '';
         const totalTokens = Number(sdkMessage.usage?.total_tokens);
         if (Number.isFinite(totalTokens)) known.totalTokens = totalTokens;
         // The sub-agent's tool calls so far: the panel row's step count.
@@ -2701,13 +2715,15 @@ export function createClaudeSessionRunner({
         proc.taskCommands.delete(taskId);
         const exitCode = shellLike ? exitCodeFromSummary(sdkMessage.summary) : null;
         const toolUses = Number(sdkMessage.usage?.tool_uses);
-        const steps = AGENT_TASK_TYPES.has(String(published?.taskType || '')) && Number.isFinite(toolUses) && toolUses >= 0
+        const steps = SUBAGENT_TASK_TYPES.has(String(published?.taskType || '')) && Number.isFinite(toolUses) && toolUses >= 0
           ? Math.floor(toolUses)
           : null;
+        const settledRunId = String(sdkMessage.run_id || published?.taskRunId || '').trim();
         void keptTaskSettles.post('/api/background-task-settled', {
           conversationId: sdkSessionId,
           taskId,
-          toolUseId: String(sdkMessage.tool_use_id || published?.toolUseId || '').trim() || null,
+          toolUseId: timelineRecorder.runIdFor(sdkMessage.tool_use_id) || published?.toolUseId || null,
+          ...(settledRunId ? { taskRunId: settledRunId } : {}),
           status: String(sdkMessage.status || '').trim() || 'completed',
           summary: String(sdkMessage.summary || '').trim().slice(0, 500) || null,
           ...(sdkMessage.reason ? { reason: String(sdkMessage.reason).slice(0, 40) } : {}),
@@ -3501,6 +3517,7 @@ export function createClaudeSessionRunner({
             message: ctx.message,
             errorText: String(streamError?.message || streamError || 'unknown error'),
             usageLimit: usageLimit.classifyException(streamError),
+            error: streamError,
           }).catch(() => {});
         }
         continue;
@@ -3522,6 +3539,11 @@ export function createClaudeSessionRunner({
   // Spawn / adapt
 
   function spawnProcess(message, { resume: resumeOverride = '' } = {}) {
+    // A spawn in a folder that is gone fails with ENOENT, which the SDK
+    // reports as a native binary that does not match the libc. Thrown here,
+    // the delivery fails with the folder's name instead (handlePendingPayload).
+    const missingFolder = checkWorkingDirectoryImpl(cwd);
+    if (missingFolder) throw missingFolder;
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
     const effort = normalizeClaudeEffort(message.reasoningEffort);
@@ -3742,7 +3764,11 @@ export function createClaudeSessionRunner({
           syncDeliveryReadiness();
         }
       } catch (error) {
-        if (!processRef.aborted && !abortController.signal.aborted) streamError = error;
+        // A launch that failed because the folder went away after the check
+        // above is told as that, too.
+        if (!processRef.aborted && !abortController.signal.aborted) {
+          streamError = explainLaunchFailure(error, cwd, { check: checkWorkingDirectoryImpl });
+        }
       } finally {
         try {
           processRef.turn.endInput?.();
@@ -4221,7 +4247,7 @@ export function createClaudeSessionRunner({
       settingsWindowOpen = false;
       const errorText = String(error?.message || error || 'unknown error');
       dbg('claude turn failed', message.id, errorText);
-      await publisher.publishTurnException({ message, errorText, usageLimit: usageLimit.classifyException(error) });
+      await publisher.publishTurnException({ message, errorText, usageLimit: usageLimit.classifyException(error), error });
       return true;
     } finally {
       endAdmission();
@@ -4262,7 +4288,7 @@ export function createClaudeSessionRunner({
    * subagents have no task id and remain full-turn-Stop only.
    */
   async function stopBackgroundTaskByToolUseId(toolUseId) {
-    const normalized = String(toolUseId || '').trim();
+    const normalized = timelineRecorder.runIdFor(toolUseId);
     if (!normalized || !proc) return false;
     for (const [taskId, task] of proc.liveTasks.entries()) {
       if (String(task?.toolUseId || '').trim() === normalized) {

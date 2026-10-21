@@ -7,13 +7,13 @@ A second engine for Copilot conversations: instead of the `copilot` TUI under a 
 `.github/extensions/web-relay/extension.mjs` injected, one plain Node process per conversation
 drives the CLI's **bundled SDK** (`COPILOT_SDK_PATH`) as a headless JSON-RPC runtime — the same
 shape as the Claude, Cursor and Grok workers. The extension engine ([copilot-sdk.md](copilot-sdk.md))
-remains the default and is untouched; this file tracks the SDK engine only.
+is the fallback (and a setting) and is untouched; this file tracks the SDK engine only.
 
 **Status:** implemented (phases 0–4), **burn-in in progress**. **Default engine is SDK** as of
 2026-09-07 (hardening Phase 6): an unset `copilot_engine` reads as `sdk` when the relay can run
 it, falling back to `extension` when no Copilot CLI resolves or session-worker routing is off —
 the same guard the save path enforces. Both maintainer relays run `sdk` by explicit setting.
-Burn-in finding #2 (self-initiated turns were dropped; live session `10a1a9ad`, 2026-08-31) is fixed
+Burn-in finding #2 (self-initiated turns were dropped; a live session on 2026-08-31) is fixed
 worker-side, and `/api/continuation-turn` accepts `github`/`openai` alongside `claude`
 (`CONTINUATION_PROVIDER_TYPES`, `server/routes/messages-routes.mjs`), so self-initiated turns are
 live-testable. See [Self-initiated turns](#self-initiated-continuation-turns).
@@ -41,7 +41,7 @@ quartet moved to `shared/worker-runtime/` ahead of extension deletion.
 | Where is it stored? | App setting `copilot_engine` (`COPILOT_ENGINE_SETTING_KEY`), values `COPILOT_ENGINES = ['extension','sdk']`, `DEFAULT_COPILOT_ENGINE = 'sdk'` with `FALLBACK_COPILOT_ENGINE = 'extension'` when `copilotSdkEngineUnavailableReason()` fires; read by `getCopilotEngine()` / `getCopilotProviderSettings()` (`server/server-runtime.mjs`). |
 | When does it take effect? | Per spawn: `buildSessionWorkerLaunchEnvForSession()` reads `getCopilotEngine()` each time a worker launches, so running sessions keep their engine until their worker restarts. Applies to `provider_type` `github` **and** `openai` (BYOK rides the same worker). |
 | Why can a save be refused? | `setCopilotProviderSettings()` answers **409** with `copilotSdkEngineUnavailableReason({ env, routingEnabled })` (`server/services/session-worker-launch-service.mjs`) rather than persisting a setting that cannot take effect: (a) `COPILOT_SDK_PATH` never resolved at boot — the launch env is snapshotted once in `buildSessionWorkerLaunchEnv()`, so a CLI installed since startup needs a relay restart; (b) `SESSION_WORKER_ROUTING_ENABLED` is off, so no node worker is ever spawned. |
-| How is the worker launched? | Worker kind `copilot-sdk` (`COPILOT_WEB_RELAY_WORKER_KIND`) in the launch service's node-worker descriptors (`windowsTitle: 'Copilot SDK Worker'`), env applied by `applyCopilotSdkProviderEnvironment()` (throws `copilot-sdk-path-not-resolved` when the path is empty), script from `resolveCopilotSdkWorkerScriptPath()`. Plain `node <script> --session-id <id>` — no PTY, no tmux wrapper, no extension bootstrap. |
+| How is the worker launched? | Worker kind `copilot-sdk` (`COPILOT_WEB_RELAY_WORKER_KIND`) in the launch service's node-worker descriptors (`windowsTitle: 'Copilot SDK Worker'`), env applied by `applyCopilotSdkProviderEnvironment()` (throws `copilot-sdk-path-not-resolved` when the path is empty), script from `resolveCopilotSdkWorkerScriptPath()`. Plain `node <script> --session-id <id>` — no `script` PTY, no extension bootstrap; under tmux it runs in the session's tmux session like the other Node workers, with its output in the worker log. |
 | What does routing see? | Nothing new: `shared/provider-routing.mjs` is deliberately untouched. The engine changes the worker *kind*, not the provider type — conversations stay bound to `github`/`openai`, so model catalogs, usage cards and queue SQL are unaffected. |
 | Process inspection | `looksLikeCopilotWorkerProcess` (`server/services/session-worker-process-service.mjs`) matches the `<kind>-session-worker` naming convention rather than per-worker literals — which also made `grok-session-worker` visible to the kill route. |
 
@@ -110,7 +110,7 @@ because they are about the session rather than the turn: `system.notification` (
 
 The runtime starts turns nobody asked for. A detached shell (`bash{mode:"async", detach:true}`)
 settles on its own clock and the runtime re-invokes the model with no prompt behind it. Live burn-in
-(session `10a1a9ad`, 2026-08-31, "set a timer to 1 minute") caught the whole of that second turn
+(a live session on 2026-08-31, "set a timer to 1 minute") caught the whole of that second turn
 being dropped — `routeEvent` returned early with no active turn — so the user never saw the reply.
 
 | Question | Answer / evidence |
@@ -158,9 +158,13 @@ collapses the *parent's* tool-call argument streaming (live-reproduced twice eac
   single table also read — through its sibling export `resolveFallbackContextLimitTokens` — by
   `server/services/context-snapshot-service.mjs`, `server/cursor-worker/cursor-turn-runner.mjs` and
   `server/grok-worker/grok-context-usage.mjs`.
-- Overrides `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_WIRE_API` (`responses`|`completions`),
-  `COPILOT_PROVIDER_MAX_PROMPT_TOKENS`, `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS`; invalid values are
-  logged and ignored rather than passed through.
+- `COPILOT_PROVIDER_BASE_URL` and `COPILOT_PROVIDER_WIRE_API` are not overrides: the relay's
+  `applyOpenAIProviderEnvironment` deletes both from the launch environment and sets them again,
+  the base URL from the OpenAI settings (default `https://api.openai.com/v1`) and the wire API from
+  the model (`resolveOpenAIWireApi`: `responses` for GPT-5, `codex-*` and o1/o3/o4, else
+  `completions`). The worker forwards only `responses` or `completions`. Overrides that do pass
+  through: `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` and `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` (a value
+  that is not a positive whole number is logged and ignored).
 - BYOK turns **skip usage ingest** entirely: they spend the user's own key, so their numbers do not
   belong on the Copilot plan card.
 
@@ -227,7 +231,7 @@ JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans
 | `server/copilot-worker/copilot-model-switch.test.mjs` | 24 | switchTo/setReasoningEffort selection, none→default mapping, deferred drain/expiry, confirmation-required, BYOK RPC-first vs rebuild |
 | `server/copilot-worker/copilot-sdk-model-snapshot.test.mjs` | 9 | catalog snapshots on start/resume/model_change, dedupe, BYOK skip |
 | `server/copilot-worker/copilot-byok-provider.test.mjs` | 14 | provider config, ceilings, override validation |
-| `server/copilot-worker/copilot-question-bridge.test.mjs` | 18 | ask_user + approval cards, freeform flag, schema cards, closing-state expiry |
+| `server/copilot-worker/copilot-question-bridge.test.mjs` | 19 | ask_user + approval cards, freeform flag, schema cards, closing-state expiry |
 | `server/copilot-worker/copilot-ask-user-tool.test.mjs` | 9 | relay `ask_user` schema/args/result wording, override registration, card + question hold while open, in-band failure, refused-override fallback, opt-out |
 | `server/copilot-worker/copilot-attachments.test.mjs` | 14 | inline blob vs file refs, decoded-size ceiling for data URLs |
 | `server/copilot-worker/copilot-plan-board.test.mjs` | 8 | board payload, fallback gating |
@@ -242,8 +246,8 @@ JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans
 
 ## Burn-in checklist (deprecation gate)
 
-From the plan's §5 — the extension stays default until these are green on real sessions for a
-sustained period. Extension removal is a separate future decision.
+From the plan's §5. The SDK engine became the default in 0.9.2 with these still open; they remain
+the gate for removing the extension engine, which is a separate future decision.
 
 - [ ] Turn delivery + completion/failure records
 - [ ] Steering mid-turn
@@ -262,8 +266,10 @@ sustained period. Extension removal is a separate future decision.
       with an `op=` idempotency key).
 - [ ] **Background shell outliving the idle window** — start a shell that takes >10 min; the runtime
       must still be up when it settles (it is the shell's parent), and the reply must arrive.
-- [ ] **The cap** — a shell that never finishes must stop pinning after 30 min
-      (`COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS`), and the runtime must then idle out.
+- [ ] **The cap** — a task that never finishes must stop pinning at the relay's *Background task
+      timeout* (4 h by default; `COPILOT_SDK_RELAY_BACKGROUND_TASK_TIMEOUT_MS` overrides it; on a
+      runtime without `rpc.tasks` an unlimited timeout means 30 min), and the runtime must then
+      idle out.
 - [ ] **Resume replay** — restart the worker mid-conversation; the resume must produce **no**
       continuation rows and no duplicated replies.
 - [ ] Background-task gating (shells, not Claude-style tasks — see the section above)

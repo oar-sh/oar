@@ -37,6 +37,10 @@ test('cursor discovery records whether a model can actually turn reasoning off',
   assert.equal(detect({ parameters: [{ id: 'thinking', values: [] }] }), true);
   assert.equal(detect({ parameters: [{ id: 'reasoning', values: [{ value: 'none' }, { value: 'low' }] }] }), true);
   assert.equal(detect({ parameters: [{ id: 'effort', values: ['low', 'high'] }] }), false);
+  assert.equal(detect({ parameters: [{ id: 'reasoning_effort', values: ['none', 'low'] }] }), true);
+  assert.equal(detect({ parameters: [{ id: 'reasoning_effort', values: ['low', 'high'] }] }), false);
+  // 'effort' comes first: its missing 'none' is not made up by another parameter.
+  assert.equal(detect({ parameters: [{ id: 'effort', values: ['low'] }, { id: 'reasoning_effort', values: ['none'] }] }), false);
   assert.equal(detect({ parameters: [] }), false);
   assert.equal(detect({}), false);
 
@@ -150,6 +154,20 @@ test('cursorEntryEffortLevels maps effort/reasoning params into composer tiers',
   assert.deepEqual(cursorEntryEffortLevels({
     id: 'gemini-3.6-flash',
     parameters: [{ id: 'effort', values: [{ value: 'minimal' }, { value: 'low' }, { value: 'high' }] }],
+  }), ['low', 'high']);
+  // Models that name the parameter 'reasoning_effort' (claude-haiku-5-5,
+  // grok-4.7, gemini-4-argon, ...).
+  assert.deepEqual(cursorEntryEffortLevels({
+    id: 'claude-haiku-5-5',
+    parameters: [
+      { id: 'thinking', values: [{ value: 'false' }, { value: 'true' }] },
+      { id: 'context', values: [{ value: '300k' }, { value: '1m' }] },
+      { id: 'reasoning_effort', values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }, { value: 'max' }] },
+    ],
+  }), ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.deepEqual(cursorEntryEffortLevels({
+    id: 'muse-wonder-1.0',
+    parameters: [{ id: 'reasoning_effort', values: [{ value: 'minimal' }, { value: 'low' }, { value: 'high' }] }],
   }), ['low', 'high']);
   assert.deepEqual(cursorEntryEffortLevels({ id: 'composer-2.5', parameters: [{ id: 'fast', values: [{ value: 'true' }] }] }), []);
   assert.deepEqual(cursorEntryEffortLevels({ id: 'plain' }), []);

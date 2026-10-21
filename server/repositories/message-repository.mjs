@@ -18,6 +18,25 @@ export function createMessageRepository(db) {
     const notHeldForUsageLimit = (alias = '') => (queueHasUsageLimitPause
         ? `AND NOT (${alias}usage_limit_pause IS NOT NULL AND ${alias}status = 'pending' AND ${alias}next_attempt_at IS NOT NULL AND ${alias}next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
         : '');
+    // When a processing row is due for the stale sweep; one rule for the
+    // listings and the requeue, so the UPDATE can never take a row the
+    // listing did not. Inactivity is measured from the last heartbeat, the
+    // ceiling (@ceilingBefore, NULL = no limit) from the later of the turn's
+    // start and its last answered question, and a turn waiting on an
+    // unanswered question is never due. The comments at the statements say why.
+    const staleProcessingSql = `(
+              (
+                COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
+                OR (
+                  @ceilingBefore IS NOT NULL
+                  AND MAX(
+                    COALESCE(processing_at, timestamp),
+                    COALESCE((SELECT MAX(answered_at) FROM relay_questions WHERE queue_id = queue.id), '')
+                  ) < @ceilingBefore
+                )
+              )
+              AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+            )`;
     const messageColumns = new Set(db.prepare(`PRAGMA table_info(messages)`).all().map((column) => column.name));
     const messagesHaveSourceId = messageColumns.has('source_message_id');
     const messagesHaveResendOf = messageColumns.has('resend_of_message_id');
@@ -369,18 +388,13 @@ export function createMessageRepository(db) {
           FROM queue
           WHERE status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
-            AND (
-              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
-              OR (
-                @ceilingBefore IS NOT NULL
-                AND MAX(
-                  COALESCE(processing_at, timestamp),
-                  COALESCE((SELECT MAX(answered_at) FROM relay_questions WHERE queue_id = queue.id), '')
-                ) < @ceilingBefore
-              )
-            )
-            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+            AND ${staleProcessingSql}
         `),
+        // Requeues one row listRecoverableProcessing returned, so the caller
+        // knows exactly which rows it requeued and announces only those. The
+        // sweep runs synchronously, so nothing changes between listing and
+        // requeue; re-checking the same rule here is a safeguard that keeps
+        // this statement from ever taking a row the listing would not.
         recoverProcessingBefore: db.prepare(`
           UPDATE queue
           SET status = 'pending',
@@ -390,14 +404,11 @@ export function createMessageRepository(db) {
               owner_lease_expires_at = NULL,
               owner_last_claimed_at = NULL,
               retry_count = retry_count + 1
-          WHERE status = 'processing'
+          WHERE id = @id
+            AND status = 'processing'
             AND COALESCE(kind, '') != 'continuation'
             AND consumed_at IS NULL
-            AND (
-              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
-              OR (@ceilingBefore IS NOT NULL AND COALESCE(processing_at, timestamp) < @ceilingBefore)
-            )
-            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+            AND ${staleProcessingSql}
         `),
         // Dead-worker recovery: the owner's process is provably gone, so its
         // in-flight rows go back to pending — owner intact (the primer
@@ -467,17 +478,7 @@ export function createMessageRepository(db) {
           FROM queue
           WHERE status = 'processing'
             AND kind = 'continuation'
-            AND (
-              COALESCE(owner_last_claimed_at, processing_at, timestamp) < @inactiveBefore
-              OR (
-                @ceilingBefore IS NOT NULL
-                AND MAX(
-                  COALESCE(processing_at, timestamp),
-                  COALESCE((SELECT MAX(answered_at) FROM relay_questions WHERE queue_id = queue.id), '')
-                ) < @ceilingBefore
-              )
-            )
-            AND id NOT IN (SELECT queue_id FROM relay_questions WHERE status = 'pending')
+            AND ${staleProcessingSql}
         `),
         listQueueForPauseDrop: db.prepare(`SELECT id, conversation_id FROM queue WHERE status IN ('pending', 'processing', 'parked')`),
         // Authoritative "is a turn in flight" signal for the conversation list.

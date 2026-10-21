@@ -33,15 +33,25 @@ export function isConversationUsingClaudeCloudProvider(conversation = null) {
 // The marker that tells a cloud chat from a local Claude one at a glance.
 const CLAUDE_CLOUD_MARKER = '☁';
 
+const PROVIDER_NAMES = Object.freeze({
+  openai: 'OpenAI',
+  claude: 'Claude',
+  'claude-cloud': 'Claude Cloud',
+  cursor: 'Cursor',
+  grok: 'Grok',
+  github: 'Copilot',
+  'github-copilot': 'Copilot',
+});
+
+// A provider type's name as the list pill and the question card say it; ''
+// when unknown. The relay's question push uses it too
+// (services/push-dispatch-service.mjs).
+export function providerDisplayName(providerType = '') {
+  return PROVIDER_NAMES[String(providerType || '').trim().toLowerCase()] || '';
+}
+
 function conversationProviderName(conversation = null) {
-  const providerType = resolveConversationProviderType(conversation);
-  if (providerType === 'openai') return 'OpenAI';
-  if (providerType === 'claude') return 'Claude';
-  if (providerType === 'claude-cloud') return 'Claude Cloud';
-  if (providerType === 'cursor') return 'Cursor';
-  if (providerType === 'grok') return 'Grok';
-  if (providerType === 'github' || providerType === 'github-copilot') return 'Copilot';
-  return '';
+  return providerDisplayName(resolveConversationProviderType(conversation));
 }
 
 // An unresolved provider stays unlabelled rather than defaulting to Copilot, so

@@ -7,7 +7,8 @@ import {
   createPreviewRegistry,
   normalizePreviewsConfig,
 } from '../services/preview-registry-service.mjs';
-import { registerPreviewRoutes } from './preview-routes.mjs';
+import { createMemoryPreviewStore } from '../services/preview-store.mjs';
+import { createPreviewScopeResolver, registerPreviewRoutes } from './preview-routes.mjs';
 
 const AUTH_TOKEN = 'test-relay-token';
 
@@ -19,8 +20,14 @@ function previewConfig(overrides = {}) {
   }, { env: {}, relayPort: 3333, relayHostnames: ['relay.example.com'], reservedPorts: [4445] });
 }
 
-async function startApi({ config = previewConfig(), probeCalls = [], workspaceRoot = '', cardCalls = [] } = {}) {
-  const registry = createPreviewRegistry({ config });
+async function startApi({
+  config = previewConfig(),
+  probeCalls = [],
+  workspaceRoot = '',
+  cardCalls = [],
+  registry = createPreviewRegistry({ config }),
+  resolveConversationScope,
+} = {}) {
   const app = express();
   app.use(express.json());
   // Stand-in for the runtime's auth middleware: same contract (bearer token or
@@ -36,18 +43,20 @@ async function startApi({ config = previewConfig(), probeCalls = [], workspaceRo
     previewHealthProbe: { probeNow: (token) => { probeCalls.push(token); } },
     resolvePreviewWorkspaceRoot: () => workspaceRoot,
     recordPreviewCard: (conversationId, preview) => { cardCalls.push({ conversationId, preview }); },
+    ...(resolveConversationScope ? { resolveConversationScope } : {}),
   });
 
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`;
 
-  async function call(path, { method = 'GET', body, token = AUTH_TOKEN } = {}) {
+  async function call(path, { method = 'GET', body, token = AUTH_TOKEN, headers = {} } = {}) {
     const response = await fetch(`${origin}${path}`, {
       method,
       headers: {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(body ? { 'content-type': 'application/json' } : {}),
+        ...headers,
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
@@ -282,4 +291,155 @@ test('POST for a target this conversation already publishes returns that preview
   const portAgain = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: '5173', host: 'localhost' } });
   assert.equal(portAgain.body.existing, true);
   assert.equal(portAgain.body.preview.token, port.body.preview.token);
+});
+
+// ─── conversation scope ───────────────────────────────────────────────────────
+// A request that names a conversation (the `conversationId` query, else the
+// worker identity header every agent-side caller sends) only reaches that
+// conversation's previews. The owner's view (neither) still covers the relay.
+
+async function seedTwoConversations(api) {
+  const own = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5001 } });
+  const other = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-2', port: 5002 } });
+  return { own: own.body.preview.token, other: other.body.preview.token };
+}
+
+test('GET from a conversation-bound caller lists only its own conversation', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+  await seedTwoConversations(api);
+
+  const scoped = await api.call('/api/previews', { headers: { 'x-relay-conversation-id': 'conv-1' } });
+  assert.equal(scoped.status, 200);
+  assert.deepEqual(scoped.body.previews.map((entry) => entry.targetPort), [5001]);
+  // The lane facts a worker reads for its instruction block stay.
+  assert.equal(scoped.body.enabled, true);
+  assert.equal(scoped.body.publicBaseUrl, 'https://preview.example.com');
+
+  const owner = await api.call('/api/previews');
+  assert.deepEqual(owner.body.previews.map((entry) => entry.targetPort), [5001, 5002]);
+});
+
+test('DELETE in a conversation scope refuses another conversation\'s preview', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+  const { other } = await seedTwoConversations(api);
+
+  const byQuery = await api.call(`/api/previews/${other}?conversationId=conv-1`, { method: 'DELETE' });
+  assert.equal(byQuery.status, 403);
+  assert.match(byQuery.body.error, /belongs to another conversation/);
+
+  const byHeader = await api.call(`/api/previews/${other}`, { method: 'DELETE', headers: { 'x-relay-conversation-id': 'conv-1' } });
+  assert.equal(byHeader.status, 403);
+  assert.deepEqual(api.registry.list().map((entry) => entry.targetPort), [5001, 5002]);
+
+  // Unknown stays 404, not a refusal.
+  const unknown = await api.call(`/api/previews/${'c'.repeat(32)}?conversationId=conv-1`, { method: 'DELETE' });
+  assert.equal(unknown.status, 404);
+});
+
+test('DELETE in a conversation scope closes its own preview; the owner closes any', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+  const { own, other } = await seedTwoConversations(api);
+
+  const closedOwn = await api.call(`/api/previews/${own}?conversationId=conv-1`, {
+    method: 'DELETE',
+    headers: { 'x-relay-conversation-id': 'conv-1' },
+  });
+  assert.equal(closedOwn.status, 200);
+  assert.equal(closedOwn.body.preview.token, own);
+
+  const closedByOwner = await api.call(`/api/previews/${other}`, { method: 'DELETE' });
+  assert.equal(closedByOwner.status, 200);
+  assert.equal(api.registry.size, 0);
+});
+
+test('the conversationId query names the scope over the identity header', async (t) => {
+  // The header is the worker's own session; a worker handed a row of another
+  // conversation names that conversation in the query.
+  const api = await startApi();
+  t.after(() => api.close());
+  const { other } = await seedTwoConversations(api);
+
+  const listed = await api.call('/api/previews?conversationId=conv-2', { headers: { 'x-relay-conversation-id': 'session-1' } });
+  assert.deepEqual(listed.body.previews.map((entry) => entry.targetPort), [5002]);
+
+  const closed = await api.call(`/api/previews/${other}?conversationId=conv-2`, {
+    method: 'DELETE',
+    headers: { 'x-relay-conversation-id': 'session-1' },
+  });
+  assert.equal(closed.status, 200);
+});
+
+test('DELETE in a conversation scope refuses a stored, not yet verified preview of another conversation', async (t) => {
+  // A stored folder preview whose check could not answer at the restart:
+  // listed as unverified, not served, and still another conversation's.
+  const store = createMemoryPreviewStore();
+  const registryOptions = {
+    config: previewConfig(),
+    store,
+    hostBootId: 'linux:boot-1',
+    checkConversation: () => true,
+    logger: { log() {}, warn() {}, error() {} },
+  };
+  const first = createPreviewRegistry({ ...registryOptions, checkStaticRoot: (rootDir) => ({ ok: true, rootDir }) });
+  const { token } = first.createStatic({ conversationId: 'conv-2', rootDir: '/srv/site', label: 'site' }).preview;
+  const registry = createPreviewRegistry({
+    ...registryOptions,
+    checkStaticRoot: () => ({ ok: false, error: 'Directory not readable (EIO)', transient: true }),
+  });
+  assert.equal(registry.keptCount, 1);
+
+  const api = await startApi({ registry });
+  t.after(() => api.close());
+
+  const refused = await api.call(`/api/previews/${token}?conversationId=conv-1`, { method: 'DELETE' });
+  assert.equal(refused.status, 403);
+  assert.match(refused.body.error, /belongs to another conversation/);
+  assert.equal(registry.keptCount, 1);
+
+  const own = await api.call(`/api/previews/${token}?conversationId=conv-2`, { method: 'DELETE' });
+  assert.equal(own.status, 200);
+  assert.equal(registry.keptCount, 0);
+});
+
+test('a scope named by the session id reaches the conversation it belongs to', async (t) => {
+  // After a placeholder rekey the conversation is conv-1 but its session id
+  // is sess-1: a tool server bound to the session, or a worker's between-turn
+  // fallback, names sess-1 and must still reach conv-1's previews.
+  const conversations = [{ id: 'conv-1', sdk_session_id: 'sess-1' }, { id: 'conv-2', sdk_session_id: 'sess-2' }];
+  const api = await startApi({
+    resolveConversationScope: createPreviewScopeResolver({
+      getConversation: (id) => conversations.find((conv) => conv.id === id) || null,
+      getConversationBySdkSessionId: (id) => conversations.find((conv) => conv.sdk_session_id === id) || null,
+    }),
+  });
+  t.after(() => api.close());
+  const { own, other } = await seedTwoConversations(api);
+  // A preview stored under the session id is the same conversation's.
+  const bySession = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'sess-1', port: 5003 } });
+
+  for (const scope of ['sess-1', 'conv-1']) {
+    const listed = await api.call(`/api/previews?conversationId=${scope}`);
+    assert.deepEqual(listed.body.previews.map((entry) => entry.targetPort), [5001, 5003], scope);
+  }
+  const header = await api.call('/api/previews', { headers: { 'x-relay-conversation-id': 'sess-1' } });
+  assert.deepEqual(header.body.previews.map((entry) => entry.targetPort), [5001, 5003]);
+
+  const refused = await api.call(`/api/previews/${other}?conversationId=sess-1`, { method: 'DELETE' });
+  assert.equal(refused.status, 403);
+  const closed = await api.call(`/api/previews/${own}?conversationId=sess-1`, { method: 'DELETE' });
+  assert.equal(closed.status, 200);
+  const closedBySession = await api.call(`/api/previews/${bySession.body.preview.token}?conversationId=conv-1`, { method: 'DELETE' });
+  assert.equal(closedBySession.status, 200);
+});
+
+test('the scope resolver keeps the named id and survives a failing lookup', () => {
+  const resolve = createPreviewScopeResolver({
+    getConversation: () => { throw new Error('database is locked'); },
+  });
+  assert.deepEqual(resolve('conv-9'), ['conv-9']);
+  assert.deepEqual(resolve(''), []);
+  assert.deepEqual(createPreviewScopeResolver()('conv-9'), ['conv-9']);
 });

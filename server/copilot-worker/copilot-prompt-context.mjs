@@ -80,7 +80,9 @@ export function createCopilotPromptContextBuilder({
     if (includeInstructions) {
       // Advisory: a preview lookup that fails costs the block, never the turn.
       const previewBlock = typeof getPreviewInstructions === 'function'
-        ? await Promise.resolve().then(getPreviewInstructions).catch(() => '')
+        ? await Promise.resolve()
+          .then(() => getPreviewInstructions({ conversationId: String(message?.conversationId || '') }))
+          .catch(() => '')
         : '';
       instructions = applyMediaEmbedInstructions(applyPreviewInstructions(toolInstructions, previewBlock));
     }

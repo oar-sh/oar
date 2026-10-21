@@ -32,7 +32,14 @@ relay.example.com {
 }
 ```
 
-The relay auto-reconnects tunnel drops with exponential backoff.
+The relay runs `ssh -N -R` in batch mode, so the key must work without a password prompt (a key
+without passphrase, or one your SSH agent holds), and it accepts the server's host key on the first
+connection. It auto-reconnects tunnel drops with exponential backoff. When the server refuses the
+forward because `remotePort` is taken, the relay logs in, tries to stop a listener of your user that
+holds it, and retries (`sshTunnel.autoReclaimPort`, on by default). A port still held by a dropped
+earlier `ssh -R` session is freed only with `sshTunnel.reclaimStaleSshSessions: true`; otherwise
+the relay keeps retrying with backoff (see the
+[configuration reference](configuration.md#configuration-reference-serverconfigjson)).
 
 ## Optional remote internet access (Cloudflare Tunnel)
 

@@ -64,7 +64,7 @@ import {
   sanitizeRunHeaderPatch,
   TIMELINE_READ_DEFAULT_LIMIT,
 } from '../services/subagent-timeline-service.mjs';
-import { normalizeSubagentRunStatus } from '../../shared/subagent-timeline.mjs';
+import { SUBAGENT_TASK_TYPES, isTerminalSubagentRunStatus, normalizeSubagentRunStatus } from '../../shared/subagent-timeline.mjs';
 import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
 import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay-shutdown-gate.mjs';
 import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limiter.mjs';
@@ -1431,6 +1431,9 @@ function isOpenAIImageAttachment(raw) {
 export function resolveOpenAIImageEditAttachment(rawAttachments, {
   maxImageBytes = 20 * 1024 * 1024,
   allowedRootPath = '',
+  // Folders of earlier versions that uploads are still read from: only a
+  // sha256-named blob directly inside one counts.
+  allowedBlobRootPaths = [],
   allowedGeneratedImagesRootPath = '',
 } = {}) {
   const attachments = Array.isArray(rawAttachments) ? rawAttachments : [];
@@ -1451,8 +1454,11 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
     const filePath = String(firstImage.path || '').trim();
     if (!filePath) throw new Error('Image attachment is missing file path or data URL');
     const allowedRoot = String(allowedRootPath || '').trim();
+    const blobRoots = (Array.isArray(allowedBlobRootPaths) ? allowedBlobRootPaths : [])
+      .map((root) => String(root || '').trim())
+      .filter(Boolean);
     const generatedImagesRoot = String(allowedGeneratedImagesRootPath || '').trim();
-    if (allowedRoot || generatedImagesRoot) {
+    if (allowedRoot || blobRoots.length || generatedImagesRoot) {
       const resolvedPath = path.resolve(filePath);
       const isWithinRoot = (rootPath) => {
         if (!rootPath) return false;
@@ -1467,7 +1473,11 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
           && relativeParts[0] !== '..'
           && relativeParts[1] === 'generated-images';
       })();
-      if (!isWithinRoot(allowedRoot) && !isGeneratedImagePath) {
+      const isOldUploadBlob = blobRoots.some((root) => (
+        path.dirname(resolvedPath) === path.resolve(root)
+        && /^[a-f0-9]{64}$/.test(path.basename(resolvedPath))
+      ));
+      if (!isWithinRoot(allowedRoot) && !isOldUploadBlob && !isGeneratedImagePath) {
         throw new Error('Image attachment path is outside the upload directory');
       }
     }
@@ -1747,6 +1757,7 @@ export function registerMessagesRoutes(app, deps) {
     MAX_UPLOAD_BYTES,
     MAX_UPLOAD_ATTACHMENTS,
     uploadsDir,
+    uploadReadDirs = [uploadsDir],
     MAX_REPO_TREE_NODES,
     MAX_REQUEUE_RETRIES,
     MAX_IMAGE_DATA_URL_LENGTH,
@@ -1894,6 +1905,21 @@ export function registerMessagesRoutes(app, deps) {
     const runId = String(run?.id || '');
     const taskId = String(run?.task_id || '');
     return tasks.find((task) => (task?.toolUseId && task.toolUseId === runId) || (taskId && task?.taskId === taskId)) || null;
+  }
+
+  // A conversation's sub-agent run by its task id. A Claude agent resumed by
+  // a new message keeps its task id, and the CLI names the call that resumed
+  // it (SendMessage) as the task's tool use, an id no run row carries: its
+  // run is the one the task id leads to.
+  function subagentRunOfTask(conversationId, taskId) {
+    const conversation = String(conversationId || '').trim();
+    const task = String(taskId || '').trim().slice(0, 200);
+    if (!conversation || !task) return null;
+    try {
+      return stmts.getSubagentRunByTaskId?.get?.(conversation, task) || null;
+    } catch {
+      return null;
+    }
   }
 
   // Stop is offered while a run is running: a background run through its
@@ -4791,9 +4817,9 @@ export function registerMessagesRoutes(app, deps) {
       ? (pinnedGrokModel || String(configuredGrok?.model || '').trim())
       : '';
     // Claude Cloud conversations resolve models against the cloud provider's
-    // own list (plain ids, no "[1m]" tier). The model is part of the cloud
-    // session's configuration: it can still change before the first message
-    // creates that session, and is locked afterwards.
+    // own list (plain ids, no "[1m]" tier). The first message creates the
+    // cloud session with the conversation's model; a later change is applied
+    // by the worker before the next message (see below).
     const configuredClaudeCloud = runtimeUsesClaudeCloud ? getClaudeCloudProviderSettings() : null;
     const pinnedClaudeCloudModel = runtimeUsesClaudeCloud
       ? stripModelTierSuffix(existingRuntimeSession?.provider_model)
@@ -6971,6 +6997,7 @@ export function registerMessagesRoutes(app, deps) {
         editAttachment = resolveOpenAIImageEditAttachment(requestBody.attachments, {
           maxImageBytes: MAX_UPLOAD_BYTES,
           allowedRootPath: uploadsDir,
+          allowedBlobRootPaths: uploadReadDirs.slice(1),
           allowedGeneratedImagesRootPath: resolveSessionStateRoot?.() || '',
         });
       } catch (error) {
@@ -7830,6 +7857,8 @@ export function registerMessagesRoutes(app, deps) {
     sessionActivityTracker?.noteTaskSettled?.(conversationId, {
       taskId,
       toolUseId: sanitizeSubagentRunId(req.body?.toolUseId) || null,
+      // Which run ended (a resumed agent runs again under the same task id).
+      ...(req.body?.taskRunId ? { taskRunId: String(req.body.taskRunId).trim().slice(0, 200) } : {}),
       status: String(req.body?.status || '').trim().slice(0, 40) || 'completed',
       summary: cleanTaskText(String(req.body?.summary || ''), 500) || null,
       exitCode: exitCode ?? null,
@@ -7886,6 +7915,9 @@ export function registerMessagesRoutes(app, deps) {
         // The spawning tool_use id: the sub-agent run this task is. The panel
         // opens the run's viewer from it.
         toolUseId: sanitizeSubagentRunId(task?.toolUseId) || undefined,
+        // Which run of the task this is (the SDK's run id): a resumed agent
+        // keeps its task id and runs again under a new one.
+        taskRunId: String(task?.taskRunId || '').trim().slice(0, 200) || undefined,
         // The console (shell and Monitor tasks): the file holding the
         // output, how it is obtained ('none': the provider has none to give).
         ...taskOutputFields(task),
@@ -7894,6 +7926,15 @@ export function registerMessagesRoutes(app, deps) {
         exitCode: wholeNumber(task?.exitCode),
       }))
       .filter((task) => task.taskId);
+    // A resumed agent's row names the call that resumed it, which no run
+    // carries: it opens the run of its task instead (a worker that remembers
+    // the spawn sends that already).
+    const runConversationId = resolveTaskConversationId(conversationId);
+    for (const task of tasks) {
+      if (!task.toolUseId || !SUBAGENT_TASK_TYPES.has(task.taskType) || stmts.getSubagentRun?.get?.(task.toolUseId)) continue;
+      const run = subagentRunOfTask(runConversationId, task.taskId);
+      if (run) task.toolUseId = String(run.id);
+    }
     // The first path a task names wins: a later post cannot point a live
     // task's console at another file.
     for (const task of tasks) {
@@ -8563,12 +8604,14 @@ export function registerMessagesRoutes(app, deps) {
   // Fenced by the run row, not by an open turn: a background agent keeps
   // writing after its turn ended, and its entries belong to that turn. A run
   // the relay does not know yet but whose parent it does (an agent spawned
-  // inside another) is created under the parent's turn; anything else is a
-  // 404 the worker retries once the spawn has landed.
+  // inside another) is created under the parent's turn; a run of a task the
+  // relay knows by its task id (a resumed agent: same task, new tool use) is
+  // that task's run; anything else is a 404 the worker retries once the spawn
+  // has landed.
   app.post('/api/subagent-timeline', auth, (req, res) => {
     touchCli();
     const conversationId = String(req.body?.conversationId || '').trim();
-    const runId = sanitizeSubagentRunId(req.body?.subagentRunId);
+    let runId = sanitizeSubagentRunId(req.body?.subagentRunId);
     if (!conversationId || !runId) {
       return res.status(400).json({ error: 'Missing conversationId or subagentRunId' });
     }
@@ -8577,6 +8620,17 @@ export function registerMessagesRoutes(app, deps) {
     }
     const rawHeader = req.body?.header && typeof req.body.header === 'object' ? req.body.header : {};
     let run = stmts.getSubagentRun?.get?.(runId) || null;
+    // A finished run that a later run of its task (posted under another id)
+    // sets running again: the relay marks where it resumed, once per id.
+    let resumedNote = null;
+    if (!run) {
+      run = subagentRunOfTask(conversationId, req.body?.taskId || rawHeader.taskId);
+      if (run && isTerminalSubagentRunStatus(normalizeSubagentRunStatus(run.status))
+        && rawHeader.status && normalizeSubagentRunStatus(rawHeader.status) === 'running') {
+        resumedNote = { key: `relay:resumed:${runId}`, kind: 'note', text: 'Resumed with a new message', metadata: { resumed: true } };
+      }
+      if (run) runId = String(run.id);
+    }
     let created = false;
     if (!run) {
       const parentId = sanitizeSubagentRunId(rawHeader.parentSubagentId);
@@ -8599,7 +8653,8 @@ export function registerMessagesRoutes(app, deps) {
     if (patch) run = subagentTimeline.applyHeader(runId, patch) || run;
     let stored;
     try {
-      stored = subagentTimeline.applyEntries(run, req.body?.entries);
+      const entries = Array.isArray(req.body?.entries) ? req.body.entries : [];
+      stored = subagentTimeline.applyEntries(run, resumedNote ? [resumedNote, ...entries] : entries);
     } catch (error) {
       return res.status(500).json({ error: error?.message || 'Failed to store the timeline' });
     }

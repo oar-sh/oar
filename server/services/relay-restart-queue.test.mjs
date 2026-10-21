@@ -93,6 +93,10 @@ test('nothing processing: the request starts the restart at once', () => {
   assert.equal(started.length, 1);
   assert.equal(started[0].action, 'restart');
   assert.equal(started[0].immediate, false);
+  // The next start tells who asked and when (relay_restarted).
+  assert.equal(started[0].requestedBy, 'phone');
+  assert.equal(started[0].requestedAt, answer.requestedAt);
+  assert.equal(started[0].requestedAt, '2026-10-19T08:00:00.000Z');
   assert.equal(clock.timerCount, 0);
 });
 

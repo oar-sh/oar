@@ -14,14 +14,21 @@
 // answer is the selected labels joined with ", " — plus whatever the user
 // typed as an extra answer — which is Claude's own multi-select answer format.
 
+import { questionAcceptsFreeText } from './question-answer-rule.mjs';
+
 function choiceCount(question) {
   return Array.isArray(question?.choices) ? question.choices.length : 0;
 }
 
-/** Whether the card offers the "Select several" switch. */
+/**
+ * Whether the card offers the "Select several" switch. Never on a card that
+ * takes no typed text: the relay takes several choices there only when the
+ * provider flagged the card multi-select.
+ */
 export function offersMultiSelectToggle(question) {
   if (!question || typeof question !== 'object') return false;
-  return choiceCount(question) >= 2 && question?.context?.allowMultiSelect === true;
+  return choiceCount(question) >= 2 && question?.context?.allowMultiSelect === true
+    && questionAcceptsFreeText(question);
 }
 
 /**

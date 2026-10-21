@@ -8,6 +8,7 @@ import {
   isTurnStalledError,
   resolveTurnStallWindows,
 } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
 
 /**
  * The only module in the repo that imports `@cursor/sdk` (and its
@@ -422,6 +423,19 @@ export function classifyCursorError(error) {
   const message = String(error?.message || error);
   const isRetryable = error?.isRetryable === true;
   const name = String(error?.name || '');
+  // The conversation's folder is gone; the message names it.
+  if (isWorkingDirectoryMissingError(error)) {
+    return {
+      isAuth: false,
+      isBusy: false,
+      isRetryable: false,
+      code: WORKING_DIRECTORY_MISSING_CODE,
+      stableCode: `cursor.${WORKING_DIRECTORY_MISSING_CODE}`,
+      message,
+      text: message,
+      guidance: error.guidance,
+    };
+  }
   if (isTurnStalledError(error)) {
     return {
       isAuth: false,
@@ -611,12 +625,13 @@ const modelParameterDefsCache = new Map();
 
 /**
  * Map the composer's reasoning effort onto the model params Cursor expects on
- * `agent.send`. Effort lives in a per-model parameter named 'effort' or
- * 'reasoning' ('extra-high' is Cursor's spelling of 'xhigh'); models that also
- * expose a boolean 'thinking' parameter only honor the higher tiers with
- * thinking enabled, so an explicit effort turns thinking on and 'none' turns it
- * off. Best-effort like readModelContextWindow: null on any failure or when the
- * model has no matching parameter, which sends the model's default variant.
+ * `agent.send`. Effort lives in a per-model parameter named 'effort',
+ * 'reasoning' or 'reasoning_effort', consulted in that order ('extra-high' is
+ * Cursor's spelling of 'xhigh'); models that also expose a boolean 'thinking'
+ * parameter only honor the higher tiers with thinking enabled, so an explicit
+ * effort turns thinking on and 'none' turns it off. Best-effort like
+ * readModelContextWindow: null on any failure or when the model has no
+ * matching parameter, which sends the model's default variant.
  */
 export async function resolveCursorReasoningParams({
   apiKey,
@@ -651,7 +666,7 @@ export async function resolveCursorReasoningParams({
   const paramsById = new Map(
     parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]),
   );
-  const effortParam = paramsById.get('effort') || paramsById.get('reasoning');
+  const effortParam = paramsById.get('effort') || paramsById.get('reasoning') || paramsById.get('reasoning_effort');
   const hasThinkingParam = paramsById.has('thinking');
   const effortValues = new Set(
     (Array.isArray(effortParam?.values) ? effortParam.values : [])

@@ -31,8 +31,10 @@ test("the first turn carries the guidance with the generated preview block", asy
     getPreviewInstructions: createPreviewInstructionsProvider({ api }),
   });
 
-  const prompt = await build({ text: "ship it", relayMode: "agent" });
+  const prompt = await build({ text: "ship it", relayMode: "agent", conversationId: "conv-1" });
   assert.ok(prompt.startsWith("[Relay mode: agent]"));
+  // The block names this conversation, so the model lists only its previews.
+  assert.ok(prompt.includes("GET /api/previews?conversationId=conv-1"));
   assert.ok(prompt.includes("Ask questions through the relay."));
   assert.ok(prompt.includes(PREVIEW_TOOL_DESCRIPTION));
   assert.ok(prompt.includes("https://previews.example.test"));

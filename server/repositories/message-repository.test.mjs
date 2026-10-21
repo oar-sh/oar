@@ -401,7 +401,9 @@ test('recovery statements never put a consumed row back to pending, and surface 
   assert.ok(repo.listProcessingRowsForOwner.all('sdk-1').find((row) => row.id === 'consumed')?.consumed_at);
 
   repo.recoverProcessingRowKeepOwner.run(later, 'consumed');
-  repo.recoverProcessingBefore.run({ inactiveBefore: later, ceilingBefore: null, requeueAt: later });
+  for (const id of ['consumed', 'plain']) {
+    repo.recoverProcessingBefore.run({ id, inactiveBefore: later, ceilingBefore: null, requeueAt: later });
+  }
   repo.recoverStale.run(later, later);
   assert.equal(repo.findQById.get('consumed').status, 'processing', 'never requeued by recovery');
   assert.equal(repo.findQById.get('plain').status, 'pending', 'ordinary rows still recover');
@@ -655,6 +657,24 @@ test('answering a question restarts the ceiling clock', () => {
   assert.deepEqual(fixture.recoverable({ ceilingMinutes: 60 }), ['q-watched']);
 });
 
+test('the requeue applies the ceiling the way the listing does', () => {
+  // The listing measured the ceiling from the last answer while the requeue
+  // measured it from the turn's start, so a sweep that listed any row also
+  // requeued an old turn whose question had just been answered.
+  const fixture = createRecoveryFixture();
+  fixture.addTurn({ id: 'q-watched', startedMsAgo: 3 * RECOVERY_HOUR_MS, lastHeartbeatMsAgo: 5_000 });
+  fixture.askQuestion('q-watched', 'answered');
+  fixture.db.prepare(`UPDATE relay_questions SET answered_at = ? WHERE queue_id = 'q-watched'`).run(recoveryIsoAgo(5 * 60_000));
+  fixture.addTurn({ id: 'q-hung', startedMsAgo: 3 * RECOVERY_HOUR_MS, lastHeartbeatMsAgo: 5_000 });
+  const params = { inactiveBefore: recoveryIsoAgo(10 * 60_000), ceilingBefore: recoveryIsoAgo(60 * 60_000), requeueAt: recoveryIsoAgo(0) };
+
+  assert.deepEqual(fixture.recoverable({ ceilingMinutes: 60 }), ['q-hung']);
+  const changes = ['q-watched', 'q-hung'].map((id) => fixture.stmts.recoverProcessingBefore.run({ ...params, id }).changes);
+  assert.deepEqual(changes, [0, 1]);
+  const statuses = fixture.db.prepare(`SELECT id, status FROM queue ORDER BY id`).all().map((row) => [row.id, row.status]);
+  assert.deepEqual(statuses, [['q-hung', 'pending'], ['q-watched', 'processing']]);
+});
+
 test('the ceiling catches a turn that is hung but still heartbeating', () => {
   const fixture = createRecoveryFixture();
   fixture.addTurn({ id: 'q-hung', startedMsAgo: 3 * RECOVERY_HOUR_MS, lastHeartbeatMsAgo: 5_000 });
@@ -675,11 +695,15 @@ test('recovery keeps ownership and requeues exactly the stale rows', () => {
   fixture.addTurn({ id: 'q-dead', startedMsAgo: 90 * 60_000, lastHeartbeatMsAgo: 30 * 60_000, attemptId: 'attempt-dead' });
   const requeueAt = recoveryIsoAgo(0);
 
-  fixture.stmts.recoverProcessingBefore.run({
-    inactiveBefore: recoveryIsoAgo(10 * 60_000),
-    ceilingBefore: null,
-    requeueAt,
-  });
+  // Asked for both ids, the update still re-checks the rule per row.
+  for (const id of ['q-live', 'q-dead']) {
+    fixture.stmts.recoverProcessingBefore.run({
+      id,
+      inactiveBefore: recoveryIsoAgo(10 * 60_000),
+      ceilingBefore: null,
+      requeueAt,
+    });
+  }
 
   const rows = fixture.db
     .prepare(`SELECT id, status, processing_at, owner_sdk_session_id, next_attempt_at, attempt_id FROM queue ORDER BY id`)
@@ -790,7 +814,7 @@ test('the stale sweep tears down continuations instead of requeueing them', () =
   };
   // The recovery statements skip it entirely...
   assert.deepEqual(stmts.listRecoverableProcessing.all(params), []);
-  stmts.recoverProcessingBefore.run({ ...params, requeueAt: recoveryIsoAgo(0) });
+  stmts.recoverProcessingBefore.run({ ...params, id: 'q-cont-stale', requeueAt: recoveryIsoAgo(0) });
   assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-stale'`).get().status, 'processing');
 
   // ...and the companion teardown statements own it.

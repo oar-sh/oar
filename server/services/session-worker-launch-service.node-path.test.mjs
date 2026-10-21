@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 
+import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 import {
   appendNodeDirectoryToPath,
   buildTmuxWorkerShellCommand,
+  describeLaunchFolderFailure,
   describeWindowsStartFailure,
   launchSessionCli,
   locateExecutable,
@@ -40,7 +44,7 @@ function fakeStartChild({ exit, error } = {}) {
   return child;
 }
 
-function windowsLaunch({ env = {}, child = fakeStartChild({ exit: 0 }), found = null, locate = () => 'located', logs = [] } = {}) {
+function windowsLaunch({ env = {}, child = fakeStartChild({ exit: 0 }), found = null, locate = () => 'located', checkFolder = () => null, logs = [] } = {}) {
   const spawnCalls = [];
   const launched = launchSessionCli({
     targetSessionId: SESSION,
@@ -52,6 +56,8 @@ function windowsLaunch({ env = {}, child = fakeStartChild({ exit: 0 }), found = 
     prepareOarMcpConfigImpl: () => null,
     prepareWorkerLogFileImpl: () => null,
     locateExecutableImpl: locate,
+    // The fixture folders exist on no host; a failed spawn would be put down to them.
+    checkWorkingDirectoryImpl: checkFolder,
     processInspector: { async findProcessForSessionAsync() { return found; } },
     detachedPollAttempts: 2,
     detachedPollDelayMs: 1,
@@ -270,6 +276,8 @@ test('a POSIX spawn without a pid names the command and the reason', async () =>
     allowProcessReuse: false,
     execFileSyncImpl() { throw new Error('no tmux'); },
     locateExecutableImpl: () => 'located',
+    // The fixture folder exists on no host; a failed spawn would be put down to it.
+    checkWorkingDirectoryImpl: () => null,
     log: (line) => logs.push(line),
     spawnImpl() {
       process.nextTick(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })));
@@ -279,4 +287,67 @@ test('a POSIX spawn without a pid names the command and the reason', async () =>
   await assert.rejects(launched, /^Error: worker-spawn-unhealthy:missing-pid \(\/home\/dev\/node\/bin\/node: ENOENT\)$/);
   assert.equal(logs.length, 1);
   assert.ok(logs[0].endsWith(`could not start ${posixNode} (ENOENT); PATH=/home/dev/bin:/home/dev/node/bin`), logs[0]);
+});
+
+const statEnoent = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+
+test('cmd.exe that cannot run because the folder is gone names the folder', async () => {
+  const error = Object.assign(new Error('spawn cmd.exe ENOENT'), { code: 'ENOENT' });
+  const checkFolder = (folder) => missingWorkingDirectoryError(folder, { statSync: statEnoent });
+  const { launched, logs } = windowsLaunch({ child: fakeStartChild({ error }), checkFolder });
+  await assert.rejects(launched, /^Error: worker-spawn-failed: The working directory of this conversation no longer exists: C:\\Users\\dev\\oar\.$/);
+  assert.match(logs[0], /worker-spawn-failed: The working directory of this conversation no longer exists: C:\\Users\\dev\\oar\./);
+});
+
+test('a POSIX spawn that fails because the folder is gone names the folder, not Node', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-launch-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const gone = path.join(root, 'deleted');
+  const logs = [];
+  const child = new EventEmitter();
+  child.unref = () => {};
+  const launched = launchSessionCli({
+    targetSessionId: SESSION,
+    cwd: gone,
+    env: {
+      PATH: '/home/dev/bin',
+      COPILOT_WEB_RELAY_NODE: '/home/dev/node/bin/node',
+      COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+      COPILOT_WEB_RELAY_ROOT: '/home/dev/oar',
+    },
+    platform: 'linux',
+    allowProcessReuse: false,
+    execFileSyncImpl() { throw new Error('no tmux'); },
+    locateExecutableImpl: () => 'located',
+    log: (line) => logs.push(line),
+    spawnImpl() {
+      process.nextTick(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })));
+      return child;
+    },
+  });
+  await assert.rejects(launched, (error) => error.message === `worker-spawn-failed: The working directory of this conversation no longer exists: ${gone}.`);
+  assert.equal(logs.length, 1);
+});
+
+test('describeLaunchFolderFailure answers only for an ENOENT in a folder that is gone', () => {
+  const enoent = { error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) };
+  assert.equal(describeLaunchFolderFailure(enoent, os.tmpdir()), null);
+  assert.equal(describeLaunchFolderFailure({ error: Object.assign(new Error('denied'), { code: 'EACCES' }) }, '/x', { check: () => new Error('gone') }), null);
+  assert.equal(describeLaunchFolderFailure({ exited: true, code: 1 }, '/x', { check: () => new Error('gone') }), null);
+  assert.equal(
+    describeLaunchFolderFailure(enoent, '/x', { check: (folder) => missingWorkingDirectoryError(folder, { statSync: statEnoent }) }),
+    'worker-spawn-failed: The working directory of this conversation no longer exists: /x.',
+  );
+});
+
+test('a file where the folder was is named as not a folder', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-launch-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'file.txt');
+  fs.writeFileSync(file, 'x');
+  const enoent = { error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) };
+  assert.equal(
+    describeLaunchFolderFailure(enoent, file),
+    `worker-spawn-failed: The working directory of this conversation is not a folder: ${file}.`,
+  );
 });

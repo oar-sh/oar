@@ -427,6 +427,14 @@ test('event actions default to this relay and validate their arguments', () => {
   assert.equal(validate({ action: 'subscribe', sessions: 'all' }).args.scope, 'all');
   assert.equal(validate({ action: 'subscribe', session: 'conv-a' }).args.sessions[0], 'conv-a');
   assert.match(validate({ action: 'subscribe' }).error, /needs sessions/);
+  // relay_restarted alone watches no session; with anything else, sessions are needed.
+  assert.deepEqual(validate({ action: 'subscribe', events: ['relay_restarted'], once: true }), {
+    ok: true,
+    action: 'subscribe',
+    args: { relay: 'this', events: ['relay_restarted'], once: true },
+  });
+  assert.match(validate({ action: 'subscribe', events: ['relay_restarted', 'turn_end'] }).error, /needs sessions .* unless events names only relay_restarted/);
+  assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['relay_restarted'] }).args.sessions, ['conv-a']);
   assert.match(validate({ action: 'subscribe', sessions: ['all', 'conv-a'] }).error, /not both/);
   assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['nope'] }).error, /events must be some of/);
   assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['subagent_finished', 'task_finished'] }).args.events, ['subagent_finished', 'task_finished']);
@@ -460,6 +468,7 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'subscribe', session: 'all' },
     { action: 'subscribe', sessions: 'all', events: ['turn_end'], once: true, stalled_minutes: 20, heartbeat_minutes: 60 },
     { action: 'subscribe', relay: 'linux-test', sessions: ['conv-a', 'conv-b'], match: 'done' },
+    { action: 'subscribe', events: ['relay_restarted'], once: true },
     { action: 'unsubscribe', subscription_id: 'all' },
     { action: 'unsubscribe', subscription_id: 'sub_fixture1' },
     { action: 'list_subscriptions', watcher: 'conv-b' },

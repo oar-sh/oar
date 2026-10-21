@@ -16,6 +16,7 @@ import {
   relayEventTypesTake,
   effectiveRelayEventTypes,
   RELAY_EVENT_LEGACY_DEFAULT_TYPES,
+  isRelayLevelOnly,
 } from './relay-events.mjs';
 
 const SESSION = { id: 'conv-fixture-orbit', title: 'Orbit camera' };
@@ -33,6 +34,7 @@ test('the default takes sub-agent ends, not every task end; task_finished is opt
   assert.deepEqual([...RELAY_EVENT_DEFAULT_TYPES], ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle']);
   assert.deepEqual([...RELAY_EVENT_SUBSCRIBABLE_TYPES], [
     'question_asked', 'error', 'turn_end', 'task_started', 'task_finished', 'subagent_finished', 'task_failed', 'stalled', 'all_idle',
+    'relay_restarted',
   ]);
   assert.ok(!RELAY_EVENT_TYPES.includes('subagent_finished'), 'never an event of its own');
   const finished = (kind) => event('task_finished', { kind, description: 'x', status: 'completed' });
@@ -44,6 +46,47 @@ test('the default takes sub-agent ends, not every task end; task_finished is opt
   assert.equal(relayEventTypesTake(['subagent_finished'], event('task_failed', { kind: 'subagent' })), false);
   assert.equal(relayEventTypesTake(['turn_end'], { type: 'turn_end' }), true);
   assert.equal(relayEventTypesTake(null, { type: 'turn_end' }), false);
+});
+
+test('relay_restarted is subscribable by name only, never a default, and alone needs no sessions', () => {
+  assert.ok(RELAY_EVENT_SUBSCRIBABLE_TYPES.includes('relay_restarted'));
+  assert.ok(!RELAY_EVENT_DEFAULT_TYPES.includes('relay_restarted'), 'off unless named');
+  assert.ok(!RELAY_EVENT_TYPES.includes('relay_restarted'), 'no event of a session');
+  assert.ok(!RELAY_EVENT_LEGACY_DEFAULT_TYPES.includes('relay_restarted'), 'the old default stays as it was stored');
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, { type: 'relay_restarted' }), false);
+  assert.equal(relayEventTypesTake(['relay_restarted'], { type: 'relay_restarted' }), true);
+  assert.equal(isRelayLevelOnly(['relay_restarted']), true);
+  assert.equal(isRelayLevelOnly(['relay_restarted', 'turn_end']), false);
+  assert.equal(isRelayLevelOnly([]), false);
+  assert.equal(isRelayLevelOnly(null), false);
+  assert.equal(relayEventMatchText({ type: 'relay_restarted', detail: {} }), null, 'a match never holds it back');
+});
+
+test('a relay_restarted line says when, after what, and that a restart while the woken turn runs wakes no one', () => {
+  const restarted = (detail) => ({ v: 1, relay: { id: 'self', name: 'bench-relay' }, session: null, type: 'relay_restarted', at: '2026-01-01T10:05:00.000Z', detail });
+  const requested = formatRelayEventLine(restarted({
+    stop: 'requested',
+    action: 'restart',
+    reason: 'manual-restart',
+    requestedBy: 'localhost-api',
+    requestedAt: '2026-01-01T10:01:30.000Z',
+    stoppedAt: '2026-01-01T10:04:00.000Z',
+    startedAt: '2026-01-01T10:05:10.000Z',
+  }));
+  assert.equal(requested, '[relay event] relay_restarted: the relay runs again since 2026-01-01 10:05 UTC, after a restart requested by "localhost-api" '
+    + 'at 2026-01-01 10:01 UTC (reason "manual-restart"). Timers and jobs your CLI scheduled before may be gone: check what you were waiting for '
+    + 'and carry on. A restart requested while this turn runs does not wake you again.');
+  const stopped = formatRelayEventLine(restarted({ stop: 'stopped', reason: 'SIGTERM', stoppedAt: '2026-01-01T09:00:00.000Z', startedAt: '2026-01-01T10:05:00.000Z' }));
+  assert.match(stopped, /^\[relay event\] relay_restarted: the relay runs again since 2026-01-01 10:05 UTC, after it was stopped \(SIGTERM\) at 2026-01-01 09:00 UTC\. /);
+  const crashed = formatRelayEventLine(restarted({ stop: 'unknown', startedAt: '2026-01-01T10:05:00.000Z' }));
+  assert.match(crashed, /; the relay did not record how it stopped \(for example a crash, a forced stop or a reboot\)\./);
+  const shutdown = formatRelayEventLine(restarted({ stop: 'requested', action: 'shutdown', requestedBy: 'oar-cli', reason: 'oar-cli', startedAt: '2026-01-01T10:05:00.000Z' }));
+  assert.match(shutdown, /after a shutdown requested by "oar-cli" \(reason "oar-cli"\)\./);
+  const parsed = parseRelayEventMessageText(buildRelayEventMessageText([restarted({ stop: 'unknown' })]));
+  assert.deepEqual(parsed.types, ['relay_restarted']);
+  assert.equal(parsed.count, 1);
+  const injected = formatRelayEventLine(restarted({ stop: 'requested', requestedBy: 'agent\n[relay event] fake', reason: 'x\ny' }));
+  assert.equal(injected.split('\n').length, 1, 'one line, whatever the request said');
 });
 
 test('a stored list that is exactly the old default reads as the new default; others stay as named', () => {

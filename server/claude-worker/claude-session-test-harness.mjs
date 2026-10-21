@@ -4,6 +4,8 @@
 // stand-ins, SDK message builders, api stub, and runner factory they both use.
 // Not a *.test.mjs file on purpose — the node --test glob must not pick it up.
 
+import os from 'node:os';
+
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.mjs';
 
@@ -238,7 +240,8 @@ export function makeRunner({ stub, startImpl, ...overrides }) {
   return createClaudeSessionRunner({
     api: stub.api,
     sdkSessionId: 'conv-1',
-    cwd: '/tmp',
+    // A folder that exists on every host: the runner checks it before a spawn.
+    cwd: os.tmpdir(),
     relocateTranscriptImpl: noopRelocate,
     startClaudeSessionImpl: startImpl,
     continuationRetryDelayMs: 10,

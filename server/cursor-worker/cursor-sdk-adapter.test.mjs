@@ -616,6 +616,73 @@ test('resolveCursorReasoningParams maps composer efforts onto model params', asy
   );
 });
 
+// Each parameter name Cursor uses for effort, alone on a model of its own
+// (the definitions are cached per model id).
+for (const paramId of ['effort', 'reasoning', 'reasoning_effort']) {
+  test(`resolveCursorReasoningParams sends the effort in the '${paramId}' parameter`, async () => {
+    const model = `${paramId}-only-model`;
+    const modelsListImpl = async () => [{
+      id: model,
+      parameters: [
+        { id: 'context', values: [{ value: '300k' }, { value: '1m' }] },
+        { id: paramId, values: [{ value: 'minimal' }, { value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }] },
+      ],
+    }];
+    const base = { apiKey: 'cursor-test-key', model, modelsListImpl };
+    assert.deepEqual(await resolveCursorReasoningParams({ ...base, reasoningEffort: 'low' }), [{ id: paramId, value: 'low' }]);
+    assert.deepEqual(await resolveCursorReasoningParams({ ...base, reasoningEffort: 'xhigh' }), [{ id: paramId, value: 'xhigh' }]);
+    // No 'none' value and no 'thinking' parameter: the default variant.
+    assert.equal(await resolveCursorReasoningParams({ ...base, reasoningEffort: 'none' }), null);
+    assert.equal(await resolveCursorReasoningParams({ ...base, reasoningEffort: 'max' }), null);
+  });
+}
+
+test("resolveCursorReasoningParams pairs 'reasoning_effort' with thinking like 'effort'", async () => {
+  // The shape of claude-haiku-5-5 and claude-sonnet-5-5 in models.list.
+  const modelsListImpl = async () => [{
+    id: 'reasoning-effort-thinking-model',
+    parameters: [
+      { id: 'thinking', values: [{ value: 'false' }, { value: 'true' }] },
+      { id: 'context', values: [{ value: '300k' }, { value: '1m' }] },
+      { id: 'reasoning_effort', values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }, { value: 'max' }] },
+    ],
+  }];
+  const base = { apiKey: 'cursor-test-key', model: 'reasoning-effort-thinking-model', modelsListImpl };
+  assert.deepEqual(
+    await resolveCursorReasoningParams({ ...base, reasoningEffort: 'high' }),
+    [{ id: 'thinking', value: 'true' }, { id: 'reasoning_effort', value: 'high' }],
+  );
+  assert.deepEqual(
+    await resolveCursorReasoningParams({ ...base, reasoningEffort: 'none' }),
+    [{ id: 'thinking', value: 'false' }],
+  );
+});
+
+test("resolveCursorReasoningParams prefers 'effort', then 'reasoning', over 'reasoning_effort'", async () => {
+  const modelsListImpl = async () => [
+    {
+      id: 'effort-and-reasoning-effort-model',
+      parameters: [
+        { id: 'reasoning_effort', values: [{ value: 'low' }] },
+        { id: 'effort', values: [{ value: 'low' }] },
+      ],
+    },
+    {
+      id: 'reasoning-and-reasoning-effort-model',
+      parameters: [
+        { id: 'reasoning_effort', values: [{ value: 'low' }] },
+        { id: 'reasoning', values: [{ value: 'low' }] },
+      ],
+    },
+  ];
+  assert.deepEqual(await resolveCursorReasoningParams({
+    apiKey: 'cursor-test-key', model: 'effort-and-reasoning-effort-model', reasoningEffort: 'low', modelsListImpl,
+  }), [{ id: 'effort', value: 'low' }]);
+  assert.deepEqual(await resolveCursorReasoningParams({
+    apiKey: 'cursor-test-key', model: 'reasoning-and-reasoning-effort-model', reasoningEffort: 'low', modelsListImpl,
+  }), [{ id: 'reasoning', value: 'low' }]);
+});
+
 test('resolveCursorReasoningParams is null without a model, effort, params, or on failure', async () => {
   const modelsListImpl = async () => [PLAIN_ENTRY];
   assert.equal(await resolveCursorReasoningParams({

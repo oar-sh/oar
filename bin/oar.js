@@ -11,8 +11,17 @@ import net from 'net';
 
 import {
   migrateStateToOarRoot,
-  resolveOarRoot,
 } from '../server/services/oar-state-migration-service.mjs';
+import { resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
+import { TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
+import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
+import {
+  getLauncherLogDir,
+  getLegacyManagedConfigDir,
+  isGitCheckout,
+  resolveRelayStateDirs,
+  resolveStateLayout,
+} from '../server/services/oar-state-layout.mjs';
 import {
   buildDefaultConfig, buildServicePath, buildSystemdUnit, describeRelayAddress, DOCTOR_PROBES, generateAuthToken,
   NPM_ALLOW_SCRIPTS_ARG, parseCliArgs, primaryLanAddress, renderDoctorReport, resolveNpmInvocation, usageText,
@@ -56,20 +65,42 @@ function readRelayLock(lockPath) {
       pid: Number.parseInt(String(parsed?.pid ?? ''), 10),
       startedAt: typeof parsed?.startedAt === 'string' ? parsed.startedAt : null,
       token: typeof parsed?.token === 'string' ? parsed.token : '',
+      format: Number(parsed?.format) || 0,
     };
   } catch {
     return null;
   }
 }
 
+// What a relay that holds its lock and does not answer yet is bringing over
+// (earlier-database-service), or null: the progress file names the lock's
+// pid, and that pid is the lock's holder still (lockHolderMayRun: a pid
+// reused after a crash is not).
+function readTakeover(lockPath, isProcessAliveImpl = isProcessAlive) {
+  const progress = readJsonFile(path.join(path.dirname(lockPath), TAKEOVER_PROGRESS_FILE));
+  const lock = readJsonFile(lockPath);
+  const pid = Number.parseInt(String(progress?.pid ?? ''), 10);
+  return Number.isInteger(pid) && Number(lock?.pid) === pid && lockHolderMayRun({ lock, isProcessAlive: isProcessAliveImpl }) ? progress : null;
+}
+
+// The lock a relay that did not come up found held, and whether its holder
+// is known to be a relay (its recorded identity matches): only when it is
+// not may the user delete the lock. Null when no live process holds it.
+function heldLock(lockPath, isProcessAliveImpl = isProcessAlive) {
+  const lock = readJsonFile(lockPath);
+  const pid = Number.parseInt(String(lock?.pid ?? ''), 10);
+  if (!Number.isInteger(pid) || !lockHolderMayRun({ lock, isProcessAlive: isProcessAliveImpl })) return null;
+  return { pid, path: lockPath, startedAt: lock.startedAt || 'unknown', known: !!lock.holder && !!processIdentity(pid) };
+}
+
+function takeoverLine(takeover, logDir) {
+  const what = takeover ? ` (${takeover.from}, ${Math.max(1, Math.round(Number(takeover.bytes || 0) / 1048576))} MB)` : '';
+  return `[oar] The relay${takeover ? ` (process ${takeover.pid})` : ''} is bringing over the database it ran on until now${what} and is still running; it answers once that is done. Its log: ${path.join(String(logDir || ''), 'server.log')}`;
+}
+
+// As the server tells it: a process this user may not signal (EPERM) lives.
 function isProcessAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return defaultIsProcessAlive(pid);
 }
 
 function readJsonFile(filePath) {
@@ -91,45 +122,66 @@ function openAppendFileDescriptor(filePath) {
   return fs.openSync(filePath, 'a');
 }
 
-// Pre-OAR managed config location — kept only as a migration source and as the
-// config home for git checkouts, where nothing may change underfoot.
-function getLegacyManagedConfigDir(env = process.env) {
-  if (process.platform === 'win32') {
-    return path.join(
-      env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
-      'copilot-remote',
-    );
-  }
-  return path.join(
-    env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
-    'copilot-remote',
-  );
-}
-
-function isGitCheckout(packageRoot) {
-  try { return fs.existsSync(path.join(packageRoot, '.git')); } catch { return false; }
-}
-
 /**
- * Where launcher-managed state lives. A git checkout keeps every pre-OAR
- * default (repo-local server/data, legacy managed config) so development and
- * the two existing machines change nothing. A global install gets the OAR
- * state root: config, data, logs all under ~/.oar (APPDATA\oar on Windows),
- * which survives `npm i -g` updates.
+ * Brings pre-OAR state into a global install's state root. Without
+ * --migrate-from it runs quietly, once; with it, it runs unless that source
+ * was migrated already, never overwrites, and says what it did or why it did
+ * nothing. Database and uploads go where the relay `oar` starts will read
+ * them, resolved as the relay resolves them. Returns null to go on, or the
+ * result to stop with. A refusal stops only `oar setup` (`strict`): `oar
+ * copilot` warns and starts the session on the state root as it is.
  */
-function resolveStateLayout({ packageRoot, env = process.env } = {}) {
-  if (isGitCheckout(packageRoot)) {
-    return { checkout: true, root: null, configDir: getLegacyManagedConfigDir(env), dataDir: null };
+async function migrateIntoStateRoot({
+  layout, env, packageRoot, migrateFrom = '', logger, isProcessAliveImpl = isProcessAlive, strict = true,
+}) {
+  const serverDir = path.join(packageRoot, 'server');
+  const relayEnv = { COPILOT_WEB_RELAY_DATA_DIR: resolveRelayStateDirs({ env, layout }).dataDir };
+  const dataDir = resolveDataDir({ env: relayEnv, serverDir });
+  const source = migrateFrom ? path.resolve(migrateFrom) : '';
+  let migration;
+  try {
+    migration = await migrateStateToOarRoot({
+      targetRoot: layout.root,
+      targetDataDir: dataDir,
+      targetUploadDir: resolveUploadDir({ dataDir, env: relayEnv, serverDir }),
+      repoServerDir: source ? path.join(source, 'server') : null,
+      managedConfigDir: getLegacyManagedConfigDir(env),
+      isProcessAliveImpl,
+    });
+  } catch (error) {
+    logger.error?.(`[oar] State migration failed, nothing was changed at the source: ${error?.message || error}`);
+    return { code: 1, reason: 'migration-failed', error };
   }
-  const root = resolveOarRoot(env);
-  return { checkout: false, root, configDir: root, dataDir: path.join(root, 'data') };
-}
-
-function getLauncherLogDir(env = process.env, layout = null) {
-  const envLogDir = String(env.COPILOT_WEB_RELAY_LOG_DIR || '').trim();
-  if (envLogDir) return envLogDir;
-  if (layout && !layout.checkout) return path.join(layout.root, 'logs');
-  return path.join(getLegacyManagedConfigDir(env), 'logs');
+  const refused = (message, reason) => {
+    logger.error?.(`[oar] ${message}`);
+    if (strict) return { code: 1, reason };
+    logger.error?.('[oar] Nothing was migrated; starting on the state root as it is.');
+    return null;
+  };
+  switch (migration.status) {
+    case 'blocked-live-relay': return refused(migration.error, 'migration-blocked');
+    case 'refused-relay-running': return refused(migration.error, 'migration-relay-running');
+    case 'refused-existing-database': return refused(migration.error, 'migration-refused');
+    case 'nothing-to-migrate':
+      return source ? refused(`Nothing to migrate from ${source}: ${migration.reason}.`, 'migration-nothing') : null;
+    case 'already-migrated':
+      if (source) logger.log?.(`[oar] ${layout.root} is already migrated from ${source}; nothing to do.`);
+      return null;
+    case 'migrated':
+      if (migration.movedAsideTo) {
+        logger.log?.(`[oar] The state root's database had no conversations yet (a fresh one); moved it aside to ${migration.movedAsideTo}.`);
+      }
+      logger.log?.(`[oar] Migrated ${source || 'earlier relay state'} into ${layout.root} (${migration.copied} items, sources untouched; receipt in backups/MIGRATION.md).`);
+      for (const kept of migration.kept || []) {
+        logger.log?.(`[oar] Kept the existing ${kept}; the one from the source was not copied.`);
+      }
+      for (const link of migration.skipped || []) {
+        logger.log?.(`[oar] Skipped the link ${link}: what it points to was not copied.`);
+      }
+      return null;
+    default:
+      return null;
+  }
 }
 
 function getCopilotHomeDir(env = process.env) {
@@ -278,6 +330,7 @@ export async function launchRelay({
   fetchImpl = globalThis.fetch,
   isProcessAliveImpl = isProcessAlive,
   lockGraceMs = 5000,
+  readyWaitMs = 20_000,
   env = process.env,
   logger = console,
 } = {}) {
@@ -328,22 +381,11 @@ export async function launchRelay({
 
   if (!layout.checkout) {
     // Global install: state lives in the OAR root. Migrate pre-OAR state in
-    // exactly once (marker-guarded); a live source relay blocks the migration.
-    try {
-      const migration = await migrateStateToOarRoot({
-        targetRoot: layout.root,
-        repoServerDir: migrateFromRoot ? path.join(path.resolve(migrateFromRoot), 'server') : null,
-        managedConfigDir: getLegacyManagedConfigDir(env),
-        logger,
-      });
-      if (migration.status === 'blocked-live-relay') {
-        logger.error?.(`[oar] ${migration.error}`);
-        return { code: 1, reason: 'migration-blocked' };
-      }
-    } catch (error) {
-      logger.error?.(`[oar] State migration failed, nothing was changed at the source: ${error?.message || error}`);
-      return { code: 1, reason: 'migration-failed', error };
-    }
+    // (once, or as --migrate-from asks); a live source relay blocks it.
+    const stop = await migrateIntoStateRoot({
+      layout, env, packageRoot, migrateFrom: migrateFromRoot, logger, isProcessAliveImpl, strict: false,
+    });
+    if (stop) return stop;
   }
 
   const lockPath = layout.checkout
@@ -372,14 +414,21 @@ export async function launchRelay({
     ? await probeRelayPort(probe)
     : await probeRelayBehindLock({ ...probe, lockPath, port, isProcessAliveImpl, lockGraceMs, logger });
   if (answer === 'taken') {
-    logger.error?.(`[oar] Port ${port} is in use by another program (or by a relay with another token).`);
+    logger.error?.(`[oar] Port ${port} is in use by another program, or by a relay with another token.`);
     logger.error?.('[oar] Stop that program, or pick another port: oar copilot --port <port>');
     return { code: 1, reason: 'port-taken' };
+  }
+  if (answer === 'bringing-over') {
+    logger.log(takeoverLine(readTakeover(lockPath, isProcessAliveImpl), getLauncherLogDir(env, layout)));
+    return { code: 1, reason: 'bringing-over' };
   }
   if (runtimeConfig.managed || !fs.existsSync(runtimeConfig.configPath)) {
     writeJsonFile(runtimeConfig.configPath, runtimeConfig.config);
   }
 
+  // Checkouts keep the repo-local server/data default; global installs point
+  // the server at the OAR root so updates cannot wipe the database.
+  const stateDirs = resolveRelayStateDirs({ env, layout });
   const baseEnv = {
     ...env,
     COPILOT_WORKSPACE_ROOT: cwd,
@@ -387,11 +436,7 @@ export async function launchRelay({
     COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
     COPILOT_WEB_RELAY_CONFIG: runtimeConfig.configPath,
     COPILOT_WEB_RELAY_LOG_DIR: getLauncherLogDir(env, layout),
-    // Checkouts keep the repo-local server/data default; global installs point
-    // the server at the OAR root so updates cannot wipe the database.
-    ...(layout.checkout ? {} : {
-      COPILOT_WEB_RELAY_DATA_DIR: String(env.COPILOT_WEB_RELAY_DATA_DIR || '').trim() || layout.dataDir,
-    }),
+    ...(stateDirs.dataDir ? { COPILOT_WEB_RELAY_DATA_DIR: stateDirs.dataDir } : {}),
     GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: String(env.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || 'true'),
   };
 
@@ -429,7 +474,7 @@ export async function launchRelay({
       return { code: 1, reason: 'spawn-invalid-child' };
     }
 
-    const readyDeadlineMs = 20_000;
+    const readyDeadlineMs = readyWaitMs;
     const ready = await new Promise((resolve) => {
       const deadline = Date.now() + readyDeadlineMs;
       const probe = async () => {
@@ -457,6 +502,14 @@ export async function launchRelay({
       probe();
     });
 
+    const takeover = ready ? null : readTakeover(lockPath, isProcessAliveImpl);
+    if (takeover) {
+      // Left running: a kill would cut the copy short for nothing.
+      logger.log(takeoverLine(takeover, logDir));
+      try { fs.closeSync(serverOutFd); } catch {}
+      try { fs.closeSync(serverErrFd); } catch {}
+      return { code: 1, reason: 'bringing-over' };
+    }
     if (!ready) {
       logger.error?.(`[oar] Relay did not become ready at ${statusUrl}`);
       try {
@@ -667,7 +720,11 @@ async function probeRelayBehindLock({
       await new Promise((resolve) => setTimeout(resolve, 300));
       answer = await probeRelayPort({ statusUrl, token, fetchImpl });
     }
-    if (answer === 'none' && lockedByLiveProcess()) {
+    if (answer === 'none' && readTakeover(lockPath, isProcessAliveImpl)) return 'bringing-over';
+    // A lock this version wrote is left to the server, which tells a reused
+    // process id itself (lockHolderMayRun): removed here, a second relay
+    // started beside one still bringing over its database.
+    if (answer === 'none' && lockedByLiveProcess() && !readRelayLock(lockPath)?.format) {
       // Nothing listens: the lock is left over from a relay that did not
       // stop cleanly. The server refuses to start beside a lock whose process
       // id is alive, so it goes first.
@@ -697,6 +754,7 @@ export async function ensureRelayRunning({
   fetchImpl = globalThis.fetch,
   isProcessAliveImpl = isProcessAlive,
   lockGraceMs = 5000,
+  readyWaitMs = 20_000,
   homeDir = os.homedir(),
   platform = process.platform,
   logger = console,
@@ -710,8 +768,9 @@ export async function ensureRelayRunning({
     statusUrl, token, lockPath, port, fetchImpl, isProcessAliveImpl, lockGraceMs, logger,
   });
   if (answer === 'oar') return { ok: true, how: 'already', logDir };
+  if (answer === 'bringing-over') return { ok: false, how: 'bringing-over', logDir, takeover: readTakeover(lockPath, isProcessAliveImpl) };
   if (answer === 'taken') {
-    logger.error?.(`[oar] Port ${port} is in use by another program (or by a relay with another token).`);
+    logger.error?.(`[oar] Port ${port} is in use by another program, or by a relay with another token.`);
     logger.error?.('[oar] Stop that program, or pick another port: oar setup --port <port>');
     return { ok: false, how: 'port-taken', logDir };
   }
@@ -739,7 +798,7 @@ export async function ensureRelayRunning({
         COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
         COPILOT_WEB_RELAY_CONFIG: configPath,
         COPILOT_WEB_RELAY_LOG_DIR: logDir,
-        COPILOT_WEB_RELAY_DATA_DIR: String(env.COPILOT_WEB_RELAY_DATA_DIR || '').trim() || layout.dataDir,
+        COPILOT_WEB_RELAY_DATA_DIR: resolveRelayStateDirs({ env, layout }).dataDir,
       },
       detached: true,
       stdio: ['ignore', outFd, errFd],
@@ -753,8 +812,10 @@ export async function ensureRelayRunning({
     try { fs.closeSync(outFd); } catch {}
     try { fs.closeSync(errFd); } catch {}
   }
-  const ok = await waitForRelay({ statusUrl, token, fetchImpl, stillStarting: () => child.exitCode === null });
-  return { ok, how: 'detached', logDir };
+  const ok = await waitForRelay({ statusUrl, token, fetchImpl, deadlineMs: readyWaitMs, stillStarting: () => child.exitCode === null });
+  const takeover = ok ? null : readTakeover(lockPath, isProcessAliveImpl);
+  if (takeover) return { ok: false, how: 'bringing-over', logDir, takeover };
+  return { ok, how: 'detached', logDir, ...(ok ? {} : { lock: heldLock(lockPath, isProcessAliveImpl) }) };
 }
 
 /**
@@ -916,7 +977,7 @@ async function restartRelay(ctx, paths, { old, viaService }) {
     logger.error('[oar] The relay came back on its earlier port and token: it was started with fixed ones (oar copilot). End that session, then run: oar start');
     return { ok: false, reason: 'fixed-settings' };
   }
-  logger.error(`[oar] The relay did not come back — see ${path.join(paths.logDir, 'server-err.log')}`);
+  logger.error(`[oar] The relay did not come back — see ${viaService ? 'journalctl --user -u oar' : path.join(paths.logDir, 'server-err.log')}`);
   return { ok: false, reason: 'server-not-ready' };
 }
 
@@ -987,6 +1048,7 @@ function startRelay(ctx, paths) {
     fetchImpl: ctx.fetchImpl,
     isProcessAliveImpl: ctx.isProcessAliveImpl,
     lockGraceMs: ctx.lockGraceMs,
+    readyWaitMs: ctx.readyWaitMs,
     homeDir: ctx.homeDir,
     platform: ctx.platform,
     logger: ctx.logger,
@@ -1028,12 +1090,18 @@ function warnWindowsPort(ctx, port, windowsHolder = createWindowsPortCheck(ctx))
 function reportRelayStart(result, logger) {
   // A port held by something else was already explained.
   if (result.how === 'port-taken') return;
+  if (result.how === 'bringing-over') {
+    logger.log(takeoverLine(result.takeover, result.logDir));
+    return;
+  }
   if (!result.ok) {
-    logger.error?.(`[oar] The relay did not come up — see ${path.join(result.logDir, 'server-err.log')}`);
+    logger.error?.(`[oar] The relay did not come up — see ${result.how === 'service' ? 'journalctl --user -u oar' : path.join(result.logDir, 'server-err.log')}`);
+    if (result.lock?.known) logger.error?.(`[oar] The lock ${result.lock.path} is held by relay process ${result.lock.pid} (started ${result.lock.startedAt}): oar stop, or end process ${result.lock.pid}.`);
+    else if (result.lock) logger.error?.(`[oar] The lock ${result.lock.path} names process ${result.lock.pid}, which cannot be told to be a relay: if no relay is running, end process ${result.lock.pid} or delete the lock.`);
     return;
   }
   if (result.how === 'already') {
-    logger.log('[oar] The relay is already running. To load a new version, restart it: oar restart');
+    logger.log('[oar] The relay is already running. It keeps the version and settings it started with until you restart it: oar restart');
   } else if (result.how === 'service') {
     logger.log('[oar] The relay is running as a systemd user service (systemctl --user status oar).');
   } else {
@@ -1048,7 +1116,7 @@ function requireConfig(ctx, paths) {
 }
 
 function reportPortTaken(ctx, paths, port) {
-  ctx.logger.error(`[oar] Port ${port} is held by another program, or by a relay with another token.`);
+  ctx.logger.error(`[oar] Port ${port} is in use by another program, or by a relay with another token.`);
   // A relay that was started before its token was changed in the config
   // cannot be asked to restart: only its lock tells that it is there.
   const pid = readRelayLock(paths.lockPath)?.pid;
@@ -1077,6 +1145,7 @@ export async function runStart(options = {}) {
   reportRelayStart(result, logger);
   if (result.ok) await showAddress(ctx, paths);
   warnWindowsPort(ctx, endpointOf(paths.config).port);
+  if (result.how === 'bringing-over') return { code: 0, reason: 'bringing-over' };
   return { code: result.ok ? 0 : 1, reason: result.ok ? 'started' : 'server-not-ready' };
 }
 
@@ -1092,7 +1161,7 @@ export async function runStop(options = {}) {
       logger.error('[oar] systemctl --user stop oar failed — see: systemctl --user status oar');
       return { code: 1, reason: 'service' };
     }
-    logger.log('[oar] The relay service is stopped. It starts again at the next login; to take it out: oar service remove');
+    logger.log('[oar] The relay service is stopped. It starts again at the next boot (without lingering: at the next login); to take it out: oar service remove');
     return { code: 0, reason: 'stopped' };
   }
   const relay = await findRelay(ctx, paths);
@@ -1172,7 +1241,7 @@ export async function runStatus(options = {}) {
   const access = status.access === 'lan' ? 'LAN access' : 'this machine only';
   if (status.relay === 'running') logger.log(`[oar] The relay is running on port ${status.port} (${access}): ${status.url}`);
   else if (status.relay === 'stopped') logger.log(`[oar] The relay is stopped (port ${status.port}, ${access}). Start it with: oar start`);
-  else logger.log(`[oar] Port ${status.port} is held by another program, or by a relay with another token.`);
+  else logger.log(`[oar] Port ${status.port} is in use by another program, or by a relay with another token.`);
   if (status.service !== 'unavailable') {
     logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed', none: 'not installed' }[status.service]}`);
   }
@@ -1205,7 +1274,7 @@ async function runWindowsService(ctx, paths, action) {
     return { code: 0, reason: 'service-status' };
   }
   if (boot) {
-    logger.error('[oar] The relay starts at boot through a scheduled task. Change that in the web UI: Settings → Autostart.');
+    logger.error('[oar] The relay starts at boot through a scheduled task. Change that in the web UI: Settings → General → Autostart (Windows).');
     return { code: 1, reason: 'boot-task' };
   }
   if (action === 'install' && requireConfig(ctx, paths)) return { code: 1, reason: 'no-config' };
@@ -1261,7 +1330,7 @@ export async function runService(options = {}) {
     // A relay started by hand holds the port and the lock: it makes way first.
     if ((await runStop({ ...options, argv: [] })).reason !== 'stopped') {
       runQuiet('systemctl', ['--user', 'enable', 'oar'], ctx);
-      logger.log('[oar] The service is installed and takes over at the next login, or once the relay has stopped: oar start');
+      logger.log('[oar] The service is installed and takes over at the next boot (without lingering: at the next login), or once the relay has stopped: oar start');
       return { code: 0, reason: 'service-install' };
     }
   }
@@ -1310,21 +1379,13 @@ export async function runSetup(options = {}) {
   let paths = installPaths(ctx);
   const { layout } = paths;
   if (!layout.checkout) {
-    const migrateFromRoot = String(optionValue(argv, '--migrate-from') || '').trim();
-    const migration = await migrateStateToOarRoot({
-      targetRoot: layout.root,
-      repoServerDir: migrateFromRoot ? path.join(path.resolve(migrateFromRoot), 'server') : null,
-      managedConfigDir: getLegacyManagedConfigDir(env),
-      logger,
+    const migrateFrom = String(optionValue(argv, '--migrate-from') || '').trim();
+    const stop = await migrateIntoStateRoot({
+      layout, env, packageRoot: ctx.packageRoot, migrateFrom, logger, isProcessAliveImpl: ctx.isProcessAliveImpl,
     });
-    if (migration.status === 'blocked-live-relay') {
-      logger.error?.(`[oar] ${migration.error}`);
-      return { code: 1, reason: 'migration-blocked' };
-    }
-    if (migration.status === 'migrated') {
-      logger.log(`[oar] Migrated existing relay state into ${layout.root} (sources untouched).`);
-      paths = installPaths(ctx);
-    }
+    if (stop) return stop;
+    // A migration may have brought a config over.
+    paths = installPaths(ctx);
   }
 
   const existing = paths.config;

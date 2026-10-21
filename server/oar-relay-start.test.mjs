@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import net from 'node:net';
+import { spawn } from 'node:child_process';
 
 import { ensureRelayRunning, findFreePort, isPortFree, probeRelayPort } from '../bin/oar.js';
 
@@ -140,6 +141,161 @@ test('a relay that is still starting behind its lock is waited for, not started 
     logger: { log() {}, error() {} },
   });
   assert.equal(result.how, 'already');
+  assert.deepEqual(spawned, []);
+  assert.equal(fs.existsSync(lockPath), true);
+});
+
+// ─── A relay bringing over its earlier database does not answer for minutes ──
+
+// A lock as this version writes it, by a live relay that does not answer.
+function heldLock(layout, pid) {
+  fs.mkdirSync(layout.dataDir, { recursive: true });
+  const lockPath = path.join(layout.dataDir, 'relay-server.lock');
+  fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid, tokenHash: 'x', startedAt: '2031-01-01T00:00:00.000Z', holder: null }));
+  return lockPath;
+}
+const bringingOver = (layout, pid) => fs.writeFileSync(path.join(layout.dataDir, 'earlier-database-progress.json'), JSON.stringify({
+  pid, from: path.join(layout.root, 'pkg', 'server', 'data', 'copilot.db'), bytes: 630 * 1048576, step: 'copy',
+}));
+const silentRelay = (spawned, onSpawn = () => {}) => ({
+  spawnImpl: (command, args) => { spawned.push(args); onSpawn(); return { exitCode: null, unref() {} }; },
+  spawnSyncImpl: noSystemd,
+  fetchImpl: async () => { throw new Error('connection refused'); },
+  lockGraceMs: 20,
+  readyWaitMs: 200,
+});
+
+test('a second start while the relay brings over its database leaves its lock, starts nothing, and says so', async (t) => {
+  const layout = makeLayout(t);
+  const lockPath = heldLock(layout, 4545);
+  bringingOver(layout, 4545);
+  const before = fs.readFileSync(lockPath, 'utf8');
+  const spawned = [];
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4017, authToken: 'tok' }, env: {}, ...silentRelay(spawned),
+    isProcessAliveImpl: (pid) => pid === 4545,
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(result.how, 'bringing-over');
+  assert.equal(result.takeover.pid, 4545);
+  assert.deepEqual(spawned, []);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), before, 'its lock is left as it is');
+});
+
+test('a lock this version wrote is never removed by a start: the server tells a stale one itself', async (t) => {
+  const layout = makeLayout(t);
+  const lockPath = heldLock(layout, 4646);
+  const spawned = [];
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4018, authToken: 'tok' }, env: {}, ...silentRelay(spawned),
+    isProcessAliveImpl: (pid) => pid === 4646,
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(spawned.length, 1, 'the server is started, and refuses or recovers the lock');
+  assert.equal(result.ok, false);
+  assert.equal(fs.existsSync(lockPath), true);
+});
+
+test('a relay this start launched that is bringing over its database is said to be running, not to have failed', async (t) => {
+  const layout = makeLayout(t);
+  const spawned = [];
+  // The relay takes its lock, then the takeover begins: no answer for minutes.
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4019, authToken: 'tok' }, env: {},
+    ...silentRelay(spawned, () => { heldLock(layout, 4747); bringingOver(layout, 4747); }),
+    isProcessAliveImpl: (pid) => pid === 4747,
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(spawned.length, 1);
+  assert.equal(result.how, 'bringing-over');
+  assert.equal(result.takeover.pid, 4747);
+});
+
+test('a progress file whose pid now belongs to another process is no take-over: the server is started', async (t) => {
+  const layout = makeLayout(t);
+  // A crash in the middle left lock and progress file; the pid went to an
+  // unrelated program that runs on.
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });
+  t.after(() => other.kill());
+  await new Promise((resolve) => other.once('spawn', resolve));
+  fs.mkdirSync(layout.dataDir, { recursive: true });
+  const lockPath = path.join(layout.dataDir, 'relay-server.lock');
+  fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid: other.pid, tokenHash: 'x', holder: { start: 'ticks:1' } }));
+  bringingOver(layout, other.pid);
+  const spawned = [];
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4021, authToken: 'tok' }, env: {}, ...silentRelay(spawned),
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(result.how, 'detached');
+  assert.equal(spawned.length, 1, 'the server recovers the stale lock itself');
+});
+
+test('a progress file is a take-over only with its pid alive and the lock\'s', async (t) => {
+  // The relay this start launched: its pid is gone.
+  const gone = makeLayout(t);
+  const spawnedGone = [];
+  const ended = await ensureRelayRunning({
+    packageRoot: path.join(gone.root, 'pkg'), layout: gone, configPath: path.join(gone.root, 'config.json'),
+    config: { port: 4022, authToken: 'tok' }, env: {},
+    ...silentRelay(spawnedGone, () => { heldLock(gone, 4848); bringingOver(gone, 4848); }),
+    isProcessAliveImpl: () => false,
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(ended.how, 'detached');
+  // Another pid than the lock's.
+  const mismatch = makeLayout(t);
+  heldLock(mismatch, 4545);
+  bringingOver(mismatch, 1111);
+  const spawnedMismatch = [];
+  const other = await ensureRelayRunning({
+    packageRoot: path.join(mismatch.root, 'pkg'), layout: mismatch, configPath: path.join(mismatch.root, 'config.json'),
+    config: { port: 4023, authToken: 'tok' }, env: {}, ...silentRelay(spawnedMismatch),
+    isProcessAliveImpl: (pid) => pid === 4545 || pid === 1111,
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(other.how, 'detached');
+  assert.equal(spawnedMismatch.length, 1);
+});
+
+test('a relay that did not come up beside a live lock says how to clear it', async (t) => {
+  const layout = makeLayout(t);
+  const lockPath = heldLock(layout, 4646);
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4024, authToken: 'tok' }, env: {}, ...silentRelay([]),
+    isProcessAliveImpl: (pid) => pid === 4646,
+    logger: { log() {}, error() {} },
+  });
+  assert.deepEqual(result.lock, { pid: 4646, path: lockPath, startedAt: '2031-01-01T00:00:00.000Z', known: false });
+});
+
+test('a relay this user may not signal (EPERM) counts as alive: its take-over is seen, nothing is started', async (t) => {
+  const layout = makeLayout(t);
+  const lockPath = heldLock(layout, 4545);
+  bringingOver(layout, 4545);
+  const realKill = process.kill;
+  process.kill = (pid, signal) => {
+    if (pid === 4545) throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    return realKill.call(process, pid, signal);
+  };
+  const spawned = [];
+  let result;
+  try {
+    // No isProcessAliveImpl: the CLI's own liveness check.
+    result = await ensureRelayRunning({
+      packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+      config: { port: 4025, authToken: 'tok' }, env: {}, ...silentRelay(spawned),
+      logger: { log() {}, error() {} },
+    });
+  } finally {
+    process.kill = realKill;
+  }
+  assert.equal(result.how, 'bringing-over');
   assert.deepEqual(spawned, []);
   assert.equal(fs.existsSync(lockPath), true);
 });

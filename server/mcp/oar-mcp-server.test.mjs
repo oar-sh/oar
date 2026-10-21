@@ -53,7 +53,7 @@ async function startFakeRelay({ remoteCount = 1, hangTool = false } = {}) {
         if (body?.action === 'list_sessions') return answer(403, LOCKED);
         return answer(200, { ok: true, summary: `${body.action} ok`, received: body });
       }
-      if (req.method === 'GET' && req.url === '/api/previews') return answer(200, { enabled: true, previews: [] });
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/previews') return answer(200, { enabled: true, previews: [] });
       return answer(404, { error: 'not found' });
     });
   });
@@ -256,7 +256,9 @@ test('tools/call preview runs through the preview core for the bound conversatio
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const listed = await mcp.request('tools/call', { name: 'preview', arguments: { action: 'list' } });
     assert.deepEqual(JSON.parse(listed.result.content[0].text), { ok: true, enabled: true, previews: [] });
-    assert.ok(relay.requests.some((request) => request.method === 'GET' && request.url === '/api/previews'));
+    // Scoped to the bound conversation: never the relay-wide list.
+    assert.ok(relay.requests.some((request) => request.method === 'GET' && request.url === '/api/previews?conversationId=conv-mcp-1'));
+    assert.ok(!relay.requests.some((request) => request.url === '/api/previews'));
   });
 });
 

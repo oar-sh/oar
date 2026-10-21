@@ -203,6 +203,98 @@ test("renders and answers relay question card in the web UI", async ({ page, req
   }
 });
 
+test("an Allow / Deny card shows its header and no reply box, and the relay refuses typed text for it", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const questionPrompt = `Playwright approval ${stamp}: start a session here?`;
+  let conversationId = "";
+  let messageId = "";
+  let questionId = "";
+
+  try {
+    const queued = await request.post("/api/message", {
+      headers,
+      data: { text: `Playwright approval seed ${stamp}`, relayMode: "ask", model: "gpt-5.4-mini" },
+    });
+    expect(queued.ok()).toBeTruthy();
+    const queuedBody = await queued.json();
+    conversationId = String(queuedBody?.conversationId || "");
+    messageId = String(queuedBody?.messageId || "");
+    await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+
+    const created = await request.post("/api/relay-question", {
+      headers,
+      data: {
+        queueId: messageId,
+        messageId,
+        conversationId,
+        mode: "ask",
+        prompt: questionPrompt,
+        choices: ["Allow", "Deny"],
+        allowFreeform: false,
+        timeout_ms: 120000,
+        context: { source: "playwright-e2e", header: "Agent sessions" },
+      },
+    });
+    expect(created.ok()).toBeTruthy();
+    questionId = String((await created.json())?.question?.id || "");
+    expect(questionId).toBeTruthy();
+
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(() => typeof window.openConversation === "function");
+    await page.evaluate(async (id) => { await window.openConversation(id); }, conversationId);
+
+    const questionCard = page.locator(".relay-question-container", { hasText: questionPrompt });
+    await expect(questionCard).toBeVisible();
+    await expect(questionCard.locator(".relay-question-header")).toHaveText("Agent sessions");
+    await expect(questionCard.getByRole("button", { name: "Allow" })).toBeVisible();
+    await expect(questionCard.locator("textarea")).toHaveCount(0);
+    await expect(questionCard.locator(".relay-question-submit")).toHaveCount(0);
+
+    // Typed text (from any client) is no answer to this card: refused, still open.
+    const typed = await request.post(`/api/relay-question/${questionId}/answer`, { headers, data: { answer: "yes" } });
+    expect(typed.status()).toBe(400);
+    expect((await typed.json())?.choices).toEqual(["Allow", "Deny"]);
+    const stillOpen = await request.get(`/api/relay-question/${questionId}`, { headers });
+    expect(String((await stillOpen.json())?.question?.status || "")).toBe("pending");
+    await expect(questionCard).toBeVisible();
+
+    // A page that still sends typed text (an older tab) is told why and what to pick.
+    const dialogMessage = new Promise((resolve) => {
+      page.once("dialog", async (dialog) => { resolve(dialog.message()); await dialog.dismiss(); });
+    });
+    await page.evaluate((id) => window.submitRelayQuestionAnswer(id, "yes"), questionId);
+    const refusalText = await dialogMessage;
+    expect(refusalText).toContain("not typed text");
+    expect(refusalText).toContain("Choices: Allow, Deny.");
+    await expect(questionCard.getByRole("button", { name: "Allow" })).toBeEnabled();
+
+    await questionCard.getByRole("button", { name: "Allow" }).click();
+    await expect(questionCard).not.toBeVisible({ timeout: 10000 });
+    const answered = await request.get(`/api/relay-question/${questionId}`, { headers });
+    const answeredBody = await answered.json();
+    expect(String(answeredBody?.question?.status || "")).toBe("answered");
+    expect(String(answeredBody?.question?.answer || "")).toBe("Allow");
+  } finally {
+    if (messageId && conversationId) {
+      await request.post("/api/response", {
+        headers,
+        data: {
+          messageId,
+          conversationId,
+          text: "playwright cleanup",
+          model: "gpt-5.4-mini",
+          reasoningEffort: "high",
+          mode: "autopilot",
+        },
+      }).catch(() => {});
+      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
+    }
+  }
+});
+
 test("renders a multi-select question card with checkmarks and answers with every ticked choice", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };

@@ -140,7 +140,10 @@ export function createSubagentTimelineService({ db, stmts, now = () => new Date(
     if (hasFields && headerSupported()) {
       stmts.updateSubagentRunHeader.run({ id: runId, updatedAt: at, ...fields });
     }
-    if (status) {
+    if (status === 'running' && typeof stmts.reopenSubagentRun?.run === 'function') {
+      // Running (again, for a resumed agent): the end of an earlier run goes.
+      stmts.reopenSubagentRun.run(at, runId);
+    } else if (status) {
       const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
       stmts.updateSubagentRunStatus?.run?.(status, at, terminal ? at : null, runId);
     }

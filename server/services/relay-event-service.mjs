@@ -32,6 +32,13 @@
  * boot. A subscription ends on unsubscribe, when its watcher is archived or
  * deleted, when its last listed session is, or after firing (`once`).
  *
+ * relay_restarted is the relay's own event, opt-in by name: each start of
+ * the runtime (noteRelayStarted) wakes the subscriptions of this relay's
+ * watchers that name it, once, with how the run before ended
+ * (noteRelayExit). A conversation whose turn answered relay_restarted when
+ * the restart was requested (noteRestartRequested) is not woken by it: a
+ * woken turn that restarts again ends the chain.
+ *
  * Across paired relays (migrations/0012-cross-relay-event-subscriptions.mjs)
  * this service plays both sides:
  *
@@ -57,6 +64,8 @@ import {
   RELAY_EVENT_LINK_LOST_TYPE,
   RELAY_EVENT_LINK_RESTORED_TYPE,
   RELAY_EVENT_MESSAGE_KIND,
+  RELAY_EVENT_RELAY_LEVEL_TYPES,
+  RELAY_EVENT_RELAY_RESTARTED_TYPE,
   RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
   RELAY_EVENT_SUBSCRIBABLE_TYPES,
   RELAY_EVENT_TYPES,
@@ -66,6 +75,7 @@ import {
   effectiveRelayEventTypes,
   isLegacyDefaultRelayEventTypes,
   isRelayEventType,
+  isRelayLevelOnly,
   isUrgentRelayEventType,
   relayEventMatchText,
   relayEventTypesTake,
@@ -77,6 +87,12 @@ export const RELAY_EVENT_SELF_RELAY_ID = 'self';
 // conversation id, so nothing a paired relay asks for is ever written into
 // one of this relay's conversations.
 export const RELAY_EVENT_SERVED_WATCHER_PREFIX = 'remote:';
+// app_settings: how the runtime before this one ended, written on its way
+// out (noteRelayExit) and taken by the next start (noteRelayStarted).
+export const RELAY_LAST_EXIT_SETTING_KEY = 'relay_last_exit';
+// Older than this, a record is not of the run just before this one. Long:
+// a relay stopped for a weekend still says how; the line shows the stop time.
+export const RELAY_LAST_EXIT_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -291,6 +307,19 @@ export function createRelayEventService({
         AND COALESCE(m.kind, '') <> ?
     `),
     deleteDeliveredBefore: db.prepare(RELAY_EVENT_PRUNE_SQL.deleteDeliveredBefore),
+    // The loop guard: conversations whose running turn answers relay_restarted.
+    listRestartWokenRunning: db.prepare(`
+      SELECT DISTINCT q.conversation_id FROM queue q JOIN relay_events e ON e.message_id = q.id
+      WHERE q.status = 'processing' AND e.type = ?
+    `),
+  } : null;
+  const exitSql = available && tableExists('app_settings') ? {
+    get: db.prepare(`SELECT value FROM app_settings WHERE key = ?`),
+    put: db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `),
+    take: db.prepare(`DELETE FROM app_settings WHERE key = ?`),
   } : null;
   // Without migration 0012 the table has no remote_sync column.
   const deleteEndedSubscriptionsBefore = available
@@ -381,6 +410,12 @@ export function createRelayEventService({
   let sweepTimer = null;
   let started = false;
   let lastPruneAt = 0;
+  // relay_restarted: the conversations a requested restart does not wake
+  // (the loop guard), whether this runtime's end is written, and whether its
+  // start was noted.
+  const restartNoWake = new Set();
+  let exitNoted = false;
+  let startNoted = false;
 
   function isoNow() {
     return new Date(now()).toISOString();
@@ -500,12 +535,25 @@ export function createRelayEventService({
   /**
    * What a subscribe asks for, checked: `{ all, ids, types, matchText,
    * stalled, heartbeat }`. Throws RelayEventError (`invalid`, `notFound`).
-   * `exclude` is the watcher, never watched by itself.
+   * `exclude` is the watcher, never watched by itself. `relayLevel` allows
+   * relay_restarted (this relay's own watchers only); a subscription that
+   * names nothing else needs no sessions.
    */
-  function prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude = '' }) {
+  function prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude = '', relayLevel = false }) {
     const all = scope === 'all';
     const ids = all ? [] : [...new Set((Array.isArray(sessionIds) ? sessionIds : []).map(toText).filter(Boolean))];
-    if (!all && !ids.length) throw new RelayEventError('invalid', 'subscribe needs sessions (ids from list_sessions) or "all".');
+    const named = Array.isArray(events) ? events.map(toText).filter(Boolean) : [];
+    const relayLevelNamed = named.filter((type) => RELAY_EVENT_RELAY_LEVEL_TYPES.includes(type));
+    if (relayLevelNamed.length && !relayLevel) {
+      throw new RelayEventError('invalid', `${relayLevelNamed.join(', ')} is about the relay the watcher runs on and cannot be watched on another relay (an outage there shows as link_lost and link_restored).`);
+    }
+    if (!all && !ids.length && !isRelayLevelOnly(named)) {
+      throw new RelayEventError('invalid', `subscribe needs sessions (ids from list_sessions) or "all"${relayLevel ? ', unless events names only relay_restarted' : ''}.`);
+    }
+    // No session, no work that could run: a heartbeat would never come.
+    if (!all && !ids.length && heartbeatMinutes !== null && heartbeatMinutes !== undefined && heartbeatMinutes !== '') {
+      throw new RelayEventError('invalid', 'heartbeat_minutes needs sessions to watch; relay_restarted alone has none.');
+    }
     if (ids.length > RELAY_EVENT_LIMITS.sessionsMax) {
       throw new RelayEventError('invalid', `subscribe takes at most ${RELAY_EVENT_LIMITS.sessionsMax} sessions; use "all" for more.`);
     }
@@ -555,7 +603,7 @@ export function createRelayEventService({
     if (!available) throw new RelayEventError('unavailable', 'Event subscriptions are not available on this relay right now (its storage is missing; see the server log).');
     const watcher = toText(watcherConversationId);
     if (!isLive(conversation(watcher))) throw new RelayEventError('notFound', 'The watching conversation was not found or is archived.');
-    const prepared = prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude: watcher });
+    const prepared = prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude: watcher, relayLevel: true });
     const { all, ids, types } = prepared;
     checkWatcherCapacity(watcher);
     const id = `sub_${randomBytes(5).toString('hex')}`;
@@ -577,7 +625,8 @@ export function createRelayEventService({
     // The watched set starts from what it is doing now: all_idle fires when
     // work that is running now (or starts later) has ended.
     noteBusy(sql.getSubscription.get(id));
-    log(`conv=${shortId(watcher)} subscribed ${id} to ${all ? 'all sessions' : `${ids.length} session${ids.length === 1 ? '' : 's'}`} (${types.join(',')})${once ? ' once' : ''}`);
+    const what = all ? 'all sessions' : (ids.length ? `${ids.length} session${ids.length === 1 ? '' : 's'}` : 'this relay');
+    log(`conv=${shortId(watcher)} subscribed ${id} to ${what} (${types.join(',')})${once ? ' once' : ''}`);
     broadcast();
     return subscription;
   }
@@ -1617,6 +1666,131 @@ export function createRelayEventService({
     return ended;
   }
 
+  // ─── The relay's own start: relay_restarted ────────────────────────────────
+
+  /** Conversations whose running turn answers a relay_restarted event. */
+  function restartWokenConversations() {
+    if (!available) return [];
+    try {
+      return sql.listRestartWokenRunning.all(RELAY_EVENT_RELAY_RESTARTED_TYPE).map((row) => toText(row.conversation_id)).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * A restart or shutdown was requested: a conversation whose turn answers
+   * relay_restarted right now is not woken by it (the request may be that
+   * turn's). Called on every request while one is queued; returns them.
+   */
+  function noteRestartRequested() {
+    const woken = restartWokenConversations();
+    for (const id of woken) restartNoWake.add(id);
+    if (woken.length) log(`restart requested while ${woken.map(shortId).join(', ')} answer${woken.length === 1 ? 's' : ''} relay_restarted: not woken by it`);
+    return [...restartNoWake];
+  }
+
+  /** The queued request was withdrawn (or never queued): nothing is held back. */
+  function noteRestartCancelled() {
+    restartNoWake.clear();
+  }
+
+  /**
+   * This runtime ends cleanly: how, for the next start to tell. The first
+   * call wins (a queued request's details before the generic exit's); none
+   * before noteRelayStarted. `requestedAt` set means the end was a queued (or immediate) request.
+   */
+  function noteRelayExit({ action = 'shutdown', reason = '', requestedBy = null, requestedAt = null } = {}) {
+    // A runtime stopped before it listened (and took the record) leaves the
+    // record of the run before it for the next start.
+    if (!exitSql || exitNoted || !startNoted) return false;
+    exitNoted = true;
+    const requested = !!toText(requestedAt);
+    // The runtime's own reasons may carry a process id (`owner-pid-missing:<pid>`):
+    // not for an agent's eyes.
+    const ownReason = requested ? toText(reason) : toText(reason).replace(/:\d+\b/g, '');
+    const record = {
+      v: 1,
+      requested,
+      action: action === 'restart' ? 'restart' : 'shutdown',
+      reason: ownReason.slice(0, 140) || null,
+      requestedBy: toText(requestedBy).slice(0, 80) || null,
+      requestedAt: toText(requestedAt) || null,
+      stoppedAt: isoNow(),
+      noWake: [...restartNoWake],
+    };
+    try {
+      exitSql.put.run(RELAY_LAST_EXIT_SETTING_KEY, JSON.stringify(record), record.stoppedAt);
+      return true;
+    } catch (error) {
+      warn(`how this run ended was not stored: ${toText(error?.message || error).slice(0, 200)}`);
+      return false;
+    }
+  }
+
+  function restartedDetail(exit, startedAt) {
+    if (!exit) return { stop: 'unknown', startedAt };
+    const base = { startedAt, stoppedAt: toText(exit.stoppedAt) || null, reason: toText(exit.reason) || null };
+    if (exit.requested !== true) return { stop: 'stopped', ...base };
+    return {
+      stop: 'requested',
+      ...base,
+      action: exit.action === 'shutdown' ? 'shutdown' : 'restart',
+      requestedBy: toText(exit.requestedBy) || null,
+      requestedAt: toText(exit.requestedAt) || null,
+    };
+  }
+
+  /**
+   * The runtime started (it listens). Takes how the run before ended (read
+   * and deleted with the events written, so a start is told once) and gives
+   * every active subscription of this relay's live watchers that names
+   * relay_restarted one event; a `once` one ends with it. Watchers the
+   * restart's request held back (noteRestartRequested) are left out, and
+   * their `once` subscriptions end too (`held-back`): that restart was the
+   * one they were for, and a later one would wake them with a stale "carry
+   * on". A record older than RELAY_LAST_EXIT_MAX_AGE_MS is not the run just
+   * before (an older OAR, which neither writes nor takes it, may have run in
+   * between): it is dropped unread. Once per runtime. Returns `{ recorded,
+   * skipped }`.
+   */
+  function noteRelayStarted() {
+    if (!available || startNoted) return { recorded: 0, skipped: [] };
+    startNoted = true;
+    const startedAt = isoNow();
+    let recorded = 0;
+    let skipped = [];
+    const heldBack = [];
+    db.transaction(() => {
+      let exit = null;
+      if (exitSql) {
+        exit = parseJson(exitSql.get.get(RELAY_LAST_EXIT_SETTING_KEY)?.value, null);
+        exitSql.take.run(RELAY_LAST_EXIT_SETTING_KEY);
+        const stoppedAt = Date.parse(String(exit?.stoppedAt || ''));
+        if (exit && !(Number.isFinite(stoppedAt) && now() - stoppedAt <= RELAY_LAST_EXIT_MAX_AGE_MS)) exit = null;
+      }
+      const noWake = new Set((Array.isArray(exit?.noWake) ? exit.noWake : []).map(toText));
+      const rows = activeRows().filter((row) => !isMirror(row)
+        && !isServedKey(row.watcher_conversation_id)
+        && wants(row, { type: RELAY_EVENT_RELAY_RESTARTED_TYPE })
+        && isLive(conversation(row.watcher_conversation_id)));
+      const held = rows.filter((row) => noWake.has(row.watcher_conversation_id));
+      skipped = [...new Set(held.map((row) => row.watcher_conversation_id))];
+      for (const row of held) {
+        if (Number(row.once || 0) === 1 && endSubscription(row.id, 'held-back')) heldBack.push(row.id);
+      }
+      const woken = rows.filter((row) => !noWake.has(row.watcher_conversation_id));
+      if (!woken.length) return;
+      recorded = enqueueForRows(woken, buildEvent(RELAY_EVENT_RELAY_RESTARTED_TYPE, '', restartedDetail(exit, startedAt)), '');
+    })();
+    if (recorded || skipped.length) {
+      log(`relay started: ${recorded} watcher${recorded === 1 ? '' : 's'} told${skipped.length ? `; not woken (answering relay_restarted when this restart was requested): ${skipped.map(shortId).join(', ')}` : ''}`
+        + `${heldBack.length ? `; one-shot ${heldBack.join(', ')} ended (held-back)` : ''}`);
+    }
+    if (heldBack.length) broadcast();
+    return { recorded, skipped };
+  }
+
   // ─── Hooks ─────────────────────────────────────────────────────────────────
 
   function isRelayEventTurn(queueMessageId) {
@@ -1962,6 +2136,10 @@ export function createRelayEventService({
     noteQuestion,
     noteTaskEdge,
     noteConversationGone,
+    noteRestartRequested,
+    noteRestartCancelled,
+    noteRelayExit,
+    noteRelayStarted,
     afterStateChange,
     sweep,
     start,

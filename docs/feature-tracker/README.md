@@ -1,6 +1,6 @@
 # SDK Feature Tracker
 
-Updated: 2026-10-02
+Updated: 2026-10-20
 Scope: `server/` + `server/claude-worker/` + `server/claude-cloud-worker/` + `shared/claude-cloud/` + `.github/extensions/web-relay/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
@@ -9,8 +9,8 @@ that live in the relay itself (and apply to every provider) are tracked here.
 | Provider | Runtime | Tracker |
 | -------- | ------- | ------- |
 | **Copilot** | `@github/copilot-sdk`, driven by the CLI extension (foreground) or the standalone relay client | [copilot-sdk.md](copilot-sdk.md) |
-| **Copilot (SDK engine)** | The same SDK driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *implemented, experimental, burn-in pending; opt in per relay* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
-| **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars; image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md) + the core rows below |
+| **Copilot (SDK engine)** | The same SDK driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *the default engine since 0.9.2 on a relay that can run it (`getCopilotEngine()`), else the extension; burn-in checklist still open* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
+| **OpenAI (BYOK)** | Rides the Copilot worker of the selected engine via `COPILOT_PROVIDER_*` env vars (base URL from the OpenAI settings); image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md), [copilot-sdk-worker.md](copilot-sdk-worker.md#byok-openai-compatible) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
 | **Claude Cloud** | Claude Code cloud sessions (a sandbox at Anthropic on a clone of a GitHub repository), driven over the session API the Claude CLI itself uses by `server/claude-cloud-worker/` + `shared/claude-cloud/` — no SDK, no local agent; *not a documented public API, off by default* | [claude-cloud.md](claude-cloud.md) |
 | **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
@@ -38,7 +38,7 @@ checklist for a new provider (details per column in the per-SDK files).
 | Structured multi-field forms | Implemented (`onElicitationRequest`) | n/a (single-question cards only) | n/a | n/a | n/a |
 | Plan boards (`plan_ready`) | Implemented (tool detection + text fallback) | Implemented (`ExitPlanMode` + text fallback) | Implemented (text fallback only) | Implemented (text fallback only) | Not applicable (no relay modes) |
 | Subagent lifecycle bubbles | Implemented (SDK lifecycle events) | Implemented (inferred from tool blocks) | Implemented **with text/thinking attribution** via `tool-call-delta` nested frames (live-verified 2026-08-16) | Implemented (title/name-shaped detection; lifecycle chips) | Implemented (inferred from tool blocks; thoughts and activity attributed, subagent text not published) |
-| Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) | Not implemented (part of the session's configuration: 409 once the session exists, composer pin from the first message; see [claude-cloud.md](claude-cloud.md) for the launch-model caveat) |
+| Per-message model switch | Implemented (both paths since 2026-08-16) | Implemented | Implemented (re-pinned every send — sticky overrides) | Not implemented (locked; 409 + composer pin) | Implemented (2026-10-02: the worker sends a `set_model` control request before a message whose model differs from the one it last gave the sandbox; no 409, no composer pin; see [claude-cloud.md](claude-cloud.md)) |
 | Model discovery / catalog | Implemented | Implemented | Implemented (`Cursor.models.list()`) | Implemented (initialize `_meta.modelState` + CLI fallback) | No discovery of its own: the Claude provider's list under plain ids (`buildClaudeCloudModelList`) |
 | Reasoning effort per turn | Implemented | Implemented (plus the derived **Ultracode** tier on xhigh-capable models — a settings flag, not an `EffortLevel`) | Implemented (model params; per-model discovery) | Partial (best-effort `_meta`) | Not applicable (`none` only; `CLAUDE_CLOUD_REASONING_EFFORTS`) |
 | Attachments / images | Implemented | Implemented | Implemented (`images` on send; path notes otherwise) | Partial (path notes only) | Partial (inline images only, jpeg/png/gif/webp ≤ 5 MB; any other attachment refuses the turn, there is no path fallback) |
@@ -72,6 +72,12 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-10-20: Corrected stale rows against the code: the SDK engine is the default (since 0.9.2)
+  and no longer "experimental, opt in"; Claude Cloud switches models between turns (the matrix
+  still said 409 + pin); Claude Cloud's event stream stays open between turns (`idleCloseMs`
+  defaults to 0) and `scripts/claude-cloud-live-check.mjs` exists; `COPILOT_PROVIDER_BASE_URL` and
+  `COPILOT_PROVIDER_WIRE_API` are set by the relay (the base URL from the OpenAI settings, the wire API
+  from the model), not overridable from the environment.
 - 2026-10-03: **Compaction in progress, and a compaction window that takes effect.** The Claude
   worker publishes a compaction's start (`metadata: {kind:'compact_boundary', state:'pending'}`)
   and, when it ends without a boundary, `state:'cancelled'`; the page draws one break line per

@@ -4,6 +4,7 @@ import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
 import { buildUsageLimitFailure } from '../../shared/claude-usage-limit.mjs';
+import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -390,12 +391,30 @@ export function createClaudeTurnPublisher({ api, dbg = () => {}, takeWorkflowRun
     });
   }
 
-  async function publishTurnException({ message, errorText, usageLimit = null }) {
+  async function publishTurnException({ message, errorText, usageLimit = null, error = null }) {
     if (usageLimit) {
       await publishResponse(message, {
         text: usageLimit.text || errorText,
         model: null,
         terminalError: buildUsageLimitFailure(message, usageLimit),
+      });
+      return;
+    }
+    // The conversation's folder is gone: the error names it and says what to
+    // do, which neither a retry nor a sign-in changes.
+    if (isWorkingDirectoryMissingError(error)) {
+      await publishResponse(message, {
+        text: `System note: ${error.message} ${error.guidance}`,
+        model: null,
+        terminalError: {
+          kind: 'claude-turn-failed',
+          code: WORKING_DIRECTORY_MISSING_CODE,
+          stableCode: `claude.${WORKING_DIRECTORY_MISSING_CODE}`,
+          message: error.message,
+          guidance: error.guidance,
+          failedAt: new Date().toISOString(),
+          queueMessageId: String(message.id || '') || null,
+        },
       });
       return;
     }

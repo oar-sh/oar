@@ -13,6 +13,7 @@ import path from "path";
 import { generateHighEntropyToken } from "./utils/token-generation.mjs";
 import { delay, killProcessTree, sleep } from "./utils/process-utils.mjs";
 import {
+  carryOverPackageConfig,
   resolveRelayPaths,
   loadTokenFromConfig,
   loadRelayInstructionsFromFile,
@@ -60,7 +61,13 @@ const {
   LOG_DIR,
   SERVER_LOG_PATH,
   SERVER_ERR_PATH,
+  RELAY_ENV,
 } = resolveRelayPaths(import.meta.url);
+// A global install's config moves to the state root with the relay's data:
+// the one the package held before is copied there once (never over one).
+const CARRIED_OVER_CONFIG = RELAY_ENV.COPILOT_WEB_RELAY_CONFIG
+  ? carryOverPackageConfig({ serverDir: SERVER_DIR, configPath: CONFIG_PATH, dataDir: RELAY_ENV.COPILOT_WEB_RELAY_DATA_DIR })
+  : null;
 const SERVER_URL = resolveRelayServerUrl({ configPath: CONFIG_PATH });
 const SERVER_START_TIMEOUT_MS = 20_000;
 const NODE_BIN = process.env.COPILOT_WEB_RELAY_NODE || "node";
@@ -78,6 +85,7 @@ const MODEL_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
 const BANNER_DEDUPE_TTL_MS = 6 * 60 * 60 * 1000;
 const BANNER_DEDUPE_COOLDOWN_MS = 15 * 1000;
 const { dbg } = createDebugLogger({ logDir: LOG_DIR });
+if (CARRIED_OVER_CONFIG) dbg("copied the relay config", CARRIED_OVER_CONFIG, "to", CONFIG_PATH);
 const api = createApiClient({
   serverUrl: SERVER_URL,
   token: TOKEN,
@@ -117,6 +125,7 @@ const managedServerLifecycle = createManagedServerLifecycle({
   serverDir: SERVER_DIR,
   serverLogPath: SERVER_LOG_PATH,
   serverErrPath: SERVER_ERR_PATH,
+  relayEnv: RELAY_ENV,
   relayPort: Number(new URL(SERVER_URL).port) || 3333,
   nodeBin: NODE_BIN,
   serverStartTimeoutMs: SERVER_START_TIMEOUT_MS,

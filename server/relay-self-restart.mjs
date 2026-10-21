@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import path from 'path';
-import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
+import { RELAY_RESTART_EXIT_CODE, RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
 
 // Role selection travels on argv, never in the environment. The runtime's env is
 // inherited by tmux worker sessions and by the Copilot CLI it launches, and the
@@ -149,6 +149,11 @@ export async function runDirectRelaySupervisor({
 
       if (exitCode === 0) {
         return await exitImpl(0);
+      }
+
+      // Stopped on purpose, with its reason already said: not a crash.
+      if (exitCode === RELAY_STOP_EXIT_CODE) {
+        return await exitImpl(RELAY_STOP_EXIT_CODE);
       }
 
       const attempt = crashCount + 1;

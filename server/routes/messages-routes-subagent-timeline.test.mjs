@@ -247,3 +247,86 @@ test('a failed turn closes its foreground runs with their turn named, and leaves
   assert.equal(closed.messageId, 'q-2', 'the event names the run\'s turn so the browser can place it');
   assert.equal(closed.status, 'failed');
 });
+
+// ─── A resumed background agent ─────────────────────────────────────────────
+
+// A Claude session that sends a finished background agent a new message
+// resumes it as a new run of the same task: the task id stays, the CLI names
+// the SendMessage call as the task's tool use. The relay only knows the run
+// by its spawn id, so it finds the run by the task id.
+const SEND = 'toolu_fixture_send';
+
+async function finishedBackgroundRun(call) {
+  await spawnRun(call, { background: true, timelineOwner: 'worker' });
+  await call('POST', '/api/subagent-timeline', {
+    body: { conversationId: CONV, subagentRunId: RUN, header: { taskId: 'agent-fixture-1', background: true }, entries: [{ key: 'w:1', kind: 'text', text: 'First pass done.' }] },
+  });
+  await call('POST', '/api/subagent-timeline', {
+    body: { conversationId: CONV, subagentRunId: RUN, header: { status: 'completed' }, entries: [{ key: 'w:2', kind: 'note', text: 'Finished: first pass' }] },
+  });
+}
+
+test('a resumed agent\'s record continues its first run: found by the task id, running again', async () => {
+  const { call, stmts, events } = boot();
+  await finishedBackgroundRun(call);
+  assert.ok(stmts.getSubagentRun.get(RUN).completed_at);
+
+  const resumed = await call('POST', '/api/subagent-timeline', {
+    body: {
+      conversationId: CONV,
+      subagentRunId: SEND,
+      taskId: 'agent-fixture-1',
+      header: { taskId: 'agent-fixture-1', status: 'running', background: true, timelineOwner: 'worker' },
+      entries: [],
+    },
+  });
+  assert.equal(resumed.status, 200);
+  assert.equal(stmts.getSubagentRun.get(SEND), undefined, 'no second run');
+  const row = stmts.getSubagentRun.get(RUN);
+  assert.equal(row.status, 'running');
+  assert.equal(row.completed_at, null, 'a running run has no end time');
+  assert.equal(events('subagent_status').at(-1).subagentRunId, RUN);
+
+  // An entry-only write names the task too, and lands on the same run.
+  await call('POST', '/api/subagent-timeline', {
+    body: { conversationId: CONV, subagentRunId: SEND, taskId: 'agent-fixture-1', entries: [{ key: 'w:4', kind: 'text', text: 'Tests pass.' }] },
+  });
+  const page = await call('GET', '/api/conversation/:conversationId/subagent/:subagentRunId', { params: { conversationId: CONV, subagentRunId: RUN }, query: {} });
+  assert.equal(page.status, 200);
+  assert.deepEqual(page.body.entries.map((entry) => entry.text), [
+    'First pass done.',
+    'Finished: first pass',
+    'Resumed with a new message',
+    'Tests pass.',
+  ]);
+  assert.equal(page.body.run.status, 'running');
+  // The relay marks the resume once: a repeated post keeps the one note.
+  await call('POST', '/api/subagent-timeline', {
+    body: { conversationId: CONV, subagentRunId: SEND, taskId: 'agent-fixture-1', header: { status: 'running' }, entries: [] },
+  });
+  const again = await call('GET', '/api/conversation/:conversationId/subagent/:subagentRunId', { params: { conversationId: CONV, subagentRunId: RUN }, query: {} });
+  assert.equal(again.body.entries.filter((entry) => entry.metadata?.resumed).length, 1);
+
+  // A task id no run carries, or one of another conversation, is still unknown.
+  const stranger = await call('POST', '/api/subagent-timeline', { body: { conversationId: CONV, subagentRunId: 'toolu_fixture_other', taskId: 'agent-nobody', entries: [] } });
+  assert.equal(stranger.status, 404);
+  const elsewhere = await call('POST', '/api/subagent-timeline', { body: { conversationId: OTHER_CONV, subagentRunId: 'toolu_fixture_other', taskId: 'agent-fixture-1', entries: [] } });
+  assert.equal(elsewhere.status, 404);
+});
+
+test('the task panel row of a resumed agent opens its run, whatever tool use the worker names', async () => {
+  const { call, stmts, events } = boot();
+  await finishedBackgroundRun(call);
+  await call('POST', '/api/background-tasks', {
+    body: { conversationId: CONV, tasks: [{ taskId: 'agent-fixture-1', taskRunId: 'run-fixture-2', taskType: 'local_agent', description: 'Survey the widget parser', toolUseId: SEND, totalTokens: 300 }] },
+  });
+  const [panel] = events('background_tasks');
+  assert.equal(panel.tasks[0].toolUseId, RUN, 'the row opens the run the relay knows');
+  assert.equal(panel.tasks[0].taskRunId, 'run-fixture-2');
+  assert.equal(stmts.getSubagentRun.get(RUN).total_tokens, 300);
+  // A shell never borrows a run.
+  await call('POST', '/api/background-tasks', {
+    body: { conversationId: CONV, tasks: [{ taskId: 'agent-fixture-1', taskType: 'local_bash', description: 'npm test', toolUseId: 'toolu_fixture_bash' }] },
+  });
+  assert.equal(events('background_tasks').at(-1).tasks[0].toolUseId, 'toolu_fixture_bash');
+});

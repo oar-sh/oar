@@ -27,6 +27,17 @@ test('an enabled lane yields the generated block with the relay public base URL'
   assert.ok(block.startsWith(PREVIEW_INSTRUCTION_HEADING));
 });
 
+test('the block names the asking conversation, from one cached lookup', async () => {
+  const api = createFakeApi({ enabled: true, publicBaseUrl: 'https://previews.example.test', previews: [] });
+  const provider = createPreviewInstructionsProvider({ api });
+  const first = await provider({ conversationId: 'conv-a' });
+  const second = await provider({ conversationId: 'conv-b' });
+  assert.match(first, /\?conversationId=conv-a/);
+  assert.match(second, /\?conversationId=conv-b/);
+  assert.doesNotMatch(second, /conv-a/);
+  assert.deepEqual(api.calls, ['GET /api/previews']);
+});
+
 test('a disabled lane yields no block', async () => {
   const api = createFakeApi({ enabled: false, publicBaseUrl: '', previews: [] });
   assert.equal(await createPreviewInstructionsProvider({ api })(), '');

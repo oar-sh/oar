@@ -5,6 +5,7 @@ import {
   describeExecError,
   describeSpawnEnvironment,
   envPathKey,
+  normalizeTempEnv,
   readEnvValue,
   windowsCmdPath,
   windowsSystemRoot,
@@ -66,4 +67,29 @@ test('an exec error reads as code, signal, message and stderr on one line', () =
   assert.equal(describeExecError(Object.assign(new Error('spawn x ENOENT'), { code: 'ENOENT' })), 'code=ENOENT spawn x ENOENT');
   assert.equal(describeExecError(Object.assign(new Error('timed out'), { signal: 'SIGTERM', killed: true })), 'signal=SIGTERM timed out');
   assert.equal(describeExecError(null), 'unknown error');
+});
+
+test('a quoted TEMP loses its quotes; one that is not there becomes the user temp folder', () => {
+  const folders = new Set(['C:\\My Temp', 'C:\\Users\\dev\\AppData\\Local\\Temp']);
+  const existsImpl = (dir) => folders.has(dir);
+  const env = { Temp: '"C:\\My Temp"', TMP: 'Q:\\temp', LOCALAPPDATA: 'C:\\Users\\dev\\AppData\\Local' };
+  const changes = normalizeTempEnv({ env, platform: 'win32', existsImpl });
+  assert.equal(env.Temp, 'C:\\My Temp', 'the key keeps its case');
+  assert.equal(env.TMP, 'C:\\Users\\dev\\AppData\\Local\\Temp');
+  assert.deepEqual(changes, ['TEMP "C:\\My Temp" -> C:\\My Temp', 'TMP Q:\\temp -> C:\\Users\\dev\\AppData\\Local\\Temp']);
+  // Good values, and other platforms, are left alone.
+  const good = { TEMP: 'C:\\My Temp', TMP: 'C:\\My Temp' };
+  assert.deepEqual(normalizeTempEnv({ env: good, platform: 'win32', existsImpl }), []);
+  assert.deepEqual(good, { TEMP: 'C:\\My Temp', TMP: 'C:\\My Temp' });
+  const posix = { TMPDIR: '/tmp', TEMP: '"/odd"' };
+  assert.deepEqual(normalizeTempEnv({ env: posix, platform: 'linux', existsImpl }), []);
+  assert.equal(posix.TEMP, '"/odd"');
+  // No folder to fall back on: only the quotes go.
+  const bare = { TEMP: '"Q:\\gone"' };
+  normalizeTempEnv({ env: bare, platform: 'win32', existsImpl: () => false });
+  assert.equal(bare.TEMP, 'Q:\\gone');
+  // The user's temp folder is used only when it is there.
+  const noFallback = { TEMP: 'Q:\\gone', LOCALAPPDATA: 'C:\\Users\\dev\\AppData\\Local' };
+  assert.deepEqual(normalizeTempEnv({ env: noFallback, platform: 'win32', existsImpl: () => false }), []);
+  assert.equal(noFallback.TEMP, 'Q:\\gone');
 });

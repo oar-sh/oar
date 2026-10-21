@@ -33,6 +33,31 @@ export function readEnvValue(env, name) {
   return '';
 }
 
+/**
+ * On Windows, TEMP and TMP as the relay and its children get them: without
+ * surrounding quotes (`"D:\My Temp"` puts PowerShell into ConstrainedLanguage
+ * mode), and a folder that is not there replaced by the user's own temp
+ * folder. Changes `env` in place; returns what changed, for one log line.
+ */
+export function normalizeTempEnv({ env = process.env, platform = process.platform, existsImpl = fs.existsSync } = {}) {
+  if (platform !== 'win32') return [];
+  const local = readEnvValue(env, 'LOCALAPPDATA') || (readEnvValue(env, 'USERPROFILE') && path.win32.join(readEnvValue(env, 'USERPROFILE'), 'AppData', 'Local'));
+  const fallback = local ? path.win32.join(local, 'Temp') : '';
+  const changes = [];
+  for (const name of ['TEMP', 'TMP']) {
+    const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name);
+    if (!key) continue;
+    const before = String(env[key]);
+    let value = before.trim().replace(/^"(.*)"$/, '$1').trim();
+    if ((!path.win32.isAbsolute(value) || !existsImpl(value)) && fallback && existsImpl(fallback)) value = fallback;
+    if (value !== before) {
+      env[key] = value;
+      changes.push(`${name} ${before} -> ${value}`);
+    }
+  }
+  return changes;
+}
+
 /** The key PATH is stored under in `env` (`Path` on most Windows machines). */
 export function envPathKey(env, platform = process.platform) {
   if (env && typeof env === 'object') {

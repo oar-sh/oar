@@ -560,3 +560,74 @@ test('a running background row that its worker\'s set does not list is dropped o
   t.db.prepare(`UPDATE subagent_runs SET updated_at = started_at, background = 0`).run();
   assert.equal(t.tracker.describe(CONV).runningTaskCount, 1);
 });
+
+// ─── A resumed sub-agent: the same task id, a run of its own ────────────────
+
+// A Claude session that sends a finished background agent a new message
+// resumes it: the CLI registers the same task id again, with a new run id
+// (the SDK's `run_id`, `taskRunId` in the worker's set).
+test('a resumed sub-agent is a running task again, with a start of its own, and ends once more', () => {
+  const t = setup();
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', toolUseId: 'toolu_fixture_orbit', taskRunId: 'run-fixture-1', status: 'completed', summary: 'First pass done' });
+  t.tracker.noteTaskSet(CONV, []);
+  // A late set of the first run does not bring it back.
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  assert.equal(t.tracker.describe(CONV).state, 'idle');
+
+  t.advance(60_000);
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-2', startedAt: T0 + 60_000, summary: null })]);
+  const view = t.tracker.describe(CONV);
+  assert.equal(view.state, 'background_only');
+  assert.deepEqual(view.tasks.map((task) => [task.id, task.status, task.runId]), [['task-agent-1', 'running', 'toolu_fixture_orbit']],
+    'one row: the task runs again, the first run\'s end is not listed beside it');
+  assert.equal(view.tasks[0].startedAt, new Date(T0 + 60_000).toISOString());
+  assert.deepEqual(t.edges.map((edge) => edge.type), ['task_started', 'task_finished', 'task_started']);
+
+  // A settle of the first run that arrives late does not end the second.
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', toolUseId: 'toolu_fixture_orbit', taskRunId: 'run-fixture-1', status: 'completed' });
+  assert.equal(t.tracker.describe(CONV).runningTaskCount, 1);
+
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', toolUseId: 'toolu_fixture_orbit', taskRunId: 'run-fixture-2', status: 'failed', summary: 'Tests still red' });
+  t.tracker.noteTaskSet(CONV, []);
+  const ended = t.tracker.describe(CONV);
+  assert.equal(ended.state, 'idle');
+  assert.deepEqual(t.edges.map((edge) => edge.type), ['task_started', 'task_finished', 'task_started', 'task_failed']);
+  assert.equal(ended.tasks[0].summary, 'Tests still red');
+});
+
+test('a set that names no run cannot tell a resume from a late set: the ended task stays ended', () => {
+  const t = setup();
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', taskRunId: 'run-fixture-1', status: 'completed' });
+  t.tracker.noteTaskSet(CONV, [agentTask()]);
+  assert.equal(t.tracker.describe(CONV).state, 'idle');
+  assert.deepEqual(t.edges.map((edge) => edge.type), ['task_started', 'task_finished']);
+});
+
+test('a task back in the set within the grace, under another run, ended and started again: the earlier run\'s late notice does not end it', () => {
+  const t = setup();
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  // It leaves without word, and is resumed before the grace is over.
+  t.tracker.noteTaskSet(CONV, []);
+  t.advance(1_000);
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-2', startedAt: T0 + 1_000 })]);
+  assert.deepEqual(t.edges.map((edge) => edge.type), ['task_started', 'task_finished', 'task_started']);
+  // The first run's notice, sent again late.
+  t.tracker.noteTaskSettled(CONV, { taskId: 'task-agent-1', taskRunId: 'run-fixture-1', status: 'failed' });
+  t.advance(TASK_END_GRACE_MS + 1);
+  const view = t.tracker.describe(CONV);
+  assert.equal(view.runningTaskCount, 1);
+  assert.equal(view.tasks[0].startedAt, new Date(T0 + 1_000).toISOString());
+  assert.equal(t.edges.length, 3);
+});
+
+test('a task back in the set within the grace under the same run never ended', () => {
+  const t = setup();
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  t.tracker.noteTaskSet(CONV, []);
+  t.tracker.noteTaskSet(CONV, [agentTask({ taskRunId: 'run-fixture-1' })]);
+  t.advance(TASK_END_GRACE_MS + 1);
+  assert.equal(t.tracker.describe(CONV).runningTaskCount, 1);
+  assert.deepEqual(t.edges.map((edge) => edge.type), ['task_started']);
+});

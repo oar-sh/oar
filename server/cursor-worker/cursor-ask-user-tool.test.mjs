@@ -24,7 +24,7 @@ test('tool shape steers the model and validates 1-4 questions with 2-6 options',
     + 'This is the ONLY way to ask the user anything: a question written as plain '
     + 'reply text is NOT shown interactively and ends the turn unanswered. Call '
     + 'this tool whenever user input would materially change the result, before '
-    + 'making assumptions. Provide 2-4 concise options per question; the user can '
+    + 'making assumptions. Provide 2-6 concise options per question; the user can '
     + 'always answer in free text instead. This tool blocks until the user '
     + 'responds; on timeout it returns an instruction to continue under the '
     + 'current relay mode.',

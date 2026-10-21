@@ -47,10 +47,11 @@ relay, **Agents may** limits it to *read only*, *read and prompt* (existing sess
 (also create sessions, answer questions, stop turns, archive). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
-session it works in, as far as the other relay offers it. A model the provider does not list there
-(the list New Chat offers) is refused before anything is created or sent, with the close matches
-("Unknown model 'gpt-5-4' for Copilot on relay …; did you mean 'gpt-5.4'?"); for Claude, `opus`, `sonnet` and
-`haiku` stand for the newest listed model of that name, and a Copilot model named with its effort
+session it works in, as far as the other relay offers it. A `send` that names no model or effort
+keeps the ones the session there uses. A model in `create_session` or `send` that the provider
+does not list there (the list New Chat offers) is refused before anything is created or sent,
+with the close matches ("Unknown model 'gpt-5-4' for Copilot on relay …; did you mean 'gpt-5.4'?"); for
+Claude, `opus`, `sonnet` and `haiku` stand for the newest listed model of that name, and a Copilot model named with its effort
 (`gpt-5.4-high`) runs as that model with that effort. When the relay has no list for the
 provider yet (its model discovery has not run), the model is passed on unchecked and the answer
 says so. A [Claude Cloud](providers.md#claude-cloud) session
@@ -79,9 +80,18 @@ sending relay, session and model on the message, and marks sessions an agent cre
 conversation list. The remote agent sees a one-line header saying that another agent is talking
 to it. In the transcript, a message from another agent (on a paired relay or on this one) folds
 into one row ("note from … · answered below") that opens to the full text; the session's reply
-always shows, like a reply to you. Turns started this way do not send "reply ready"
-notifications on the remote relay; question cards still do. **Accept prompts from other relays' agents** in **Settings → Relays**
-switches incoming agent prompts off.
+always shows, like a reply to you. A turn that an agent started, from a paired relay or from
+this one, sends no "reply ready" or "failed" push notification: the agent waits for the reply
+and reports back itself. Question cards still notify.
+
+**Accept prompts from other relays' agents** in **Settings → Relays** (on by default) leaves
+other relays' agents only reading when you switch it off. They are then refused when they prompt
+a session, start one, answer a question, stop a turn, cancel a queued message, archive or
+unarchive a session, subscribe to sessions here, or fetch the events of a subscription. So a
+paired relay that [watches sessions](#watching-sessions) here gets no events while it is off;
+this relay keeps them, as during an outage, and delivers them once the switch is on again.
+Listing and reading sessions, a task's output, `wait`, `relay_info` and `usage` still work. This
+relay's own agents ([agent sessions](#agent-sessions)) are not affected.
 
 The calls go through your own relay, which holds the other relay's token: agents never see a
 token. Remote addresses must use `https://`; plain `http://` is accepted only for loopback (an
@@ -161,6 +171,19 @@ for every session, later ones included; the watcher's own conversation is never 
 filter replies and task results by a regular expression, end after it fired once, and add a
 heartbeat while work runs.
 
+**After a relay restart.** An agent can also ask to be woken when this relay runs again, after a
+restart, an update, a crash or a host reboot: `relay_restarted` in `events`, with no sessions
+needed. It is never part of the default; only an agent that names it is woken. An agent that is
+about to restart the relay subscribes to it with `once` first, so it goes on with its work when the
+relay is back even if the timers its CLI had scheduled did not survive. The message says when the
+relay came back and how it stopped: who requested the restart, when and why, or that the relay
+did not record how it stopped (for example a crash, a forced stop or a reboot; on Windows an
+ordinary stop by the supervisor may read like that too). Each start wakes such a subscription
+once. A restart requested while a turn that such a message woke is still running does not wake
+that conversation, whoever asked for it, so restarts cannot chain into a loop; the message says so,
+and a `once` subscription held back this way ends. This one needs no approval card when it names no
+sessions (it watches no session), and it is for this relay only.
+
 Subscriptions made before this default changed without naming events get the new default by
 themselves; those that named their events keep them. A paired relay that runs an older OAR applies its own
 default and refuses `subagent_finished` by name.
@@ -174,11 +197,14 @@ questions and errors still come at once.
 
 **What it may do.** A subscription only notifies. It approves nothing and answers
 nothing; what an event asks for is decided as before, by you or by the agent within what
-it may do anyway. The first subscribe of a conversation, and any to `all`, asks you on an approval
-card naming the sessions (and the relay); `transfer_subscriptions`, which hands every subscription
+it may do anyway. A conversation's first subscribe to sessions of a relay asks you on an approval
+card naming the sessions (and the relay), and so does its first subscribe to `all` sessions of
+that relay; **Allow** covers the later ones there. The approval is per relay: subscribing to
+sessions of another relay asks again. `transfer_subscriptions`, which hands every subscription
 of an old watcher to a new one, always asks.
 
-**Where you see it.** The watcher's header shows **watching N sessions**; the chip opens the list
+**Where you see it.** The watcher's header shows **watching N sessions** (**waiting for a relay
+restart** when it only asked for `relay_restarted`); the chip opens the list
 of its subscriptions with an **Unsubscribe** button each. A watched session shows a **watched**
 badge.
 

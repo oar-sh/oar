@@ -1560,13 +1560,15 @@ export async function loadRelayQuestion(questionId) {
   return apiFetch(`/api/relay-question/${encodeURIComponent(id)}`);
 }
 
-export async function answerRelayQuestion(questionId, answer, sdkSessionId = null) {
+// `onErrorResponse` reads the relay's refusal (why, and a card's choices).
+export async function answerRelayQuestion(questionId, answer, sdkSessionId = null, { onErrorResponse } = {}) {
   const id = String(questionId || '').trim();
   if (!id) return null;
   const sessionId = String(sdkSessionId || '').trim();
   return apiFetch(`/api/relay-question/${encodeURIComponent(id)}/answer`, {
     method: 'POST',
     body: JSON.stringify({ answer, sdk_session_id: sessionId || undefined }),
+    onErrorResponse,
   });
 }
 

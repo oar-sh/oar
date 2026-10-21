@@ -112,7 +112,7 @@ test.describe.serial("Copilot engine panel on a relay without session-worker rou
     // switching does not disturb a running session.
     const panel = page.locator("#settings-provider-panel-copilot");
     await expect(panel).toContainText("no tmux inspector for those sessions");
-    await expect(panel).toContainText("Applies to newly started conversations");
+    await expect(panel).toContainText("Applies whenever a conversation's worker starts");
   });
 
   test("refuses the SDK engine in place, with the relay's reason", async ({ page, request }) => {

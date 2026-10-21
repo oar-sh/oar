@@ -30,6 +30,22 @@ test('the preview block replaces the static section of the tool guidance', async
   assert.match(prefix, /## After/);
 });
 
+test('the preview block is asked for the message\'s conversation', async () => {
+  const asked = [];
+  const build = createCopilotPromptContextBuilder({
+    toolInstructions: TOOLS,
+    getPreviewInstructions: (options) => {
+      asked.push(options);
+      return `## Preview servers\n\nGET /api/previews?conversationId=${options?.conversationId}`;
+    },
+  });
+
+  const { prefix } = await build({ relayMode: 'agent', conversationId: 'conv-7' });
+
+  assert.deepEqual(asked, [{ conversationId: 'conv-7' }]);
+  assert.match(prefix, /conversationId=conv-7/);
+});
+
 test('a disabled preview lane drops the section rather than advertising a 503', async () => {
   const build = createCopilotPromptContextBuilder({
     toolInstructions: TOOLS,

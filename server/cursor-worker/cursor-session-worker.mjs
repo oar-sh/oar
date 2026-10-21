@@ -17,6 +17,7 @@ import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-fil
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createCursorTurnRunner } from './cursor-turn-runner.mjs';
+import { resolveCursorSessionStoreDir } from '../services/cursor-session-root-service.mjs';
 
 // Windows console launch: the launcher names the worker log, this copies
 // stdout/stderr into it. A no-op wherever the launcher redirects instead.
@@ -57,8 +58,14 @@ async function main() {
     // renewal hint, which is more visible to the user than a dead worker.
     console.warn('cursor-session-worker: CURSOR_API_KEY is not set; turns will fail until it is provided');
   }
-  const storeDir = String(process.env.CURSOR_AGENT_STORE_DIR || '').trim()
-    || path.resolve(__dirname, '..', 'data', 'cursor-agents');
+  // `$CURSOR_AGENT_STORE_DIR`, else `cursor-agents` in the relay's data dir:
+  // the same folder the relay's Session root looks in.
+  const storeDir = resolveCursorSessionStoreDir({
+    env: process.env,
+    serverDir: path.resolve(__dirname, '..'),
+    configPath,
+    sdkSessionId,
+  });
 
   const api = createApiClient({
     serverUrl,

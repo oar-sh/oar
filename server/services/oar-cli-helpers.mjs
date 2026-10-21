@@ -194,6 +194,9 @@ export function buildSystemdUnit({ nodeBin, packageRoot, configPath, dataDir, lo
     // an install with a private Node, `node` and `npm` themselves.
     ...(pathEnv ? [`Environment="PATH=${escapeSystemdValue(pathEnv)}"`] : []),
     'Restart=on-failure',
+    // 78 (RELAY_STOP_EXIT_CODE): the relay stopped on purpose, its database
+    // or data folder needs a decision; restarting it cannot help.
+    'RestartPreventExitStatus=78',
     'RestartSec=5',
     '',
     '[Install]',
@@ -231,7 +234,9 @@ export function buildServicePath({ nodeBin, envPath = '', homeDir = '' } = {}) {
  * accept the flag and run the scripts as before. `npm-install-scripts.test.mjs`
  * holds this list to the lockfile.
  */
-export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['better-sqlite3', 'koffi']);
+// @oar-sh/oar itself: its preinstall copies the data an earlier version
+// kept inside the package before npm deletes it (package-data-rescue.mjs).
+export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['@oar-sh/oar', 'better-sqlite3', 'koffi']);
 export const NPM_ALLOW_SCRIPTS_ARG = `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`;
 
 /**

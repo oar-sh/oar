@@ -32,6 +32,7 @@ import {
 } from './copilot-model-switch.mjs';
 import { copilotRuntimeEntry } from '../copilot-sdk-runtime.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
+import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
 
 const VERSION_DIR_RE = /^\d+\.\d+\.\d+$/;
 
@@ -510,6 +511,16 @@ export const COPILOT_TURN_CONTINUE_GUIDANCE =
  */
 export function classifyCopilotTurnException(error) {
   const detail = String(error?.message || error || '').trim() || 'unknown error';
+  // The conversation's folder is gone; the message names it.
+  if (isWorkingDirectoryMissingError(error)) {
+    return {
+      code: WORKING_DIRECTORY_MISSING_CODE,
+      stableCode: `copilot.${WORKING_DIRECTORY_MISSING_CODE}`,
+      text: detail,
+      guidance: error.guidance,
+      detail,
+    };
+  }
   // An unconfirmed explicit model selection (audit #13). The error's own
   // message already names requested vs actual model, so it IS the user-facing
   // text; the stable code is what lets the UI (and tests) key on it.

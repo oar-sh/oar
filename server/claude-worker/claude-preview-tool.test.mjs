@@ -83,6 +83,7 @@ test('the conversation id is resolved per call', async () => {
 test('a disabled lane and a bad input both come back as quotable JSON, never a throw', async () => {
   const disabled = createPreviewToolDefinition({
     api: async () => { throw new Error('Preview lane is disabled'); },
+    getConversationId: () => 'conv-1',
   });
   assert.deepEqual(
     JSON.parse((await disabled.handler({ action: 'list' }, {})).content[0].text),

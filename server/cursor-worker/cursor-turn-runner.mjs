@@ -23,6 +23,7 @@ import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instr
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
 // Stale-auth recovery budget per turn: expiry is routine on long-lived
 // handles, and one retry proved too small in practice (an orchestrator turn
@@ -122,6 +123,9 @@ export function createCursorTurnRunner({
   resolveModelParamsImpl = resolveCursorReasoningParams,
   createNormalizerImpl = createSdkMessageNormalizer,
   buildUserMessageImpl = buildCursorUserMessage,
+  // The error an agent started in `cwd` fails with up front, or null
+  // (shared/worker-runtime/working-directory.mjs).
+  checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   // Whether agent handles carry the relay's `remote_relay` tool
   // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
   remoteRelayToolGate = null,
@@ -174,7 +178,9 @@ export function createCursorTurnRunner({
   // plain refusal the model can relay instead of a failed turn.
   const previewTool = createPreviewTool({
     api,
-    getConversationId: () => activeMessage?.conversationId || '',
+    // Between turns, the worker's own session (as remote_relay below): list
+    // and close are scoped to a conversation and refused without one.
+    getConversationId: () => activeMessage?.conversationId || sdkSessionId || '',
     dbg,
   });
   const customTools = {
@@ -301,6 +307,10 @@ export function createCursorTurnRunner({
       agentHandle = null;
     }
     if (!agentHandle) {
+      // The agent works in the conversation's folder: a folder that is gone
+      // fails the turn with its name (and is no reason to drop the agent).
+      const missingFolder = checkWorkingDirectoryImpl(cwd);
+      if (missingFolder) throw missingFolder;
       const durableId = String(message.cursorAgentId || '').trim() || cursorAgentId;
       const agents = buildCursorSubagentAgents(rosterModels);
       await remoteRelayGate.ready();
@@ -309,11 +319,15 @@ export function createCursorTurnRunner({
       try {
         agentHandle = await createAgentHandleImpl({ ...options, agentId: durableId });
       } catch (error) {
-        if (!durableId) throw error;
+        if (!durableId) throw explainLaunchFailure(error, cwd, { check: checkWorkingDirectoryImpl });
         // The durable agent may have been pruned server-side; fall back to a
         // fresh agent rather than wedging the conversation.
         dbg('cursor agent resume failed, creating fresh agent', error?.message || String(error));
-        agentHandle = await createAgentHandleImpl({ ...options, agentId: '' });
+        try {
+          agentHandle = await createAgentHandleImpl({ ...options, agentId: '' });
+        } catch (freshError) {
+          throw explainLaunchFailure(freshError, cwd, { check: checkWorkingDirectoryImpl });
+        }
       }
     }
     // Only recorded once a handle exists: a create that threw leaves the
@@ -787,6 +801,7 @@ export function createCursorTurnRunner({
           // A stall is told in the user's terms, and with its own advice: the
           // run was cancelled, so sending the message again is all it takes.
           message: classified.text || classified.message,
+          ...(classified.guidance ? { guidance: classified.guidance } : {}),
           ...(classified.isStalled ? { guidance: 'Send the message again to retry.' } : {}),
           failedAt: new Date().toISOString(),
           queueMessageId: String(message.id || '') || null,

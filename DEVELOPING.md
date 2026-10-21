@@ -139,7 +139,7 @@ In extension-managed mode, the worker WebSocket begins after the CLI session bec
 The extension supervises managed `server.js` restarts (bounded backoff) while the CLI session is alive, and stops restart attempts on session shutdown.
 When the CLI extension connects, it also prints the relay info window (local/network/remote/auth URLs) directly in the Copilot CLI client.
 
-On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry (*At sign-in*) that opens a visible terminal at sign-in and runs the installed `node server\server.js` path, or a boot-triggered scheduled task (*At system startup*). Either starts only the web relay server. With session worker routing on (the default), the relay then launches each conversation's worker itself; only with routing off must a Copilot CLI session using the extension attach before queued turns can be processed. Turning the setting off removes the OAR Startup entry.
+On Windows, **Settings → Autostart (Windows)** can add a per-user Startup entry (*At sign-in*) that opens a visible terminal at sign-in and runs the installed `node server\server.js` path, or a boot-triggered scheduled task (*At system startup*). Either starts only the web relay server, with the config, data and log folders `oar start` uses (`resolveRelayStateDirs` in `server/services/oar-state-layout.mjs`). Before Node starts, both wait up to 5 minutes in all for `%TEMP%` and the drive of the data folder, and log a wait that runs out (`autostartWaitLines`). Once it runs, the relay brings an entry or launcher an earlier version generated for the install up to date: one without the data and log folders, without the wait, or with the Node line that dropped Node's exit code (`buildEarlierWindowsAutostartScripts`, `buildEarlierBootLauncherScripts`); one edited by hand is left alone. Every generated launcher jumps over a line of blanks that reaches past the end of the file it replaced (at least 4 KB, for a cmd of an earlier entry still running when autostart is switched off and on), and its Node line (`& exit`, which hands on Node's exit code) ends the script, so it can be rewritten while a cmd.exe still runs the earlier one (`buildLauncherFile` in `server/services/windows-autostart-service.mjs`). With session worker routing on (the default), the relay then launches each conversation's worker itself; only with routing off must a Copilot CLI session using the extension attach before queued turns can be processed. Turning the setting off removes the OAR Startup entry.
 
 ### Manual relay control
 
@@ -298,7 +298,15 @@ recurring trap:
 - **A restart is not a deploy for session workers.** Worker processes survive
   relay restarts by design (resume-across-restart; idle shutdown closes only
   their SDK runtime, never the process), so a live worker keeps executing the
-  code it loaded at spawn. After changing worker-side code, recycle affected
+  code it loaded at spawn. That holds for every restart the relay performs
+  itself (exit 75, relaunched by `server.js`'s supervisor or the CLI
+  extension), also under the systemd user service. It does not hold for
+  `systemctl --user stop|restart oar` (what `oar stop`, `oar restart` and
+  `oar setup` run when the service is active): the unit sets no `KillMode`,
+  so systemd's default `control-group` stops every process in the service's
+  cgroup, detached workers and a tmux server the service started included;
+  only workers on a tmux server started outside the service survive
+  (`relay-restart-picture.mjs` describes the same). After changing worker-side code, recycle affected
   workers too — `POST /api/session-worker/<sdkSessionId>/kill` or
   `tmux kill-session -t <sdk-session-id>` — and compare
   `pgrep -af 'session-worker'` start times against the deploy time to find
@@ -580,7 +588,10 @@ output, because nothing tells the worker when the call ended.
 Overrides, for every worker: `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS`,
 `OAR_TURN_STALL_TOOL_MS` (`0` = no limit for that phase). When only the idle window is set, by
 this variable or by `COPILOT_SDK_RELAY_TURN_STALL_TIMEOUT_MS`, the other two keep their proportion
-to it.
+to it. These variables, like the `COPILOT_SDK_RELAY_*` overrides above, are not on the tmux
+launch's export list (`buildTmuxWorkerShellCommand`), so a worker started under tmux sees them
+only when the tmux server or the login profile has them (see
+[Session workers under tmux](docs/configuration.md#environment-variables)).
 
 While a turn is kept past the idle window, the Copilot worker asks its runtime once per idle window
 whether it is still there (`ping`, 5 s to answer). A runtime that does not answer fails the turn at
@@ -763,10 +774,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **6242 pass / 0 fail / 1 skip on Linux (0.9.13, 2026-10-20)** — the count
-grows with every change, so treat it as a floor. The Linux skip is a Windows-only drive check. Windows runs the
-same suite with **4 skips** that are host-gated (0600 file modes, symlinks) and run on Linux (0.9.13: **6239 pass /
-0 fail / 4 skip**).
+Expected: **0 fail** everywhere; **6526 pass / 0 fail / 8 skip on Linux (0.9.14, 2026-10-21)** — the count
+grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
+cmd launchers). Windows runs the same suite with **8 skips** that are host-gated (0600 file modes, symlinks, `ps`)
+and run on Linux (0.9.14: **6526 pass / 0 fail / 8 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

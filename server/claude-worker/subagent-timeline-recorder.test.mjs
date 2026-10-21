@@ -140,7 +140,7 @@ test('a background launch keeps the run running until its task notification ends
   });
   recorder.observe({ type: 'system', subtype: 'task_progress', task_id: 'task-1', tool_use_id: RUN, usage: { total_tokens: 900 } });
   await tick();
-  assert.ok(headers().every((header) => header.status === undefined), 'not settled by the launch receipt');
+  assert.ok(headers().every((header) => header.status === undefined || header.status === 'running'), 'not settled by the launch receipt');
   assert.ok(headers().some((header) => header.background === true && header.taskId === 'task-1'));
 
   recorder.observe({ type: 'system', subtype: 'task_notification', task_id: 'task-1', tool_use_id: RUN, status: 'completed', summary: 'Found two parser bugs', usage: { total_tokens: 1500 } });
@@ -255,4 +255,107 @@ test('tool result content of every shape reads as text', () => {
   assert.equal(toolResultText('plain'), 'plain');
   assert.equal(toolResultText([{ type: 'text', text: 'a' }, { type: 'image', source: {} }, { type: 'tool_reference' }]), 'a\n[image]\n[tool_reference]');
   assert.equal(toolResultText(null), '');
+});
+
+// A finished background agent that the session sends a new message
+// (SendMessage) runs again as the same task: task_started names the same
+// task_id with a new run_id, and the SendMessage call as its tool_use_id
+// (the shape CLI 2.1.x emits; the agent's own frames keep naming the spawn).
+const SEND = 'toolu_fixture_send';
+const taskEvent = (subtype, extra = {}) => ({ type: 'system', subtype, task_id: 'agent-fixture-1', ...extra });
+
+test('a resumed agent continues its first run\'s record: same run, a note where it resumed, running again', async () => {
+  const { recorder, tick, entries, headers, posts } = makeRecorder();
+  recorder.observe(spawn());
+  recorder.observe(taskEvent('task_started', { tool_use_id: RUN, run_id: 'run-fixture-1', subagent_type: 'general-purpose', is_backgrounded: true }));
+  recorder.observe(subAssistant([{ type: 'text', text: 'The parser is fine.' }]));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: RUN, run_id: 'run-fixture-1', status: 'completed', summary: 'Parser checked' }));
+  await tick();
+  assert.equal(headers().at(-1).status, 'completed');
+
+  recorder.observe(taskEvent('task_started', { tool_use_id: SEND, run_id: 'run-fixture-2', subagent_type: 'general-purpose', is_backgrounded: true, prompt: 'Now check the tests too.' }));
+  await tick();
+  assert.equal(headers().at(-1).status, 'running', 'running again');
+
+  recorder.observe(subAssistant([{ type: 'tool_use', id: 'toolu_bash_2', name: 'Bash', input: { command: 'npm test' } }], { id: 'msg-sub-2' }));
+  // Frames that name the resume's tool use land on the same run.
+  recorder.observe(subAssistant([{ type: 'text', text: 'Tests pass.' }], { parent: SEND, id: 'msg-sub-3' }));
+  recorder.observe(taskEvent('task_progress', { tool_use_id: SEND, run_id: 'run-fixture-2', usage: { total_tokens: 2400, tool_uses: 1 } }));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: SEND, run_id: 'run-fixture-2', status: 'completed', summary: 'Tests checked', usage: { total_tokens: 2600 } }));
+  await tick();
+
+  assert.equal(posts.filter((post) => post.subagentRunId === SEND).length, 0, 'no run of its own');
+  assert.equal(recorder.hasPending(), false, 'nothing waits for a run the relay does not know');
+  assert.deepEqual(entries().map((entry) => [entry.kind, entry.text]), [
+    ['text', 'The parser is fine.'],
+    ['note', 'Finished: Parser checked'],
+    ['note', 'Resumed with a new message: Now check the tests too.'],
+    ['tool_call', '{\n  "command": "npm test"\n}'],
+    ['text', 'Tests pass.'],
+    ['note', 'Finished: Tests checked'],
+  ]);
+  const last = headers().at(-1);
+  assert.equal(last.status, 'completed');
+  assert.equal(last.totalTokens, 2600);
+  assert.ok(posts.filter((post) => post.subagentRunId === RUN).every((post) => post.taskId === 'agent-fixture-1'), 'every post names its task');
+  assert.equal(recorder.runIdFor(SEND), RUN, 'the resume\'s tool use leads to the first run');
+  assert.equal(recorder.runIdFor(RUN), RUN);
+});
+
+test('a recorder that never saw the first run posts the resume under its task, for the relay to place', async () => {
+  const { recorder, tick, known, posts } = makeRecorder({ knownRuns: [] });
+  // The relay places a post by its task id; this stand-in knows SEND only that way.
+  known.add(SEND);
+  recorder.observe(taskEvent('task_started', { tool_use_id: SEND, run_id: 'run-fixture-2', is_backgrounded: true, prompt: 'Again.' }));
+  await tick();
+  recorder.observe(taskEvent('task_progress', { tool_use_id: SEND, usage: { total_tokens: 10 } }));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: SEND, status: 'completed', summary: 'Done again' }));
+  await tick();
+  const sent = posts.filter((post) => post.subagentRunId === SEND);
+  assert.ok(sent.length >= 2);
+  assert.ok(sent.every((post) => post.taskId === 'agent-fixture-1'), 'each post names its task');
+  assert.equal(sent[0].header.status, 'running');
+  assert.equal(sent.at(-1).header.status, 'completed');
+});
+
+test('a task that starts again under its first tool use after it ended is resumed too', async () => {
+  const { recorder, tick, entries, headers } = makeRecorder();
+  recorder.observe(spawn());
+  recorder.observe(taskEvent('task_started', { tool_use_id: RUN, run_id: 'run-fixture-1', is_backgrounded: true }));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: RUN, status: 'completed', summary: 'Done' }));
+  recorder.observe(taskEvent('task_started', { tool_use_id: RUN, run_id: 'run-fixture-2', is_backgrounded: true }));
+  await tick();
+  assert.deepEqual(entries().map((entry) => entry.text), ['Finished: Done', 'Resumed with a new message']);
+  assert.equal(headers().at(-1).status, 'running');
+  await recorder.processEnded();
+  assert.equal(headers().at(-1).status, 'failed', 'running again: the process end fails it');
+});
+
+test('an earlier run\'s late events do not touch the resumed run, and a repeated start adds no second note', async () => {
+  const { recorder, tick, entries, headers } = makeRecorder();
+  recorder.observe(spawn());
+  recorder.observe(taskEvent('task_started', { task_type: 'local_agent', tool_use_id: RUN, run_id: 'run-fixture-1', is_backgrounded: true }));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: RUN, run_id: 'run-fixture-1', status: 'completed', summary: 'First' }));
+  recorder.observe(taskEvent('task_started', { task_type: 'local_agent', tool_use_id: SEND, run_id: 'run-fixture-2', is_backgrounded: true }));
+  // The same start again (a repeated frame), and the first run's notice again, late.
+  recorder.observe(taskEvent('task_started', { task_type: 'local_agent', tool_use_id: SEND, run_id: 'run-fixture-2', is_backgrounded: true }));
+  recorder.observe(taskEvent('task_progress', { tool_use_id: RUN, run_id: 'run-fixture-1', usage: { total_tokens: 1 } }));
+  recorder.observe(taskEvent('task_notification', { tool_use_id: RUN, run_id: 'run-fixture-1', status: 'failed', summary: 'First, again' }));
+  await tick();
+  assert.deepEqual(entries().map((entry) => entry.text), ['Finished: First', 'Resumed with a new message']);
+  assert.equal(headers().at(-1).status, 'running');
+  assert.notEqual(headers().at(-1).totalTokens, 1);
+
+  // Its own end still counts; events that name no run keep the old behaviour.
+  recorder.observe(taskEvent('task_notification', { tool_use_id: SEND, status: 'completed', summary: 'Second' }));
+  await tick();
+  assert.equal(headers().at(-1).status, 'completed');
+  assert.equal(entries().at(-1).text, 'Finished: Second');
+});
+
+test('only agent tasks are remembered for a resume: a shell task id is never led to another run', () => {
+  const { recorder } = makeRecorder();
+  recorder.observe({ type: 'system', subtype: 'task_started', task_id: 'shell-fixture-1', task_type: 'local_bash', tool_use_id: 'toolu_bash_a' });
+  recorder.observe({ type: 'system', subtype: 'task_started', task_id: 'shell-fixture-1', task_type: 'local_bash', tool_use_id: 'toolu_bash_b' });
+  assert.equal(recorder.runIdFor('toolu_bash_b'), 'toolu_bash_b');
 });

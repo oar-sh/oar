@@ -492,6 +492,8 @@ export function makeRunner({
       api: stub,
       sdkSessionId: 'conv-1',
       cwd: '/tmp/relay-fixture-workspace',
+      // The fixture folder exists on no host; the folder check has its own tests.
+      checkWorkingDirectoryImpl: () => null,
       resolvePathsImpl: () => FAKE_SDK_PATHS,
       // Spawn-free and relay-free by default: no test reads the real
       // relay-tools.md off disk or asks a relay whether previews are on.

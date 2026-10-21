@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import nodePath from 'node:path';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
 import { classifyGrokError } from './grok-sdk-adapter.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
@@ -421,6 +424,7 @@ test('an enabled preview lane prefixes the first Grok prompt with the instructio
   });
   assert.ok(prompts[0].includes(PREVIEW_TOOL_DESCRIPTION));
   assert.ok(prompts[0].includes('https://previews.example.test'));
+  assert.ok(prompts[0].includes('GET /api/previews?conversationId=conv-preview-on'));
   assert.ok(prompts[0].endsWith('show me the app'));
   await runner.dispose();
 });
@@ -721,4 +725,69 @@ test('the runner hands its terminal publisher to the agent handle and answers fo
   const bare = createGrokTurnRunner({ api, sdkSessionId: 'conv-1', cwd: process.cwd(), oarMcpServer: null });
   assert.deepEqual(bare.backgroundTaskIds(), []);
   assert.equal(bare.stopBackgroundTask('term-fixture-1'), false);
+});
+
+function grokFolderRunner({ api, cwd, createAgentHandleImpl }) {
+  return createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd,
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl,
+    startGrokTurnImpl: () => { throw new Error('no turn runs without an agent'); },
+  });
+}
+
+function assertGrokFolderFailure(api, folder) {
+  const response = api.calls.find((c) => c.path === '/api/response');
+  assert.equal(response?.body.terminalError?.code, 'grok.working-directory-missing');
+  assert.equal(response.body.terminalError.message, `The working directory of this conversation no longer exists: ${folder}.`);
+  assert.match(response.body.terminalError.guidance || '', /Change CWD/);
+  assert.equal(response.body.text, response.body.terminalError.message);
+  assert.doesNotMatch(response.body.text, /not found on PATH|Install/);
+}
+
+test('a missing working directory fails the Grok turn with the folder, before the CLI is started', async (t) => {
+  const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'oar-grok-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const gone = nodePath.join(root, 'deleted');
+  const api = createMockApi();
+  let creates = 0;
+  const runner = grokFolderRunner({
+    api,
+    cwd: gone,
+    createAgentHandleImpl: async () => {
+      creates += 1;
+      throw Object.assign(new Error('spawn grok ENOENT'), { code: 'ENOENT' });
+    },
+  });
+
+  await runner.handlePendingPayload({ message: { id: 'msg-cwd', conversationId: 'conv-1', text: 'Hello', relayMode: 'agent' } });
+
+  assert.equal(creates, 0, 'nothing is spawned in a folder that is not there');
+  assertGrokFolderFailure(api, gone);
+});
+
+test('a Grok spawn that fails because the folder went away meanwhile is not a missing CLI', async (t) => {
+  const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'oar-grok-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const folder = nodePath.join(root, 'project');
+  fs.mkdirSync(folder);
+  const api = createMockApi();
+  const runner = grokFolderRunner({
+    api,
+    cwd: folder,
+    createAgentHandleImpl: async () => {
+      fs.rmSync(folder, { recursive: true, force: true });
+      throw Object.assign(new Error('spawn grok ENOENT'), { code: 'ENOENT' });
+    },
+  });
+
+  await runner.handlePendingPayload({ message: { id: 'msg-cwd', conversationId: 'conv-1', text: 'Hello', relayMode: 'agent' } });
+
+  assertGrokFolderFailure(api, folder);
+});
+
+test('a missing Grok CLI in a folder that is there is still a missing CLI', () => {
+  assert.equal(classifyGrokError(Object.assign(new Error('spawn grok ENOENT'), { code: 'ENOENT' })).code, 'grok.cli_missing');
 });

@@ -45,9 +45,11 @@ Ships disabled. Three things to configure:
 }
 ```
 
-Environment overrides: `COPILOT_PREVIEWS_ENABLED`, `COPILOT_PREVIEWS_PORT`,
-`COPILOT_PREVIEWS_BIND_HOST`, `COPILOT_PREVIEWS_PUBLIC_BASE_URL`,
-`COPILOT_PREVIEWS_ALLOWED_TARGET_HOSTS`.
+Environment overrides: `COPILOT_PREVIEWS_ENABLED` (`1`/`true` or `0`/`false`),
+`COPILOT_PREVIEWS_PORT`, `COPILOT_PREVIEWS_BIND_HOST`,
+`COPILOT_PREVIEWS_PUBLIC_BASE_URL`, `COPILOT_PREVIEWS_ALLOWED_TARGET_HOSTS`
+(comma-separated). `previews.allowPublicBind` and `previews.maxLive` are read
+from the config file only.
 
 `publicHostnames` is what the same-hostname interlock checks against, so list
 every hostname the relay itself answers on.
@@ -92,9 +94,12 @@ argument, so none of them degrade to a warning.
 Three ways in, all backed by the same API:
 
 1. **Ask the agent.** "Show me a preview of this" / "start the dev server and host
-   it". Claude and Cursor sessions have a first-class `preview` tool; Copilot CLI
-   and Grok sessions are taught the HTTP API through injected instructions. Both
-   come from `shared/preview-tool-core.mjs`, so the semantics are identical.
+   it". Claude and Cursor sessions have a first-class `preview` tool, and so do
+   Grok and Copilot's Extension engine, through OAR's MCP server (unless the
+   relay runs with `OAR_MCP_SERVER=0`). Copilot's SDK engine, and the other two
+   without the MCP server, are taught the HTTP API through injected
+   instructions. Tool and instructions drive the same API, so the semantics are
+   identical.
 2. **`/preview` in the composer.** Client-side, works on every provider, costs no
    agent turn:
 
@@ -120,6 +125,24 @@ npm run dev -- --base=/test_<token>/
 A card appears in the conversation's background-task panel with **Open**, **Copy
 link** and **Close**; the settings modal's *Live previews* section lists every
 preview across all sessions, with when it was published and last opened.
+
+An agent sees only its own conversation's previews: the tool's `list` shows
+them and nothing else, and its `close` refuses another conversation's preview
+with a 403 that says so. Agents that use the HTTP API instead of a tool
+(Copilot, and Grok without the tool server) are taught the same calls with
+their conversation already written in. The relay-wide view is yours, in
+Settings → Previews (and `/preview list`). The relay enforces the scope on
+every request that names a conversation — the `conversationId` query, or the
+`X-Relay-Conversation-Id` header every session worker and the agents' tool
+server send; a conversation's id and its session id count as the same
+conversation.
+
+Known limit: agents authenticate with the same relay token as you do, so
+the scope is declared by the request, not proven. A request that names no
+conversation still gets the relay-wide answer, and one can name any
+conversation. The scope keeps the tools and the taught calls
+honest; it is not a wall against an agent that reads the relay token and
+calls the API by hand.
 
 Previews never expire, and they survive a relay restart (an update, a queued
 restart, a crash): the relay keeps them in its database and restores them when
@@ -166,8 +189,8 @@ after the limit was lowered; new ones are refused until enough are closed.
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/previews` | `{conversationId?, port \| dir, host?, label?}` → `{url, basePath, preview, existing}` |
-| `GET /api/previews` | All live previews; `?conversationId=` to filter |
-| `DELETE /api/previews/:token` | Close one. The dev server is untouched. |
+| `GET /api/previews` | All live previews; scoped to one conversation by `?conversationId=` or the `X-Relay-Conversation-Id` header |
+| `DELETE /api/previews/:token` | Close one. The dev server is untouched. Scoped like `GET`: another conversation's preview is refused with 403 |
 
 A preview published while an agent turn is running is also pinned into the
 transcript as a compact link card on that response (it shows a `closed` badge

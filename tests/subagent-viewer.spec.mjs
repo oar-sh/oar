@@ -253,6 +253,80 @@ test.describe("sub-agent viewer", () => {
     }
   });
 
+  // A Claude session sends a finished background agent a new message: the CLI
+  // runs it again as the same task under a new run, naming the SendMessage
+  // call as the task's tool use. Posted here as a worker that did not see the
+  // first run posts it (the relay places it by the task id).
+  test("a resumed agent opens its record, which goes on, and is a running task again", async ({ page, request }) => {
+    const token = relayToken();
+    const headers = { Authorization: `Bearer ${token}` };
+    const stamp = Date.now();
+    const runId = `toolu_resume_${stamp}`;
+    const sendId = `toolu_resume_send_${stamp}`;
+    const taskId = `agent-resume-${stamp}`;
+    const { conversationId, messageId } = await startTurn(request, headers, `Survey the widget tests ${stamp}`);
+    const timeline = (subagentRunId, entries, header, extra = {}) => request.post("/api/subagent-timeline", {
+      headers,
+      data: { conversationId, subagentRunId, entries, ...(header ? { header } : {}), ...extra },
+    });
+    const taskSet = (tasks) => request.post("/api/background-tasks", { headers, data: { conversationId, tasks } });
+    const agentTask = (taskRunId, toolUseId) => ({ taskId, taskRunId, taskType: "local_agent", description: "Survey the widget tests", toolUseId, startedAt: Date.now() - 1_000 });
+    const settle = (taskRunId, toolUseId, summary) => request.post("/api/background-task-settled", {
+      headers,
+      data: { conversationId, taskId, taskRunId, toolUseId, status: "completed", summary, description: "Survey the widget tests", taskType: "local_agent" },
+    });
+    const sessionTasks = async () => (await (await request.get(`/api/conversation/${conversationId}?limit=5`, { headers })).json()).sessionTasks || [];
+
+    try {
+      // The first run: spawned in the background, finished.
+      expect((await request.post("/api/subagent-run", {
+        headers,
+        data: { messageId, conversationId, subagentRunId: runId, displayName: "Survey the widget tests", status: "running", timelineOwner: "worker", background: true },
+      })).ok()).toBeTruthy();
+      expect((await taskSet([agentTask("run-1", runId)])).ok()).toBeTruthy();
+      expect((await timeline(runId, [{ key: "w:1", kind: "text", text: "The parser tests pass." }], { taskId })).ok()).toBeTruthy();
+      expect((await timeline(runId, [{ key: "w:2", kind: "note", text: "Finished: parser tests checked" }], { status: "completed" })).ok()).toBeTruthy();
+      expect((await settle("run-1", runId, "parser tests checked")).ok()).toBeTruthy();
+      expect((await taskSet([])).ok()).toBeTruthy();
+      expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "Survey started.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+
+      // The resume: the task set names the SendMessage call; so does the record.
+      expect((await taskSet([agentTask("run-2", sendId)])).ok()).toBeTruthy();
+      // (The relay marks where it resumed: this worker did not know.)
+      expect((await timeline(sendId, [], { status: "running", taskId }, { taskId })).ok()).toBeTruthy();
+      expect((await timeline(runId, [{ key: "w2:2", kind: "text", text: "The widget tests pass too." }])).ok()).toBeTruthy();
+
+      // The session's task list has it running again.
+      await expect.poll(async () => (await sessionTasks()).filter((task) => task.status === "running").map((task) => [task.id, task.runId]))
+        .toEqual([[taskId, runId]]);
+
+      await openConversationPage(page, token, conversationId);
+      const panel = page.locator("#background-tasks-panel");
+      await expect(panel).toBeVisible();
+      if ((await panel.getAttribute("open")) === null) await page.locator("#background-tasks-summary").click();
+      await panel.locator(`[data-subagent-open="${runId}"]`).click();
+      const modal = page.locator("#subagent-viewer-modal");
+      await expect(modal).toHaveClass(/visible/);
+      await expect(modal).not.toContainText("could not be loaded");
+      await expect(modal.locator(".sav-entry")).toHaveCount(4);
+      await expect(modal.locator(".sav-entry-note").last()).toContainText("Resumed with a new message");
+      await expect(modal.locator(".sav-entry-text").last()).toContainText("The widget tests pass too.");
+      await expect(page.locator("#subagent-viewer-stop")).toBeVisible();
+
+      // It ends again: the record says so, the task list too.
+      expect((await timeline(sendId, [{ key: "w2:3", kind: "note", text: "Finished: widget tests checked" }], { status: "completed" }, { taskId })).ok()).toBeTruthy();
+      await expect(modal.locator(".sav-entry")).toHaveCount(5);
+      expect((await settle("run-2", runId, "widget tests checked")).ok()).toBeTruthy();
+      expect((await taskSet([])).ok()).toBeTruthy();
+      await expect.poll(async () => (await sessionTasks()).filter((task) => task.id === taskId).map((task) => task.status)).toEqual(["completed"]);
+      await page.keyboard.press("Escape");
+      await expect(modal).not.toHaveClass(/visible/);
+    } finally {
+      await taskSet([]).catch(() => {});
+      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+    }
+  });
+
   test("a record past its retention shows what the sweep removed", async ({ page, request }) => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };

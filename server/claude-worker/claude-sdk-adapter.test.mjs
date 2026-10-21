@@ -108,7 +108,7 @@ test('an injected api registers the relay MCP server carrying the preview tool',
   const registered = server.instance._registeredTools;
   assert.deepEqual(Object.keys(registered), ['preview']);
   const result = await registered.preview.handler({ action: 'list' }, {});
-  assert.deepEqual(calls, [{ method: 'GET', routePath: '/api/previews', body: undefined }]);
+  assert.deepEqual(calls, [{ method: 'GET', routePath: '/api/previews?conversationId=conv-7', body: undefined }]);
   assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, enabled: true, previews: [] });
 });
 

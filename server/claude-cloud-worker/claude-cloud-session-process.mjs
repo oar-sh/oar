@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRelayQuestion } from '../../shared/question-wait.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../../shared/question-timeout.mjs';
+import { readApprovalAnswer } from '../../shared/question-answer-rule.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
 import { resolveDeliveredAttribution, sameClaudeAttribution } from '../../shared/claude-attribution.mjs';
@@ -27,6 +28,7 @@ const PERMISSION_ALLOW = 'Allow';
 const PERMISSION_DENY = 'Deny';
 const QUESTION_UNANSWERED_MESSAGE = 'The user did not answer. Continue without this, or end the turn and say what you need.';
 const PERMISSION_DENIED_MESSAGE = 'The user denied this tool use.';
+const PERMISSION_UNREADABLE_MESSAGE = 'The permission card was answered with neither Allow nor Deny, so the tool use is not allowed.';
 // A catch-up after a worker restart reads the events of one unfinished turn;
 // the cap only stops a cursor that never advances.
 const MAX_CATCH_UP_PAGES = 200;
@@ -253,8 +255,8 @@ export function createClaudeCloudSessionRunner({
     const requested = String(message?.model || '').trim();
     const perTurn = requested && requested.toLowerCase() !== 'auto' ? requested : '';
     // The delivered message names the conversation's current model; the launch
-    // model is what it was when the worker started, and the model may still be
-    // changed until the first message creates the cloud session.
+    // model is what it was when the worker started. A change after the first
+    // message is applied before the next one (applyModel).
     return stripModelTierSuffix(String(message?.providerModel || '').trim() || perTurn || defaultModel);
   }
 
@@ -723,8 +725,12 @@ export function createClaudeCloudSessionRunner({
     });
     const result = await askUserBridge.waitForRelayQuestionAnswer(questionId, { signal });
     if (result.timedOut || signal.aborted) return { behavior: 'deny', message: QUESTION_UNANSWERED_MESSAGE };
-    if (result.answer === PERMISSION_ALLOW) return { behavior: 'allow', updatedInput: request.input };
-    return { behavior: 'deny', message: PERMISSION_DENIED_MESSAGE };
+    const decision = readApprovalAnswer(result.answer, { approve: PERMISSION_ALLOW, deny: PERMISSION_DENY });
+    if (decision === 'approve') return { behavior: 'allow', updatedInput: request.input };
+    if (decision === 'deny') return { behavior: 'deny', message: PERMISSION_DENIED_MESSAGE };
+    // The relay takes only the choices on this card; anything else is no
+    // decision of the user's, and the agent is told so.
+    return { behavior: 'deny', message: PERMISSION_UNREADABLE_MESSAGE };
   }
 
   async function askUser(t, request, signal) {

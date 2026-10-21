@@ -2,9 +2,9 @@
 
 The runtimes OAR drives, what each needs, and what each conversation can do with it. This is the detail behind the [README](../README.md#runtimes); the most complete guide is [Providers on oar.sh](https://oar.sh/docs/providers/overview/).
 
-The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation: once a conversation has sent its first message it keeps that provider, and its composer is locked to that provider's models. The composer states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / ☁ Claude Cloud / Cursor SDK / Grok models.`, colour-coded per provider. OpenAI sessions also pin one exact model, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
+The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation, also before its first message: the composer offers only that provider's models and states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / ☁ Claude Cloud / Cursor SDK / Grok models.`, colour-coded per provider. For another provider, start a new chat. OpenAI and Grok sessions also pin one exact model once the first message is sent, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
 
-Turning a provider **off** (or removing the OpenAI key) rebinds conversations that have not sent a message yet back to Copilot, so you are never left with a conversation pointing at a runtime that can no longer start. Conversations already in flight, and conversations belonging to a different provider, are left alone. Claude Cloud is the exception: switching it off only takes it out of **New Chat**, and its conversations stay as they are.
+A conversation that has no message and nothing queued yet is moved back to Copilot when its provider goes away, so it never points at a runtime that cannot start: Claude and Grok when you switch them off, OpenAI and Cursor when you remove their key (switching those off only takes them out of **New Chat**). Removing the OpenAI or Cursor key is refused as long as any conversation of that provider, archived ones and OpenAI Image chats included, has a message or a queued one; switch the provider off instead. Conversations of other providers are left alone, and so are Claude Cloud's: switching it off only takes it out of **New Chat**.
 
 | Runtime | Enable via | Auth | Notes |
 | ------- | ---------- | ---- | ----- |
@@ -49,7 +49,9 @@ Save your key in **⚙️ Settings → Providers → OpenAI**, together with the
 
 *On oar.sh: [Claude](https://oar.sh/docs/providers/claude/)*
 
-Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Chat model selection**. The relay authenticates through the Claude credentials on the host machine (`~/.claude`), so there is no key to enter.
+Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Chat model selection**, and set the default model under **Claude model ID**. The relay authenticates through the Claude credentials on the host machine (`~/.claude`), so there is no key to enter.
+
+Claude turns run on the Claude Code build bundled with the Agent SDK, so they need no Claude Code CLI on the host. Once the CLI is installed or updated from the panel (see [below](#installing-a-provider-cli-from-the-relay)) and the relay has restarted, turns run on that CLI instead; `CLAUDE_CODE_EXECUTABLE` in the relay's environment names one too. The CLI itself is needed for the account row, **Relogin** and **Logout**, and for Claude Cloud's login.
 
 **Commit attribution.** Commits an agent makes in a Claude session end with `Co-authored-by: Open Agent Relay (<model>) <no-reply@oar.sh>` — the model's name in the parentheses, e.g. `Claude Fable 5.1` — and pull request bodies with `🤖 Generated with [Open Agent Relay](https://oar.sh)`. The same tab has the choice: **OAR** (default), **vanilla** (Claude Code's own `Co-Authored-By: Claude …` lines) or **off** (no attribution). A repo folder can override it for all of its Claude sessions from the **🧠** context modal. A change reaches a running session with its next message (a switch back to vanilla restarts the session's CLI between turns). [Claude Cloud](#claude-cloud) chats follow the same setting. Other providers are not affected: their tools have no such setting.
 
@@ -150,7 +152,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 
 *On oar.sh: [Cursor](https://oar.sh/docs/providers/cursor/)*
 
-Turn on **⚙️ Settings → Providers → Cursor**, paste your Cursor API key, and enable it for New Chat model selection. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **🤗 Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model, `composer-2.5` unless you change it, always stays enabled).
+Paste your Cursor API key in **⚙️ Settings → Providers → Cursor**; **Enable Cursor for New Chat model selection** is on once a key is saved. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **🤗 Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model, `composer-2.5` unless you change it, always stays enabled).
 
 What Cursor conversations support:
 
@@ -160,7 +162,7 @@ What Cursor conversations support:
 - The browsable **Session** root points at the worker's per-session agent store, created on the session's first turn
 - Expired cached agent handles are recreated and retried automatically once — a second auth failure means the API key itself is invalid
 
-Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under **⚙️ Settings → Providers → Cursor → Cursor monthly plan allowance**. The optional **Dashboard session token** in the same panel unlocks live *Included in plan* bars; it is detected automatically from the host's Cursor IDE login when there is one, and headless hosts can set `CURSOR_SESSION_TOKEN` instead.
+Like Claude, Cursor turns are not included in the Copilot usage line and no usage line is attached to their replies. Cursor spend is tracked separately in **Check Usage**; set your monthly pool allowances and billing reset day under **⚙️ Settings → Providers → Cursor → Cursor monthly plan allowance**. The optional **Dashboard session token** in the same panel unlocks the live *Plan usage (total)*, *Auto + Composer* and *API* bars; it is detected automatically from the host's Cursor IDE login when there is one, and headless hosts can set `CURSOR_SESSION_TOKEN` instead.
 
 ## Grok (CLI ACP)
 
@@ -192,9 +194,9 @@ is `grok-4.5`), and question cards are not available — the protocol has no ask
 
 ## Installing a provider CLI from the relay
 
-Grok and Claude both run as CLIs on the relay host, and the failure mode used to be a dead end: a
-turn fails with *"Grok CLI was not found on PATH"* and the only fix is a shell on the host — the one
-thing the relay exists to avoid. The Copilot, Claude, and Grok sub-tabs therefore carry a CLI row at the top:
+Grok runs as a CLI on the relay host, and Claude's login is managed with the Claude Code CLI there.
+The failure mode used to be a dead end: a turn fails with *"Grok CLI was not found on PATH"* and
+the only fix is a shell on the host — the one thing the relay exists to avoid. The Copilot, Claude, and Grok sub-tabs therefore carry a CLI row at the top:
 
 ```
 Grok CLI    not installed                                    [ Install ]
@@ -209,8 +211,9 @@ Grok CLI    1.0.13 · ~/.grok/bin/grok · native · up to date  [ Update  ]
 - The output streams into the panel live, and the log survives closing the modal or watching from
   another device. One install at a time, relay-wide.
 - When it finishes, the relay resolves the binary, wires it into the environment it launches workers
-  with, and remembers it across restarts — **no relay restart is needed**. Sessions already running
-  keep the binary they started with.
+  with, and remembers it across restarts. New Grok sessions use it at once, with no relay restart;
+  sessions already running keep the binary they started with. Claude sessions run on the installed
+  CLI, rather than on the build bundled with the Agent SDK, only after the next relay restart.
 - **Update** runs the CLI's own updater (`grok update`, `claude update`), not the install script again.
 - If your Claude was installed with npm into a folder the relay user cannot write, `claude doctor`
   says so and the button becomes **Switch to native installer** — Anthropic's own recommended fix.

@@ -25,6 +25,7 @@
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
 import { createRelayQuestion } from '../../shared/question-wait.mjs';
 import { looksLikeMultiSelectQuestion } from '../../shared/question-multi-select.mjs';
+import { readApprovalAnswer } from '../../shared/question-answer-rule.mjs';
 import {
   DEFAULT_QUESTION_TIMEOUT_MS,
   QUESTION_TIMEOUT_CONTINUATION_TEXT,
@@ -262,9 +263,10 @@ export function createCopilotQuestionBridge({
   /**
    * `onPermissionRequest` in ask mode → an approve/deny card.
    *
-   * Freeform is allowed and anything that is not exactly "Approve" denies —
-   * so a human can type *why* they are refusing and the model receives it as
-   * feedback instead of a bare refusal.
+   * Freeform is allowed and anything but the approve choice (by the shared
+   * rule: trimmed, any case) denies — so a human can type *why* they are
+   * refusing and the model receives it as feedback instead of a bare refusal.
+   * The card's rationale says so, since a typed "yes" refuses too.
    */
   async function askToolApproval(request, { signal, message } = {}) {
     const description = describePermissionRequest(request);
@@ -273,21 +275,24 @@ export function createCopilotQuestionBridge({
       choices: [PERMISSION_APPROVE_CHOICE, PERMISSION_DENY_CHOICE],
       allowFreeform: true,
       source: 'onPermissionRequest',
-      rationale: 'Copilot requested permission to run a tool in ask mode.',
+      rationale: 'Copilot requested permission to run a tool in ask mode. Approve runs it; Deny or a typed reply refuses it, and a typed reply tells Copilot why.',
       extra: {
         requestId: String(request?.requestId || '') || undefined,
         permissionKind: String(request?.kind || '') || undefined,
       },
     }, { signal, message });
     const answer = String(result?.answer ?? '').trim();
-    const approved = !result?.timedOut && answer.toLowerCase() === PERMISSION_APPROVE_CHOICE.toLowerCase();
+    const decision = result?.timedOut
+      ? null
+      : readApprovalAnswer(answer, { approve: PERMISSION_APPROVE_CHOICE, deny: PERMISSION_DENY_CHOICE });
+    const approved = decision === 'approve';
     // The denial note is composed HERE rather than in the permission handler so
     // the handler never needs to know the card's choice labels — that would be
     // an import cycle (this module already imports the request describer from
     // the adapter). A freeform denial carries the human's own reason; a plain
     // "Deny" click does not, so echoing the button label back at the model as
     // though it were an explanation is avoided.
-    const feedback = answer && answer.toLowerCase() !== PERMISSION_DENY_CHOICE.toLowerCase()
+    const feedback = answer && decision !== 'deny'
       ? answer
       : 'The user declined this action.';
     return { approved, answer, feedback, timedOut: result?.timedOut === true, description };

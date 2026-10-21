@@ -7,11 +7,16 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+
+import Database from 'better-sqlite3';
 
 import {
-  exitWhenIdle, main, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUrl,
+  exitWhenIdle, launchRelay, main, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUrl,
 } from '../bin/oar.js';
 import { PromptAborted } from './services/oar-cli-menu.mjs';
+import { processIdentity } from './services/relay-singleton-guard.mjs';
 
 const noFile = () => { throw new Error('ENOENT'); };
 const LAN = { eth0: [{ family: 'IPv4', internal: false, address: '192.168.7.20' }] };
@@ -478,6 +483,153 @@ test('setup --start installs the service where systemd answers and starts the re
   assert.equal(fs.existsSync(plain.unitPath), false);
 });
 
+// ─── setup: --migrate-from ───────────────────────────────────────────────────
+
+// A pre-rename git checkout beside the install: a database with one
+// conversation, its config and one upload.
+function oldCheckout(install) {
+  const checkout = path.join(install.root, 'old-checkout');
+  fs.mkdirSync(path.join(checkout, 'server', 'data'), { recursive: true });
+  fs.mkdirSync(path.join(checkout, 'server', 'uploads'), { recursive: true });
+  const db = new Database(path.join(checkout, 'server', 'data', 'copilot.db'));
+  db.exec('CREATE TABLE conversations (id TEXT PRIMARY KEY); CREATE TABLE messages (id TEXT PRIMARY KEY)');
+  db.prepare('INSERT INTO conversations VALUES (?)').run('c1');
+  db.close();
+  fs.writeFileSync(path.join(checkout, 'server', 'config.json'), JSON.stringify({ authToken: 'checkout-token', port: 3333 }));
+  fs.writeFileSync(path.join(checkout, 'server', 'uploads', 'blob'), 'attachment');
+  return checkout;
+}
+
+// The state root's database: as the installer's first relay start leaves it
+// (tables, no rows), or with conversations.
+function stateRootDb(install, { conversations = 0 } = {}) {
+  fs.mkdirSync(path.join(install.stateRoot, 'data'), { recursive: true });
+  const db = new Database(path.join(install.stateRoot, 'data', 'copilot.db'));
+  db.exec('CREATE TABLE conversations (id TEXT PRIMARY KEY); CREATE TABLE messages (id TEXT PRIMARY KEY)');
+  for (let i = 0; i < conversations; i += 1) db.prepare('INSERT INTO conversations VALUES (?)').run(`kept-${i}`);
+  db.close();
+}
+
+test('setup --migrate-from runs behind the marker of an earlier automatic run and says what it did', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  // An earlier release's installer run found nothing and wrote the marker anyway.
+  fs.writeFileSync(path.join(install.stateRoot, '.migrated'), '2026-01-01T00:00:00.000Z nothing-to-migrate\n');
+  const checkout = oldCheckout(install);
+  const result = await runSetup(install.options({ argv: ['--migrate-from', checkout, '--defaults'] }));
+  assert.equal(result.code, 0);
+  // Database and upload land where the relay `oar` starts reads them.
+  assert.ok(fs.existsSync(path.join(install.stateRoot, 'data', 'copilot.db')));
+  assert.equal(fs.readFileSync(path.join(install.stateRoot, 'data', 'uploads', 'blob'), 'utf8'), 'attachment');
+  assert.equal(install.readConfig().authToken, 'old-token', 'the existing config is kept');
+  assert.match(install.output(), /Migrated .*old-checkout.* into /);
+  assert.match(install.output(), /Kept the existing .*config\.json/);
+});
+
+test('setup --migrate-from refuses to overwrite a state root database with conversations and stops', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  stateRootDb(install, { conversations: 1 });
+  const before = fs.readFileSync(path.join(install.stateRoot, 'data', 'copilot.db'));
+  const checkout = oldCheckout(install);
+  const result = await runSetup(install.options({ argv: ['--migrate-from', checkout, '--port', '4200'] }));
+  assert.deepEqual(result, { code: 1, reason: 'migration-refused' });
+  assert.deepEqual(fs.readFileSync(path.join(install.stateRoot, 'data', 'copilot.db')), before);
+  assert.equal(install.readConfig().port, 4100, 'setup stopped before changing the config');
+  assert.match(install.output(), /already has a database with conversations/);
+  assert.match(install.output(), /oar stop/);
+});
+
+test('setup --migrate-from after the installer: the fresh database is moved aside and the checkout migrated', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  stateRootDb(install);
+  const checkout = oldCheckout(install);
+  const result = await runSetup(install.options({ argv: ['--migrate-from', checkout, '--defaults'] }));
+  assert.equal(result.code, 0);
+  const db = new Database(path.join(install.stateRoot, 'data', 'copilot.db'), { readonly: true });
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 1);
+  db.close();
+  const backups = fs.readdirSync(path.join(install.stateRoot, 'backups')).filter((name) => name !== 'MIGRATION.md');
+  assert.equal(backups.length, 1);
+  assert.ok(fs.existsSync(path.join(install.stateRoot, 'backups', backups[0], 'copilot.db')));
+  assert.match(install.output(), /had no conversations yet .*moved it aside to .*backups/);
+  assert.match(install.output(), /Migrated .*old-checkout.* into /);
+});
+
+test('setup --migrate-from with a relay running on the fresh database: stop the relay first', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  stateRootDb(install);
+  fs.writeFileSync(path.join(install.stateRoot, 'data', 'relay-server.lock'), JSON.stringify({ pid: 7171 }));
+  const checkout = oldCheckout(install);
+  const result = await runSetup(install.options({
+    argv: ['--migrate-from', checkout],
+    isProcessAliveImpl: (pid) => pid === 7171,
+  }));
+  assert.deepEqual(result, { code: 1, reason: 'migration-relay-running' });
+  assert.match(install.output(), /stop the relay first \(oar stop\)/);
+  assert.equal(fs.existsSync(path.join(install.stateRoot, 'backups')), false);
+});
+
+test('setup --migrate-from a folder without relay state says why nothing was done', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const empty = path.join(install.root, 'not-a-checkout');
+  fs.mkdirSync(empty);
+  const result = await runSetup(install.options({ argv: ['--migrate-from', empty] }));
+  assert.deepEqual(result, { code: 1, reason: 'migration-nothing' });
+  assert.match(install.output(), /Nothing to migrate from .*not-a-checkout/);
+  assert.equal(fs.existsSync(path.join(install.stateRoot, '.migrated')), false);
+});
+
+test('setup without --migrate-from and nothing to migrate writes no marker', async (t) => {
+  const install = makeInstall(t);
+  assert.equal((await runSetup(install.options({ argv: [] }))).code, 0);
+  assert.equal(fs.existsSync(path.join(install.stateRoot, '.migrated')), false);
+});
+
+test('setup --migrate-from the same checkout again says it is already migrated and goes on', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const checkout = oldCheckout(install);
+  assert.equal((await runSetup(install.options({ argv: ['--migrate-from', checkout, '--defaults'] }))).code, 0);
+  install.lines.length = 0;
+  const again = await runSetup(install.options({ argv: ['--migrate-from', checkout, '--defaults'] }));
+  assert.equal(again.code, 0);
+  assert.match(install.output(), /already migrated from .*old-checkout/);
+  assert.doesNotMatch(install.output(), /aside|oar stop/);
+});
+
+test('oar copilot --migrate-from that is refused warns and still starts the session', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  stateRootDb(install, { conversations: 1 });
+  const checkout = oldCheckout(install);
+  // The install's relay already answers; the session is a gh process that exits 0.
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const started = [];
+  const { packageRoot, env, logger, cwd, isProcessAliveImpl } = install.options();
+  const result = await launchRelay({
+    argv: ['--no-install-extension', '--migrate-from', checkout],
+    packageRoot,
+    env,
+    logger,
+    cwd,
+    fetchImpl: relay.fetch,
+    isProcessAliveImpl,
+    lockGraceMs: 10,
+    spawnSyncImpl: () => ({ status: 0 }),
+    spawnImpl: (command) => {
+      started.push(command);
+      const proc = new EventEmitter();
+      proc.exitCode = null;
+      proc.kill = () => {};
+      setImmediate(() => { proc.exitCode = 0; proc.emit('exit', 0, null); });
+      return proc;
+    },
+  });
+  assert.equal(result.code, 0);
+  assert.deepEqual(started, ['gh']);
+  assert.match(install.output(), /already has a database with conversations/);
+  const db = new Database(path.join(install.stateRoot, 'data', 'copilot.db'), { readonly: true });
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 1, 'the state root is untouched');
+  db.close();
+});
+
 // ─── WSL ─────────────────────────────────────────────────────────────────────
 
 // Interop of a WSL distro whose Windows has `holders` (port → program) listening.
@@ -593,7 +745,7 @@ test('status tells running, stopped, a foreign port holder and a missing config 
   relay.running = true;
   relay.token = 'another-token';
   assert.deepEqual(await runStatus(install.options({ fetchImpl: relay.fetch })), { code: 3, reason: 'relay-taken' });
-  assert.match(install.output(), /Port 4100 is held by another program, or by a relay with another token\./);
+  assert.match(install.output(), /Port 4100 is in use by another program, or by a relay with another token\./);
   assert.ok(!install.output().includes('old-token'));
 
   const fresh = makeInstall(t);
@@ -619,6 +771,47 @@ test('start needs a config, starts the relay detached and prints the URL without
   assert.equal(install.spawned[0].spawnOptions.env.COPILOT_WEB_RELAY_CONFIG, install.configPath);
   assert.match(install.output(), /Relay URL: http:\/\/localhost:4100\//);
   assert.deepEqual(install.qrCodes, []);
+});
+
+test('start while the relay brings over its earlier database says it is still running, not that it did not come up', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'relay-server.lock'), JSON.stringify({ format: 2, pid: 5151, tokenHash: 'x', holder: null }));
+  fs.writeFileSync(path.join(dataDir, 'earlier-database-progress.json'), JSON.stringify({
+    pid: 5151, from: path.join(install.packageRoot, 'server', 'data', 'copilot.db'), bytes: 630 * 1048576, step: 'check',
+  }));
+  const result = await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 }));
+  assert.deepEqual(result, { code: 0, reason: 'bringing-over' });
+  assert.deepEqual(install.spawned, []);
+  assert.match(install.output(), /The relay \(process 5151\) is bringing over the database it ran on until now \(.+copilot\.db, 630 MB\) and is still running; it answers once that is done\./);
+  assert.doesNotMatch(install.output(), /did not come up/);
+});
+
+test('a relay that did not come up beside a held lock: stop its relay when the holder is known, delete the lock only when not', async (t) => {
+  // Known: a live process whose identity is the one the lock records.
+  const relay = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });
+  t.after(() => relay.kill());
+  await new Promise((resolve) => relay.once('spawn', resolve));
+  const cases = [
+    { pid: relay.pid, holder: processIdentity(relay.pid), alive: undefined },
+    { pid: 5252, holder: null, alive: (pid) => pid === 5252 },
+  ];
+  const outputs = [];
+  for (const { pid, holder, alive } of cases) {
+    const install = makeInstall(t, { config: EXISTING });
+    const lockPath = path.join(install.stateRoot, 'data', 'relay-server.lock');
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid, tokenHash: 'x', startedAt: '2026-10-21T08:00:00.000Z', holder }));
+    // No isProcessAliveImpl for the known one: the CLI's own check.
+    const result = await runStart(install.options({ isProcessAliveImpl: alive, readyWaitMs: 100 }));
+    assert.deepEqual(result, { code: 1, reason: 'server-not-ready' });
+    outputs.push({ install, lockPath, pid });
+  }
+  const [known, unknown] = outputs;
+  assert.ok(known.install.lines.some((line) => line.includes(`The lock ${known.lockPath} is held by relay process ${known.pid} (started 2026-10-21T08:00:00.000Z): oar stop, or end process ${known.pid}.`)), known.install.output());
+  assert.doesNotMatch(known.install.output(), /delete/);
+  assert.ok(unknown.install.lines.some((line) => line.includes(`The lock ${unknown.lockPath} names process 5252, which cannot be told to be a relay: if no relay is running, end process 5252 or delete the lock.`)), unknown.install.output());
 });
 
 test('stop asks the relay to stop and waits until its port is closed', async (t) => {
@@ -744,7 +937,7 @@ test('service install first stops a relay that was started by hand', async (t) =
   await runService(busy.options({ argv: ['install'], fetchImpl: busyRelay.fetch, spawnSyncImpl: busySystemd.impl }));
   assert.ok(busySystemd.calls.includes('systemctl --user enable oar'));
   assert.ok(!busySystemd.calls.includes('systemctl --user enable --now oar'));
-  assert.match(busy.output(), /takes over at the next login/);
+  assert.match(busy.output(), /takes over at the next boot/);
 });
 
 test('service remove on Linux disables the service, deletes the unit and reloads systemd', async (t) => {
@@ -806,7 +999,7 @@ test('on win32 the service is the autostart entry of the web UI', async (t) => {
   await runService(options(['status']));
   assert.match(install.lines.at(-1), /Autostart: on, at boot/);
   assert.deepEqual(await runService(options(['remove'])), { code: 1, reason: 'boot-task' });
-  assert.match(install.lines.at(-1), /Settings → Autostart/);
+  assert.match(install.lines.at(-1), /Settings → General → Autostart \(Windows\)/);
   assert.deepEqual(autostart.sets, [true, false]);
 });
 

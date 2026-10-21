@@ -42,7 +42,7 @@ import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
 import { registerClaudeCloudRoutes } from './routes/claude-cloud-routes.mjs';
-import { registerPreviewRoutes } from './routes/preview-routes.mjs';
+import { createPreviewScopeResolver, registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { registerRelayEventRoutes } from './routes/relay-event-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
@@ -124,7 +124,9 @@ import { createClaudeSessionRootResolver } from './services/claude-session-root-
 import { createCursorSessionRootResolver } from './services/cursor-session-root-service.mjs';
 import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
-import { resolveDataDir } from './services/data-dir-resolution.mjs';
+import { adoptEarlierDatabase, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
+import { ensureDataDirs, resolveDataDir, resolveUploadDir, resolveUploadReadDirs, uploadPathInDirs } from './services/data-dir-resolution.mjs';
+import { mergeStrayMigratedUploads } from './services/oar-state-migration-service.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
@@ -173,7 +175,7 @@ import {
   migrateLegacyConfigFeatures,
   resolveBootFeatureFlags,
 } from './features.mjs';
-import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
+import { RELAY_RESTART_EXIT_CODE, RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../shared/question-timeout.mjs';
 import {
   parseTurnCeilingUpdate,
@@ -201,6 +203,7 @@ import {
 } from './services/relay-restart-queue.mjs';
 import { createRestartPictureCollector } from './services/relay-restart-picture.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
+import { createStaleTurnRecovery } from './services/stale-turn-recovery.mjs';
 import {
   STALE_SUBAGENT_RUN_BOOT_DELAY_MS,
   STALE_SUBAGENT_RUN_SWEEP_INTERVAL_MS,
@@ -248,7 +251,7 @@ import {
 import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
 import { applyPwaManifestTheme, normalizePwaTheme } from './services/pwa-manifest-theme.mjs';
 import { mapSubagentRunHeader } from './services/subagent-timeline-service.mjs';
-import { describeExecError, describeSpawnEnvironment, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
+import { describeExecError, describeSpawnEnvironment, normalizeTempEnv, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -279,9 +282,8 @@ const APP_CONFIG_PLACEHOLDER = /window\.__COPILOT_APP_CONFIG = \{ basePath: '[^'
 const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
 // The console goes to a terminal, a tmux pane or nowhere: keep a copy to read
 // after a restart or an incident.
-const relayConsoleLog = installRelayConsoleLog({
-  logPath: resolveRelayConsoleLogPath({ env: process.env, serverDir: __dirname }),
-});
+const relayConsoleLogPath = resolveRelayConsoleLogPath({ env: process.env, serverDir: __dirname });
+const relayConsoleLog = installRelayConsoleLog({ logPath: relayConsoleLogPath });
 const ttyConsoleRuntime = await maybeStartTtyConsole({
   serverDir: __dirname,
   logsDir: path.join(__dirname, 'logs'),
@@ -289,6 +291,8 @@ const ttyConsoleRuntime = await maybeStartTtyConsole({
 });
 // The terminal console takes the console's methods over when it starts.
 relayConsoleLog?.rewrap();
+// TEMP and TMP for this relay and everything it starts (normalizeTempEnv).
+for (const change of normalizeTempEnv()) console.log(`[startup] ${change} (quotes taken off, or the folder is not there)`);
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
@@ -296,26 +300,32 @@ const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
   : path.join(__dirname, 'config.json');
 // env var > config.json `dataDir` > <server>/data — see data-dir-resolution.mjs
 // for why the config can carry it (a dev checkout pointing at a release
-// install's data, and autostart launchers that only pin the config path).
+// install's data).
 const DATA_DIR = resolveDataDir({ env: process.env, configPath: CONFIG_PATH, serverDir: __dirname });
 const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
 const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
-const UPLOAD_DIR     = process.env.COPILOT_WEB_RELAY_DATA_DIR
-  ? path.join(DATA_DIR, 'uploads')
-  : path.join(__dirname, 'uploads');
+// Uploads follow the data dir whenever the env var or config.json chose it.
+const UPLOAD_DIR     = resolveUploadDir({ dataDir: DATA_DIR, env: process.env, serverDir: __dirname });
+// Uploads earlier versions left in <server>/uploads or <state root>/uploads
+// are read in place; nothing there is written, moved or deleted.
+const UPLOAD_READ_DIRS = resolveUploadReadDirs({ uploadDir: UPLOAD_DIR, dataDir: DATA_DIR, serverDir: __dirname });
 const INITIAL_WORKSPACE_ROOT = resolveStartupWorkspaceRoot(__dirname);
 const WORKSPACE_ROOT_LOCKED = true;
 const SESSION_COOKIE = 'copilot_session';
 const AUTH_COOKIE = 'copilot_auth';
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-}
+ensureDataDirs({ dataDir: DATA_DIR, uploadDir: UPLOAD_DIR });
 if (process.platform !== 'win32') {
   fs.chmodSync(DATA_DIR, 0o700);
 }
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Earlier migrations put a checkout's uploads in <state root>/uploads, which
+// nothing read: merge them in (never overwriting, never deleting the source).
+mergeStrayMigratedUploads({ dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, logger: console });
+for (const dir of UPLOAD_READ_DIRS.slice(1)) {
+  try {
+    const count = fs.readdirSync(dir).filter((name) => isSha256(name)).length;
+    if (count) console.log(`[uploads] New uploads go to ${UPLOAD_DIR}; ${count} earlier upload${count === 1 ? '' : 's'} in ${dir} are read from there.`);
+  } catch {}
 }
 
 async function refreshOpenAIProviderModels() {
@@ -1097,18 +1107,20 @@ function setCursorProviderSettings(update = {}) {
 const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
 
 // Reasoning tiers for one discovered Cursor model, in composer vocabulary.
-// Cursor exposes effort as a per-model parameter named 'effort' or 'reasoning'
-// whose value list varies by model; 'extra-high' is Cursor's spelling of the
-// composer's 'xhigh'. Values with no composer equivalent (e.g. 'minimal') are
-// dropped rather than remapped onto a tier the model does not actually have.
+// Cursor exposes effort as a per-model parameter named 'effort', 'reasoning'
+// or 'reasoning_effort' whose value list varies by model; 'extra-high' is
+// Cursor's spelling of the composer's 'xhigh'. Values with no composer
+// equivalent (e.g. 'minimal') are dropped rather than remapped onto a tier the
+// model does not actually have.
 // Mirrors resolveCursorReasoningParams exactly, including its parameter
-// precedence: it consults 'effort' first and only falls back to 'reasoning',
-// so scanning both would advertise an off switch the worker never sends.
+// precedence: it consults 'effort' first, then 'reasoning', then
+// 'reasoning_effort', so scanning several would advertise an off switch the
+// worker never sends.
 function cursorEntrySupportsReasoningOff(entry) {
   const parameters = Array.isArray(entry?.parameters) ? entry.parameters : [];
   const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
   if (byId.has('thinking')) return true;
-  const effortParam = byId.get('effort') || byId.get('reasoning');
+  const effortParam = byId.get('effort') || byId.get('reasoning') || byId.get('reasoning_effort');
   const values = Array.isArray(effortParam?.values) ? effortParam.values : [];
   return values.some((value) => (
     String((value && typeof value === 'object' ? value.value : value) || '').trim().toLowerCase() === 'none'
@@ -1121,7 +1133,7 @@ function cursorEntryEffortLevels(entry) {
   // listing both parameters must not have its tiers read from one and its off
   // switch from the other.
   const byId = new Map(parameters.map((param) => [String(param?.id || '').trim().toLowerCase(), param]));
-  const effortParam = byId.get('effort') || byId.get('reasoning');
+  const effortParam = byId.get('effort') || byId.get('reasoning') || byId.get('reasoning_effort');
   if (!effortParam) return [];
   const levels = [];
   for (const value of (Array.isArray(effortParam.values) ? effortParam.values : [])) {
@@ -1824,18 +1836,43 @@ function isProcessAlive(pid) {
   }
 }
 
+// The guard's own stale-lock rules (lockHolderMayRun; an EPERM is alive).
 const relaySingletonGuard = createRelaySingletonGuard({
   lockPath: RELAY_LOCK_PATH,
   pid: process.pid,
   token: config.authToken,
-  isProcessAlive,
   logger: console,
 });
 try {
   relaySingletonGuard.acquire();
 } catch (error) {
+  // A held lock is not a crash: the supervisors do not retry 78.
   console.error(`[server] ${error?.message || String(error)}`);
-  process.exit(1);
+  process.exit(error?.code === 'ERELAYLOCKED' ? RELAY_STOP_EXIT_CODE : 1);
+}
+// Before the database opens, under the lock (adoptEarlierDatabase); the
+// result also feeds lostPackageDatabaseWarning.
+let earlierDatabase;
+{
+  try {
+    earlierDatabase = adoptEarlierDatabase({
+      dataDir: DATA_DIR,
+      uploadDir: UPLOAD_DIR,
+      serverDir: __dirname,
+      configPath: CONFIG_PATH,
+      packageRoot: REPO_ROOT,
+      Database,
+      authToken: config.authToken,
+      logger: console,
+    });
+  } catch (error) {
+    earlierDatabase = { status: 'refused', error: `[data] Not starting: the database this relay ran on until now could not be looked at (${error?.message || error}).` };
+  }
+  if (earlierDatabase.status === 'refused') {
+    console.error(earlierDatabase.error);
+    try { relaySingletonGuard.release(); } catch {}
+    process.exit(RELAY_STOP_EXIT_CODE);
+  }
 }
 
 const MAX_REQUEUE_RETRIES = Number.isFinite(Number(config.maxRequeueRetries))
@@ -2128,7 +2165,7 @@ function setSharePathPrivacyMode(value) {
 // checkout, data and upload dirs, the workspace roots it knows, and the OS
 // user name. The share routes add the conversation's own roots.
 function sharePathKnownRoots() {
-  const roots = [REPO_ROOT, DATA_DIR, UPLOAD_DIR, currentWorkspaceRootPath(), INITIAL_WORKSPACE_ROOT];
+  const roots = [REPO_ROOT, DATA_DIR, ...UPLOAD_READ_DIRS, currentWorkspaceRootPath(), INITIAL_WORKSPACE_ROOT];
   const userNames = [];
   try { roots.push(os.homedir()); } catch {}
   try { userNames.push(os.userInfo().username); } catch {}
@@ -2679,6 +2716,7 @@ const configuredConversationSessionMode =
 updateModelCatalog({ models: [DEFAULT_MODEL], currentModel: DEFAULT_MODEL, defaultModel: DEFAULT_MODEL, source: 'bootstrap' });
 
 // ─── SQLite Setup ─────────────────────────────────────────────────────────────
+const databaseCreatedAtStart = !fs.existsSync(DB_PATH);
 const db = new Database(DB_PATH);
 if (process.platform !== 'win32') {
   fs.chmodSync(DB_PATH, 0o600);
@@ -3042,6 +3080,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       enabled: true,
       model: cursorModel,
       apiKey: cursorSettings.apiKey,
+      dataDir: DATA_DIR,
     });
   }
   if (providerType === 'grok') {
@@ -3526,8 +3565,11 @@ function collectRestartPicture({ action = 'restart' } = {}) {
 const relayRestartQueue = createRelayRestartQueue({
   getCounts: () => queueCounts(),
   collectPicture: collectRestartPicture,
-  startShutdown: ({ action, reason }) => {
+  startShutdown: ({ action, reason, requestedBy, requestedAt }) => {
     const exitCode = action === 'restart' ? RELAY_RESTART_EXIT_CODE : 0;
+    // The next start tells the conversations that asked for relay_restarted
+    // how this one ended (services/relay-event-service.mjs).
+    try { relayEventService?.noteRelayExit({ action, reason, requestedBy, requestedAt }); } catch {}
     sessionWorkerWebSocketService.emitDraining(`api-${action}:${reason}`);
     void shutdownRuntime(`api-${action}:${reason}`, { exitCode });
   },
@@ -3554,7 +3596,9 @@ function relayShutdownStatePayload() {
 }
 
 function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
-  return relayRestartQueue.cancel({ requestedBy });
+  const result = relayRestartQueue.cancel({ requestedBy });
+  if (result?.cancelled) relayEventService?.noteRestartCancelled();
+  return result;
 }
 
 function keepWaitingForRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
@@ -3562,7 +3606,13 @@ function keepWaitingForRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
 }
 
 function requestRelayShutdown(options = {}) {
-  return relayRestartQueue.request(options);
+  // The loop guard of relay_restarted: a conversation whose turn answers the
+  // last restart is not woken by this one. Noted first, since an immediate
+  // request exits from inside the call.
+  if (!runtimeShutdownStarted) relayEventService?.noteRestartRequested();
+  const result = relayRestartQueue.request(options);
+  if (!relayRestartQueue.isQueued() && !runtimeShutdownStarted) relayEventService?.noteRestartCancelled();
+  return result;
 }
 
 function toNullableInt(value) {
@@ -4205,7 +4255,9 @@ function isSha256(value) {
 }
 
 function uploadPathForSha(sha256) {
-  return path.join(UPLOAD_DIR, sha256);
+  let expectedSize = null;
+  try { expectedSize = stmts.getUploadFile.get(String(sha256 || '').trim().toLowerCase())?.size_bytes ?? null; } catch {}
+  return uploadPathInDirs(UPLOAD_READ_DIRS, sha256, { expectedSize });
 }
 
 function uploadContentUrlForSha(sha256) {
@@ -4886,7 +4938,10 @@ function persistUploadBuffer(buffer, options = {}) {
   if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('Empty upload');
   if (buffer.length > MAX_UPLOAD_BYTES) throw new Error('Uploaded file too large');
   const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-  const filePath = uploadPathForSha(sha256);
+  // Always kept in the upload dir: the folders of earlier versions can go
+  // (a package update, a clean checkout), so a new reference never relies on
+  // them. An existing file is never overwritten.
+  const filePath = path.join(UPLOAD_DIR, sha256);
   if (!fs.existsSync(filePath)) {
     const tmpPath = path.join(UPLOAD_DIR, `${sha256}.${process.pid}.${Date.now()}.tmp`);
     fs.writeFileSync(tmpPath, buffer);
@@ -4924,13 +4979,14 @@ function buildStoredAttachment({ sha256, name, type, size }) {
   if (!isSha256(normalizedSha)) return null;
   const normalizedName = String(name || '').trim().slice(0, 255) || `upload-${normalizedSha.slice(0, 12)}`;
   const normalizedType = String(type || '').trim().toLowerCase().slice(0, 127) || 'application/octet-stream';
+  const filePath = uploadPathForSha(normalizedSha);
   return {
     name: normalizedName,
     type: normalizedType,
     size: Number(size || 0),
     sha256: normalizedSha,
-    path: uploadPathForSha(normalizedSha),
-    reference: `@${uploadPathForSha(normalizedSha)}`,
+    path: filePath,
+    reference: `@${filePath}`,
     contentUrl: uploadContentUrlForSha(normalizedSha),
   };
 }
@@ -5003,7 +5059,9 @@ function deleteOrphanedUploads(hashes) {
     const refs = Number(stmts.countUploadRefsBySha.get(sha256)?.cnt || 0);
     if (refs > 0) continue;
     stmts.deleteUploadFile.run(sha256);
-    const filePath = uploadPathForSha(sha256);
+    // Only the upload dir is swept; the folders of earlier versions are
+    // read-only to the relay.
+    const filePath = path.join(UPLOAD_DIR, sha256);
     if (fs.existsSync(filePath)) {
       try { fs.unlinkSync(filePath); } catch {}
     }
@@ -5536,64 +5594,21 @@ function failConsumedRowTerminally(row, reason) {
   });
 }
 
-function recoverProcessingOlderThan(cutoffIso, requeueAtIso, { ceilingBeforeIso = null } = {}) {
-  const params = { inactiveBefore: cutoffIso, ceilingBefore: ceilingBeforeIso || null };
-  // Stale background-continuation turns are torn down, never requeued —
-  // replaying one would deliver the CLI's own continuation as a user prompt.
-  const staleContinuations = stmts.listStaleProcessingContinuations?.all?.(params) || [];
-  for (const row of staleContinuations) {
-    stmts.dropStaleContinuation?.run?.(row.id);
-    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
-    noteRestartTurnOutcome(row, 'cut');
-    // A teardown is a turn ending with no reply; it must be visible in the
-    // console log (the only trace of a silent one was `ignored=already_failed`
-    // hours later, when the worker's reply arrived for the dead row).
-    const lastSeen = row.owner_last_claimed_at || row.processing_at || row.timestamp || null;
-    const reason = lastSeen && lastSeen < cutoffIso ? `inactive since ${lastSeen}` : `ceiling (started ${row.processing_at || row.timestamp})`;
-    console.warn(`${runtimeLogPrefix()}STALE CONTINUATION ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} dropped: ${reason}`);
-  }
-  const listedRows = stmts.listRecoverableProcessing.all(params);
-  for (const row of listedRows.filter((entry) => entry?.consumed_at)) {
-    failConsumedRowTerminally(row, 'stale-recovery');
-    noteRestartTurnOutcome(row, 'cut');
-  }
-  const allRows = listedRows.filter((entry) => !entry?.consumed_at);
-  if (!allRows.length) return [];
-  // Enforce the retry budget before requeueing: failing these rows first
-  // flips them out of 'processing' so the recovery UPDATE below skips them.
-  const overBudget = allRows.filter((row) => Number(row?.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES);
-  for (const row of overBudget) {
-    failRecoveredRowTerminally(row, 'stale-recovery');
-    noteRestartTurnOutcome(row, 'failed');
-  }
-  const rows = allRows.filter((row) => Number(row?.retry_count || 0) + 1 < MAX_REQUEUE_RETRIES);
-  if (!rows.length) return [];
-
-  const tx = db.transaction(() => {
-    stmts.recoverProcessingBefore.run({ ...params, requeueAt: requeueAtIso });
-    const settleRecoveredAbortControls = db.prepare(`
-      UPDATE relay_control_requests
-      SET status = 'failed',
-          error = ?,
-          updated_at = ?,
-          completed_at = ?
-      WHERE queue_message_id = ?
-        AND type IN ('abort_turn', 'abort_subagent')
-        AND status IN ('pending', 'processing')
-    `);
-    const now = new Date().toISOString();
-    for (const row of rows) {
-      settleRecoveredAbortControls.run('queue-recovered', now, now, row.id);
-    }
-  });
-  tx();
-
-  for (const row of rows) {
-    io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
-    noteRestartTurnOutcome(row, 'requeued');
-  }
-  io.emit('queue_updated', { recovered: rows.length });
-  return rows;
+// The stale-turn sweep itself lives in services/stale-turn-recovery.mjs so it
+// can be tested against a real database; io is created further down, hence
+// the late-bound emit.
+const staleTurnRecovery = createStaleTurnRecovery({
+  db,
+  stmts,
+  emit: (event, payload) => io.emit(event, payload),
+  maxRequeueRetries: MAX_REQUEUE_RETRIES,
+  failRecoveredRowTerminally,
+  failConsumedRowTerminally,
+  noteRestartTurnOutcome,
+  warn: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
+});
+function recoverProcessingOlderThan(cutoffIso, requeueAtIso, options) {
+  return staleTurnRecovery.recoverProcessingOlderThan(cutoffIso, requeueAtIso, options);
 }
 
 // One `/api/usage` needs the same token for the quota read and the billing
@@ -5928,7 +5943,7 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 // Claude-provider sessions live under the Agent SDK's project layout rather than
 // ~/.copilot/session-state, so their browsable session folder resolves separately.
 const claudeSessionRootResolver = createClaudeSessionRootResolver({ fs, path });
-const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, serverDir: __dirname });
+const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, serverDir: __dirname, dataDir: DATA_DIR });
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
 const app        = express();
@@ -6805,6 +6820,34 @@ const windowsBootAutostartService = createWindowsBootAutostartService({
   packageRoot: REPO_ROOT,
   configPath: CONFIG_PATH,
 });
+// Autostart entries written before they pinned the data and log folders start
+// the relay on a database inside the package directory, or before TEMP and
+// the data drive are there. Brought up to date once this relay holds the
+// lock and its port; edited ones stay.
+function refreshWindowsAutostartEntries() {
+  // Entries that ran the relay on the database inside the package.
+  const unpinnedLaunchers = [];
+  const onEarlierForm = ({ path: launcher, pinnedData }) => { if (!pinnedData) unpinnedLaunchers.push(launcher); };
+  for (const [name, refresh] of [
+    ['sign-in entry', () => windowsAutostartService.refreshInstalledEntry({ onEarlierForm })],
+    ['boot launcher', () => windowsBootAutostartService.refreshInstalledLauncher({ onEarlierForm })],
+  ]) {
+    try {
+      if (refresh()) console.log(`[autostart] brought the ${name} up to date: it pins the data and log folders and waits for TEMP and the data drive`);
+    } catch (error) {
+      console.warn(`[autostart] could not bring the ${name} up to date: ${error?.message || error}`);
+    }
+  }
+  const warning = lostPackageDatabaseWarning({
+    unpinnedLaunchers,
+    earlierDatabase,
+    databaseCreated: databaseCreatedAtStart,
+    evidence: unpinnedLaunchers.length > 0 && packageDatabaseEvidence({ serverDir: __dirname, ownDirs: [DATA_DIR, path.dirname(relayConsoleLogPath)] }),
+    serverDir: __dirname,
+    dbPath: DB_PATH,
+  });
+  if (warning) console.error(warning);
+}
 
 const gitChangesService = createGitChangesService();
 // GET /api/git/remote: where a folder lives on GitHub (New Chat, Claude Cloud).
@@ -7069,6 +7112,7 @@ const sharedRouteDeps = {
   fs,
   path,
   uploadsDir: UPLOAD_DIR,
+  uploadReadDirs: UPLOAD_READ_DIRS,
   fetchUsageSummary,
   fetchCopilotBillingUsage,
   fetchGrokBillingUsage: createGrokBillingUsageFetcher(),
@@ -7776,6 +7820,14 @@ registerPreviewRoutes(app, {
       new Date().toISOString(),
     );
   },
+  // A scope named by a conversation's id or its session id covers both.
+  resolveConversationScope: createPreviewScopeResolver({
+    getConversation: (id) => {
+      const conv = stmts.getConvAnyStatus.get(id) || null;
+      return conv && String(conv.status || '').trim().toLowerCase() !== 'deleted' ? conv : null;
+    },
+    getConversationBySdkSessionId: (id) => stmts.getConvBySdkSessionId?.get?.(id) || null,
+  }),
 });
 
 function clearRuntimeTimers() {
@@ -7835,6 +7887,9 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
     console.warn(`${runtimeLogPrefix()}Grok auth service shutdown failed: ${error?.message || error}`);
   }
   sessionWorkerWebSocketService.stop();
+  // A queued request wrote its own end already; this covers the rest
+  // (signals, the owner gone).
+  try { relayEventService.noteRelayExit({ action: runtimeShutdownExitCode === RELAY_RESTART_EXIT_CODE ? 'restart' : 'shutdown', reason }); } catch {}
   try { relayEventService.stop(); } catch {}
   try { relayEventLinkService.stop(); } catch {}
   tmuxInspectorSocketService.stop();
@@ -7965,12 +8020,19 @@ httpServer.on('error', (error) => {
   process.exit(1);
 });
 httpServer.listen(config.port, listenHost, () => {
+  // Conversations that asked for relay_restarted hear that the relay is back:
+  // once it listens, so a start that fails to bind does not take the record
+  // of how the run before ended.
+  try { relayEventService.noteRelayStarted(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}relay_restarted not recorded: ${error?.message || error}`);
+  }
   const readyBanner = buildRelayReadyBannerData();
   console.log('');
   for (const line of (readyBanner.lines || [])) {
     console.log(line);
   }
   console.log('\nCLI status: waiting for first heartbeat...\n');
+  refreshWindowsAutostartEntries();
 
   // Start SSH tunnel after server is listening
   sshTunnelManager.start();

@@ -124,6 +124,7 @@ import { createTaskOutputSpool } from '../../shared/worker-runtime/task-output-s
 import { createShellOutputMirror } from './copilot-shell-output-mirror.mjs';
 import { isTransientProgressText, settleForTask, shellExitFromEvent } from './copilot-task-settle.mjs';
 import { createKeptPosts } from '../../shared/worker-runtime/kept-posts.mjs';
+import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
 // How long the runtime may sit with no session activity before the worker
 // closes it. The worker process itself stays up and reconnects lazily on the
@@ -369,6 +370,9 @@ export function createCopilotSdkSessionRunner({
   // module imports the real SDK (that lives in copilot-sdk-adapter.mjs).
   resolvePathsImpl = resolveCopilotSdkPaths,
   startClientImpl = startCopilotClient,
+  // The error a runtime started in `cwd` fails with up front, or null
+  // (shared/worker-runtime/working-directory.mjs).
+  checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   createNormalizerImpl = createCopilotEventNormalizer,
   buildMessageOptionsImpl = buildCopilotMessageOptions,
   // BYOK: `COPILOT_PROVIDER_*` in this worker's env become
@@ -2622,8 +2626,17 @@ export function createCopilotSdkSessionRunner({
     if (client) return client;
     if (starting) return starting;
     starting = (async () => {
+      // The runtime is spawned in the conversation's folder: a folder that is
+      // gone fails the turn with its name, not with the spawn's ENOENT.
+      const missingFolder = checkWorkingDirectoryImpl(cwd);
+      if (missingFolder) throw missingFolder;
       sdkPaths = resolvePathsImpl({ env });
-      const started = await startClientImpl({ paths: sdkPaths, cwd, clientName, logLevel, dbg });
+      let started;
+      try {
+        started = await startClientImpl({ paths: sdkPaths, cwd, clientName, logLevel, dbg });
+      } catch (error) {
+        throw explainLaunchFailure(error, cwd, { check: checkWorkingDirectoryImpl });
+      }
       client = started.client;
       detachRuntimeExit = observeRuntimeExit(client, handleRuntimeExit);
       runtimeTree = watchRuntimeTree(client);

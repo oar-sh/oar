@@ -15,9 +15,9 @@ export const PREVIEW_TOOL_NAME = 'preview';
 
 export const PREVIEW_TOOL_DESCRIPTION =
   'Publish a local web server or a static directory on a public preview URL so '
-  + 'the user can open it from any device, or list/close existing previews. Use '
-  + 'this whenever the user wants to see, try, or share something with a web UI '
-  + '— never ask them to open localhost or forward a port. '
+  + 'the user can open it from any device, or list/close this conversation\'s '
+  + 'previews. Use this whenever the user wants to see, try, or share something '
+  + 'with a web UI — never ask them to open localhost or forward a port. '
   + 'For a dev server: call this FIRST with {action:"create", port} to get the '
   + 'basePath, then start the server configured to serve under that basePath '
   + '(Vite --base, Next basePath, Express mount prefix); the proxy forwards '
@@ -37,7 +37,7 @@ export const PREVIEW_TOOL_INPUT_SCHEMA = {
     action: {
       type: 'string',
       enum: ['create', 'list', 'close'],
-      description: 'create: publish a port or directory. list: live previews. close: unpublish one.',
+      description: 'create: publish a port or directory. list: this conversation\'s live previews. close: unpublish one of them.',
     },
     port: {
       type: 'integer',
@@ -114,10 +114,19 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
   if (typeof api !== 'function') return { ok: false, error: 'Preview API unavailable in this worker' };
   const parsed = validatePreviewToolInput(input);
   if (!parsed.ok) return parsed;
+  // list and close reach only this conversation's previews: a preview's token
+  // is its only credential. The relay enforces the same scope for every
+  // request that names a conversation (routes/preview-routes.mjs). A create
+  // without one would land in no conversation's scope, so it is refused too.
+  const conversation = toText(conversationId);
+  const scope = `conversationId=${encodeURIComponent(conversation)}`;
+  if (!conversation) {
+    return { ok: false, error: 'This tool call is not bound to a conversation; it cannot publish, list or close previews' };
+  }
 
   try {
     if (parsed.action === 'list') {
-      const response = await api('GET', '/api/previews');
+      const response = await api('GET', `/api/previews?${scope}`);
       return {
         ok: true,
         enabled: response?.enabled === true,
@@ -138,7 +147,7 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
     if (parsed.action === 'close') {
       let token = parsed.token;
       if (!token) {
-        const response = await api('GET', `/api/previews?conversationId=${encodeURIComponent(conversationId)}`);
+        const response = await api('GET', `/api/previews?${scope}`);
         const live = response?.previews || [];
         if (live.length === 0) return { ok: false, error: 'No live previews in this conversation' };
         if (live.length > 1) {
@@ -150,12 +159,14 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
         }
         token = live[0].token;
       }
-      const response = await api('DELETE', `/api/previews/${token}`);
+      // Another conversation's token is refused by the relay (403); its
+      // message comes back as the answer.
+      const response = await api('DELETE', `/api/previews/${token}?${scope}`);
       return { ok: true, closed: { token, label: response?.preview?.label || null } };
     }
 
     const body = {
-      conversationId,
+      conversationId: conversation,
       label: parsed.label || undefined,
       ...(parsed.port ? { port: parsed.port } : { dir: parsed.dir }),
     };
@@ -176,26 +187,33 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
         : hint,
     };
   } catch (error) {
-    return { ok: false, error: String(error?.message || error) };
+    // A scope refusal (403) in its own words, without the HTTP wrapper.
+    const refusal = Number(error?.status) === 403 ? toText(error?.detail) : '';
+    return { ok: false, error: refusal || String(error?.message || error) };
   }
 }
 
 /**
  * The instruction block for providers without a custom-tool surface. Generated
  * from the same description/schema strings the tool uses; keep any wording
- * change up in the constants, never here.
+ * change up in the constants, never here. `conversationId` is the conversation
+ * the block is sent to: written into every call, so the model's natural call
+ * is the scoped one (without it, a plain GET would list the whole relay).
  */
-export function renderPreviewInstructionBlock({ publicBaseUrl = '' } = {}) {
+export function renderPreviewInstructionBlock({ publicBaseUrl = '', conversationId = '' } = {}) {
   const base = toText(publicBaseUrl) || 'https://<preview-host>';
+  const id = toText(conversationId);
+  const conv = id ? JSON.stringify(id).slice(1, -1) : '<conv>';
+  const convQuery = id ? encodeURIComponent(id) : '<conv>';
   return `## Preview servers
 
 ${PREVIEW_TOOL_DESCRIPTION}
 
 There is no \`${PREVIEW_TOOL_NAME}\` tool on this provider — use the authenticated localhost API (same auth as /api/relay/shutdown):
 
-- Publish a running dev server: \`POST /api/previews\` with \`{ "conversationId": "<conv>", "port": 5173, "label": "web app" }\` → \`{ "url": "${base}/test_<token>/", "basePath": "/test_<token>/" }\`. Register FIRST, then start the server under the returned basePath.
-- Publish files without a server: \`POST /api/previews\` with \`{ "conversationId": "<conv>", "dir": "./dist", "label": "built site" }\` — the relay serves the directory itself. \`dir\` must live inside the conversation's workspace root.
-- List: \`GET /api/previews\` (\`?conversationId=\` filters). Close: \`DELETE /api/previews/:token\` — closes the link only, never the dev server behind it.
+- Publish a running dev server: \`POST /api/previews\` with \`{ "conversationId": "${conv}", "port": 5173, "label": "web app" }\` → \`{ "url": "${base}/test_<token>/", "basePath": "/test_<token>/" }\`. Register FIRST, then start the server under the returned basePath.
+- Publish files without a server: \`POST /api/previews\` with \`{ "conversationId": "${conv}", "dir": "./dist", "label": "built site" }\` — the relay serves the directory itself. \`dir\` must live inside the conversation's workspace root.
+- List this conversation's previews: \`GET /api/previews?conversationId=${convQuery}\`. Close one: \`DELETE /api/previews/:token?conversationId=${convQuery}\` — closes the link only, never the dev server behind it. Always pass the conversation: you may list and close only this conversation's previews, another conversation's is refused (403), and the relay-wide list is the user's (Settings → Previews).
 
 A 503 with \`details\` means the preview lane is disabled or misconfigured — surface those details to the user. A 400 names exactly what was refused (relay-owned port, non-loopback host, dir outside the workspace root).`;
 }

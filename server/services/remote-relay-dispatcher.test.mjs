@@ -2286,6 +2286,17 @@ test('answer_question validates options and multi-field questions before sending
   const right = await run('answer_question', { relay: 'linux-test', question_id: 'question-4', choices: ['dark'] });
   assert.equal(right.status, 200);
   assert.deepEqual(remote.callsTo('POST', '/api/relay-question/question-4/answer')[0].body, { answer: 'Dark' });
+  // A card without typed text takes none from an agent either (the remote's
+  // answer route would refuse it); an option typed as the answer is an option.
+  remote.addQuestion({ id: 'question-6', conversationId: 'conv-9', prompt: 'Pick one', choices: ['Light', 'Dark'], allowFreeform: false, sdkSessionId: null });
+  const typed = await run('answer_question', { relay: 'linux-test', question_id: 'question-6', answer: 'whichever is darker' });
+  assert.equal(typed.status, 400);
+  assert.equal(typed.body.code, CODES.invalidInput);
+  assert.match(typed.body.error, /takes only its options \(Light, Dark\)/);
+  assert.equal(remote.callsTo('POST', '/api/relay-question/question-6/answer').length, 0);
+  const typedOption = await run('answer_question', { relay: 'linux-test', question_id: 'question-6', answer: ' light ' });
+  assert.equal(typedOption.status, 200);
+  assert.deepEqual(remote.callsTo('POST', '/api/relay-question/question-6/answer')[0].body, { answer: 'Light' });
 
   remote.addQuestion({
     id: 'question-5',
@@ -3054,6 +3065,30 @@ test('subscribe defaults to this relay and asks the user once per conversation',
   // Another conversation asks for itself.
   await run('subscribe', { sessions: ['conv-watched'] }, 'c-2');
   assert.equal(approvals.length, 2);
+});
+
+test('relay_restarted alone watches no session: no card; on a paired relay it is refused', async () => {
+  const { run, approvals, relayEvents, dispatcher } = setupEvents();
+  const result = await run('subscribe', { events: ['relay_restarted'], once: true });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(approvals.length, 0, 'nothing of another conversation is watched');
+  assert.deepEqual(relayEvents.subscriptions[0].sessions, []);
+  assert.deepEqual(relayEvents.subscriptions[0].events, ['relay_restarted']);
+  assert.match(result.body.summary, /subscribe → .*: relay_restarted \(sub_fixture1\)/);
+  // The worker's own check hands it on, and the relay's check takes it again.
+  const asWorker = await runAsWorker(dispatcher, 'subscribe', { events: ['relay_restarted'] });
+  assert.equal(asWorker.ok, true, JSON.stringify(asWorker));
+  assert.equal(approvals.length, 0);
+  // With sessions beside it, the first-subscribe card is asked as always.
+  await run('subscribe', { sessions: ['conv-watched'], events: ['turn_end', 'relay_restarted'] });
+  assert.equal(approvals.length, 1);
+
+  const paired = setup({ relayEvents: createFakeRelayEvents() });
+  const refused = await paired.run('subscribe', { relay: 'linux-test', events: ['relay_restarted'] });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, CODES.invalidInput);
+  assert.match(refused.body.error, /about the relay you run on/);
+  assert.equal(paired.remote.calls.length, 0);
 });
 
 test('a subscription to all is always on a card, also after a listed-ids Allow', async () => {

@@ -10,6 +10,9 @@ export function createManagedServerLifecycle({
   serverDir,
   serverLogPath,
   serverErrPath,
+  // The state root's folders a global install pins (resolveRelayPaths'
+  // RELAY_ENV); what the CLI's own environment names wins.
+  relayEnv = {},
   relayPort = 3333,
   nodeBin,
   serverStartTimeoutMs,
@@ -24,6 +27,9 @@ export function createManagedServerLifecycle({
   let restartTimer = null;
   let restartAttempts = 0;
   let attemptedSqliteRepair = false;
+  // The relay stopped on purpose (RELAY_STOP_EXIT_CODE): its reason is in
+  // its log, and starting it again at once cannot help.
+  let stoppedOnPurpose = false;
   // Keep in sync with server/relay-self-restart.mjs. Passing this on argv (not
   // in the env) is deliberate: this extension's own env is inherited from the
   // relay worker that launched the CLI, so an env flag here would be read by
@@ -33,6 +39,7 @@ export function createManagedServerLifecycle({
   const RESTART_BACKOFF_MS = [1000, 2000, 5000, 10000, 20000];
   // Keep in sync with server/relay-exit-codes.mjs
   const RELAY_RESTART_EXIT_CODE = 75;
+  const RELAY_STOP_EXIT_CODE = 78;
   const STARTUP_LOG_TAIL_BYTES = 24 * 1024;
   const STATUS_PATH = "/api/status";
   const RELAY_PORT = Number.isInteger(Number(relayPort)) && Number(relayPort) > 0
@@ -198,6 +205,7 @@ export function createManagedServerLifecycle({
   async function waitForServerReady(timeoutMs = serverStartTimeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (stoppedOnPurpose) return false;
       try {
         await api("GET", STATUS_PATH);
         return true;
@@ -280,12 +288,16 @@ export function createManagedServerLifecycle({
 
         dbg("starting managed web server", serverDir);
         managedServerOwned = true;
+        stoppedOnPurpose = false;
         startedOwnedProcess = true;
         const serverArgs = ["server.js", RELAY_SUPERVISED_FLAG, "--token", token];
         if (legacyOwnerPidWatchdog) {
           serverArgs.push("--owner-pid", String(process.pid));
         }
         const serverEnv = { ...process.env };
+        for (const [key, value] of Object.entries(relayEnv || {})) {
+          if (!String(serverEnv[key] || "").trim() && value) serverEnv[key] = value;
+        }
         if (startupWorkspaceRoot) {
           serverEnv.COPILOT_WORKSPACE_ROOT = startupWorkspaceRoot;
         }
@@ -300,13 +312,14 @@ export function createManagedServerLifecycle({
         managedServerProc.once("exit", (code, signal) => {
           const normalizedCode = Number.isInteger(Number(code)) ? Number(code) : null;
           const intentionalRestart = normalizedCode === RELAY_RESTART_EXIT_CODE;
+          stoppedOnPurpose = normalizedCode === RELAY_STOP_EXIT_CODE;
           dbg(
             "managed web server exited",
             `code=${code ?? "null"}`,
             `signal=${signal ?? "none"}`,
             intentionalRestart ? "intentionalRestart=true" : "intentionalRestart=false",
           );
-          const shouldRestart = desiredRunning && managedServerOwned && !stoppingManagedServer;
+          const shouldRestart = desiredRunning && managedServerOwned && !stoppingManagedServer && !stoppedOnPurpose;
           closeManagedServerStreams();
           managedServerProc = null;
           managedServerOwned = false;
@@ -357,6 +370,7 @@ export function createManagedServerLifecycle({
         closeManagedServerStreams();
         managedServerProc = null;
         managedServerOwned = false;
+        if (stoppedOnPurpose) markNonRetryable(error);
         if (desiredRunning && !stoppingManagedServer && error?.relayRetryable !== false) {
           scheduleManagedServerRestart("start-failed");
         }

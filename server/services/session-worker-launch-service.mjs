@@ -14,6 +14,7 @@ import {
   isOarMcpServerDisabled,
 } from '../mcp/oar-mcp-server.mjs';
 import { WORKER_LOG_FILE_ENV } from '../../shared/worker-runtime/worker-log-file.mjs';
+import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 import {
   describeSpawnEnvironment,
   envPathKey,
@@ -213,6 +214,9 @@ export function applyCursorProviderEnvironment(env = {}, {
   enabled = false,
   model = '',
   apiKey = '',
+  // The relay's resolved, absolute data dir: the worker keeps its agent stores
+  // there, and must not resolve a relative one or the config's own again.
+  dataDir = '',
 } = {}) {
   const next = { ...env };
   if (resolveWorkerKind(next) === 'cursor') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
@@ -225,6 +229,8 @@ export function applyCursorProviderEnvironment(env = {}, {
   next.CURSOR_API_KEY = normalizedApiKey;
   const normalizedModel = normalizeText(model);
   if (normalizedModel) next.CURSOR_RELAY_MODEL = normalizedModel;
+  const normalizedDataDir = normalizeText(dataDir);
+  if (normalizedDataDir) next.COPILOT_WEB_RELAY_DATA_DIR = path.resolve(normalizedDataDir);
   return next;
 }
 
@@ -717,6 +723,9 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     'COPILOT_WEB_RELAY_CONFIG',
     'COPILOT_WEB_RELAY_TOOLS',
     'COPILOT_WEB_RELAY_LOG_DIR',
+    // The Cursor worker keeps its agent stores in the relay's data dir
+    // (applyCursorProviderEnvironment).
+    'COPILOT_WEB_RELAY_DATA_DIR',
     'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
     'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
     'COPILOT_SDK_PATH',
@@ -847,6 +856,19 @@ export function describeWindowsStartFailure(state, { spawnCommand = 'cmd.exe', p
   return null;
 }
 
+/**
+ * A spawn whose folder is gone fails with ENOENT (or ENOTDIR), which reads as
+ * a missing program (`node`, `cmd.exe`). Asked only after a spawn failed: the folder
+ * is named instead, or null when it is there. Exported for the tests.
+ * (A tmux launch never gets here: `new-session -c` falls back to the home
+ * folder, and the worker reports the folder on the turn.)
+ */
+export function describeLaunchFolderFailure(state, folder, { check = missingWorkingDirectoryError } = {}) {
+  if (state?.error?.code !== 'ENOENT' && state?.error?.code !== 'ENOTDIR') return null;
+  const missing = check(folder);
+  return missing ? `worker-spawn-failed: ${missing.message}` : null;
+}
+
 function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } = {}) {
   const launchProcessCwd = String(processCwd || '').trim();
   const launchWorkspaceRoot = String(workspaceRoot || '').trim() || launchProcessCwd;
@@ -900,6 +922,8 @@ export async function launchSessionCli({
   // Where a launch that went wrong explains itself (one line per call).
   log = null,
   locateExecutableImpl = locateExecutable,
+  // Asked after a failed spawn whether its folder is gone (the error, or null).
+  checkWorkingDirectoryImpl = missingWorkingDirectoryError,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -1154,7 +1178,8 @@ export async function launchSessionCli({
     // `cmd /c start` returns at once when the program started. Still running,
     // or ended with an error, means it did not: name the program, and log the
     // command and the PATH it was looked up on.
-    const failure = describeWindowsStartFailure(childState, { spawnCommand, program: startedProgram });
+    const failure = describeLaunchFolderFailure(childState, launchProcessCwd, { check: checkWorkingDirectoryImpl })
+      || describeWindowsStartFailure(childState, { spawnCommand, program: startedProgram });
     if (failure) {
       if (childState.tracked && !childState.exited) {
         try { child.kill?.(); } catch {}
@@ -1176,6 +1201,11 @@ export async function launchSessionCli({
     // A failed spawn reports its error on the next tick.
     await new Promise((resolve) => setImmediate(resolve));
     const reason = childState.error?.code || childState.error?.message || '';
+    const folderFailure = describeLaunchFolderFailure(childState, launchProcessCwd, { check: checkWorkingDirectoryImpl });
+    if (folderFailure) {
+      explain(`could not start ${spawnCommand}: ${folderFailure}`);
+      throw new Error(folderFailure);
+    }
     explain(`could not start ${spawnCommand}${reason ? ` (${reason})` : ''}; ${spawnEnvironmentText()}`);
     throw new Error(`worker-spawn-unhealthy:missing-pid${reason ? ` (${spawnCommand}: ${reason})` : ''}`);
   }

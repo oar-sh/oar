@@ -14,6 +14,7 @@ import { schemaFieldsFromQuestion } from './question-schema-view.mjs';
 import { composeMultiSelectAnswer, isMultiSelectQuestion, offersMultiSelectToggle } from './question-multi-select.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 import { questionCardHeadLabel } from './conversation-provider-indicator.mjs';
+import { questionAcceptsFreeText } from './question-answer-rule.mjs';
 import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
 
 let relayQuestionRenderHash = '';
@@ -265,6 +266,10 @@ export function renderRelayQuestions() {
     const modeTag = question.mode ? ` <span class="msg-mode">${escHtml(question.mode)}</span>` : '';
     const contextText = String(question?.context?.rationale || '').trim();
     const contextHtml = contextText ? `<div class="relay-question-context">${renderLinkedPlainText(contextText)}</div>` : '';
+    // The card's own title ("Agent sessions", "Remote relay", a Claude
+    // question's header), above the question.
+    const headerText = String(question?.context?.header || '').trim();
+    const headerHtml = headerText ? `<div class="relay-question-header">${escHtml(headerText)}</div>` : '';
     const fields = schemaFieldsFromQuestion(question);
     const structuredQuestion = fields.length > 0;
 
@@ -296,14 +301,21 @@ export function renderRelayQuestions() {
           choices.map((choice) => `<button class="relay-question-choice" disabled>${escHtml(choice)}</button>`).join('')
         }</div>`;
       }
-      const showReplyControls = question.status === 'pending';
+      // A card that takes no typed text (approval and permission cards) is
+      // answered by its choices alone: no reply box, and a multi-select one
+      // keeps only its "Reply with selection".
+      const freeText = questionAcceptsFreeText(question);
+      const showReplyControls = question.status === 'pending' && (freeText || multiSelect);
       const draftText = String(relayQuestionDrafts.get(question.id) || '');
       const replyPlaceholder = multiSelect
         ? 'Add another answer or a note (optional)… (Ctrl/Cmd+Enter to send)'
         : 'Type a reply… (Ctrl/Cmd+Enter to send)';
+      const replyInputHtml = freeText
+        ? `<textarea id="relay-question-input-${question.id}" placeholder="${replyPlaceholder}" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>`
+        : '';
       const replyHtml = showReplyControls
         ? `<div class="relay-question-reply">
-            <textarea id="relay-question-input-${question.id}" placeholder="${replyPlaceholder}" onkeydown="handleRelayQuestionKey(event, '${question.id}')" oninput="onRelayQuestionDraftInput('${question.id}', this.value)">${escHtml(draftText)}</textarea>
+            ${replyInputHtml}
             <button class="relay-question-submit" onclick="${multiSelect ? 'submitRelayQuestionMultiSelect' : 'submitRelayQuestionAnswer'}('${question.id}')">${multiSelect ? 'Reply with selection' : 'Reply'}</button>
           </div>`
         : '';
@@ -320,6 +332,7 @@ export function renderRelayQuestions() {
     wrapper.innerHTML = `
       <div class="relay-question-card${question.status === 'timed_out' ? ' relay-question-timed-out' : ''}">
         <div class="relay-question-head">${questionCardHeadLabel(conversations[question.conversationId])}${modeTag} · ${fmtDate(question.createdAt)}</div>
+        ${headerHtml}
         <div class="relay-question-body">${renderLinkedPlainText(question.prompt || '')}</div>
         ${contextHtml}
         ${answeredHtml}
@@ -580,6 +593,15 @@ async function enqueueRelayAnswerForSync(questionId, body) {
   return queued;
 }
 
+// The relay's reason for refusing an answer (a card that takes only its
+// choices names them), or '' when it gave none.
+function relayAnswerRefusalText(refusal) {
+  const reason = String(refusal?.error || '').trim();
+  if (!reason) return '';
+  const choices = Array.isArray(refusal?.choices) ? refusal.choices.map((choice) => String(choice)).filter(Boolean) : [];
+  return choices.length ? `${reason}. Choices: ${choices.join(', ')}.` : reason;
+}
+
 export async function submitRelayQuestionAnswer(questionId, presetAnswer = null) {
   const input = document.getElementById(`relay-question-input-${questionId}`);
   // Ctrl/Cmd+Enter in a multi-select card's text field sends the ticked
@@ -600,15 +622,18 @@ export async function submitRelayQuestionAnswer(questionId, presetAnswer = null)
     const question = relayQuestions.get(questionId) || null;
     const sdkSessionId = String(question?.sdkSessionId || '').trim();
     const singleFieldStructuredAnswer = resolveSingleFieldStructuredAnswer(question, answer);
+    let refusal = null;
     const r = singleFieldStructuredAnswer
       ? await answerRelayQuestionStructured(questionId, singleFieldStructuredAnswer, sdkSessionId || null)
-      : await answerRelayQuestion(questionId, answer, sdkSessionId || null);
+      : await answerRelayQuestion(questionId, answer, sdkSessionId || null, {
+        onErrorResponse: async (response) => { refusal = await response.json().catch(() => null); },
+      });
     if (!r?.question) {
       const queued = await enqueueRelayAnswerForSync(questionId, singleFieldStructuredAnswer
         ? { structuredAnswer: singleFieldStructuredAnswer, sdk_session_id: sdkSessionId || undefined }
         : { answer, sdk_session_id: sdkSessionId || undefined });
       if (queued) return;
-      throw new Error('Failed to submit relay question answer');
+      throw new Error(relayAnswerRefusalText(refusal) || 'Failed to submit relay question answer');
     }
     relayQuestionDrafts.delete(questionId);
     relayQuestionStructuredDrafts.delete(questionId);

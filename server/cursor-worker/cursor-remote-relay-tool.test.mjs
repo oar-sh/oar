@@ -136,6 +136,8 @@ function runnerFixture({ summary = { count: 1 }, toolReply = null, gate = null }
     api,
     sdkSessionId: 'sess-1',
     cwd: '/home/dev',
+    // The fixture folder exists on no host.
+    checkWorkingDirectoryImpl: () => null,
     apiKey: 'cursor-test-key',
     storeDir: '/home/dev/.cursor-agents',
     defaultModel: 'default-cursor-model',
@@ -226,6 +228,8 @@ test('a Stop cancels the pending remote_relay call and releases the hold', async
     api,
     sdkSessionId: 'sess-1',
     cwd: '/home/dev',
+    // The fixture folder exists on no host.
+    checkWorkingDirectoryImpl: () => null,
     apiKey: 'cursor-test-key',
     storeDir: '/home/dev/.cursor-agents',
     readContextWindowImpl: async () => null,

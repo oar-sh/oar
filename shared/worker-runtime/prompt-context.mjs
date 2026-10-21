@@ -99,7 +99,9 @@ export function createRelayPromptBuilder({
       // Guidance is advisory: a preview lookup that fails must cost the block,
       // never the turn.
       const previewBlock = typeof getPreviewInstructions === "function"
-        ? await Promise.resolve().then(getPreviewInstructions).catch(() => "")
+        ? await Promise.resolve()
+          .then(() => getPreviewInstructions({ conversationId: String(message?.conversationId || "") }))
+          .catch(() => "")
         : "";
       instructions = applyPreviewInstructions(toolInstructions, previewBlock);
     }

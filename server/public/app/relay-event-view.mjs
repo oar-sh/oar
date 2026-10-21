@@ -24,6 +24,7 @@ const EVENT_TYPES = new Set([
   'heartbeat',
   'link_lost',
   'link_restored',
+  'relay_restarted',
 ]);
 const URGENT_TYPES = new Set(['question_asked', 'error']);
 const DIGEST_PATTERN = /^Digest of \d+ events?/;
@@ -43,6 +44,7 @@ const TYPE_LABELS = Object.freeze({
   heartbeat: 'heartbeat',
   link_lost: 'link lost',
   link_restored: 'link back',
+  relay_restarted: 'relay restarted',
 });
 
 function defaultEscape(value) {
@@ -181,6 +183,8 @@ export function watchersOf(subscriptions, conversationId, { includeAll = true } 
 export function watchingChipText(summary) {
   if (!summary?.subscriptions?.length) return '';
   if (summary.all) return summary.count ? `watching all sessions (+${summary.count} listed)` : 'watching all sessions';
+  // Only relay_restarted: no session is watched.
+  if (!summary.count) return 'waiting for a relay restart';
   return `watching ${summary.count} session${summary.count === 1 ? '' : 's'}`;
 }
 
@@ -198,7 +202,7 @@ function describeSubscription(sub, conversations) {
   const listed = (Array.isArray(sub.sessions) ? sub.sessions : []).filter((session) => session?.id).map(titleOf).join(', ');
   const what = sub.scope === 'all'
     ? (paired ? `All sessions of ${relay}` : 'All sessions')
-    : (paired ? `${relay} · ${listed}` : listed);
+    : (paired ? `${relay} · ${listed}` : (listed || 'This relay'));
   const extras = [
     sub.once ? 'once' : '',
     sub.heartbeatMinutes ? `heartbeat ${sub.heartbeatMinutes} min` : '',

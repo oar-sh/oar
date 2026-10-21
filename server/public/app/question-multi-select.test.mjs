@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { composeMultiSelectAnswer, isMultiSelectQuestion, offersMultiSelectToggle } from './question-multi-select.mjs';
 
-const card = (context, choices = ['a', 'b', 'c']) => ({ choices, context });
+const card = (context, choices = ['a', 'b', 'c'], allowFreeform = true) => ({ choices, context, allowFreeform });
 
 test('without the switch, a card is multi-select exactly when its provider flagged it', () => {
   assert.equal(isMultiSelectQuestion(card({ multiSelect: true })), true);
@@ -22,6 +22,12 @@ test('a Copilot card offers the switch; its position overrides the flag either w
   assert.equal(isMultiSelectQuestion(copilotSingle, true), true, 'switched on');
   assert.equal(isMultiSelectQuestion(copilotMulti), true, 'pre-selected by the flag or wording');
   assert.equal(isMultiSelectQuestion(copilotMulti, false), false, 'switched back off');
+});
+
+test('a card that takes no typed text offers no switch: the relay would refuse a joined answer', () => {
+  const closed = card({ allowMultiSelect: true }, ['a', 'b', 'c'], false);
+  assert.equal(offersMultiSelectToggle(closed), false);
+  assert.equal(isMultiSelectQuestion(closed, true), false, 'a stale switch position does not count');
 });
 
 test('a Claude card has no switch and follows its flag strictly, whatever the override says', () => {

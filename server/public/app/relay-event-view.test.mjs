@@ -31,6 +31,7 @@ test('the browser copy matches shared/relay-events.mjs', () => {
       { ...event('question_asked', { prompt: 'Ship?' }), relay: { id: 'rr_fixture', name: 'lab-relay' }, replayed: true },
       { type: 'link_restored', relay: { id: 'rr_fixture', name: 'lab-relay' }, at: '2026-01-01T10:31:00.000Z', detail: { since: '2026-01-01T10:00:00.000Z', kept: 1 } },
     ]),
+    shared.buildRelayEventMessageText([{ type: 'relay_restarted', session: null, relay: { id: 'self', name: 'bench-relay' }, detail: { stop: 'unknown' } }]),
     'a stray text',
   ];
   for (const text of samples) assert.deepEqual(parseRelayEventMessageText(text), shared.parseRelayEventMessageText(text));
@@ -71,6 +72,19 @@ const SUBS = [
   { id: 'sub_c', watcher: 'conv-other', scope: 'all', sessions: 'all', events: ['all_idle'], heartbeatMinutes: 60 },
   { id: 'sub_d', watcher: 'conv-gone', scope: 'sessions', sessions: [{ id: 'conv-1' }], endedAt: '2026-01-01T00:00:00.000Z' },
 ];
+
+test('relay_restarted: its row is labelled, and a subscription to it alone waits for a restart', () => {
+  const text = shared.buildRelayEventMessageText([{ type: 'relay_restarted', session: null, relay: { id: 'self', name: 'bench-relay' }, detail: { stop: 'unknown' } }]);
+  assert.equal(relayEventSummaryText(parseRelayEventMessageText(text)), '1 event · relay restarted');
+  assert.match(renderRelayEventRowHtml({ role: 'user', kind: RELAY_EVENT_MESSAGE_KIND, text }), /relay-event-line relay-event-relay-restarted/);
+  const subscriptions = [{ id: 'sub_fixture1', watcher: 'conv-w', relay: 'self', scope: 'sessions', sessions: [], events: ['relay_restarted'], once: true }];
+  const summary = watchingSummary(subscriptions, 'conv-w');
+  assert.equal(watchingChipText(summary), 'waiting for a relay restart');
+  assert.match(renderWatchingPanelHtml(summary), /<span class="relay-watch-what">This relay<\/span><span class="relay-watch-events">relay_restarted · once<\/span>/);
+  assert.deepEqual(watchersOf(subscriptions, 'conv-other'), [], 'no session is watched');
+  subscriptions.push({ id: 'sub_fixture2', watcher: 'conv-w', relay: 'self', scope: 'sessions', sessions: [{ id: 'conv-a' }], events: ['turn_end'] });
+  assert.equal(watchingChipText(watchingSummary(subscriptions, 'conv-w')), 'watching 1 session');
+});
 
 test('a watcher counts the distinct sessions it watches', () => {
   const summary = watchingSummary(SUBS, 'conv-watcher');

@@ -528,6 +528,33 @@ test('another tool asking for permission becomes an Allow/Deny card', async () =
   await runner.dispose();
 });
 
+test('a permission card reads its answer by the shared rule: any case allows, no choice is no plain Deny', async () => {
+  const api = makeApi({
+    '/api/relay-question': (body, attempt) => ({ question: { id: `question-${attempt + 1}` } }),
+    '/api/relay-question/question-1': { question: { status: 'answered', answer: ' allow ' } },
+    '/api/relay-question/question-2': { question: { status: 'answered', answer: 'yes please' } },
+  });
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+  const input = { command: 'git push origin feature/licence' };
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(toolRequest(5, { requestId: 'request-1', toolName: 'Bash', input }));
+  await waitFor(() => cloud.callsOf('sendControlResponse').length === 1, 'first decision sent');
+  stream.emit(toolRequest(6, { requestId: 'request-2', toolName: 'Bash', input }));
+  await waitFor(() => cloud.callsOf('sendControlResponse').length === 2, 'second decision sent');
+
+  const [first, second] = cloud.callsOf('sendControlResponse').map((call) => call.args.response);
+  assert.deepEqual(first, { behavior: 'allow', updatedInput: input });
+  assert.equal(second.behavior, 'deny');
+  assert.match(second.message, /neither Allow nor Deny/);
+
+  stream.emit(turnResult(9, { result: 'Pushed.' }));
+  await done;
+  await runner.dispose();
+});
+
 test('a card answered from another client is closed here without a second answer', async () => {
   let polls = 0;
   const api = makeApi({

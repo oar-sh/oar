@@ -37,7 +37,12 @@ export const RELAY_EVENT_HEARTBEAT_TYPE = 'heartbeat';
 export const RELAY_EVENT_LINK_LOST_TYPE = 'link_lost';
 export const RELAY_EVENT_LINK_RESTORED_TYPE = 'link_restored';
 const LINK_EVENT_TYPES = Object.freeze([RELAY_EVENT_LINK_LOST_TYPE, RELAY_EVENT_LINK_RESTORED_TYPE]);
-const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBEAT_TYPE, ...LINK_EVENT_TYPES]);
+// An event of this relay, not of a session: its runtime started again. Only
+// a subscription that names it gets it (never the default), and one that
+// names nothing else needs no sessions.
+export const RELAY_EVENT_RELAY_RESTARTED_TYPE = 'relay_restarted';
+export const RELAY_EVENT_RELAY_LEVEL_TYPES = Object.freeze([RELAY_EVENT_RELAY_RESTARTED_TYPE]);
+const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBEAT_TYPE, ...LINK_EVENT_TYPES, ...RELAY_EVENT_RELAY_LEVEL_TYPES]);
 
 // Not an event of its own but a narrower task_finished a subscription can
 // name: the end of a task other than a shell command (a sub-agent's). Its
@@ -46,19 +51,28 @@ const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBE
 // whole context; a failed one is still a task_failed.
 export const RELAY_EVENT_SUBAGENT_FINISHED_TYPE = 'subagent_finished';
 
-// What `events` may name: the event types and the narrower subagent_finished.
+// What `events` may name: the event types, the narrower subagent_finished
+// and the relay's own relay_restarted.
 export const RELAY_EVENT_SUBSCRIBABLE_TYPES = Object.freeze([
   ...RELAY_EVENT_TYPES.slice(0, RELAY_EVENT_TYPES.indexOf('task_finished') + 1),
   RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
   ...RELAY_EVENT_TYPES.slice(RELAY_EVENT_TYPES.indexOf('task_finished') + 1),
+  ...RELAY_EVENT_RELAY_LEVEL_TYPES,
 ]);
 
 // What a subscription gets when it names no events: everything but the
 // start of a task, and of the task ends that went well only a sub-agent's
 // (subagent_finished, not task_finished): the start of a task and every
-// shell command's end a watcher asks for explicitly.
+// shell command's end a watcher asks for explicitly. relay_restarted is
+// never a default: a wake-up after each restart is asked for by name.
 export const RELAY_EVENT_DEFAULT_TYPES = Object.freeze(RELAY_EVENT_SUBSCRIBABLE_TYPES
-  .filter((type) => type !== 'task_started' && type !== 'task_finished'));
+  .filter((type) => type !== 'task_started' && type !== 'task_finished' && !RELAY_EVENT_RELAY_LEVEL_TYPES.includes(type)));
+
+/** Whether `events` names relay-level events only (then no sessions are needed). */
+export function isRelayLevelOnly(types) {
+  const list = (Array.isArray(types) ? types : []).map(toText).filter(Boolean);
+  return list.length > 0 && list.every((type) => RELAY_EVENT_RELAY_LEVEL_TYPES.includes(type));
+}
 
 // The default before subagent_finished: every type but task_started. A
 // subscription made without events stored exactly this list.
@@ -249,11 +263,47 @@ function taskOutcome(detail) {
   return parts.join(', ');
 }
 
+/** `2026-10-20 14:05 UTC`, or '' for a time that does not parse. */
+function utcMinute(value) {
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
+}
+
+// The end of a relay_restarted line: what the agent should do, and the loop
+// guard said up front (services/relay-event-service.mjs noteRelayStarted).
+export const RELAY_RESTARTED_ADVICE = 'Timers and jobs your CLI scheduled before may be gone: check what you were waiting for and carry on. '
+  + 'A restart requested while this turn runs does not wake you again.';
+
+function relayRestartedLine(prefix, detail) {
+  const startedAt = utcMinute(detail.startedAt);
+  const stoppedAt = utcMinute(detail.stoppedAt);
+  const requestedAt = utcMinute(detail.requestedAt);
+  const since = `${prefix}${RELAY_EVENT_RELAY_RESTARTED_TYPE}: the relay runs again${startedAt ? ` since ${startedAt}` : ''}`;
+  if (detail.stop !== 'requested' && detail.stop !== 'stopped') {
+    // No record: a crash, a forced stop (on Windows a supervisor's stop ends
+    // the process without its signal handler) or a reboot.
+    return `${since}; the relay did not record how it stopped (for example a crash, a forced stop or a reboot). ${RELAY_RESTARTED_ADVICE}`;
+  }
+  let how;
+  if (detail.stop === 'requested') {
+    const action = oneLine(detail.action, 20) === 'shutdown' ? 'shutdown' : 'restart';
+    const by = oneLine(detail.requestedBy, 80);
+    const reason = oneLine(detail.reason, 140);
+    how = `after a ${action} requested${by ? ` by ${quote(by, 80)}` : ''}${requestedAt ? ` at ${requestedAt}` : ''}`
+      + `${reason ? ` (reason ${quote(reason, 140)})` : ''}`;
+  } else {
+    const reason = oneLine(detail.reason, 140);
+    how = `after it was stopped${reason ? ` (${reason.replace(/[()]/g, '')})` : ''}${stoppedAt ? ` at ${stoppedAt}` : ''}`;
+  }
+  return `${since}, ${how}. ${RELAY_RESTARTED_ADVICE}`;
+}
+
 /** One line of the event message, the watcher's to read. */
 export function formatRelayEventLine(event) {
   const type = oneLine(event?.type, 40);
   const detail = event?.detail && typeof event.detail === 'object' ? event.detail : {};
   const prefix = linePrefix(event);
+  if (type === RELAY_EVENT_RELAY_RESTARTED_TYPE) return relayRestartedLine(prefix, detail);
   if (type === RELAY_EVENT_LINK_LOST_TYPE) {
     const since = oneLine(detail.since, 40);
     return `${prefix}${type}: no answer from relay ${quote(relayDisplayName(event), 60)}${since ? ` since ${since}` : ''}; your subscriptions there saw nothing meanwhile`;

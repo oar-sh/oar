@@ -18,6 +18,9 @@ test('every shipped dependency with an install script is on the allow list', () 
     .filter(([key, entry]) => key && entry.hasInstallScript && !entry.dev)
     .map(([key]) => key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length))
     .sort();
-  assert.deepEqual([...new Set(withScripts)], [...NPM_INSTALL_SCRIPT_PACKAGES].sort());
+  // The package's own install scripts (the preinstall rescue) need it listed too.
+  const own = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const ownScripts = ['preinstall', 'install', 'postinstall'].some((hook) => own.scripts?.[hook]);
+  assert.deepEqual([...new Set([...withScripts, ...(ownScripts ? [own.name] : [])])].sort(), [...NPM_INSTALL_SCRIPT_PACKAGES].sort());
   assert.equal(NPM_ALLOW_SCRIPTS_ARG, `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`);
 });
