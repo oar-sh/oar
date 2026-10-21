@@ -7,18 +7,19 @@ import { resolveLayoutStateDirs, resolveRelayStateDirs } from './oar-state-layou
 import {
   describeExecError,
   describeSpawnEnvironment,
+  windowsSystemRoot,
   windowsSystemToolPath,
 } from '../../shared/windows-system-tools.mjs';
 import {
-  LEGACY_WINDOWS_AUTOSTART_FILENAME,
-  WINDOWS_AUTOSTART_FILENAME,
   autostartWaitLines,
+  backupPathFor,
   buildLauncherFile,
+  createWindowsAutostartService,
   escapeBatchValue,
   launcherNodeLine,
   launcherScriptsMatch,
+  otherInstallOf,
   readLauncherNodePath,
-  resolveWindowsStartupDirectory,
   stateDirLines,
 } from './windows-autostart-service.mjs';
 
@@ -60,6 +61,9 @@ const ELEVATION_TIMEOUT_MS = 120_000;
 export const BOOT_LAUNCHER_LOG_FILENAME = 'oar-web-relay-launcher.log';
 // Each schtasks query; the settings page waits on two of them.
 const QUERY_TIMEOUT_MS = 6_000;
+// The PowerShell export a task with non-ASCII text is read again with
+// (PowerShell and its ScheduledTasks module start first).
+const EXPORT_TIMEOUT_MS = 20_000;
 
 function normalizeText(value) {
   return String(value == null ? '' : value).trim();
@@ -338,26 +342,133 @@ function samePath(a, b) {
 }
 
 /**
- * How a task that runs our launcher differs from the one buildBootTaskXml
- * registers, as short names (empty when it does not). Only what the generated
- * XML sets is compared: Task Scheduler adds its own defaults on export, and
- * the run level, for one, is not set by OAR.
+ * Elements, attributes and text of a Task Scheduler export, as a tree of
+ * `{ name, attrs, children, text }`; no XML parser dependency. Throws on
+ * anything it cannot read (callers take that as hand-made).
  */
-export function describeTaskCustomisations(xmlText, { launcherPath, workingDirectory } = {}) {
-  const parsed = parseTaskXml(xmlText);
+export function parseXmlTree(xmlText) {
+  const root = { name: '#document', attrs: {}, children: [], text: '' };
+  const stack = [root];
+  const token = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<(\/?)([A-Za-z_][\w.:-]*)((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)|(<)/g;
+  for (const match of String(xmlText == null ? '' : xmlText).matchAll(token)) {
+    const [, closing, name, attrText, selfClosing, text, stray] = match;
+    const top = stack.at(-1);
+    if (stray) throw new Error('unreadable task XML');
+    if (text !== undefined) {
+      top.text += unescapeXml(text);
+    } else if (closing) {
+      if (top.name !== name || stack.length === 1) throw new Error('unbalanced task XML');
+      stack.pop();
+    } else if (name) {
+      const attrs = {};
+      for (const [, key, quoted] of String(attrText || '').matchAll(/([\w.:-]+)\s*=\s*("[^"]*"|'[^']*')/g)) {
+        attrs[key] = unescapeXml(quoted.slice(1, -1));
+      }
+      const element = { name, attrs, children: [], text: '' };
+      top.children.push(element);
+      if (!selfClosing) stack.push(element);
+    }
+  }
+  if (stack.length !== 1) throw new Error('unbalanced task XML');
+  return root;
+}
+
+// The settings buildBootTaskXml writes, and those Task Scheduler adds with
+// their default values on export. Any other setting or value is a change.
+const TASK_SETTINGS = {
+  DisallowStartIfOnBatteries: 'false',
+  StopIfGoingOnBatteries: 'false',
+  ExecutionTimeLimit: 'PT0S',
+  StartWhenAvailable: 'true',
+  RestartOnFailure: { Count: '5', Interval: 'PT1M' },
+};
+const TASK_SETTING_DEFAULTS = {
+  MultipleInstancesPolicy: 'IgnoreNew',
+  UseUnifiedSchedulingEngine: 'true',
+  AllowHardTerminate: 'true',
+  RunOnlyIfNetworkAvailable: 'false',
+  AllowStartOnDemand: 'true',
+  Enabled: 'true',
+  Hidden: 'false',
+  RunOnlyIfIdle: 'false',
+  DisallowStartOnRemoteAppSession: 'false',
+  WakeToRun: 'false',
+  Priority: '7',
+  IdleSettings: { StopOnIdleEnd: 'true', RestartOnIdle: 'false', Duration: 'PT10M', WaitTimeout: 'PT1H' },
+};
+
+// Children of `element` are exactly the named ones with these values
+// (`optional` ones may be missing).
+function childrenMatch(element, required, optional = {}) {
+  const seen = new Set();
+  for (const child of element?.children || []) {
+    if (seen.has(child.name)) return false;
+    seen.add(child.name);
+    const wanted = required[child.name] ?? optional[child.name];
+    if (wanted === undefined) return false;
+    if (typeof wanted === 'object' ? !childrenMatch(child, {}, wanted) || child.text.trim() : !sameText(child.text, wanted)) return false;
+  }
+  return Object.keys(required).every((name) => seen.has(name)
+    && (typeof required[name] !== 'object' || childrenMatch(element.children.find((child) => child.name === name), required[name])));
+}
+
+function sameUser(userId, user) {
+  const id = normalizeText(userId).toLowerCase();
+  if (!id || !user) return false;
+  const name = normalizeText(user.name).toLowerCase();
+  return id === normalizeText(user.sid).toLowerCase() || (name && (id === name || id === name.split('\\').pop()));
+}
+
+/**
+ * How a task that runs our launcher differs from the one buildBootTaskXml
+ * registers, as short names (empty when it does not): only a task that is
+ * that one in every field that matters is OAR's own. Task Scheduler's own
+ * additions on export are no change (RegistrationInfo, the defaults in
+ * TASK_SETTING_DEFAULTS, `Enabled` on the trigger); anything else is: the
+ * account (`user`, when given: `{ sid, name }`, or null when it is not known),
+ * a run level above least privilege, a second action or trigger, any other
+ * setting. XML it cannot read is `unreadable`.
+ */
+export function describeTaskCustomisations(xmlText, { launcherPath, workingDirectory, user } = {}) {
+  let task;
+  try {
+    task = parseXmlTree(xmlText).children.find((element) => element.name === 'Task');
+  } catch {}
+  if (!task) return ['unreadable'];
   const differences = [];
-  if (!sameText(parsed.command, 'C:\\Windows\\System32\\cmd.exe')
-    || normalizeText(parsed.argumentsLine).replace(/\s+/g, ' ').toLowerCase()
-      !== `/d /c "${normalizeText(launcherPath)}"`.toLowerCase()) {
+  const section = (name) => task.children.filter((element) => element.name === name);
+  if (task.children.some((element) => !['RegistrationInfo', 'Principals', 'Settings', 'Triggers', 'Actions'].includes(element.name))
+    || ['Principals', 'Settings', 'Triggers', 'Actions'].some((name) => section(name).length !== 1)) {
+    differences.push('other');
+  }
+  const [principal, ...morePrincipals] = section('Principals')[0]?.children || [];
+  const field = (element, name) => element?.children.find((child) => child.name === name)?.text ?? null;
+  if (user !== undefined && (!sameUser(field(principal, 'UserId'), user) || morePrincipals.length)) differences.push('user');
+  if (!sameText(field(principal, 'LogonType'), 'S4U')) differences.push('logon-type');
+  if (field(principal, 'RunLevel') !== null && !sameText(field(principal, 'RunLevel'), 'LeastPrivilege')) differences.push('run-level');
+  if ((principal?.children || []).some((child) => !['UserId', 'LogonType', 'RunLevel'].includes(child.name))) differences.push('user');
+
+  const actions = section('Actions')[0]?.children || [];
+  const exec = actions[0];
+  if (actions.length !== 1 || exec.name !== 'Exec'
+    || exec.children.some((child) => !['Command', 'Arguments', 'WorkingDirectory'].includes(child.name))
+    || !sameText(field(exec, 'Command'), 'C:\\Windows\\System32\\cmd.exe')
+    || normalizeText(field(exec, 'Arguments')).replace(/\s+/g, ' ').toLowerCase() !== `/d /c "${normalizeText(launcherPath)}"`.toLowerCase()) {
     differences.push('action');
   }
-  if (normalizeText(workingDirectory) && !samePath(parsed.workingDirectory, workingDirectory)) {
+  if (normalizeText(workingDirectory) && !samePath(field(exec, 'WorkingDirectory'), workingDirectory)) {
     differences.push('working-directory');
   }
-  if (!sameText(parsed.logonType, 'S4U')) differences.push('logon-type');
-  if (!parsed.hasBootTrigger) differences.push('trigger');
-  else if (!sameText(parsed.bootDelay, 'PT30S')) differences.push('boot-delay');
-  return differences;
+
+  const triggers = section('Triggers')[0]?.children || [];
+  const boot = triggers[0];
+  if (triggers.length !== 1 || boot.name !== 'BootTrigger' || !childrenMatch(boot, {}, { Delay: field(boot, 'Delay') ?? '', Enabled: 'true' })) {
+    differences.push('trigger');
+  } else if (!sameText(field(boot, 'Delay'), 'PT30S')) {
+    differences.push('boot-delay');
+  }
+  if (!childrenMatch(section('Settings')[0], TASK_SETTINGS, TASK_SETTING_DEFAULTS)) differences.push('settings');
+  return [...new Set(differences)];
 }
 
 // Shared with the sign-in entry; still exported from here for its callers.
@@ -378,34 +489,149 @@ export function classifyTaskXml(xmlText, { launcherPath } = {}) {
 }
 
 /**
+ * A PowerShell string literal that keeps `value` as it is: single-quoted
+ * (no `$` or backtick expansion), each single quote doubled, typographic
+ * ones too (PowerShell ends a single-quoted string at those as well).
+ */
+export function psLiteral(value) {
+  return `'${String(value).replace(/['‘’‚‛]/g, (quote) => quote + quote)}'`;
+}
+
+// The exit code of a sweep that failed (and put back what it had deleted).
+export const SWEEP_FAILED_EXIT_CODE = 3;
+// Windows' ERROR_CANCELLED: the administrator prompt was declined.
+export const ELEVATION_DECLINED_EXIT_CODE = 1223;
+
+/**
  * The elevated sweep. Everything the admin token is actually needed for —
  * and nothing else — in one script, so one UAC covers the whole transition
  * out of any mixed state (legacy-named task, hand-made task, fresh install).
+ * Every path is a PowerShell literal (psLiteral): a space, an apostrophe,
+ * `&`, `%`, `$` or non-ASCII in the OAR folder are passed on as they are.
+ * When it fails (the create, or a task still there after its delete) it
+ * puts back each task it deleted from `restore` (`{ task, xml }`: the copies
+ * made before, which `schtasks /create /xml` takes back) and exits
+ * SWEEP_FAILED_EXIT_CODE.
  */
-export function buildElevationScript({ action, xmlPath, schtasksPath = 'schtasks' } = {}) {
+export function buildElevationScript({ action, xmlPath, schtasksPath = 'schtasks', includeLegacy = false, restore = [] } = {}) {
   // PowerShell runs a quoted path only behind the call operator.
-  const schtasks = /[\\/]/.test(schtasksPath) ? `& "${schtasksPath}"` : schtasksPath;
+  const schtasks = /[\\/]/.test(schtasksPath) ? `& ${psLiteral(schtasksPath)}` : schtasksPath;
+  const remove = (name) => `${schtasks} /delete /tn ${psLiteral(name)} /f 2>$null`;
+  const stillThere = (name) => [`${schtasks} /query /tn ${psLiteral(name)} *>$null`, 'if ($LASTEXITCODE -eq 0) { $failed = $true }'];
+  let steps;
   if (action === 'enable') {
     if (!normalizeText(xmlPath)) {
       throw new Error('The enable sweep needs the task XML path.');
     }
-    return [
-      `${schtasks} /delete /tn "${LEGACY_BOOT_TASK_NAME}" /f 2>$null`,
-      `${schtasks} /delete /tn "${BOOT_TASK_NAME}" /f 2>$null`,
-      `${schtasks} /create /tn "${BOOT_TASK_NAME}" /xml "${xmlPath}"`,
-      'exit $LASTEXITCODE',
-      '',
-    ].join('\r\n');
+    steps = [
+      remove(LEGACY_BOOT_TASK_NAME),
+      remove(BOOT_TASK_NAME),
+      `${schtasks} /create /tn ${psLiteral(BOOT_TASK_NAME)} /xml ${psLiteral(xmlPath)}`,
+      'if ($LASTEXITCODE -ne 0) { $failed = $true }',
+    ];
+  } else if (action === 'disable') {
+    // Our own task only: a pre-rebrand one was made by hand, and stays
+    // unless `includeLegacy` (--replace, a copy kept).
+    const names = [BOOT_TASK_NAME, ...(includeLegacy ? [LEGACY_BOOT_TASK_NAME] : [])];
+    steps = [...names.map(remove), ...names.flatMap(stillThere)];
+  } else {
+    throw new Error(`Unknown elevation action: ${JSON.stringify(action)}`);
   }
-  if (action === 'disable') {
-    return [
-      `${schtasks} /delete /tn "${BOOT_TASK_NAME}" /f 2>$null`,
-      `${schtasks} /delete /tn "${LEGACY_BOOT_TASK_NAME}" /f 2>$null`,
-      'exit 0',
-      '',
-    ].join('\r\n');
-  }
-  throw new Error(`Unknown elevation action: ${JSON.stringify(action)}`);
+  const putBack = restore.flatMap(({ task, xml }) => [
+    `  ${schtasks} /query /tn ${psLiteral(task)} *>$null`,
+    `  if ($LASTEXITCODE -ne 0) { ${schtasks} /create /tn ${psLiteral(task)} /xml ${psLiteral(xml)} /f 2>$null }`,
+  ]);
+  return [
+    '$failed = $false',
+    ...steps,
+    'if ($failed) {',
+    ...putBack,
+    `  exit ${SWEEP_FAILED_EXIT_CODE}`,
+    '}',
+    'exit 0',
+    '',
+  ].join('\r\n');
+}
+
+// The elevated PowerShell did not start (Start-Process failed otherwise
+// than by the cancel): nothing elevated ran, as with a declined prompt.
+export const ELEVATION_NOT_STARTED_EXIT_CODE = 2;
+// It started, but its exit code cannot be told: the sweep may have run.
+export const ELEVATION_UNKNOWN_EXIT_CODE = 4;
+
+/**
+ * The command the unelevated PowerShell runs: Start-Process -Verb RunAs of
+ * a PowerShell (no profile) that runs `script` as an -EncodedCommand (UTF-16,
+ * so no path in it is quoted or re-encoded on the way). Its exit code is the
+ * sweep's only when the elevated PowerShell ran: a declined prompt is
+ * ELEVATION_DECLINED_EXIT_CODE, whether Start-Process says so with an
+ * error (stopped here, also when it is not a terminating one) or returns no
+ * process at all; never 0, which `exit $null` would give.
+ * ELEVATION_NOT_STARTED_EXIT_CODE: Start-Process failed otherwise.
+ * `verb: ''` (tests) runs it unelevated.
+ */
+export function buildElevationCommand({ powershellPath, script, verb = 'RunAs' } = {}) {
+  const encoded = Buffer.from(String(script), 'utf16le').toString('base64');
+  const declined = ELEVATION_DECLINED_EXIT_CODE;
+  return [
+    '$ErrorActionPreference = \'Stop\'; $p = $null;',
+    `try { $p = Start-Process -FilePath ${psLiteral(powershellPath)}${verb ? ` -Verb ${verb}` : ''} -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop`,
+    `-ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}' }`,
+    // 1223 is ERROR_CANCELLED; -2147023673 the same as an HRESULT.
+    `catch { $e = $_.Exception; while ($e) { if ($e.NativeErrorCode -eq ${declined} -or $e.HResult -eq -2147023673) { exit ${declined} }; $e = $e.InnerException }; exit ${ELEVATION_NOT_STARTED_EXIT_CODE} };`,
+    `if (-not $p) { exit ${declined} };`,
+    `if ($null -eq $p.ExitCode) { exit ${ELEVATION_UNKNOWN_EXIT_CODE} };`,
+    'exit $p.ExitCode',
+  ].join(' ');
+}
+/** How a task is named where entries are listed (`handMade`, `oar autostart status`). */
+export function bootTaskLabel(name) {
+  return `scheduled task \\${name}`;
+}
+
+/**
+ * The autostart mode out of the sign-in entries (`listEntries()` of the
+ * sign-in service) and the boot state (`getState()`), with every entry as
+ * `{ mode, path, generated, otherInstall }`; `unknown` when the boot task
+ * cannot be read. `oar autostart` and the web UI read it alike.
+ */
+export function describeWindowsAutostart({ signinEntries = [], boot = {} } = {}) {
+  const handMade = boot.handMade || [];
+  const listed = (entryPath) => handMade.some((entry) => entry.path === entryPath);
+  const entries = signinEntries.map((entry) => ({ ...entry, otherInstall: entry.otherInstall || null, mode: 'signin' }));
+  const own = bootTaskLabel(boot.taskName || BOOT_TASK_NAME);
+  if (boot.taskStatus === 'ready' && !listed(own)) entries.push({ mode: 'boot', path: own, generated: true, otherInstall: null });
+  if (boot.launcherPath && !listed(boot.launcherPath)) entries.push({ mode: 'boot', path: boot.launcherPath, generated: true, otherInstall: null });
+  entries.push(...handMade.map((entry) => ({ mode: 'boot', path: entry.path, generated: false, otherInstall: entry.otherInstall || null })));
+  let mode = entries.some((entry) => entry.mode === 'signin') ? 'signin' : 'off';
+  if (boot.taskStatus === 'ready') mode = 'boot';
+  if (boot.readError) mode = 'unknown';
+  return { mode, entries };
+}
+
+/**
+ * The hand-made entries that stop a switch to `target`: one of another mode
+ * would stay beside it, and a hand-made boot entry would be replaced by
+ * switching boot on. While there are any, nothing changes (unless --replace).
+ */
+export function switchBlockers({ mode, entries = [] } = {}, target) {
+  return entries.filter((entry) => !entry.generated && (entry.mode !== target || (target === 'boot' && mode !== 'boot')));
+}
+
+export function describeHandMade(entry) {
+  return `${entry.path} (hand-made${entry.otherInstall ? `: it starts the OAR install in ${entry.otherInstall}` : ''})`;
+}
+
+/**
+ * What `oar autostart` prints, and the web UI shows, when hand-made entries
+ * stop a switch: what to do first (the UI shortens a long error), then each
+ * entry.
+ */
+export function handMadeLines(entries, target) {
+  return [
+    `Nothing changed: OAR does not delete or overwrite an autostart entry it did not make. Remove it yourself, or replace it keeping a copy: oar autostart ${target} --replace.`,
+    ...entries.map((entry) => `Left as it is: ${describeHandMade(entry)}.`),
+  ];
 }
 
 /** `whoami /user /fo csv` → the current user's SID. */
@@ -414,11 +640,30 @@ export function parseSidFromWhoami(stdout) {
   return match ? match[1] : null;
 }
 
+/** `whoami /user /fo csv` → `{ name, sid }` of the current user, or null. */
+export function parseUserFromWhoami(stdout) {
+  const match = String(stdout || '').match(/"([^"\r\n]+)","(S-1-[\d-]+)"/);
+  return match ? { name: match[1], sid: match[2] } : null;
+}
+
+/**
+ * The command that exports a task's XML with a known encoding: Windows
+ * PowerShell, its output switched to UTF-8 (no BOM), the XML written as it
+ * is. The name is a literal (psLiteral); our tasks sit in the root folder.
+ */
+export function buildTaskExportCommand(taskName) {
+  return [
+    "$ErrorActionPreference = 'Stop';",
+    '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false;',
+    `[Console]::Out.Write((Export-ScheduledTask -TaskName ${psLiteral(taskName)} -TaskPath '\\'))`,
+  ].join(' ');
+}
+
 // `startError` is set when the program did not run at all (not found, timed
 // out): unlike an exit code, that says nothing about the task.
-function defaultExecFileImpl(file, args) {
+function defaultExecFileImpl(file, args, { timeout = QUERY_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    execFile(file, args, { windowsHide: true, timeout: QUERY_TIMEOUT_MS }, (error, stdout, stderr) => {
+    execFile(file, args, { windowsHide: true, timeout }, (error, stdout, stderr) => {
       const exitCode = typeof error?.code === 'number' ? error.code : null;
       resolve({
         code: error ? (exitCode ?? 1) : 0,
@@ -471,8 +716,10 @@ export function createWindowsBootAutostartService({
 
   /**
    * The task's XML, null when there is no such task, or `{ readError }` when
-   * schtasks itself could not run: that says nothing about the task, so it
-   * must not read as "missing".
+   * it could not be read: schtasks did not run, it failed on a task that is
+   * there (a task only an administrator may read: one storing another
+   * account's password), or the export below failed. That says nothing about
+   * the task, so it must not read as "missing" (or as anyone's).
    */
   async function queryTaskXml(taskName) {
     let result;
@@ -486,7 +733,64 @@ export function createWindowsBootAutostartService({
       // The details stay in the log (they can name folders on the host).
       return { readError: 'schtasks could not be run; the relay log has the details.' };
     }
-    return result?.code === 0 ? result.stdout : null;
+    if (result?.code !== 0) {
+      if (taskFileMissing(taskName)) return null;
+      log(`schtasks /query ${taskName} failed (exit code ${result?.code}): ${normalizeText(result?.stderr).split('\n')[0] || 'no detail'}`);
+      return { readError: `${bootTaskLabel(taskName)} could not be read; the relay log has the details.` };
+    }
+    return needsExport(result.stdout) ? exportTaskXml(taskName) : result.stdout;
+  }
+
+  /**
+   * Whether a task schtasks failed on is not there: its file under
+   * %SystemRoot%\System32\Tasks is not found. schtasks exits 1 alike for a
+   * missing task and one it may not read, and says which only in the
+   * system's language; the file is found (or access to it denied) either way
+   * for a task that is there.
+   */
+  function taskFileMissing(taskName) {
+    try {
+      fsImpl.statSync(pathImpl.join(windowsSystemRoot(env), 'System32', 'Tasks', taskName));
+      return false;
+    } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+  }
+
+  /**
+   * schtasks writes into a pipe in the console's code page, not UTF-8: a
+   * character outside ASCII comes out as a byte of that code page (ü as 0x81
+   * in 437), as a look-alike (Ł as L) or as `?` (日). Its output is taken as
+   * it is only when it is ASCII with no `?` after the declaration (no path
+   * holds one) and the OAR folder is ASCII too (else an L may be its Ł).
+   */
+  function needsExport(xmlText) {
+    const body = String(xmlText || '').replace(/^\s*<\?xml[^>]*\?>/, '');
+    return /[^\x00-\x7f]|\?/.test(body) || /[^\x00-\x7f]/.test(oarRoot());
+  }
+
+  // One export per task at a time: a poll while one runs shares its result.
+  const exportsInFlight = new Map();
+  function exportTaskXml(taskName) {
+    if (!exportsInFlight.has(taskName)) {
+      exportsInFlight.set(taskName, runTaskExport(taskName).finally(() => exportsInFlight.delete(taskName)));
+    }
+    return exportsInFlight.get(taskName);
+  }
+
+  // The task's XML through PowerShell (buildTaskExportCommand), or `{ readError }`.
+  async function runTaskExport(taskName) {
+    let result;
+    try {
+      result = await execFileImpl(tool('powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', buildTaskExportCommand(taskName)], { timeout: EXPORT_TIMEOUT_MS });
+    } catch (error) {
+      result = { code: 1, stdout: '', stderr: '', startError: describeExecError(error) };
+    }
+    const xml = String(result?.stdout || '').replace(/^\ufeff/, '');
+    if (result?.code === 0 && !result.startError && /<Task[\s>]/.test(xml)) return xml;
+    const why = result?.startError || normalizeText(result?.stderr).split('\n')[0] || `exit code ${result?.code}`;
+    log(`the task ${taskName} could not be exported to read its non-ASCII text exactly: ${why}`);
+    return { readError: 'the task could not be exported to read its non-ASCII text exactly; the relay log has the details.' };
   }
 
   function readLauncher() {
@@ -542,11 +846,48 @@ export function createWindowsBootAutostartService({
     return true;
   }
 
+  /**
+   * A launcher OAR generates or an earlier version generated for this
+   * install (whatever Node it runs): one a mode change may delete.
+   */
+  function launcherIsGenerated(launcher) {
+    try {
+      const ownNodePath = readLauncherNodePath(launcher, serverPath());
+      if (!ownNodePath) return false;
+      if (launcherScriptsMatch(launcher, generatedLauncher({ nodePathOverride: ownNodePath }))) return true;
+      return buildEarlierBootLauncherScripts({
+        packageRoot,
+        nodePath: ownNodePath,
+        configPath,
+        ...resolveRelayStateDirs({ packageRoot, env, platform, fsImpl, pathImpl }),
+        workingDirectory: oarRoot(),
+        pathImpl,
+      }).some((earlier) => launcherScriptsMatch(launcher, earlier, { ignoreCase: true }));
+    } catch {
+      return false;
+    }
+  }
+
+  // The account this relay runs as (`whoami`), once: our task runs as it.
+  let userLookup = null;
+  function currentUser() {
+    userLookup ||= Promise.resolve()
+      .then(() => execFileImpl(tool('whoami'), ['/user', '/fo', 'csv']))
+      .then((result) => parseUserFromWhoami(result?.stdout))
+      .catch(() => null)
+      .then((user) => {
+        if (!user) userLookup = null; // asked again next time
+        return user;
+      });
+    return userLookup;
+  }
+
   /** What differs from the generated task and launcher, for a task that runs our launcher. */
-  function customisationsOf(xmlText) {
+  async function customisationsOf(xmlText) {
     const differences = describeTaskCustomisations(xmlText, {
       launcherPath: launcherPath(),
       workingDirectory: oarRoot(),
+      user: await currentUser(),
     });
     const launcher = readLauncher();
     if (launcher === null) differences.push('launcher-missing');
@@ -563,27 +904,82 @@ export function createWindowsBootAutostartService({
     return differences;
   }
 
-  function startupCmdPaths() {
-    const dir = resolveWindowsStartupDirectory(env, pathImpl);
-    return [
-      pathImpl.join(dir, WINDOWS_AUTOSTART_FILENAME),
-      pathImpl.join(dir, LEGACY_WINDOWS_AUTOSTART_FILENAME),
-    ];
+  /**
+   * The boot entries OAR did not generate, which no mode change deletes or
+   * writes over: a task under our name that runs something else, our task or
+   * launcher changed by hand (a missing launcher is no change), the
+   * pre-rebrand task, a hand-made launcher without our task.
+   */
+  // Each `{ path, task, otherInstall }`: `task` names a scheduled task,
+  // `otherInstall` the package folder of another OAR install a launcher starts.
+  function handMadeEntries({ taskStatus, customisations = [], legacyTaskPresent }) {
+    const entries = [];
+    const task = (name) => ({ path: bootTaskLabel(name), task: name, otherInstall: null });
+    if (taskStatus === 'foreign') entries.push(task(BOOT_TASK_NAME));
+    if (taskStatus === 'ready' && customisations.some((name) => name !== 'launcher' && name !== 'launcher-missing')) {
+      entries.push(task(BOOT_TASK_NAME));
+    }
+    if (legacyTaskPresent) entries.push(task(LEGACY_BOOT_TASK_NAME));
+    const launcher = readLauncher();
+    if (launcher !== null && !launcherIsGenerated(launcher)) {
+      entries.push({ path: launcherPath(), task: null, otherInstall: otherInstallOf(launcher, packageRoot, pathImpl) });
+    }
+    return entries;
   }
 
-  function removeStartupCmds() {
-    let removed = 0;
-    for (const target of startupCmdPaths()) {
-      try {
-        if (fsImpl.existsSync(target)) {
-          fsImpl.unlinkSync(target);
-          removed += 1;
+  /**
+   * Before `replace` deletes or writes over hand-made boot entries: a copy
+   * of each, `<name>.bak` next to the launcher, and of each task its
+   * exported XML (`schtasks /create /xml` takes it back) in the OAR folder.
+   * The copies, each `{ path, backup }`, or null when one could not be written.
+   */
+  async function backUpHandMade(entries) {
+    const copies = [];
+    try {
+      for (const entry of entries) {
+        let contents;
+        let target = entry.path;
+        if (entry.task) {
+          const xml = await queryTaskXml(entry.task);
+          if (xml === null) continue;
+          // Unread is no copy: nothing may be deleted without one.
+          if (typeof xml !== 'string') throw new Error(`${entry.path}: ${xml.readError}`);
+          contents = encodeTaskXml(xml);
+          target = pathImpl.join(oarRoot(), `${entry.task}.task.xml`);
+        } else {
+          contents = readLauncher();
+          if (contents === null) continue;
         }
-      } catch (error) {
-        log(`could not remove ${target}: ${error?.message || error}`);
+        const copy = backupPathFor(target, oarRoot(), fsImpl, pathImpl);
+        fsImpl.mkdirSync(oarRoot(), { recursive: true });
+        fsImpl.writeFileSync(copy, contents);
+        copies.push({ path: entry.path, backup: copy });
+        log(`kept a copy of ${entry.path} as ${copy}`);
       }
+      return copies;
+    } catch (error) {
+      log(`could not keep a copy before replacing: ${error?.message || error}`);
+      removeFiles(copies);
+      return null;
     }
-    return removed;
+  }
+
+  function removeFiles(copies) {
+    for (const { backup } of copies) {
+      try { fsImpl.unlinkSync(backup); } catch {}
+    }
+  }
+
+  // The sign-in entries of this install, which boot mode replaces.
+  const signin = createWindowsAutostartService({ platform, env, packageRoot, nodePath, configPath, fsImpl, pathImpl });
+
+  function removeStartupCmds() {
+    try {
+      return signin.setEnabled(false).kept;
+    } catch (error) {
+      log(`could not remove the sign-in entries: ${error?.message || error}`);
+      return [];
+    }
   }
 
   function manualCommandFor(action) {
@@ -611,6 +1007,8 @@ export function createWindowsBootAutostartService({
         taskName: BOOT_TASK_NAME,
         legacyTaskPresent: false,
         launcherPath: null,
+        generated: false,
+        handMade: [],
         pendingElevation: null,
         lastError: null,
         manualCommand: manualCommandFor('enable'),
@@ -618,18 +1016,20 @@ export function createWindowsBootAutostartService({
     }
     const ownXml = await queryTaskXml(BOOT_TASK_NAME);
     const legacyXml = await queryTaskXml(LEGACY_BOOT_TASK_NAME);
-    const readError = ownXml?.readError || null;
+    // Either task unread: nothing may be taken out or replaced (mode unknown).
+    const readError = ownXml?.readError || legacyXml?.readError || null;
     const legacyKnown = typeof legacyXml === 'string';
     let taskStatus;
-    if (readError) taskStatus = 'unknown';
+    if (ownXml?.readError) taskStatus = 'unknown';
     else if (ownXml === null) taskStatus = legacyKnown ? 'legacy' : 'missing';
     else taskStatus = classifyTaskXml(ownXml, { launcherPath: launcherPath() });
     // A task that runs our launcher but is not quite the one OAR registers (no
     // boot delay, an edited launcher) still is boot mode; it is reported,
     // never failed on.
-    const customisations = taskStatus === 'ready' ? customisationsOf(ownXml) : [];
+    const customisations = taskStatus === 'ready' ? await customisationsOf(ownXml) : [];
     let launcherPresent = false;
     try { launcherPresent = fsImpl.existsSync(launcherPath()); } catch {}
+    const handMade = handMadeEntries({ taskStatus, customisations, legacyTaskPresent: legacyKnown });
     return {
       supported: true,
       platform,
@@ -639,6 +1039,10 @@ export function createWindowsBootAutostartService({
       launcherPath: launcherPresent ? launcherPath() : null,
       customised: customisations.length > 0,
       customisations,
+      // Our task as OAR registers it, with a launcher OAR generated (or
+      // none): the one boot entry a mode change may delete.
+      generated: taskStatus === 'ready' && !handMade.some((entry) => entry.task === BOOT_TASK_NAME || entry.path === launcherPath()),
+      handMade,
       launcherBackupPath,
       readError,
       pendingElevation: pending ? pending.action : null,
@@ -654,61 +1058,163 @@ export function createWindowsBootAutostartService({
     fsImpl.renameSync(temporaryPath, targetPath);
   }
 
-  function settlePending(outcome) {
-    if (!pending) return;
-    if (pending.timer) clearTimeoutImpl(pending.timer);
-    pending = null;
-    lastError = outcome || null;
-  }
-
   /**
-   * The elevated child is powershell running Start-Process -Verb RunAs -Wait:
-   * the outer process lives exactly as long as the UAC prompt plus the sweep
-   * script, so its exit is the "elevation finished (or was declined)" signal.
+   * The elevated child is powershell running Start-Process -Verb RunAs -Wait
+   * (buildElevationCommand): the outer process lives exactly as long as the
+   * UAC prompt plus the sweep, so its exit is the signal. `onOutcome('ok' |
+   * 'declined' | 'failed', detail)`: a declined prompt changed nothing; a
+   * failed sweep may have run (it puts back what it deleted), and a timeout
+   * leaves the prompt open, so both keep every copy.
    */
-  function spawnElevated(action, onSettled) {
+  function spawnElevated(action, script, onOutcome) {
     const powershell = tool('powershell.exe');
     const child = spawnImpl(powershell, [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      [
-        `$p = Start-Process -FilePath '${powershell.replaceAll("'", "''")}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList`,
-        `'-NoProfile','-ExecutionPolicy','Bypass','-File','${elevationScriptPath()}'`,
-        '; exit $p.ExitCode',
-      ].join(' '),
+      buildElevationCommand({ powershellPath: powershell, script }),
     ], {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
     });
     let stderr = '';
     child.stderr?.on?.('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-2000); });
+    const settle = (outcome, detail) => {
+      if (!pending) return; // settled already
+      if (pending.timer) clearTimeoutImpl(pending.timer);
+      pending = null;
+      onOutcome(outcome, detail);
+    };
     const timer = setTimeoutImpl(() => {
       try { child.kill('SIGTERM'); } catch {}
-      settlePending(`${action} timed out waiting for the admin confirmation on the PC.`);
-      onSettled?.(false);
+      settle('failed', 'no answer at the administrator prompt within 2 minutes');
     }, ELEVATION_TIMEOUT_MS);
     timer?.unref?.();
     pending = { action, startedAt: now(), timer, child };
-    child.on('error', (error) => {
-      settlePending(`${action} could not request elevation: ${error?.message || error}`);
-      onSettled?.(false);
-    });
+    // Nothing elevated ran when the prompt was declined, or when neither
+    // PowerShell could be started: those put everything back.
+    child.on('error', (error) => settle('declined', `elevation could not be requested: ${error?.message || error}`));
     child.on('close', (code) => {
-      if (!pending) return; // timeout already settled it
-      if (code === 0) {
-        settlePending(null);
-        onSettled?.(true);
-      } else {
-        // 1 from Start-Process usually means the UAC prompt was declined.
-        const detail = normalizeText(stderr).split('\n')[0] || `exit code ${code}`;
-        settlePending(`${action} was not confirmed (${detail}). Run the command below from an elevated shell instead.`);
-        onSettled?.(false);
-      }
+      if (code === 0) settle('ok');
+      else if (code === ELEVATION_DECLINED_EXIT_CODE) settle('declined');
+      else if (code === ELEVATION_NOT_STARTED_EXIT_CODE) settle('declined', `the elevated step could not be started: ${normalizeText(stderr).split('\n')[0] || 'no detail'}`);
+      else settle('failed', code === SWEEP_FAILED_EXIT_CODE ? 'schtasks failed' : (normalizeText(stderr).split('\n')[0] || `exit code ${code}`));
     });
   }
 
-  async function requestEnable() {
+  const COPY_FAILED = 'Could not keep a copy of an entry before changing it, so nothing was changed; the relay log has the details.';
+
+  /**
+   * A copy of each entry before a sweep deletes it or the launcher is
+   * written over: `<name>.bak` beside the launcher, a task's exported XML
+   * (`schtasks /create /xml` takes it back) in the OAR folder. Each copy is
+   * `{ path, backup, task, generated }`; null when one could not be written.
+   */
+  async function copyEntries(entries) {
+    const copies = [];
+    try {
+      for (const entry of entries) {
+        let contents = entry.contents;
+        let target = entry.path;
+        if (entry.task) {
+          const xml = await queryTaskXml(entry.task);
+          if (xml === null) continue;
+          // Unread is no copy: nothing may be deleted without one.
+          if (typeof xml !== 'string') throw new Error(`${entry.path}: ${xml.readError}`);
+          contents = encodeTaskXml(xml);
+          target = pathImpl.join(oarRoot(), `${entry.task}.task.xml`);
+        }
+        if (contents == null) continue;
+        const backup = backupPathFor(target, oarRoot(), fsImpl, pathImpl);
+        fsImpl.mkdirSync(oarRoot(), { recursive: true });
+        fsImpl.writeFileSync(backup, contents);
+        copies.push({ path: entry.path, backup, task: entry.task || null, generated: Boolean(entry.generated) });
+        log(`kept a copy of ${entry.path} as ${backup}`);
+      }
+      return copies;
+    } catch (error) {
+      log(`could not keep a copy before changing an entry: ${error?.message || error}`);
+      removeFiles(copies);
+      return null;
+    }
+  }
+
+  // The tasks a sweep deletes, generated or not (`state.handMade`).
+  function tasksToCopy(state, names) {
+    return names.map((name) => ({
+      path: bootTaskLabel(name),
+      task: name,
+      generated: !state.handMade.some((entry) => entry.task === name),
+    }));
+  }
+
+  function restoreLauncher(previous) {
+    try {
+      if (previous === null) fsImpl.unlinkSync(launcherPath());
+      else writeFileAtomic(launcherPath(), previous);
+      return true;
+    } catch (error) {
+      log(`could not put the launcher back: ${error?.message || error}`);
+      return previous === null;
+    }
+  }
+
+  // Each copied task as read afterwards: one that could not be read is not
+  // said to be there, or gone.
+  async function tasksAfterwards(copies) {
+    const lines = [];
+    for (const copy of copies.filter((entry) => entry.task)) {
+      const xml = await queryTaskXml(copy.task);
+      if (typeof xml === 'string') lines.push(`${copy.path} is registered`);
+      else if (xml === null) lines.push(`${copy.path} is not registered`);
+      else lines.push(`${copy.path} could not be read, so whether it is registered is not known`);
+    }
+    return lines.length ? ` Afterwards: ${lines.join('; ')}.` : '';
+  }
+
+  async function failureText(action, detail, copies) {
+    const what = action === 'enable' ? 'registered' : 'removed';
+    const kept = copies.length ? ` Copies kept: ${copies.map((copy) => copy.backup).join(', ')}.` : '';
+    return `The boot task could not be ${what} (${detail}).${await tasksAfterwards(copies)}${kept} Run the command below from an elevated shell instead.`;
+  }
+
+  // Confirmed (exit 0), but the task could not be read back: nothing is
+  // undone or claimed, and every file stays.
+  function unverifiedText(action, readError, copies) {
+    const what = action === 'enable' ? 'registered' : 'removed';
+    const kept = copies.length ? ` Copies kept: ${copies.map((copy) => copy.backup).join(', ')}.` : '';
+    return `The administrator prompt was confirmed and the boot task should be ${what}, but it could not be read back to check (${readError}). Nothing was undone; the launcher stays.${kept}`;
+  }
+
+  /**
+   * After a declined prompt nothing ran: a copy goes once what it copies is
+   * verified in place (a task still registered, the launcher put back).
+   */
+  async function dropCopiesAfterDecline(copies, launcherBack) {
+    const left = [];
+    for (const copy of copies) {
+      const inPlace = copy.task ? typeof (await queryTaskXml(copy.task)) === 'string' : launcherBack;
+      if (inPlace) removeFiles([copy]);
+      else left.push(copy);
+    }
+    return left;
+  }
+
+  /**
+   * Registers our task, elevated. Refused while a boot entry OAR did not
+   * make is there (`handMade`: a task under our name or the pre-rebrand
+   * one, our task or launcher changed by hand), unless `replace`. Every task
+   * the sweep deletes and a launcher it writes over are copied first
+   * (copyEntries). `onSettled(ok, { kept, copies, declined, error })` once
+   * the elevation ends: `kept` the hand-made sign-in entries a confirmed
+   * enable left, `copies` the copies still there. Confirmed and verified
+   * (our task is registered), the copies of generated entries go and those
+   * of hand-made ones stay; declined, the launcher is put back and the
+   * copies go; failed, the launcher is put back and every copy stays.
+   * Confirmed but our task not readable afterwards (`unverified`): nothing
+   * is undone, every file stays, and it is no success.
+   */
+  async function requestEnable({ onSettled, replace = false } = {}) {
     if (!supported) {
       throw new Error('Windows boot autostart is only available on Windows.');
     }
@@ -718,51 +1224,101 @@ export function createWindowsBootAutostartService({
     if (pending) {
       return { ...(await getState()), accepted: false };
     }
-    lastError = null;
-    const launcher = generatedLauncher();
-    const previous = readLauncher();
-    if (previous !== null && !launcherScriptsMatch(previous, launcher)) {
-      // An edited (or older) launcher is replaced, but kept: one copy, the
-      // latest replaced one.
-      const backupPath = `${launcherPath()}${BOOT_LAUNCHER_BACKUP_SUFFIX}`;
-      try {
-        fsImpl.writeFileSync(backupPath, previous);
-        launcherBackupPath = backupPath;
-        log(`the launcher differed from the generated one; saved it as ${backupPath}`);
-      } catch (error) {
-        log(`could not save the current launcher as ${backupPath}: ${error?.message || error}`);
-        lastError = 'Could not keep a copy of the current launcher next to it, so it was not replaced; the relay log has the details.';
-        return { ...(await getState()), accepted: false };
-      }
+    const before = await getState();
+    if (before.readError) {
+      return { ...before, accepted: false, refused: `the boot task could not be read (${before.readError})` };
     }
-    writeFileAtomic(launcherPath(), generatedLauncher({ coverBytes: previous === null ? 0 : Buffer.byteLength(previous, 'utf8') }));
+    if (before.handMade.length && !replace) {
+      return { ...before, accepted: false, refused: handMadeLines(before.handMade, 'boot').join(' ') };
+    }
+    lastError = null;
     const who = await execFileImpl(tool('whoami'), ['/user', '/fo', 'csv']);
     const sid = parseSidFromWhoami(who.stdout);
     if (!sid) {
       lastError = 'Could not determine the current user SID (whoami /user failed).';
       return { ...(await getState()), accepted: false };
     }
+    const launcher = generatedLauncher();
+    const previous = readLauncher();
+    const deleted = [
+      ...(['ready', 'foreign'].includes(before.taskStatus) ? [BOOT_TASK_NAME] : []),
+      ...(before.legacyTaskPresent ? [LEGACY_BOOT_TASK_NAME] : []),
+    ];
+    const copies = await copyEntries([
+      ...tasksToCopy(before, deleted),
+      ...(previous !== null && !launcherScriptsMatch(previous, launcher)
+        ? [{ path: launcherPath(), contents: previous, generated: launcherIsGenerated(previous) }]
+        : []),
+    ]);
+    if (copies === null) {
+      lastError = COPY_FAILED;
+      return { ...(await getState()), accepted: false };
+    }
+    launcherBackupPath = copies.find((copy) => copy.path === launcherPath())?.backup || null;
+    const putBackFiles = snapshotFiles([xmlPath()]);
+    writeFileAtomic(launcherPath(), generatedLauncher({ coverBytes: previous === null ? 0 : Buffer.byteLength(previous, 'utf8') }));
     writeFileAtomic(xmlPath(), encodeTaskXml(buildBootTaskXml({
       sid,
       launcherPath: launcherPath(),
       packageRoot: pathImpl.resolve(String(packageRoot)),
       workingDirectory: oarRoot(),
     })));
-    writeFileAtomic(elevationScriptPath(), buildElevationScript({ action: 'enable', xmlPath: xmlPath(), schtasksPath: tool('schtasks') }));
-    spawnElevated('enable', (ok) => {
-      if (ok) {
-        // Mutual exclusion: boot mode owns startup now, so the sign-in
-        // entries (either name) must not race it at the next logon.
-        const removed = removeStartupCmds();
-        log(`enabled; removed ${removed} sign-in autostart entr${removed === 1 ? 'y' : 'ies'}`);
-      } else {
-        log(`enable did not complete: ${lastError}`);
+    const script = buildElevationScript({
+      action: 'enable',
+      xmlPath: xmlPath(),
+      schtasksPath: tool('schtasks'),
+      restore: copies.filter((copy) => copy.task).map((copy) => ({ task: copy.task, xml: copy.backup })),
+    });
+    spawnElevated('enable', script, async (outcome, detail) => {
+      let kept = [];
+      let left = copies;
+      const after = outcome === 'ok' ? await getState() : null;
+      if (after?.taskStatus === 'unknown') {
+        // Registered, as far as the sweep knows; only a task known to be
+        // missing or someone else's undoes the launcher.
+        writeScriptFile(script);
+        lastError = unverifiedText('enable', after.readError, copies);
+        log(`enable not verified: ${lastError}`);
+        onSettled?.(false, { kept, copies, unverified: true, reason: null, error: lastError });
+        return;
       }
+      if (after?.taskStatus === 'ready') {
+        removeFiles(copies.filter((copy) => copy.generated));
+        left = copies.filter((copy) => !copy.generated);
+        // Mutual exclusion: boot mode owns startup now, so the sign-in
+        // entries OAR generated must not race it at the next logon.
+        kept = removeStartupCmds();
+        writeScriptFile(script);
+        log(`enabled; ${kept.length ? `left ${kept.length} hand-made sign-in entr${kept.length === 1 ? 'y' : 'ies'}` : 'no sign-in entry left'}`);
+        onSettled?.(true, { kept, copies: left });
+        return;
+      }
+      const launcherBack = restoreLauncher(previous);
+      if (outcome === 'declined') {
+        putBackFiles();
+        left = await dropCopiesAfterDecline(copies, launcherBack);
+        lastError = declineText(detail);
+      } else {
+        lastError = await failureText('enable', outcome === 'ok' ? 'it is not registered afterwards' : detail, copies);
+      }
+      launcherBackupPath = null;
+      log(`enable did not complete: ${lastError}`);
+      onSettled?.(false, { kept, copies: left, declined: outcome === 'declined', reason: detail || null, error: lastError });
     });
     return { ...(await getState()), accepted: true };
   }
 
-  async function requestDisable() {
+  /**
+   * Deletes our task, elevated, and then its launcher; only when both are as
+   * OAR generates them (`generated`). Anything hand-made (`handMade`) stays
+   * as it is: then nothing is deleted and nothing elevated. With `replace`
+   * the hand-made ones go too (our task, the pre-rebrand one, the launcher).
+   * The tasks are copied first, as for requestEnable, and so is a hand-made
+   * launcher; the launcher goes only once the tasks are verified gone (not
+   * readable afterwards: `unverified`, everything stays).
+   * `onSettled(ok, { copies, declined, unverified, error })`.
+   */
+  async function requestDisable({ onSettled, replace = false } = {}) {
     if (!supported) {
       throw new Error('Windows boot autostart is only available on Windows.');
     }
@@ -772,24 +1328,117 @@ export function createWindowsBootAutostartService({
     if (pending) {
       return { ...(await getState()), accepted: false };
     }
+    const before = await getState();
+    if (before.readError) {
+      return { ...before, accepted: false, refused: `the boot task could not be read (${before.readError})` };
+    }
+    if (!before.generated && !(replace && before.handMade.length)) return { ...before, accepted: false };
     lastError = null;
     launcherBackupPath = null;
-    writeFileAtomic(elevationScriptPath(), buildElevationScript({ action: 'disable', schtasksPath: tool('schtasks') }));
-    spawnElevated('disable', (ok) => {
-      if (ok) {
-        try {
-          if (fsImpl.existsSync(launcherPath())) fsImpl.unlinkSync(launcherPath());
-        } catch (error) {
-          log(`could not remove launcher: ${error?.message || error}`);
+    const deleted = [
+      ...(['ready', 'foreign'].includes(before.taskStatus) ? [BOOT_TASK_NAME] : []),
+      ...(replace && before.legacyTaskPresent ? [LEGACY_BOOT_TASK_NAME] : []),
+    ];
+    const launcherHandMade = before.handMade.some((entry) => entry.path === launcherPath());
+    const copies = await copyEntries([
+      ...tasksToCopy(before, deleted),
+      ...(replace && launcherHandMade ? [{ path: launcherPath(), contents: readLauncher(), generated: false }] : []),
+    ]);
+    if (copies === null) {
+      lastError = COPY_FAILED;
+      return { ...(await getState()), accepted: false };
+    }
+    const removeLauncher = () => {
+      const launcher = readLauncher();
+      try {
+        // Unless it was changed meanwhile, or is a copy's original.
+        if (launcher !== null && (launcherIsGenerated(launcher) || copies.some((copy) => copy.path === launcherPath()))) {
+          fsImpl.unlinkSync(launcherPath());
         }
-        log('disabled');
-      } else {
-        log(`disable did not complete: ${lastError}`);
+      } catch (error) {
+        log(`could not remove launcher: ${error?.message || error}`);
       }
+    };
+    if (!deleted.length) {
+      // Only a launcher no task runs: nothing to elevate.
+      removeLauncher();
+      onSettled?.(true, { copies });
+      return { ...(await getState()), accepted: true };
+    }
+    const script = buildElevationScript({
+      action: 'disable',
+      schtasksPath: tool('schtasks'),
+      includeLegacy: deleted.includes(LEGACY_BOOT_TASK_NAME),
+      restore: copies.filter((copy) => copy.task).map((copy) => ({ task: copy.task, xml: copy.backup })),
+    });
+    spawnElevated('disable', script, async (outcome, detail) => {
+      let left = copies;
+      if (outcome === 'ok') {
+        const after = await getState();
+        if (after.readError) {
+          // Not read back: never claimed removed; the launcher and every copy stay.
+          lastError = unverifiedText('disable', after.readError, copies);
+          log(`disable not verified: ${lastError}`);
+          onSettled?.(false, { copies, unverified: true, reason: null, error: lastError });
+          return;
+        }
+        const gone = !['ready', 'foreign'].includes(after.taskStatus) && !(deleted.includes(LEGACY_BOOT_TASK_NAME) && after.legacyTaskPresent);
+        if (gone) {
+          removeLauncher();
+          // Out of boot mode, the task XML and the record of the last sweep go too.
+          for (const file of [xmlPath(), elevationScriptPath()]) {
+            try { if (fsImpl.existsSync(file)) fsImpl.unlinkSync(file); } catch {}
+          }
+          removeFiles(copies.filter((copy) => copy.generated));
+          left = copies.filter((copy) => !copy.generated);
+          log('disabled');
+          onSettled?.(true, { copies: left });
+          return;
+        }
+      }
+      if (outcome === 'declined') {
+        left = await dropCopiesAfterDecline(copies, true);
+        lastError = declineText(detail);
+      } else {
+        lastError = await failureText('disable', outcome === 'ok' ? 'it is still registered afterwards' : detail, copies);
+      }
+      log(`disable did not complete: ${lastError}`);
+      onSettled?.(false, { copies: left, declined: outcome === 'declined', reason: detail || null, error: lastError });
     });
     return { ...(await getState()), accepted: true };
   }
 
+  // The files as they are now; the returned function puts them back (after
+  // a declined prompt nothing of the request is left).
+  function snapshotFiles(files) {
+    const saved = files.map((file) => {
+      try { return { file, contents: fsImpl.existsSync(file) ? fsImpl.readFileSync(file) : null }; } catch { return { file, contents: null }; }
+    });
+    return () => {
+      for (const { file, contents } of saved) {
+        try {
+          if (contents === null) { if (fsImpl.existsSync(file)) fsImpl.unlinkSync(file); } else fsImpl.writeFileSync(file, contents);
+        } catch (error) {
+          log(`could not put back ${file}: ${error?.message || error}`);
+        }
+      }
+    };
+  }
+
+  function declineText(detail) {
+    return detail ? `Nothing was changed: ${detail}.` : 'The administrator prompt was declined; nothing was changed.';
+  }
+
+  // A record of the last confirmed sweep beside the task XML (none before
+  // the prompt is answered, so a declined one leaves none), UTF-8 with a BOM so
+  // Windows PowerShell reads a non-ASCII path in it right when run by hand.
+  function writeScriptFile(script) {
+    try {
+      writeFileAtomic(elevationScriptPath(), `﻿${script}`);
+    } catch (error) {
+      log(`could not write ${elevationScriptPath()}: ${error?.message || error}`);
+    }
+  }
   return {
     getState,
     requestEnable,

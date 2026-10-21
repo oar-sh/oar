@@ -33,7 +33,8 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // banner (the restart queue, its picture of what runs, its routes and its
 // banner module) took it to 513. 520 until 2026-10-20; the take-over of the
 // database earlier autostart launchers used and the install-time copy of the
-// one inside the package (three modules) took it to 522.
+// one inside the package (three modules) took it to 522. The two developer
+// READMEs left the package for GitHub on 2026-10-21: 519.
 const MAX_ENTRIES = 530;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
@@ -115,6 +116,10 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
     paths.some((p) => p.startsWith('.github/extensions/web-relay/')),
     'tarball is missing the Copilot CLI extension',
   );
+  // Developer documentation lives on GitHub, not in the package.
+  for (const absent of ['server/README.md', '.github/extensions/web-relay/README.md']) {
+    assert.ok(!paths.includes(absent), `tarball ships ${absent}, which belongs on GitHub only`);
+  }
   // An install script must run a packed file, and every module that file
   // reaches (static or dynamic relative imports) must be packed too.
   const { scripts = {} } = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));

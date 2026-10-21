@@ -109,7 +109,17 @@ function registerAutostartRoutes(windowsAutostartService, windowsBootAutostartSe
 }
 
 /** A boot service double whose task state the test scripts directly. */
-function createBootServiceDouble({ taskStatus = 'missing', legacyTaskPresent = false } = {}) {
+const OWN_TASK = { path: 'scheduled task \\oar-relay', task: 'oar-relay', otherInstall: null };
+const LEGACY_TASK = { path: 'scheduled task \\copilot-remote-relay', task: 'copilot-remote-relay', otherInstall: null };
+const LAUNCHER = 'C:\\Users\\dev\\AppData\\Roaming\\oar\\oar-web-relay-launcher.cmd';
+
+function createBootServiceDouble({
+  taskStatus = 'missing',
+  legacyTaskPresent = false,
+  // What the service lists as not made by OAR (see handMadeEntries).
+  handMade = [...(taskStatus === 'foreign' ? [OWN_TASK] : []), ...(legacyTaskPresent ? [LEGACY_TASK] : [])],
+  customised = false,
+} = {}) {
   const calls = [];
   const state = {
     supported: true,
@@ -117,12 +127,15 @@ function createBootServiceDouble({ taskStatus = 'missing', legacyTaskPresent = f
     taskStatus,
     taskName: 'oar-relay',
     legacyTaskPresent,
+    handMade,
+    customised,
+    generated: taskStatus === 'ready' && !handMade.some((entry) => entry.task === 'oar-relay' || entry.path === LAUNCHER),
     launcherPath: null,
     pendingElevation: null,
     lastError: null,
     manualCommand: 'schtasks /create /tn "oar-relay" /xml "C:\\Users\\dev\\task.xml" /f',
   };
-  return {
+  const double = {
     calls,
     state,
     getState: async () => ({ ...state }),
@@ -131,13 +144,17 @@ function createBootServiceDouble({ taskStatus = 'missing', legacyTaskPresent = f
       state.pendingElevation = 'enable';
       return { ...state, accepted: true };
     },
-    requestDisable: async () => {
+    // The administrator answers with `answer` (true: confirmed).
+    answer: true,
+    requestDisable: async ({ onSettled } = {}) => {
       calls.push('disable');
-      state.taskStatus = 'missing';
-      state.legacyTaskPresent = false;
+      const ok = double.answer;
+      if (ok) Object.assign(state, { taskStatus: 'missing', legacyTaskPresent: false });
+      onSettled?.(ok, {});
       return { ...state, accepted: true };
     },
   };
+  return double;
 }
 
 async function callRoute(handlers, req = {}) {
@@ -163,12 +180,13 @@ async function callRoute(handlers, req = {}) {
   return response;
 }
 
-function createSigninServiceDouble({ enabled = false, supported = true } = {}) {
+function createSigninServiceDouble({ enabled = false, supported = true, entries = [] } = {}) {
   const platform = supported ? 'win32' : 'linux';
   const calls = [];
   let isEnabled = enabled;
   return {
     calls,
+    listEntries: () => entries,
     getState: () => ({ supported, enabled: isEnabled, platform }),
     setEnabled: (next) => {
       calls.push(next);
@@ -223,6 +241,17 @@ test('selecting boot mode requests the elevated enable and reports pending', asy
   assert.deepEqual(signin.calls, [], 'the .cmd survives until the UAC is actually confirmed');
 });
 
+test('a declined or failed disable leaves the earlier mode: the sign-in half applies only after a confirmed one', async () => {
+  const signin = createSigninServiceDouble();
+  const boot = createBootServiceDouble({ taskStatus: 'ready' });
+  boot.answer = false;
+  const { app } = registerAutostartRoutes(signin, boot);
+  const response = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'signin' } });
+  assert.deepEqual(boot.calls, ['disable']);
+  assert.deepEqual(signin.calls, [], 'not armed beside the boot task');
+  assert.equal(response.body.mode, 'boot');
+});
+
 test('leaving boot mode sweeps the task first, then applies the sign-in half', async () => {
   const signin = createSigninServiceDouble();
   const boot = createBootServiceDouble({ taskStatus: 'ready' });
@@ -233,22 +262,59 @@ test('leaving boot mode sweeps the task first, then applies the sign-in half', a
   assert.equal(response.body.accepted, true);
 });
 
-test('a foreign task under our name is never deleted by picking sign-in mode', async () => {
-  const signin = createSigninServiceDouble();
-  const boot = createBootServiceDouble({ taskStatus: 'foreign' });
+const UNCHANGED = /^Nothing changed: OAR does not delete or overwrite an autostart entry it did not make\. .*oar autostart (signin|boot|off) --replace\. Left as it is: /;
+
+// Posts `mode` and returns the response; asserts that nothing was changed.
+async function refused(signin, boot, mode) {
   const { app } = registerAutostartRoutes(signin, boot);
-  await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'signin' } });
-  assert.deepEqual(boot.calls, [], 'foreign tasks are replaced only through an explicit boot enable');
-  assert.deepEqual(signin.calls, [true]);
+  const response = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode } });
+  assert.equal(response.statusCode, 409);
+  assert.match(response.body.error, UNCHANGED);
+  assert.deepEqual(boot.calls, [], 'no elevation, no delete, no replace');
+  assert.deepEqual(signin.calls, [], 'no second mode armed beside it');
+  return response;
+}
+
+test('a foreign or pre-rebrand task stops sign-in and off, as in oar autostart (#57)', async () => {
+  for (const mode of ['signin', 'off']) {
+    for (const options of [{ taskStatus: 'missing', legacyTaskPresent: true }, { taskStatus: 'foreign' }]) {
+      const response = await refused(createSigninServiceDouble({ enabled: true }), createBootServiceDouble(options), mode);
+      assert.match(response.body.error, /Left as it is: scheduled task \\(oar-relay|copilot-remote-relay) \(hand-made\)\.$/);
+    }
+  }
 });
 
-test('a lingering legacy task is swept even when switching to off', async () => {
-  const signin = createSigninServiceDouble({ enabled: true });
-  const boot = createBootServiceDouble({ taskStatus: 'missing', legacyTaskPresent: true });
-  const { app } = registerAutostartRoutes(signin, boot);
-  await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'off' } });
-  assert.deepEqual(boot.calls, ['disable']);
-  assert.deepEqual(signin.calls, [false]);
+test('leaving boot mode with a customised task or launcher changes nothing and says why (#57)', async () => {
+  for (const mode of ['signin', 'off']) {
+    for (const handMade of [[OWN_TASK], [{ path: LAUNCHER, task: null, otherInstall: null }]]) {
+      await refused(createSigninServiceDouble(), createBootServiceDouble({ taskStatus: 'ready', handMade, customised: true }), mode);
+    }
+  }
+});
+
+test('picking boot never replaces a foreign task, the pre-rebrand one, a hand-made launcher or a hand-made Startup entry', async () => {
+  await refused(createSigninServiceDouble(), createBootServiceDouble({ taskStatus: 'foreign' }), 'boot');
+  await refused(createSigninServiceDouble(), createBootServiceDouble({ legacyTaskPresent: true }), 'boot');
+  await refused(createSigninServiceDouble(), createBootServiceDouble({ handMade: [{ path: LAUNCHER, task: null, otherInstall: null }] }), 'boot');
+  const stale = { path: 'C:\\Startup\\oar-web-relay.cmd', generated: false, otherInstall: 'C:\\old\\oar' };
+  const response = await refused(createSigninServiceDouble({ enabled: true, entries: [stale] }), createBootServiceDouble(), 'boot');
+  assert.match(response.body.error, /C:\\Startup\\oar-web-relay\.cmd \(hand-made: it starts the OAR install in C:\\old\\oar\)/);
+});
+
+test('picking boot again keeps a hand-made launcher, and regenerates only a generated one that is missing', async () => {
+  const keep = createBootServiceDouble({ taskStatus: 'ready', handMade: [{ path: LAUNCHER, task: null, otherInstall: null }], customised: true });
+  const signin = createSigninServiceDouble();
+  const { app } = registerAutostartRoutes(signin, keep);
+  const response = await callRoute(app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'boot' } });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(keep.calls, []);
+  assert.deepEqual(signin.calls, [false], 'generated sign-in leftovers only');
+  assert.deepEqual(response.body.boot.handMade, [{ path: LAUNCHER, task: null, otherInstall: null }]);
+
+  const missing = createBootServiceDouble({ taskStatus: 'ready', customised: true });
+  const second = registerAutostartRoutes(createSigninServiceDouble(), missing);
+  await callRoute(second.app.routes.get('POST /api/settings/windows-autostart'), { body: { mode: 'boot' } });
+  assert.deepEqual(missing.calls, ['enable']);
 });
 
 test('Windows autostart update rejects malformed and unsupported requests', async () => {
@@ -347,4 +413,12 @@ test('a failed autostart read is logged server-side while the client gets the ge
     console.warn = originalWarn;
   }
   assert.ok(warnings.some((line) => line.startsWith('[autostart]') && line.includes('EACCES')));
+});
+
+test('the setting names a Startup entry OAR did not make', async () => {
+  const stale = { path: 'C:\\Startup\\oar-web-relay.cmd', generated: false, otherInstall: 'C:\\old\\oar' };
+  const signin = createSigninServiceDouble({ enabled: true, entries: [stale, { path: 'C:\\Startup\\copilot-remote-web-relay.cmd', generated: true }] });
+  const { app } = registerAutostartRoutes(signin, createBootServiceDouble());
+  const response = await callRoute(app.routes.get('GET /api/settings/windows-autostart'));
+  assert.deepEqual(response.body.signinHandMade, [{ path: stale.path, otherInstall: stale.otherInstall }]);
 });

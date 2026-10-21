@@ -102,7 +102,9 @@ test('setEnabled installs, preserves, and removes only the owned Startup entry',
     assert.equal(enabledAgain.changed, false);
     assert.equal(fs.readFileSync(context.entryPath, 'utf8'), installedScript);
 
-    fs.writeFileSync(context.entryPath, '@echo off\r\nrem stale installation\r\n', 'utf8');
+    // The entry an earlier version generated is written over.
+    const earlier = buildEarlierWindowsAutostartScripts({ packageRoot: context.packageRoot, nodePath: context.nodePath }).at(-1);
+    fs.writeFileSync(context.entryPath, earlier, 'utf8');
     const repaired = context.service.setEnabled(true);
     assert.equal(repaired.changed, true);
     // The same script; only the padding follows the size of the file replaced.
@@ -140,8 +142,9 @@ test('a pre-rebrand entry still reads as enabled and converges on the new name',
   const context = createTestContext();
   try {
     const legacyPath = path.join(context.startupDirectory, LEGACY_WINDOWS_AUTOSTART_FILENAME);
+    const preRebrand = buildEarlierWindowsAutostartScripts({ packageRoot: context.packageRoot, nodePath: context.nodePath }).at(-1);
     fs.mkdirSync(context.startupDirectory, { recursive: true });
-    fs.writeFileSync(legacyPath, '@echo off\r\n');
+    fs.writeFileSync(legacyPath, preRebrand);
     assert.equal(context.service.getState().enabled, true, 'the old file starts a relay too');
 
     const enabled = context.service.setEnabled(true);
@@ -149,11 +152,74 @@ test('a pre-rebrand entry still reads as enabled and converges on the new name',
     assert.equal(fs.existsSync(legacyPath), false, 'legacy name removed on enable');
     assert.equal(fs.existsSync(context.entryPath), true);
 
-    fs.writeFileSync(legacyPath, '@echo off\r\n');
+    fs.writeFileSync(legacyPath, preRebrand);
     const disabled = context.service.setEnabled(false);
     assert.equal(disabled.enabled, false);
     assert.equal(fs.existsSync(legacyPath), false, 'disable sweeps both names');
     assert.equal(fs.existsSync(context.entryPath), false);
+  } finally {
+    context.cleanup();
+  }
+});
+
+test('a hand-made entry is never written over or deleted, and no second entry joins it', () => {
+  const context = createTestContext();
+  try {
+    fs.mkdirSync(context.startupDirectory, { recursive: true });
+    const handMade = '@echo off\r\nrem my own start\r\n';
+    fs.writeFileSync(context.entryPath, handMade);
+    assert.deepEqual(context.service.listEntries(), [{ path: context.entryPath, generated: false, otherInstall: null }]);
+
+    const enabled = context.service.setEnabled(true);
+    assert.deepEqual([enabled.enabled, enabled.changed, enabled.kept], [true, false, [context.entryPath]]);
+    assert.equal(fs.readFileSync(context.entryPath, 'utf8'), handMade);
+    const disabled = context.service.setEnabled(false);
+    assert.deepEqual([disabled.enabled, disabled.changed, disabled.kept], [true, false, [context.entryPath]]);
+    assert.equal(fs.readFileSync(context.entryPath, 'utf8'), handMade);
+
+    // Beside a hand-made pre-rebrand entry no second one is written either.
+    const legacyPath = path.join(context.startupDirectory, LEGACY_WINDOWS_AUTOSTART_FILENAME);
+    fs.renameSync(context.entryPath, legacyPath);
+    assert.deepEqual(context.service.setEnabled(true).kept, [legacyPath]);
+    assert.equal(fs.existsSync(context.entryPath), false);
+    assert.equal(fs.readFileSync(legacyPath, 'utf8'), handMade);
+
+    // An entry generated for this install (any Node) reads as OAR's own.
+    fs.rmSync(legacyPath);
+    context.service.setEnabled(true);
+    assert.deepEqual(context.service.listEntries(), [{ path: context.entryPath, generated: true, otherInstall: null }]);
+  } finally {
+    context.cleanup();
+  }
+});
+
+test('an entry left by another OAR install is hand-made and names that install; --replace keeps a copy outside the Startup folder', () => {
+  const context = createTestContext();
+  try {
+    fs.mkdirSync(context.startupDirectory, { recursive: true });
+    const otherRoot = path.join(context.root, 'Old Prefix', 'oar');
+    const stale = buildWindowsAutostartScript({ packageRoot: otherRoot, nodePath: context.nodePath });
+    fs.writeFileSync(context.entryPath, stale);
+    assert.deepEqual(context.service.listEntries(), [{ path: context.entryPath, generated: false, otherInstall: otherRoot }]);
+    assert.equal(context.service.refreshInstalledEntry(), false, 'no automatic repair');
+    assert.equal(fs.readFileSync(context.entryPath, 'utf8'), stale);
+
+    assert.throws(() => context.service.setEnabled(true, { replace: true }), /folder for its copy/);
+    const backupDir = path.join(context.root, 'state');
+    const replaced = context.service.setEnabled(true, { replace: true, backupDir });
+    const copy = path.join(backupDir, `${WINDOWS_AUTOSTART_FILENAME}.bak`);
+    assert.deepEqual(replaced.backedUp, [{ path: context.entryPath, backup: copy }]);
+    assert.deepEqual(replaced.kept, []);
+    assert.equal(fs.readFileSync(copy, 'utf8'), stale, 'the copy is the old entry, byte for byte');
+    assert.deepEqual(context.service.listEntries(), [{ path: context.entryPath, generated: true, otherInstall: null }]);
+    assert.deepEqual(fs.readdirSync(context.startupDirectory), [WINDOWS_AUTOSTART_FILENAME], 'no copy in the Startup folder');
+
+    // A second replace keeps the first copy and numbers the next one.
+    fs.writeFileSync(context.entryPath, '@echo off\r\nrem mine\r\n');
+    const off = context.service.setEnabled(false, { replace: true, backupDir });
+    assert.deepEqual(off.backedUp, [{ path: context.entryPath, backup: `${copy}-2` }]);
+    assert.equal(fs.existsSync(context.entryPath), false);
+    assert.equal(fs.readFileSync(copy, 'utf8'), stale);
   } finally {
     context.cleanup();
   }

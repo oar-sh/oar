@@ -3,6 +3,100 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.15] — 2026-10-22
+
+Highlights: `oar setup` asks how the relay starts on Windows, at sign-in or
+at boot before anyone signs in, and `oar autostart` switches between them
+later. `oar uninstall` takes OAR off the machine and keeps your data unless
+you ask for `--purge`. A declined administrator prompt changes nothing, boot
+tasks work in profile folders with spaces or non-ASCII names, and a
+hand-made task, or one only an administrator can read, is never deleted
+without a copy. The package is smaller.
+
+### Upgrade notes
+
+- **From 0.9.14 with a hand-made autostart task:** switching to boot mode
+  in 0.9.14 could delete an existing task of the same name (`oar-relay` or
+  the pre-rebrand name) without a copy. 0.9.15 keeps such a task and asks
+  for `--replace`, which saves a copy first.
+
+### Added
+
+- **`oar setup` asks how the relay starts** on Windows: at sign-in, at boot
+  (before anyone signs in; one administrator prompt) or not at all, with the
+  current mode as the default. `--autostart signin|boot|off` answers it
+  without a question.
+- **`oar autostart signin|boot|off|status`.** Switching to or from boot mode
+  asks for an administrator once, only for the schtasks call; sign-in mode
+  needs none. A declined prompt changes nothing. `status` lists each entry,
+  whether OAR generated it, and which other OAR install a stale one starts.
+  `--replace` replaces hand-made entries with generated ones, keeping a copy
+  of each (`<name>.bak`: a launcher's beside it, a task's exported XML and a
+  Startup entry's in the OAR folder); nothing else ever does. On Linux it is
+  the systemd user service (`oar service`); elsewhere it says it is not
+  supported.
+- **`oar uninstall [--purge]`** stops the relay, takes out the autostart
+  entries OAR generated and the Copilot extension wrapper OAR wrote for this
+  install (a changed one, or one of another install, stays and is named),
+  and has npm remove the package once `oar` has ended. **The data stays** (config,
+  database, uploads, logs in the state root), and the command says where.
+  `--purge` deletes the state root after you type `delete`; a data folder
+  outside it, one in a git checkout, and `rescued-package-data` are each
+  deleted only after a question of their own; a drive root, the home folder
+  or a folder above it, a system folder and a folder without OAR's config or
+  database in it are refused, whatever is typed. A relay that holds its lock
+  without answering (bringing over a database) stops the command before it
+  deletes anything. Programs that still run from the package (session
+  workers) are named: npm leaves the files they hold in a hidden `.oar-*`
+  folder, which the log names. A step
+  that fails stops the command, which says what is done and what is left.
+
+### Changed
+
+- The two developer READMEs (`server/README.md` with the HTTP API, and the
+  web-relay extension's) are no longer in the npm package; they are on
+  [GitHub](https://github.com/oar-sh/oar).
+
+### Fixed
+
+- **A hand-made autostart entry is never deleted or written over.** Leaving
+  boot mode deleted a boot task or launcher edited by hand, and *Off* also
+  a task OAR did not make; switching to sign-in replaced an edited Startup
+  entry. Only entries exactly as an OAR version generated them are changed
+  now, in the web UI as in `oar autostart`: a hand-made entry that would stay
+  beside the new mode, or be replaced by it, stops the switch with the same
+  message. Picking *At system startup* no longer replaces a hand-edited
+  launcher or a task someone else made, the pre-rebrand one included. A boot
+  task is OAR's own only while it is exactly the one OAR registers: the
+  account, the run level, one action, one boot trigger and its settings.
+- **Boot mode switches on and off with a space, an apostrophe or non-ASCII
+  characters in the profile path.** The elevated step was a script file
+  passed unquoted, and read in the wrong encoding; it now travels as an
+  encoded command with every path quoted. A failed switch is no longer
+  reported as a declined prompt: it puts back the tasks it deleted from their
+  copies and keeps the copies, and a declined one leaves no file behind.
+  Windows PowerShell can report a declined prompt with an error that does not
+  stop it, or with no process at all; that read as confirmed, so leaving boot
+  mode deleted the launcher but kept the task, and switching it on removed
+  the sign-in entry without registering the task. Both now count as declined.
+  Leaving boot mode in the web UI switches the sign-in entry only after the
+  prompt was confirmed. Leaving boot mode removes the task XML and the record of
+  the sweep too, and the web UI names a Startup entry OAR did not make.
+- **A boot task with non-ASCII characters in its paths reads right.**
+  schtasks writes its XML in the console's code page, so a profile path like
+  `C:\Users\Jürgen` came back garbled and OAR took its own task for a
+  hand-made one: switching boot on reported a failure and deleted the new
+  launcher, and *Off* refused to remove the task. Such a task is now read
+  again through PowerShell in UTF-8. A task that still cannot be read is
+  never taken as missing, removed, put back or someone else's, and never
+  deleted without a copy: nothing is changed while it cannot be read, and
+  after a confirmed prompt OAR says it could not check, and undoes nothing.
+- **A boot task only an administrator can read is never deleted.** One that
+  stores another account's password answers "Access is denied" to OAR; that
+  read as no task, so `oar autostart boot` deleted it without a copy. Any
+  failed read of a task that is there now counts as unreadable: status says
+  so, and OAR changes nothing, `--replace` included.
+
 ## [0.9.14] — 2026-10-21
 
 Highlights: a relay started by Windows autostart, or by a plain

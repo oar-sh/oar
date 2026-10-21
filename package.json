@@ -1,6 +1,6 @@
 {
   "name": "@oar-sh/oar",
-  "version": "0.9.14",
+  "version": "0.9.15",
   "type": "module",
   "description": "OAR — Open Agent Relay: drive your local coding agents from any browser",
   "license": "MIT",
@@ -22,6 +22,7 @@
     "!server/**/*.test.mjs",
     "!server/**/*-test-harness.mjs",
     "!server/**/fixtures/",
+    "!server/README.md",
     "!server/data/",
     "!server/logs/",
     "!server/config.json",
@@ -33,6 +34,7 @@
     "!shared/**/fixtures/",
     ".github/extensions/web-relay/",
     "!.github/extensions/web-relay/**/*.test.mjs",
+    "!.github/extensions/web-relay/README.md",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

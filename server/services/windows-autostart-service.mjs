@@ -192,6 +192,31 @@ export function readLauncherNodePath(script, serverPath) {
 }
 
 /**
+ * The package folder of another OAR install a launcher starts (its Node line
+ * runs a `server\server.js` other than `packageRoot`'s), or null.
+ */
+export function otherInstallOf(script, packageRoot, pathImpl = path) {
+  const own = pathImpl.resolve(String(packageRoot || '')).toLowerCase();
+  for (const line of String(script == null ? '' : script).split(/\r?\n/)) {
+    const match = line.trimEnd().match(/^"[^"]+" "([^"]+)[\\/]server[\\/]server\.js"(?: & exit(?: \/b)?)?$/i);
+    if (match && pathImpl.resolve(match[1].replaceAll('%%', '%')).toLowerCase() !== own) return match[1].replaceAll('%%', '%');
+  }
+  return null;
+}
+
+/**
+ * Where a copy of `target` goes before `--replace` writes over or removes
+ * it: `<name>.bak` in `dir`, numbered when one is there already, so no
+ * earlier copy is lost.
+ */
+export function backupPathFor(target, dir, fsImpl = fs, pathImpl = path) {
+  const base = pathImpl.join(dir, `${pathImpl.basename(target)}.bak`);
+  let candidate = base;
+  for (let index = 2; fsImpl.existsSync(candidate); index += 1) candidate = `${base}-${index}`;
+  return candidate;
+}
+
+/**
  * Same launcher, whatever the line endings, trailing blanks and the length
  * of the padding. `ignoreCase` for telling whether a launcher is one an
  * earlier version generated: Windows paths compare without case.
@@ -346,13 +371,6 @@ export function createWindowsAutostartService({
     };
   }
 
-  function removeLegacyEntry() {
-    const target = legacyEntryPath();
-    if (!fsImpl.existsSync(target)) return false;
-    fsImpl.unlinkSync(target);
-    return true;
-  }
-
   const workingDirectory = () => resolveOarRoot(env, platform);
   const serverPath = () => pathImpl.join(pathImpl.resolve(String(packageRoot || '')), 'server', 'server.js');
 
@@ -418,7 +436,46 @@ export function createWindowsAutostartService({
     return changed;
   }
 
-  function setEnabled(enabled) {
+  /**
+   * Whether `script` is an entry OAR generates or generated for this install
+   * and its config (with whatever Node it runs). Anything else, an entry
+   * edited by hand or one of another install, is hand-made.
+   */
+  function isGenerated(script) {
+    const entryNodePath = readLauncherNodePath(script, serverPath());
+    if (!entryNodePath) return false;
+    const stateDirs = resolveRelayStateDirs({ packageRoot, env, platform, fsImpl, pathImpl });
+    return launcherScriptsMatch(script, buildScript({ stateDirs, nodePathOverride: entryNodePath }))
+      || buildEarlierWindowsAutostartScripts({
+        packageRoot, nodePath: entryNodePath, configPath, ...stateDirs, workingDirectory: workingDirectory(), pathImpl,
+      }).some((earlier) => launcherScriptsMatch(script, earlier, { ignoreCase: true }));
+  }
+
+  /**
+   * The sign-in entries there are, each `{ path, generated, otherInstall }`:
+   * `otherInstall` is the package folder of the other OAR install a
+   * hand-made entry starts (an entry left from a moved or second install).
+   */
+  function listEntries() {
+    if (!supported) return [];
+    return [entryPath(), legacyEntryPath()]
+      .filter((target) => fsImpl.existsSync(target))
+      .map((target) => {
+        const script = String(fsImpl.readFileSync(target, 'utf8'));
+        const generated = isGenerated(script);
+        return { path: target, generated, otherInstall: generated ? null : otherInstallOf(script, packageRoot, pathImpl) };
+      });
+  }
+
+  /**
+   * Switches the sign-in entry on or off. Only entries OAR generated are
+   * written over or removed: a hand-made one stays byte-identical and is
+   * returned in `kept`, and while one is there no second entry is added.
+   * `replace` (with `backupDir`, never inside the Startup folder, which
+   * would open the copy at sign-in) first moves each hand-made entry there
+   * as `<name>.bak`, listed in `backedUp`.
+   */
+  function setEnabled(enabled, { replace = false, backupDir = '' } = {}) {
     if (!supported) {
       throw new Error('Windows autostart is only available on Windows.');
     }
@@ -426,28 +483,43 @@ export function createWindowsAutostartService({
       throw new TypeError('Windows autostart enabled state must be a boolean.');
     }
 
-    const targetPath = entryPath();
-    const existed = fsImpl.existsSync(targetPath);
-    if (!enabled) {
-      const removedLegacy = removeLegacyEntry();
-      if (existed) fsImpl.unlinkSync(targetPath);
-      return { ...getState(), changed: existed || removedLegacy };
+    const backedUp = [];
+    if (replace) {
+      if (!String(backupDir || '').trim()) throw new Error('Replacing a hand-made entry needs a folder for its copy.');
+      for (const entry of listEntries().filter((listed) => !listed.generated)) {
+        fsImpl.mkdirSync(backupDir, { recursive: true });
+        const copy = backupPathFor(entry.path, backupDir, fsImpl, pathImpl);
+        fsImpl.copyFileSync(entry.path, copy);
+        fsImpl.unlinkSync(entry.path);
+        backedUp.push({ path: entry.path, backup: copy });
+      }
     }
+    const entries = listEntries();
+    const kept = entries.filter((entry) => !entry.generated).map((entry) => entry.path);
+    const remove = (entry) => { fsImpl.unlinkSync(entry.path); return true; };
+    if (!enabled) {
+      const removed = entries.filter((entry) => entry.generated).map(remove);
+      return { ...getState(), changed: removed.length + backedUp.length > 0, kept, backedUp };
+    }
+    if (kept.length) return { ...getState(), changed: false, kept, backedUp };
     // Enabling always converges on the one current filename; if only the
     // legacy entry existed, the current-name write below reports the change.
-    removeLegacyEntry();
+    entries.filter((entry) => entry.path === legacyEntryPath()).forEach(remove);
 
+    const targetPath = entryPath();
+    const existed = fsImpl.existsSync(targetPath);
     const current = existed ? String(fsImpl.readFileSync(targetPath, 'utf8')) : '';
     if (existed && launcherScriptsMatch(current, buildScript())) {
-      return { ...getState(), changed: false };
+      return { ...getState(), changed: backedUp.length > 0, kept, backedUp };
     }
 
     writeEntry(targetPath, buildScript({ coverBytes: Buffer.byteLength(current, 'utf8') }));
-    return { ...getState(), changed: true };
+    return { ...getState(), changed: true, kept, backedUp };
   }
 
   return {
     getState,
+    listEntries,
     setEnabled,
     refreshInstalledEntry,
   };

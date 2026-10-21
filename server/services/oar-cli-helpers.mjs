@@ -66,7 +66,7 @@ export function describeRelayAddress({ config, lanAddress = null, wslNat = false
   return { url, lines, qrUrl, tunnelUrl };
 }
 
-const VALUE_OPTIONS = ['--port', '--migrate-from', '--to'];
+const VALUE_OPTIONS = ['--port', '--migrate-from', '--to', '--autostart'];
 const LAUNCHER_FLAGS = ['--install-extension', '--no-install-extension', '--migrate-from'];
 const COMMAND_OPTIONS = { '--setup': 'setup', '--start': 'start', '--stop': 'stop', '--status': 'status' };
 const CLI_COMMANDS = {
@@ -79,8 +79,10 @@ const CLI_COMMANDS = {
   doctor: {},
   help: {},
   version: {},
-  setup: { flags: ['--lan', '--local', '--new-token', '--defaults', '--start'], values: ['--port', '--migrate-from'] },
+  setup: { flags: ['--lan', '--local', '--new-token', '--defaults', '--start'], values: ['--port', '--migrate-from', '--autostart'] },
   service: { words: ['install', 'remove', 'status'] },
+  autostart: { words: ['signin', 'boot', 'off', 'status'], flags: ['--replace'] },
+  uninstall: { flags: ['--purge'] },
   update: { flags: ['--beta'], values: ['--to'] },
   copilot: { flags: ['--install-extension', '--no-install-extension'], values: ['--port', '--migrate-from'], forwards: true },
 };
@@ -95,10 +97,16 @@ export function usageText() {
     '  oar restart            Restart the relay (waits for running turns)',
     '  oar status             Is the relay running, on which port, as a service',
     '  oar url                Relay URL, with a QR code when a phone can reach it',
-    '  oar setup              Auth token, access and port; asks, or takes',
-    '                         [--port <port>] [--lan | --local] [--new-token] [--defaults] [--start]',
+    '  oar setup              Auth token, access, port and autostart; asks, or takes',
+    '                         [--port <port>] [--lan | --local] [--new-token] [--autostart signin|boot|off]',
+    '                         [--defaults] [--start]',
+    '  oar autostart signin | boot | off | status [--replace]',
+    '                         Start the relay at sign-in or at boot (Windows: boot asks for an admin once);',
+    '                         --replace replaces hand-made entries, keeping a copy',
     '  oar service install | remove | status',
     '                         Start the relay at login',
+    '  oar uninstall [--purge]',
+    '                         Remove autostart and the package; the data stays (--purge deletes it)',
     '  oar copilot [--port <port>] [--install-extension] [--no-install-extension] [-- gh copilot args...]',
     '                         Relay plus a Copilot terminal session',
     '  oar doctor             Check the install and the provider CLIs',

@@ -12,8 +12,8 @@ import net from 'net';
 import {
   migrateStateToOarRoot,
 } from '../server/services/oar-state-migration-service.mjs';
-import { resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
-import { TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
+import { readConfiguredDataDir, resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
+import { RESCUE_DIR_NAME, TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
 import {
   getLauncherLogDir,
@@ -29,8 +29,13 @@ import {
 import { describeConfiguredTunnel, describeTunnelState } from '../server/services/cloudflared-tunnel-service.mjs';
 import { createPrompter, PromptAborted, runMenu } from '../server/services/oar-cli-menu.mjs';
 import { createWindowsPortCheck, isWsl, isWslNat, windowsPortWarning } from '../server/services/oar-cli-wsl.mjs';
-import { createWindowsAutostartService } from '../server/services/windows-autostart-service.mjs';
-import { createWindowsBootAutostartService } from '../server/services/windows-boot-autostart-service.mjs';
+import { readEnvValue, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
+import { createProcessLister } from '../server/services/process-list-service.mjs';
+import { createWindowsAutostartService, launcherScriptsMatch } from '../server/services/windows-autostart-service.mjs';
+import {
+  BOOT_ELEVATION_SCRIPT_FILENAME, BOOT_TASK_XML_FILENAME,
+  bootTaskLabel, createWindowsBootAutostartService, describeHandMade, describeWindowsAutostart, handMadeLines, switchBlockers,
+} from '../server/services/windows-boot-autostart-service.mjs';
 
 function resolvePackageRoot(metaUrl = import.meta.url) {
   return path.resolve(path.dirname(fileURLToPath(metaUrl)), '..');
@@ -841,6 +846,7 @@ function cliContext(options = {}) {
     isPortFreeImpl: isPortFree,
     readFileImpl: fs.readFileSync,
     qrImpl: renderQr,
+    pid: process.pid,
     restartWaitMs: 60_000,
     stopWaitMs: 30_000,
     pollMs: 300,
@@ -987,16 +993,168 @@ function windowsAutostart(ctx, paths) {
   });
 }
 
-// Windows can also start the relay at boot, through a scheduled task the web
-// UI sets up (it needs an elevation); the command line only reports that one.
+// Windows can also start the relay at boot, through a scheduled task (setting
+// it up or taking it out needs an elevation): `oar autostart` or the web UI.
+function windowsBoot(ctx, paths) {
+  return ctx.windowsBootAutostartImpl || createWindowsBootAutostartService({
+    platform: ctx.platform, env: ctx.env, packageRoot: ctx.packageRoot, nodePath: ctx.nodeBin, configPath: paths.configPath, logger: null,
+  });
+}
+
 async function windowsBootTaskReady(ctx, paths) {
   try {
-    const service = ctx.windowsBootAutostartImpl || createWindowsBootAutostartService({
-      platform: ctx.platform, env: ctx.env, packageRoot: ctx.packageRoot, nodePath: ctx.nodeBin, configPath: paths.configPath,
-    });
-    return (await service.getState())?.taskStatus === 'ready';
+    return (await windowsBoot(ctx, paths).getState())?.taskStatus === 'ready';
   } catch {
     return false;
+  }
+}
+
+const AUTOSTART_MODES = ['signin', 'boot', 'off'];
+const AUTOSTART_TEXT = {
+  boot: 'at boot, before anyone signs in (scheduled task)',
+  signin: 'at sign-in (Startup folder)',
+  off: 'off',
+};
+
+/**
+ * This install's Windows autostart (describeWindowsAutostart): the mode
+ * (`unknown` when the boot task cannot be read) and every entry there is.
+ */
+async function readWindowsAutostart(ctx, paths) {
+  const boot = await windowsBoot(ctx, paths).getState();
+  return { ...describeWindowsAutostart({ signinEntries: windowsAutostart(ctx, paths).listEntries(), boot }), boot };
+}
+
+/**
+ * Runs one elevated request of the boot service (`requestEnable` or
+ * `requestDisable`) and waits until the administrator prompt is answered:
+ * `ok` when it was confirmed and the sweep ran.
+ */
+async function elevated(request, options = {}) {
+  let settle;
+  const settled = new Promise((resolve) => { settle = resolve; });
+  const state = await request({ ...options, onSettled: (ok, extra = {}) => settle({ ...extra, ok }) });
+  if (!state.accepted) return { ok: false, refused: state.refused || state.lastError || 'the boot task cannot be changed now' };
+  return settled;
+}
+
+function reportCopies(ctx, copies = []) {
+  for (const { path: original, backup } of copies) ctx.logger.log(`[oar] Kept a copy of ${original} as ${backup}`);
+}
+
+/**
+ * One line for an elevation that did not go through: a declined prompt (the
+ * service put everything back), or a sweep that failed (it put back what it
+ * had deleted; the copies stay, and are named).
+ */
+function notElevated(ctx, result) {
+  if (result.refused) ctx.logger.error(`[oar] Nothing changed: ${result.refused}.`);
+  else if (result.declined) ctx.logger.error(`[oar] Nothing changed: ${result.reason || 'the administrator prompt was declined'}.`);
+  else ctx.logger.error(`[oar] ${result.error || 'The boot task could not be changed.'}`);
+  if (result.unverified) return { code: 1, reason: 'unverified' };
+  return { code: 1, reason: result.declined || result.refused ? 'not-elevated' : 'elevation-failed' };
+}
+
+/**
+ * Switches Windows autostart to `target`. Boot mode on or off is one
+ * administrator prompt (the elevated part is only the schtasks call); sign-in
+ * mode needs none. The other mode's entry goes, but only one OAR generated: a
+ * hand-made entry is never deleted or written over, and while one would stay
+ * beside the new mode, or be replaced by it, nothing changes at all
+ * (switchBlockers). `replace` (`--replace`) replaces every hand-made entry,
+ * keeping a copy of each: a launcher's beside it, a task's exported XML and a
+ * Startup entry's in the OAR folder (a copy in the Startup folder would be
+ * opened at sign-in).
+ */
+async function switchWindowsAutostart(ctx, paths, target, { replace = false } = {}) {
+  const { logger } = ctx;
+  const now = await readWindowsAutostart(ctx, paths);
+  if (now.mode === 'unknown') {
+    logger.error(`[oar] Nothing changed: the boot task could not be read (${now.boot.readError}).`);
+    return { code: 1, reason: 'unknown' };
+  }
+  const blocking = switchBlockers(now, target);
+  if (blocking.length && !replace) {
+    for (const line of handMadeLines(blocking, target)) logger.error(`[oar] ${line}`);
+    return { code: 1, reason: 'hand-made' };
+  }
+  const bootHandMade = replace && now.entries.some((entry) => entry.mode === 'boot' && !entry.generated);
+  const root = paths.layout.root;
+  // A generated launcher that is missing or of an earlier version is
+  // regenerated too (customised, nothing hand-made).
+  const regenerate = now.mode === 'boot' && now.boot.customised && !now.boot.handMade?.length;
+  if (target === 'boot' && (now.mode !== 'boot' || bootHandMade || regenerate)) {
+    logger.log('[oar] Confirm the administrator prompt to register the boot task …');
+    const result = await elevated(windowsBoot(ctx, paths).requestEnable, { replace });
+    if (!result.ok) return notElevated(ctx, result);
+    reportCopies(ctx, result.copies);
+  } else if (target !== 'boot' && (now.mode === 'boot' || bootHandMade)) {
+    const tasks = ['ready', 'foreign'].includes(now.boot.taskStatus) || (replace && now.boot.legacyTaskPresent);
+    if (tasks) logger.log('[oar] Confirm the administrator prompt to remove the boot task …');
+    const result = await elevated(windowsBoot(ctx, paths).requestDisable, { replace });
+    if (!result.ok) return notElevated(ctx, result);
+    reportCopies(ctx, result.copies);
+  }
+  let signin;
+  try {
+    signin = windowsAutostart(ctx, paths).setEnabled(target === 'signin', replace ? { replace, backupDir: root } : {});
+  } catch (error) {
+    logger.error(`[oar] The sign-in entry could not be changed: ${error?.message || error}`);
+    return { code: 1, reason: 'signin-failed' };
+  }
+  reportCopies(ctx, signin.backedUp);
+  if (target === 'boot') logger.log(`[oar] The relay starts at boot, before anyone signs in (${bootTaskLabel(now.boot.taskName)}).`);
+  else if (target === 'off') logger.log('[oar] Autostart is off. A running relay keeps running; stop it with: oar stop');
+  else logger.log(`[oar] The relay starts when you sign in to Windows${signin.kept.length ? ', through a hand-made entry' : ''}.`);
+  // Hand-made entries of the mode picked serve it, and stay.
+  const serving = replace ? [] : now.entries.filter((entry) => !entry.generated && entry.mode === target);
+  for (const entry of serving) logger.log(`[oar] Left as it is: ${describeHandMade(entry)}. To replace it, keeping a copy: oar autostart ${target} --replace`);
+  return { code: 0, reason: `autostart-${target}` };
+}
+
+/**
+ * `oar autostart boot|signin|off|status`. On Windows the sign-in entry or the
+ * boot task; on Linux the systemd user service (`oar service`), which starts
+ * at boot with lingering; elsewhere not supported.
+ */
+export async function runAutostart(options = {}) {
+  const ctx = cliContext(options);
+  const paths = installPaths(ctx);
+  const { logger } = ctx;
+  const target = ctx.argv.find((arg) => [...AUTOSTART_MODES, 'status'].includes(arg)) || 'status';
+  if (paths.layout.checkout) {
+    logger.error('[oar] This is a git checkout — autostart is for global installs.');
+    return { code: 1, reason: 'git-checkout' };
+  }
+  if (ctx.platform === 'linux') {
+    return runService({ ...options, argv: [{ status: 'status', off: 'remove' }[target] || 'install'] });
+  }
+  if (ctx.platform !== 'win32') {
+    logger.error(`[oar] Autostart is not supported on ${ctx.platform === 'darwin' ? 'macOS' : ctx.platform} yet. Start the relay with: oar start`);
+    return { code: 1, reason: 'unsupported' };
+  }
+  if (target === 'status') {
+    const now = await readWindowsAutostart(ctx, paths);
+    logger.log(`[oar] Autostart: ${now.mode === 'unknown' ? `unknown, the boot task could not be read (${now.boot.readError})` : AUTOSTART_TEXT[now.mode]}`);
+    for (const entry of now.entries) logger.log(`[oar]   ${entry.generated ? `${entry.path} (generated by OAR)` : describeHandMade(entry)}`);
+    if (now.entries.some((entry) => !entry.generated)) {
+      logger.log('[oar] OAR leaves hand-made entries as they are. To replace them with its own, keeping a copy: oar autostart signin|boot|off --replace');
+    }
+    return { code: 0, reason: 'autostart-status', mode: now.mode };
+  }
+  if (target !== 'off' && requireConfig(ctx, paths)) return { code: 1, reason: 'no-config' };
+  return switchWindowsAutostart(ctx, paths, target, { replace: ctx.argv.includes('--replace') });
+}
+
+/** `oar setup`'s question; null keeps the mode there is. */
+async function askAutostart(ctx, paths) {
+  const current = (await readWindowsAutostart(ctx, paths)).mode;
+  if (current === 'unknown') return null;
+  const fallback = AUTOSTART_MODES.indexOf(current) + 1;
+  for (;;) {
+    const answer = await ctx.prompter.line(`Autostart: 1 = at sign-in, 2 = at boot, before anyone signs in (one administrator prompt), 3 = off [${fallback}]: `);
+    if (!answer) return null;
+    if (['1', '2', '3'].includes(answer)) return AUTOSTART_MODES[Number(answer) - 1];
   }
 }
 
@@ -1274,7 +1432,7 @@ async function runWindowsService(ctx, paths, action) {
     return { code: 0, reason: 'service-status' };
   }
   if (boot) {
-    logger.error('[oar] The relay starts at boot through a scheduled task. Change that in the web UI: Settings → General → Autostart (Windows).');
+    logger.error('[oar] The relay starts at boot through a scheduled task. Change that with oar autostart signin|off, or in the web UI: Settings → General → Autostart (Windows).');
     return { code: 1, reason: 'boot-task' };
   }
   if (action === 'install' && requireConfig(ctx, paths)) return { code: 1, reason: 'no-config' };
@@ -1373,11 +1531,20 @@ export async function runSetup(options = {}) {
     logger.error('[oar] --lan and --local exclude each other.');
     return { code: 2, reason: 'bad-access' };
   }
+  const autostartFlag = optionValue(argv, '--autostart');
+  if (autostartFlag !== undefined && !AUTOSTART_MODES.includes(autostartFlag)) {
+    logger.error('[oar] --autostart expects signin, boot or off.');
+    return { code: 2, reason: 'bad-autostart' };
+  }
   const terminal = Boolean(ctx.stdin?.isTTY) && !has('--defaults');
-  const ask = terminal && !portFlag && !has('--lan') && !has('--local') && !has('--new-token');
+  const ask = terminal && !portFlag && !has('--lan') && !has('--local') && !has('--new-token') && !autostartFlag;
 
   let paths = installPaths(ctx);
   const { layout } = paths;
+  if (autostartFlag && layout.checkout) {
+    logger.error('[oar] --autostart is for global installs; a git checkout has no autostart (start it with: npm start). Nothing was changed.');
+    return { code: 1, reason: 'git-checkout' };
+  }
   if (!layout.checkout) {
     const migrateFrom = String(optionValue(argv, '--migrate-from') || '').trim();
     const stop = await migrateIntoStateRoot({
@@ -1461,6 +1628,14 @@ export async function runSetup(options = {}) {
     fs.writeFileSync(paths.previousPath, `${JSON.stringify({ port: old.port, authToken: old.token })}\n`, { mode: 0o600 });
   }
 
+  // Autostart: as --autostart says, else in a terminal on Windows the
+  // question, with the mode there is as its default.
+  let autostart = null;
+  if (!layout.checkout) {
+    const target = autostartFlag || (ask && ctx.platform === 'win32' ? await askAutostart(ctx, paths) : null);
+    if (target) autostart = await runAutostart({ ...options, argv: [target] });
+  }
+
   const startRequested = has('--start') && !layout.checkout;
   const viaService = running && (await serviceState(ctx, paths)) === 'active';
   if (startRequested && systemdUserAvailable(ctx)) writeSystemdUnit(ctx, paths);
@@ -1480,6 +1655,10 @@ export async function runSetup(options = {}) {
 
   await showAddress(ctx, paths, { qr: true });
   warnWindowsPort(ctx, port, windowsHolder);
+  if (autostart?.code) {
+    logger.error('[oar] The config is written; the autostart step did not go through (see above).');
+    return { code: 1, reason: autostart.reason };
+  }
   if (outcome) return { code: outcome.ok ? 0 : 1, reason: outcome.ok ? 'setup-complete' : outcome.reason };
   if (layout.checkout) {
     logger.log('[oar] Start the relay with: npm start');
@@ -1488,6 +1667,338 @@ export async function runSetup(options = {}) {
     logger.log(`[oar] Start the relay with: oar start${atLogin}`);
   }
   return { code: 0, reason: 'setup-complete' };
+}
+
+const PACKAGE_NAME = '@oar-sh/oar';
+
+/**
+ * The detached helper `oar uninstall` leaves behind (`node -e`, arguments:
+ * the pid to outlive, the log, the npm command line): npm cannot remove a
+ * package while it runs, so it waits for `oar` to end, then runs npm and
+ * writes the outcome to the log.
+ */
+export const UNINSTALL_HELPER_SOURCE = [
+  'const [pid, log, scope, command, ...args] = process.argv.slice(1);',
+  'const fs = require("fs"); const path = require("path");',
+  'const alive = () => { try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code === "EPERM"; } };',
+  'const until = Date.now() + 120000;',
+  'const run = () => {',
+  '  if (alive() && Date.now() < until) return setTimeout(run, 250);',
+  '  const result = require("child_process").spawnSync(command, args, { encoding: "utf8", shell: process.platform === "win32", windowsHide: true });',
+  '  let text = new Date().toISOString() + " " + [command, ...args].join(" ") + ": exit " + result.status + "\\n"',
+  '    + (result.stdout || "") + (result.stderr || "") + (result.error ? result.error.message + "\\n" : "");',
+  // npm moves the package to a hidden .oar-* folder in its scope and deletes
+  // that; files a running program holds stay there.
+  '  let left = []; try { left = fs.readdirSync(scope).filter((name) => name.startsWith(".oar-")).map((name) => path.join(scope, name)); } catch {}',
+  '  for (const dir of left) text += "Left behind: " + dir + " holds files a program still ran from (a session worker, or a CLI it started). Delete it once nothing runs from it any more, at the latest after a reboot.\\n";',
+  '  fs.appendFileSync(log, text);',
+  '};',
+  'setTimeout(run, 500);',
+].join('\n');
+
+/**
+ * The processes other than this one that run from dir (their command line
+ * names it): { pid, commandLine }, or null when the list cannot be read.
+ */
+async function processesRunningFrom(ctx, dir) {
+  try {
+    const lister = ctx.processListImpl || createProcessLister({ platform: ctx.platform, systemToolPath: (name) => windowsSystemToolPath(name, { env: ctx.env }) });
+    const needle = path.resolve(dir).toLowerCase();
+    return (await lister.list())
+      .map((row) => {
+        const pid = Number(row.processId ?? row.pid);
+        return { pid, commandLine: String(row.commandLine ?? lister.describe?.(pid) ?? '') };
+      })
+      .filter((row) => row.pid && row.pid !== ctx.pid && row.commandLine.toLowerCase().includes(needle));
+  } catch {
+    return null;
+  }
+}
+
+function isInside(child, parent) {
+  const relative = path.relative(parent, child);
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+// The git checkout `target` lies in, or ''.
+function checkoutAround(target) {
+  for (let dir = path.resolve(target); ; dir = path.dirname(dir)) {
+    if (isGitCheckout(dir)) return dir;
+    if (path.dirname(dir) === dir) return '';
+  }
+}
+
+/**
+ * Why `dir` is no folder `--purge` may delete, or '': a drive or file-system
+ * root, the home folder or a folder above it (`C:\Users`), a system folder or
+ * one above it, a git checkout, or, with `marker`, a folder without it.
+ */
+function purgeRefusal(ctx, dir, marker = null) {
+  const resolved = path.resolve(dir);
+  const same = (a, b) => (ctx.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  const atOrAbove = (target) => target && (same(resolved, path.resolve(target)) || isInside(path.resolve(target).toLowerCase(), resolved.toLowerCase()));
+  if (path.parse(resolved).root === resolved) return 'a drive or file-system root';
+  const homes = [ctx.homeDir, ctx.env.USERPROFILE, ctx.env.HOME].filter(Boolean);
+  if (homes.some(atOrAbove)) return 'the home folder or a folder above it';
+  const system = ctx.platform === 'win32'
+    ? ['SystemRoot', 'windir', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData', 'APPDATA', 'LOCALAPPDATA'].map((name) => readEnvValue(ctx.env, name))
+    : ['/etc', '/usr', '/bin', '/sbin', '/lib', '/var', '/opt', '/home', '/Users', '/System', '/Library', '/Applications'];
+  if (system.some(atOrAbove)) return 'a system folder or a folder above one';
+  const windows = readEnvValue(ctx.env, 'SystemRoot');
+  if (windows && isInside(resolved.toLowerCase(), path.resolve(windows).toLowerCase())) return 'inside the Windows folder';
+  if (isGitCheckout(resolved)) return 'a git checkout';
+  if (marker && !marker(resolved)) return 'no OAR config or database in it';
+  return '';
+}
+
+// An OAR state root: its config, or a database in its data folder.
+const looksLikeStateRoot = (dir) => fs.existsSync(path.join(dir, 'config.json')) || fs.existsSync(path.join(dir, 'data', 'copilot.db'));
+const looksLikeDataDir = (dir) => fs.existsSync(path.join(dir, 'copilot.db'));
+
+/**
+ * What `oar uninstall --purge` deletes: the state root (`refused` when
+ * purgeRefusal names a reason), and, each only after a question of its own
+ * (`extra`), the rescued package data, a data folder outside the state root,
+ * and the state root itself when it lies in a git checkout. An extra folder
+ * purgeRefusal refuses is not offered (`skipped`).
+ */
+function purgePlan(ctx, paths) {
+  const root = path.resolve(paths.layout.root);
+  const refused = purgeRefusal(ctx, root, looksLikeStateRoot);
+  const dataDir = resolveRelayStateDirs({ env: ctx.env, layout: paths.layout }).dataDir;
+  const extra = [];
+  const skipped = [];
+  const add = (target, why, marker = null) => {
+    const resolved = path.resolve(target);
+    if (!fs.existsSync(resolved) || extra.some((item) => item.path === resolved)) return;
+    const refusal = resolved === root ? '' : purgeRefusal(ctx, resolved, marker);
+    if (refusal) skipped.push({ path: resolved, why: refusal });
+    else extra.push({ path: resolved, why });
+  };
+  const rootCheckout = checkoutAround(root);
+  if (rootCheckout) add(root, `the state root, inside the git checkout ${rootCheckout}`);
+  add(path.join(dataDir, RESCUE_DIR_NAME), 'data an earlier version kept inside its package, saved at install time');
+  for (const dir of [dataDir, readConfiguredDataDir({ configPath: paths.configPath })]) {
+    if (!dir || path.resolve(dir) === root || isInside(path.resolve(dir), root)) continue;
+    const checkout = checkoutAround(dir);
+    add(dir, checkout ? `a data folder in the git checkout ${checkout}` : 'a data folder outside the state root', looksLikeDataDir);
+  }
+  return { root, refused, extra, skipped };
+}
+// Deletes `target` except the paths in `keep` (and the folders they are in).
+function deleteTree(target, keep) {
+  if (keep.includes(target)) return;
+  if (!keep.some((kept) => isInside(kept, target))) {
+    fs.rmSync(target, { recursive: true, force: true });
+    return;
+  }
+  for (const name of fs.readdirSync(target)) deleteTree(path.join(target, name), keep);
+}
+
+// A unit `oar service install` wrote for this install: the same lines, with
+// whatever Node and PATH it was written with.
+function systemdUnitIsGenerated(ctx, paths, text) {
+  const nodeBin = String(text).match(/^ExecStart=(\S+) /m)?.[1] || ctx.nodeBin;
+  const strip = (unit) => String(unit).split('\n').filter((line) => !line.startsWith('Environment="PATH=')).join('\n').trim();
+  return strip(text) === strip(buildSystemdUnit({
+    nodeBin, packageRoot: ctx.packageRoot, configPath: paths.configPath, dataDir: paths.dataDir, logDir: paths.logDir,
+  }));
+}
+
+function readText(filePath) {
+  try { return fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+}
+
+/**
+ * Takes out the autostart entries and the Copilot wrapper OAR generated for
+ * this install; returns the hand-made ones it left, or `{ failed }`.
+ */
+async function removeGeneratedEntries(ctx, paths, done) {
+  const kept = [];
+  if (ctx.platform === 'win32') {
+    const now = await readWindowsAutostart(ctx, paths);
+    if (now.mode === 'unknown') return { failed: `the boot task could not be read (${now.boot.readError})`, left: 'autostart' };
+    if (now.boot.generated) {
+      ctx.logger.log('[oar] Confirm the administrator prompt to remove the boot task …');
+      const result = await elevated(windowsBoot(ctx, paths).requestDisable);
+      if (!result.ok) {
+      if (result.unverified) return { failed: String(result.error).replace(/\.$/, ''), left: 'autostart' };
+      const why = result.refused || (result.declined ? 'the administrator prompt was declined' : result.error || 'the sweep failed');
+      return { failed: `the boot task was not removed: ${why}`, left: 'autostart' };
+    }
+      done.push(`removed the ${bootTaskLabel(now.boot.taskName)}`);
+    }
+    const root = paths.layout.root;
+    const leftovers = [BOOT_TASK_XML_FILENAME, BOOT_ELEVATION_SCRIPT_FILENAME].map((name) => path.join(root, name));
+    // A generated launcher no task can run (a task left as it is may run it).
+    const stray = now.boot.taskStatus === 'missing' && !now.boot.legacyTaskPresent
+      && now.entries.find((entry) => entry.generated && entry.path === now.boot.launcherPath);
+    if (stray) leftovers.push(stray.path);
+    for (const file of leftovers) fs.rmSync(file, { force: true });
+    const signin = now.entries.filter((entry) => entry.mode === 'signin');
+    windowsAutostart(ctx, paths).setEnabled(false);
+    done.push(...signin.filter((entry) => entry.generated).map((entry) => `removed ${entry.path}`));
+    kept.push(...now.entries.filter((entry) => !entry.generated));
+  } else {
+    const unitPath = systemdUnitPath(ctx.homeDir);
+    const unit = readText(unitPath);
+    if (unit !== null && !systemdUnitIsGenerated(ctx, paths, unit)) kept.push({ path: unitPath });
+    else if (unit !== null) {
+      runQuiet('systemctl', ['--user', 'disable', '--now', 'oar'], ctx);
+      fs.rmSync(unitPath, { force: true });
+      runQuiet('systemctl', ['--user', 'daemon-reload'], ctx);
+      done.push(`removed ${unitPath}`);
+    }
+  }
+  const wrapper = path.join(getCopilotUserExtensionsDir(ctx.env), 'web-relay', 'extension.mjs');
+  const source = readText(wrapper);
+  if (source !== null && wrapperIsGenerated(ctx, source)) {
+    fs.rmSync(wrapper, { force: true });
+    try { fs.rmdirSync(path.dirname(wrapper)); } catch {}
+    done.push(`removed ${wrapper}`);
+  } else if (source !== null) {
+    const otherInstall = source.match(/^const PACKAGE_ROOT = (".*");$/m)?.[1];
+    const root = otherInstall ? JSON.parse(otherInstall) : '';
+    kept.push({ path: wrapper, otherInstall: root && path.resolve(root) !== path.resolve(ctx.packageRoot) ? root : null });
+  }
+  return { kept };
+}
+
+/**
+ * The Copilot wrapper as this version or an earlier one (before the rename,
+ * as copilot-remote) wrote it for this install; the same rule as the
+ * autostart launchers: anything else is hand-made.
+ */
+function wrapperIsGenerated(ctx, source) {
+  const current = buildGlobalExtensionWrapperSource(path.join(ctx.packageRoot, '.github', 'extensions', 'web-relay', 'extension.mjs'));
+  const earlier = current
+    .replace('Auto-generated by oar ', 'Auto-generated by copilot-remote ')
+    .replace('`oar --install-extension`', '`copilot-remote --install-extension`');
+  return [current, earlier].some((generated) => launcherScriptsMatch(source, generated));
+}
+
+/**
+ * `oar uninstall [--purge]` — stops the relay, takes out the autostart
+ * entries OAR generated (never hand-made ones) and has npm remove the
+ * package once this command has ended. The data stays, unless `--purge` and
+ * a typed confirmation say otherwise; folders outside the state root, in a
+ * git checkout or the rescued package data each get a question of their own.
+ * A step that fails ends the command with what is done and what is left.
+ */
+export async function runUninstall(options = {}) {
+  const ctx = cliContext(options);
+  const paths = installPaths(ctx);
+  const { logger, prompter } = ctx;
+  if (paths.layout.checkout) {
+    logger.error('[oar] This is a git checkout — there is no global package to uninstall.');
+    return { code: 1, reason: 'git-checkout' };
+  }
+  const plan = ctx.argv.includes('--purge') ? purgePlan(ctx, paths) : null;
+  const done = [];
+  const left = ['the package'];
+  if (plan) left.unshift('the data');
+  const stop = (reason, message) => {
+    logger.error(`[oar] ${message}`);
+    if (done.length) logger.error(`[oar] Done: ${done.join('; ')}.`);
+    logger.error(`[oar] Not done: ${left.join('; ')}. Run oar uninstall${plan ? ' --purge' : ''} again once that is sorted out.`);
+    return { code: 1, reason };
+  };
+
+  if (plan) {
+    if (plan.refused) {
+      logger.error(`[oar] --purge deletes nothing in ${plan.root} (${plan.refused}). Nothing was changed.`);
+      return { code: 1, reason: 'purge-unsafe' };
+    }
+    for (const item of plan.skipped) logger.log(`[oar] Not deleted, and not offered: ${item.path} (${item.why}).`);
+    logger.log(`[oar] --purge deletes ${plan.root} for good: the config, the database with every conversation, the uploads and the logs.`);
+    if ((await prompter.line('Type "delete" to confirm: ')) !== 'delete') {
+      logger.log('[oar] Not confirmed. Nothing was changed.');
+      return { code: 1, reason: 'purge-not-confirmed' };
+    }
+    for (const item of plan.extra) {
+      item.remove = await prompter.yesNo(`Also delete ${item.path} (${item.why})?`, { defaultYes: false });
+    }
+  }
+
+  left.unshift('the autostart entries');
+  // A relay may run without answering yet (it holds its lock while it brings
+  // over a database, or while it starts): nothing goes while one may run.
+  // One that does not answer cannot be asked to stop, so that ends it here,
+  // before `oar stop` would call it not running.
+  const holder = () => heldLock(paths.lockPath, ctx.isProcessAliveImpl);
+  const lockedOut = (lock) => {
+    const takeover = readTakeover(paths.lockPath, ctx.isProcessAliveImpl);
+    return stop('relay-running', takeover
+      ? `The relay (process ${lock.pid}) is bringing over its database and does not answer yet; once oar status says it runs, run oar uninstall again.`
+      : `A relay (process ${lock.pid}) holds ${paths.lockPath} without answering; stop it (oar stop, or end process ${lock.pid}).`);
+  };
+  const held = holder();
+  if (held && (readTakeover(paths.lockPath, ctx.isProcessAliveImpl) || !paths.config || (await findRelay(ctx, paths)).answer !== 'oar')) {
+    return lockedOut(held);
+  }
+  if (paths.config) {
+    const stopped = await runStop({ ...options, argv: [] });
+    if (!['stopped', 'not-running'].includes(stopped.reason)) {
+      return stop('relay-running', stopped.reason === 'stop-queued'
+        ? 'The relay finishes its running turns first; it stops by itself after them.'
+        : 'The relay did not stop.');
+    }
+    if (stopped.reason === 'stopped') done.push('stopped the relay');
+  }
+  if (!(await pollUntil(() => !holder(), { waitMs: done.length ? ctx.stopWaitMs : 0, pollMs: ctx.pollMs }))) {
+    return lockedOut(holder() || { pid: '?' });
+  }
+  // Session workers outlive the relay: npm cannot remove the files they hold.
+  const users = await processesRunningFrom(ctx, ctx.packageRoot);
+  let entries;
+  try {
+    entries = await removeGeneratedEntries(ctx, paths, done);
+  } catch (error) {
+    entries = { failed: error?.message || String(error) };
+  }
+  if (entries.failed) return stop('autostart', `Uninstall stopped: ${entries.failed}.`);
+  left.shift();
+
+  if (plan) {
+    const keep = plan.extra.filter((item) => !item.remove).map((item) => item.path);
+    const targets = [plan.root, ...plan.extra.filter((item) => item.remove && !isInside(item.path, plan.root)).map((item) => item.path)];
+    for (const target of targets) {
+      if (keep.includes(target)) continue;
+      try {
+        deleteTree(target, keep);
+      } catch (error) {
+        return stop('purge-failed', `Could not delete all of ${target}: ${error?.message || error}`);
+      }
+      done.push(`deleted ${target}${keep.some((kept) => isInside(kept, target)) ? ' except what you kept' : ''}`);
+    }
+    left.shift();
+  }
+
+  const npm = resolveNpmInvocation({ packageRoot: ctx.packageRoot, env: ctx.env, platform: ctx.platform, execPath: ctx.nodeBin });
+  const logPath = path.join(plan ? os.tmpdir() : paths.logDir, 'oar-uninstall.log');
+  try {
+    if (!plan) fs.mkdirSync(paths.logDir, { recursive: true });
+    const child = ctx.spawnImpl(ctx.nodeBin, [
+      '-e', UNINSTALL_HELPER_SOURCE, String(ctx.pid), logPath, path.dirname(ctx.packageRoot), npm.command, 'uninstall', '-g', ...npm.prefixArgs, PACKAGE_NAME,
+    ], { cwd: ctx.homeDir, env: npm.env, detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref?.();
+  } catch (error) {
+    return stop('npm-failed', `Could not start the package removal (${error?.message || error}); remove it yourself: npm uninstall -g ${PACKAGE_NAME}`);
+  }
+
+  for (const line of done) logger.log(`[oar] Done: ${line}.`);
+  for (const kept of entries.kept) logger.log(`[oar] Left as it is: ${describeHandMade(kept)}`);
+  if (plan) {
+    for (const item of plan.extra.filter((extra) => !extra.remove)) logger.log(`[oar] Kept: ${item.path}`);
+  } else {
+    const dataDir = resolveRelayStateDirs({ env: ctx.env, layout: paths.layout }).dataDir;
+    logger.log(`[oar] Your data stays in ${paths.layout.root}${isInside(path.resolve(dataDir), path.resolve(paths.layout.root)) ? '' : ` and ${dataDir}`} (config, database, uploads, logs). A later install picks it up again; delete the folder yourself if you no longer need it.`);
+  }
+  if (users?.length) {
+    logger.log(`[oar] ${users.length === 1 ? 'A program still runs' : `${users.length} programs still run`} from the package (process ${users.map((user) => user.pid).join(', ')}: a session worker, or a CLI it started). npm cannot remove the files they hold and leaves them in a hidden .oar-* folder in ${path.dirname(ctx.packageRoot)}; delete it once they have ended, at the latest after a reboot. The log names what was left.`);
+  }
+  logger.log(`[oar] npm removes ${PACKAGE_NAME} once this command has ended (log: ${logPath}).`);
+  return { code: 0, reason: 'uninstalled' };
 }
 
 export async function runDoctor(options = {}) {
@@ -1685,6 +2196,8 @@ const COMMANDS = {
   url: runUrl,
   setup: runSetup,
   service: runService,
+  autostart: runAutostart,
+  uninstall: runUninstall,
   copilot: launchRelay,
   doctor: runDoctor,
   update: runUpdate,

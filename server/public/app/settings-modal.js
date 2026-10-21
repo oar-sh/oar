@@ -1502,6 +1502,11 @@ const WINDOWS_BOOT_CUSTOMISATION_LABELS = Object.freeze({
   'boot-delay': 'boot delay',
   launcher: 'launcher edited or from an older OAR',
   'launcher-missing': 'launcher missing',
+  user: 'account',
+  'run-level': 'run level',
+  settings: 'settings',
+  other: 'other parts',
+  unreadable: 'unreadable',
 });
 
 function windowsAutostartStatusText() {
@@ -1511,21 +1516,30 @@ function windowsAutostartStatusText() {
   }
   if (boot?.lastError) return boot.lastError;
   if (boot?.readError) return `The boot task could not be read: ${boot.readError}`;
+  const [startupEntry] = windowsAutostartState?.signinHandMade || [];
+  if (startupEntry) {
+    const starts = startupEntry.otherInstall ? ` (it starts the OAR install in ${startupEntry.otherInstall})` : '';
+    return `A Startup entry OAR did not make is there: ${startupEntry.path}${starts}. OAR leaves it as it is; to replace it, keeping a copy: oar autostart signin --replace.`;
+  }
   if (windowsAutostartState?.mode === 'boot' && windowsAutostartState?.signinEnabled) {
     return 'A sign-in Startup entry also exists and can double-start the relay. Re-select "At system startup" to clean it up.';
   }
+  // OAR never deletes or writes over an entry it did not make (as `oar autostart`).
+  const replaceHint = 'OAR leaves it as it is; to replace it, keeping a copy: oar autostart boot --replace';
   if (windowsAutostartState?.mode === 'boot' && boot?.customised) {
     const labels = (boot.customisations || []).map((name) => WINDOWS_BOOT_CUSTOMISATION_LABELS[name] || name);
-    return `The boot task or its launcher differs from what OAR generates (${labels.join(', ')}). Re-selecting "At system startup" regenerates both and keeps a changed launcher as a .bak copy.`;
+    return boot.handMade?.length
+      ? `The boot task or its launcher was changed by hand (${labels.join(', ')}). ${replaceHint}.`
+      : `The boot task or its launcher differs from what OAR generates (${labels.join(', ')}). Re-selecting "At system startup" regenerates it.`;
   }
   if (windowsAutostartState?.mode === 'boot' && boot?.launcherBackupPath) {
     return `The previous launcher was replaced and kept as ${boot.launcherBackupPath}.`;
   }
   if (boot?.taskStatus === 'foreign') {
-    return `A task named "${boot.taskName}" exists but was not created by OAR. Selecting "At system startup" replaces it.`;
+    return `A task named "${boot.taskName}" exists but was not created by OAR. ${replaceHint}.`;
   }
   if (boot?.legacyTaskPresent && windowsAutostartState?.mode !== 'boot') {
-    return 'A pre-rebrand boot task exists. Selecting "At system startup" migrates it (one admin confirmation).';
+    return `A pre-rebrand boot task exists. ${replaceHint}.`;
   }
   return '';
 }
