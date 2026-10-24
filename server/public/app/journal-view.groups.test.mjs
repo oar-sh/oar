@@ -478,3 +478,37 @@ test('a drag holds the list\'s re-renders until the row is let go; a loose row o
   assert.equal(document.getElementById('conv-list-announce').textContent, 'New group with “Page one renamed” and “Page two b”');
   delete routes['/api/conversation-groups'];
 });
+
+test('an owner\'s group an agent emptied shows as an empty group with its menu, until the relay stops naming it', async () => {
+  const KEPT = 'grp_kept';
+  const listRoute = routes['/api/conversations'];
+  const keptGroup = { id: KEPT, name: 'Kept batch', displayName: 'Kept batch', parentConversationId: null, memberCount: 0, liveMemberCount: 0, keptEmptyAt: '2031-02-02T11:00:00.000Z' };
+  routes['/api/conversations'] = (entry) => {
+    const answer = listRoute(entry);
+    return entry.query.archived === 'only' ? answer : { ...answer, groups: { ...answer.groups, [KEPT]: keptGroup } };
+  };
+  try {
+    await journal.refreshConversations({ preservePagination: false });
+    const head = syntheticHead(KEPT);
+    assert.ok(head, 'the kept group shows');
+    assert.ok(head.classList.contains('conv-group-empty'));
+    assert.equal(head.querySelector('.conv-title').textContent.trim(), 'Kept batch');
+    assert.equal(head.querySelector('.conv-meta-primary').textContent.trim(), 'group · empty');
+    assert.equal(head.querySelector('[data-group-fold]'), null, 'nothing to fold');
+    // In the list like a group head (its place by time is the arranger's, tested there).
+    assert.ok(listed().includes(`group:${KEPT}`));
+    // The owner's usual group entries: rename and dissolve (nothing to archive or stop).
+    const menu = menuOf(head);
+    assert.deepEqual(menu.map(([id]) => id), ['group-archive', 'group-stop', 'group-rename', 'group-dissolve']);
+    assert.equal(menu.find(([id]) => id === 'group-archive')[1], true);
+    // A plain list refresh keeps it while the relay names it; a fetch without it forgets it.
+    store.pruneConversationGroups([]);
+    assert.ok(store.conversationGroups[KEPT], 'no loaded row needed');
+    routes['/api/conversations'] = listRoute;
+    await journal.refreshConversations({ preservePagination: false });
+    assert.equal(syntheticHead(KEPT), null);
+    assert.equal(store.conversationGroups[KEPT], undefined);
+  } finally {
+    routes['/api/conversations'] = listRoute;
+  }
+});

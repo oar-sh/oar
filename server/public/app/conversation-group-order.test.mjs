@@ -178,3 +178,32 @@ test('a cursor row moved up inside its group: the next page starts after the who
   // A loose cursor row still continues right after itself.
   assert.deepEqual(pageConversationRows(rows, GROUPS, { limit: 1, beforeConversationId: 'solo-new' }).rows.map((entry) => entry.id), ['lead-a', 'child-a1', 'child-a2']);
 });
+
+test('an owner\'s group an agent emptied shows as an empty head, placed by when it was emptied', () => {
+  const groups = {
+    ...GROUPS,
+    grp_kept: { id: 'grp_kept', parentConversationId: null, name: 'Kept batch', keptEmptyAt: at(22), memberCount: 0 },
+    grp_old: { id: 'grp_old', parentConversationId: null, name: null, keptEmptyAt: at(1), memberCount: 0 },
+  };
+  const rows = [row('solo-new', 30), row('lead-a', 20, 'grp_a'), row('child-a1', 21, 'grp_a'), row('solo-old', 5)];
+  // Off by default: the list shows rows and the groups they are in.
+  assert.equal(arrangeConversationList(rows, groups).some((item) => item.group?.empty), false);
+  const items = arrangeConversationList(rows, groups, { emptyGroups: true });
+  assert.deepEqual(items.map((item) => item.conversation?.id || `[${item.group.id}]`), ['solo-new', '[grp_kept]', 'lead-a', 'child-a1', 'solo-old', '[grp_old]']);
+  const kept = items.find((item) => item.group?.id === 'grp_kept');
+  assert.equal(kept.kind, 'head');
+  assert.equal(kept.conversation, null);
+  assert.equal(kept.group.empty, true);
+  assert.deepEqual(kept.group.members, []);
+  // A kept group that has a row again is an ordinary group.
+  const back = arrangeConversationList([...rows, row('joined', 12, 'grp_kept')], groups, { emptyGroups: true });
+  assert.equal(back.filter((item) => item.group?.id === 'grp_kept' && item.kind === 'head').length, 1);
+  assert.equal(back.some((item) => item.group?.empty && item.group.id === 'grp_kept'), false);
+  // Under a filter only when its name matches; Maps work as well.
+  const filtered = arrangeConversationList(rows, new Map(Object.entries(groups)), {
+    emptyGroups: true,
+    matches: () => false,
+    groupNameMatches: (info) => /kept/i.test(info?.name || ''),
+  });
+  assert.deepEqual(filtered.map((item) => item.group?.id), ['grp_kept']);
+});

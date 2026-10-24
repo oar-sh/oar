@@ -7,6 +7,7 @@ import { createSessionRepository } from '../repositories/session-repository.mjs'
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createRemoteRelayRepository } from '../repositories/remote-relay-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
+import { createRelayScheduleService } from '../services/relay-schedule-service.mjs';
 import { withRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 
@@ -48,7 +49,7 @@ function createMockApp() {
   };
 }
 
-function setup({ withRemoteRelays = true, modelCatalog = null } = {}) {
+function setup({ withRemoteRelays = true, modelCatalog = null, extraDeps = () => ({}) } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
@@ -137,6 +138,7 @@ function setup({ withRemoteRelays = true, modelCatalog = null } = {}) {
     statusEventService: { recordSharedAccess: () => ({ event: null }) },
     isSha256: () => false,
     ...(remoteRelayInbound ? { remoteRelayInbound } : {}),
+    ...extraDeps({ db, stmts }),
   });
 
   const call = async (key, { body = {}, headers = {}, params = {}, query = {} } = {}) => {
@@ -244,6 +246,28 @@ test('with the inbound switch off, an agent cannot archive; the user still can',
   const archived = await fx.call('POST /api/conversation/:id/archive', { params: { id: conversationId } });
   assert.equal(archived.status, 200);
   assert.equal(fx.db.prepare(`SELECT archived FROM conversations WHERE id = ?`).get(conversationId).archived, 1);
+});
+
+test('archiving a conversation ends the schedules that fire into it and the ones it set', async () => {
+  let schedules = null;
+  const fx = setup({
+    extraDeps: ({ db, stmts }) => {
+      schedules = createRelayScheduleService({ db, stmts, logger: { log() {}, warn() {} } });
+      return { relayScheduleService: schedules };
+    },
+  });
+  const archivedId = (await fx.bootstrap()).body.conversationId;
+  const otherId = (await fx.bootstrap({ title: 'another session' })).body.conversationId;
+  const own = schedules.create({ conversationId: archivedId, createdBy: archivedId, text: 'sweep', everyMinutes: 30 });
+  const set = schedules.create({ conversationId: otherId, createdBy: archivedId, text: 'check', everyMinutes: 60 });
+  const kept = schedules.create({ conversationId: otherId, createdBy: otherId, text: 'mine', everyMinutes: 60 });
+
+  const archived = await fx.call('POST /api/conversation/:id/archive', { params: { id: archivedId } });
+  assert.equal(archived.status, 200);
+  assert.equal(schedules.get(own.id).endReason, 'archived');
+  assert.equal(schedules.get(set.id).endReason, 'archived');
+  assert.equal(schedules.get(kept.id).endedAt, undefined);
+  assert.deepEqual(schedules.listActive().map((schedule) => schedule.id), [kept.id]);
 });
 
 test('with the inbound switch on, an agent may archive', async () => {

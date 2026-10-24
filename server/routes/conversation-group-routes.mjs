@@ -8,8 +8,17 @@
 //
 // The owner's action only: every route is behind `auth`, and a request that
 // arrived from a paired relay is refused, as the remote_relay tool's own
-// route refuses calls from other relays. The tool reads groups, never
-// changes them.
+// route refuses calls from other relays. The tool reads groups, names an
+// existing one for a session it creates (the bootstrap route), and moves one
+// session into a group, out of it, or into a new group of a name it gives
+// (update_session, PATCH /api/conversation/:id/settings in
+// sessions-routes.mjs). Renaming and dissolving groups, and moving several
+// rows at once, stay here, the owner's.
+//
+// The one read, GET /api/conversation-groups, is the list relay_info and
+// create_session look a group up in: open to whoever may list conversations
+// (the same `auth` as GET /api/conversations), paired relays included, and
+// only id, name and member count.
 
 import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { GROUP_NAME_MAX } from '../repositories/conversation-group-repository.mjs';
@@ -61,6 +70,12 @@ export function registerConversationGroupRoutes(app, deps) {
       members: conversationGroups.membersOf(group.id).map((member) => member.id),
     };
   }
+
+  // GET /api/conversation-groups — `{ ok, groups: [{ id, name, memberCount }] }`, latest activity first.
+  app.get('/api/conversation-groups', auth, (req, res) => {
+    if (!conversationGroups?.enabled) return unavailable(res);
+    return res.json({ ok: true, groups: conversationGroups.listGroups({ headTitle: resolveConversationTitleText }) });
+  });
 
   // POST /api/conversation-groups { name?, conversationIds } — a group by hand.
   app.post('/api/conversation-groups', auth, (req, res) => {

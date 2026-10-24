@@ -65,7 +65,7 @@ import {
   TIMELINE_READ_DEFAULT_LIMIT,
 } from '../services/subagent-timeline-service.mjs';
 import { SUBAGENT_TASK_TYPES, isTerminalSubagentRunStatus, normalizeSubagentRunStatus } from '../../shared/subagent-timeline.mjs';
-import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
+import { isRelayAutomatedMessageKind } from '../../shared/relay-events.mjs';
 import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay-shutdown-gate.mjs';
 import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limiter.mjs';
 import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
@@ -1216,7 +1216,7 @@ export function buildDequeuedRelayMessage({
         fallbackEnvironmentId: getClaudeCloudProviderSettings()?.environmentId || '',
       })
     : null;
-  // An event message the relay wrote (relay event subscriptions): the
+  // A message the relay wrote itself (a relay event, a scheduled prompt): the
   // workers deliver it without the steer note, which speaks as the user.
   let messageKind = '';
   try {
@@ -1253,7 +1253,7 @@ export function buildDequeuedRelayMessage({
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
     imageOperationId: String(msg.image_operation_id || '').trim() || null,
-    ...(messageKind === RELAY_EVENT_MESSAGE_KIND ? { messageKind } : {}),
+    ...(isRelayAutomatedMessageKind(messageKind) ? { messageKind } : {}),
   };
 }
 

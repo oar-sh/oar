@@ -17,7 +17,7 @@ import {
 } from '../services/conversation-history-page.mjs';
 import { MESSAGE_PIN_LIMIT, buildPinList } from '../services/message-pin-list.mjs';
 import { buildHiddenMessageList } from '../services/hidden-message-list.mjs';
-import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { persistConversationPreferences, readMayCreateSessions } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import {
   claudeBackgroundCommandLimitSettingsFields,
@@ -61,7 +61,7 @@ import { requestHostOf } from '../services/request-boundary.mjs';
 import { parseRemoteRelayOriginJson } from '../repositories/remote-relay-repository.mjs';
 import { createShareRepository } from '../repositories/share-repository.mjs';
 import { createShareAccessLog, readShareRequestViewer } from '../services/share-access-log-service.mjs';
-import { resolveGroupDisplayName } from '../repositories/conversation-group-repository.mjs';
+import { GROUP_NAME_MAX, resolveGroupDisplayName } from '../repositories/conversation-group-repository.mjs';
 import { conversationGroupPosition, conversationGroupRole, groupActivityTimes, pageConversationRows } from '../public/app/conversation-group-order.mjs';
 import { admitRemoteRelayRequest, publicRemoteRelayOrigin, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import {
@@ -82,6 +82,14 @@ import {
 } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
+import {
+  REMOTE_RELAY_ERROR_CODES,
+  REMOTE_RELAY_GROUP_LIMITS,
+  REMOTE_RELAY_SESSION_SETTINGS,
+  formatSessionGroupList,
+  resolveSessionGroupReference,
+  validateRemoteRelaySessionSettings,
+} from '../../shared/remote-relay-contract.mjs';
 import {
   buildCloudSourceRecord,
   buildConversationCloudPayload,
@@ -2167,6 +2175,12 @@ export function registerSessionsRoutes(app, deps) {
     // Relay events: what each session is doing (state, tasks) and the
     // subscriptions that end with an archived or deleted conversation.
     relayEventService = null,
+    // Relay schedules: the ones that fire into or were set by an archived or
+    // deleted conversation end with it.
+    relayScheduleService = null,
+    // Questions that don't block: the pending ones in an archived or deleted
+    // conversation end with it.
+    relayAskService = null,
     sessionActivityTracker = null,
     // Public shares and their access log (migration 0016); built on `db` when
     // the wiring does not pass one.
@@ -2616,6 +2630,8 @@ export function registerSessionsRoutes(app, deps) {
       io.emit('conversation_deleted', { conversationId });
       if (leftGroupId) emitGroupChanged(leftGroupId, [conversationId]);
       try { relayEventService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
+      try { relayScheduleService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
+      try { relayAskService?.noteConversationGone?.(conversationId); } catch {}
       finalized.push(conversationId);
     }
     return finalized;
@@ -2641,6 +2657,8 @@ export function registerSessionsRoutes(app, deps) {
       parentConversationId: group.parentConversationId || null,
       memberCount: members.length,
       liveMemberCount: members.filter((member) => !member.archived).length,
+      // An owner's group an agent emptied, which stays until the owner acts.
+      keptEmptyAt: group.keptEmptyAt || null,
     };
   }
 
@@ -2700,6 +2718,38 @@ export function registerSessionsRoutes(app, deps) {
       order,
       positions: conversationGroups?.positionsOf?.([...order, ...ids]) || {},
     });
+  }
+
+  // A session group named at bootstrap (an agent's create_session `group`):
+  // what the lookup sees is what an agent may see (GET /api/conversation-groups).
+  const autoTitle = (title) => resolveConversationTitle({ title, titleSource: 'auto' });
+  const listGroupsForAgents = () => conversationGroups?.listGroups?.({ headTitle: autoTitle }) || [];
+
+  /** The 400 body for a group this relay does not have, or has several of by that name. */
+  function bootstrapGroupRefusal(found, requested, groups) {
+    const ambiguous = found.status === 'ambiguous';
+    const listed = ambiguous ? found.matches : groups;
+    const asked = String(requested || '').replace(/["\r\n]+/g, ' ').slice(0, 80);
+    let error;
+    if (ambiguous) error = `"${asked}" names several session groups here: ${formatSessionGroupList(listed)}. Pass the id.`;
+    else if (groups.length) error = `No session group "${asked}" here. Groups: ${formatSessionGroupList(groups)}.`;
+    else error = `No session group "${asked}" here: this relay has no session groups.`;
+    return {
+      ok: false,
+      code: ambiguous ? 'SESSION_GROUP_AMBIGUOUS' : 'SESSION_GROUP_NOT_FOUND',
+      error: `${error} No conversation was created.`,
+      groups: listed.slice(0, REMOTE_RELAY_GROUP_LIMITS.refusalMax).map((group) => ({ id: group.id, name: group.name })),
+      // How many there are when `groups` is cut to the cap.
+      ...(listed.length > REMOTE_RELAY_GROUP_LIMITS.refusalMax ? { groupsTotal: listed.length } : {}),
+    };
+  }
+
+  /** `{ id, name, role }` of the group a conversation sits in (list_sessions' shape), or null. */
+  function conversationGroupField(conversationId) {
+    const membership = conversationGroups?.membershipsOf?.([conversationId])?.[conversationId];
+    if (!membership?.groupId) return null;
+    const described = conversationGroups.describeGroup?.(membership.groupId, { headTitle: autoTitle }) || null;
+    return { id: membership.groupId, name: described?.displayName || null, role: membership.role === 'head' ? 'head' : 'member' };
   }
 
   /** The `cloud` field of a conversation payload; null unless it is a cloud one. */
@@ -3116,6 +3166,8 @@ export function registerSessionsRoutes(app, deps) {
         draftUpdatedByClientId: r.draft_updated_by_client_id || null,
         // Set on conversations another relay's agent created ("via <relay>").
         origin: parseRemoteRelayOriginJson(r.origin_json),
+        // The owner let this agent-started session's agents start sessions.
+        mayCreateSessions: readMayCreateSessions(r),
         // Set on Claude Cloud conversations: repository, branch, session link.
         cloud: buildConversationCloudPayload({
           cloudSourceJson: r.cloud_source_json,
@@ -3139,6 +3191,14 @@ export function registerSessionsRoutes(app, deps) {
     const groupsPayload = {};
     for (const groupId of new Set(page.rows.map((row) => String(row?.group_id || '')).filter((id) => groups.has(id)))) {
       groupsPayload[groupId] = groupSummaryPayload(groups.get(groupId));
+    }
+    // The owner's groups an agent emptied have no row to come with: the live
+    // list's first page brings them, so the sidebar shows them as empty
+    // groups the owner can rename or dissolve.
+    if (archivedMode !== 'only' && !beforeConversationId) {
+      for (const group of conversationGroups?.listKeptEmptyGroups?.() || []) {
+        groupsPayload[group.id] = groupSummaryPayload(group);
+      }
     }
 
     return res.json({
@@ -3862,6 +3922,7 @@ export function registerSessionsRoutes(app, deps) {
       draftUpdatedAt: conv.draft_updated_at || null,
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       origin: parseRemoteRelayOriginJson(conv.origin_json),
+      mayCreateSessions: readMayCreateSessions(conv),
       cloud: conversationCloudPayload(conv, runtimeSession),
       group: conversationGroupPayload(conversationId),
       groupPosition: conversationGroupPositionOf(conv),
@@ -4563,6 +4624,7 @@ export function registerSessionsRoutes(app, deps) {
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       // Set on conversations another relay's agent created ("via <relay>").
       origin: parseRemoteRelayOriginJson(conv.origin_json),
+      mayCreateSessions: readMayCreateSessions(conv),
       // Set on Claude Cloud conversations: repository, branch, session link.
       cloud: conversationCloudPayload(conv, runtimeSession),
       // The session group it is in, with the other members; null when none.
@@ -4738,6 +4800,73 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  /**
+   * Writes a conversation's preferences and tells every open page: the one
+   * code path of PATCH …/preferences (the composer, the context modal) and of
+   * an agent's update_session (PATCH …/settings). `body` uses the preferences
+   * route's keys; a key it does not mention keeps the stored value.
+   */
+  function applyConversationPreferences({ conversationId, existing, body = {}, senderClientId = null }) {
+    const now = new Date().toISOString();
+    // Every write replaces all four columns, so a caller that only wants to
+    // change one field (the context modal's auto-compact slider) must not have
+    // the others reset to their defaults: an unmentioned key keeps the stored
+    // value. The composer always sends all three, so its behaviour — including
+    // clearing a preference with an explicit '' — is unchanged.
+    const mentions = (key) => Object.prototype.hasOwnProperty.call(body || {}, key);
+    const preferredRelayMode = normalizeRelayModePreference(
+      mentions('preferredRelayMode') ? body.preferredRelayMode : existing?.preferred_relay_mode,
+      {
+        supportedRelayModes: SUPPORTED_RELAY_MODES,
+        fallbackMode: DEFAULT_RELAY_MODE,
+      },
+    );
+    const preferredModel = normalizePreferredModel(
+      mentions('preferredModel') ? body.preferredModel : existing?.preferred_model,
+    );
+    const preferredReasoningEffort = normalizePreferredReasoningEffort(
+      mentions('preferredReasoningEffort') ? body.preferredReasoningEffort : existing?.preferred_reasoning_effort,
+    );
+    // Only an explicit mention rewrites the window (null = Auto is a real
+    // value, so a plain falsy check would not do). Same for the thinking
+    // control, where null = Host default.
+    const persisted = persistConversationPreferences({
+      db,
+      stmts,
+      conversationId,
+      preferredRelayMode,
+      preferredModel,
+      preferredReasoningEffort,
+      ...(mentions('autoCompactWindow')
+        ? { autoCompactWindow: parseAutoCompactWindow(body.autoCompactWindow) }
+        : {}),
+      ...(mentions('thinkingEnabled')
+        ? { thinkingEnabled: parseThinkingEnabled(body.thinkingEnabled) }
+        : {}),
+      ...(mentions('thinkingDisplay')
+        ? { thinkingDisplay: parseThinkingDisplay(body.thinkingDisplay) }
+        : {}),
+      ...(mentions('mayCreateSessions') ? { mayCreateSessions: body.mayCreateSessions === true } : {}),
+      updatedAt: now,
+      createIfMissing: !existing,
+      createTitle: 'Session',
+    });
+    const payload = {
+      conversationId,
+      preferredRelayMode: persisted.preferredRelayMode,
+      preferredModel: persisted.preferredModel,
+      preferredReasoningEffort: persisted.preferredReasoningEffort,
+      autoCompactWindow: persisted.autoCompactWindow ?? null,
+      thinkingEnabled: persisted.thinkingEnabled ?? null,
+      thinkingDisplay: persisted.thinkingDisplay ?? null,
+      mayCreateSessions: persisted.mayCreateSessions === true,
+      updatedAt: persisted.updatedAt,
+      senderClientId,
+    };
+    io.emit('conversation_preferences_updated', payload);
+    return { ...payload, created: persisted.created };
+  }
+
   app.patch('/api/conversation/:id/preferences', auth, (req, res) => {
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) return res.status(400).json({ error: 'Missing conversation id' });
@@ -4747,78 +4876,430 @@ export function registerSessionsRoutes(app, deps) {
     if (existing && String(existing.status || '').trim() === 'deleted') {
       return res.status(404).json({ error: 'Conversation not found' });
     }
+    // "Agents in this conversation may start sessions" is the owner's alone:
+    // an agent (of this relay or a paired one) could grant it to itself.
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'mayCreateSessions')) {
+      if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+        return res.status(403).json({ error: 'Whether agents in a conversation may start sessions is the owner\'s setting alone.' });
+      }
+      if (typeof req.body.mayCreateSessions !== 'boolean') {
+        return res.status(400).json({ error: 'mayCreateSessions must be true or false' });
+      }
+      if (!stmts.conversationsHaveMayCreateSessions) {
+        return res.status(503).json({ error: 'This setting is unavailable until the relay restarts (its storage is missing).' });
+      }
+    }
 
-    const now = new Date().toISOString();
-    // Every write replaces all four columns, so a caller that only wants to
-    // change one field (the context modal's auto-compact slider) must not have
-    // the others reset to their defaults: an unmentioned key keeps the stored
-    // value. The composer always sends all three, so its behaviour — including
-    // clearing a preference with an explicit '' — is unchanged.
-    const mentions = (key) => Object.prototype.hasOwnProperty.call(req.body || {}, key);
-    const preferredRelayMode = normalizeRelayModePreference(
-      mentions('preferredRelayMode') ? req.body?.preferredRelayMode : existing?.preferred_relay_mode,
-      {
-        supportedRelayModes: SUPPORTED_RELAY_MODES,
-        fallbackMode: DEFAULT_RELAY_MODE,
-      },
-    );
-    const preferredModel = normalizePreferredModel(
-      mentions('preferredModel') ? req.body?.preferredModel : existing?.preferred_model,
-    );
-    const preferredReasoningEffort = normalizePreferredReasoningEffort(
-      mentions('preferredReasoningEffort') ? req.body?.preferredReasoningEffort : existing?.preferred_reasoning_effort,
-    );
-    // Only an explicit mention rewrites the window (null = Auto is a real
-    // value, so a plain falsy check would not do). Same for the thinking
-    // control, where null = Host default.
-    const mentionsAutoCompactWindow = mentions('autoCompactWindow');
-    const mentionsThinkingEnabled = mentions('thinkingEnabled');
-    const mentionsThinkingDisplay = mentions('thinkingDisplay');
-    const persisted = persistConversationPreferences({
-      db,
-      stmts,
-      conversationId,
-      preferredRelayMode,
-      preferredModel,
-      preferredReasoningEffort,
-      ...(mentionsAutoCompactWindow
-        ? { autoCompactWindow: parseAutoCompactWindow(req.body?.autoCompactWindow) }
-        : {}),
-      ...(mentionsThinkingEnabled
-        ? { thinkingEnabled: parseThinkingEnabled(req.body?.thinkingEnabled) }
-        : {}),
-      ...(mentionsThinkingDisplay
-        ? { thinkingDisplay: parseThinkingDisplay(req.body?.thinkingDisplay) }
-        : {}),
-      updatedAt: now,
-      createIfMissing: !existing,
-      createTitle: 'Session',
+    const persisted = applyConversationPreferences({ conversationId, existing, body: req.body || {}, senderClientId });
+    return res.json({ ok: true, ...persisted });
+  });
+
+  // ─── PATCH /api/conversation/:id/settings — the remote_relay tool's update_session ───
+  //
+  // `{ settings: { model, effort, mode, auto_compact_window, title, group,
+  // thinking_enabled, thinking_display, cwd }, dry_run, owner_approved }`.
+  // Reached by an agent of this relay (the loopback) and by a paired relay's
+  // agent (under the inbound switch); the owner may call it too. It applies
+  // this relay's own rule: an agent changes freely only a session its own
+  // conversation started (the request's origin against the session's); any
+  // other changes only with `owner_approved` (the calling relay asked its
+  // user). A dry run checks everything, writes nothing, and says whether
+  // approval is needed. A group the owner made never goes through this path
+  // (it may stay empty); one an agent made here goes once empty. A step that
+  // fails after an earlier one wrote answers `changed` with what was written.
+  // Every write goes through the code the owner's
+  // own controls use (preferences, title, group, workspace root), with their
+  // socket events, so an open page shows the change at once. The owner's
+  // "may start sessions" switch is not among the settings.
+
+  const SESSION_SETTINGS_INVALID = 'SESSION_SETTINGS_INVALID';
+
+  function currentSessionSettings(conversationId) {
+    const conv = stmts.getConvAnyStatus.get(conversationId) || {};
+    const runtime = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    const workspace = resolveConversationWorkspaceState?.({ conversationId }) || null;
+    const window = parseAutoCompactWindow(conv.auto_compact_window);
+    return {
+      model: normalizePreferredModel(conv.preferred_model) || String(runtime?.provider_model || runtime?.model || '').trim() || null,
+      effort: normalizePreferredReasoningEffort(conv.preferred_reasoning_effort) || null,
+      mode: normalizeRelayModePreference(conv.preferred_relay_mode, { supportedRelayModes: SUPPORTED_RELAY_MODES, fallbackMode: DEFAULT_RELAY_MODE }),
+      auto_compact_window: window === null ? 'auto' : window,
+      title: resolveConversationTitle({ title: conv.title, titleSource: conv.title_source }) || null,
+      group: conversationGroupField(conversationId),
+      thinking_enabled: parseThinkingEnabled(conv.thinking_enabled),
+      thinking_display: parseThinkingDisplay(conv.thinking_display),
+      cwd: String(workspace?.currentWorkspaceRootPath || workspace?.configuredWorkspaceRootPath || conv.configured_workspace_root_path || '').trim() || null,
+    };
+  }
+
+  /**
+   * Whether the agent calling the settings route started this session from
+   * its own conversation: the session's origin names that conversation, and
+   * this relay's own agent (the loopback) for a local origin, the same
+   * paired relay for one from there.
+   */
+  function sessionStartedByCaller(createdBy, remoteRequest) {
+    const caller = remoteRequest?.remote ? remoteRequest.origin : null;
+    if (!createdBy || !caller) return false;
+    const callerConversation = String(caller.conversationId || '').trim();
+    if (!callerConversation || String(createdBy.conversationId || '').trim() !== callerConversation) return false;
+    if (remoteRequest.local === true) return createdBy.local === true && caller.local === true;
+    const relayId = String(createdBy.relayId || '').trim();
+    return createdBy.local !== true && !!relayId && relayId === String(caller.relayId || '').trim();
+  }
+
+  /** Why a session cannot move to another folder now ('' when it can). */
+  function sessionBusyReason(conversationId) {
+    if (Number(countActiveConversationQueueRows.get(conversationId)?.count || 0) > 0) return 'a turn is queued or running there';
+    const state = describeSessionActivity(conversationId)?.sessionState;
+    if (state === 'running_turn') return 'a turn is running there';
+    if (state === 'background_only') return 'a background task is running there';
+    return '';
+  }
+
+  /**
+   * What update_session would do: `{ ok, plan }` or `{ ok:false, status,
+   * body }`. The plan holds what changes (`changed`, in the order of the
+   * contract's settings) and how.
+   */
+  function planSessionSettings(conversation, raw) {
+    const conversationId = String(conversation.id);
+    const fail = (status, error, extra = {}) => ({ ok: false, status, body: { ok: false, error, ...extra } });
+    const settingsInput = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+    if (!settingsInput) return fail(400, 'settings must be an object', { code: SESSION_SETTINGS_INVALID });
+    const unknown = Object.keys(settingsInput).filter((key) => !REMOTE_RELAY_SESSION_SETTINGS.includes(key));
+    if (unknown.length) {
+      return fail(400, `Not a setting an agent may change: ${unknown.slice(0, 10).join(', ')}. Settings: ${REMOTE_RELAY_SESSION_SETTINGS.join(', ')}.`, { code: SESSION_SETTINGS_INVALID });
+    }
+    const checked = validateRemoteRelaySessionSettings(settingsInput);
+    if (!checked.ok) return fail(400, checked.error, { code: SESSION_SETTINGS_INVALID });
+    const wanted = checked.values;
+    const current = currentSessionSettings(conversationId);
+    const runtime = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    const provider = String(runtime?.provider_type || 'github').trim().toLowerCase() || 'github';
+    const plan = { conversationId, provider, current, wanted, changed: [], preferences: {}, notes: [] };
+    const change = (key) => { if (!plan.changed.includes(key)) plan.changed.push(key); };
+
+    if (wanted.model !== undefined && normalizePreferredModel(wanted.model) !== normalizePreferredModel(conversation.preferred_model)) {
+      plan.preferences.preferredModel = wanted.model;
+      change('model');
+    }
+    if (wanted.effort !== undefined && wanted.effort !== normalizePreferredReasoningEffort(conversation.preferred_reasoning_effort)) {
+      plan.preferences.preferredReasoningEffort = wanted.effort;
+      change('effort');
+    }
+    if (wanted.mode !== undefined) {
+      if (!SUPPORTED_RELAY_MODES.includes(wanted.mode)) {
+        return fail(400, `This relay has no mode "${wanted.mode}". Modes: ${SUPPORTED_RELAY_MODES.join(', ')}.`, { code: SESSION_SETTINGS_INVALID });
+      }
+      if (wanted.mode !== current.mode) {
+        plan.preferences.preferredRelayMode = wanted.mode;
+        change('mode');
+      }
+    }
+    if (wanted.auto_compact_window !== undefined) {
+      const window = wanted.auto_compact_window === 'auto' ? null : parseAutoCompactWindow(wanted.auto_compact_window);
+      if (window !== parseAutoCompactWindow(conversation.auto_compact_window)) {
+        plan.preferences.autoCompactWindow = window;
+        change('auto_compact_window');
+      }
+      if (window !== null && window !== wanted.auto_compact_window) {
+        plan.notes.push(`auto_compact_window ${wanted.auto_compact_window} was taken as ${window}, the nearest window this relay offers.`);
+      }
+    }
+    if (wanted.thinking_enabled !== undefined && wanted.thinking_enabled !== current.thinking_enabled) {
+      plan.preferences.thinkingEnabled = wanted.thinking_enabled;
+      change('thinking_enabled');
+    }
+    if (wanted.thinking_display !== undefined && wanted.thinking_display !== current.thinking_display) {
+      plan.preferences.thinkingDisplay = wanted.thinking_display;
+      change('thinking_display');
+    }
+    if (provider !== 'claude' && ['auto_compact_window', 'thinking_enabled', 'thinking_display'].some((key) => wanted[key] !== undefined)) {
+      plan.notes.push(`auto_compact_window and thinking apply to Claude sessions only; this one runs on ${provider}, so they are stored but change nothing there.`);
+    }
+    if (wanted.title !== undefined) {
+      const title = normalizeConversationTitle(wanted.title);
+      if (title !== current.title) {
+        plan.title = title;
+        change('title');
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(wanted, 'group')) {
+      if (!conversationGroups?.enabled) {
+        return fail(503, 'Session groups are not available on this relay (its storage for them is missing). Nothing was changed.', { code: 'SESSION_GROUPS_UNAVAILABLE' });
+      }
+      if (wanted.group === null) {
+        if (current.group) {
+          plan.group = { action: 'leave', previous: current.group };
+          change('group');
+        }
+      } else {
+        const groups = listGroupsForAgents();
+        const found = resolveSessionGroupReference(groups, wanted.group);
+        if (found.status === 'ambiguous') {
+          const refusal = bootstrapGroupRefusal(found, wanted.group, groups);
+          return fail(400, refusal.error.replace('No conversation was created.', 'Nothing was changed.'), { code: refusal.code, groups: refusal.groups, ...(refusal.groupsTotal ? { groupsTotal: refusal.groupsTotal } : {}) });
+        }
+        if (found.status === 'found') {
+          if (current.group?.id !== found.group.id) {
+            plan.group = { action: 'join', id: found.group.id, name: found.group.name };
+            change('group');
+          }
+        } else if (/^grp_/i.test(wanted.group)) {
+          // An id that is not there names no group to make.
+          const refusal = bootstrapGroupRefusal(found, wanted.group, groups);
+          return fail(400, refusal.error.replace('No conversation was created.', 'Nothing was changed.'), { code: refusal.code, groups: refusal.groups, ...(refusal.groupsTotal ? { groupsTotal: refusal.groupsTotal } : {}) });
+        } else if (wanted.group.replace(/\s+/g, ' ').length > GROUP_NAME_MAX) {
+          return fail(400, `A group name has at most ${GROUP_NAME_MAX} characters. Nothing was changed.`, { code: SESSION_SETTINGS_INVALID });
+        } else {
+          plan.group = { action: 'create', name: wanted.group.replace(/\s+/g, ' ') };
+          change('group');
+        }
+      }
+    }
+    if (wanted.cwd !== undefined) {
+      if (provider === 'claude-cloud') {
+        return fail(400, 'cwd does not apply to a Claude Cloud session: it works on a clone of its repository. Nothing was changed.', { code: SESSION_SETTINGS_INVALID });
+      }
+      if (typeof updateConversationConfiguredWorkspaceRoot !== 'function') {
+        return fail(503, 'Conversation workspace updates are unavailable on this relay. Nothing was changed.', { code: SESSION_SETTINGS_INVALID });
+      }
+      const validated = validateRequestedWorkspaceRoot(wanted.cwd, { allowList: workspaceRootAllowList });
+      if (!validated.ok) {
+        return fail(validated.code === 'root-path-not-allowed' ? 403 : 400, `${validated.error || 'cwd is not a folder this relay may use'}. Nothing was changed.`, { code: validated.code || SESSION_SETTINGS_INVALID });
+      }
+      if (normalizeWorkspaceRootKey(validated.realPath) !== normalizeWorkspaceRootKey(current.cwd || '')) {
+        const busy = sessionBusyReason(conversationId);
+        if (busy) {
+          return fail(409, `The session cannot move to another folder now: ${busy}. Wait for it to finish (wait or read_session), then try again. Nothing was changed.`, { code: 'SESSION_BUSY', reason: busy });
+        }
+        plan.cwd = validated.realPath;
+        change('cwd');
+      }
+    }
+    plan.changed.sort((a, b) => REMOTE_RELAY_SESSION_SETTINGS.indexOf(a) - REMOTE_RELAY_SESSION_SETTINGS.indexOf(b));
+    return { ok: true, plan };
+  }
+
+  /** The session's folder through the owner's CWD path: saved, and its CLI relaunched there when it has one. */
+  async function applySessionCwd(plan, req) {
+    const { conversationId } = plan;
+    const rateLimited = consumeWorkspaceRootRateLimit(conversationId, req);
+    if (!rateLimited.ok) {
+      return { ok: false, status: 429, body: { ok: false, code: 'rate-limited', error: 'Too many CWD updates. Try again shortly. Nothing was changed.' } };
+    }
+    const sdkSessionId = String(resolveConversationWorkspaceState?.({ conversationId })?.sdkSessionId || '').trim();
+    if (!sdkSessionId) {
+      // Never launched: the folder is saved for its first launch.
+      const saved = await sessionLaunchMutex.runExclusive(`conv:${conversationId}`, () => {
+        const busy = sessionBusyReason(conversationId);
+        return busy ? { ok: false, busyReason: busy } : updateConversationConfiguredWorkspaceRoot({ conversationId, rootPath: plan.cwd });
+      });
+      if (saved?.busyReason) {
+        return { ok: false, status: 409, body: { ok: false, code: 'SESSION_BUSY', reason: saved.busyReason, error: `The session cannot move to another folder now: ${saved.busyReason}. Wait for it to finish, then try again. Nothing was changed.` } };
+      }
+      if (!saved?.ok) return { ok: false, status: 400, body: { ok: false, error: `${saved?.error || 'Failed to update the session\'s folder'}. Nothing was changed.` } };
+      const state = saved.state || null;
+      io.emit('conversation_workspace_root_updated', {
+        conversationId,
+        sdkSessionId: state?.sdkSessionId || null,
+        configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
+        configuredWorkspaceRootName: state?.configuredWorkspaceRootName || null,
+        runtimeWorkspaceRootPath: state?.runtimeWorkspaceRootPath || null,
+        runtimeWorkspaceRootName: state?.runtimeWorkspaceRootName || null,
+        currentWorkspaceRootPath: state?.currentWorkspaceRootPath || null,
+        currentWorkspaceRootName: state?.currentWorkspaceRootName || null,
+        recentWorkspaceRoots: Array.isArray(workspaceRootPayload()?.recentWorkspaceRoots) ? workspaceRootPayload().recentWorkspaceRoots : [],
+      });
+      return { ok: true, relaunched: false };
+    }
+    let attempt;
+    try {
+      attempt = await sessionLaunchMutex.tryRunExclusive(sdkSessionId, () => {
+        // Asked again under the lock, right before the relaunch: a turn or a
+        // task may have started since the plan.
+        const busy = sessionBusyReason(conversationId);
+        if (busy) return { busyReason: busy };
+        return runWorkspaceRootRelaunch({ conversationId, sdkSessionId, rootPath: plan.cwd });
+      });
+    } catch (error) {
+      return { ok: false, status: 500, body: { ok: false, code: 'relaunch-error', error: error?.message || 'Failed to relaunch the CLI' } };
+    }
+    if (attempt.busy) {
+      return { ok: false, status: 409, body: { ok: false, code: 'SESSION_BUSY', reason: 'its CLI is being relaunched', error: 'The session cannot move to another folder now: its CLI is being relaunched. Try again shortly. Nothing was changed.' } };
+    }
+    const outcome = attempt.result || {};
+    if (outcome.busyReason) {
+      return { ok: false, status: 409, body: { ok: false, code: 'SESSION_BUSY', reason: outcome.busyReason, error: `The session cannot move to another folder now: ${outcome.busyReason}. Wait for it to finish, then try again. Nothing was changed.` } };
+    }
+    // The relay could not read its process list, so it cannot tell whether
+    // the session's CLI still runs: nothing is stopped or started.
+    if (/^process-list-unreadable/.test(String(outcome.error || ''))) {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          ok: false,
+          code: 'PROCESS_LIST_UNREADABLE',
+          error: 'This relay could not read its process list, so it cannot tell whether the session\'s CLI still runs; the folder was not changed. Try again shortly. Nothing was changed.',
+        },
+      };
+    }
+    if (outcome.statusCode !== 200 || outcome.body?.ok !== true) {
+      const body = outcome.body || {};
+      const busy = body.code === 'relaunch-not-eligible';
+      // A CLI that would not stop or start: the folder is saved for the next
+      // launch all the same (the owner's route does the same), so cwd changed.
+      const saved = !busy && !!body.configuredWorkspaceRootPath;
+      return {
+        ok: false,
+        status: outcome.statusCode || 500,
+        body: {
+          ...body,
+          ok: false,
+          ...(busy ? { code: 'SESSION_BUSY', reason: 'a turn is queued or running there' } : {}),
+          error: busy
+            ? `The session cannot move to another folder now: ${body.error || 'it is busy'}. Nothing was changed.`
+            : `${body.error || 'Failed to relaunch the CLI'}${saved ? ' The folder is saved for its next launch; nothing else was changed.' : ' Nothing was changed.'}`,
+          changed: saved ? ['cwd'] : [],
+        },
+      };
+    }
+    return {
+      ok: true,
+      relaunched: outcome.body.relaunched === true,
+      ...(outcome.body.relaunched === true ? {} : { warning: outcome.body.message || 'The folder is saved for the next launch, but the running CLI kept its current folder.' }),
+    };
+  }
+
+  app.patch('/api/conversation/:id/settings', auth, async (req, res) => {
+    const remoteRequest = admitRemoteRelayRequest(req, res, remoteRelayInbound);
+    if (!remoteRequest) return;
+    const requestedId = String(req.params.id || '').trim();
+    const conversation = requestedId ? resolveConversationByIdOrSdkSessionId(requestedId) : null;
+    if (!conversation || String(conversation.status || '').trim() === 'deleted') {
+      return res.status(404).json({ ok: false, code: 'SESSION_NOT_FOUND', error: 'Conversation not found' });
+    }
+    const conversationId = String(conversation.id);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const planned = planSessionSettings(conversation, body.settings);
+    if (!planned.ok) return res.status(planned.status).json(planned.body);
+    const { plan } = planned;
+    const createdBy = parseRemoteRelayOriginJson(conversation.origin_json);
+    const byCaller = sessionStartedByCaller(createdBy, remoteRequest);
+    // An agent changes freely only a session its own conversation started;
+    // any other (the owner's, another agent's, its own creator's) needs the
+    // owner's Allow, which the calling relay asks for and states.
+    const approvalNeeded = remoteRequest.remote === true && !byCaller;
+    const facts = { session: conversationId, provider: plan.provider, ownerStarted: !createdBy, startedByCaller: byCaller, approvalNeeded };
+    if (body.dry_run === true) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        ...facts,
+        settings: plan.current,
+        changed: plan.changed,
+        ...(plan.group ? { group: plan.group } : {}),
+        ...(plan.notes.length ? { notes: plan.notes } : {}),
+      });
+    }
+    // This relay's own rule, whatever the calling relay checked.
+    if (approvalNeeded && body.owner_approved !== true) {
+      return res.status(403).json({
+        ok: false,
+        code: REMOTE_RELAY_ERROR_CODES.permission,
+        ...facts,
+        error: 'This session was not started by the calling conversation: an agent changes its settings only after the relay\'s owner allowed that for the calling conversation.',
+      });
+    }
+    if (!plan.changed.length) {
+      return res.json({ ok: true, ...facts, settings: plan.current, changed: [], ...(plan.notes.length ? { notes: plan.notes } : {}) });
+    }
+
+    // What is written so far: a step that fails later answers it, so a
+    // partial change is never passed off as none.
+    const written = [];
+    const failAfter = (status, payload) => res.status(status).json({
+      ...payload,
+      ok: false,
+      error: `${payload.error}${written.length ? ` These settings were changed before: ${written.join(', ')}.` : ' Nothing was changed.'}`,
+      changed: [...written],
     });
+    // The folder first: it is the one change that can fail after the checks
+    // (a CLI that does not stop or start), and then nothing else is written.
+    let cwdResult = null;
+    if (plan.cwd) {
+      cwdResult = await applySessionCwd(plan, req);
+      if (!cwdResult.ok) return res.status(cwdResult.status).json(cwdResult.body);
+      written.push('cwd');
+    }
+    if (plan.title !== undefined) {
+      const titled = persistConversationTitle({ db, stmts, io, conversationId, title: plan.title, resolveSessionStateRoot });
+      if (!titled.ok) return failAfter(titled.statusCode || 500, { error: titled.error || 'Failed to update the title.' });
+      written.push('title');
+    }
+    if (Object.keys(plan.preferences).length) {
+      applyConversationPreferences({
+        conversationId,
+        existing: stmts.getConvAnyStatus.get(conversationId),
+        body: plan.preferences,
+      });
+      written.push(...plan.changed.filter((key) => !['cwd', 'title', 'group'].includes(key)));
+    }
+    // Groups through the agent path: an owner's group the session leaves is
+    // never removed (it stays, empty if it was the last member); a group an
+    // agent made goes once empty.
+    const groupOptions = { keepOwnerGroups: remoteRequest.remote === true };
+    let groupCreated = null;
+    let groupPlan = plan.group;
+    if (groupPlan?.action === 'create') {
+      // Looked up once more right before it is made: a call that ran beside
+      // this one may have made the group of that name meanwhile.
+      const groups = listGroupsForAgents();
+      const found = resolveSessionGroupReference(groups, groupPlan.name);
+      if (found.status === 'found') groupPlan = { action: 'join', id: found.group.id, name: found.group.name };
+      // Several of that name by now: refused as the first lookup refuses.
+      if (found.status === 'ambiguous') {
+        const refusal = bootstrapGroupRefusal(found, groupPlan.name, groups);
+        return failAfter(400, {
+          code: refusal.code,
+          error: refusal.error.replace(' No conversation was created.', ''),
+          groups: refusal.groups,
+          ...(refusal.groupsTotal ? { groupsTotal: refusal.groupsTotal } : {}),
+        });
+      }
+    }
+    if (groupPlan?.action === 'leave') {
+      const left = conversationGroups.setMembership(conversationId, null, undefined, groupOptions);
+      if (left.ok && left.changed) emitGroupChanged(left.previousGroupId, [conversationId]);
+    } else if (groupPlan?.action === 'join') {
+      const joined = conversationGroups.setMembership(conversationId, groupPlan.id, undefined, groupOptions);
+      if (!joined.ok) {
+        return failAfter(400, { code: 'SESSION_GROUP_NOT_FOUND', error: `The session group ${groupPlan.id} is gone.` });
+      }
+      if (joined.changed) {
+        emitGroupChanged(groupPlan.id, [conversationId]);
+        if (joined.previousGroupId && joined.previousGroupId !== groupPlan.id) emitGroupChanged(joined.previousGroupId, [conversationId]);
+      }
+    } else if (groupPlan?.action === 'create') {
+      const previousGroupId = conversationGroups.groupOfConversation(conversationId)?.id || null;
+      const group = conversationGroups.createGroup({ name: groupPlan.name, conversationIds: [conversationId], agentMade: remoteRequest.remote === true, ...groupOptions });
+      groupCreated = group ? { id: group.id, name: group.name } : null;
+      if (group) emitGroupChanged(group.id, [conversationId]);
+      if (previousGroupId) emitGroupChanged(previousGroupId, [conversationId]);
+    }
 
-    io.emit('conversation_preferences_updated', {
-      conversationId,
-      preferredRelayMode: persisted.preferredRelayMode,
-      preferredModel: persisted.preferredModel,
-      preferredReasoningEffort: persisted.preferredReasoningEffort,
-      autoCompactWindow: persisted.autoCompactWindow ?? null,
-      thinkingEnabled: persisted.thinkingEnabled ?? null,
-      thinkingDisplay: persisted.thinkingDisplay ?? null,
-      updatedAt: persisted.updatedAt,
-      senderClientId,
-    });
-
+    const notes = [...plan.notes];
+    if (cwdResult?.warning) notes.push(cwdResult.warning);
     return res.json({
       ok: true,
-      conversationId,
-      preferredRelayMode: persisted.preferredRelayMode,
-      preferredModel: persisted.preferredModel,
-      preferredReasoningEffort: persisted.preferredReasoningEffort,
-      autoCompactWindow: persisted.autoCompactWindow ?? null,
-      thinkingEnabled: persisted.thinkingEnabled ?? null,
-      thinkingDisplay: persisted.thinkingDisplay ?? null,
-      updatedAt: persisted.updatedAt,
-      created: persisted.created,
-      senderClientId,
+      ...facts,
+      settings: currentSessionSettings(conversationId),
+      changed: plan.changed,
+      ...(cwdResult ? { relaunched: cwdResult.relaunched } : {}),
+      ...(groupCreated ? { groupCreated } : {}),
+      ...(notes.length ? { notes } : {}),
     });
   });
 
@@ -5426,6 +5907,8 @@ export function registerSessionsRoutes(app, deps) {
     if (wasShared) io.emit('share_revoked', { conversationId: id });
     if (leftGroupId) emitGroupChanged(leftGroupId, [id]);
     try { relayEventService?.noteConversationGone?.(id, { deleted: true }); } catch {}
+    try { relayScheduleService?.noteConversationGone?.(id, { deleted: true }); } catch {}
+    try { relayAskService?.noteConversationGone?.(id); } catch {}
     return { statusCode: 200, body: { ok: true, workerStopped, cliSessionDeleted: cliSession.deleted } };
   }
 
@@ -5516,6 +5999,9 @@ export function registerSessionsRoutes(app, deps) {
         io.emit('conversation_archived', { conversationId: id, archived: true });
         // Its subscriptions end, and so does its place in others'.
         try { relayEventService?.noteConversationGone?.(id); } catch {}
+        // So do its schedules.
+        try { relayScheduleService?.noteConversationGone?.(id); } catch {}
+        try { relayAskService?.noteConversationGone?.(id); } catch {}
         // The cloud session of a Claude Cloud conversation is archived with it;
         // best effort and not waited for.
         if (!sharedWithConversationId) {
@@ -5882,6 +6368,30 @@ export function registerSessionsRoutes(app, deps) {
       });
     }
 
+    // The session group an agent's create_session names (an id or an exact
+    // name): resolved before anything is written, so an unknown one creates
+    // nothing. It wins over the creator's group. Only the row created here is
+    // ever placed; the group routes stay the owner's.
+    const rawGroup = req.body?.group;
+    if (rawGroup !== undefined && rawGroup !== null && typeof rawGroup !== 'string') {
+      return res.status(400).json({ ok: false, code: 'SESSION_GROUP_INVALID', error: 'group must be text: a group id or name' });
+    }
+    const requestedGroup = String(rawGroup || '').trim();
+    let bootstrapGroupId = '';
+    if (requestedGroup) {
+      if (!conversationGroups?.enabled) {
+        return res.status(503).json({
+          ok: false,
+          code: 'SESSION_GROUPS_UNAVAILABLE',
+          error: 'Session groups are not available on this relay (its storage for them is missing). No conversation was created.',
+        });
+      }
+      const groups = listGroupsForAgents();
+      const found = resolveSessionGroupReference(groups, requestedGroup);
+      if (found.status !== 'found') return res.status(400).json(bootstrapGroupRefusal(found, requestedGroup, groups));
+      bootstrapGroupId = found.group.id;
+    }
+
     // Optional launch CWD from the New Chat modal. Validated before insertConv
     // so a rejected path never leaves an orphaned conversation behind.
     const requestedWorkspaceRootPath = readWorkspaceRootPathFromBody(req.body);
@@ -6000,14 +6510,23 @@ export function registerSessionsRoutes(app, deps) {
       // binding and preferences: every later reader treats these three as a
       // single canonical tuple.
       let attachedGroupId = null;
+      let attachedGroupIds = [];
       const commitBootstrapState = db.transaction(() => {
         stmts.insertConv.run(conversationId, title, now, now);
         if (remoteRequest.origin) remoteRelayInbound?.repository?.setConversationOrigin?.(conversationId, remoteRequest.origin);
-        // A session an agent of this relay created joins its creator's group
-        // (or starts one with the creator as head). A creator on a paired
-        // relay has no local flag and groups nothing.
-        if (remoteRequest.origin?.local === true && remoteRequest.origin.conversationId) {
+        if (bootstrapGroupId) {
+          // The group named in the request. Dissolved since it was looked up:
+          // the whole bootstrap rolls back, and the caller hears it as unknown.
+          const placed = conversationGroups.setMembership(conversationId, bootstrapGroupId, now);
+          if (!placed?.ok) throw Object.assign(new Error('session group gone'), { bootstrapGroupGone: true });
+          attachedGroupId = bootstrapGroupId;
+          attachedGroupIds = [conversationId];
+        } else if (remoteRequest.origin?.local === true && remoteRequest.origin.conversationId) {
+          // A session an agent of this relay created joins its creator's group
+          // (or starts one with the creator as head). A creator on a paired
+          // relay has no local flag and groups nothing.
           attachedGroupId = conversationGroups?.attachCreatedConversation?.(conversationId, remoteRequest.origin.conversationId, now) || null;
+          attachedGroupIds = [conversationId, remoteRequest.origin.conversationId];
         }
         const boundRuntimeSession = ensureRuntimeSessionBinding(
           conversationId,
@@ -6037,7 +6556,7 @@ export function registerSessionsRoutes(app, deps) {
         return { boundRuntimeSession, preferences };
       });
       const { boundRuntimeSession, preferences } = commitBootstrapState();
-      if (attachedGroupId) emitGroupChanged(attachedGroupId, [conversationId, remoteRequest.origin.conversationId]);
+      if (attachedGroupId) emitGroupChanged(attachedGroupId, attachedGroupIds);
       const runtimeSession = boundRuntimeSession;
       const preferredRelayMode = preferences?.preferredRelayMode || bootstrapRelayMode;
       const preferredModel = preferences?.preferredModel || selectedModel;
@@ -6138,6 +6657,9 @@ export function registerSessionsRoutes(app, deps) {
         cloud: bootstrapCloudSource
           ? buildConversationCloudPayload({ cloudSourceJson: bootstrapCloudSource })
           : null,
+        // Always present (null outside a group): a caller that asked for a
+        // group tells this relay from one that predates it by the key.
+        group: conversationGroupField(conversationId),
         runtimeSessionId: runtimeSession?.id || null,
         ownerSessionId,
         worker: ownerWorker,
@@ -6156,6 +6678,10 @@ export function registerSessionsRoutes(app, deps) {
         ...workspaceRootPayload(),
       });
     } catch (error) {
+      if (error?.bootstrapGroupGone) {
+        const groups = listGroupsForAgents();
+        return res.status(400).json(bootstrapGroupRefusal({ status: 'unknown' }, requestedGroup, groups));
+      }
       console.warn(`[bootstrap] conversation bootstrap failed: ${error?.message || error}`);
       return res.status(500).json({
         ok: false,

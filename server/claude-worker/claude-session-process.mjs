@@ -53,7 +53,7 @@ import {
   STEER_STOPPED_TEXT,
 } from '../../shared/steer-settle-markers.mjs';
 import { stripSteerNote, withSteerNoteContent } from '../../shared/steer-note.mjs';
-import { isRelayEventDelivery } from '../../shared/relay-events.mjs';
+import { isRelayAutomatedDelivery } from '../../shared/relay-events.mjs';
 import {
   stripSlashCommandGuard,
   stripSlashCommandGuardContent,
@@ -4209,9 +4209,9 @@ export function createClaudeSessionRunner({
         // noted steer no longer starts with "/" and is pushed as noted. The
         // replay signatures strip the guard too, so expectedText stays the
         // user's own text here as well.
-        // Nor into an event message the relay wrote: the note speaks as the
-        // user, the event must not (shared/relay-events.mjs).
-        const pushedContent = withSlashCommandGuardContent(steered && procRef.activeCtx?.kind !== 'continuation' && !isRelayEventDelivery(message)
+        // Nor into a message the relay wrote (an event, a scheduled prompt):
+        // the note speaks as the user, that message must not (shared/relay-events.mjs).
+        const pushedContent = withSlashCommandGuardContent(steered && procRef.activeCtx?.kind !== 'continuation' && !isRelayAutomatedDelivery(message)
           ? withSteerNoteContent(content)
           : content);
         procRef.pendingDelivered.push({ ctx, expectedText: contentText(content), pushedAt: Date.now(), steered });

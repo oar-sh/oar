@@ -238,6 +238,7 @@ import { initScrollbarHover } from './scrollbar-hover.mjs';
 import {
   autoCompactWindowNotes,
   renderAutoCompactControlHtml,
+  renderAgentSessionsControlHtml,
   renderAutoCompactNotesHtml,
   renderContextUsageHtml,
   renderThinkingControlHtml,
@@ -401,6 +402,8 @@ import { openStopSharingConfirmation } from './shared-conversations-settings.js'
 import { showAbout, syncAboutMenuLabel } from './about-ui.js';
 import { syncConversationOriginHeader } from './conversation-origin-ui.js';
 import { loadRelayEventSubscriptions, onRelayEventSubscriptionsChanged, syncRelayEventHeader } from './relay-event-subscriptions-ui.js';
+import { loadRelaySchedules, onRelaySchedulesChanged, syncRelayScheduleHeader } from './relay-schedules-ui.js';
+import { leaveInboxView, startInbox, toggleInboxView } from './inbox-ui.js';
 import {
   previewAgentSessionsMaxWait,
   saveAgentSessionsMaxWait,
@@ -3346,6 +3349,41 @@ function initAttributionControl() {
   });
 }
 
+// The owner's "agents in this conversation may start sessions" in the 🧠
+// modal: one request per change; the store follows the answer (other tabs
+// follow the socket event).
+let agentSessionsControlUpdateInFlight = false;
+function initAgentSessionsControl() {
+  const body = document.getElementById('summary-modal-body');
+  if (!body || body.dataset.agentSessionsControlBound === 'true') return;
+  body.dataset.agentSessionsControlBound = 'true';
+  body.addEventListener('change', async (event) => {
+    const box = event.target?.closest?.('#ctx-may-create-sessions');
+    if (!box) return;
+    const convId = String(box.dataset.conversationId || '').trim();
+    if (!convId || agentSessionsControlUpdateInFlight) return;
+    const wanted = box.checked === true;
+    agentSessionsControlUpdateInFlight = true;
+    box.disabled = true;
+    try {
+      const response = await updateConversationPreferences(convId, { clientId: CLIENT_ID, mayCreateSessions: wanted });
+      if (!response) throw new Error('The relay refused the change');
+      const stored = response.mayCreateSessions === true;
+      if (conversations[convId]) conversations[convId] = { ...conversations[convId], mayCreateSessions: stored };
+      box.checked = stored;
+      showTransientRelayNotice(stored
+        ? 'Agents in this conversation may now start sessions.'
+        : 'Agents in this conversation can no longer start sessions.');
+    } catch (error) {
+      box.checked = !wanted;
+      showTransientRelayNotice(`Could not change the setting: ${error?.message || error}`);
+    } finally {
+      box.disabled = false;
+      agentSessionsControlUpdateInFlight = false;
+    }
+  });
+}
+
 function initThinkingControl() {
   const body = document.getElementById('summary-modal-body');
   if (!body || body.dataset.thinkingBound === '1') return;
@@ -3511,14 +3549,21 @@ async function loadContextSummaryAndRender(convId) {
     enabled: payload.thinkingEnabled !== false,
     display: payload.thinkingDisplay || 'summarized',
   };
+  // For a session an agent started (any provider): may its agents start
+  // sessions? Only meaningful there, so only shown there.
+  const settingsConversationId = String(payload.resolvedConversationId || trimmedConvId || '').trim();
+  const settingsConversation = settingsConversationId ? conversations[settingsConversationId] : null;
+  const agentSessionsHtml = settingsConversation?.origin
+    ? renderAgentSessionsControlHtml({ conversationId: settingsConversationId, mayCreateSessions: settingsConversation.mayCreateSessions === true })
+    : '';
   const detailText = String(payload.text || '').trim();
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
   const bodyHtml = usageHtml
-    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${attributionHtml}${detailText
+    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${attributionHtml}${agentSessionsHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
-    : `${autoCompactHtml}${thinkingHtml}${attributionHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+    : `${autoCompactHtml}${thinkingHtml}${attributionHtml}${agentSessionsHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -4387,6 +4432,8 @@ function syncChatTitleControls() {
   syncConversationOriginHeader();
   // Relay events: "watching N sessions" on a watcher, "watched" on a watched one.
   syncRelayEventHeader();
+  // Relay schedules: "N scheduled" with its list and Cancel buttons.
+  syncRelayScheduleHeader();
   syncChatTitleWatcherIndicator();
 }
 
@@ -4884,6 +4931,7 @@ async function initApp() {
   initAutoCompactWindowControl();
   initThinkingControl();
   initAttributionControl();
+  initAgentSessionsControl();
   initModeSelector();
   initModelSelector();
   initReasoningSelector();
@@ -4965,6 +5013,11 @@ async function initApp() {
   // The sidebar's "watched" badges follow the subscriptions.
   onRelayEventSubscriptionsChanged(() => renderConvList());
   void loadRelayEventSubscriptions();
+  // The sidebar's "scheduled" markers follow the schedules.
+  onRelaySchedulesChanged(() => renderConvList());
+  void loadRelaySchedules();
+  // The Inbox's count, and the cards of questions that don't block.
+  startInbox();
   const pushConversationId = consumePushConversationDeepLink();
   if (pushConversationId) {
     await openConversation(pushConversationId).catch(() => {});
@@ -5165,7 +5218,12 @@ window.toggleArchivedConversations = toggleArchivedConversations;
 window.refreshNewConversationCloudRepoList = refreshNewConversationCloudRepoList;
 window.openConversation = openConversation;
 window.openOriginConversation = openOriginConversation;
-window.toggleStatusView = toggleStatusView;
+// The Inbox and Status share the transcript's place: opening one leaves the other.
+window.toggleStatusView = () => {
+  leaveInboxView();
+  return toggleStatusView();
+};
+window.toggleInboxView = toggleInboxView;
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;

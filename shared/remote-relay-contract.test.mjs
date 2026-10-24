@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 
 import {
   REMOTE_RELAY_ACTIONS,
+  REMOTE_RELAY_ACTION_ARGUMENTS,
   REMOTE_RELAY_ACTION_PERMISSION,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_LIMITS,
+  REMOTE_RELAY_NO_GROUP,
   REMOTE_RELAY_PROVIDERS,
+  REMOTE_RELAY_SESSION_SETTINGS,
+  REMOTE_RELAY_SCHEDULE_ACTIONS,
   REMOTE_RELAY_SETTING_KEYS,
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
@@ -15,6 +19,8 @@ import {
   AGENT_SESSIONS_SOCKET_EVENT,
   checkRemoteRelayUrlPolicy,
   formatRemotePromptHeader,
+  formatSessionGroupList,
+  resolveSessionGroupReference,
   isRemoteRelayApprovalQuestion,
   isRemoteRelayWriteAction,
   normalizeRemoteRelayLink,
@@ -23,12 +29,14 @@ import {
   normalizeRemoteRelayPermission,
   normalizeRemoteRelayRepo,
   remoteConversationUrl,
+  remoteRelayActionPermission,
   remoteRelayPermissionAllows,
   stripRemotePromptHeader,
   summarizeRemoteRelayCall,
   validateRemoteRelayToolInput,
   withRemotePromptHeader,
 } from './remote-relay-contract.mjs';
+import { RELAY_EVENT_LIMITS } from './relay-events.mjs';
 
 test('the tool is named remote_relay and its schema lists every action', () => {
   assert.equal(REMOTE_RELAY_TOOL_NAME, 'remote_relay');
@@ -244,7 +252,7 @@ test('send and create_session take an effort: any short lowercase token, no fixe
   }
 });
 
-test('an effort on any other action is ignored, not validated', () => {
+test('an effort on any other action is ignored and named, not validated', () => {
   const inputs = [
     { action: 'list_relays' },
     { action: 'relay_info', relay: 'r' },
@@ -258,7 +266,7 @@ test('an effort on any other action is ignored, not validated', () => {
   for (const input of inputs) {
     const plain = validateRemoteRelayToolInput(input);
     assert.equal(plain.ok, true, input.action);
-    assert.deepEqual(validateRemoteRelayToolInput({ ...input, effort: 'very high!' }), plain, input.action);
+    assert.deepEqual(validateRemoteRelayToolInput({ ...input, effort: 'very high!' }), { ...plain, ignored: ['effort'] }, input.action);
   }
 });
 
@@ -446,6 +454,37 @@ test('event actions default to this relay and validate their arguments', () => {
   assert.equal(summarize({ action: 'subscribe', relay: 'this', sessions: ['all'] }), 'subscribe → this: all sessions');
 });
 
+test('subscribe options: digest_minutes is clamped, quiet_hours checked, exclude only with ["all"]', () => {
+  const validate = validateRemoteRelayToolInput;
+  assert.deepEqual(validate({
+    action: 'subscribe',
+    sessions: ['all'],
+    digest_minutes: 0,
+    quiet_hours: { from: '7:30', to: '19:00', tz: 'America/New_York' },
+    exclude: ['conv-a', ' conv-a ', 'conv-b'],
+  }), {
+    ok: true,
+    action: 'subscribe',
+    args: { relay: 'this', scope: 'all', digest_minutes: 1, quiet_hours: { from: '07:30', to: '19:00', tz: 'America/New_York' }, exclude: ['conv-a', 'conv-b'] },
+  });
+  assert.equal(validate({ action: 'subscribe', sessions: ['conv-a'], digest_minutes: 99999 }).args.digest_minutes, RELAY_EVENT_LIMITS.digestMinutesMax);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], digest_minutes: 'often' }).error, /digest_minutes must be a number/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], quiet_hours: { from: '23:00', to: '06:00', tz: 'Moon/Base' } }).error, /not an IANA time zone/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], quiet_hours: { from: '23:00', to: '06:00' } }).error, /needs tz/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], quiet_hours: { from: '25:00', to: '06:00', tz: 'UTC' } }).error, /HH:MM/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], quiet_hours: { from: '06:00', to: '06:00', tz: 'UTC' } }).error, /differ/);
+  assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], exclude: ['conv-b'] }).error, /exclude goes with sessions \["all"\] only/);
+  assert.match(validate({ action: 'subscribe', sessions: ['all'], exclude: Array.from({ length: 51 }, (_, index) => `conv-${index}`) }).error, /at most 50/);
+  assert.match(validate({ action: 'subscribe', sessions: ['all'], exclude: { id: 'conv-a' } }).error, /list of session ids/);
+  // Providers that send every property empty: no option, nothing ignored.
+  const empty = validate({ action: 'subscribe', sessions: ['conv-a'], digest_minutes: null, quiet_hours: { from: '', to: '', tz: '' }, exclude: [] });
+  assert.deepEqual(empty, { ok: true, action: 'subscribe', args: { relay: 'this', sessions: ['conv-a'] } });
+  assert.deepEqual(validate({ action: 'list_subscriptions', quiet_hours: {} }).ignored, undefined);
+  assert.deepEqual(validate({ action: 'list_subscriptions', digest_minutes: 5 }).ignored, ['digest_minutes']);
+  for (const key of ['digest_minutes', 'quiet_hours', 'exclude']) assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties[key], key);
+  assert.deepEqual(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.quiet_hours.required, ['from', 'to', 'tz']);
+});
+
 test('what the input check hands on passes it again unchanged, for every action', () => {
   // A call is checked twice: by the worker's tool, and by the relay that
   // receives what the tool sent. ["all"] failed the second check (the
@@ -459,8 +498,11 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 'task-b7', lines: 40 },
     { action: 'wait', relay: 'this', session: 'conv-a', message_id: 'm-1', wait_seconds: 30 },
     { action: 'send', relay: 'this', session: 'conv-a', text: 'hello', mode: 'plan', effort: 'high', if_busy: 'fail', model: 'gpt-5.4-mini' },
-    { action: 'create_session', relay: 'this', text: 'start', provider: 'claude', cwd: '/home/dev/project', title: 'docs pass' },
+    { action: 'create_session', relay: 'this', text: 'start', provider: 'claude', cwd: '/home/dev/project', title: 'docs pass', group: 'Docs' },
     { action: 'create_session', relay: 'this', text: 'start', provider: 'claude-cloud', repo: 'https://github.com/example-org/example-repo', branch: 'feature/x' },
+    { action: 'update_session', relay: 'this', session: 'conv-a', model: 'claude-opus-5', effort: 'high', mode: 'plan', auto_compact_window: 200000, title: 'Docs pass', group: 'Docs', thinking_enabled: false, thinking_display: 'omitted', cwd: '/home/dev/next' },
+    { action: 'update_session', relay: 'this', session: 'conv-a', group: null, auto_compact_window: 'auto' },
+    { action: 'update_session', relay: 'this', session: 'conv-a', group: 'none' },
     { action: 'answer_question', relay: 'this', session: 'conv-a', question_id: 'q-1', choices: ['Yes'] },
     { action: 'stop', relay: 'this', session: 'conv-a' },
     { action: 'archive', relay: 'this', session: 'conv-a' },
@@ -469,19 +511,122 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'subscribe', sessions: 'all', events: ['turn_end'], once: true, stalled_minutes: 20, heartbeat_minutes: 60 },
     { action: 'subscribe', relay: 'linux-test', sessions: ['conv-a', 'conv-b'], match: 'done' },
     { action: 'subscribe', events: ['relay_restarted'], once: true },
+    { action: 'subscribe', sessions: ['all'], digest_minutes: 30, quiet_hours: { from: '23:00', to: '06:00', tz: 'Europe/Berlin' }, exclude: ['conv-a'] },
     { action: 'unsubscribe', subscription_id: 'all' },
     { action: 'unsubscribe', subscription_id: 'sub_fixture1' },
     { action: 'list_subscriptions', watcher: 'conv-b' },
     { action: 'transfer_subscriptions', from: 'conv-old' },
+    { action: 'schedule', text: 'Run the sweep.', every_minutes: 30, title: 'Sweep' },
+    { action: 'schedule', session: 'conv-b', text: 'Check in.', at: new Date(Date.now() + 3_600_000).toISOString() },
+    { action: 'schedule', text: 'Nightly.', at: new Date(Date.now() + 7_200_000).toISOString(), every_minutes: 1440, once: false },
+    { action: 'list_schedules', session: 'conv-b' },
+    { action: 'unschedule', schedule_id: 'sch_fixture1' },
+    { action: 'ask', question: 'Which database?', options: ['Postgres', 'SQLite'], recommendation: 'sqlite', detail: 'Two lines\nof background', urgency: 'now' },
+    { action: 'ask', relay: 'linux-test', session: 'conv-b', question: 'Ship it?' },
+    { action: 'list_questions', session: 'conv-b' },
+    { action: 'withdraw', question_id: 'ask_fixture01' },
   ];
   for (const input of inputs) {
     const first = validateRemoteRelayToolInput(input);
     assert.equal(first.ok, true, `${JSON.stringify(input)}: ${first.error}`);
     const second = validateRemoteRelayToolInput({ ...first.args, action: first.action });
-    assert.deepEqual(second, first, JSON.stringify(input));
+    // What the first check named as ignored is not handed on: the second one
+    // refuses and ignores nothing.
+    const { ignored: _named, ...handedOn } = first;
+    assert.deepEqual(second, handedOn, JSON.stringify(input));
+    assert.equal(second.ignored, undefined, JSON.stringify(input));
   }
   // The covered actions are all of them.
   assert.deepEqual([...new Set(inputs.map((input) => input.action))].sort(), [...REMOTE_RELAY_ACTIONS].sort());
+});
+
+test('schedule: text and a time, once by default only for at; list and unschedule; relay may be left out', () => {
+  const now = Date.parse('2026-03-02T10:00:00.000Z');
+  const validate = (input) => validateRemoteRelayToolInput(input, { now });
+  assert.deepEqual(validate({ action: 'schedule', text: ' Sweep. ', every_minutes: 30, title: ' Sweep\nnow ' }), {
+    ok: true,
+    action: 'schedule',
+    args: { relay: 'this', text: 'Sweep.', every_minutes: 30, once: false, title: 'Sweep now' },
+  });
+  assert.deepEqual(validate({ action: 'schedule', session: 'conv-b', text: 'Hi.', at: '2026-03-02T11:30:00+01:00' }).args, {
+    relay: 'this', session: 'conv-b', text: 'Hi.', at: '2026-03-02T10:30:00.000Z', once: true,
+  });
+  assert.deepEqual(validate({ action: 'schedule', text: 'x', at: '2026-03-03T02:00:00Z', every_minutes: '1440' }).args,
+    { relay: 'this', text: 'x', at: '2026-03-03T02:00:00.000Z', every_minutes: 1440, once: false });
+  assert.equal(validate({ action: 'schedule', text: 'x', every_minutes: 60, once: 'true' }).args.once, true);
+  assert.match(validate({ action: 'schedule', every_minutes: 30 }).error, /needs text/);
+  assert.match(validate({ action: 'schedule', text: 'x' }).error, /needs at .* or every_minutes/);
+  assert.match(validate({ action: 'schedule', text: 'x', every_minutes: 4 }).error, /from 5 to 10080/);
+  assert.match(validate({ action: 'schedule', text: 'x', every_minutes: 10081 }).error, /from 5 to 10080/);
+  assert.match(validate({ action: 'schedule', text: 'x', every_minutes: 7.5 }).error, /whole number/);
+  assert.match(validate({ action: 'schedule', text: 'x', at: '2026-03-02T09:00:00Z' }).error, /in the past/);
+  assert.match(validate({ action: 'schedule', text: 'x', at: '2026-03-02 12:00' }).error, /with a zone/);
+  assert.match(validate({ action: 'schedule', text: 'x', at: '2026-03-02T12:00:00Z', once: false }).error, /repeats needs every_minutes/);
+  assert.match(validate({ action: 'schedule', text: 'x'.repeat(20001), every_minutes: 5 }).error, /longer than 20000/);
+  assert.deepEqual(validate({ action: 'schedule', text: 'x', every_minutes: 5, wait_seconds: 9 }).ignored, ['wait_seconds']);
+  assert.deepEqual(validate({ action: 'list_schedules' }).args, { relay: 'this' });
+  assert.deepEqual(validate({ action: 'list_schedules', relay: 'lab', session: 'conv-b' }).args, { relay: 'lab', session: 'conv-b' });
+  assert.match(validate({ action: 'unschedule' }).error, /needs schedule_id/);
+  assert.deepEqual(validate({ action: 'unschedule', schedule_id: 'sch_ab' }).args, { relay: 'this', schedule_id: 'sch_ab' });
+  assert.equal(summarizeRemoteRelayCall({ action: 'schedule', relay: 'this', every_minutes: 30, title: 'Sweep' }), 'schedule → this: every 30 min “Sweep”');
+  assert.equal(summarizeRemoteRelayCall({ action: 'unschedule', relay: 'this', schedule_id: 'sch_ab' }), 'unschedule → this: sch_ab');
+  for (const key of ['at', 'every_minutes', 'schedule_id']) assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties[key], key);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /\[relay schedule <id>/);
+  assert.doesNotMatch(REMOTE_RELAY_TOOL_DESCRIPTION, /may not survive/);
+});
+
+test('schedule needs prompt for another session and read for the caller\'s own', () => {
+  assert.equal(remoteRelayActionPermission('schedule'), 'prompt');
+  assert.equal(remoteRelayActionPermission('schedule', { ownSession: true }), 'read');
+  assert.equal(remoteRelayActionPermission('list_schedules'), 'read');
+  assert.equal(remoteRelayActionPermission('unschedule'), 'read');
+  assert.equal(remoteRelayActionPermission('send', { ownSession: true }), 'prompt');
+  assert.equal(remoteRelayActionPermission('nope'), undefined);
+  assert.equal(remoteRelayPermissionAllows('read', 'schedule'), false);
+  assert.equal(remoteRelayPermissionAllows('read', 'schedule', { ownSession: true }), true);
+  assert.equal(remoteRelayPermissionAllows('prompt', 'schedule'), true);
+  assert.deepEqual([...REMOTE_RELAY_SCHEDULE_ACTIONS], ['schedule', 'list_schedules', 'unschedule']);
+});
+
+test('ask: a question with options, a recommendation, a detail and an urgency; relay may be left out', () => {
+  assert.deepEqual(validateRemoteRelayToolInput({
+    action: 'ask',
+    question: ' Which database? ',
+    options: ['Postgres', 'SQLite'],
+    recommendation: 'sqlite',
+    detail: '<b>not markup</b>',
+  }), {
+    ok: true,
+    action: 'ask',
+    args: { relay: 'this', question: 'Which database?', options: ['Postgres', 'SQLite'], recommendation: 'SQLite', detail: '<b>not markup</b>', urgency: 'normal' },
+  });
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'ask', relay: 'lab', session: 'conv-b', question: 'Q', urgency: 'now' }).args,
+    { relay: 'lab', session: 'conv-b', question: 'Q', urgency: 'now' });
+  assert.match(validateRemoteRelayToolInput({ action: 'ask' }).error, /ask needs question/);
+  assert.equal(validateRemoteRelayToolInput({ action: 'ask', question: 'x'.repeat(501) }).code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+  assert.match(validateRemoteRelayToolInput({ action: 'ask', question: 'Q', options: Array.from({ length: 9 }, (_, i) => `o${i}`) }).error, /at most 8/);
+  assert.match(validateRemoteRelayToolInput({ action: 'ask', question: 'Q', urgency: 'soon' }).error, /urgency/);
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'ask', question: 'Q', text: 'x' }).ignored, ['text']);
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'list_questions' }).args, { relay: 'this' });
+  assert.match(validateRemoteRelayToolInput({ action: 'withdraw' }).error, /needs question_id/);
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'withdraw', question_id: 'ask_ab12cd' }).args, { relay: 'this', question_id: 'ask_ab12cd' });
+  assert.equal(summarizeRemoteRelayCall({ action: 'ask', relay: 'this', question: 'Which database?', urgency: 'now' }), 'ask → this: “Which database?” (now)');
+  assert.equal(summarizeRemoteRelayCall({ action: 'withdraw', relay: 'this', question_id: 'ask_ab12cd' }), 'withdraw → this: ask_ab12cd');
+  for (const key of ['question', 'options', 'recommendation', 'detail', 'urgency']) assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties[key], key);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.options.maxItems, 8);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /question_answered/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /Only the user answers an ask/);
+  assert.ok(REMOTE_RELAY_ERROR_CODES.questionLimit);
+});
+
+test('ask needs prompt on behalf of another session and read for the caller\'s own; it asks no approval', () => {
+  assert.equal(remoteRelayActionPermission('ask'), 'prompt');
+  assert.equal(remoteRelayActionPermission('ask', { ownSession: true }), 'read');
+  assert.equal(remoteRelayActionPermission('list_questions'), 'read');
+  assert.equal(remoteRelayActionPermission('withdraw'), 'read');
+  assert.equal(remoteRelayPermissionAllows('read', 'ask'), false);
+  assert.equal(remoteRelayPermissionAllows('prompt', 'ask'), true);
+  for (const action of ['ask', 'list_questions', 'withdraw']) assert.equal(isRemoteRelayWriteAction(action), false, action);
 });
 
 test('subscribe takes scope "all" as ["all"], and not together with session ids', () => {
@@ -505,4 +650,224 @@ test('read_task_output: session and task_id required, lines defaulted and clampe
   assert.equal(remoteRelayPermissionAllows('read', 'read_task_output'), true);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /read_task_output/);
   assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.lines.maximum, 500);
+});
+
+// ─── create_session group, and arguments an action does not take ─────────────
+
+test('create_session takes group, trimmed and capped', () => {
+  const parsed = validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', group: '  Docs pass  ' });
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.args.group, 'Docs pass');
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', group: 'g'.repeat(500) }).args.group.length, 200);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.type, 'string');
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.description, /create_session/);
+  // An empty group is no group: today's default grouping.
+  for (const group of ['', '   ', null, undefined]) {
+    const plain = validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', group });
+    assert.equal(plain.ok, true, String(group));
+    assert.equal(Object.prototype.hasOwnProperty.call(plain.args, 'group'), false, String(group));
+  }
+  // A known argument of the wrong type still fails.
+  const typed = validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', group: { id: 'grp_1' } });
+  assert.equal(typed.ok, false);
+  assert.match(typed.error, /group must be text/);
+});
+
+test('group is not an argument of send (taken by create_session and update_session only, ignored on send)', () => {
+  const sent = validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 's', text: 'hi', group: 'Docs' });
+  assert.equal(sent.ok, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(sent.args, 'group'), false);
+  assert.deepEqual(sent.ignored, ['group']);
+  assert.ok(REMOTE_RELAY_ACTION_ARGUMENTS.create_session.includes('group'));
+  assert.ok(REMOTE_RELAY_ACTION_ARGUMENTS.update_session.includes('group'));
+  for (const action of REMOTE_RELAY_ACTIONS.filter((name) => name !== 'create_session' && name !== 'update_session')) {
+    assert.equal(REMOTE_RELAY_ACTION_ARGUMENTS[action].includes('group'), false, action);
+  }
+});
+
+test('create_session refuses an argument it does not take and lists its arguments', () => {
+  const refused = validateRemoteRelayToolInput({
+    action: 'create_session', relay: 'this', text: 'go', session: 'conv-a', scope: 'recent', groupId: 'grp_1',
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+  assert.match(refused.error, /^create_session does not take: groupId, scope, session\./);
+  assert.match(refused.error, /Its arguments: relay, text, provider, model, cwd, repo, branch, mode, effort, title, group, wait_seconds\./);
+  assert.match(refused.error, /Nothing was created\./);
+  // The refusal comes first, before any other check of the call.
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', bogus: 1 }).error.startsWith('create_session does not take: bogus'), true);
+});
+
+test('create_session treats null, empty, false and [] extra arguments as absent', () => {
+  const parsed = validateRemoteRelayToolInput({
+    action: 'create_session', relay: 'this', text: 'go',
+    session: null, scope: '', query: '   ', include_activity: false, choices: [], sessions: undefined,
+  });
+  assert.equal(parsed.ok, true, parsed.error);
+  assert.equal(parsed.ignored, undefined);
+  // 0 and true are values.
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', last: 0 }).ok, false);
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', once: true }).ok, false);
+});
+
+test('other actions return the arguments they do not take in ignored', () => {
+  const read = validateRemoteRelayToolInput({ action: 'read_session', relay: 'this', session: 's', text: 'x', provider: 'claude', limit: null });
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.ignored, ['provider', 'text']);
+  const stop = validateRemoteRelayToolInput({ action: 'stop', relay: 'this', session: 's', if_busy: 'fail' });
+  assert.deepEqual(stop.ignored, ['if_busy']);
+  // A failed check names them too.
+  const failed = validateRemoteRelayToolInput({ action: 'wait', relay: 'this', session: 's', model: 'x' });
+  assert.equal(failed.ok, false);
+  assert.deepEqual(failed.ignored, ['model']);
+  // Nothing to name: no key.
+  assert.equal(validateRemoteRelayToolInput({ action: 'stop', relay: 'this', session: 's' }).ignored, undefined);
+  // Capped.
+  const many = Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`extra_${String(index).padStart(2, '0')}`, 1]));
+  assert.equal(validateRemoteRelayToolInput({ action: 'stop', relay: 'this', session: 's', ...many }).ignored.length, 20);
+});
+
+test('list_relays reports ignored arguments too', () => {
+  const parsed = validateRemoteRelayToolInput({ action: 'list_relays', relay: 'this', session: 'conv-a' });
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.args, {});
+  assert.deepEqual(parsed.ignored, ['session']);
+});
+
+test('resolveSessionGroupReference finds by id, by name case-insensitively, reports unknown and ambiguous', () => {
+  const groups = [
+    { id: 'grp_aaa', name: 'Docs pass', memberCount: 3 },
+    { id: 'grp_bbb', name: 'Release', memberCount: 1 },
+    { id: 'grp_ccc', name: 'release', memberCount: 2 },
+  ];
+  assert.equal(resolveSessionGroupReference(groups, 'grp_bbb').group.id, 'grp_bbb');
+  assert.equal(resolveSessionGroupReference(groups, '  docs   PASS ').group.id, 'grp_aaa');
+  assert.deepEqual(resolveSessionGroupReference(groups, 'nope'), { status: 'unknown' });
+  assert.deepEqual(resolveSessionGroupReference(groups, ''), { status: 'unknown' });
+  assert.deepEqual(resolveSessionGroupReference([], 'Docs pass'), { status: 'unknown' });
+  const ambiguous = resolveSessionGroupReference(groups, 'RELEASE');
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.deepEqual(ambiguous.matches.map((group) => group.id), ['grp_bbb', 'grp_ccc']);
+  // An id wins over a group that is named like it.
+  assert.equal(resolveSessionGroupReference([...groups, { id: 'grp_ddd', name: 'grp_aaa' }], 'grp_aaa').group.id, 'grp_aaa');
+  assert.equal(formatSessionGroupList(groups, 2), 'Docs pass (grp_aaa), Release (grp_bbb) and 1 more');
+});
+
+test('the tool text lets agents name a group, move sessions with update_session, and leaves renaming to the owner', () => {
+  assert.doesNotMatch(REMOTE_RELAY_TOOL_DESCRIPTION, /read-only for agents/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /Agents can name an existing group when they create a session/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /Renaming and dissolving groups stay the owner's/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /comes back in ignored; create_session and update_session refuse/);
+  assert.equal(REMOTE_RELAY_ERROR_CODES.unknownGroup, 'REMOTE_RELAY_UNKNOWN_GROUP');
+});
+
+// ─── update_session ──────────────────────────────────────────────────────────
+
+test('update_session: a full-permission write action on one session, with the settings it names', () => {
+  assert.ok(REMOTE_RELAY_ACTIONS.includes('update_session'));
+  assert.equal(REMOTE_RELAY_ACTION_PERMISSION.update_session, 'full');
+  assert.equal(isRemoteRelayWriteAction('update_session'), true);
+  assert.equal(remoteRelayPermissionAllows('prompt', 'update_session'), false);
+  assert.equal(remoteRelayPermissionAllows('full', 'update_session'), true);
+  assert.deepEqual([...REMOTE_RELAY_SESSION_SETTINGS], ['model', 'effort', 'mode', 'auto_compact_window', 'title', 'group', 'thinking_enabled', 'thinking_display', 'cwd']);
+  assert.deepEqual([...REMOTE_RELAY_ACTION_ARGUMENTS.update_session], ['session', ...REMOTE_RELAY_SESSION_SETTINGS]);
+  const parsed = validateRemoteRelayToolInput({
+    action: 'update_session', relay: 'this', session: ' conv-a ', model: ' claude-opus-5 ', effort: 'HIGH', mode: 'Plan',
+    auto_compact_window: '150000', title: '  Docs pass ', group: ' Docs ', thinking_enabled: 'off', thinking_display: 'Omitted', cwd: ' /home/dev/next ',
+  });
+  assert.equal(parsed.ok, true, parsed.error);
+  assert.deepEqual(parsed.args, {
+    relay: 'this', session: 'conv-a', model: 'claude-opus-5', effort: 'high', mode: 'plan',
+    auto_compact_window: 150000, title: 'Docs pass', group: 'Docs', thinking_enabled: false, thinking_display: 'omitted', cwd: '/home/dev/next',
+  });
+  assert.equal(REMOTE_RELAY_ERROR_CODES.permission, 'REMOTE_RELAY_PERMISSION');
+});
+
+test('update_session needs a session and at least one setting', () => {
+  const validate = (input) => validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', ...input });
+  assert.match(validate({ model: 'x' }).error, /needs session/);
+  const none = validate({ session: 'conv-a' });
+  assert.equal(none.ok, false);
+  assert.match(none.error, /needs at least one setting to change: model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd/);
+  // Empty values are no settings.
+  assert.equal(validate({ session: 'conv-a', model: '', title: '  ', effort: null, thinking_display: '' }).ok, false);
+});
+
+test('update_session: group takes an id or name, and "none" or null take the session out', () => {
+  const validate = (group) => validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', group });
+  assert.equal(validate('grp_abc').args.group, 'grp_abc');
+  assert.equal(validate('New batch').args.group, 'New batch');
+  assert.equal(validate(null).args.group, null);
+  assert.equal(validate('None').args.group, null);
+  assert.equal(validate('g'.repeat(500)).args.group.length, 200);
+  assert.match(validate({ id: 'grp_1' }).error, /group must be text/);
+  // An empty group names nothing.
+  assert.equal(validate('').ok, false);
+  assert.equal(REMOTE_RELAY_NO_GROUP, 'none');
+});
+
+test('update_session: auto_compact_window, thinking and mode are checked for their shape', () => {
+  const validate = (extra) => validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', ...extra });
+  assert.equal(validate({ auto_compact_window: 0 }).args.auto_compact_window, 'auto');
+  assert.equal(validate({ auto_compact_window: 'AUTO' }).args.auto_compact_window, 'auto');
+  assert.equal(validate({ auto_compact_window: 123456.7 }).args.auto_compact_window, 123456);
+  assert.match(validate({ auto_compact_window: -5 }).error, /auto_compact_window must be a number of tokens/);
+  assert.match(validate({ auto_compact_window: 'lots' }).error, /auto_compact_window/);
+  assert.match(validate({ auto_compact_window: true }).error, /auto_compact_window/);
+  // false is no 0: refused, never taken for the model default.
+  const off = validate({ auto_compact_window: false, model: 'x' });
+  assert.equal(off.ok, false);
+  assert.match(off.error, /auto_compact_window must be a number of tokens/);
+  // The schema promises 0 for the default, not "auto" (a strict schema takes an integer only).
+  assert.doesNotMatch(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.auto_compact_window.description, /"auto"/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.auto_compact_window.description, /or 0 for the model default/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.description, /out of its group \("none"\)/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.description, /A group the owner made is never removed this way/);
+  assert.equal(validate({ thinking_enabled: false }).args.thinking_enabled, false);
+  assert.equal(validate({ thinking_enabled: 'true' }).args.thinking_enabled, true);
+  assert.match(validate({ thinking_enabled: 'maybe' }).error, /thinking_enabled must be true or false/);
+  assert.match(validate({ thinking_display: 'raw' }).error, /thinking_display must be one of: summarized, omitted/);
+  assert.match(validate({ mode: 'yolo' }).error, /mode must be one of/);
+  assert.match(validate({ effort: 'very high!' }).error, /effort must be a short word/);
+  assert.match(validate({ model: 42 }).error, /model must be text/);
+  assert.match(validate({ title: ['x'] }).error, /title must be text/);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.auto_compact_window.type, 'integer');
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.thinking_enabled.type, 'boolean');
+  assert.deepEqual(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.thinking_display.enum, ['summarized', 'omitted']);
+});
+
+test('update_session refuses an argument it does not take, the owner-only switch with a word on why', () => {
+  const refused = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', model: 'x', text: 'go' });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /^update_session does not take: text\. Its arguments: relay, session, model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd\. Nothing was changed\.$/);
+  const owner = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', may_create_sessions: true });
+  assert.equal(owner.ok, false);
+  assert.match(owner.error, /does not take: may_create_sessions\..*the owner's setting alone/);
+  assert.match(validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', mayCreateSessions: true }).error, /owner's setting alone/);
+});
+
+test('update_session is summarized with the settings it names, and the tool text explains it', () => {
+  assert.equal(
+    summarizeRemoteRelayCall({ action: 'update_session', relay: 'this', session: 'conv-abcdef123', model: 'x', group: null, thinking_enabled: false }),
+    'update_session → this session conv-abc: model, group, thinking_enabled',
+  );
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /update_session \{session, \.\.\.\} sets another session's model, effort, mode, auto_compact_window, title, group/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /A session this conversation started may be changed freely; any other \(the owner's, another agent's, the one that started you\) needs the owner's Allow once per conversation and relay; your own conversation never/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /A group the owner made is never removed that way \(it may stay empty\)/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /lasts until the next send that names another mode or comes from a caller in another mode/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /unless the owner allowed it for that session \(list_sessions and read_session show mayCreateSessions\)/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.description, /update_session: change another session's settings/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /thinking and cwd \(its CLI restarts there; not while it works\)/);
+  for (const key of ['model', 'mode', 'effort', 'title', 'group', 'cwd']) {
+    assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties[key].description, /update_session/, key);
+  }
+});
+
+test('formatSessionGroupList counts the groups a capped list leaves out', () => {
+  const groups = [{ id: 'grp_a', name: 'A' }, { id: 'grp_b', name: 'B' }];
+  assert.equal(formatSessionGroupList(groups, 20, 25), 'A (grp_a), B (grp_b) and 23 more');
+  assert.equal(formatSessionGroupList(groups, 1, 25), 'A (grp_a) and 24 more');
+  // A total below the list's own length changes nothing.
+  assert.equal(formatSessionGroupList(groups, 20, 1), 'A (grp_a), B (grp_b)');
+  assert.equal(formatSessionGroupList(groups), 'A (grp_a), B (grp_b)');
 });

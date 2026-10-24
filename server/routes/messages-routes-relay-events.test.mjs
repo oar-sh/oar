@@ -10,6 +10,7 @@ import { createMessageRepository } from '../repositories/message-repository.mjs'
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
+import { RELAY_SCHEDULE_MESSAGE_KIND } from '../../shared/relay-schedules.mjs';
 import { buildDequeuedRelayMessage } from './messages-routes.mjs';
 import { captureRoutes, invokeRoute, makeRouteDeps } from './messages-routes-test-harness.mjs';
 
@@ -43,6 +44,14 @@ test('an event row is delivered marked as one; a message of the user is not', ()
   db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('q-user', 'conv-fixture-watcher', 'user', 'x', ?)`).run(NOW);
   assert.equal(dequeue(stmts, 'q-event').messageKind, RELAY_EVENT_MESSAGE_KIND);
   assert.equal('messageKind' in dequeue(stmts, 'q-user'), false);
+});
+
+test('a scheduled prompt is delivered marked as the relay\'s, like an event; other kinds are not named', () => {
+  const { db, stmts } = setupDb();
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind) VALUES ('q-schedule', 'conv-fixture-watcher', 'user', 'x', ?, ?)`).run(NOW, RELAY_SCHEDULE_MESSAGE_KIND);
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind) VALUES ('q-limit', 'conv-fixture-watcher', 'user', 'x', ?, 'claude-usage-limit')`).run(NOW);
+  assert.equal(dequeue(stmts, 'q-schedule').messageKind, RELAY_SCHEDULE_MESSAGE_KIND);
+  assert.equal('messageKind' in dequeue(stmts, 'q-limit'), false);
 });
 
 test('the task routes feed the tracker by conversation, with how a task ended', async () => {

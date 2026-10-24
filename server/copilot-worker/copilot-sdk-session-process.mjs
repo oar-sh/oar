@@ -112,7 +112,7 @@ import { STEER_FOLDED_TEXT, STEER_STOPPED_TEXT, STEER_TURN_FAILED_TEXT } from '.
 import { buildSteerSettleFailure } from '../../shared/steer-settle-failure.mjs';
 import { shouldEmitStreamUpdate } from '../../shared/stream-emit-gating.mjs';
 import { withSteerNote } from '../../shared/steer-note.mjs';
-import { isRelayEventDelivery } from '../../shared/relay-events.mjs';
+import { isRelayAutomatedDelivery } from '../../shared/relay-events.mjs';
 import { isTransientRelayError } from '../../shared/worker-runtime/relay-errors.mjs';
 import {
   createTurnLiveness,
@@ -4456,7 +4456,7 @@ export function createCopilotSdkSessionRunner({
     // Not in a continuation: there the running work is the runtime's own
     // follow-up, not a request of the user's to keep going with.
     // Nor in an event message the relay wrote: the note speaks as the user.
-    const prompt = withRelayContext(context?.prefix, turn.kind === 'continuation' || isRelayEventDelivery(message) ? body : withSteerNote(body));
+    const prompt = withRelayContext(context?.prefix, turn.kind === 'continuation' || isRelayAutomatedDelivery(message) ? body : withSteerNote(body));
     // Re-checked AFTER the awaits and before anything is sent or registered.
     // Nothing has been sent yet, so handing the row back to the normal path is
     // free.

@@ -210,12 +210,47 @@ export function pageConversationRows(rows, groups = null, { limit = 40, beforeCo
  * `isOpen(groupId, group)` decides the fold; `matches(row)` keeps rows that
  * match a filter (a group shows when any row matches: its head as context
  * with the matching members, or whole when the head or its name matches).
+ *
+ * With `emptyGroups`, an owner's group an agent emptied (`keptEmptyAt`, no
+ * row here) shows too: a head item without members (`group.empty`), placed
+ * by the time it was emptied; under a filter only when its name matches.
  */
 export function arrangeConversationList(rows, groups = null, {
   isOpen = () => true,
   matches = null,
   groupNameMatches = null,
+  emptyGroups = false,
 } = {}) {
+  const items = arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches });
+  if (!emptyGroups || !groups) return items;
+  const present = new Set((Array.isArray(rows) ? rows : []).map(rowGroupId).filter(Boolean));
+  const entries = typeof groups.entries === 'function' && typeof groups.get === 'function' ? [...groups.entries()] : Object.entries(groups);
+  const kept = entries
+    .map(([id, info]) => ({ id: toText(id), info }))
+    .filter(({ id, info }) => id && toText(info?.keptEmptyAt) && !present.has(id))
+    .filter(({ info }) => !matches || (typeof groupNameMatches === 'function' && groupNameMatches(info, null)))
+    .map(({ id, info }) => ({
+      kind: 'head',
+      conversation: null,
+      group: { id, info, head: null, members: [], activityMs: parseConversationTimeMs(info.keptEmptyAt), open: false, contextOnly: false, empty: true },
+    }))
+    .sort((a, b) => (b.group.activityMs - a.group.activityMs) || b.group.id.localeCompare(a.group.id));
+  if (!kept.length) return items;
+  // Merged in by time, before the first row or group that is older.
+  const timeOf = (item) => (item.kind === 'head' ? item.group.activityMs : rowOwnTimeMs(item.conversation));
+  const out = [];
+  let next = 0;
+  for (const item of items) {
+    if (item.kind !== 'member') {
+      while (next < kept.length && kept[next].group.activityMs > timeOf(item)) out.push(kept[next++]);
+    }
+    out.push(item);
+  }
+  while (next < kept.length) out.push(kept[next++]);
+  return out;
+}
+
+function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches }) {
   const ordered = orderConversationRows(rows, groups);
   const activity = groupActivityTimes(ordered);
   const items = [];

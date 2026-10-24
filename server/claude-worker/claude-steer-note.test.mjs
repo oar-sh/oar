@@ -22,6 +22,7 @@ import {
 import { STEERED_MESSAGE_NOTE, withSteerNote } from '../../shared/steer-note.mjs';
 import { SLASH_COMMAND_GUARD } from '../../shared/slash-command-guard.mjs';
 import { RELAY_EVENT_LEAD, RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
+import { RELAY_SCHEDULE_MESSAGE_KIND, buildRelayScheduleMessageText } from '../../shared/relay-schedules.mjs';
 
 const textOf = (content) => (Array.isArray(content)
   ? content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
@@ -172,6 +173,38 @@ test('a relay event message steers in without the note, which would speak as the
   await waitFor(() => turn.pushed.length === 2, { label: 'the event was steered in' });
   assert.equal(textOf(turn.pushed[1]), eventText);
   assert.equal(textOf(turn.pushed[1]).includes(STEERED_MESSAGE_NOTE), false);
+
+  turn.emit(resultMessage('noted', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  turn.endInput();
+  await settled(runner);
+});
+
+test('a scheduled prompt reaching a busy session comes in as the next message without the note', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 10,
+    pendingDeliveredTimeoutMs: 60_000,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  turn.emit(assistantText('working on it'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'a turn is live' });
+
+  const scheduledText = buildRelayScheduleMessageText({ id: 'sch_fixture01', title: 'Sweep', text: 'Run the sweep.' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-schedule', text: scheduledText, messageKind: RELAY_SCHEDULE_MESSAGE_KIND } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'the scheduled prompt came in' });
+  // As it is: its own first line says it is the relay's, nothing speaks as the user before it.
+  assert.equal(textOf(turn.pushed[1]), scheduledText);
+  assert.equal(textOf(turn.pushed[1]).includes(STEERED_MESSAGE_NOTE), false);
+  assert.match(textOf(turn.pushed[1]), /^\[relay schedule sch_fixture01 "Sweep" · automated message from OAR/);
 
   turn.emit(resultMessage('noted', 'native-1'));
   assert.equal(await first, true);

@@ -11,7 +11,7 @@ import { createMemoryPreviewStore } from './preview-store.mjs';
 // with them, as with a delete from the UI. A conversation it archives or keeps
 // keeps its previews.
 
-function setup() {
+function setup({ gone = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const insert = db.prepare(`
@@ -50,6 +50,7 @@ function setup() {
     collectOrphanedUploadsFromConversation: () => [],
     deleteOrphanedUploads: () => {},
     closeConversationPreviews: (id) => registry.closeForConversation(id),
+    ...(gone ? { onConversationGone: (id, options) => gone.push([id, options]) } : {}),
   });
   const live = () => Object.entries(tokens).filter(([, token]) => registry.resolve(token)).map(([id]) => id).sort();
   const stored = () => store.list().map((row) => row.conversationId || 'none').sort();
@@ -97,4 +98,22 @@ test('a failing preview hook does not fail the rebuild', () => {
     console.warn = warn;
   }
   assert.ok(warnings.some((line) => /purged conversation failed: registry gone/.test(line)));
+});
+
+test('the conversations a rebuild archives or removes are passed on (their relay schedules end)', () => {
+  const reconciled = [];
+  setup({ gone: reconciled }).service.rebuildCache({ mode: 'reconcile' });
+  assert.deepEqual(reconciled, [['conv-busy', { deleted: false }], ['conv-legacy', { deleted: true }]]);
+  const wiped = [];
+  setup({ gone: wiped }).service.rebuildCache({ mode: 'full' });
+  assert.deepEqual(wiped.map(([id, options]) => [id, options.deleted]).sort(), [['conv-bound', true], ['conv-busy', true], ['conv-legacy', true]]);
+  // A hook that throws does not fail the rebuild.
+  const fx = setup({ gone: { push() { throw new Error('hook failed'); } } });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    assert.doesNotThrow(() => fx.service.rebuildCache({ mode: 'reconcile' }));
+  } finally {
+    console.warn = warn;
+  }
 });

@@ -34,8 +34,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // banner module) took it to 513. 520 until 2026-10-20; the take-over of the
 // database earlier autostart launchers used and the install-time copy of the
 // one inside the package (three modules) took it to 522. The two developer
-// READMEs left the package for GitHub on 2026-10-21: 519.
-const MAX_ENTRIES = 530;
+// READMEs left the package for GitHub on 2026-10-21: 519. 530 until
+// 2026-10-23; questions that don't block and the Inbox (migration 0023, the
+// ask service, its link and routes, the shared module, the Inbox view and
+// its page module) took it to 535.
+const MAX_ENTRIES = 540;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and

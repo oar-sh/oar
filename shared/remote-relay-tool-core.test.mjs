@@ -335,3 +335,39 @@ test('activity summaries come from the contract and tolerate string arguments', 
   assert.equal(remoteRelayActivitySummary({}), '');
   assert.equal(remoteRelayActivitySummary('not json'), '');
 });
+
+test('executeRemoteRelayTool adds the validator\'s ignored list to the relay\'s answer', async () => {
+  const stub = recordingApi({ ok: true, summary: 'stop', ignored: ['zeta'] });
+  const result = await executeRemoteRelayTool(
+    { action: 'stop', relay: 'linux-test', session: 's-1', text: 'why', if_busy: 'fail', model: null },
+    { api: stub.api, conversationId: 'conv-1' },
+  );
+  // Only the arguments the action takes reach the relay.
+  assert.deepEqual(stub.calls[0].body.args, { relay: 'linux-test', session: 's-1' });
+  assert.deepEqual(result.ignored, ['if_busy', 'text', 'zeta']);
+  assert.equal(result.ok, true);
+
+  // A refusal from the relay names them too.
+  const refusing = {
+    api: async () => { throw httpError(403, { ok: false, code: contract.REMOTE_RELAY_ERROR_CODES.locked, error: 'locked' }); },
+  };
+  const refused = await executeRemoteRelayTool({ action: 'read_session', relay: 'r', session: 's', title: 'x' }, { api: refusing.api, conversationId: 'c' });
+  assert.equal(refused.code, contract.REMOTE_RELAY_ERROR_CODES.locked);
+  assert.deepEqual(refused.ignored, ['title']);
+
+  // Nothing ignored: the answer is the relay's, untouched.
+  const plain = recordingApi({ ok: true, summary: 'stop' });
+  assert.deepEqual(await executeRemoteRelayTool({ action: 'stop', relay: 'r', session: 's' }, { api: plain.api, conversationId: 'c' }), { ok: true, summary: 'stop' });
+});
+
+test('executeRemoteRelayTool refuses create_session with an unknown argument without calling the relay', async () => {
+  const stub = recordingApi({ ok: true });
+  const result = await executeRemoteRelayTool(
+    { action: 'create_session', relay: 'this', text: 'go', group_id: 'grp_1' },
+    { api: stub.api, conversationId: 'conv-1' },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, contract.REMOTE_RELAY_ERROR_CODES.invalidInput);
+  assert.match(result.error, /create_session does not take: group_id/);
+  assert.equal(stub.calls.length, 0);
+});

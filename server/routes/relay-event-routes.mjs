@@ -92,7 +92,8 @@ export function registerRelayEventRoutes(app, deps) {
   // POST /api/relay-events/remote/subscribe — a paired relay's agent
   // subscribes: `{ watcher: { conversationId, title }, subscriber: { name },
   // scope, sessions, events, once, match, stalled_minutes, heartbeat_minutes,
-  // dry_run }`. A dry run checks everything and stores nothing.
+  // exclude, dry_run }`. A dry run checks everything and stores nothing.
+  // Digest and quiet hours are the watching relay's: never sent here.
   app.post('/api/relay-events/remote/subscribe', auth, (req, res) => {
     const subscriber = admitPairedRelay(req, res);
     if (!subscriber) return;
@@ -111,6 +112,7 @@ export function registerRelayEventRoutes(app, deps) {
         match: typeof body.match === 'string' ? body.match : '',
         stalledMinutes: body.stalled_minutes ?? null,
         heartbeatMinutes: body.heartbeat_minutes ?? null,
+        exclude: Array.isArray(body.exclude) ? body.exclude.map((id) => String(id ?? '')) : null,
         dryRun: body.dry_run === true,
       });
       res.json({ ok: true, ...(body.dry_run === true ? { dryRun: true } : {}), subscription });

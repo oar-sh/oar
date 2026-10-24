@@ -41,7 +41,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.15 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.16 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -54,7 +54,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.15'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.16'` before the command.
 
 ## npm
 

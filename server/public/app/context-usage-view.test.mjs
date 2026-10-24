@@ -7,6 +7,7 @@ import {
   formatCompactionWindowHeadline,
   renderAutoCompactControlHtml,
   renderAutoCompactNotesHtml,
+  renderAgentSessionsControlHtml,
   renderThinkingControlHtml,
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
@@ -351,4 +352,12 @@ test('thinking enabled key mapping round-trips, and anything but off is on', () 
 test('a session started on Auto reports a stored window as waiting for the next message', () => {
   const notes = autoCompactWindowNotes({ storedWindow: 100000, activeWindow: null, deferred: 'next-message' });
   assert.equal(notes.pending, AUTO_COMPACT_NOTE_TEXT.nextMessage);
+});
+
+test('the owner\'s "may start sessions" switch: checked as stored, bound to its conversation, escaped', () => {
+  const off = renderAgentSessionsControlHtml({ conversationId: 'conv-1' });
+  assert.match(off, /id="ctx-may-create-sessions" data-conversation-id="conv-1">/);
+  assert.match(off, /Agents in this conversation may start sessions \(even though an agent started it\)/);
+  assert.match(renderAgentSessionsControlHtml({ conversationId: 'conv-1', mayCreateSessions: true }), /data-conversation-id="conv-1" checked>/);
+  assert.doesNotMatch(renderAgentSessionsControlHtml({ conversationId: '"><b>', mayCreateSessions: true }), /"><b>/);
 });

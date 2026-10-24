@@ -202,6 +202,39 @@ test('jitter stays inside ±1h of the 12h interval', () => {
   }
 });
 
+/**
+ * The fetch the real-server test uses: node:http with an agent of its own,
+ * which never goes through a proxy. The global fetch follows the
+ * environment's proxy settings (NODE_USE_ENV_PROXY, HTTP_PROXY), and a proxy
+ * may drop the ETag or hold the connection open.
+ */
+function directFetch(url, { headers = {}, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const agent = new http.Agent({ keepAlive: false });
+    const request = http.request(url, { method: 'GET', headers, agent, ...(signal ? { signal } : {}) }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        agent.destroy();
+        const text = Buffer.concat(chunks).toString('utf8');
+        const status = Number(response.statusCode) || 0;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          headers: { get: (name) => response.headers[String(name).toLowerCase()] ?? null },
+          json: async () => JSON.parse(text),
+        });
+      });
+      response.on('error', reject);
+    });
+    request.on('error', (error) => {
+      agent.destroy();
+      reject(error);
+    });
+    request.end();
+  });
+}
+
 test('the etag flow works against a real HTTP server', async () => {
   const body = JSON.stringify({
     schemaVersion: 1,
@@ -223,7 +256,7 @@ test('the etag flow works against a real HTTP server', async () => {
   const url = `http://127.0.0.1:${server.address().port}/latest.json`;
   try {
     const store = settingsStore();
-    const service = createService(store, { manifestUrl: url, fetchImpl: globalThis.fetch });
+    const service = createService(store, { manifestUrl: url, fetchImpl: directFetch });
     const first = await service.checkNow();
     const second = await service.checkNow();
     assert.equal(first.available, true);

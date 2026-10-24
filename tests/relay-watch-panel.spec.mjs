@@ -115,7 +115,8 @@ test.describe.serial("the watching list opens unclipped", () => {
 
   async function checkPanel(page, viewport) {
     const chip = await openWatcher(page, viewport);
-    const panel = page.locator(".relay-watch-panel");
+    // The schedules list shares the popover's class: the watching list by its id.
+    const panel = page.locator("#relay-watch-panel");
 
     await chip.click();
     await expect(chip).toHaveAttribute("aria-expanded", "true");

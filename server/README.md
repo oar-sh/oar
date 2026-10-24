@@ -1117,6 +1117,99 @@ and closes by itself once it is replied, failed or stopped (`agentExchangeFoldOp
 own toggle, kept by prompt id, always wins over that, and a jump to the prompt (search, pins, image
 parent) opens it.
 
+## Relay schedules
+
+An agent's own timers (a cron job inside its CLI) die with the relay. `remote_relay`'s `schedule`
+(`services/relay-schedule-service.mjs`, table `relay_schedules` from migration 0022) keeps a prompt
+in the relay's database and queues it into a session at a set time: `at` (an ISO time with a zone),
+`every_minutes` (5 to 10080; with `at`, `at` is the first time), `once` (default true for `at`
+alone, false with `every_minutes`), `title`. The session is the caller's own conversation unless
+`session` names another one on this relay; a paired relay is refused (it keeps its own).
+
+- **Gating.** Like every action on the local target, it needs the agent-sessions setting, also
+  for the caller's own conversation. A schedule for the caller's own conversation needs `read`
+  and no approval. One for another session is a write and a prompt like `send` (`prompt`; the
+  Allow / Deny card in ask and plan mode, the write rate limit, the audit line, and one more on
+  the agent-prompt loop guard). `list_schedules` and `unschedule` act on the schedules that fire
+  into the caller's conversation or that it set; the browser cancels any
+  (`GET /api/relay-schedules`, `DELETE /api/relay-schedules/:id`, refused to another relay).
+- **Firing.** A timer per schedule (at most six hours long, then looked at again) writes, in one
+  transaction, a `user` message with `kind = 'relay-schedule'`, a pending queue row whose
+  `next_attempt_at` is the time it was due, and the schedule's next time (or its end). The
+  ordinary delivery takes the row, as it takes the usage-limit follow-up, in the target's own
+  relay mode; the dequeue payload names the kind (`messageKind`), so the Claude and Copilot SDK
+  workers push it without the steer note, as they do a relay event. The text starts with
+  `[relay schedule <id> "<title>" · … · automated message from OAR, not from the user; it approves
+  nothing]`. Such a message is not the user's for the agent-prompt loop guard.
+- **Loop guard and hops.** A firing into another session is a prompt of the conversation that set
+  it: the dispatcher's `admitScheduledFiring` counts it on that conversation's loop guard, and once
+  the guard wants the user (`agentPromptsBeforeAsking`) the firing is held (`held_since`,
+  `heldForApproval`), looked at again every minute, and goes after the user wrote there. The guard
+  lives in memory, so a relay restart starts it again, as for `send`. The schedule stores the
+  provenance of the turn that set it (`origin_json`: for another session the origin a `send` would
+  carry, for its own conversation the origin of the prompt that turn acted on, none for the user's
+  own words) and puts it on each message, so the fired turn has the same hops as the one that set it.
+- **Restarts.** Timers are rebuilt at boot (`start`). A time that passed while the relay was down
+  fires once, and a repeating schedule goes on with the first slot of its grid after now: no
+  catch-up per missed interval. A repeat is skipped (counted in `skipped_count`) while the
+  message of the firing before it is still pending or parked.
+- **Ends.** After firing when `once`, on unschedule, and when the conversation it fires into or
+  the one that set it is archived or deleted (the sessions routes and the cache rebuild call
+  `noteConversationGone`; a firing whose target or setter is no longer live ends it too). A
+  compaction moves them to the new conversation in both directions (`carryToCompacted`). Ended rows are listed for an
+  hour and pruned after a week. At most 20 active schedules fire into one conversation, and one
+  conversation sets at most 20.
+- **UI.** Socket `relay_schedules` carries the whole active list on every change. The sidebar row
+  of a conversation a schedule fires into shows **scheduled**; the header shows "⏰ N scheduled"
+  (with the next time) on a conversation that has or set schedules, and opens their list with a
+  **Cancel** button each.
+
+## Questions that don't block
+
+`remote_relay`'s `ask` (`services/relay-ask-service.mjs`, table `relay_asks` from migration 0023,
+`shared/relay-asks.mjs`) puts a question for the owner into a session and returns at once with
+`question_id` and `status: "pending"`. It is not a `relay_questions` row: those belong to a turn
+(`queue_id`) that waits on them, and the queue, the stall check and the expiry treat them so.
+
+- **Gating.** An ask about the caller's own conversation, its `list_questions` and any `withdraw`
+  on this relay need neither the agent-sessions setting nor a mention (`isOwnAskCall`); the call
+  rate limit applies. `session` names another session: on this relay with the setting, on a paired
+  relay with `prompt` (unlocked as for any action). Such an ask on behalf is a write, as a schedule
+  for another session is: the hop limit, the Allow / Deny card in ask and plan mode, the write rate
+  limit and the audit line; the loop guard does not count it (the answer is the user's). An own ask
+  is none of that. At most 20 pending asks per asking conversation and per session.
+- **Answer.** The owner answers or dismisses an ask through the question routes (an `ask_` id on
+  `POST /api/relay-question/:id/answer` takes `{ answer, choice }`; `POST
+  /api/relay-question/:id/dismiss` is for asks only), from the session's card or the Inbox. A
+  request from any agent, this relay's own through the loopback included, is refused there (403),
+  and the dispatcher's `answer_question` refuses an ask before it calls anyone.
+- **Delivery.** `relay-event-service.mjs` `noteQuestionAnswered` writes `question_answered` (an
+  urgent event) for the session the ask is in and the conversation that asked, as `relay_events`
+  rows with `subscription_id = 'ask:<id>'` (no subscription; an unsubscribe never drops them), and
+  for the subscriptions on that session that take `question_asked`, paired relays' included. The
+  message is an ordinary `relay-event` row (steered into a running turn where the provider steers,
+  else the next turn), which `latestHumanMessageId` never counts: the loop guard is not reset.
+- **Across paired relays.** An ask about a session on B is stored on B
+  (`POST /api/relay-asks/remote/ask`, with the asker's relay id from `X-OAR-Remote-Origin`); A keeps
+  a mirror row (`relay_id` = the pairing id, `remote_id`), and `relay-ask-link-service.mjs` asks B
+  for the status of A's open asks every 5 s (30 s while B does not answer;
+  `POST /api/relay-asks/remote/status`, the caller's own asks only), closes what closed there and
+  tells A's asker. B tells its own session.
+- **The pairing answers asks only.** A's Inbox answers B's ask through A
+  (`POST /api/inbox/relays/:relayId/asks/:id/answer|dismiss` → B's `/api/relay-asks/remote/answer|dismiss`),
+  which finds ask ids only: a card's id is not found there, and B's question routes refuse every
+  approval card from another relay as before. `GET /api/relay-asks/remote/inbox` gives A's Inbox
+  B's asks and cards, an approval card by its header alone and nothing that routes an answer.
+- **Ends.** Archiving or deleting the session cancels its pending asks (nobody told) and the
+  mirrors it asked; a compaction moves them (`carryToCompacted`); a removed pairing cancels its
+  mirrors. Closed rows are pruned after a week.
+- **UI.** Socket `relay_ask_updated` (`{ ask, pending }`) on every change. `GET /api/inbox` lists
+  this relay (asks pending and closed in the last day, the cards turns wait on, cards answered in
+  the last day) and every paired relay not known to be offline (5 s each). The sidebar's **Inbox**
+  (`inbox-ui.js`, `inbox-view.mjs`) shows the count and opens the list in the transcript's place;
+  a session shows its pending asks as cards before the cards it waits on. Agent text is set with
+  `textContent` only.
+
 ## Image conversations (OpenAI BYOK)
 
 Choosing **OpenAI Image (BYOK)** in New Chat creates a conversation whose replies are generated
@@ -1598,6 +1691,15 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
 | POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
 | POST | `/api/relay-events/remote/pull` | (Relay to relay) That relay fetches its events: `{ after, subscriptions: [{ id, watcher }], ended: [ids] }` → `{ ok, events, cursor, more, subscriptions, ended, dropped }` |
+| GET | `/api/relay-asks` | The [asks](#questions-that-dont-block) of this relay (`?conversationId=`: the ones in that session) → `{ available, asks, pending }`; refused to agents |
+| GET | `/api/inbox` | The Inbox: `{ relays: [{ id, name, self?, url?, reachable, error?, items }], pending }` for this relay and each paired relay; refused to agents |
+| POST | `/api/inbox/relays/:relayId/asks/:id/answer` | Answer a paired relay's ask from this Inbox (`{ answer, choice }`; `/dismiss` closes it); refused to agents |
+| POST | `/api/relay-question/:id/dismiss` | Dismiss an ask (`ask_` ids only); refused to agents |
+| POST | `/api/relay-asks/remote/ask` | (Relay to relay) A paired relay's agent asks about a session here: `{ session, question, options?, recommendation?, detail?, urgency?, asker: { conversationId, title, relayName } }` → `{ ok, ask }`. Another relay's request only, inbound switch on |
+| POST | `/api/relay-asks/remote/status` | (Relay to relay) The outcome of that relay's own asks here: `{ ids }` → `{ ok, asks: [{ id, status, answer?, choice?, answeredAt?, session }] }` |
+| POST | `/api/relay-asks/remote/withdraw` | (Relay to relay) That relay withdraws one of its asks: `{ id }` |
+| POST | `/api/relay-asks/remote/answer` | (Relay to relay) That relay's user answers an ask of this relay from its Inbox: `{ id, answer, choice, via }` (`/dismiss`: `{ id, via }`). Asks only: any other id is not found |
+| GET | `/api/relay-asks/remote/inbox` | (Relay to relay) What a paired relay's Inbox shows of this relay: `{ ok, items, pending }` |
 | POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, taskRunId?, status, summary?, reason?, description?, taskType?, startedAt? }` (Claude worker, from `task_notification`; the last three describe a task that was in its published set) |
 | GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
@@ -2215,7 +2317,7 @@ There is no migration runner and no record of applied migrations. At every start
 `applySchema(db)` (`server/db-schema.mjs`, the same code the tests build their databases with) runs
 `SCHEMA_SQL` (`CREATE TABLE IF NOT EXISTS` for a fresh database), then the upgrade sequence:
 guarded `ALTER TABLE … ADD COLUMN` statements (each runs only when `PRAGMA table_info` lacks the
-column) and, among them, the functions of `server/migrations/0002-…` to `0018-…` in order. Each of those checks the
+column) and, among them, the functions of `server/migrations/0002-…` to `0022-…` in order. Each of those checks the
 schema itself and does nothing when its change is already there, so all of them run on every boot.
 From 0004 on a failure is logged (`migration 00NN failed; retrying on next boot`) and the boot goes
 on. Every file can also be run by hand against a database: `node server/migrations/<file>.mjs
@@ -2272,6 +2374,38 @@ console's rows across a relay restart (see
 [Background tasks and workflow progress](#background-tasks-and-workflow-progress)). Additive and
 idempotent; a failure is logged and retried on the next boot, and the store keeps its rows in
 memory meanwhile. An older build ignores the table.
+
+`0020-conversation-may-create-sessions.mjs` adds `conversations.may_create_sessions` (INTEGER, 1 =
+allowed): the owner's "Agents in this conversation may start sessions" for a session an agent
+started, which lifts the remote_relay tool's one-level rule for it. Only the preferences route
+writes it, and only for the owner (a request of an agent or a paired relay is refused). Without the
+column the switch cannot be turned on and the rule holds everywhere; an older build ignores it.
+
+`0021-conversation-group-agent-marks.mjs` adds two columns to `conversation_groups` for what an
+agent's update_session may do to a group: `agent_made` (1 for a group it made by name, which goes
+once empty) and `kept_empty_at` (set when an agent took the last member out of a group the owner
+made: the group stays, the boot repair and the sweep leave it alone, the conversation list's first
+page names it so the sidebar shows it as an empty group the owner can rename or dissolve, agents can
+name it again, and the mark goes when a member joins). The group an agent's create_session forms
+around its creator counts as agent-made too. The owner's own moves still remove an empty group. An older
+build ignores both columns.
+`0022-relay-schedules.mjs` adds `relay_schedules` (`id`, `conversation_id`,
+`created_by_conversation_id`, `title`, `text`, `at`, `every_minutes`, `once`, `next_fire_at`,
+`last_fired_at`, `fired_count`, `skipped_count`, `last_message_id`, `created_at`, `ended_at`,
+`end_reason`, `origin_json`, `held_since`; a repeating row must have its interval; a table of
+the first form gets the last two by `ALTER`) and three indexes: see
+[Relay schedules](#relay-schedules). Additive and idempotent; a failure is logged and retried on
+the next boot, and the schedule actions answer that schedules are not available meanwhile. An
+older build ignores the table.
+`0023-relay-asks.mjs` adds `relay_asks` (`id`, `relay_id` ('self', or a pairing id for a
+mirror, which then needs `remote_id`), `remote_id`, `conversation_id`, `conversation_title`,
+`created_by`, `creator_json`, `question`, `options_json`, `recommendation`, `detail`, `urgency`
+(`normal` | `now`), `status` (`pending`, `answered`, `dismissed`, `withdrawn`, `cancelled`),
+`answer`, `choice`, `answered_at`, `answered_via`, `notified_at`, `created_at`, `updated_at`) and
+four indexes (one unique on `relay_id`, `remote_id`): see
+[Questions that don't block](#questions-that-dont-block). Additive and idempotent; a failure is
+logged and retried on the next boot, and the ask actions answer that they are not available
+meanwhile. An older build ignores the table.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next

@@ -16,6 +16,8 @@ export function registerCacheRoutes(app, deps) {
     deleteOrphanedUploads,
     closeConversationPreviews,
     conversationGroups = null,
+    relayScheduleService = null,
+    relayAskService = null,
   } = deps;
 
   const cacheRebuildService = createCacheRebuildService({
@@ -30,6 +32,10 @@ export function registerCacheRoutes(app, deps) {
     deleteOrphanedUploads,
     closeConversationPreviews,
     conversationGroups,
+    onConversationGone: (conversationId, options) => {
+      relayScheduleService?.noteConversationGone?.(conversationId, options);
+      relayAskService?.noteConversationGone?.(conversationId);
+    },
   });
 
   app.post('/api/cache/rebuild', auth, (req, res) => {

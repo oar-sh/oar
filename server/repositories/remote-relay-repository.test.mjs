@@ -25,6 +25,18 @@ test('an unlock is recorded once and listed', () => {
   assert.equal(repo.recordUnlock('', 'r-1'), false);
 });
 
+test('"may start sessions" reads the owner\'s switch; without it (or the column) nobody has it', () => {
+  const { db, repo } = setup();
+  assert.equal(repo.mayCreateSessions('c-1'), false);
+  db.prepare(`UPDATE conversations SET may_create_sessions = 1 WHERE id = 'c-1'`).run();
+  assert.equal(repo.mayCreateSessions('c-1'), true);
+  assert.equal(repo.mayCreateSessions('c-missing'), false);
+  const old = new Database(':memory:');
+  applySchema(old);
+  old.exec(`ALTER TABLE conversations DROP COLUMN may_create_sessions`);
+  assert.equal(createRemoteRelayRepository(old).mayCreateSessions('c-1'), false);
+});
+
 test('unlocks recorded in the same millisecond list in the order they were recorded', () => {
   // Windows' clock often gives two sends in a row the same timestamp; the
   // later relay must not move ahead because its id sorts first.
@@ -90,7 +102,34 @@ test('the latest message of the user is one no agent sent', () => {
     .run('2026-09-20T10:06:00.000Z');
   assert.equal(repo.latestHumanMessageId('c-1'), 'm-3');
   assert.equal(repo.latestHumanMessageId('c-9'), null);
+  // A message a schedule queued is the relay's.
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind) VALUES ('m-4', 'c-1', 'user', '[relay schedule sch_a] sweep', ?, 'relay-schedule')`)
+    .run('2026-09-20T10:07:00.000Z');
+  assert.equal(repo.latestHumanMessageId('c-1'), 'm-3', 'a scheduled prompt is not the user\'s');
 });
+
+// Every message the relay writes into a conversation itself carries a kind;
+// none of them is the user's, so none resets the agents' loop guard. Each
+// kind as its service writes it (the worker-launch notes as the assistant's).
+for (const [kind, role, label] of [
+  ['relay-event', 'user', 'a relay event'],
+  ['claude-usage-limit', 'user', 'the usage-limit follow-up'],
+  ['relay-restart-resume', 'user', 'the note after a restart'],
+  ['worker-launch-stopped', 'assistant', 'a worker-launch note'],
+  ['relay-schedule', 'user', 'a scheduled prompt'],
+]) {
+  test(`${label} (${kind}) is not the user's latest message`, () => {
+    const { db, repo } = setup();
+    assert.equal(repo.latestHumanMessageId('c-1'), 'm-1');
+    db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, kind) VALUES ('m-relay', 'c-1', ?, 'written by the relay', ?, ?)`)
+      .run(role, '2026-09-20T10:09:00.000Z', kind);
+    assert.equal(repo.latestHumanMessageId('c-1'), 'm-1');
+    // The user writing again moves it on.
+    db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('m-own', 'c-1', 'user', 'carry on', ?)`)
+      .run('2026-09-20T10:10:00.000Z');
+    assert.equal(repo.latestHumanMessageId('c-1'), 'm-own');
+  });
+}
 
 test('a damaged origin column reads as no origin', () => {
   assert.equal(parseRemoteRelayOriginJson('{not json'), null);

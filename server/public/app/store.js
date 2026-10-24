@@ -222,6 +222,16 @@ export function setCurrentConv(id) {
   updateCompactButton();
 }
 
+/**
+ * Forgets the kept empty groups before the list's first page names the ones
+ * still kept (one the owner dissolved meanwhile is not named again).
+ */
+export function forgetKeptEmptyConversationGroups() {
+  for (const [id, group] of Object.entries(conversationGroups)) {
+    if (group?.keptEmptyAt) delete conversationGroups[id];
+  }
+}
+
 /** Merges a list payload's `groups` (by id) into the known session groups. */
 export function mergeConversationGroups(groups) {
   if (!groups || typeof groups !== 'object') return;
@@ -240,13 +250,15 @@ export function forgetConversationGroup(groupId) {
 /**
  * Keeps only the groups that a loaded row still belongs to: after a list
  * refresh a dissolved group has no row left, and the picker must not offer
- * it. Returns the ids dropped.
+ * it. An owner's group an agent emptied (`keptEmptyAt`) has no row and
+ * stays: the list's first page names it while it is kept. Returns the ids
+ * dropped.
  */
 export function pruneConversationGroups(keepGroupIds) {
   const keep = new Set((Array.isArray(keepGroupIds) ? keepGroupIds : []).map((id) => String(id || '').trim()).filter(Boolean));
   const dropped = [];
   for (const id of Object.keys(conversationGroups)) {
-    if (keep.has(id)) continue;
+    if (keep.has(id) || conversationGroups[id]?.keptEmptyAt) continue;
     delete conversationGroups[id];
     dropped.push(id);
   }
@@ -1126,9 +1138,10 @@ function measureSidebarHeaderMinWidthPx() {
     sectionCount += 1;
   }
 
-  const statusButton = document.getElementById('status-btn');
-  if (isVisibleElement(statusButton)) {
-    const buttonStyle = window.getComputedStyle(statusButton);
+  for (const id of ['status-btn', 'inbox-btn']) {
+    const headerButton = document.getElementById(id);
+    if (!isVisibleElement(headerButton)) continue;
+    const buttonStyle = window.getComputedStyle(headerButton);
     neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
     sectionCount += 1;
   }

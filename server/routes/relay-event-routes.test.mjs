@@ -113,6 +113,23 @@ test('only another relay\'s request is taken, and only while the inbound switch 
   assert.equal(service.listActive().length, 0);
 });
 
+test('a paired relay\'s "all" subscription takes exclude; digest and quiet hours are not this relay\'s', async () => {
+  const { service, route, fromRelay } = setup();
+  const body = { watcher: { conversationId: LOCAL_WATCHER }, scope: 'all', exclude: [LOCAL_WATCHER], digest_minutes: 10, quiet_hours: { from: '22:00', to: '06:00', tz: 'UTC' } };
+  const made = await callRoute(route('POST /api/relay-events/remote/subscribe'), fromRelay(body));
+  assert.equal(made.statusCode, 200, JSON.stringify(made.body));
+  assert.deepEqual(made.body.subscription.exclude, [LOCAL_WATCHER]);
+  assert.equal(made.body.subscription.digestMinutes, undefined);
+  assert.equal(made.body.subscription.quietHours, undefined);
+  service.noteTurnEnd({ conversationId: LOCAL_WATCHER, replyText: 'left out' });
+  service.noteTurnEnd({ conversationId: BUILDER, replyText: 'watched' });
+  const pulled = await callRoute(route('POST /api/relay-events/remote/pull'), fromRelay({ after: 0, subscriptions: [{ id: made.body.subscription.id }] }));
+  assert.deepEqual(pulled.body.events.map((event) => event.payload.session.id), [BUILDER]);
+  const listed = await callRoute(route('POST /api/relay-events/remote/subscribe'), fromRelay({ sessions: [BUILDER], exclude: [LOCAL_WATCHER] }));
+  assert.equal(listed.statusCode, 400);
+  assert.match(listed.body.error, /exclude goes with sessions \["all"\] only/);
+});
+
 test('refusals carry a code: an unknown session is not a missing route', async () => {
   const { route, fromRelay } = setup();
   const missing = await callRoute(route('POST /api/relay-events/remote/subscribe'), fromRelay({ sessions: ['conv-fixture-missing'] }));

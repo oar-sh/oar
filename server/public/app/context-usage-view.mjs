@@ -350,6 +350,23 @@ ${renderThinkingButtons('display', THINKING_DISPLAY_CHOICES, displayKey)}
   `;
 }
 
+/**
+ * The owner's switch for a session an agent started: may its agents start
+ * sessions themselves (the remote_relay tool's one-level rule lifted for it)?
+ * Only the owner sets it; no agent can.
+ */
+export function renderAgentSessionsControlHtml({ conversationId = '', mayCreateSessions = false } = {}) {
+  return `
+    <div class="ctx-agent-sessions">
+      <label class="ctx-agent-sessions-row">
+        <input type="checkbox" id="ctx-may-create-sessions" data-conversation-id="${escapeHtml(conversationId)}"${mayCreateSessions === true ? ' checked' : ''}>
+        <span>Agents in this conversation may start sessions (even though an agent started it)</span>
+      </label>
+      <div class="ctx-thinking-note">An agent started this session, so its agents cannot start sessions of their own unless you allow it here. The limit of sessions at work, your Allow for the first one and the relay's "Agents may start and use sessions" setting still apply.</div>
+    </div>
+  `;
+}
+
 // A model limit is a round figure: 1M rather than 1.0M.
 function formatModelLimit(value) {
   const n = toNullableNumber(value);

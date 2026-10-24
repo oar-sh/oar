@@ -38,6 +38,9 @@ import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
 import { clearOpenConversation, renderConvList, refreshConversations, scheduleLoadedConversationsRefresh, applyConversationGroupEvent, openConversation } from './journal-view.js';
 import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
 import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
+import { applyRelaySchedules, loadRelaySchedules } from './relay-schedules-ui.js';
+import { noteInboxQuestionsChanged, noteRelayAskUpdated, refreshInbox } from './inbox-ui.js';
+import { RELAY_ASK_SOCKET_EVENT } from './inbox-view.mjs';
 import {
   upsertRelayQuestion,
   loadRelayQuestions,
@@ -368,6 +371,10 @@ export async function connectSocket(overrideDeps) {
     void handleTaskConsoleReconnect();
     // Subscriptions that changed while away.
     void loadRelayEventSubscriptions();
+    // Schedules that changed or fired while away.
+    void loadRelaySchedules();
+    // Questions asked or answered while away.
+    void refreshInbox();
     // Shares made or stopped while away.
     void refreshShares().catch(() => {});
   });
@@ -618,11 +625,20 @@ export async function connectSocket(overrideDeps) {
     noteTranscriptLiveRow();
     keepLiveRow(conversationId, message, messageId);
   });
-  socket.on('relay_question', ({ question }) => upsertRelayQuestion(question));
-  socket.on('relay_question_updated', ({ question }) => upsertRelayQuestion(question));
+  socket.on('relay_question', ({ question }) => {
+    upsertRelayQuestion(question);
+    noteInboxQuestionsChanged();
+  });
+  socket.on('relay_question_updated', ({ question }) => {
+    upsertRelayQuestion(question);
+    noteInboxQuestionsChanged();
+  });
   socket.on('relay_question_changed', () => {
     loadRelayQuestions(currentConvId);
+    noteInboxQuestionsChanged();
   });
+  // Questions that don't block: one ask, after every change of it.
+  socket.on(RELAY_ASK_SOCKET_EVENT, (payload) => noteRelayAskUpdated(payload));
   socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_changed', () => {
@@ -631,6 +647,10 @@ export async function connectSocket(overrideDeps) {
   // Relay event subscriptions: the whole active list, after every change.
   socket.on('relay_event_subscriptions', ({ subscriptions }) => {
     applyRelayEventSubscriptions(subscriptions);
+  });
+  // Relay schedules: the whole active list, after every change.
+  socket.on('relay_schedules', ({ schedules }) => {
+    applyRelaySchedules(schedules);
   });
   socket.on('background_tasks', ({ conversationId, tasks, endedTasks }) => {
     setConversationBackgroundTasks(conversationId, tasks, { endedTasks, event: true });
@@ -799,7 +819,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, thinkingEnabled, thinkingDisplay, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, thinkingEnabled, thinkingDisplay, mayCreateSessions, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
@@ -821,6 +841,10 @@ export async function connectSocket(overrideDeps) {
       thinkingDisplay: thinkingDisplay === undefined
         ? (conversations[id].thinkingDisplay ?? null)
         : (thinkingDisplay ?? null),
+      // The owner's "agents may start sessions"; an older relay omits it.
+      mayCreateSessions: typeof mayCreateSessions === 'boolean'
+        ? mayCreateSessions
+        : conversations[id].mayCreateSessions === true,
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {

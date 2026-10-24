@@ -316,7 +316,7 @@ test.describe.serial("agent sessions on this relay", () => {
     const refused = await tool(created[0], "create_session", { relay: "this", text: "one level deeper", wait_seconds: 0 });
     expect(refused.status).toBe(403);
     expect(refused.payload.code).toBe("REMOTE_RELAY_NESTED_SESSION");
-    expect(refused.payload.error).toContain("A session that an agent created cannot create sessions.");
+    expect(refused.payload.error).toContain("A session that an agent created cannot create sessions (unless the relay's owner allows it for this session).");
     expect((await api("/api/conversations")).payload.conversations).toHaveLength(before);
     // It may still read and report on this relay.
     const read = await tool(created[0], "read_session", { relay: "this", session: created[1] });

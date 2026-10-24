@@ -3,6 +3,91 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.16] — 2026-10-24
+
+Highlights: agents can file the sessions they start into your session
+groups, change another session's model, mode or other settings, watch other
+sessions with fewer wake-ups (digests, quiet hours, exclusions), and
+schedule prompts that survive a relay restart. Agents can ask you a question
+without stopping their work, and the new Inbox lists every open question
+from this relay and its paired relays in one place. A new switch lets the
+agents of a conversation start sessions themselves.
+
+### Added
+
+- **Agents can put a new session into an existing session group.**
+  `remote_relay` create_session takes `group` (a group id, or its name in
+  any case) on this relay or a paired one, and `relay_info` lists the groups
+  there. An unknown group is refused with the groups listed, and nothing is
+  created. The approval card names the group, and the result carries it. A
+  relay too old for this is refused before anything is created. Renaming
+  and rearranging groups stays the owner's. An argument an action does not
+  take is no longer dropped without a word: create_session refuses it, and
+  the other actions list it in `ignored`.
+- **Agents can change another session's settings.** `remote_relay`
+  update_session sets a session's model, reasoning effort, relay mode,
+  auto-compact window, title, group, thinking or working folder for its next
+  turns, on this relay or a paired one, and answers the settings and what
+  changed. An unknown model is refused with the close matches; a group name
+  that does not exist makes a new group, and `none` takes the session out (a
+  group you made is never removed this way: it stays, shown empty in the
+  sidebar for you to rename or dissolve); a new folder
+  restarts the session's CLI there and is refused while it works. Only a
+  session the agent's own conversation started may be changed freely; any
+  other, yours or another agent's, needs your Allow once per conversation and
+  relay. A failed change still lists what it wrote. An open page shows the
+  change at once.
+- **"Agents in this conversation may start sessions."** A switch in the 🧠
+  settings of a session an agent started lets its agents start sessions
+  themselves, past the one-level rule; the limit of four at work and your
+  first Allow still apply. Only you can set it: agents and paired relays are
+  refused.
+- **Fewer wake-ups for watching agents.** A `remote_relay` subscription takes
+  `digest_minutes` (its events come as one message every N minutes),
+  `quiet_hours` (a daily window in a time zone, crossing midnight and the
+  clock changes included, whose events come as one message when it ends) and
+  `exclude` (sessions a subscription to all leaves out). Questions and errors
+  still come at once, held events survive a restart, and the hourly limit
+  stays on top. A turn the watcher prompted itself and whose finished reply it
+  waited for no longer wakes it a second time with turn_end.
+  `list_subscriptions` shows how many events each subscription holds and when
+  they are due, and the watching chip shows a small digest or quiet-hours hint.
+- **Scheduled prompts that survive a restart.** `remote_relay` schedule
+  queues a prompt at a time (`at`) or every N minutes (`every_minutes`, 5 to
+  10080), into the agent's own conversation or, with the user's approval in
+  ask and plan mode, another session on this relay. The relay keeps it in its
+  database, so a nightly review or a sweep no longer has to be set up again
+  after a deploy. A time missed while the relay was down fires once when it is
+  back, and a repeat waits while the one before is still queued. The message
+  says it is automated and approves nothing. `list_schedules` and `unschedule`
+  manage them, archiving a session ends its schedules, and a conversation
+  holds at most 20. The sidebar marks a scheduled session, and its header
+  lists the schedules with a Cancel button each.
+- **Questions that don't block, and the Inbox.** `remote_relay` ask puts a
+  question for you into the agent's session (up to eight options, a
+  recommendation, a folded detail, and urgency `now` for a push) and returns
+  at once, so the agent goes on with what does not depend on it. Your answer
+  or dismissal reaches it as a relay event, question_answered, without a
+  subscription, and does not count as your message for the agents' loop
+  guard. A lead can ask on behalf of another session, on this relay or a
+  paired one (kept where that session lives); `list_questions` and `withdraw`
+  manage them, and `read_session` lists them with their kind. The new
+  **Inbox** in the sidebar, with its count, lists every pending question
+  across this relay and the paired relays that answer, grouped by relay,
+  with a filter for your sessions or the agents', and what you answered in
+  the last day under a divider. An ask is answered there or in its session,
+  also one on a paired relay; a paired relay's cards open there, and the
+  pairing never carries an answer to a card. Agent text shows as plain text,
+  and on a phone the Inbox is one column with full-width buttons.
+
+### Fixed
+
+- **The agents' loop guard no longer counts the relay's own messages as the
+  user's.** A relay event, the usage-limit follow-up or the note after a
+  restart reset the count of prompts an agent may send to other agents
+  before the user is asked, so two agents that watched each other could go
+  on without the user. Only a message the user wrote resets it now.
+
 ## [0.9.15] — 2026-10-22
 
 Highlights: `oar setup` asks how the relay starts on Windows, at sign-in or

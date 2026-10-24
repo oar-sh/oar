@@ -162,19 +162,30 @@ export async function executeRemoteRelayTool(input, { api, conversationId = '', 
   }
   const parsed = validateRemoteRelayToolInput(input);
   if (!parsed.ok) return parsed;
-  if (signal?.aborted) return remoteRelayCancelledResult();
+  // Only this check sees what the agent wrote: the relay gets the arguments
+  // the action takes, so the ones it does not take are named here.
+  const withIgnored = (result) => withIgnoredArguments(result, parsed.ignored);
+  if (signal?.aborted) return withIgnored(remoteRelayCancelledResult());
   try {
     const response = await api('POST', REMOTE_RELAY_TOOL_ENDPOINT, {
       conversationId: conversation,
       action: parsed.action,
       args: parsed.args,
     }, { longCall: true, ...(signal ? { signal } : {}) });
-    if (response && typeof response === 'object' && !Array.isArray(response)) return response;
-    return { ok: true, result: response ?? null };
+    if (response && typeof response === 'object' && !Array.isArray(response)) return withIgnored(response);
+    return withIgnored({ ok: true, result: response ?? null });
   } catch (error) {
-    if (signal?.aborted || isAbortError(error)) return remoteRelayCancelledResult();
-    return remoteRelayErrorResult(error);
+    if (signal?.aborted || isAbortError(error)) return withIgnored(remoteRelayCancelledResult());
+    return withIgnored(remoteRelayErrorResult(error));
   }
+}
+
+/** `result` with `ignored` (the arguments the action did not take) merged in. */
+export function withIgnoredArguments(result, ignored) {
+  const extra = Array.isArray(ignored) ? ignored.map(toText).filter(Boolean) : [];
+  if (!extra.length || !result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const known = Array.isArray(result.ignored) ? result.ignored.map(toText).filter(Boolean) : [];
+  return { ...result, ignored: [...new Set([...known, ...extra])].sort() };
 }
 
 /**

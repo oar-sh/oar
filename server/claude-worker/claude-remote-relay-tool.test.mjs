@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { REMOTE_RELAY_TOOL_ZOD_SHAPE, createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
+import { createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+
+import { REMOTE_RELAY_TOOL_ZOD_SCHEMA, REMOTE_RELAY_TOOL_ZOD_SHAPE, createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
 import {
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_ENDPOINT,
@@ -39,19 +41,110 @@ function sampleFor(property) {
   if (property.type === 'integer') return 5;
   if (property.type === 'boolean') return true;
   if (property.type === 'array') return ['a'];
+  if (property.type === 'object') return Object.fromEntries(Object.entries(property.properties).map(([key, field]) => [key, sampleFor(field)]));
   throw new Error(`no sample for ${property.type}`);
 }
 
 function wrongTypeFor(property) {
-  return property.type === 'string' ? 7 : 'seven';
+  // A number is wrong for a list too, also for one that takes comma-separated text.
+  return property.type === 'string' || property.type === 'array' ? 7 : 'seven';
 }
 
-test('the definition carries the contract name/description and a zod shape', () => {
+test('the definition carries the contract name/description and the shape as a loose object', () => {
   const definition = createRemoteRelayToolDefinition({ api: recordingApi().api });
   assert.equal(definition.name, 'remote_relay');
   assert.equal(definition.description, REMOTE_RELAY_TOOL_DESCRIPTION);
-  assert.equal(definition.inputSchema, REMOTE_RELAY_TOOL_ZOD_SHAPE);
+  assert.equal(definition.inputSchema, REMOTE_RELAY_TOOL_ZOD_SCHEMA);
+  assert.deepEqual(Object.keys(definition.inputSchema.shape), Object.keys(REMOTE_RELAY_TOOL_ZOD_SHAPE));
+  // A key the schema lacks survives the parse, for the contract to judge.
+  assert.deepEqual(definition.inputSchema.parse({ action: 'stop', stray: 1 }), { action: 'stop', stray: 1 });
   assert.equal(typeof definition.handler, 'function');
+});
+
+// The SDK's in-process MCP server with the tool registered as the worker does,
+// reached through a minimal transport: requests go through the SDK's own
+// schema handling (tools/list, and the argument parse of tools/call).
+async function connectRelayMcpServer(definition) {
+  const server = createSdkMcpServer({ name: 'relay', tools: [definition] });
+  const pending = new Map();
+  let nextId = 1;
+  const transport = {
+    async start() {},
+    async close() { transport.onclose?.(); },
+    async send(message) {
+      const resolve = pending.get(message?.id);
+      if (!resolve) return;
+      pending.delete(message.id);
+      resolve(message);
+    },
+  };
+  await server.instance.connect(transport);
+  const request = (method, params) => new Promise((resolve) => {
+    const id = nextId;
+    nextId += 1;
+    pending.set(id, resolve);
+    transport.onmessage({ jsonrpc: '2.0', id, method, params });
+  });
+  const initialized = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' } });
+  assert.ok(initialized.result, JSON.stringify(initialized));
+  transport.onmessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  return { request, close: () => server.instance.close() };
+}
+
+test('through the SDK\'s MCP server: every field is advertised, and unknown keys reach the contract', async () => {
+  const stub = recordingApi({ ok: true, status: 'stopped' });
+  const mcp = await connectRelayMcpServer(createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' }));
+  try {
+    const listed = await mcp.request('tools/list', {});
+    const [tool] = listed.result.tools;
+    assert.equal(tool.name, 'remote_relay');
+    assert.deepEqual(Object.keys(tool.inputSchema.properties), Object.keys(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties));
+    assert.deepEqual(tool.inputSchema.required, ['action']);
+    assert.equal(tool.inputSchema.properties.group.description, REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.description);
+    assert.equal(tool.inputSchema.additionalProperties === false, false, 'unknown keys are not refused by the schema');
+
+    const call = async (args) => {
+      const answer = await mcp.request('tools/call', { name: 'remote_relay', arguments: args });
+      assert.ok(answer.result, JSON.stringify(answer));
+      return JSON.parse(answer.result.content[0].text);
+    };
+    // create_session: refused by the contract, the relay never asked.
+    const refused = await call({ action: 'create_session', relay: 'this', text: 'go', group_id: 'grp_1' });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.code, 'REMOTE_RELAY_INVALID_INPUT');
+    assert.match(refused.error, /^create_session does not take: group_id\./);
+    assert.equal(stub.calls.length, 0);
+    // Another action: carried out, the key named in ignored.
+    const stopped = await call({ action: 'stop', relay: 'this', session: 's-1', group_id: 'grp_1' });
+    assert.equal(stopped.ok, true);
+    assert.deepEqual(stopped.ignored, ['group_id']);
+    assert.deepEqual(stub.calls[0].body.args, { relay: 'this', session: 's-1' });
+    // The schema still checks the types it declares.
+    const typed = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'stop', relay: 7 } });
+    assert.equal(typed.result?.isError === true || !!typed.error, true, JSON.stringify(typed));
+    assert.equal(stub.calls.length, 1);
+  } finally {
+    await mcp.close();
+  }
+});
+
+test('the zod mirror takes update_session\'s settings, group null (out of the group) included', () => {
+  const parsed = REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({
+    action: 'update_session', relay: 'this', session: 'conv-a', group: null, auto_compact_window: 200000, thinking_enabled: false, thinking_display: 'omitted',
+  });
+  assert.equal(parsed.success, true);
+  assert.equal(parsed.data.group, null);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'update_session', thinking_display: 'raw' }).success, false);
+});
+
+test('the zod mirror takes an ask: question, options, recommendation, detail, urgency', () => {
+  const parsed = REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({
+    action: 'ask', question: 'Which database?', options: ['Postgres', 'SQLite'], recommendation: 'SQLite', detail: 'Background', urgency: 'now',
+  });
+  assert.equal(parsed.success, true);
+  assert.deepEqual(parsed.data.options, ['Postgres', 'SQLite']);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'ask', question: 'Q', urgency: 'later' }).success, false);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'withdraw', question_id: 'ask_ab12cd' }).success, true);
 });
 
 test('the zod mirror has parity with the contract schema', () => {
@@ -71,6 +164,9 @@ test('the zod mirror has parity with the contract schema', () => {
     );
     assert.equal(schema.safeParse(sampleFor(property)).success, true, `${field} accepts a ${property.type}`);
     assert.equal(schema.safeParse(wrongTypeFor(property)).success, false, `${field} rejects the wrong type`);
+    // The one documented exception: group takes null on Claude (out of the
+    // group, update_session); the JSON schema keeps a string, "none".
+    assert.equal(schema.safeParse(null).success, field === 'group', `${field} and null`);
     if (Array.isArray(property.enum)) {
       for (const value of property.enum) {
         assert.equal(schema.safeParse(value).success, true, `${field} accepts ${value}`);
@@ -78,6 +174,37 @@ test('the zod mirror has parity with the contract schema', () => {
       assert.equal(schema.safeParse('not-a-member').success, false, `${field} is an enum`);
     }
   }
+});
+
+test('the zod mirror takes the subscription options, and the handler hands them on checked', async () => {
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.quiet_hours.safeParse({ from: '23:00', to: '06:00', tz: 'Europe/Berlin' }).success, true);
+  // A partial window reaches the contract, which says what is missing.
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.quiet_hours.safeParse({ from: '23:00' }).success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.quiet_hours.safeParse(['23:00', '06:00']).success, false);
+  const stub = recordingApi({ ok: true, subscription: { id: 'sub_fixture' } });
+  const definition = createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' });
+  await definition.handler({
+    action: 'subscribe',
+    sessions: ['all'],
+    digest_minutes: 20,
+    quiet_hours: { from: '22:00', to: '7:00', tz: 'Europe/Berlin' },
+    exclude: ['conv-2'],
+  }, {});
+  assert.deepEqual(stub.calls[0].body.args, {
+    relay: 'this',
+    scope: 'all',
+    digest_minutes: 20,
+    quiet_hours: { from: '22:00', to: '07:00', tz: 'Europe/Berlin' },
+    exclude: ['conv-2'],
+  });
+  const refused = JSON.parse((await definition.handler({ action: 'subscribe', sessions: ['all'], quiet_hours: { from: '22:00', to: '07:00' } }, {})).content[0].text);
+  assert.equal(refused.code, 'REMOTE_RELAY_INVALID_INPUT');
+  assert.equal(stub.calls.length, 1);
+  // exclude as comma-separated text, as the contract takes it.
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.exclude.safeParse('conv-2, conv-3').success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.exclude.safeParse(['conv-2']).success, true);
+  await definition.handler({ action: 'subscribe', sessions: ['all'], exclude: 'conv-2, conv-3' }, {});
+  assert.deepEqual(stub.calls[1].body.args.exclude, ['conv-2', 'conv-3']);
 });
 
 test('the zod mirror takes an effort as free text and the handler passes it on', async () => {

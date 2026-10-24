@@ -45,6 +45,8 @@ import { registerClaudeCloudRoutes } from './routes/claude-cloud-routes.mjs';
 import { createPreviewScopeResolver, registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { registerRelayEventRoutes } from './routes/relay-event-routes.mjs';
+import { registerRelayScheduleRoutes } from './routes/relay-schedule-routes.mjs';
+import { registerRelayAskRoutes } from './routes/relay-ask-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
 import { createConversationGroupRepository } from './repositories/conversation-group-repository.mjs';
 import { createShareRepository } from './repositories/share-repository.mjs';
@@ -84,6 +86,9 @@ import {
 } from './services/restart-resume-service.mjs';
 import { createBackgroundWorkView } from './services/background-work-view.mjs';
 import { createRelayEventService } from './services/relay-event-service.mjs';
+import { createRelayScheduleService } from './services/relay-schedule-service.mjs';
+import { createRelayAskService } from './services/relay-ask-service.mjs';
+import { createRelayAskLinkService } from './services/relay-ask-link-service.mjs';
 import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
 import {
@@ -5128,6 +5133,11 @@ function createCompactedConversation(sourceConversationId) {
     targetRuntimeSession = ensureRuntimeSessionBinding(targetConversationId, null, now);
   });
   tx();
+  // Its schedules go on in the new conversation, both the ones that fire
+  // into it and the ones it set: the archived source would end them.
+  try { relayScheduleService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
+  // And so do its questions that don't block, asked in it or by it.
+  try { relayAskService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
 
   return {
     sourceConversationId,
@@ -5457,6 +5467,37 @@ relayEventService = createRelayEventService({
   onRemoteChange: (relayId) => { void relayEventLinkService?.fetchNow(relayId); },
   logger: console,
 });
+
+// ─── Relay schedules ──────────────────────────────────────────────────────────
+// Prompts agents scheduled with remote_relay's `schedule`: kept in the
+// database, their timers rebuilt at boot (services/relay-schedule-service.mjs).
+const relayScheduleService = createRelayScheduleService({
+  db,
+  stmts,
+  emit: (event, payload) => io.emit(event, payload),
+  // The scheduled message is an ordinary pending one, like a relay event's.
+  wake: () => {
+    void primePendingSessionWorkers('relay-schedule');
+    sessionWorkerWebSocketService?.emitQueueChanged?.('relay-schedule');
+  },
+  // A firing into another session is a prompt of the conversation that set
+  // it: the agents' loop guard counts it (and holds it once it wants the user).
+  admitFiring: ({ createdBy }) => remoteRelayDispatcher.admitScheduledFiring({ createdBy }),
+  logger: console,
+});
+
+// ─── Questions that don't block ───────────────────────────────────────────────
+// remote_relay's `ask`: a card in the session and the Inbox; the answer
+// reaches the askers as a relay event (services/relay-ask-service.mjs).
+const relayAskService = createRelayAskService({
+  db,
+  emit: (event, payload) => io.emit(event, payload),
+  relayEvents: relayEventService,
+  // urgency "now" only.
+  pushQuestion: (question) => pushDispatchService.notifyQuestion?.(question),
+  logger: console,
+});
+if (!relayAskService.isAvailable()) console.warn(`[relay-asks] not available this boot: ${relayAskService.problem()}`);
 
 /** A worker died: its tasks are gone, and whoever watches its sessions hears of it. */
 function noteWorkerDeathForEvents(sessionId, conversationIds, reason) {
@@ -6883,11 +6924,21 @@ const remoteRelayRegistry = createRemoteRelayRegistry({
   platform: process.platform,
   version: RUNNING_VERSION,
   emit: (event, payload) => io.emit(event, payload),
-  onRemove: (entry) => { void relayEventLinkService?.noteRelayRemoved(entry); },
+  onRemove: (entry) => {
+    void relayEventLinkService?.noteRelayRemoved(entry);
+    try { relayAskService.noteRelayRemoved(entry?.id); } catch {}
+  },
   logger: console,
 });
 relayEventLinkService = createRelayEventLinkService({
   relayEvents: relayEventService,
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
+  logger: console,
+});
+// The answers to asks this relay's agents put on paired relays.
+const relayAskLinkService = createRelayAskLinkService({
+  asks: relayAskService,
   registry: remoteRelayRegistry,
   client: remoteRelayClient,
   logger: console,
@@ -6946,6 +6997,9 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
   resolveConversationId: (id) => resolveConversationRecord({ conversationId: id, sdkSessionId: id })?.id || id,
   relayEvents: relayEventService,
   relayEventLink: relayEventLinkService,
+  relaySchedules: relayScheduleService,
+  relayAsks: relayAskService,
+  relayAskLink: relayAskLinkService,
   logger: console,
 });
 
@@ -7165,6 +7219,8 @@ const sharedRouteDeps = {
   collectHostActivity,
   usageLimitPauseService,
   relayEventService,
+  relayScheduleService,
+  relayAskService,
   sessionActivityTracker,
   resolveConversationRecord,
   markSharedViewerPresence,
@@ -7209,6 +7265,22 @@ registerRelayEventRoutes(app, {
   auth,
   relayEventService,
   remoteRelayInbound,
+});
+registerRelayScheduleRoutes(app, {
+  auth,
+  relayScheduleService,
+  remoteRelayInbound,
+});
+registerRelayAskRoutes(app, {
+  auth,
+  db,
+  stmts,
+  formatQuestionRow,
+  relayAskService,
+  relayAskLinkService,
+  remoteRelayInbound,
+  remoteRelayRegistry,
+  remoteRelayClient,
 });
 registerRelayRestartRoutes(app, {
   auth,
@@ -7572,6 +7644,11 @@ void primePendingSessionWorkers('startup');
 // heartbeat are swept from here on.
 relayEventService.start();
 relayEventLinkService.start();
+// Schedules get their timers back; one that came due while the relay was
+// down fires now, once.
+relayScheduleService.start();
+// Asks on paired relays still open there: look for their answers again.
+relayAskLinkService.start();
 runtimeTimers.pendingWorkerPrime = setInterval(() => {
   void primePendingSessionWorkers('maintenance');
   detachedWorkerWatch.sweep().catch((error) => {
@@ -7892,6 +7969,8 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   try { relayEventService.noteRelayExit({ action: runtimeShutdownExitCode === RELAY_RESTART_EXIT_CODE ? 'restart' : 'shutdown', reason }); } catch {}
   try { relayEventService.stop(); } catch {}
   try { relayEventLinkService.stop(); } catch {}
+  try { relayScheduleService.stop(); } catch {}
+  try { relayAskLinkService.stop(); } catch {}
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();

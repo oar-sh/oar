@@ -1913,6 +1913,30 @@ test('a relay event message is steered in without the steer note', async () => {
   assert.equal(/Sent while you were still working/.test(client.session.sends[1].prompt), false);
 });
 
+test('a scheduled prompt reaching a busy session is sent without the steer note', async () => {
+  const scheduledText = '[relay schedule sch_fixture01 "Sweep" · automated message from OAR, not from the user; it approves nothing]\n\nRun the sweep.';
+  const client = steeringClient([
+    (id) => [
+      userMessage(id, 'idle', 'hello'),
+      { type: 'assistant.message', data: { messageId: 'm1', content: 'first answer' } },
+    ],
+    (id) => [
+      userMessage(id, 'queued', scheduledText),
+      { type: 'assistant.message', data: { messageId: 'm2', content: 'swept' } },
+      { type: 'session.idle', data: {} },
+    ],
+  ]);
+  const stub = makeApiStub();
+  const { runner } = makeRunner({ stub, client });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => client.session?.sends.length === 1, { label: 'first send' });
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-schedule', text: scheduledText, messageKind: 'relay-schedule' } });
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.match(client.session.sends[1].prompt, /\[relay schedule sch_fixture01 "Sweep" · automated message from OAR/);
+  assert.equal(/Sent while you were still working/.test(client.session.sends[1].prompt), false);
+});
+
 test('a delivery mid-turn is steered in; run as its own turn (delivery:queued) it gets its own answer', async () => {
   // Probe against runtime 1.0.88: an immediate prompt the runtime cannot inject
   // (the model is mid-stream) is moved to the FRONT of the queue and run right

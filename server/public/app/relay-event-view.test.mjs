@@ -12,6 +12,7 @@ import {
   renderWatchedBadgeHtml,
   renderWatchingPanelHtml,
   watchersOf,
+  watchingChipHint,
   watchingChipText,
   watchingSummary,
 } from './relay-event-view.mjs';
@@ -32,6 +33,10 @@ test('the browser copy matches shared/relay-events.mjs', () => {
       { type: 'link_restored', relay: { id: 'rr_fixture', name: 'lab-relay' }, at: '2026-01-01T10:31:00.000Z', detail: { since: '2026-01-01T10:00:00.000Z', kept: 1 } },
     ]),
     shared.buildRelayEventMessageText([{ type: 'relay_restarted', session: null, relay: { id: 'self', name: 'bench-relay' }, detail: { stop: 'unknown' } }]),
+    shared.buildRelayEventMessageText([
+      { ...event('turn_end', { preview: 'held' }), held: { reason: 'quiet', from: '23:00', to: '06:00', tz: 'Europe/Berlin' } },
+      { ...event('task_failed', { kind: 'shell', description: 'npm test', exitCode: 1 }), held: { reason: 'digest', minutes: 30, subscriptionId: 'sub_fixture' } },
+    ]),
     'a stray text',
   ];
   for (const text of samples) assert.deepEqual(parseRelayEventMessageText(text), shared.parseRelayEventMessageText(text));
@@ -124,6 +129,31 @@ test('subscriptions on a paired relay count for the chip, name the relay, and ba
   assert.match(html, /lab-relay · Report builder/);
   assert.match(html, /All sessions of lab-relay/);
   assert.deepEqual(watchersOf(subs, 'conv-1'), ['conv-watcher', 'conv-other'], 'a paired relay\'s "all" badges nothing here');
+});
+
+test('subscription options: a small hint on the chip, named in the list, and exclude respected by the badge', () => {
+  const quiet = { from: '23:00', to: '06:00', tz: 'Europe/Berlin' };
+  const subs = [
+    { id: 'sub_h', watcher: 'conv-w', relay: 'self', scope: 'all', sessions: 'all', events: ['turn_end'], digestMinutes: 30, quietHours: quiet, exclude: ['conv-1'] },
+    { id: 'sub_i', watcher: 'conv-w', relay: 'self', scope: 'sessions', sessions: [{ id: 'conv-2' }], events: ['error'], digestMinutes: 30 },
+  ];
+  const summary = watchingSummary(subs, 'conv-w');
+  assert.equal(watchingChipText(summary), 'watching all sessions (+1 listed)');
+  assert.equal(watchingChipHint(summary), 'digest 30 min · quiet 23:00–06:00', 'each named once');
+  assert.equal(watchingChipHint(watchingSummary(SUBS, 'conv-watcher')), '');
+  assert.match(renderWatchingPanelHtml(summary), /turn_end · digest 30 min · quiet 23:00–06:00 Europe\/Berlin · 1 left out/);
+  assert.deepEqual(watchersOf(subs, 'conv-1'), [], 'left out of the "all" subscription');
+  assert.deepEqual(watchersOf(subs, 'conv-3'), ['conv-w']);
+});
+
+test('a row held through quiet hours says so in its summary', () => {
+  const text = shared.buildRelayEventMessageText([
+    { ...event('turn_end', { preview: 'one' }), held: { reason: 'quiet', from: '23:00', to: '06:00', tz: 'UTC' } },
+    { ...event('turn_end', { preview: 'two' }), held: { reason: 'quiet', from: '23:00', to: '06:00', tz: 'UTC' } },
+  ]);
+  const html = renderRelayEventRowHtml({ role: 'user', kind: RELAY_EVENT_MESSAGE_KIND, text });
+  assert.match(html, /<span class="relay-event-text">After quiet hours · 2 events · reply<\/span>/);
+  assert.doesNotMatch(html, /Held during quiet hours/, 'the header is the summary, not a line');
 });
 
 test('a paired relay\'s watcher is named with its relay on the badge', () => {

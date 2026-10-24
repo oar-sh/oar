@@ -14,7 +14,9 @@ import { REMOTE_RELAY_LOCAL_ID, normalizeRemoteRelayOrigin } from '../../shared/
 // Agent sessions on this relay itself reuse both: the user's "Allow" for a
 // conversation's agent to start sessions here is an unlock under the local
 // target's id, and a conversation such an agent created carries an origin
-// with `local: true` that names the conversation it was created from.
+// with `local: true` that names the conversation it was created from. The
+// Allow to change sessions a conversation did not start (update_session) is an unlock
+// under `<relay id>:session-settings`, like the watch approvals.
 
 function parseOrigin(json) {
   if (!json) return null;
@@ -56,11 +58,23 @@ export function createRemoteRelayRepository(db) {
         WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked')
       )
   `);
+  // The user's own messages have no kind. Every user-role message with one is
+  // the relay's (a relay event, a scheduled prompt, the usage-limit follow-up,
+  // the note after a restart): it must not reset the loop guard that counts
+  // agents' prompts since the user wrote, or two agents could keep each other
+  // going through events.
   const getLatestHumanMessage = db.prepare(`
     SELECT id FROM messages
-    WHERE conversation_id = ? AND role = 'user' AND origin_json IS NULL
+    WHERE conversation_id = ? AND role = 'user' AND origin_json IS NULL AND NULLIF(kind, '') IS NULL
     ORDER BY timestamp DESC LIMIT 1
   `);
+  // The owner's "agents in this conversation may start sessions" (migration
+  // 0020). Without the column nobody has it.
+  const hasMayCreateColumn = db.prepare(`PRAGMA table_info(conversations)`).all()
+    .some((column) => column.name === 'may_create_sessions');
+  const getMayCreateSessions = hasMayCreateColumn
+    ? db.prepare(`SELECT may_create_sessions FROM conversations WHERE id = ?`)
+    : null;
 
   return {
     hasUnlock(conversationId, remoteRelayId) {
@@ -142,6 +156,10 @@ export function createRemoteRelayRepository(db) {
     /** The id of the latest message the user wrote themselves, or null. */
     latestHumanMessageId(conversationId) {
       return getLatestHumanMessage.get(String(conversationId || ''))?.id || null;
+    },
+    /** Did the owner let the agents of this (agent-started) conversation start sessions? */
+    mayCreateSessions(conversationId) {
+      return Number(getMayCreateSessions?.get(String(conversationId || ''))?.may_create_sessions) === 1;
     },
   };
 }

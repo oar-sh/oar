@@ -41,6 +41,9 @@ export function persistConversationPreferences({
   // fallback is the relay default (on / summarized).
   thinkingEnabled = undefined,
   thinkingDisplay = undefined,
+  // The owner's "agents in this conversation may start sessions" (a boolean;
+  // `undefined` leaves it alone). The route decides who may write it.
+  mayCreateSessions = undefined,
   updatedAt = new Date().toISOString(),
   createIfMissing = false,
   createTitle = 'Session',
@@ -56,6 +59,7 @@ export function persistConversationPreferences({
   const enabled = writesThinkingEnabled ? parseThinkingEnabled(thinkingEnabled) : DEFAULT_THINKING_ENABLED;
   const writesThinkingDisplay = thinkingDisplay !== undefined;
   const display = writesThinkingDisplay ? parseThinkingDisplay(thinkingDisplay) : null;
+  const writesMayCreateSessions = mayCreateSessions !== undefined;
   if (!db || !stmts || !convId || !mode) {
     return {
       ok: false,
@@ -66,6 +70,7 @@ export function persistConversationPreferences({
       autoCompactWindow: null,
       thinkingEnabled: DEFAULT_THINKING_ENABLED,
       thinkingDisplay: DEFAULT_THINKING_DISPLAY,
+      mayCreateSessions: false,
       updatedAt,
     };
   }
@@ -98,6 +103,10 @@ export function persistConversationPreferences({
     if (writesThinkingDisplay) {
       extraSets.push('thinking_display = ?');
       extraValues.push(display);
+    }
+    if (writesMayCreateSessions) {
+      extraSets.push('may_create_sessions = ?');
+      extraValues.push(mayCreateSessions === true ? 1 : 0);
     }
     try {
       if (extraSets.length) {
@@ -136,10 +145,18 @@ export function persistConversationPreferences({
       thinkingDisplay: writesThinkingDisplay
         ? display
         : parseThinkingDisplay(existing?.thinking_display),
+      mayCreateSessions: writesMayCreateSessions
+        ? mayCreateSessions === true
+        : readMayCreateSessions(existing),
       updatedAt,
     };
   });
   return writePreferences();
+}
+
+/** The owner's "agents in this conversation may start sessions" of a conversations row. */
+export function readMayCreateSessions(row) {
+  return Number(row?.may_create_sessions) === 1;
 }
 
 export function persistConversationModelPreference({

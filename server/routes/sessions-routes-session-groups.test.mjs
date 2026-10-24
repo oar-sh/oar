@@ -44,11 +44,15 @@ const agentHeaders = { 'x-oar-remote-origin': 'relay-id-win', 'x-oar-remote-hops
 
 function createMockApp() {
   const routes = new Map();
+  // Every handler of a route, the middleware in front included.
+  const chains = new Map();
   const record = (method) => (routePath, ...handlers) => {
     routes.set(`${method} ${routePath}`, handlers[handlers.length - 1]);
+    chains.set(`${method} ${routePath}`, handlers);
   };
   return {
     routes,
+    chains,
     get: record('GET'),
     post: record('POST'),
     patch: record('PATCH'),
@@ -58,7 +62,7 @@ function createMockApp() {
   };
 }
 
-function setup() {
+function setup(overrides = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
@@ -146,6 +150,7 @@ function setup() {
     isSha256: () => false,
     remoteRelayInbound,
     conversationGroups,
+    ...overrides,
   };
   registerSessionsRoutes(app, deps);
   registerConversationGroupRoutes(app, deps);
@@ -184,7 +189,29 @@ function setup() {
   );
   const events = (name) => emitted.filter(([event]) => event === name).map(([, payload]) => payload);
   const touch = (id, at) => db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`).run(at, id);
-  return { db, stmts, conversationGroups, emitted, events, call, bootstrap, createdBy, touch };
+  // A request through the route's whole chain, as express runs it.
+  const callChain = async (key, { headers = {}, loopback = false } = {}) => {
+    const handlers = app.chains.get(key);
+    assert.ok(handlers, `${key} should be registered`);
+    const captured = { status: 200, body: null };
+    const res = {
+      setHeader() {},
+      set() {},
+      status(code) { captured.status = code; return res; },
+      json(payload) { captured.body = payload; return res; },
+    };
+    const req = { body: {}, headers, query: {}, params: {}, socket: {} };
+    if (loopback) markRemoteRelayLoopbackRequest(req);
+    let index = 0;
+    const next = async () => {
+      const handler = handlers[index];
+      index += 1;
+      if (handler) await handler(req, res, next);
+    };
+    await next();
+    return captured;
+  };
+  return { db, app, stmts, conversationGroups, emitted, events, call, callChain, bootstrap, createdBy, touch };
 }
 
 test('a session created by a local conversation joins its creator\'s group; the list and the single payload carry it', async () => {
@@ -200,7 +227,7 @@ test('a session created by a local conversation joins its creator\'s group; the 
   assert.deepEqual(fx.events('conversation_group_changed'), [{
     groupId: group.id,
     conversationIds: [child, lead],
-    group: { id: group.id, name: null, displayName: 'Release lead', parentConversationId: lead, memberCount: 2, liveMemberCount: 2 },
+    group: { id: group.id, name: null, displayName: 'Release lead', parentConversationId: lead, memberCount: 2, liveMemberCount: 2, keptEmptyAt: null },
     memberships: { [child]: { groupId: group.id, role: 'member' }, [lead]: { groupId: group.id, role: 'head' } },
     order: [lead, child],
     positions: { [lead]: null, [child]: null },
@@ -224,6 +251,7 @@ test('a session created by a local conversation joins its creator\'s group; the 
       parentConversationId: lead,
       memberCount: 3,
       liveMemberCount: 3,
+      keptEmptyAt: null,
     },
   });
 
@@ -294,7 +322,7 @@ test('hand-made groups: create, rename, move in and out, dissolve; every change 
   assert.deepEqual(fx.events('conversation_group_changed').at(-1), {
     groupId,
     conversationIds: [a],
-    group: { id: groupId, name: 'Sample batch', displayName: 'Sample batch', parentConversationId: null, memberCount: 1, liveMemberCount: 1 },
+    group: { id: groupId, name: 'Sample batch', displayName: 'Sample batch', parentConversationId: null, memberCount: 1, liveMemberCount: 1, keptEmptyAt: null },
     memberships: { [a]: { groupId, role: 'member' } },
     order: [a],
     positions: { [a]: null },
@@ -522,4 +550,250 @@ test('a drag places a conversation before another or at the end, takes it out wi
   const refused = await fx.call('PUT /api/conversation/:id/group', { params: { id: a }, body: { groupId: null, beforeConversationId: null }, headers: agentHeaders });
   assert.equal(refused.status, 403);
   assert.equal(fx.conversationGroups.groupOfConversation(a)?.id, groupId);
+});
+
+// ─── A group named at bootstrap (create_session `group`), and the group list ──
+
+const loopbackHeaders = { 'x-oar-remote-origin': 'self', 'x-oar-remote-hops': '0' };
+
+// A hand-made group of fresh conversations, by the owner's route.
+async function handGroup(fx, name, titles) {
+  const ids = [];
+  for (const title of titles) ids.push(await fx.bootstrap({ title }));
+  const made = await fx.call('POST /api/conversation-groups', { body: { name, conversationIds: ids } });
+  assert.equal(made.status, 200, JSON.stringify(made.body));
+  return made.body.group.id;
+}
+
+const conversationCount = (fx) => fx.db.prepare(`SELECT COUNT(*) AS n FROM conversations`).get().n;
+
+test('GET /api/conversation-groups uses the auth of GET /api/conversations: owner and paired relay allowed, no auth refused', async () => {
+  const tokenAuth = (req, res, next) => (req.headers.authorization === 'Bearer owner-token'
+    ? next()
+    : res.status(401).json({ error: 'unauthorized' }));
+  const fx = setup({ auth: tokenAuth });
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A', 'Docs B']);
+  // The very same middleware stands in front of both lists, and nothing else.
+  assert.deepEqual(fx.app.chains.get('GET /api/conversation-groups').slice(0, -1), [tokenAuth]);
+  assert.deepEqual(fx.app.chains.get('GET /api/conversations').slice(0, -1), [tokenAuth]);
+
+  const token = { authorization: 'Bearer owner-token' };
+  const owner = await fx.callChain('GET /api/conversation-groups', { headers: token });
+  assert.equal(owner.status, 200);
+  assert.deepEqual(owner.body, { ok: true, groups: [{ id: groupId, name: 'Docs batch', memberCount: 2 }] });
+  const paired = await fx.callChain('GET /api/conversation-groups', { headers: { ...token, ...agentHeaders } });
+  assert.equal(paired.status, 200);
+  assert.deepEqual(paired.body, owner.body);
+  const loopback = await fx.callChain('GET /api/conversation-groups', { headers: { ...token, ...loopbackHeaders }, loopback: true });
+  assert.deepEqual(loopback.body, owner.body);
+  // Only id, name and member count: no member ids, no session titles.
+  assert.doesNotMatch(JSON.stringify(owner.body), /Docs A|Docs B|parentConversationId|members/);
+  for (const headers of [{}, agentHeaders, { authorization: 'Bearer wrong' }]) {
+    const refused = await fx.callChain('GET /api/conversation-groups', { headers });
+    assert.equal(refused.status, 401, JSON.stringify(headers));
+    assert.equal((await fx.callChain('GET /api/conversations', { headers })).status, 401, JSON.stringify(headers));
+  }
+  // The loopback carries the token like any request: no exemption.
+  assert.equal((await fx.callChain('GET /api/conversation-groups', { headers: loopbackHeaders, loopback: true })).status, 401);
+});
+
+test('the group write routes still refuse paired-relay and loopback requests', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A']);
+  const a = await fx.bootstrap({ title: 'Chat A' });
+  for (const [headers, loopback] of [[agentHeaders, false], [loopbackHeaders, true]]) {
+    for (const [key, options] of [
+      ['POST /api/conversation-groups', { body: { conversationIds: [a] } }],
+      ['PATCH /api/conversation-groups/:id', { params: { id: groupId }, body: { name: 'x' } }],
+      ['PUT /api/conversation/:id/group', { params: { id: a }, body: { groupId } }],
+      ['DELETE /api/conversation/:id/group', { params: { id: a } }],
+      ['DELETE /api/conversation-groups/:id', { params: { id: groupId } }],
+      ['POST /api/conversation-groups/:id/archive', { params: { id: groupId } }],
+    ]) {
+      const refused = await fx.call(key, { ...options, headers, loopback });
+      assert.equal(refused.status, 403, `${key} ${loopback ? 'loopback' : 'paired'}`);
+    }
+  }
+  assert.equal(fx.conversationGroups.groupOfConversation(a), null);
+  assert.equal(fx.conversationGroups.getGroup(groupId).name, 'Docs batch');
+});
+
+test('bootstrap with group (id) puts the new session into that group and answers it', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A', 'Docs B']);
+  fx.emitted.length = 0;
+  const created = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Docs C', group: groupId } });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const id = created.body.conversationId;
+  assert.equal(fx.conversationGroups.groupOfConversation(id)?.id, groupId);
+  assert.deepEqual(created.body.group, { id: groupId, name: 'Docs batch', role: 'member' });
+  const [event] = fx.events('conversation_group_changed');
+  assert.equal(event.groupId, groupId);
+  assert.deepEqual(event.conversationIds, [id]);
+});
+
+test('bootstrap with group by name, case-insensitive', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A']);
+  const created = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Docs C', group: '  docs   BATCH ' } });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.group.id, groupId);
+  // An empty group is no group.
+  const plain = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Plain', group: '' } });
+  assert.equal(plain.status, 200);
+  assert.equal(plain.body.group, null);
+});
+
+test('bootstrap with an unknown group refuses with the groups listed and creates nothing', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A']);
+  const before = conversationCount(fx);
+  fx.emitted.length = 0;
+  const refused = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Lost', group: 'Release' } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, 'SESSION_GROUP_NOT_FOUND');
+  assert.equal(refused.body.error, `No session group "Release" here. Groups: Docs batch (${groupId}). No conversation was created.`);
+  assert.deepEqual(refused.body.groups, [{ id: groupId, name: 'Docs batch' }]);
+  assert.equal(conversationCount(fx), before);
+  assert.deepEqual(fx.emitted, []);
+  // A relay with no group at all says so.
+  const empty = setup();
+  const none = await empty.call('POST /api/conversation/bootstrap', { body: { group: 'grp_missing' } });
+  assert.equal(none.status, 400);
+  assert.match(none.body.error, /this relay has no session groups/);
+  assert.deepEqual(none.body.groups, []);
+  assert.equal(conversationCount(empty), 0);
+  // Not text: refused as well.
+  const typed = await fx.call('POST /api/conversation/bootstrap', { body: { group: 7 } });
+  assert.equal(typed.status, 400);
+  assert.equal(typed.body.code, 'SESSION_GROUP_INVALID');
+  assert.equal(conversationCount(fx), before);
+});
+
+test('bootstrap with an ambiguous group name refuses and asks for the id', async () => {
+  const fx = setup();
+  const first = await handGroup(fx, 'Release', ['R1']);
+  const second = await handGroup(fx, 'release', ['R2']);
+  const before = conversationCount(fx);
+  const refused = await fx.call('POST /api/conversation/bootstrap', { body: { group: 'RELEASE' } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, 'SESSION_GROUP_AMBIGUOUS');
+  assert.match(refused.body.error, /names several session groups here: .*Pass the id\. No conversation was created\./);
+  assert.deepEqual(refused.body.groups.map((group) => group.id).sort(), [first, second].sort());
+  assert.equal(conversationCount(fx), before);
+  const byId = await fx.call('POST /api/conversation/bootstrap', { body: { group: second } });
+  assert.equal(byId.body.group.id, second);
+});
+
+test('bootstrap of an agent-created local session with group uses that group, not the creator\'s', async () => {
+  const fx = setup();
+  const lead = await fx.bootstrap({ title: 'Release lead' });
+  const firstChild = await fx.createdBy(lead, 'Docs pass');
+  const creatorGroup = fx.conversationGroups.groupOfConversation(lead).id;
+  const groupId = await handGroup(fx, 'QA batch', ['QA A']);
+  const created = await fx.call('POST /api/conversation/bootstrap', {
+    body: { title: 'QA B', origin: LOCAL_ORIGIN(lead), group: 'qa batch' },
+    headers: loopbackHeaders,
+    loopback: true,
+  });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  assert.equal(fx.conversationGroups.groupOfConversation(created.body.conversationId).id, groupId);
+  assert.deepEqual(created.body.group, { id: groupId, name: 'QA batch', role: 'member' });
+  // The creator's own group is untouched.
+  assert.deepEqual(fx.conversationGroups.membersOf(creatorGroup).map((member) => member.id).sort(), [firstChild, lead].sort());
+});
+
+test('bootstrap from a paired relay with group groups the session; without group it stays ungrouped', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A']);
+  const grouped = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'From afar', origin: PAIRED_ORIGIN, group: groupId }, headers: agentHeaders });
+  assert.equal(grouped.status, 200, JSON.stringify(grouped.body));
+  assert.equal(fx.conversationGroups.groupOfConversation(grouped.body.conversationId).id, groupId);
+  assert.deepEqual(grouped.body.group, { id: groupId, name: 'Docs batch', role: 'member' });
+  const plain = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'From afar 2', origin: PAIRED_ORIGIN }, headers: agentHeaders });
+  assert.equal(plain.status, 200);
+  assert.equal(plain.body.group, null);
+  assert.equal(fx.conversationGroups.groupOfConversation(plain.body.conversationId), null);
+});
+
+test('bootstrap rolls the create back when the group is gone at commit time', async () => {
+  const fx = setup();
+  const groupId = await handGroup(fx, 'Docs batch', ['Docs A']);
+  const before = conversationCount(fx);
+  // The group is dissolved between the lookup and the commit.
+  const realSetMembership = fx.conversationGroups.setMembership;
+  fx.conversationGroups.setMembership = (conversationId, target, now) => {
+    fx.conversationGroups.dissolveGroup(target);
+    return realSetMembership(conversationId, target, now);
+  };
+  fx.emitted.length = 0;
+  let refused;
+  try {
+    refused = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Late', origin: PAIRED_ORIGIN, group: groupId }, headers: agentHeaders });
+  } finally {
+    fx.conversationGroups.setMembership = realSetMembership;
+  }
+  assert.equal(refused.status, 400, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, 'SESSION_GROUP_NOT_FOUND');
+  assert.match(refused.body.error, /No conversation was created\./);
+  // Nothing of it stayed: no row, no provenance, no event. (The dissolve
+  // itself rolled back with it: the group is still there.)
+  assert.equal(conversationCount(fx), before);
+  assert.equal(fx.db.prepare(`SELECT COUNT(*) AS n FROM conversations WHERE title = 'Late'`).get().n, 0);
+  assert.deepEqual(fx.events('conversation_group_changed'), []);
+});
+
+test('bootstrap without group answers group null (and the creator\'s group for a local agent create)', async () => {
+  const fx = setup();
+  const own = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Mine' } });
+  assert.equal(own.status, 200);
+  assert.equal(Object.prototype.hasOwnProperty.call(own.body, 'group'), true);
+  assert.equal(own.body.group, null);
+  const child = await fx.call('POST /api/conversation/bootstrap', {
+    body: { title: 'Docs pass', origin: LOCAL_ORIGIN(own.body.conversationId) },
+    headers: loopbackHeaders,
+    loopback: true,
+  });
+  const creatorGroup = fx.conversationGroups.groupOfConversation(own.body.conversationId);
+  assert.deepEqual(child.body.group, { id: creatorGroup.id, name: 'Mine', role: 'member' });
+});
+
+test('a claude-cloud bootstrap with group lands in the named group, not the creator\'s', async () => {
+  const fx = setup({
+    claudeCloudSettingsService: {
+      getSettings: () => ({ enabled: true, environmentId: 'env_fixture', defaultModel: 'claude-sonnet-5', models: ['claude-sonnet-5'] }),
+    },
+  });
+  const lead = await fx.bootstrap({ title: 'Release lead' });
+  await fx.createdBy(lead, 'Docs pass');
+  const creatorGroup = fx.conversationGroups.groupOfConversation(lead).id;
+  const groupId = await handGroup(fx, 'Cloud batch', ['Cloud A']);
+  const created = await fx.call('POST /api/conversation/bootstrap', {
+    body: {
+      title: 'Cloud B',
+      providerType: 'claude-cloud',
+      cloudSource: { repoUrl: 'https://github.com/example-org/example-repo', branch: 'feature/x' },
+      origin: LOCAL_ORIGIN(lead),
+      group: groupId,
+    },
+    headers: loopbackHeaders,
+    loopback: true,
+  });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.selectedProviderType, 'claude-cloud');
+  assert.ok(created.body.cloud, 'a cloud conversation');
+  assert.deepEqual(created.body.group, { id: groupId, name: 'Cloud batch', role: 'member' });
+  assert.notEqual(fx.conversationGroups.groupOfConversation(created.body.conversationId).id, creatorGroup);
+});
+
+test('a bootstrap refusal names at most 20 groups and counts the rest', async () => {
+  const fx = setup();
+  for (let index = 0; index < 22; index += 1) await handGroup(fx, `Batch ${String(index).padStart(2, '0')}`, [`Member ${index}`]);
+  const before = conversationCount(fx);
+  const refused = await fx.call('POST /api/conversation/bootstrap', { body: { group: 'Release' } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.groups.length, 20);
+  assert.equal(refused.body.groupsTotal, 22);
+  assert.match(refused.body.error, / and 2 more\. No conversation was created\.$/);
+  assert.equal(conversationCount(fx), before);
 });

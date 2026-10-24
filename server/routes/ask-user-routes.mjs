@@ -2,7 +2,9 @@
 
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
-import { isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
+import { REMOTE_RELAY_ERROR_CODES, isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
+import { isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { sendRelayAskError } from './relay-ask-routes.mjs';
 import { closedQuestionAnswer, questionAcceptsFreeText } from '../../shared/question-answer-rule.mjs';
 import {
   extractRequestedSchema,
@@ -142,6 +144,9 @@ export function registerAskUserRoutes(app, deps) {
     // Remote relays: another relay's agent answering a question is refused
     // while the inbound switch is off. Absent in older wiring (no-op).
     remoteRelayInbound = null,
+    // Questions that don't block (relay-ask-service.mjs): their ids answer
+    // here like a card's. Absent in older wiring (no asks).
+    relayAskService = null,
   } = deps;
 
   const continuationRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true;
@@ -163,15 +168,63 @@ export function registerAskUserRoutes(app, deps) {
     const status = String(req.query.status || 'pending').trim() || 'pending';
     let rows = stmts.listQuestions.all(status, conversationId, conversationId);
     if (fromRemoteRelay(req)) rows = rows.filter((row) => !isRemoteRelayApprovalRow(row));
-    res.json({ questions: rows.map(formatQuestionRow) });
+    const questions = rows.map(formatQuestionRow).map((question) => ({ ...question, kind: relayQuestionKind(question) }));
+    // Questions that don't block, on request (read_session's pendingQuestions):
+    // the cards' own readers take only what a turn waits on.
+    if (String(req.query.includeAsks || '') === '1' && relayAskService?.isAvailable?.() && status === 'pending') {
+      const asks = conversationId ? relayAskService.listOf(conversationId) : relayAskService.listHere();
+      questions.push(...asks.filter((ask) => !ask.relayId && ask.status === 'pending' && (!conversationId || ask.conversationId === conversationId)));
+    }
+    res.json({ questions });
   });
 
   app.get('/api/relay-question/:id', auth, (req, res) => {
+    if (isRelayAskId(req.params.id)) {
+      const ask = relayAskService?.get?.(req.params.id) || null;
+      return ask ? res.json({ question: ask }) : res.status(404).json({ error: 'Not found' });
+    }
     const row = stmts.getQuestion.get(req.params.id);
     if (!row || (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req))) {
       return res.status(404).json({ error: 'Not found' });
     }
-    res.json({ question: formatQuestionRow(row) });
+    const question = formatQuestionRow(row);
+    res.json({ question: { ...question, kind: relayQuestionKind(question) } });
+  });
+
+  /**
+   * An ask (remote_relay `ask`) is the user's to answer: from this relay's
+   * own UI here, from a paired relay's Inbox through its own route
+   * (relay-ask-routes.mjs). Never from an agent, this relay's or another's.
+   */
+  function refuseAgentOnAsk(req, res) {
+    if (!fromRemoteRelay(req)) return false;
+    console.warn(`[${ts()}] QUESTION  reject id=${String(req.params.id || '').slice(0, 12)} reason=ask-from-agent`);
+    res.status(403).json({
+      error: 'This question was asked with ask: only the user answers it, in the Inbox or the session.',
+      code: REMOTE_RELAY_ERROR_CODES.forbidden,
+    });
+    return true;
+  }
+
+  function answerAsk(req, res, dismiss) {
+    if (refuseAgentOnAsk(req, res)) return;
+    if (!relayAskService?.isAvailable?.()) return res.status(503).json({ error: 'Questions that don\'t block are not available on this relay right now' });
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    try {
+      const ask = dismiss
+        ? relayAskService.dismiss(req.params.id)
+        : relayAskService.answer(req.params.id, { answer: String(body.answer ?? ''), choice: String(body.choice ?? '') });
+      console.log(`[${ts()}] QUESTION  ${String(ask.id).slice(0, 12)} ${dismiss ? 'dismissed' : 'answered'} (ask)`);
+      res.json({ ok: true, question: ask });
+    } catch (error) {
+      sendRelayAskError(res, error, dismiss ? 'The dismissal' : 'The answer');
+    }
+  }
+
+  // POST /api/relay-question/:id/dismiss — an ask closed without an answer.
+  app.post('/api/relay-question/:id/dismiss', auth, (req, res) => {
+    if (!isRelayAskId(req.params.id)) return res.status(400).json({ error: 'Only a question asked with ask can be dismissed; a card waits for its answer.' });
+    answerAsk(req, res, true);
   });
 
   app.post('/api/relay-question', auth, (req, res) => {
@@ -275,6 +328,7 @@ export function registerAskUserRoutes(app, deps) {
 
   app.post('/api/relay-question/:id/answer', auth, (req, res) => {
     if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
+    if (isRelayAskId(req.params.id)) return answerAsk(req, res, false);
     const id = String(req.params.id || '').trim();
     const { answer, structuredAnswer, sdk_session_id, continuation_id, continuation_question_id } = req.body;
     const sdkSessionId = normalizeId(sdk_session_id);

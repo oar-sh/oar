@@ -141,7 +141,7 @@ test('repair: a tombstoned head leaves its group with the title frozen to the ca
   // A rename after a frozen title stays within the cap.
   assert.equal(repo.renameGroup(groupId, 'Short', NOW).name, 'Short');
   // What the change event carries.
-  assert.deepEqual(repo.describeGroup(other), { id: other, name: 'Other lead', displayName: 'Other lead', parentConversationId: 'conv-lead-2', memberCount: 1, liveMemberCount: 1 });
+  assert.deepEqual(repo.describeGroup(other), { id: other, name: 'Other lead', displayName: 'Other lead', parentConversationId: 'conv-lead-2', memberCount: 1, liveMemberCount: 1, keptEmptyAt: null });
   assert.deepEqual(repo.membershipsOf(['conv-child-2', 'conv-lead-2', 'conv-nobody']), { 'conv-child-2': { groupId: other, role: 'member' }, 'conv-lead-2': null, 'conv-nobody': null });
 });
 
@@ -310,4 +310,33 @@ test('a schema without the position column moves membership only, in the activit
   const off = createConversationGroupRepository(bare);
   assert.deepEqual(off.moveConversation('a', { groupId: null }), { ok: false, error: 'groups-unavailable' });
   assert.deepEqual(off.orderOf('grp_x'), []);
+});
+
+test('listGroups lists every group with display name and member count, newest first', () => {
+  const { db, repo, conv } = setup();
+  conv('conv-lead', 'Catalog import', at(1));
+  conv('conv-child', 'child', at(2));
+  conv('conv-a', 'a', at(5));
+  conv('conv-b', 'b', at(3));
+  conv('conv-gone', 'gone', at(9));
+  const headed = repo.attachCreatedConversation('conv-child', 'conv-lead', NOW);
+  const named = repo.createGroup({ name: 'Sample batch', conversationIds: ['conv-a', 'conv-b', 'conv-gone'] }, NOW);
+  db.prepare(`UPDATE conversations SET status = 'deleted' WHERE id = 'conv-gone'`).run();
+  assert.deepEqual(repo.listGroups(), [
+    { id: named.id, name: 'Sample batch', memberCount: 2 },
+    // A group nobody named shows its head's title, dressed as the list does.
+    { id: headed, name: 'Catalog import', memberCount: 2 },
+  ]);
+  assert.equal(repo.listGroups({ headTitle: (title) => `${title}!` })[1].name, 'Catalog import!');
+  // Only what an agent may see.
+  for (const group of repo.listGroups()) assert.deepEqual(Object.keys(group).sort(), ['id', 'memberCount', 'name']);
+  // A group without a live member is not listed.
+  db.prepare(`UPDATE conversations SET status = 'deleted' WHERE id IN ('conv-a', 'conv-b')`).run();
+  assert.deepEqual(repo.listGroups().map((group) => group.id), [headed]);
+});
+
+test('listGroups is empty without the migration', () => {
+  const bare = new Database(':memory:');
+  bare.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+  assert.deepEqual(createConversationGroupRepository(bare).listGroups(), []);
 });

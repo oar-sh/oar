@@ -23,6 +23,30 @@
  * interval while its watched set has a turn or task running, none while it
  * is idle: the watcher's sign that its watching still works.
  *
+ * Options of a subscription (migrations/0019-relay-event-subscription-options.mjs),
+ * all applied where the watcher is (for a paired relay's sessions: on the
+ * mirror here):
+ *
+ * - `digest_minutes`: its non-urgent events are held and go as one row, N
+ *   minutes after the last such row at the earliest.
+ * - `quiet_hours`: its non-urgent events that would go inside the window are
+ *   held until it ends; no heartbeat is made inside it.
+ * - `exclude`: sessions an "all" subscription leaves out (the watched relay
+ *   is told too, for all_idle, stalled and the heartbeat's list).
+ *
+ * question_asked and error are never held. A one-shot subscription's event
+ * keeps to its options after the subscription ended with it, and what a
+ * paired relay replays after a link gap keeps to them too. An event that several of the
+ * watcher's subscriptions took goes when the first of them lets it; the
+ * hourly cap stays the outer limit. Held events are undelivered rows like
+ * any, so they and their timers survive a restart (planDelivery).
+ *
+ * The watcher's own turns: a prompt it sent with send or create_session is
+ * noted (noteOwnPrompt). While it waits for the reply (beginOwnWait) that
+ * turn's turn_end is held; a wait that returns the finished reply
+ * (endOwnWait with `received`) drops it, and a turn_end that comes later is
+ * never recorded for it. Errors and questions of the turn still go.
+ *
  * `transferSubscriptions` moves every subscription of one watcher, with its
  * undelivered events, to another: a watcher is replaced without a moment
  * where events go nowhere.
@@ -64,6 +88,7 @@ import {
   RELAY_EVENT_LINK_LOST_TYPE,
   RELAY_EVENT_LINK_RESTORED_TYPE,
   RELAY_EVENT_MESSAGE_KIND,
+  RELAY_EVENT_QUESTION_ANSWERED_TYPE,
   RELAY_EVENT_RELAY_LEVEL_TYPES,
   RELAY_EVENT_RELAY_RESTARTED_TYPE,
   RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
@@ -77,7 +102,9 @@ import {
   isRelayEventType,
   isRelayLevelOnly,
   isUrgentRelayEventType,
+  normalizeRelayEventQuietHours,
   relayEventMatchText,
+  relayEventQuietWindowEnd,
   relayEventTypesTake,
 } from '../../shared/relay-events.mjs';
 
@@ -145,10 +172,19 @@ export const RELAY_EVENT_PRUNE_SQL = Object.freeze({
     DELETE FROM relay_event_subscriptions WHERE ended_at IS NOT NULL AND ended_at < ?
   `,
 });
+// A turn_end held while the watcher waits for that turn's reply goes anyway
+// this long after the wait should have ended (a wait that never reported).
+const OWN_WAIT_GRACE_MS = 60_000;
+// The watcher's own prompts are kept a day: longer than any digest or quiet
+// window holds their turn_end.
+export const RELAY_EVENT_OWN_PROMPT_KEEP_MS = 25 * HOUR_MS;
 // A watched set must look idle twice, this far apart, before all_idle fires:
 // a task's end and the continuation turn it opens are seconds apart.
 const ALL_IDLE_SETTLE_MS = 10_000;
 const LOG_PREFIX = '[relay-events]';
+// The `subscription_id` of an answer told to the conversations that asked:
+// no subscription stands behind it (noteQuestionAnswered).
+const ASK_DELIVERY_PREFIX = 'ask:';
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -261,7 +297,16 @@ export function createRelayEventService({
     `),
     listEventsOfMessage: db.prepare(`SELECT * FROM relay_events WHERE message_id = ? ORDER BY id ASC`),
     markDelivered: db.prepare(`UPDATE relay_events SET delivered_at = ?, message_id = ? WHERE id = ?`),
+    setEventPayload: db.prepare(`UPDATE relay_events SET payload_json = ? WHERE id = ?`),
+    deleteEvent: db.prepare(`DELETE FROM relay_events WHERE id = ? AND delivered_at IS NULL`),
     dropUndelivered: db.prepare(`DELETE FROM relay_events WHERE watcher_conversation_id = ? AND delivered_at IS NULL`),
+    // An answer to the watcher's own ask is owed without a subscription.
+    dropUndeliveredUnowed: db.prepare(`
+      DELETE FROM relay_events WHERE watcher_conversation_id = ? AND delivered_at IS NULL
+        AND subscription_id NOT IN (SELECT id FROM relay_event_subscriptions WHERE end_reason = 'fired')
+        AND json_extract(payload_json, '$.ends') IS NULL
+        AND substr(subscription_id, 1, ${ASK_DELIVERY_PREFIX.length}) <> '${ASK_DELIVERY_PREFIX}'
+    `),
     // Wake-ups: the event messages that carried more than a heartbeat.
     countWakes: db.prepare(`
       SELECT COUNT(DISTINCT message_id) AS n FROM relay_events
@@ -320,6 +365,23 @@ export function createRelayEventService({
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `),
     take: db.prepare(`DELETE FROM app_settings WHERE key = ?`),
+  } : null;
+  // Migration 0019: without it a subscription takes no options and the
+  // watcher's own replies are delivered as before.
+  const optionsAvailable = available && db
+    .prepare(`PRAGMA table_info(relay_event_subscriptions)`).all().some((column) => column.name === 'quiet_hours_json');
+  const optionSql = optionsAvailable ? {
+    setOptions: db.prepare(`UPDATE relay_event_subscriptions SET digest_minutes = ?, quiet_hours_json = ?, exclude_json = ? WHERE id = ?`),
+    markDigestDelivered: db.prepare(`UPDATE relay_event_subscriptions SET digest_last_at = ? WHERE id = ?`),
+  } : null;
+  const ownSql = optionsAvailable && tableExists('relay_event_own_prompts') ? {
+    insert: db.prepare(`
+      INSERT OR IGNORE INTO relay_event_own_prompts (message_id, watcher_conversation_id, relay_id, session_id, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `),
+    get: db.prepare(`SELECT * FROM relay_event_own_prompts WHERE message_id = ?`),
+    markReceived: db.prepare(`UPDATE relay_event_own_prompts SET received_at = ? WHERE message_id = ? AND watcher_conversation_id = ?`),
+    pruneBefore: db.prepare(`DELETE FROM relay_event_own_prompts WHERE created_at < ?`),
   } : null;
   // Without migration 0012 the table has no remote_sync column.
   const deleteEndedSubscriptionsBefore = available
@@ -406,6 +468,11 @@ export function createRelayEventService({
   const idleSinceBySubscription = new Map();
   // heartbeat: subscription id → since when its watched set has been busy
   const busySinceBySubscription = new Map();
+  // `${watcher}\n${messageId}` → { count, until }: the watcher waits for
+  // the reply to its own prompt; that turn's turn_end is held meanwhile.
+  const ownWaits = new Map();
+  // quiet_hours_json → the checked window (or null)
+  const quietCache = new Map();
   let allIdleTimer = null;
   let sweepTimer = null;
   let started = false;
@@ -448,8 +515,38 @@ export function createRelayEventService({
     return effectiveRelayEventTypes(parseJson(row?.events_json, []));
   }
 
+  function quietOf(row) {
+    const text = toText(row?.quiet_hours_json);
+    if (!text) return null;
+    if (!quietCache.has(text)) quietCache.set(text, normalizeRelayEventQuietHours(parseJson(text, null)).value || null);
+    return quietCache.get(text);
+  }
+
+  /** A subscription's options: `{ digest, quiet, exclude }` (0, null, [] when off). */
+  function optionsOf(row) {
+    const digest = Number(row?.digest_minutes) > 0 ? Math.trunc(Number(row.digest_minutes)) : 0;
+    const exclude = toText(row?.scope) === 'all' ? parseJson(row?.exclude_json, []) : [];
+    return {
+      digest,
+      quiet: quietOf(row),
+      exclude: (Array.isArray(exclude) ? exclude : []).map(toText).filter(Boolean),
+    };
+  }
+
+  function excludes(row, sessionId) {
+    const id = toText(sessionId);
+    return !!id && optionsOf(row).exclude.includes(id);
+  }
+
+  /** Whether `at` falls in the subscription's quiet window. */
+  function inQuietHours(row, at = now()) {
+    const quiet = quietOf(row);
+    return !!quiet && relayEventQuietWindowEnd(quiet, at) !== null;
+  }
+
   function shapeSubscription(row) {
     if (!row) return null;
+    const options = optionsOf(row);
     const scope = toText(row.scope) === 'all' ? 'all' : 'sessions';
     const sessionIds = scope === 'all' ? [] : parseJson(row.session_ids_json, []).map(toText).filter(Boolean);
     const mirror = isMirror(row);
@@ -484,6 +581,9 @@ export function createRelayEventService({
       ...(toText(row.match) ? { match: row.match } : {}),
       stalledMinutes: Number(row.stalled_minutes) || RELAY_EVENT_LIMITS.stalledMinutesDefault,
       ...(Number(row.heartbeat_minutes) > 0 ? { heartbeatMinutes: Number(row.heartbeat_minutes) } : {}),
+      ...(options.digest ? { digestMinutes: options.digest } : {}),
+      ...(options.quiet ? { quietHours: options.quiet } : {}),
+      ...(options.exclude.length ? { exclude: options.exclude } : {}),
       createdAt: row.created_at,
       ...(row.ended_at ? { endedAt: row.ended_at, endReason: row.end_reason || null } : {}),
       firedCount: Number(row.fired_count || 0),
@@ -523,23 +623,115 @@ export function createRelayEventService({
     }
   }
 
-  /** A watcher's subscriptions: the active ones and those that ended within the hour. */
+  /**
+   * A watcher's subscriptions: the active ones and those that ended within
+   * the hour. An active one says how many of its events its digest or quiet
+   * window holds (`heldCount`) and when the first of them is due
+   * (`nextDeliveryAt`, null when none is held).
+   */
   function listSubscriptions({ watcherConversationId, includeEndedSinceMs = HOUR_MS } = {}) {
     if (!available) return [];
+    const watcher = toText(watcherConversationId);
     const since = new Date(now() - includeEndedSinceMs).toISOString();
-    return sql.listForWatcher.all(toText(watcherConversationId), since).map(shapeSubscription);
+    const held = heldBySubscription(watcher);
+    return sql.listForWatcher.all(watcher, since).map((row) => {
+      const shaped = shapeSubscription(row);
+      const mine = held.get(row.id);
+      // An ended one says so only while its last event (a one-shot's) is held.
+      if (shaped.endedAt && !mine) return shaped;
+      return { ...shaped, heldCount: mine?.count || 0, nextDeliveryAt: mine ? new Date(mine.next).toISOString() : null };
+    });
+  }
+
+  /** subscription id → `{ count, next }` of the watcher's events its options hold now. */
+  function heldBySubscription(watcher) {
+    const held = new Map();
+    if (!watcher || isServedKey(watcher)) return held;
+    let rows = [];
+    try {
+      rows = sql.listUndelivered.all(watcher);
+    } catch {
+      return held;
+    }
+    const at = now();
+    for (const entry of planDelivery(watcher, rows)) {
+      if (!entry.subscriptionId || entry.releaseAt <= at) continue;
+      const current = held.get(entry.subscriptionId) || { count: 0, next: Infinity };
+      current.count += 1;
+      current.next = Math.min(current.next, entry.releaseAt);
+      held.set(entry.subscriptionId, current);
+    }
+    return held;
   }
 
   // ─── Subscribe / unsubscribe ───────────────────────────────────────────────
 
   /**
-   * What a subscribe asks for, checked: `{ all, ids, types, matchText,
-   * stalled, heartbeat }`. Throws RelayEventError (`invalid`, `notFound`).
-   * `exclude` is the watcher, never watched by itself. `relayLevel` allows
-   * relay_restarted (this relay's own watchers only); a subscription that
-   * names nothing else needs no sessions.
+   * A subscription's options, checked: `{ digest, quiet, exclude }` (null,
+   * null, [] when not asked for). `exclude` goes with "all" only. Throws
+   * RelayEventError (`invalid`, `unavailable` without migration 0019).
    */
-  function prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude = '', relayLevel = false }) {
+  function prepareOptions({ all, digestMinutes = null, quietHours = null, exclude = null }) {
+    let digest = null;
+    if (digestMinutes !== null && digestMinutes !== undefined && digestMinutes !== '') {
+      const number = Number(digestMinutes);
+      if (!Number.isFinite(number)) throw new RelayEventError('invalid', 'digest_minutes must be a number of minutes');
+      digest = Math.min(RELAY_EVENT_LIMITS.digestMinutesMax, Math.max(RELAY_EVENT_LIMITS.digestMinutesMin, Math.trunc(number)));
+    }
+    const quiet = normalizeRelayEventQuietHours(quietHours);
+    if (!quiet.ok) throw new RelayEventError('invalid', quiet.error);
+    const excluded = [...new Set((Array.isArray(exclude) ? exclude : []).map(toText).filter(Boolean))].map((id) => id.slice(0, 200));
+    if (excluded.length && !all) {
+      throw new RelayEventError('invalid', 'exclude goes with sessions ["all"] only; a list of sessions names what it watches.');
+    }
+    if (excluded.length > RELAY_EVENT_LIMITS.excludeMax) {
+      throw new RelayEventError('invalid', `exclude takes at most ${RELAY_EVENT_LIMITS.excludeMax} sessions.`);
+    }
+    if ((digest !== null || quiet.value || excluded.length) && !optionsAvailable) {
+      throw new RelayEventError('unavailable', 'digest_minutes, quiet_hours and exclude are not available on this relay right now (its storage is missing; see the server log).');
+    }
+    return { digest, quiet: quiet.value, exclude: excluded };
+  }
+
+  function optionsLogText(options) {
+    const parts = [
+      options?.digest ? `digest ${options.digest} min` : '',
+      options?.quiet ? `quiet ${options.quiet.from}-${options.quiet.to} ${options.quiet.tz}` : '',
+      options?.exclude?.length ? `${options.exclude.length} excluded` : '',
+    ].filter(Boolean);
+    return parts.length ? ` [${parts.join(', ')}]` : '';
+  }
+
+  function storeOptions(id, options) {
+    if (!optionSql || !options) return;
+    optionSql.setOptions.run(
+      options.digest ?? null,
+      options.quiet ? JSON.stringify(options.quiet) : null,
+      options.exclude?.length ? JSON.stringify(options.exclude) : null,
+      id,
+    );
+  }
+
+  /**
+   * What a subscribe asks for, checked: `{ all, ids, types, matchText,
+   * stalled, heartbeat, options }`. Throws RelayEventError (`invalid`,
+   * `notFound`). `ownId` is the watcher, never watched by itself.
+   * `relayLevel` allows relay_restarted (this relay's own watchers only); a
+   * subscription that names nothing else needs no sessions.
+   */
+  function prepareSubscription({
+    scope,
+    sessionIds,
+    events,
+    match,
+    stalledMinutes,
+    heartbeatMinutes,
+    digestMinutes = null,
+    quietHours = null,
+    exclude = null,
+    ownId = '',
+    relayLevel = false,
+  }) {
     const all = scope === 'all';
     const ids = all ? [] : [...new Set((Array.isArray(sessionIds) ? sessionIds : []).map(toText).filter(Boolean))];
     const named = Array.isArray(events) ? events.map(toText).filter(Boolean) : [];
@@ -557,9 +749,10 @@ export function createRelayEventService({
     if (ids.length > RELAY_EVENT_LIMITS.sessionsMax) {
       throw new RelayEventError('invalid', `subscribe takes at most ${RELAY_EVENT_LIMITS.sessionsMax} sessions; use "all" for more.`);
     }
-    if (exclude && ids.includes(exclude)) {
-      throw new RelayEventError('ownSession', `Session ${exclude} is the conversation you are running in: it is never watched, events of your own turns would wake you up.`);
+    if (ownId && ids.includes(ownId)) {
+      throw new RelayEventError('ownSession', `Session ${ownId} is the conversation you are running in: it is never watched, events of your own turns would wake you up.`);
     }
+    const options = prepareOptions({ all, digestMinutes, quietHours, exclude });
     const missing = ids.filter((id) => !isLive(conversation(id)));
     if (missing.length) {
       throw new RelayEventError('notFound', `No live session with id ${missing.join(', ')} on this relay (archived sessions cannot be watched).`, { sessions: missing });
@@ -581,7 +774,7 @@ export function createRelayEventService({
       ? null
       : Math.min(RELAY_EVENT_LIMITS.heartbeatMinutesMax, Math.max(RELAY_EVENT_LIMITS.heartbeatMinutesMin, Math.trunc(Number(heartbeatMinutes))));
     if (heartbeat !== null && !Number.isFinite(heartbeat)) throw new RelayEventError('invalid', 'heartbeat_minutes must be a number of minutes');
-    return { all, ids, types, matchText: toText(match) ? String(match) : null, stalled, heartbeat };
+    return { all, ids, types, matchText: toText(match) ? String(match) : null, stalled, heartbeat, options };
   }
 
   /**
@@ -599,34 +792,42 @@ export function createRelayEventService({
     match = '',
     stalledMinutes = null,
     heartbeatMinutes = null,
+    digestMinutes = null,
+    quietHours = null,
+    exclude = null,
   } = {}) {
     if (!available) throw new RelayEventError('unavailable', 'Event subscriptions are not available on this relay right now (its storage is missing; see the server log).');
     const watcher = toText(watcherConversationId);
     if (!isLive(conversation(watcher))) throw new RelayEventError('notFound', 'The watching conversation was not found or is archived.');
-    const prepared = prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude: watcher, relayLevel: true });
+    const prepared = prepareSubscription({
+      scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, digestMinutes, quietHours, exclude, ownId: watcher, relayLevel: true,
+    });
     const { all, ids, types } = prepared;
     checkWatcherCapacity(watcher);
     const id = `sub_${randomBytes(5).toString('hex')}`;
     const at = isoNow();
-    sql.insertSubscription.run(
-      id,
-      watcher,
-      RELAY_EVENT_SELF_RELAY_ID,
-      all ? 'all' : 'sessions',
-      all ? null : JSON.stringify(ids),
-      JSON.stringify(types),
-      once ? 1 : 0,
-      prepared.matchText,
-      prepared.stalled,
-      prepared.heartbeat,
-      at,
-    );
+    db.transaction(() => {
+      sql.insertSubscription.run(
+        id,
+        watcher,
+        RELAY_EVENT_SELF_RELAY_ID,
+        all ? 'all' : 'sessions',
+        all ? null : JSON.stringify(ids),
+        JSON.stringify(types),
+        once ? 1 : 0,
+        prepared.matchText,
+        prepared.stalled,
+        prepared.heartbeat,
+        at,
+      );
+      storeOptions(id, prepared.options);
+    })();
     const subscription = shapeSubscription(sql.getSubscription.get(id));
     // The watched set starts from what it is doing now: all_idle fires when
     // work that is running now (or starts later) has ended.
     noteBusy(sql.getSubscription.get(id));
     const what = all ? 'all sessions' : (ids.length ? `${ids.length} session${ids.length === 1 ? '' : 's'}` : 'this relay');
-    log(`conv=${shortId(watcher)} subscribed ${id} to ${what} (${types.join(',')})${once ? ' once' : ''}`);
+    log(`conv=${shortId(watcher)} subscribed ${id} to ${what} (${types.join(',')})${once ? ' once' : ''}${optionsLogText(prepared.options)}`);
     broadcast();
     return subscription;
   }
@@ -790,10 +991,13 @@ export function createRelayEventService({
       // A paired relay's events wait for its fetch (and the retention bound):
       // its subscription's last events and its end must still reach it.
       if (stillWatching.has(watcher) || isServedKey(watcher)) continue;
-      try { sql.dropUndelivered.run(watcher); } catch {}
+      // The event of a one-shot subscription that fired is still owed: it
+      // may be held by that subscription's options.
+      try { sql.dropUndeliveredUnowed.run(watcher); } catch {}
       const pending = flushTimers.get(watcher);
       if (pending) clearTimer(pending.timer);
       flushTimers.delete(watcher);
+      scheduleFlush(watcher);
     }
   }
 
@@ -833,7 +1037,7 @@ export function createRelayEventService({
 
   function subscriptionCovers(row, sessionId) {
     if (row.watcher_conversation_id === sessionId) return false;
-    if (toText(row.scope) === 'all') return true;
+    if (toText(row.scope) === 'all') return !excludes(row, sessionId);
     return parseJson(row.session_ids_json, []).map(toText).includes(sessionId);
   }
 
@@ -903,6 +1107,12 @@ export function createRelayEventService({
       const ending = heartbeat ? [] : matches
         .filter(({ row, hit }) => Number(row.once || 0) === 1 && (!toText(row.match) || hit))
         .map(({ row }) => row.id);
+      // The watcher already has this reply: it waited for it itself. One
+      // that ends a one-shot subscription still goes, or it would never end.
+      if (!ending.length && ownReplyReceived(watcher, event)) {
+        log(`conv=${shortId(watcher)} turn_end of ${shortId(sessionId)} not recorded: the watcher received that reply itself`);
+        continue;
+      }
       const payload = { ...stored, subscriptionIds: matches.map(({ row }) => row.id), ...(ending.length ? { ends: ending } : {}) };
       sql.insertEvent.run(first.id, watcher, RELAY_EVENT_SELF_RELAY_ID, sessionId || '', event.type, urgent ? 1 : 0, JSON.stringify(payload), event.at);
       if (!heartbeat) for (const { row } of matches) sql.markFired.run(event.at, row.id);
@@ -940,7 +1150,107 @@ export function createRelayEventService({
     return Math.max(now(), last + RELAY_EVENT_LIMITS.digestIntervalMs);
   }
 
-  function dueAtFor(watcher, undelivered) {
+  // ─── Held events: options and the watcher's own waits ─────────────────────
+
+  function ownWaitKey(watcher, messageId) {
+    return `${watcher}\n${messageId}`;
+  }
+
+  /** Until when a turn_end waits for the watcher's own wait on its reply, or 0. */
+  function ownWaitHold(watcher, row, payload) {
+    if (toText(row.type) !== 'turn_end') return 0;
+    const messageId = toText(payload?.detail?.messageId);
+    if (!messageId) return 0;
+    const wait = ownWaits.get(ownWaitKey(watcher, messageId));
+    return wait && wait.until > now() ? wait.until : 0;
+  }
+
+  /** Whether a turn_end is of the watcher's own prompt whose finished reply it received. */
+  function ownReplyReceived(watcher, event) {
+    if (!ownSql || toText(event?.type) !== 'turn_end') return false;
+    const messageId = toText(event?.detail?.messageId);
+    if (!messageId) return false;
+    try {
+      const own = ownSql.get.get(messageId);
+      return !!own && own.watcher_conversation_id === watcher && !!own.received_at;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * When one subscription lets a non-urgent event go: at once without
+   * options; with a digest, digest_minutes after its last digest row (or its
+   * start); a time inside the quiet window moves to the window's end.
+   */
+  function optionRelease(sub, row) {
+    const open = { releaseAt: 0, held: null, subscriptionId: null, digestSubscriptionId: null };
+    if (!sub) return open;
+    const { digest, quiet } = optionsOf(sub);
+    if (!digest && !quiet) return open;
+    let releaseAt = Date.parse(String(row.created_at)) || now();
+    let held = null;
+    if (digest) {
+      const last = Date.parse(String(sub.digest_last_at || '')) || Date.parse(String(sub.created_at || '')) || 0;
+      releaseAt = Math.max(releaseAt, last + digest * 60_000);
+      held = { reason: 'digest', minutes: digest, subscriptionId: sub.id };
+    }
+    if (quiet) {
+      const end = relayEventQuietWindowEnd(quiet, releaseAt);
+      if (end !== null) {
+        releaseAt = end;
+        held = { reason: 'quiet', ...quiet };
+      }
+    }
+    return { releaseAt, held, subscriptionId: sub.id, digestSubscriptionId: digest ? sub.id : null };
+  }
+
+  /**
+   * When each undelivered event of a watcher may go: `{ row, payload,
+   * releaseAt, held, subscriptionId, digestSubscriptionId }`, releaseAt 0
+   * for at once. Urgent events and heartbeats are never held; a turn_end the
+   * watcher is waiting for itself waits for that wait; the others go when
+   * the first of the subscriptions that took them lets them (one without
+   * options at once). Rebuilt from the rows and the subscriptions each
+   * time, so a restart changes nothing.
+   */
+  function planDelivery(watcher, rows) {
+    const subscriptions = new Map(activeRows().filter((row) => row.watcher_conversation_id === watcher).map((row) => [row.id, row]));
+    // A one-shot subscription ends as its event is recorded: that event
+    // still keeps to its options.
+    const subscriptionOf = (id) => {
+      if (subscriptions.has(id)) return subscriptions.get(id);
+      let row = null;
+      try {
+        row = sql.getSubscription.get(id) || null;
+      } catch {}
+      const fired = row && row.watcher_conversation_id === watcher && toText(row.end_reason) === 'fired' ? row : null;
+      subscriptions.set(id, fired);
+      return fired;
+    };
+    return rows.map((row) => {
+      const payload = parseJson(row.payload_json, null);
+      const open = { row, payload, releaseAt: 0, held: null, subscriptionId: null, digestSubscriptionId: null };
+      if (Number(row.urgent) === 1 || isHeartbeatRow(row)) return open;
+      const waitUntil = ownWaitHold(watcher, row, payload);
+      if (waitUntil) return { ...open, releaseAt: waitUntil };
+      const named = Array.isArray(payload?.subscriptionIds) && payload.subscriptionIds.length
+        ? payload.subscriptionIds.map(toText)
+        : [toText(row.subscription_id)];
+      // A subscription that ended otherwise (unsubscribed) has no say any
+      // more; with none left that has, the event goes as usual.
+      let best = null;
+      for (const id of named) {
+        const subscription = subscriptionOf(id);
+        if (!subscription) continue;
+        const option = optionRelease(subscription, row);
+        if (!best || option.releaseAt < best.releaseAt) best = option;
+      }
+      return best ? { ...open, ...best } : open;
+    });
+  }
+
+  function readyDue(watcher, undelivered) {
     if (undelivered.some((row) => Number(row.urgent) === 1)) return now();
     if (overCap(watcher)) {
       // Heartbeats are not held for the digest: they go after the usual
@@ -955,6 +1265,15 @@ export function createRelayEventService({
     return coalescedDue(undelivered);
   }
 
+  /** The next flush: what is ready by the usual rules, else the first held event's time. */
+  function dueAtFor(watcher, plan) {
+    const at = now();
+    const ready = plan.filter((entry) => entry.releaseAt <= at).map((entry) => entry.row);
+    const dues = plan.filter((entry) => entry.releaseAt > at).map((entry) => entry.releaseAt);
+    if (ready.length) dues.push(readyDue(watcher, ready));
+    return Math.min(...dues);
+  }
+
   function scheduleFlush(watcher, { urgent = false } = {}) {
     // A paired relay's events wait for its fetch.
     if (isServedKey(watcher)) return;
@@ -965,7 +1284,7 @@ export function createRelayEventService({
       return;
     }
     if (!undelivered.length) return;
-    const dueAt = urgent ? now() : dueAtFor(watcher, undelivered);
+    const dueAt = urgent ? now() : dueAtFor(watcher, planDelivery(watcher, undelivered));
     const current = flushTimers.get(watcher);
     if (current && current.dueAt <= dueAt) return;
     if (current) clearTimer(current.timer);
@@ -982,17 +1301,24 @@ export function createRelayEventService({
   }
 
   /**
-   * Writes the watcher's undelivered events into its conversation now:
-   * appended to its event row that is still pending, else as a new message.
-   * Returns `{ messageId, merged, digest, count }` or null.
+   * Writes the watcher's undelivered events that are not held into its
+   * conversation now: appended to its event row that is still pending, else
+   * as a new message. Returns `{ messageId, merged, digest, count }` or null.
    */
   function flush(watcher) {
     if (!available || isServedKey(watcher)) return null;
-    let rows = sql.listUndelivered.all(watcher);
-    if (!rows.length) return null;
+    const undelivered = sql.listUndelivered.all(watcher);
+    if (!undelivered.length) return null;
     const target = conversation(watcher);
     if (!isLive(target)) {
       sql.dropUndelivered.run(watcher);
+      return null;
+    }
+    const readyAt = now();
+    const plan = new Map(planDelivery(watcher, undelivered).filter((entry) => entry.releaseAt <= readyAt).map((entry) => [entry.row.id, entry]));
+    let rows = undelivered.filter((row) => plan.has(row.id));
+    if (!rows.length) {
+      scheduleFlush(watcher);
       return null;
     }
     const urgent = rows.some((row) => Number(row.urgent) === 1);
@@ -1012,11 +1338,22 @@ export function createRelayEventService({
         digest = rows.some((row) => !isHeartbeatRow(row));
       }
     }
-    const events = rows.map((row) => parseJson(row.payload_json, null)).filter(Boolean);
+    // An event a subscription's options held says so in its line's message;
+    // the mark is stored, for the text rebuilt when more is appended.
+    const marked = rows.map((row) => {
+      const { payload, held } = plan.get(row.id);
+      return { row, payload: payload && held ? { ...payload, held } : payload, held };
+    });
+    const events = marked.map((entry) => entry.payload).filter(Boolean);
     const ended = [...new Set(events.flatMap((event) => (Array.isArray(event.ends) ? event.ends : [])))];
+    const digestSubscriptions = [...new Set(rows.map((row) => plan.get(row.id).digestSubscriptionId).filter(Boolean))];
     const at = isoNow();
     let result = null;
     const write = db.transaction(() => {
+      for (const entry of marked) {
+        if (entry.held && entry.payload) sql.setEventPayload.run(JSON.stringify(entry.payload), entry.row.id);
+      }
+      for (const id of digestSubscriptions) optionSql?.markDigestDelivered.run(at, id);
       const pending = sql.findPendingEventRow.get(watcher, RELAY_EVENT_MESSAGE_KIND) || null;
       if (pending) {
         const earlier = sql.listEventsOfMessage.all(pending.id).map((row) => parseJson(row.payload_json, null)).filter(Boolean);
@@ -1148,13 +1485,17 @@ export function createRelayEventService({
     match = '',
     stalledMinutes = null,
     heartbeatMinutes = null,
+    exclude = null,
     dryRun = false,
   } = {}) {
     if (!available) throw new RelayEventError('unavailable', 'Event subscriptions are not available on this relay right now (its storage is missing; see the server log).');
     requireCross();
     const subscriber = subscriberOf(subscriberRelayId);
     const watcher = toText(watcherId).slice(0, 200);
-    const prepared = prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes });
+    // Digest and quiet hours are the watching relay's to apply; the sessions
+    // an "all" subscription leaves out matter here too (all_idle, stalled,
+    // the heartbeat's list).
+    const prepared = prepareSubscription({ scope, sessionIds, events, match, stalledMinutes, heartbeatMinutes, exclude });
     const { all, ids, types } = prepared;
     if (Number(remoteSql.countServedOfWatcher.get(subscriber, watcher)?.n || 0) >= RELAY_EVENT_LIMITS.activeSubscriptionsPerWatcher) {
       throw new RelayEventError('limit', `That conversation already has ${RELAY_EVENT_LIMITS.activeSubscriptionsPerWatcher} subscriptions on this relay; unsubscribe one first.`);
@@ -1172,28 +1513,32 @@ export function createRelayEventService({
         ...(prepared.matchText ? { match: prepared.matchText } : {}),
         stalledMinutes: prepared.stalled,
         ...(prepared.heartbeat ? { heartbeatMinutes: prepared.heartbeat } : {}),
+        ...(prepared.options.exclude.length ? { exclude: prepared.options.exclude } : {}),
       };
     }
     const id = `sub_${randomBytes(5).toString('hex')}`;
     const at = isoNow();
-    remoteSql.insertServed.run(
-      id,
-      servedWatcherKey(subscriber),
-      RELAY_EVENT_SELF_RELAY_ID,
-      all ? 'all' : 'sessions',
-      all ? null : JSON.stringify(ids),
-      JSON.stringify(types),
-      once ? 1 : 0,
-      prepared.matchText,
-      prepared.stalled,
-      prepared.heartbeat,
-      at,
-      subscriber,
-      toText(subscriberRelayName).slice(0, 60) || null,
-      watcher || null,
-      toText(watcherTitle).slice(0, 200) || null,
-      at,
-    );
+    db.transaction(() => {
+      remoteSql.insertServed.run(
+        id,
+        servedWatcherKey(subscriber),
+        RELAY_EVENT_SELF_RELAY_ID,
+        all ? 'all' : 'sessions',
+        all ? null : JSON.stringify(ids),
+        JSON.stringify(types),
+        once ? 1 : 0,
+        prepared.matchText,
+        prepared.stalled,
+        prepared.heartbeat,
+        at,
+        subscriber,
+        toText(subscriberRelayName).slice(0, 60) || null,
+        watcher || null,
+        toText(watcherTitle).slice(0, 200) || null,
+        at,
+      );
+      storeOptions(id, { exclude: prepared.options.exclude });
+    })();
     const row = sql.getSubscription.get(id);
     noteBusy(row);
     log(`relay ${shortId(subscriber)} subscribed ${id} to ${all ? 'all sessions' : `${ids.length} session${ids.length === 1 ? '' : 's'}`} (${types.join(',')})${once ? ' once' : ''}`);
@@ -1323,9 +1668,12 @@ export function createRelayEventService({
   /**
    * Stores this relay's side of a subscription a paired relay accepted:
    * `remote` is that relay's subscription (id, scope, sessions with titles,
-   * events, …). Returns the subscription as list_subscriptions shows it.
+   * events, …). `digestMinutes`, `quietHours` and `exclude` are applied
+   * here, where the events are delivered (exclude also to what that relay
+   * sends, should it not know the option). Returns the subscription as
+   * list_subscriptions shows it.
    */
-  function addMirror({ watcherConversationId, relayId, relayName = '', remote } = {}) {
+  function addMirror({ watcherConversationId, relayId, relayName = '', remote, digestMinutes = null, quietHours = null, exclude = null } = {}) {
     if (!available) throw new RelayEventError('unavailable', 'Event subscriptions are not available on this relay right now.');
     requireCross();
     const watcher = toText(watcherConversationId);
@@ -1335,27 +1683,31 @@ export function createRelayEventService({
     if (!isLive(conversation(watcher))) throw new RelayEventError('notFound', 'The watching conversation was not found or is archived.');
     checkWatcherCapacity(watcher);
     const all = remote.scope === 'all';
+    const options = prepareOptions({ all, digestMinutes, quietHours, exclude });
     const sessions = all ? [] : (Array.isArray(remote.sessions) ? remote.sessions : [])
       .map((session) => ({ id: toText(session?.id), title: toText(session?.title) || null }))
       .filter((session) => session.id);
     const types = (Array.isArray(remote.events) ? remote.events : []).filter((type) => RELAY_EVENT_SUBSCRIBABLE_TYPES.includes(type));
     const id = `sub_${randomBytes(5).toString('hex')}`;
     const at = isoNow();
-    remoteSql.insertMirror.run(
-      id,
-      watcher,
-      relay,
-      all ? 'all' : 'sessions',
-      all ? null : JSON.stringify(sessions.map((session) => session.id)),
-      JSON.stringify(types.length ? types : [...RELAY_EVENT_DEFAULT_TYPES]),
-      remote.once === true ? 1 : 0,
-      toText(remote.match) ? String(remote.match) : null,
-      Number(remote.stalledMinutes) || RELAY_EVENT_LIMITS.stalledMinutesDefault,
-      Number(remote.heartbeatMinutes) > 0 ? Number(remote.heartbeatMinutes) : null,
-      at,
-      remoteId,
-      JSON.stringify({ relayName: toText(relayName) || null, sessions }),
-    );
+    db.transaction(() => {
+      remoteSql.insertMirror.run(
+        id,
+        watcher,
+        relay,
+        all ? 'all' : 'sessions',
+        all ? null : JSON.stringify(sessions.map((session) => session.id)),
+        JSON.stringify(types.length ? types : [...RELAY_EVENT_DEFAULT_TYPES]),
+        remote.once === true ? 1 : 0,
+        toText(remote.match) ? String(remote.match) : null,
+        Number(remote.stalledMinutes) || RELAY_EVENT_LIMITS.stalledMinutesDefault,
+        Number(remote.heartbeatMinutes) > 0 ? Number(remote.heartbeatMinutes) : null,
+        at,
+        remoteId,
+        JSON.stringify({ relayName: toText(relayName) || null, sessions }),
+      );
+      storeOptions(id, options);
+    })();
     noteRemoteLinkOk(relay);
     log(`conv=${shortId(watcher)} subscribed ${id} on a paired relay (${remoteId} there)`);
     broadcast();
@@ -1417,6 +1769,11 @@ export function createRelayEventService({
     prompt: 'text',
     questionId: 'text',
     approvalCard: 'bool',
+    // question_answered
+    answer: 'text',
+    choice: 'text',
+    dismissed: 'bool',
+    via: 'text',
     description: 'text',
     summary: 'text',
     taskId: 'text',
@@ -1482,7 +1839,9 @@ export function createRelayEventService({
    * session changes there end or update the mirrors, confirmed ends clear
    * their sync mark, and the cursor moves, all in one transaction. With
    * `replay` (the first fetch after a gap) events are marked replayed and
-   * urgent and nothing is flushed yet: noteRemoteLinkRestored does that.
+   * nothing is flushed yet: noteRemoteLinkRestored does that. They keep to
+   * the subscriptions' options like any event (questions and errors go at
+   * once).
    * Returns per watcher `{ kept, urgent, dropped, ended }`.
    */
   function applyRemotePull(relayId, { relayName = '', response = {}, replay = false } = {}) {
@@ -1503,16 +1862,23 @@ export function createRelayEventService({
         const payload = item?.payload && typeof item.payload === 'object' ? item.payload : null;
         if (!payload || !isRelayEventType(payload.type)) continue;
         const named = (Array.isArray(payload.subscriptionIds) ? payload.subscriptionIds : []).map(toText);
+        const payloadSessionId = payload.session && typeof payload.session === 'object' ? remoteText(payload.session.id, 200) : '';
         const groups = new Map();
         for (const remoteId of named) {
           const row = byRemote.get(remoteId);
           if (!row || row.ended_at) continue;
+          // Left out by this relay's exclude, should that relay not know it.
+          if (excludes(row, payloadSessionId)) continue;
           if (!groups.has(row.watcher_conversation_id)) groups.set(row.watcher_conversation_id, []);
           groups.get(row.watcher_conversation_id).push(row);
         }
         for (const [watcher, mine] of groups) {
+          // No heartbeat inside the quiet window (as for this relay's sessions).
+          if (toText(payload.type) === RELAY_EVENT_HEARTBEAT_TYPE && mine.every((row) => inQuietHours(row))) continue;
           const endingRemote = new Set((Array.isArray(payload.ends) ? payload.ends : []).map(toText));
           const ends = mine.filter((row) => endingRemote.has(row.remote_subscription_id)).map((row) => row.id);
+          // The watcher's own reply it received: dropped, unless it ends a one-shot subscription.
+          if (!ends.length && ownReplyReceived(watcher, { type: toText(payload.type), detail: { messageId: cleanRemoteDetail(payload.detail).messageId } })) continue;
           // The stored event is built from the allow-listed fields of the
           // payload, never from the payload itself.
           const detail = cleanRemoteDetail(payload.detail);
@@ -1532,7 +1898,7 @@ export function createRelayEventService({
             ...(ends.length ? { ends } : {}),
             ...(replay ? { replayed: true } : {}),
           };
-          const urgent = replay || item.urgent === true || isUrgentRelayEventType(event.type);
+          const urgent = item.urgent === true || isUrgentRelayEventType(event.type);
           sql.insertEvent.run(mine[0].id, watcher, relay, toText(event.session?.id), event.type, urgent ? 1 : 0, JSON.stringify(event), at);
           if (event.type !== RELAY_EVENT_HEARTBEAT_TYPE) for (const row of mine) sql.markFired.run(at, row.id);
           for (const id of ends) {
@@ -1791,6 +2157,85 @@ export function createRelayEventService({
     return { recorded, skipped };
   }
 
+  // ─── The watcher's own prompts ─────────────────────────────────────────────
+
+  /**
+   * The watcher sent a prompt with send or create_session (`messageId` is
+   * the prompt's, on this relay or a paired one). Returns whether it was noted.
+   */
+  function noteOwnPrompt({ watcherConversationId, relayId = RELAY_EVENT_SELF_RELAY_ID, sessionId, messageId } = {}) {
+    const watcher = toText(watcherConversationId);
+    const id = toText(messageId);
+    if (!ownSql || !watcher || !id) return false;
+    try {
+      ownSql.insert.run(id, watcher, toText(relayId) || RELAY_EVENT_SELF_RELAY_ID, toText(sessionId), isoNow());
+      return true;
+    } catch (error) {
+      warn(`own prompt not noted conv=${shortId(watcher)}: ${toText(error?.message || error).slice(0, 200)}`);
+      return false;
+    }
+  }
+
+  /**
+   * The watcher starts waiting (up to `waitMs`) for the reply to a prompt
+   * it noted: until endOwnWait, that turn's turn_end is held. Returns the
+   * token for endOwnWait, or null for a prompt that is not its own.
+   */
+  function beginOwnWait({ watcherConversationId, messageId, waitMs = 0 } = {}) {
+    const watcher = toText(watcherConversationId);
+    const id = toText(messageId);
+    if (!ownSql || !watcher || !id) return null;
+    try {
+      const own = ownSql.get.get(id);
+      if (!own || own.watcher_conversation_id !== watcher) return null;
+    } catch {
+      return null;
+    }
+    const key = ownWaitKey(watcher, id);
+    const wait = ownWaits.get(key) || { count: 0, until: 0 };
+    wait.count += 1;
+    wait.until = Math.max(wait.until, now() + Math.max(0, Number(waitMs) || 0) + OWN_WAIT_GRACE_MS);
+    ownWaits.set(key, wait);
+    return { watcher, messageId: id };
+  }
+
+  /**
+   * The wait ended. `received`: it returned the finished reply (status done
+   * with the reply), so the turn's turn_end is dropped (unless it ends a
+   * one-shot subscription, which the watcher must hear of) and one that
+   * comes later is not recorded. Otherwise the held turn_end goes as usual.
+   */
+  function endOwnWait(token, { received = false } = {}) {
+    const watcher = toText(token?.watcher);
+    const id = toText(token?.messageId);
+    if (!watcher || !id) return 0;
+    const key = ownWaitKey(watcher, id);
+    const wait = ownWaits.get(key);
+    if (wait) {
+      wait.count -= 1;
+      if (wait.count <= 0) ownWaits.delete(key);
+    }
+    let dropped = 0;
+    if (received && ownSql) {
+      try {
+        db.transaction(() => {
+          ownSql.markReceived.run(isoNow(), id, watcher);
+          for (const row of sql.listUndelivered.all(watcher)) {
+            if (toText(row.type) !== 'turn_end' || Number(row.urgent) === 1) continue;
+            const payload = parseJson(row.payload_json, null);
+            if (toText(payload?.detail?.messageId) !== id || (Array.isArray(payload?.ends) && payload.ends.length)) continue;
+            dropped += sql.deleteEvent.run(row.id).changes;
+          }
+        })();
+      } catch (error) {
+        warn(`own reply not marked conv=${shortId(watcher)}: ${toText(error?.message || error).slice(0, 200)}`);
+      }
+      if (dropped) log(`conv=${shortId(watcher)} received the reply it waited for: ${dropped} turn_end not delivered`);
+    }
+    scheduleFlush(watcher);
+    return dropped;
+  }
+
   // ─── Hooks ─────────────────────────────────────────────────────────────────
 
   function isRelayEventTurn(queueMessageId) {
@@ -1863,7 +2308,65 @@ export function createRelayEventService({
       options,
       questionId: toText(question.id),
       ...(toText(context?.source) === 'remote_relay' ? { approvalCard: true } : {}),
+      // A question that does not block (remote_relay ask).
+      ...(toText(question.kind) === 'ask' ? { kind: 'ask' } : {}),
     });
+  }
+
+  /**
+   * The owner answered or dismissed a question that does not block
+   * (services/relay-ask-service.mjs). Each conversation in `notify` (the
+   * session the ask is in and the conversation whose agent asked, both of
+   * this relay) is told at once, whether it subscribed or not; then the
+   * subscriptions on that session that take question_asked, as for any
+   * event (paired relays' through their fetch), each watcher once. For an
+   * ask kept on a paired relay (this relay's agent asked there) `relay` and
+   * `sessionTitle` describe it, and only `notify` is told. Returns how many
+   * conversations or watchers got it.
+   */
+  function noteQuestionAnswered({ sessionId, sessionTitle = null, relay = null, notify = [], detail = {} } = {}) {
+    if (!available) return 0;
+    const id = toText(sessionId);
+    const questionId = toText(detail.questionId);
+    if (!id || !questionId) return 0;
+    const clean = {
+      questionId,
+      prompt: String(detail.prompt ?? '').slice(0, 2000),
+      ...(detail.dismissed === true
+        ? { dismissed: true }
+        : { answer: String(detail.answer ?? '').slice(0, 2000), choice: toText(detail.choice).slice(0, 200) }),
+      kind: 'ask',
+    };
+    // Where the answer came from: a paired relay's Inbox, else this relay
+    // (or, for an ask kept on a paired relay, what that relay said).
+    const remoteId = toText(relay?.id);
+    const remote = !!remoteId && remoteId !== RELAY_EVENT_SELF_RELAY_ID;
+    const via = toText(detail.via).slice(0, 60) || (remote ? toText(relay?.name) : toText(relayName())) || '';
+    if (via) clean.via = via;
+    const event = remote
+      ? {
+        v: RELAY_EVENT_VERSION,
+        relay: { id: remoteId, name: toText(relay.name) || remoteId },
+        session: { id, title: toText(sessionTitle) || null },
+        type: RELAY_EVENT_QUESTION_ANSWERED_TYPE,
+        at: isoNow(),
+        detail: clean,
+      }
+      : buildEvent(RELAY_EVENT_QUESTION_ANSWERED_TYPE, id, clean);
+    const told = new Set();
+    for (const watcher of new Set((Array.isArray(notify) ? notify : []).map(toText).filter(Boolean))) {
+      if (isServedKey(watcher) || !isLive(conversation(watcher))) continue;
+      sql.insertEvent.run(`${ASK_DELIVERY_PREFIX}${questionId}`, watcher, event.relay.id, id, event.type, 1, JSON.stringify({ ...event, subscriptionIds: [] }), event.at);
+      scheduleFlush(watcher, { urgent: true });
+      told.add(watcher);
+    }
+    let recorded = 0;
+    if (!remote) {
+      const rows = localWatchRows().filter((row) => !told.has(row.watcher_conversation_id) && wants(row, event) && subscriptionCovers(row, id));
+      if (rows.length) recorded = enqueueForRows(rows, event, id);
+    }
+    log(`question ${shortId(questionId)} of ${shortId(id)} ${clean.dismissed ? 'dismissed' : 'answered'}: told ${told.size} asking, ${recorded} watching`);
+    return told.size + recorded;
   }
 
   /** The tracker's edge: a background task started or ended. */
@@ -1922,6 +2425,7 @@ export function createRelayEventService({
     try { for (const r of sql.listRunningRunConversations.all()) ids.add(toText(r.conversation_id)); } catch {}
     for (const id of tracker?.knownConversationIds?.() || []) ids.add(toText(id));
     ids.delete(row.watcher_conversation_id);
+    for (const id of optionsOf(row).exclude) ids.delete(id);
     return [...ids].filter((id) => id && isLive(conversation(id)));
   }
 
@@ -1962,6 +2466,9 @@ export function createRelayEventService({
       const busy = busyEntries(row);
       noteHeartbeatBusy(row, busy.length > 0);
       if (!busy.length) continue;
+      // None inside the quiet window: held, it would only say late that the
+      // watching worked. The first after the window comes at once.
+      if (inQuietHours(row, at)) continue;
       const since = Math.max(busySinceBySubscription.get(row.id) || at, Date.parse(String(row.last_heartbeat_at || '')) || 0);
       if (at - since < minutes * 60_000) continue;
       sql.markHeartbeat.run(new Date(at).toISOString(), row.id);
@@ -2059,6 +2566,10 @@ export function createRelayEventService({
     const at = now();
     const events = sql.deleteDeliveredBefore.run(new Date(at - RELAY_EVENT_DELIVERED_KEEP_MS).toISOString()).changes;
     const subscriptions = deleteEndedSubscriptionsBefore.run(new Date(at - RELAY_EVENT_ENDED_SUBSCRIPTION_KEEP_MS).toISOString()).changes;
+    ownSql?.pruneBefore.run(new Date(at - RELAY_EVENT_OWN_PROMPT_KEEP_MS).toISOString());
+    for (const [key, wait] of ownWaits) {
+      if (wait.until <= at) ownWaits.delete(key);
+    }
     if (events || subscriptions) {
       log(`pruned ${events} delivered event${events === 1 ? '' : 's'} and ${subscriptions} ended subscription${subscriptions === 1 ? '' : 's'}`);
     }
@@ -2131,9 +2642,14 @@ export function createRelayEventService({
     listActive,
     record,
     flush,
+    noteOwnPrompt,
+    beginOwnWait,
+    endOwnWait,
+    areOptionsAvailable: () => optionsAvailable,
     noteTurnEnd,
     noteError,
     noteQuestion,
+    noteQuestionAnswered,
     noteTaskEdge,
     noteConversationGone,
     noteRestartRequested,

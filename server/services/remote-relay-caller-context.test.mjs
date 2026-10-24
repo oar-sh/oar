@@ -109,6 +109,7 @@ test('the caller context comes from the live turn, the runtime binding and the c
     userMessageId: 'q-1',
     hops: 0,
     originRelayIds: [],
+    origin: null,
   });
 });
 
@@ -147,6 +148,9 @@ test('hops come from the origin of the message behind the turn, the highest of a
   assert.equal(caller.processingRowId, 'q-1', 'without output the oldest processing row is the live turn');
   assert.equal(caller.hops, 2, 'a folded agent prompt counts too');
   assert.deepEqual(caller.originRelayIds, ['relay-a'], 'one relay, named once');
+  // The prompt with the most hops, whole: what a schedule of this turn passes on.
+  assert.equal(caller.origin.hops, 2);
+  assert.equal(caller.origin.relayId, 'relay-a');
 });
 
 test('the relays a turn\'s prompts came from are named: none for the user\'s own words', () => {
@@ -402,6 +406,46 @@ test('the card text names the action, the relay and what would be sent', () => {
   assert.ok(long.includes(`“${'w'.repeat(199)}…”`), 'the first 200 characters');
 });
 
+test('update_session cards: the write card lists the settings; the approval card names the first session it did not start and covers the rest', async () => {
+  const args = { session: 'conv-abcdef1234', model: 'claude-opus-5', effort: 'high', group: null, thinking_enabled: false, cwd: '/home/dev/next' };
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'update_session', args }),
+    'Allow the agent to change the settings of a session on relay "linux-test" (session conv-abc)?\n\n'
+      + 'Model: claude-opus-5 · Effort: high · Group: none · Thinking: off · Folder: /home/dev/next (its CLI restarts there)',
+  );
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'update_session', args: { session: 'conv-abcdef1234', title: 'Docs pass' }, sessionSettings: { session: 'conv-abcdef1234', title: 'sidebar polish' } }),
+    'This agent wants to change the settings of sessions on relay "linux-test" that its conversation did not start (yours or other agents\'), first “sidebar polish” (conv-abc).\n\nTitle: “Docs pass”',
+  );
+
+  let card = null;
+  const harness = setup({
+    // The user denies while the card waits.
+    onSleep: () => {
+      card = JSON.parse(questionRow(harness.db, 'question-1').request);
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Deny' WHERE id = 'question-1'`).run();
+    },
+  });
+  seedConversation(harness.db);
+  seedTurn(harness.db, { id: 'q-1' });
+  const asked = await harness.context.requestApproval({
+    conversationId: 'c-1',
+    callerContext: harness.context.getCallerContext('c-1'),
+    relay: { name: 'win-test', local: true },
+    action: 'update_session',
+    args: { session: 'conv-2', effort: 'low' },
+    sessionSettings: { session: 'conv-2', title: 'owner chat', changed: ['effort'] },
+  });
+  assert.equal(asked.approved, false);
+  assert.equal(card.context.header, 'Agent sessions');
+  assert.match(card.context.rationale, /Allow covers this conversation's later changes to sessions on this relay that it did not start/);
+
+  // Without a running turn there is nobody to ask.
+  const none = await harness.context.requestApproval({ conversationId: 'c-1', callerContext: {}, relay: RELAY, action: 'update_session', args: {}, sessionSettings: { session: 'conv-2' } });
+  assert.equal(none.code, CODES.noTurn);
+  assert.match(none.error, /Changing a session this conversation did not start needs the owner's approval once per conversation/);
+});
+
 test('the card says how the remote turn would run: mode, provider, model and folder', () => {
   const caller = { mode: 'plan', provider: 'claude', model: 'claude-sonnet-5' };
   assert.equal(
@@ -532,7 +576,59 @@ test('the watch card names every session or all, and a transfer says from where'
   assert.match(some, /Events: turn_end, error · heartbeat every 60 min/);
   const all = formatRemoteRelayApprovalPrompt({ watch: { kind: 'subscribe', all: true, events: ['all_idle'] } });
   assert.match(all, /ALL sessions of this relay, including ones created later/);
+  const options = formatRemoteRelayApprovalPrompt({ watch: {
+    kind: 'subscribe', all: true, events: ['turn_end'], excludeCount: 2, digestMinutes: 30, quietHours: { from: '23:00', to: '06:00', tz: 'Europe/Berlin' },
+  } });
+  assert.match(options, /ALL sessions of this relay, including ones created later \(except 2 it leaves out\)/);
+  assert.match(options, /Events: turn_end · digest every 30 min · quiet 23:00–06:00 Europe\/Berlin/);
   const transfer = formatRemoteRelayApprovalPrompt({ watch: { kind: 'transfer', from: { id: 'conv-fixture-old', title: 'Old watcher' }, count: 3, all: true } });
   assert.match(transfer, /take over 3 event subscriptions from session “Old watcher” \(conv-fix\) → this session/);
   assert.match(transfer, /Among them: ALL sessions/);
+});
+
+test('the create_session card names the group', () => {
+  const caller = { mode: 'agent', provider: 'claude' };
+  const card = formatRemoteRelayApprovalPrompt({
+    relay: RELAY,
+    action: 'create_session',
+    args: { text: 'Write the release notes', provider: 'claude', group: 'release' },
+    caller,
+    group: { id: 'grp_0123456789abcdef0123', name: 'Release' },
+  });
+  assert.equal(
+    card,
+    'Allow the agent to start a new session on relay "linux-test"?'
+      + '\n\nMode: agent · Provider: claude · Group: Release (grp_0123456789abcdef0123)'
+      + '\n\n“Write the release notes”',
+  );
+  // No group: no line. A send never names one.
+  assert.doesNotMatch(formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'create_session', args: { text: 'x' }, caller }), /Group:/);
+  assert.doesNotMatch(formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { text: 'x', session: 's' }, caller, group: { id: 'grp_1', name: 'G' } }), /Group:/);
+});
+
+test('the once-per-conversation local card names the group', async () => {
+  let harness;
+  harness = setup({
+    onSleep: () => {
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Allow' WHERE id = 'question-1'`).run();
+    },
+  });
+  const { db, context } = harness;
+  seedConversation(db, { preferredMode: 'agent' });
+  seedTurn(db, { id: 'q-1', mode: 'agent' });
+  const result = await context.requestApproval({
+    conversationId: 'c-1',
+    callerContext: context.getCallerContext('c-1'),
+    relay: SELF,
+    action: 'create_session',
+    args: { provider: 'claude', text: 'Check the docs', group: 'docs batch' },
+    localSessions: true,
+    group: { id: 'grp_docs', name: 'Docs batch' },
+  });
+  assert.deepEqual(result, { approved: true });
+  assert.equal(
+    questionRow(db, 'question-1').prompt,
+    'This agent wants to start sessions on this relay (claude, the default folder). Sessions it starts use this relay\'s accounts.'
+      + '\n\nMode: agent · Provider: claude · Group: Docs batch (grp_docs)\n\n“Check the docs”',
+  );
 });

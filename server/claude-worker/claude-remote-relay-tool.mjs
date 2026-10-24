@@ -13,7 +13,9 @@ import {
   REMOTE_RELAY_MODES,
   REMOTE_RELAY_PROVIDERS,
   REMOTE_RELAY_SESSION_SCOPES,
+  REMOTE_RELAY_THINKING_DISPLAYS,
 } from '../../shared/remote-relay-contract.mjs';
+import { RELAY_ASK_URGENCIES } from '../../shared/relay-asks.mjs';
 import {
   REMOTE_RELAY_CALL_FAILED,
   REMOTE_RELAY_TOOL_DESCRIPTION,
@@ -67,7 +69,21 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   mode: choice('mode', REMOTE_RELAY_MODES),
   effort: text('effort'),
   title: text('title'),
+  // The one exception to the parity with the JSON schema: Claude may send
+  // null for update_session's group (out of the group), as "none" does on
+  // the providers whose strict schemas take a string only.
+  group: z.string().nullable().optional().describe(FIELDS.group.description),
+  auto_compact_window: number('auto_compact_window'),
+  thinking_enabled: z.boolean().optional().describe(FIELDS.thinking_enabled.description),
+  thinking_display: choice('thinking_display', REMOTE_RELAY_THINKING_DISPLAYS),
   question_id: text('question_id'),
+  // ask: the contract's validator refuses a question or detail that is too
+  // long, or more than eight options, with a message the model can act on.
+  question: text('question'),
+  options: z.array(z.string()).optional().describe(FIELDS.options.description),
+  recommendation: text('recommendation'),
+  detail: text('detail'),
+  urgency: choice('urgency', RELAY_ASK_URGENCIES),
   answer: text('answer'),
   choices: z.array(z.string()).optional().describe(FIELDS.choices.description),
   if_busy: choice('if_busy', REMOTE_RELAY_IF_BUSY),
@@ -78,18 +94,37 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   match: text('match'),
   stalled_minutes: number('stalled_minutes'),
   heartbeat_minutes: number('heartbeat_minutes'),
+  digest_minutes: number('digest_minutes'),
+  // Loose and every field optional: the contract's validator checks the
+  // times and the zone and says what is wrong; an empty one is no option.
+  quiet_hours: z.looseObject({
+    from: z.string().optional().describe(FIELDS.quiet_hours.properties.from.description),
+    to: z.string().optional().describe(FIELDS.quiet_hours.properties.to.description),
+    tz: z.string().optional().describe(FIELDS.quiet_hours.properties.tz.description),
+  }).optional().describe(FIELDS.quiet_hours.description),
+  // A list, or the comma-separated text the contract takes as well.
+  exclude: z.union([z.array(z.string()), z.string()]).optional().describe(FIELDS.exclude.description),
   subscription_id: text('subscription_id'),
   watcher: text('watcher'),
   from: text('from'),
+  at: text('at'),
+  every_minutes: number('every_minutes'),
+  schedule_id: text('schedule_id'),
   task_id: text('task_id'),
   lines: number('lines'),
 };
+
+// What the tool registers: the shape as a loose object. A raw shape becomes a
+// strict-stripping object in the SDK's MCP layer, which would drop a key the
+// schema lacks before the contract's validator could refuse it (create_session)
+// or name it in `ignored` (the other actions). The loose object lets it through.
+export const REMOTE_RELAY_TOOL_ZOD_SCHEMA = z.looseObject(REMOTE_RELAY_TOOL_ZOD_SHAPE);
 
 export function createRemoteRelayToolDefinition({ api, getConversationId = () => '', dbg = () => {} } = {}) {
   return {
     name: REMOTE_RELAY_TOOL_NAME,
     description: REMOTE_RELAY_TOOL_DESCRIPTION,
-    inputSchema: REMOTE_RELAY_TOOL_ZOD_SHAPE,
+    inputSchema: REMOTE_RELAY_TOOL_ZOD_SCHEMA,
     // `extra.signal` is the MCP request's: the SDK aborts it when the CLI
     // cancels the call (a Stop interrupting the turn) or the process's MCP
     // transport closes, and the pending relay request goes with it.

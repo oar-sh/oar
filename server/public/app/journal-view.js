@@ -29,6 +29,7 @@ import {
   setSummaryModalLeaveHandler,
   conversationGroups,
   mergeConversationGroups,
+  forgetKeptEmptyConversationGroups,
   readConversationGroupFoldChoices,
   pruneConversationGroups,
   hasSessionWorkerStatus,
@@ -113,6 +114,7 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
+import { leaveInboxView } from './inbox-ui.js';
 import {
   CLAUDE_CLOUD_PROVIDER,
   buildCloudSourceWarnings,
@@ -132,6 +134,7 @@ import {
 } from './claude-cloud-ui.mjs';
 import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.mjs';
 import { relayEventWatchedMarkerHtml } from './relay-event-subscriptions-ui.js';
+import { relayScheduleMarkerHtml } from './relay-schedules-ui.js';
 import {
   normalizeConversationFilter,
   conversationMatchesFilter,
@@ -378,6 +381,9 @@ export async function refreshConversations(options = {}) {
       if (!knownConversationIds.has(id)) delete conversations[id];
     }
   }
+  // The owner's kept empty groups come with the first page only: the page
+  // names the ones still kept.
+  forgetKeptEmptyConversationGroups();
   mergeConversationGroups(r.groups);
   applyConversationPage(r.conversations || []);
   conversationRowsFetchedSinceRefresh = Array.isArray(r.conversations) ? r.conversations.length : 0;
@@ -613,6 +619,8 @@ function paintConvList() {
   const items = arrangeConversationList(inView, conversationGroups, {
     matches: activeFilter ? (row) => conversationMatchesFilter(row, activeFilter) : null,
     groupNameMatches: activeFilter ? (info) => conversationMatchesFilter({ title: info?.displayName || info?.name }, activeFilter) : null,
+    // An owner's group an agent emptied shows in the live list, empty.
+    emptyGroups: !conversationListArchivedView,
     isOpen: (groupId, group) => {
       const described = describeGroupForHead(group, viewOf);
       const holdsOpenConversation = !!currentConvId && group.members.some((row) => row.id === currentConvId);
@@ -690,6 +698,8 @@ function paintConvList() {
       : renderConversationOriginMarkerHtml(c, { conversations });
     // "watched": a session another conversation watches by id (relay events).
     const watchedMarkerHtml = relayEventWatchedMarkerHtml(c.id);
+    // "scheduled": a schedule fires into this session (remote_relay schedule).
+    const scheduledMarkerHtml = relayScheduleMarkerHtml(c.id);
     const groupClass = item.kind === 'head' ? ' conv-group-head' : (item.kind === 'member' ? ' conv-group-member' : '');
     const groupAttr = item.kind === 'head' || item.kind === 'member' ? ` data-group-id="${escHtml(item.group.id)}"` : '';
     // A head row shows the name the group was given by hand; until then the
@@ -700,7 +710,7 @@ function paintConvList() {
     return `
     <div class="conv-item worker-ui-${view.visualState}${view.working ? ' conv-working' : ''}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr} onclick="openConversation('${c.id}')">
       <div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${item.kind === 'head' ? groupPillHtml(item) : ''}${originMarkerHtml}${watchedMarkerHtml}${providerIndicatorHtml}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${item.kind === 'head' ? groupPillHtml(item) : ''}${originMarkerHtml}${watchedMarkerHtml}${scheduledMarkerHtml}${providerIndicatorHtml}</div>
       ${c.archived
         ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
         : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄</button>`}
@@ -711,6 +721,15 @@ function paintConvList() {
   // archived or deleted): a head line of its own, with the name and the pill.
   const syntheticHeadHtml = (item) => {
     const name = groupDisplayName(item.group.id);
+    // An owner's group an agent emptied: no members, nothing to fold; its
+    // menu (right-click or long-press) renames or dissolves it.
+    if (item.group.empty) {
+      return `
+    <div class="conv-item conv-group-head conv-group-synthetic conv-group-empty worker-ui-offline" data-group-id="${escHtml(item.group.id)}" title="An agent moved the last session out of this group; rename or dissolve it from its menu.">
+      <div class="conv-title">${escHtml(name)}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">group · empty</span></div>
+    </div>`;
+    }
     const described = groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf);
     return `
     <div class="conv-item conv-group-head conv-group-synthetic worker-ui-${described.summary.strongest === 'waiting' ? 'question' : 'offline'}" data-group-id="${escHtml(item.group.id)}" onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">
@@ -1059,7 +1078,9 @@ function applyFreshOverCachedConversation(id, response, { cached, keepTranscript
 }
 
 export async function openConversation(id, options = {}) {
-  const didLeaveStatusView = leaveStatusView();
+  // The Inbox owns the transcript like the status view does.
+  const didLeaveInboxView = leaveInboxView();
+  const didLeaveStatusView = leaveStatusView() || didLeaveInboxView;
   document.getElementById('input-area')?.removeAttribute('hidden');
   const previousConversationId = String(currentConvId || '').trim();
   const nextConversationId = String(id || '').trim();

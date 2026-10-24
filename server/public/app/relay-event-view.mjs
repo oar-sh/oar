@@ -28,6 +28,7 @@ const EVENT_TYPES = new Set([
 ]);
 const URGENT_TYPES = new Set(['question_asked', 'error']);
 const DIGEST_PATTERN = /^Digest of \d+ events?/;
+const QUIET_PATTERN = /^Held during quiet hours/;
 const REPLAYED_PATTERN = /^Replayed: \d+ events?/;
 const LINE_PATTERN = /^\[relay event\] (?:[^"·\n]{1,60} · )?(?:session "(?:[^"]*)" \([^)]*\)(?: on relay "[^"]*")?: )?([a-z_]+)/;
 const LINE_PREFIX = '[relay event] ';
@@ -63,15 +64,17 @@ export function isRelayEventMessage(message) {
 /**
  * The event lines of an event message without the lead, the types they
  * carry in order, how many events (a digest's "… and N more" counted),
- * whether it is a digest, and whether it replays what a paired relay kept
- * while the link to it was down. Any text renders: a stray one as one line.
+ * whether it is a digest, whether quiet hours held it, and whether it
+ * replays what a paired relay kept while the link to it was down. Any text
+ * renders: a stray one as one line.
  */
 export function parseRelayEventMessageText(text) {
   const rows = String(text ?? '').split(/\r?\n/).map((line) => line.trimEnd()).filter((line) => line.trim());
   const body = rows[0] === RELAY_EVENT_LEAD ? rows.slice(1) : rows;
-  const digest = DIGEST_PATTERN.test(body[0] || '');
+  const digest = body.some((line) => DIGEST_PATTERN.test(line));
+  const quiet = body.some((line) => QUIET_PATTERN.test(line));
   const replayed = body.some((line) => REPLAYED_PATTERN.test(line));
-  const lines = body.filter((line) => !DIGEST_PATTERN.test(line) && !REPLAYED_PATTERN.test(line));
+  const lines = body.filter((line) => !DIGEST_PATTERN.test(line) && !QUIET_PATTERN.test(line) && !REPLAYED_PATTERN.test(line));
   const types = [];
   let count = 0;
   for (const line of lines) {
@@ -84,7 +87,7 @@ export function parseRelayEventMessageText(text) {
     const more = /^\[relay event\] … and (\d+) more$/.exec(line);
     if (more) count += Number(more[1]) || 0;
   }
-  return { lines, types, count: count || lines.length, digest, replayed };
+  return { lines, types, count: count || lines.length, digest, quiet, replayed };
 }
 
 /** The collapsed row's one line: "3 events · question, reply". */
@@ -92,7 +95,8 @@ export function relayEventSummaryText(parsed) {
   const count = Number(parsed?.count) || 0;
   const labels = (parsed?.types || []).map((type) => TYPE_LABELS[type] || type);
   const events = `${count} event${count === 1 ? '' : 's'}`;
-  const head = parsed?.digest ? `Digest · ${events}` : events;
+  const tags = [parsed?.quiet ? 'After quiet hours' : '', parsed?.digest ? 'Digest' : ''].filter(Boolean);
+  const head = [...tags, events].join(' · ');
   return labels.length ? `${head} · ${labels.join(', ')}` : head;
 }
 
@@ -175,9 +179,21 @@ export function watchersOf(subscriptions, conversationId, { includeAll = true } 
   const watchers = new Set();
   for (const sub of activeList(subscriptions)) {
     if (sub.watcher === id || isOnPairedRelay(sub)) continue;
-    if (sub.scope === 'all' ? includeAll : sessionIdsOf(sub).includes(id)) watchers.add(watcherKey(sub));
+    const watches = sub.scope === 'all'
+      ? includeAll && !(Array.isArray(sub.exclude) && sub.exclude.includes(id))
+      : sessionIdsOf(sub).includes(id);
+    if (watches) watchers.add(watcherKey(sub));
   }
   return [...watchers];
+}
+
+/** "digest 30 min" / "quiet 23:00–06:00": what a subscription's options hold back, or ''. */
+export function subscriptionOptionHints(sub) {
+  const quiet = sub?.quietHours && typeof sub.quietHours === 'object' ? sub.quietHours : null;
+  return [
+    Number(sub?.digestMinutes) > 0 ? `digest ${Number(sub.digestMinutes)} min` : '',
+    quiet ? `quiet ${String(quiet.from || '')}–${String(quiet.to || '')}` : '',
+  ].filter(Boolean);
 }
 
 export function watchingChipText(summary) {
@@ -186,6 +202,11 @@ export function watchingChipText(summary) {
   // Only relay_restarted: no session is watched.
   if (!summary.count) return 'waiting for a relay restart';
   return `watching ${summary.count} session${summary.count === 1 ? '' : 's'}`;
+}
+
+/** The chip's small hint: the options of the conversation's subscriptions, each named once (at most two). */
+export function watchingChipHint(summary) {
+  return [...new Set((summary?.subscriptions || []).flatMap(subscriptionOptionHints))].slice(0, 2).join(' · ');
 }
 
 function conversationTitle(conversations, id) {
@@ -203,9 +224,14 @@ function describeSubscription(sub, conversations) {
   const what = sub.scope === 'all'
     ? (paired ? `All sessions of ${relay}` : 'All sessions')
     : (paired ? `${relay} · ${listed}` : (listed || 'This relay'));
+  const quiet = sub.quietHours && typeof sub.quietHours === 'object' ? sub.quietHours : null;
+  const excluded = Array.isArray(sub.exclude) ? sub.exclude.length : 0;
   const extras = [
     sub.once ? 'once' : '',
     sub.heartbeatMinutes ? `heartbeat ${sub.heartbeatMinutes} min` : '',
+    sub.digestMinutes ? `digest ${sub.digestMinutes} min` : '',
+    quiet ? `quiet ${quiet.from}–${quiet.to} ${quiet.tz}` : '',
+    excluded ? `${excluded} left out` : '',
   ].filter(Boolean);
   return { what, events: (sub.events || []).join(', '), extras: extras.join(' · ') };
 }

@@ -93,18 +93,22 @@ function excerpt(value) {
 const APPROVAL_VERBS = Object.freeze({
   send: 'send a prompt',
   create_session: 'start a new session',
+  update_session: 'change the settings of a session',
   answer_question: 'answer a question',
   stop: 'stop the running turn',
   archive: 'archive a session',
+  schedule: 'schedule a prompt',
+  ask: 'ask you a question on behalf of another session',
 });
 
 /**
  * How the remote turn would run, as far as this relay knows it: the mode (the
  * requested one, else the calling session's, which the dispatcher passes on),
- * the provider a new session gets (requested, else the caller's), and the
- * model and working directory when the agent asked for them.
+ * the provider a new session gets (requested, else the caller's), the model
+ * and working directory when the agent asked for them, and the session group
+ * a new session goes into (`group`, as the target resolved it).
  */
-function describeRemoteTurn(action, args, caller) {
+function describeRemoteTurn(action, args, caller, group = null) {
   const parts = [];
   const mode = toText(args.mode).toLowerCase() || toText(caller?.mode).toLowerCase();
   if (mode) parts.push(`Mode: ${mode}`);
@@ -116,6 +120,26 @@ function describeRemoteTurn(action, args, caller) {
   }
   if (toText(args.model)) parts.push(`Model: ${excerpt(args.model)}`);
   if (toText(args.cwd)) parts.push(`Folder: ${excerpt(args.cwd)}`);
+  if (action === 'create_session') {
+    const groupName = toText(group?.name) || toText(args.group);
+    if (groupName) parts.push(`Group: ${excerpt(groupName)}${toText(group?.id) ? ` (${excerpt(group.id)})` : ''}`);
+  }
+  return parts.join(' · ');
+}
+
+/** What an update_session sets, for the card: `Model: … · Effort: … · Group: none`. */
+function describeSettingsChange(args) {
+  const parts = [];
+  const has = (key) => Object.prototype.hasOwnProperty.call(args || {}, key);
+  if (toText(args.model)) parts.push(`Model: ${excerpt(args.model)}`);
+  if (toText(args.effort)) parts.push(`Effort: ${excerpt(args.effort)}`);
+  if (toText(args.mode)) parts.push(`Mode: ${excerpt(args.mode)}`);
+  if (has('auto_compact_window')) parts.push(`Auto-compact window: ${excerpt(args.auto_compact_window)}`);
+  if (toText(args.title)) parts.push(`Title: “${excerpt(args.title)}”`);
+  if (has('group')) parts.push(`Group: ${args.group === null ? 'none' : excerpt(args.group)}`);
+  if (typeof args.thinking_enabled === 'boolean') parts.push(`Thinking: ${args.thinking_enabled ? 'on' : 'off'}`);
+  if (toText(args.thinking_display)) parts.push(`Thinking text: ${toText(args.thinking_display) === 'omitted' ? 'hidden' : 'visible'}`);
+  if (toText(args.cwd)) parts.push(`Folder: ${excerpt(args.cwd)} (its CLI restarts there)`);
   return parts.join(' · ');
 }
 
@@ -160,7 +184,8 @@ function formatWatchApprovalPrompt(watch) {
   }
   const lines = [];
   if (watch.all) {
-    lines.push(`This agent wants to watch ALL sessions of ${where}, including ones created later, and be woken by their events.`);
+    const excluded = Number(watch.excludeCount) || 0;
+    lines.push(`This agent wants to watch ALL sessions of ${where}, including ones created later${excluded ? ` (except ${excluded} it leaves out)` : ''}, and be woken by their events.`);
   } else {
     const sessions = (Array.isArray(watch.sessions) ? watch.sessions : []).slice(0, 10)
       .map((session) => (toText(session?.title) ? `“${excerpt(session.title)}” (${shortId(session.id)})` : shortId(session?.id)));
@@ -168,18 +193,34 @@ function formatWatchApprovalPrompt(watch) {
     lines.push(`This agent wants to watch ${sessions.join(', ')}${more > 0 ? ` and ${more} more` : ''}${relayName ? ` on ${where}` : ''} and be woken by their events.`);
   }
   const events = (Array.isArray(watch.events) ? watch.events : []).join(', ');
-  const extras = [watch.once ? 'once' : '', Number(watch.heartbeatMinutes) > 0 ? `heartbeat every ${watch.heartbeatMinutes} min` : ''].filter(Boolean);
+  const quiet = watch.quietHours && typeof watch.quietHours === 'object' ? watch.quietHours : null;
+  const extras = [
+    watch.once ? 'once' : '',
+    Number(watch.heartbeatMinutes) > 0 ? `heartbeat every ${watch.heartbeatMinutes} min` : '',
+    Number(watch.digestMinutes) > 0 ? `digest every ${watch.digestMinutes} min` : '',
+    quiet ? `quiet ${excerpt(`${toText(quiet.from)}–${toText(quiet.to)} ${toText(quiet.tz)}`)}` : '',
+  ].filter(Boolean);
   if (events) lines.push(`Events: ${events}${extras.length ? ` · ${extras.join(' · ')}` : ''}`);
   return lines.join('\n\n');
 }
 
-export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false, watch = null } = {}) {
+export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false, watch = null, group = null, sessionSettings = null } = {}) {
   if (watch && typeof watch === 'object') return formatWatchApprovalPrompt(watch);
   const local = relay?.local === true;
   const name = toText(relay?.name) || 'a remote relay';
   const where = local ? 'this relay' : `relay "${name}"`;
   const verb = APPROVAL_VERBS[action] || toText(action).replace(/_/g, ' ') || 'act';
   const target = args.session ? ` (session ${shortId(args.session)})` : '';
+  // The once-per-conversation card for changing sessions the calling conversation did not start.
+  if (sessionSettings && typeof sessionSettings === 'object') {
+    const title = toText(sessionSettings.title) ? `“${excerpt(sessionSettings.title)}” ` : '';
+    const lines = [
+      `This agent wants to change the settings of sessions on ${where} that its conversation did not start (yours or other agents'), first ${title}(${shortId(sessionSettings.session || args.session)}).`,
+    ];
+    const details = describeSettingsChange(args);
+    if (details) lines.push(details);
+    return lines.join('\n\n');
+  }
   const lines = [];
   // The loop guard's card: agents that prompt each other without the user.
   if (agentPrompts > 0) {
@@ -194,13 +235,34 @@ export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, call
     lines.push(`Allow the agent to ${verb} on ${where}${target}?`);
   }
   if (action === 'send' || action === 'create_session') {
-    const details = describeRemoteTurn(action, args, caller);
+    const details = describeRemoteTurn(action, args, caller, group);
     if (details) lines.push(details);
     const text = excerpt(args.text);
     if (text) lines.push(`“${text}”`);
   } else if (action === 'answer_question') {
     const answer = excerpt([...(Array.isArray(args.choices) ? args.choices : []), args.answer].filter(Boolean).join(', '));
     if (answer) lines.push(`Answer: “${answer}”`);
+  } else if (action === 'update_session') {
+    const details = describeSettingsChange(args);
+    if (details) lines.push(details);
+  } else if (action === 'schedule') {
+    // A schedule for another session: when it fires, and the words it sends.
+    const every = Number(args.every_minutes);
+    const when = [
+      toText(args.title) ? `“${excerpt(args.title)}”` : '',
+      toText(args.at) ? `At: ${excerpt(args.at)}` : '',
+      every > 0 ? `Every ${every} min${args.once === true ? ', once' : ''}` : '',
+    ].filter(Boolean).join(' · ');
+    if (when) lines.push(when);
+    const text = excerpt(args.text);
+    if (text) lines.push(`“${text}”`);
+  } else if (action === 'ask') {
+    // An ask on behalf of another session: its card shows there, and the
+    // answer wakes that session.
+    const question = excerpt(args.question);
+    if (question) lines.push(`“${question}”`);
+    const options = (Array.isArray(args.options) ? args.options : []).map(excerpt).filter(Boolean);
+    if (options.length) lines.push(`Options: ${options.join(' · ')}`);
   }
   return lines.join('\n\n');
 }
@@ -303,7 +365,8 @@ export function createRemoteRelayCallerContext({
    * the turn it continues); without a turn (an off-turn call) the latest user
    * message decides.
    * `originRelayIds` are the relays (their instance ids) those prompts came
-   * from: empty when the agent acts on the user's words alone.
+   * from: empty when the agent acts on the user's words alone. `origin` is
+   * the one among them with the most hops (null for the user's words).
    */
   function getCallerContext(conversationId) {
     const id = toText(conversationId);
@@ -316,6 +379,8 @@ export function createRemoteRelayCallerContext({
       : [messageOrigin(getLatestUserMessage.get(id)?.id)]).filter(Boolean);
     const hops = Math.max(0, ...origins.map(originHops));
     const originRelayIds = [...new Set(origins.map((origin) => toText(origin.relayId)))];
+    // The prompt with the most hops: what a schedule of this turn's passes on.
+    const origin = origins.reduce((best, entry) => (!best || originHops(entry) > originHops(best) ? entry : best), null);
     return {
       conversationId: id,
       title: toText(conversation?.title),
@@ -328,6 +393,7 @@ export function createRemoteRelayCallerContext({
       userMessageId: live?.id || null,
       hops,
       originRelayIds,
+      origin,
     };
   }
 
@@ -353,26 +419,27 @@ export function createRemoteRelayCallerContext({
    * that, in any relay mode.
    * `localSessions` makes it the card for starting sessions on this relay
    * itself, asked once per conversation (the dispatcher remembers the Allow).
+   * `group` (`{ id, name }`) is the session group a create_session names, as
+   * the target resolved it; the card says where the session goes.
+   * `sessionSettings` (`{ session, title, changed }`) makes it the card for an
+   * update_session on a session the calling conversation did not start, asked once per
+   * conversation and relay (the dispatcher remembers the Allow).
    */
-  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0, localSessions = false, watch = null } = {}) {
+  async function requestApproval({ conversationId, callerContext, relay, action, args = {}, signal, agentPrompts = 0, localSessions = false, watch = null, group = null, sessionSettings = null } = {}) {
     const rowId = toText(callerContext?.processingRowId);
     const row = rowId ? getQueueRow.get(rowId) : null;
     if (!row || row.status !== 'processing') {
-      return {
-        approved: false,
-        code: REMOTE_RELAY_ERROR_CODES.noTurn,
-        error: watch
-          ? 'Watching sessions needs the user\'s approval, but the conversation has no running turn to ask on.'
-          : (localSessions
-            ? 'Starting sessions on this relay needs the user\'s approval once per conversation, but the conversation has no running turn to ask on.'
-            : 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.'),
-      };
+      let error = 'This write action needs the user\'s approval, but the conversation has no running turn to ask on.';
+      if (watch) error = 'Watching sessions needs the user\'s approval, but the conversation has no running turn to ask on.';
+      else if (localSessions) error = 'Starting sessions on this relay needs the user\'s approval once per conversation, but the conversation has no running turn to ask on.';
+      else if (sessionSettings) error = 'Changing a session this conversation did not start needs the owner\'s approval once per conversation, but the conversation has no running turn to ask on.';
+      return { approved: false, code: REMOTE_RELAY_ERROR_CODES.noTurn, error };
     }
 
     const createdAt = now().toISOString();
     const questionId = String(uuid());
     const relayMode = normalizeMode(row.relay_mode);
-    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions, watch });
+    const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions, watch, group, sessionSettings });
     const local = relay?.local === true;
     let rationale = `Write actions on ${local ? 'other sessions of this relay' : 'other relays'} need approval in ${relayMode} mode.`;
     if (agentPrompts > 0) {
@@ -381,6 +448,8 @@ export function createRemoteRelayCallerContext({
         : 'Agents on different relays that keep prompting each other need your go from time to time.';
     } else if (localSessions) {
       rationale = 'Allow covers every session this conversation\'s agent starts on this relay; Deny refuses this one.';
+    } else if (sessionSettings) {
+      rationale = `Allow covers this conversation's later changes to sessions on ${local ? 'this relay' : `relay "${excerpt(relay?.name)}"`} that it did not start; Deny refuses this one. Sessions this conversation started need no approval.`;
     } else if (watch?.kind === 'transfer') {
       rationale = 'The subscriptions keep their settings; event messages are the relay\'s, never yours, and approve nothing.';
     } else if (watch) {
@@ -397,7 +466,7 @@ export function createRemoteRelayCallerContext({
       queueMessageId: row.id,
       conversationId: toText(conversationId) || row.conversation_id,
       relayMode,
-      header: watch ? WATCH_HEADER : (localSessions ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER),
+      header: watch ? WATCH_HEADER : (localSessions || (sessionSettings && local) ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER),
     }, { normalizeRelayMode: normalizeMode, defaultRelayMode });
     questionStatements.insertQuestion.run(
       questionId,

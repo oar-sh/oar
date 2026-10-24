@@ -10,6 +10,7 @@ import {
   renderWatchedBadgeHtml,
   renderWatchingPanelHtml,
   watchersOf,
+  watchingChipHint,
   watchingChipText,
   watchingSummary,
 } from './relay-event-view.mjs';
@@ -164,15 +165,16 @@ export function syncRelayEventHeader() {
   }
   const summary = watchingSummary(subscriptions, id);
   const chipText = watchingChipText(summary);
+  const chipHint = chipText ? watchingChipHint(summary) : '';
   const watchers = watchersOf(subscriptions, id, { includeAll: true });
   if (!chipText) panelOpen = false;
-  const key = JSON.stringify([id, chipText, panelOpen, summary.subscriptions.map((sub) => [sub.id, sub.sessions, sub.events]), watchers]);
+  const key = JSON.stringify([id, chipText, chipHint, panelOpen, summary.subscriptions.map((sub) => [sub.id, sub.sessions, sub.events]), watchers]);
   if (key === renderedChipKey) return;
   renderedChipKey = key;
   const parts = [];
   if (chipText) {
     const where = summary.relays.length ? ` (also on ${summary.relays.join(', ')})` : '';
-    parts.push(`<button type="button" class="relay-watch-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-watch-panel" title="${escHtml(`Event subscriptions of this conversation${where}`)}">👁 ${escHtml(chipText)}</button>`);
+    parts.push(`<button type="button" class="relay-watch-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-watch-panel" title="${escHtml(`Event subscriptions of this conversation${where}`)}">👁 ${escHtml(chipText)}${chipHint ? ` <span class="relay-watch-hint">${escHtml(chipHint)}</span>` : ''}</button>`);
   }
   const badge = renderWatchedBadgeHtml(watchers, { conversations, subscriptions, escHtml });
   if (badge) parts.push(badge);

@@ -5,20 +5,25 @@ import { randomUUID as nodeRandomUUID } from 'crypto';
 import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
 import {
   REMOTE_RELAY_APPROVAL_MODES,
+  REMOTE_RELAY_ASK_ACTIONS,
   REMOTE_RELAY_CLOUD_PROVIDER,
   REMOTE_RELAY_EFFORT_PATTERN,
   REMOTE_RELAY_ERROR_CODES,
+  REMOTE_RELAY_GROUP_LIMITS,
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_LOCAL_ALIAS,
   REMOTE_RELAY_LOCAL_ID,
   REMOTE_RELAY_PROVIDERS,
+  REMOTE_RELAY_SESSION_SETTINGS,
+  formatSessionGroupList,
   isRemoteRelayApprovalQuestion,
   isRemoteRelayPromptAction,
   isRemoteRelayWriteAction,
   normalizeRemoteRelayOrigin,
   remoteConversationUrl,
+  remoteRelayActionPermission,
   remoteRelayPermissionAllows,
-  REMOTE_RELAY_ACTION_PERMISSION,
+  resolveSessionGroupReference,
   stripRemotePromptHeader,
   summarizeRemoteRelayCall,
   validateRemoteRelayToolInput,
@@ -37,6 +42,8 @@ import {
   isMissingRelayEventRoute,
   relayWithoutCrossRelayEventsText,
 } from './relay-event-link-service.mjs';
+import { RELAY_ASK_KIND, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { RELAY_ASK_REMOTE_PATHS, isMissingRelayAskRoute, relayWithoutAsksText } from './relay-ask-link-service.mjs';
 
 // The one place a `remote_relay` tool call is decided and carried out (plan
 // §5.6). Every provider adapter ends up at POST /api/remote-relays/tool, whose
@@ -51,9 +58,16 @@ import {
 // pairing, mention, permission or hop; instead:
 //
 //   setting on → no acting on the caller's own conversation → rate limit →
-//   create_session only: one level (a created session creates none), at most
-//   localActiveSessions created sessions at work, the user's Allow once per
-//   conversation → approval (ask/plan) → execute
+//   create_session only: one level (a created session creates none, unless
+//   the owner allowed it for that session), at most localActiveSessions
+//   created sessions at work, the user's Allow once per conversation →
+//   approval (ask/plan) → execute
+//
+// update_session, on either kind of target: a session the calling
+// conversation started may be changed; any other (the owner's, another
+// agent's, the caller's creator) needs the owner's Allow once per calling
+// conversation and target (remembered as an unlock), and the target holds to
+// the same rule itself (its settings route refuses without owner_approved).
 //
 // Its actions run through the same code as a paired relay's: `call()` hands
 // them to the loopback client, which reaches this relay's own routes
@@ -109,7 +123,15 @@ const CLOUD_CREATE_NOTE = 'create_session needs repo (https://github.com/owner/r
 // while the provider is switched off.
 const CLOUD_DISABLED_CODE = 'claude_cloud_disabled';
 // The actions an agent must not aim at the conversation it runs in.
-const OWN_SESSION_ACTIONS = new Set(['send', 'stop', 'archive', 'wait']);
+const OWN_SESSION_ACTIONS = new Set(['send', 'stop', 'archive', 'wait', 'update_session']);
+// The route update_session reaches on the target, and the codes it answers.
+const SESSION_SETTINGS_SUFFIX = '/settings';
+const SESSION_SETTINGS_CODES = Object.freeze({
+  notFound: 'SESSION_NOT_FOUND',
+  busy: 'SESSION_BUSY',
+  groupNotFound: 'SESSION_GROUP_NOT_FOUND',
+  groupAmbiguous: 'SESSION_GROUP_AMBIGUOUS',
+});
 // How /api/models `providersByModel` names each provider.
 const CATALOG_PROVIDER_LABELS = Object.freeze({
   github: 'github-copilot',
@@ -436,10 +458,26 @@ function relayTarget(relay) {
 function mapPendingQuestion(question) {
   if (!isPlainObject(question) || !toText(question.id)) return null;
   if (isRemoteRelayApprovalQuestion(question)) return null;
+  const kind = relayQuestionKind(question);
+  if (kind === RELAY_ASK_KIND) {
+    // A question that does not block: the user's to answer, the session works on.
+    return {
+      id: toText(question.id),
+      kind,
+      question: toText(question.question || question.prompt),
+      options: (Array.isArray(question.options) ? question.options : []).map((option) => toText(option)).filter(Boolean),
+      ...(toText(question.recommendation) ? { recommendation: toText(question.recommendation) } : {}),
+      ...(question.urgency === 'now' ? { urgency: 'now' } : {}),
+      ...(isPlainObject(question.askedBy) ? { askedBy: question.askedBy } : {}),
+      createdAt: question.createdAt || null,
+      note: 'Asked with ask: it does not block the session, and only the user answers it.',
+    };
+  }
   const context = isPlainObject(question.context) ? question.context : {};
   const fields = schemaFields(question.requestSchema);
   return {
     id: toText(question.id),
+    kind,
     question: toText(question.prompt),
     header: toText(context.header) || null,
     options: Array.isArray(question.choices) ? question.choices.map((choice) => toText(choice)).filter(Boolean) : [],
@@ -627,6 +665,15 @@ export function createRemoteRelayDispatcher({
   // The event link (relay-event-link-service.mjs): fetches the events of
   // subscriptions on paired relays. Without it those stay refused.
   relayEventLink = null,
+  // The relay schedule service (relay-schedule-service.mjs): schedule and its
+  // siblings. Without it those actions answer that the relay lacks them.
+  relaySchedules = null,
+  // The ask service (relay-ask-service.mjs): ask and its siblings, and the
+  // link that looks for the answers of asks put on paired relays
+  // (relay-ask-link-service.mjs). Without the service those actions answer
+  // that the relay lacks them.
+  relayAsks = null,
+  relayAskLink = null,
 } = {}) {
   const inflightByConversation = new Map();
   const callTimesByConversation = new Map();
@@ -644,6 +691,9 @@ export function createRemoteRelayDispatcher({
   const localApprovalsByConversation = new Map();
   // The same for the first subscribe of a conversation (by approval key).
   const watchApprovalsByKey = new Map();
+  // And for the first update_session of a conversation on a session the
+  // conversation did not start there (by approval key).
+  const sessionSettingsApprovalsByKey = new Map();
 
   // ─── Bookkeeping ───────────────────────────────────────────────────────────
 
@@ -689,6 +739,26 @@ export function createRemoteRelayDispatcher({
     const fresh = { since, count: 0 };
     agentPromptsByConversation.set(conversationId, fresh);
     return fresh;
+  }
+
+  /**
+   * A schedule another conversation set comes due in a session: that is a
+   * prompt of the conversation that set it, counted by its loop guard like
+   * a send. False (the firing is held) once the guard wants the user first;
+   * it lets the firing go again after the user wrote in that conversation,
+   * or allowed its agent's next prompt on the card.
+   */
+  function admitScheduledFiring({ createdBy } = {}) {
+    const requested = toText(createdBy);
+    if (!requested) return false;
+    let creator = requested;
+    try {
+      creator = toText(resolveConversationId(requested)) || requested;
+    } catch {}
+    const kept = agentPrompts(creator);
+    if (kept.count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) return false;
+    kept.count += 1;
+    return true;
   }
 
   /** `{ enabled, maxWaitSeconds }`; off and the default wait when unreadable. */
@@ -790,14 +860,20 @@ export function createRemoteRelayDispatcher({
     return `/api/conversation/${encodeURIComponent(session)}${suffix}`;
   }
 
-  async function loadPendingQuestions(ctx, conversationId) {
+  /**
+   * The questions a remote session has open. `includeAsks` (read_session):
+   * the ones that don't block as well (kind "ask"); a relay without them
+   * ignores it. The waits leave them out: the session works on, and only the
+   * user answers them.
+   */
+  async function loadPendingQuestions(ctx, conversationId, { includeAsks = false } = {}) {
     try {
       const response = await call(ctx, 'GET', '/api/relay-questions', {
-        query: { status: 'pending', conversationId },
+        query: { status: 'pending', conversationId, ...(includeAsks ? { includeAsks: 1 } : {}) },
       });
       return (Array.isArray(response?.questions) ? response.questions : [])
         .map(mapPendingQuestion)
-        .filter(Boolean);
+        .filter((question) => question && (includeAsks || question.kind !== RELAY_ASK_KIND));
     } catch {
       return [];
     }
@@ -1105,6 +1181,157 @@ export function createRemoteRelayDispatcher({
     });
   }
 
+  // ─── Session groups (relay_info, create_session `group`) ───────────────────
+
+  // The target's read-only group list: id, name and member count only.
+  const GROUPS_PATH = '/api/conversation-groups';
+  // The target's bootstrap refuses a group with these codes.
+  const BOOTSTRAP_GROUP_CODES = Object.freeze({
+    notFound: 'SESSION_GROUP_NOT_FOUND',
+    ambiguous: 'SESSION_GROUP_AMBIGUOUS',
+    unavailable: 'SESSION_GROUPS_UNAVAILABLE',
+    invalid: 'SESSION_GROUP_INVALID',
+  });
+
+  function groupWhere(ctx) {
+    return ctx.relay.local ? 'this relay' : `relay "${ctx.relay.name}"`;
+  }
+
+  /** A text that starts with groupWhere(), as the start of a sentence. */
+  function sentence(text) {
+    return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+  }
+
+  function mapGroupList(response) {
+    return (Array.isArray(response?.groups) ? response.groups : [])
+      .filter(isPlainObject)
+      .map((group) => ({ id: toText(group.id), name: clipLine(group.name, 80) || 'Group', memberCount: nonNegativeInt(group.memberCount) }))
+      .filter((group) => group.id);
+  }
+
+  /**
+   * Why the target's group list could not be read: `{ status, code, text }`.
+   * A relay without the list (404) predates groups on create_session.
+   */
+  function groupListProblem(ctx, error) {
+    const C = REMOTE_RELAY_ERROR_CODES;
+    const where = groupWhere(ctx);
+    const code = toText(error?.code);
+    const status = Number(error?.status) || 0;
+    if (code === C.notFound || status === 404) {
+      return { status: 400, code: C.unsupported, text: `The target relay doesn't support groups on create_session yet: ${where} runs an older OAR (its group list answered 404).` };
+    }
+    if (code === C.unauthorized || status === 401) {
+      return { status: 502, code: C.unauthorized, text: `${where} rejected this relay's token when asked for its session groups (401).` };
+    }
+    if (status === 403 || code === C.inboundDisabled) {
+      return { status: 403, code: code || `${C.httpPrefix}403`, text: `${where} refused to list its session groups (403).` };
+    }
+    if (status === 503 && toText(error?.remoteBody?.error).includes('Session groups are not available')) {
+      return { status: 400, code: C.unsupported, text: `Session groups are not available on ${where} (its storage for them is missing).` };
+    }
+    if (code === C.offline) {
+      const detail = toText(error?.detail) || 'no answer';
+      return { status: 502, code: C.offline, text: `${where} did not answer when asked for its session groups (${detail}).` };
+    }
+    if (status >= 500) {
+      return { status: 502, code: code || `${C.httpPrefix}${status}`, text: `${where} failed to list its session groups (HTTP ${status}).` };
+    }
+    return { status: 502, code: code || `${C.httpPrefix}502`, text: `${where} could not list its session groups (${toText(error?.message) || 'unexpected answer'}).` };
+  }
+
+  /**
+   * The refusal for a group the target does not have, or has several of by
+   * that name. `total` is how many there are when `groups` came capped (the
+   * target's own refusal).
+   */
+  function unknownGroupFailure(ctx, requested, found, groups, total = null) {
+    const where = groupWhere(ctx);
+    const asked = clipLine(requested, 80).replace(/"/g, "'");
+    const ambiguous = found.status === 'ambiguous';
+    const listed = ambiguous ? found.matches : groups;
+    const max = REMOTE_RELAY_GROUP_LIMITS.refusalMax;
+    const count = Number.isInteger(total) && total > listed.length ? total : listed.length;
+    const names = formatSessionGroupList(listed, max, count);
+    let text;
+    if (ambiguous) text = `"${asked}" names several session groups on ${where}: ${names}. Pass the id.`;
+    else if (groups.length) text = sentence(`${where} has no session group "${asked}". Groups there: ${names}.`);
+    else text = sentence(`${where} has no session groups.`);
+    return new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unknownGroup, `${text} No session was created.`, {
+      group: requested,
+      groups: listed.slice(0, max).map((group) => ({ id: group.id, name: group.name })),
+      ...(count > max ? { groupsTotal: count } : {}),
+      note: groups.length
+        ? 'Pass one of these ids or names (relay_info lists them), or leave group out. create_session takes an existing group only; update_session can put the session into a new group of that name afterwards. Renaming groups is the owner\'s.'
+        : 'Leave group out; update_session can put the session into a new group of that name afterwards.',
+    });
+  }
+
+  /**
+   * The group a create_session names, looked up on the target before anyone
+   * is asked: `{ id, name }`. Any failure to read the target's groups refuses
+   * the call (a DispatchFailure), as an unknown or ambiguous group does.
+   */
+  async function settleRequestedGroup(ctx, requested) {
+    let response;
+    try {
+      response = await call(ctx, 'GET', GROUPS_PATH);
+    } catch (error) {
+      if (!isRemoteRelayError(error)) throw error;
+      const problem = groupListProblem(ctx, error);
+      throw new DispatchFailure(problem.status, problem.code, `${sentence(problem.text)} No session was created.`, {
+        group: requested,
+        note: 'Leave group out (the owner can group the session by hand), or try again once that relay lists its groups.',
+      });
+    }
+    const groups = mapGroupList(response);
+    const found = resolveSessionGroupReference(groups, requested);
+    if (found.status === 'found') return { id: found.group.id, name: found.group.name };
+    throw unknownGroupFailure(ctx, requested, found, groups);
+  }
+
+  /** A bootstrap refusal of the group (it vanished after the lookup), as the agent reads it; else null. */
+  function bootstrapGroupFailure(ctx, error, requested) {
+    if (!requested || !isRemoteRelayError(error)) return null;
+    const body = isPlainObject(error.remoteBody) ? error.remoteBody : null;
+    const remoteCode = toText(body?.code);
+    if (remoteCode === BOOTSTRAP_GROUP_CODES.notFound || remoteCode === BOOTSTRAP_GROUP_CODES.ambiguous) {
+      const groups = mapGroupList(body);
+      const found = remoteCode === BOOTSTRAP_GROUP_CODES.ambiguous ? { status: 'ambiguous', matches: groups } : { status: 'unknown' };
+      const total = Number.isInteger(body?.groupsTotal) ? body.groupsTotal : null;
+      return unknownGroupFailure(ctx, requested, found, groups, total);
+    }
+    if (remoteCode === BOOTSTRAP_GROUP_CODES.unavailable) {
+      return new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unsupported,
+        `Session groups are not available on ${groupWhere(ctx)} (its storage for them is missing). No session was created.`, { group: requested });
+    }
+    if (remoteCode === BOOTSTRAP_GROUP_CODES.invalid) {
+      return new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, `${toText(body?.error) || 'group is not valid'}. No session was created.`, { group: requested });
+    }
+    return null;
+  }
+
+  /** The `group` of a bootstrap answer in list_sessions' shape, or null. */
+  function bootstrapGroupField(value) {
+    if (!isPlainObject(value) || !toText(value.id)) return null;
+    return { id: toText(value.id), name: toText(value.name) || null, role: toText(value.role) === 'head' ? 'head' : 'member' };
+  }
+
+  /** relay_info's `groups` (latest activity first, capped), or a note why there are none. */
+  async function relayGroups(ctx) {
+    try {
+      const groups = mapGroupList(await call(ctx, 'GET', GROUPS_PATH));
+      const max = REMOTE_RELAY_GROUP_LIMITS.listMax;
+      return {
+        groups: groups.slice(0, max),
+        ...(groups.length > max ? { groupsTotal: groups.length } : {}),
+      };
+    } catch (error) {
+      if (!isRemoteRelayError(error)) throw error;
+      return { groups: null, groupsNote: `${sentence(groupListProblem(ctx, error).text)} create_session cannot take group there.` };
+    }
+  }
+
   // ─── Actions ───────────────────────────────────────────────────────────────
 
   // Plan usage as the agent may see it: an allow-list of fields, so a field
@@ -1225,9 +1452,10 @@ export function createRemoteRelayDispatcher({
   }
 
   async function relayInfo(ctx) {
-    const [identity, catalog] = await Promise.all([
+    const [identity, catalog, groups] = await Promise.all([
       call(ctx, 'GET', '/api/relay/identity').catch(() => null),
       loadCatalog(ctx),
+      relayGroups(ctx),
     ]);
     const status = catalog.status;
     const providers = buildProviders(catalog);
@@ -1247,7 +1475,7 @@ export function createRemoteRelayDispatcher({
       // let in by the agent-sessions setting, which is on or this would not run.
       acceptsAgentPrompts: ctx.relay.local ? true : (remoteRelays ? remoteRelays.inbound !== false : null),
       ...(ctx.relay.local ? {
-        sessionRules: `create_session: at most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time; a session an agent created cannot create sessions; sessions run on this relay's accounts.`,
+        sessionRules: `create_session: at most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time; a session an agent created cannot create sessions unless the owner allowed it for that session (mayCreateSessions); sessions run on this relay's accounts. update_session: sessions you started freely, any other (the owner's, another agent's, your creator's) after the owner's Allow (once per conversation).`,
       } : {}),
       providers,
       workspaces: {
@@ -1257,6 +1485,8 @@ export function createRemoteRelayDispatcher({
       },
       relayModes: Array.isArray(status.supportedRelayModes) ? status.supportedRelayModes : [],
       defaultRelayMode: toText(status.defaultRelayMode) || null,
+      // The session groups a create_session there may name (`group`).
+      ...groups,
     };
   }
 
@@ -1305,6 +1535,8 @@ export function createRemoteRelayDispatcher({
       ...(via ? { via } : {}),
       ...(createdBy ? { createdBy } : {}),
       ...(createdBy && ctx?.relay?.local && createdBy === ctx.conversationId ? { startedByYou: true } : {}),
+      // The owner let this agent-started session's agents start sessions.
+      ...(row?.mayCreateSessions === true ? { mayCreateSessions: true } : {}),
       // The session group it sits in (sessions an agent started here are
       // grouped under that agent's session; the owner can group by hand).
       ...sessionGroupField(row, groups),
@@ -1511,7 +1743,7 @@ export function createRemoteRelayDispatcher({
       query: { limit: args.last, beforeMessageId: before?.beforeMessageId, beforeTimestamp: before?.beforeTimestamp, groupMembers: 1 },
     });
     const conversationId = toText(conversation?.id) || args.session;
-    const pendingQuestions = await loadPendingQuestions(ctx, conversationId);
+    const pendingQuestions = await loadPendingQuestions(ctx, conversationId, { includeAsks: true });
     const { messages, omitted } = shapeMessages(conversation?.messages, {
       maxChars: args.max_chars,
       includeActivity: args.include_activity,
@@ -1558,6 +1790,7 @@ export function createRemoteRelayDispatcher({
         active: conversation?.activeTurn === true || isBusyState(conversation?.sessionState),
         ...sessionActivityFields(conversation, { console: true }),
         ...(via ? { via } : {}),
+        ...(conversation?.mayCreateSessions === true ? { mayCreateSessions: true } : {}),
         ...(group ? { group } : {}),
         openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
       },
@@ -1681,7 +1914,7 @@ export function createRemoteRelayDispatcher({
         `Message ${args.message_id} is not in session ${args.session} on relay "${ctx.relay.name}".`);
     }
     const session = toText(around?.id) || args.session;
-    const outcome = await waitForReply(ctx, { session, messageId: args.message_id, waitSeconds: args.wait_seconds });
+    const outcome = await waitForOwnReply(ctx, { session, messageId: args.message_id, waitSeconds: args.wait_seconds });
     return { summary: outcomeSummary('wait', ctx, outcome), ...outcome };
   }
 
@@ -1804,12 +2037,46 @@ export function createRemoteRelayDispatcher({
       };
       return { summary: outcomeSummary(action, ctx, outcome), ...outcome, ...extra, openUrl };
     }
+    noteOwnPrompt(ctx, session, sent.messageId);
     if (waitSeconds <= 0) {
       const outcome = { status: 'queued', session, message_id: sent.messageId };
       return { summary: outcomeSummary(action, ctx, outcome), ...outcome, ...extra, openUrl };
     }
-    const outcome = await waitForReply(ctx, { session, messageId: sent.messageId, waitSeconds });
+    const outcome = await waitForOwnReply(ctx, { session, messageId: sent.messageId, waitSeconds });
     return { summary: outcomeSummary(action, ctx, outcome), ...outcome, ...extra, openUrl };
+  }
+
+  /**
+   * The event service learns of this conversation's own prompts: a turn_end
+   * of one whose finished reply it waited for is not delivered to it again.
+   */
+  function noteOwnPrompt(ctx, session, messageId) {
+    try {
+      relayEvents?.noteOwnPrompt?.({
+        watcherConversationId: ctx.conversationId,
+        // This relay's own sessions: the service's default.
+        ...(ctx.relay.local ? {} : { relayId: ctx.relay.id }),
+        sessionId: session,
+        messageId,
+      });
+    } catch {}
+  }
+
+  /** waitForReply, with that turn's turn_end held while it runs and dropped once the reply came. */
+  async function waitForOwnReply(ctx, { session, messageId, waitSeconds }) {
+    let token = null;
+    try {
+      token = relayEvents?.beginOwnWait?.({ watcherConversationId: ctx.conversationId, messageId, waitMs: waitSeconds * 1000 }) || null;
+    } catch {}
+    let outcome = null;
+    try {
+      outcome = await waitForReply(ctx, { session, messageId, waitSeconds });
+      return outcome;
+    } finally {
+      try {
+        relayEvents?.endOwnWait?.(token, { received: outcome?.status === 'done' && !!outcome?.reply });
+      } catch {}
+    }
   }
 
   async function send(ctx, args) {
@@ -1863,7 +2130,7 @@ export function createRemoteRelayDispatcher({
    * Claude alias resolved) and what the agent should know about it, the
    * model left unchecked for want of a list included.
    */
-  function settleRequestedModel(ctx, catalog, provider, requested, { creating, extraModels = [] }) {
+  function settleRequestedModel(ctx, catalog, provider, requested, { creating, extraModels = [], updating = false }) {
     const entry = catalog ? listProviders(catalog).find((candidate) => candidate.provider === provider) : null;
     const offered = catalog ? offeredModelList(catalog, provider) : null;
     const check = checkRequestedProviderModel({
@@ -1879,7 +2146,7 @@ export function createRemoteRelayDispatcher({
     const label = providerModelLabel(provider);
     if (check.status === 'unknown') {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unknownModel,
-        `${unknownProviderModelText({ model: requested, provider, suggestions: check.suggestions, models: check.models, where })} ${creating ? 'No session was created.' : 'Nothing was sent.'}`,
+        `${unknownProviderModelText({ model: requested, provider, suggestions: check.suggestions, models: check.models, where })} ${creating ? 'No session was created.' : (updating ? 'Nothing was changed.' : 'Nothing was sent.')}`,
         {
           provider,
           model: requested,
@@ -1891,7 +2158,7 @@ export function createRemoteRelayDispatcher({
     if (check.status === 'unchecked') {
       return {
         model: requested,
-        note: `Model '${requested}' could not be checked: ${label} ${where} has no model list yet (its model discovery has not run or failed), so ${creating ? 'the session was created' : 'the prompt was sent'} with it as asked.`,
+        note: `Model '${requested}' could not be checked: ${label} ${where} has no model list yet (its model discovery has not run or failed), so ${creating ? 'the session was created with it' : (updating ? 'the session was set to it' : 'the prompt was sent with it')} as asked.`,
       };
     }
     const tierNote = check.tierDropped ? ` ${label} ${where} lists no "[1m]" id for it, so it runs with the standard context.` : '';
@@ -2008,8 +2275,13 @@ export function createRemoteRelayDispatcher({
         // What New Chat sends for a Claude Cloud conversation; the bootstrap
         // validates it and refuses with its own codes.
         ...(cloud ? { cloudSource: { repoUrl: args.repo, ...(args.branch ? { branch: args.branch } : {}) } } : {}),
+        // The group the lookup found (its id), else the agent's words; the
+        // target resolves it again and refuses before creating anything.
+        ...(args.group ? { group: ctx.group?.id || args.group } : {}),
         origin,
       },
+    }).catch((error) => {
+      throw bootstrapGroupFailure(ctx, error, args.group) || error;
     });
     let bootstrap;
     try {
@@ -2031,6 +2303,16 @@ export function createRemoteRelayDispatcher({
     if (!session) {
       throw new DispatchFailure(502, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}502`,
         `Relay "${ctx.relay.name}" did not return the new session's id.`);
+    }
+    // A relay that takes group answers the key (null outside a group); one
+    // that predates it created the session and passed group over.
+    const groupReported = isPlainObject(bootstrap) && Object.prototype.hasOwnProperty.call(bootstrap, 'group');
+    const group = groupReported ? bootstrapGroupField(bootstrap.group) : null;
+    let groupWarning = null;
+    if (args.group && !groupReported) {
+      groupWarning = `The session was created WITHOUT a group: ${groupWhere(ctx)} ignored group "${clipLine(args.group, 80)}" (its OAR is older and does not take group on create_session). Tell the user; the owner can move the session into the group by hand.`;
+    } else if (args.group && (!group || (ctx.group?.id && group.id !== ctx.group.id))) {
+      groupWarning = `The session was created, but not in group "${clipLine(args.group, 80)}": ${groupWhere(ctx)} put it ${group ? `in "${group.name || group.id}" (${group.id})` : 'in no group'}. Tell the user.`;
     }
     const boundModel = toText(bootstrap?.selectedModel) || model;
     // A relay that swapped the asked model for another (one that predates
@@ -2060,7 +2342,7 @@ export function createRemoteRelayDispatcher({
           note: 'Use send with this session and an effort it takes (or none); do not create another session.',
         });
     }
-    return deliverAndWait('create_session', ctx, {
+    const result = await deliverAndWait('create_session', ctx, {
       session,
       sent,
       waitSeconds: args.wait_seconds,
@@ -2074,8 +2356,18 @@ export function createRemoteRelayDispatcher({
         ...(toText(bootstrap?.workspaceRootWarning) ? { cwdWarning: toText(bootstrap.workspaceRootWarning) } : {}),
         ...(note ? { modelNote: note } : {}),
         ...effortResult(choice),
+        // The session group it went into, as list_sessions shows it.
+        group,
+        ...(groupWarning ? { groupWarning } : {}),
       },
     });
+    if (!groupWarning) return result;
+    // Never a plain success: the summary and the note say what is missing.
+    return {
+      ...result,
+      summary: `${result.summary} (no group: ${groupReported ? 'not applied' : 'target too old'})`,
+      note: [groupWarning, result.note].map(toText).filter(Boolean).join(' '),
+    };
   }
 
   /** The provider a new session gets: the one asked for, else the calling session's. */
@@ -2164,6 +2456,11 @@ export function createRemoteRelayDispatcher({
         `Question ${args.question_id} is relay "${ctx.relay.name}"'s approval of its own agent's call to another relay; only its user can answer it.`,
         { session });
     }
+    if (toText(question.kind) === RELAY_ASK_KIND) {
+      throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
+        `Question ${args.question_id} was asked with ask: it is the user's to answer, in the Inbox or that session, not an agent's. Leave it to the user.`,
+        { session });
+    }
     if (toText(question.status) && toText(question.status) !== 'pending') {
       throw new DispatchFailure(409, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}409`,
         `Question ${args.question_id} on relay "${ctx.relay.name}" is already ${toText(question.status).replace(/_/g, ' ')}.`,
@@ -2219,6 +2516,244 @@ export function createRemoteRelayDispatcher({
       archived: !gone,
       ...(gone ? { note: 'The session was already deleted there.' } : {}),
     };
+  }
+
+  // ─── update_session ────────────────────────────────────────────────────────
+
+  /** The settings of a call (`args` without relay and session), as the target's route takes them. */
+  function requestedSettings(args) {
+    const settings = {};
+    for (const key of REMOTE_RELAY_SESSION_SETTINGS) {
+      if (Object.prototype.hasOwnProperty.call(args, key)) settings[key] = args[key];
+    }
+    return settings;
+  }
+
+  /**
+   * A refusal of the target's settings route, as the agent reads it (a
+   * DispatchFailure), or null for one mapRemoteError handles (offline, token,
+   * inbound switch). A 404 without the route's own code is a relay that
+   * predates update_session.
+   */
+  function sessionSettingsFailure(ctx, error, session) {
+    if (!isRemoteRelayError(error)) return null;
+    const C = REMOTE_RELAY_ERROR_CODES;
+    const body = isPlainObject(error.remoteBody) ? error.remoteBody : {};
+    const remoteCode = toText(body.code);
+    const status = Number(error.status) || 0;
+    const where = ctx.relay.local ? 'this relay' : `relay "${ctx.relay.name}"`;
+    const text = toText(body.error) || toText(error.message);
+    // What the target wrote before the step that failed.
+    const changed = Array.isArray(body.changed) ? body.changed.map(toText).filter(Boolean) : [];
+    const failed = (failureStatus, code, message, extra = {}) => new DispatchFailure(failureStatus, code, message, { session, ...extra, changed });
+    if (remoteCode === 'PROCESS_LIST_UNREADABLE') {
+      return failed(503, `${C.httpPrefix}503`, text, { remoteCode, note: 'That relay could not read its process list for a moment: try the change again shortly.' });
+    }
+    if (status === 404 || toText(error.code) === C.notFound) {
+      if (remoteCode === SESSION_SETTINGS_CODES.notFound) {
+        return new DispatchFailure(404, C.notFound, `Session ${session} was not found on ${where}.`, { session });
+      }
+      return new DispatchFailure(400, C.unsupported,
+        `${sentence(where)} cannot change a session's settings for agents yet: it runs an older OAR (no update_session there). Nothing was changed.`, { session });
+    }
+    if (remoteCode === C.permission) {
+      return failed(403, C.permission, `${text} Nothing was changed.`);
+    }
+    if (remoteCode === SESSION_SETTINGS_CODES.busy) {
+      return failed(409, C.busy, text, { reason: toText(body.reason) || null });
+    }
+    if (remoteCode === SESSION_SETTINGS_CODES.groupNotFound || remoteCode === SESSION_SETTINGS_CODES.groupAmbiguous) {
+      return failed(400, C.unknownGroup, text, {
+        groups: mapGroupList(body).slice(0, REMOTE_RELAY_GROUP_LIMITS.refusalMax).map((group) => ({ id: group.id, name: group.name })),
+        ...(Number.isInteger(body.groupsTotal) ? { groupsTotal: body.groupsTotal } : {}),
+        note: 'Pass one of these ids, a name for a new group, or "none".',
+      });
+    }
+    if (status === 403 && remoteCode && remoteCode !== C.inboundDisabled) {
+      return failed(403, remoteCode, text || `${sentence(where)} refused the change.`);
+    }
+    if (status >= 400 && status < 500 && status !== 401 && remoteCode !== C.inboundDisabled) {
+      return failed(status, status === 429 ? C.rateLimited : C.invalidInput, text || `${sentence(where)} refused the change.`, remoteCode ? { remoteCode } : {});
+    }
+    // A step that failed on that relay after an earlier one wrote (a CLI that
+    // would not restart in the new folder): what was written comes along.
+    if (status >= 500 && (changed.length || toText(body.error))) {
+      return failed(502, `${C.httpPrefix}${status}`, text || `${sentence(where)} failed to make the change.`, remoteCode ? { remoteCode } : {});
+    }
+    return null;
+  }
+
+  async function sessionSettingsCall(ctx, session, body) {
+    try {
+      // The origin names the calling conversation: the target changes freely
+      // only a session that conversation started.
+      const origin = await buildOrigin(ctx);
+      return await call(ctx, 'PATCH', sessionPath(session, SESSION_SETTINGS_SUFFIX), { body: { ...body, origin }, timeoutMs: 60_000 });
+    } catch (error) {
+      throw sessionSettingsFailure(ctx, error, session) || error;
+    }
+  }
+
+  /**
+   * What an update_session would change, checked before anyone is asked:
+   * the model against the target's list (as send checks it), the effort
+   * against what that model takes, then the target's own dry run (groups,
+   * folder, its rule). Throws a DispatchFailure for anything refused.
+   */
+  async function planSessionUpdate(ctx, args) {
+    const conversation = await call(ctx, 'GET', sessionPath(args.session), { query: { limit: 1 } });
+    const session = toText(conversation?.id) || args.session;
+    const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
+    const provider = toText(runtime.providerType).toLowerCase() || 'github';
+    const where = `on relay "${ctx.relay.name}"`;
+    const settings = requestedSettings(args);
+    const notes = [];
+    let catalog = null;
+    if (settings.model || settings.effort) catalog = await loadCatalog(ctx).catch(() => null);
+    const ownModel = toText(conversation?.preferredModel) || toText(runtime.providerModel) || toText(runtime.model);
+    if (settings.model) {
+      if (provider === 'grok' && ownModel && settings.model.toLowerCase() !== ownModel.toLowerCase()) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+          `A Grok session keeps the model it was started with (${ownModel}); start a new session for another one. Nothing was changed.`, { session });
+      }
+      const settled = settleRequestedModel(ctx, catalog, provider, settings.model, {
+        creating: false,
+        updating: true,
+        extraModels: [
+          ...(Array.isArray(catalog?.settings?.[provider]?.availableModels) ? catalog.settings[provider].availableModels : []),
+          runtime.providerModel,
+          runtime.model,
+        ],
+      });
+      settings.model = settled.model;
+      if (settled.note) notes.push(settled.note);
+      // A Copilot model named with its effort brings that effort.
+      if (!settings.effort && normalizeEffort(settled.effort)) settings.effort = normalizeEffort(settled.effort);
+    }
+    if (settings.effort) {
+      if (provider === CLOUD_PROVIDER) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+          `A Claude Cloud session takes no reasoning effort. Nothing was changed.`, { session });
+      }
+      const model = settings.model || ownModel;
+      const offered = catalog ? catalogEffortsFor(catalog.models, provider, model) : null;
+      if (offered && offered.length && !offered.includes(settings.effort)) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+          `${model || provider} ${where} does not take effort "${settings.effort}"${supportedEffortsText(offered)}. Nothing was changed.`,
+          { session, supportedEfforts: offered });
+      }
+      if (!offered) notes.push(`Effort "${settings.effort}" could not be checked against ${model || provider} ${where} (no list of its efforts); it was set as asked.`);
+    }
+    const dry = await sessionSettingsCall(ctx, session, { settings, dry_run: true });
+    if (!Array.isArray(dry?.changed)) {
+      throw new DispatchFailure(502, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}502`, `Relay "${ctx.relay.name}" did not answer the check of the change as expected. Nothing was changed.`, { session });
+    }
+    return {
+      session,
+      title: toText(conversation?.title) || null,
+      provider,
+      // Whether the owner must allow it: every session the calling
+      // conversation did not start itself (the target decides).
+      approvalNeeded: dry.approvalNeeded !== false,
+      changed: dry.changed.map(toText).filter(Boolean),
+      current: isPlainObject(dry.settings) ? dry.settings : null,
+      group: isPlainObject(dry.group) ? dry.group : null,
+      settings,
+      notes: [...notes, ...(Array.isArray(dry.notes) ? dry.notes.map(toText).filter(Boolean) : [])],
+    };
+  }
+
+  /** The `settings` of an answer as the agent reads it: the target's, the group in list_sessions' shape. */
+  function settingsResult(settings) {
+    if (!isPlainObject(settings)) return null;
+    return { ...settings, group: bootstrapGroupField(settings.group) };
+  }
+
+  async function updateSession(ctx, args) {
+    const plan = ctx.updatePlan || await planSessionUpdate(ctx, args);
+    const openUrl = remoteConversationUrl(ctx.relay.url, plan.session) || null;
+    const where = `${ctx.relay.name} session ${shortId(plan.session)}`;
+    if (!plan.changed.length) {
+      return {
+        summary: `update_session → ${where}: nothing to change`,
+        session: plan.session,
+        settings: settingsResult(plan.current),
+        changed: [],
+        openUrl,
+        note: [...plan.notes, 'The session already has these settings; nothing was changed.'].join(' '),
+      };
+    }
+    const answer = await sessionSettingsCall(ctx, plan.session, { settings: plan.settings, owner_approved: plan.approvalNeeded });
+    const changed = Array.isArray(answer?.changed) ? answer.changed.map(toText).filter(Boolean) : plan.changed;
+    const notes = [...plan.notes.filter((note) => !(answer?.notes || []).includes(note)), ...(Array.isArray(answer?.notes) ? answer.notes.map(toText).filter(Boolean) : [])];
+    if (changed.includes('mode')) {
+      notes.push('This mode lasts until the next send that names another mode or comes from a caller in another mode: a send without mode passes the caller\'s own mode.');
+    }
+    return {
+      summary: `update_session → ${where}: ${changed.join(', ') || 'nothing changed'}`,
+      session: plan.session,
+      settings: settingsResult(answer?.settings),
+      changed,
+      ...(typeof answer?.relaunched === 'boolean' ? { relaunched: answer.relaunched } : {}),
+      ...(isPlainObject(answer?.groupCreated) ? { groupCreated: { id: toText(answer.groupCreated.id), name: toText(answer.groupCreated.name) || null } } : {}),
+      openUrl,
+      ...(notes.length ? { note: notes.join(' ') } : {}),
+    };
+  }
+
+  // The owner's Allow for a conversation to change sessions on a relay that it
+  // did not start itself, stored as an unlock under `<relay id>:session-settings`.
+  function sessionSettingsApprovalKey(relayId) {
+    return `${toText(relayId) || REMOTE_RELAY_LOCAL_ID}:session-settings`;
+  }
+
+  /**
+   * Asked on the first update_session of a conversation that aims at a
+   * session on that relay it did not start itself (the owner's, another
+   * agent's, its own creator's); remembered once allowed.
+   * Parallel calls share the open card. Resolves `{ approved, asked }` or
+   * `{ approved:false, code, error }`.
+   */
+  async function ensureSessionSettingsApproval(ctx, plan, args) {
+    const { conversationId } = ctx;
+    const key = sessionSettingsApprovalKey(ctx.relay.id);
+    if (hasApprovalKey(conversationId, key)) return { approved: true, asked: false };
+    const openKey = `${conversationId}:${key}`;
+    const open = sessionSettingsApprovalsByKey.get(openKey);
+    if (open) {
+      const shared = await open;
+      return shared.approved ? { approved: true, asked: false } : shared;
+    }
+    const asking = (async () => {
+      const decision = await requestApproval({
+        conversationId,
+        callerContext: ctx.caller,
+        relay: relayTarget(ctx.relay),
+        action: 'update_session',
+        args,
+        summary: summarizeRemoteRelayCall({ action: 'update_session', ...args, relay: ctx.relay.name }),
+        signal: ctx.signal,
+        sessionSettings: { session: plan.session, title: plan.title, changed: plan.changed },
+      });
+      if (decision !== true && decision?.approved !== true) {
+        const where = ctx.relay.local ? 'this relay' : `relay "${ctx.relay.name}"`;
+        return {
+          approved: false,
+          code: toText(decision?.code) === REMOTE_RELAY_ERROR_CODES.noTurn ? REMOTE_RELAY_ERROR_CODES.noTurn : REMOTE_RELAY_ERROR_CODES.permission,
+          error: toText(decision?.error)
+            ? `${toText(decision.error)} Session ${plan.session} on ${where} was not started by this conversation; its settings were not changed.`
+            : `The owner did not allow this conversation to change sessions on ${where} that it did not start; session ${plan.session} was not changed. Sessions this conversation started there can still be changed.`,
+        };
+      }
+      recordApprovalKeys(conversationId, [key], ctx.caller?.processingRowId);
+      return { approved: true, asked: true };
+    })();
+    sessionSettingsApprovalsByKey.set(openKey, asking);
+    try {
+      return await asking;
+    } finally {
+      sessionSettingsApprovalsByKey.delete(openKey);
+    }
   }
 
   // ─── Event subscriptions ───────────────────────────────────────────────────
@@ -2287,7 +2822,7 @@ export function createRemoteRelayDispatcher({
         repository?.recordUnlock?.(conversationId, key, messageId || null);
       } catch (error) {
         try {
-          logger?.warn?.(`${LOG_PREFIX} watch approval not stored conv=${shortId(conversationId)}: ${toText(error?.message || error).slice(0, 200)}`);
+          logger?.warn?.(`${LOG_PREFIX} approval ${key} not stored conv=${shortId(conversationId)}: ${toText(error?.message || error).slice(0, 200)}`);
         } catch {}
       }
     }
@@ -2336,6 +2871,15 @@ export function createRemoteRelayDispatcher({
     }
   }
 
+  /** A subscribe's options as the approval card names them. */
+  function watchOptions(args) {
+    return {
+      ...(args.digest_minutes ? { digestMinutes: args.digest_minutes } : {}),
+      ...(args.quiet_hours ? { quietHours: args.quiet_hours } : {}),
+      ...(args.exclude?.length ? { excludeCount: args.exclude.length } : {}),
+    };
+  }
+
   async function subscribeAction(ctx, args) {
     if (!ctx.relay.local) return subscribeRemoteAction(ctx, args);
     const service = eventService(ctx);
@@ -2362,7 +2906,7 @@ export function createRemoteRelayDispatcher({
     if (all || ids.length) {
       const decision = await ensureWatchApproval(ctx, {
         all,
-        watch: { kind: 'subscribe', all, sessions: titles, events, once: args.once === true, heartbeatMinutes: args.heartbeat_minutes ?? null },
+        watch: { kind: 'subscribe', all, sessions: titles, events, once: args.once === true, heartbeatMinutes: args.heartbeat_minutes ?? null, ...watchOptions(args) },
       });
       if (!decision.approved) throw new DispatchFailure(403, decision.code, decision.error);
     }
@@ -2375,6 +2919,9 @@ export function createRemoteRelayDispatcher({
       match: args.match || '',
       stalledMinutes: args.stalled_minutes ?? null,
       heartbeatMinutes: args.heartbeat_minutes ?? null,
+      digestMinutes: args.digest_minutes ?? null,
+      quietHours: args.quiet_hours ?? null,
+      exclude: args.exclude ?? null,
     }));
     const what = all ? 'all sessions' : (ids.length ? `${ids.length} session${ids.length === 1 ? '' : 's'}` : 'relay_restarted');
     return {
@@ -2402,6 +2949,12 @@ export function createRemoteRelayDispatcher({
     const service = eventService(ctx);
     const all = args.scope === 'all';
     relayEventCall(() => service.checkWatcherCapacity(ctx.conversationId));
+    if ((args.digest_minutes || args.quiet_hours || args.exclude?.length) && service.areOptionsAvailable?.() === false) {
+      throw new DispatchFailure(503, REMOTE_RELAY_ERROR_CODES.unsupported,
+        'digest_minutes, quiet_hours and exclude are not available on this relay right now (see its server log).');
+    }
+    // Digest and quiet hours are applied here, where the events are
+    // delivered; exclude is also the watched relay's (all_idle, stalled).
     const request = {
       watcher: { conversationId: ctx.conversationId, title: toText(ctx.caller?.title) || null },
       subscriber: { name: toText(await registry.selfName?.()) || null },
@@ -2412,6 +2965,7 @@ export function createRemoteRelayDispatcher({
       ...(args.match ? { match: args.match } : {}),
       ...(args.stalled_minutes !== undefined ? { stalled_minutes: args.stalled_minutes } : {}),
       ...(args.heartbeat_minutes !== undefined ? { heartbeat_minutes: args.heartbeat_minutes } : {}),
+      ...(args.exclude?.length ? { exclude: args.exclude } : {}),
     };
     const checked = await relayEventRemoteCall(ctx, RELAY_EVENT_REMOTE_SUBSCRIBE_PATH, { ...request, dry_run: true });
     const preview = isPlainObject(checked?.subscription) ? checked.subscription : {};
@@ -2424,6 +2978,7 @@ export function createRemoteRelayDispatcher({
         events: Array.isArray(preview.events) ? preview.events : (args.events || [...RELAY_EVENT_DEFAULT_TYPES]),
         once: args.once === true,
         heartbeatMinutes: args.heartbeat_minutes ?? null,
+        ...watchOptions(args),
       },
     });
     if (!decision.approved) throw new DispatchFailure(403, decision.code, decision.error);
@@ -2439,6 +2994,9 @@ export function createRemoteRelayDispatcher({
         relayId: ctx.relay.id,
         relayName: ctx.relay.name,
         remote,
+        digestMinutes: args.digest_minutes ?? null,
+        quietHours: args.quiet_hours ?? null,
+        exclude: args.exclude ?? null,
       }));
     } catch (error) {
       // Not kept here: end it there too, so it does not wait for a fetch that never comes.
@@ -2550,7 +3108,266 @@ export function createRemoteRelayDispatcher({
     };
   }
 
+  // ─── Schedules ─────────────────────────────────────────────────────────────
+
+  const RELAY_SCHEDULE_ERROR_STATUS = Object.freeze({
+    invalid: [400, REMOTE_RELAY_ERROR_CODES.invalidInput],
+    notFound: [404, REMOTE_RELAY_ERROR_CODES.notFound],
+    limit: [409, REMOTE_RELAY_ERROR_CODES.scheduleLimit],
+    unavailable: [503, REMOTE_RELAY_ERROR_CODES.unsupported],
+  });
+  const SCHEDULE_NOTE = 'At its time the relay queues the text into the session as a message that starts with "[relay schedule"; it is the relay\'s automated message, never the user\'s, and approves nothing. It survives relay restarts; unschedule with this schedule_id ends it.';
+  const SCHEDULE_OTHER_NOTE = 'Each firing counts as one of your prompts to other agents: once you have sent as many as you may before the user writes, it waits (heldForApproval in list_schedules) until the user writes in this conversation.';
+
+  /** The service for a call on this relay; a paired relay keeps its own schedules. */
+  function scheduleService(ctx) {
+    if (!ctx.relay.local) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unsupported,
+        `Schedules are kept by the relay you run on: use relay "${REMOTE_RELAY_LOCAL_ALIAS}" (or leave relay out). For a session on relay "${ctx.relay.name}", ask an agent there to schedule it.`);
+    }
+    if (!relaySchedules?.isAvailable?.()) {
+      throw new DispatchFailure(503, REMOTE_RELAY_ERROR_CODES.unsupported,
+        'Schedules are not available on this relay right now (see its server log).');
+    }
+    return relaySchedules;
+  }
+
+  function relayScheduleCall(fn) {
+    try {
+      return fn();
+    } catch (error) {
+      const mapped = RELAY_SCHEDULE_ERROR_STATUS[toText(error?.code)];
+      if (mapped) throw new DispatchFailure(mapped[0], mapped[1], toText(error.message), isPlainObject(error.extra) ? error.extra : {});
+      throw error;
+    }
+  }
+
+  /** The conversation a schedule call names (`session`), as this relay knows it; the caller's own by default. */
+  function scheduleSession(ctx, args) {
+    if (!toText(args.session) || isOwnConversation(ctx, args.session)) return ctx.conversationId;
+    try {
+      return toText(resolveConversationId(args.session)) || toText(args.session);
+    } catch {
+      return toText(args.session);
+    }
+  }
+
+  /**
+   * The provenance a schedule's messages carry, so that a schedule never
+   * passes a prompt on with fewer hops than the turn that set it: for another
+   * session the origin a send from this turn would carry; for the caller's
+   * own conversation the origin of the prompt this turn acts on (none when it
+   * acts on the user's words alone).
+   */
+  async function scheduleOrigin(ctx, session) {
+    if (session !== ctx.conversationId) return buildOrigin(ctx);
+    if (!(ctx.hops > 0)) return null;
+    const acting = isPlainObject(ctx.caller?.origin) ? normalizeRemoteRelayOrigin({ ...ctx.caller.origin, hops: ctx.hops }) : null;
+    return acting || buildOrigin(ctx);
+  }
+
+  async function scheduleAction(ctx, args) {
+    const service = scheduleService(ctx);
+    const session = scheduleSession(ctx, args);
+    const origin = await scheduleOrigin(ctx, session);
+    const schedule = relayScheduleCall(() => service.create({
+      conversationId: session,
+      createdBy: ctx.conversationId,
+      text: args.text,
+      at: args.at ?? null,
+      everyMinutes: args.every_minutes ?? null,
+      once: args.once ?? null,
+      title: args.title || '',
+      origin,
+    }));
+    const when = schedule.everyMinutes
+      ? `every ${schedule.everyMinutes} min${schedule.once ? ', once' : ''}`
+      : 'once';
+    const forOther = session !== ctx.conversationId;
+    return {
+      summary: `schedule → ${ctx.relay.name}${forOther ? ` session ${shortId(session)}` : ''}: ${when}, next ${schedule.nextFireAt} (${schedule.id})`,
+      schedule_id: schedule.id,
+      schedule,
+      note: forOther ? `${SCHEDULE_NOTE} ${SCHEDULE_OTHER_NOTE}` : SCHEDULE_NOTE,
+    };
+  }
+
+  async function listSchedulesAction(ctx, args) {
+    const service = scheduleService(ctx);
+    const session = scheduleSession(ctx, args);
+    const schedules = relayScheduleCall(() => service.list({ conversationId: session }));
+    const active = schedules.filter((schedule) => !schedule.endedAt).length;
+    return {
+      summary: `list_schedules → ${ctx.relay.name}${session === ctx.conversationId ? '' : ` session ${shortId(session)}`}: ${active} active`,
+      session,
+      schedules,
+      ...(schedules.length > active ? { note: 'Schedules with endedAt ended within the last hour (endReason says why).' } : {}),
+    };
+  }
+
+  async function unscheduleAction(ctx, args) {
+    const service = scheduleService(ctx);
+    const schedule = relayScheduleCall(() => service.unschedule({ scheduleId: args.schedule_id, byConversationId: ctx.conversationId }));
+    return {
+      summary: `unschedule → ${ctx.relay.name}: ${schedule.id} ended`,
+      schedule,
+    };
+  }
+
+  // ─── Questions that don't block ────────────────────────────────────────────
+
+  const RELAY_ASK_ERROR_STATUS = Object.freeze({
+    invalid: [400, REMOTE_RELAY_ERROR_CODES.invalidInput],
+    notFound: [404, REMOTE_RELAY_ERROR_CODES.notFound],
+    closed: [409, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}409`],
+    forbidden: [403, REMOTE_RELAY_ERROR_CODES.forbidden],
+    limit: [409, REMOTE_RELAY_ERROR_CODES.questionLimit],
+    unavailable: [503, REMOTE_RELAY_ERROR_CODES.unsupported],
+  });
+  const ASK_NOTE = 'The user sees it as a card in that session and in the Inbox. When they answer or dismiss it you get a relay event '
+    + 'question_answered (question_id, answer, choice, dismissed, via: the relay it was answered on) without any subscription: a message that starts with "[relay event", '
+    + 'automated, but its answer is the user\'s own reply to this question. Keep working on what does not depend on it and do not ask it '
+    + 'again meanwhile; withdraw with this question_id takes it back.';
+
+  function askService() {
+    if (!relayAsks?.isAvailable?.()) {
+      throw new DispatchFailure(503, REMOTE_RELAY_ERROR_CODES.unsupported,
+        'Questions that don\'t block are not available on this relay right now (see its server log); use your own question tool instead.');
+    }
+    return relayAsks;
+  }
+
+  function relayAskCall(fn) {
+    try {
+      return fn();
+    } catch (error) {
+      const mapped = RELAY_ASK_ERROR_STATUS[toText(error?.code)];
+      if (mapped) throw new DispatchFailure(mapped[0], mapped[1], toText(error.message), isPlainObject(error.extra) ? error.extra : {});
+      throw error;
+    }
+  }
+
+  /** The conversation an ask call names (`session`), as this relay knows it; the caller's own by default. */
+  function askSession(ctx, args) {
+    if (!toText(args.session) || isOwnConversation(ctx, args.session)) return ctx.conversationId;
+    try {
+      return toText(resolveConversationId(args.session)) || toText(args.session);
+    } catch {
+      return toText(args.session);
+    }
+  }
+
+  function askInput(args) {
+    return {
+      question: args.question,
+      options: args.options || [],
+      recommendation: args.recommendation || '',
+      detail: args.detail || '',
+      urgency: args.urgency || 'normal',
+    };
+  }
+
+  /** A call to a paired relay's ask routes; an older relay without them answers a clear error. */
+  async function relayAskRemoteCall(ctx, path, body) {
+    try {
+      return await call(ctx, 'POST', path, { body });
+    } catch (error) {
+      if (isMissingRelayAskRoute(error)) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unsupported, relayWithoutAsksText(ctx.relay.name));
+      }
+      throw error;
+    }
+  }
+
+  async function askAction(ctx, args) {
+    const service = askService();
+    if (!ctx.relay.local) {
+      if (!toText(args.session)) {
+        throw invalidInput(`ask on relay "${ctx.relay.name}" needs session (an id from list_sessions there): your own questions go to "${REMOTE_RELAY_LOCAL_ALIAS}".`);
+      }
+      const response = await relayAskRemoteCall(ctx, RELAY_ASK_REMOTE_PATHS.ask, {
+        session: args.session,
+        ...askInput(args),
+        asker: {
+          conversationId: ctx.conversationId,
+          title: toText(ctx.caller?.title) || null,
+          // Shown there when that relay has no name for this one (a pairing one way round).
+          relayName: toText(await registry.selfName?.()) || null,
+        },
+      });
+      const remote = isPlainObject(response?.ask) ? response.ask : null;
+      if (!toText(remote?.id)) {
+        throw new DispatchFailure(502, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}502`, `Relay "${ctx.relay.name}" did not return the question.`);
+      }
+      const ask = relayAskCall(() => service.addMirror({ relayId: ctx.relay.id, createdBy: ctx.conversationId, remote }));
+      try { relayAskLink?.noteAsked?.(ctx.relay.id); } catch {}
+      return {
+        summary: `ask → ${ctx.relay.name} session ${shortId(ask.session.id)}: question ${ask.id} pending`,
+        question_id: ask.id,
+        status: 'pending',
+        question: ask,
+        note: `${ASK_NOTE} This relay looks for the answer on relay "${ctx.relay.name}" every few seconds; the session there is told too.`,
+      };
+    }
+    const session = askSession(ctx, args);
+    const ask = relayAskCall(() => service.create({ conversationId: session, createdBy: ctx.conversationId, ...askInput(args) }));
+    const forOther = session !== ctx.conversationId;
+    return {
+      summary: `ask → ${ctx.relay.name}${forOther ? ` session ${shortId(session)}` : ''}: question ${ask.id} pending${ask.urgency === 'now' ? ' (now)' : ''}`,
+      question_id: ask.id,
+      status: 'pending',
+      question: ask,
+      note: forOther ? `${ASK_NOTE} Session ${session} gets the answer too.` : ASK_NOTE,
+    };
+  }
+
+  async function listQuestionsAction(ctx, args) {
+    const service = askService();
+    if (!ctx.relay.local) {
+      // This conversation's asks there, as this relay last learnt them: fetched now (briefly waited for).
+      if (service.pendingMirrorIds(ctx.relay.id).length) await relayAskLink?.fetchNow?.(ctx.relay.id)?.catch?.(() => {});
+      const asks = service.listOf(ctx.conversationId)
+        .filter((ask) => ask.relayId === ctx.relay.id && (!toText(args.session) || ask.session.id === toText(args.session)));
+      return {
+        summary: `list_questions → ${ctx.relay.name}: ${asks.filter((ask) => ask.status === 'pending').length} pending`,
+        questions: asks,
+        note: 'These are the questions this conversation asked there. read_session there lists every pending question of a session, asks (kind ask) included.',
+      };
+    }
+    const session = askSession(ctx, args);
+    const asks = service.listOf(session).filter((ask) => !ask.relayId || session === ctx.conversationId);
+    const pending = asks.filter((ask) => ask.status === 'pending').length;
+    return {
+      summary: `list_questions → ${ctx.relay.name}${session === ctx.conversationId ? '' : ` session ${shortId(session)}`}: ${pending} pending`,
+      session,
+      questions: asks,
+      ...(asks.length > pending ? { note: 'Questions that are not pending were answered, dismissed or withdrawn within the last day.' } : {}),
+    };
+  }
+
+  async function withdrawAction(ctx, args) {
+    const service = askService();
+    if (!ctx.relay.local) {
+      const mirror = service.getMirror(ctx.relay.id, args.question_id);
+      if (!mirror || mirror.askedBy?.conversationId !== ctx.conversationId) {
+        throw new DispatchFailure(404, REMOTE_RELAY_ERROR_CODES.notFound,
+          `This conversation asked no question ${args.question_id} on relay "${ctx.relay.name}"; list_questions there shows the ones it did.`);
+      }
+      await relayAskRemoteCall(ctx, RELAY_ASK_REMOTE_PATHS.withdraw, { id: args.question_id });
+      const ask = service.closeMirror(ctx.relay.id, args.question_id, 'withdrawn');
+      return { summary: `withdraw → ${ctx.relay.name}: question ${args.question_id} withdrawn`, question: ask };
+    }
+    const ask = relayAskCall(() => service.withdraw(args.question_id, { byConversationId: ctx.conversationId }));
+    return { summary: `withdraw → ${ctx.relay.name}: question ${ask.id} withdrawn`, question: ask };
+  }
+
   const ACTIONS = Object.freeze({
+    ask: askAction,
+    list_questions: listQuestionsAction,
+    withdraw: withdrawAction,
+    schedule: scheduleAction,
+    list_schedules: listSchedulesAction,
+    unschedule: unscheduleAction,
     subscribe: subscribeAction,
     unsubscribe: unsubscribeAction,
     list_subscriptions: listSubscriptionsAction,
@@ -2563,6 +3380,7 @@ export function createRemoteRelayDispatcher({
     wait: waitAction,
     send,
     create_session: createSession,
+    update_session: updateSession,
     answer_question: answerQuestion,
     stop: stopTurn,
     archive: archiveSession,
@@ -2684,7 +3502,7 @@ export function createRemoteRelayDispatcher({
    * arrive while the card is open share it and its answer. Resolves
    * `{ approved:true, asked }` or `{ approved:false, code?, error? }`.
    */
-  async function ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal }) {
+  async function ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal, group = null }) {
     const remembered = () => {
       try {
         return repository.hasLocalSessionApproval(conversationId) === true;
@@ -2708,6 +3526,7 @@ export function createRemoteRelayDispatcher({
         summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
         signal,
         localSessions: true,
+        ...(group ? { group } : {}),
       });
       if (decision !== true && decision?.approved !== true) {
         return {
@@ -2754,9 +3573,15 @@ export function createRemoteRelayDispatcher({
         'Sessions on this relay are not available to agents right now: its storage for them could not be read (see the server log).',
         { relay: relay.name });
     }
-    if (origin) {
+    // One level, unless the owner allowed this session's agents to start
+    // sessions themselves; the cap and the Allow below still apply.
+    let ownerAllowed = false;
+    try {
+      ownerAllowed = repository.mayCreateSessions?.(conversationId) === true;
+    } catch {}
+    if (origin && !ownerAllowed) {
       return failure(403, REMOTE_RELAY_ERROR_CODES.nestedSession,
-        'A session that an agent created cannot create sessions. Do the work in this session, or say in your reply what the agent that prompted you should start.',
+        'A session that an agent created cannot create sessions (unless the relay\'s owner allows it for this session). Do the work in this session, or say in your reply what the agent that prompted you should start.',
         { relay: relay.name });
     }
     const limit = REMOTE_RELAY_LIMITS.localActiveSessions;
@@ -2779,7 +3604,17 @@ export function createRemoteRelayDispatcher({
     if (!target.relay) return target.failure;
     const relay = target.relay;
     const local = relay.local === true;
-    const write = isRemoteRelayWriteAction(action);
+    // A schedule for another session prompts it later: it is gated like a
+    // send (approval in ask and plan mode, the write limit, the audit line).
+    // One for the caller's own conversation prompts nobody else.
+    const ownSchedule = action === 'schedule' && (!toText(args.session) || isOwnConversation({ conversationId }, args.session));
+    // An ask on behalf of another session puts a card there and wakes it with
+    // the answer: a write too (hop limit, approval in ask and plan mode, the
+    // write limit, the audit line), but no prompt of an agent's: the loop
+    // guard does not count it, the answer is the user's. An ask about the
+    // caller's own conversation never gets here (isOwnAskCall).
+    const behalfAsk = action === 'ask' && !!toText(args.session) && !isOwnConversation({ conversationId }, args.session);
+    const write = isRemoteRelayWriteAction(action) || (action === 'schedule' && !ownSchedule) || behalfAsk;
     const finish = (result, session) => {
       if (write) {
         const ok = result.body?.ok === true;
@@ -2803,9 +3638,9 @@ export function createRemoteRelayDispatcher({
         `Relay "${relay.name}" is locked in this conversation. Ask the user to mention @${relay.name} (or its name) in a message to allow work there.`,
         { relay: relay.name }));
     }
-    if (!local && !remoteRelayPermissionAllows(relay.permission, action)) {
+    if (!local && !remoteRelayPermissionAllows(relay.permission, action, { ownSession: ownSchedule })) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
-        `Relay "${relay.name}" lets agents ${PERMISSION_DESCRIPTIONS[relay.permission] || 'do less'} (permission "${relay.permission}"); ${action} needs "${REMOTE_RELAY_ACTION_PERMISSION[action]}". The user can change this in Settings → Relays.`,
+        `Relay "${relay.name}" lets agents ${PERMISSION_DESCRIPTIONS[relay.permission] || 'do less'} (permission "${relay.permission}"); ${action} needs "${remoteRelayActionPermission(action, { ownSession: ownSchedule })}". The user can change this in Settings → Relays.`,
         { relay: relay.name, permission: relay.permission }));
     }
     if (local && OWN_SESSION_ACTIONS.has(action) && isOwnConversation({ conversationId }, args.session)) {
@@ -2848,6 +3683,20 @@ export function createRemoteRelayDispatcher({
       const problem = createSessionProblem(caller, args);
       if (problem) return finish(failure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, problem, { relay: relay.name }));
     }
+    // The group a create_session names, looked up on the target before anyone
+    // is asked, like the model: the card names it, and an unknown group (or a
+    // target whose groups cannot be read) refuses the call, nothing created.
+    let group = null;
+    if (action === 'create_session' && args.group) {
+      try {
+        group = await settleRequestedGroup({ relay, caller, hops, conversationId, signal }, args.group);
+      } catch (error) {
+        if (error instanceof DispatchFailure) {
+          return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
+        }
+        throw error;
+      }
+    }
     if ((action === 'create_session' || action === 'send') && args.model) {
       const early = { relay, caller, hops, conversationId, signal };
       try {
@@ -2872,6 +3721,21 @@ export function createRemoteRelayDispatcher({
         settledModel = null;
       }
     }
+    // What an update_session would change, settled on the target before
+    // anyone is asked: an unknown model or group, a busy session or a change
+    // to nothing never raises a card.
+    let updatePlan = null;
+    if (action === 'update_session') {
+      try {
+        updatePlan = await planSessionUpdate({ relay, caller, hops, conversationId, signal }, args);
+      } catch (error) {
+        if (error instanceof DispatchFailure) {
+          return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
+        }
+        if (isRemoteRelayError(error)) return finish(mapRemoteError(error, relay, { action, args }));
+        throw error;
+      }
+    }
 
     const localCreate = local && action === 'create_session';
     let holdsLocalCreate = false;
@@ -2889,10 +3753,12 @@ export function createRemoteRelayDispatcher({
 
     adjustInflight(conversationId, 1);
     try {
-      const prompting = isRemoteRelayPromptAction(action);
+      // A schedule for another session prompts it later: the loop guard counts
+      // it now, like a send (and each of its firings once more, admitScheduledFiring).
+      const prompting = isRemoteRelayPromptAction(action) || (action === 'schedule' && !ownSchedule);
       let asked = false;
       if (localCreate) {
-        const decision = await ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal });
+        const decision = await ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal, group });
         if (!decision.approved) {
           return finish(failure(403, decision.code || REMOTE_RELAY_ERROR_CODES.approvalDenied, decision.error, { relay: relay.name }));
         }
@@ -2902,6 +3768,16 @@ export function createRemoteRelayDispatcher({
           asked = true;
           agentPrompts(conversationId).count = 0;
         }
+      }
+      // A session this conversation did not start: the owner's Allow, once per conversation
+      // and target. The card this call raised is this call's approval too.
+      const updatesNothing = !!updatePlan && !updatePlan.changed.length;
+      if (updatePlan && !updatesNothing && updatePlan.approvalNeeded) {
+        const decision = await ensureSessionSettingsApproval({ relay, caller, conversationId, signal }, updatePlan, args);
+        if (!decision.approved) {
+          return finish(failure(403, decision.code, decision.error, { relay: relay.name, session: updatePlan.session }));
+        }
+        if (decision.asked) asked = true;
       }
       if (!asked && prompting && agentPrompts(conversationId).count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) {
         // Agents that prompt each other can go on without the user for good:
@@ -2915,6 +3791,7 @@ export function createRemoteRelayDispatcher({
           summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
           signal,
           agentPrompts: agentPrompts(conversationId).count,
+          ...(group ? { group } : {}),
         });
         const approved = decision === true || decision?.approved === true;
         if (!approved) {
@@ -2926,7 +3803,7 @@ export function createRemoteRelayDispatcher({
         agentPrompts(conversationId).count = 0;
         asked = true;
       }
-      if (!asked && write && REMOTE_RELAY_APPROVAL_MODES.includes(caller.mode)) {
+      if (!asked && write && !updatesNothing && REMOTE_RELAY_APPROVAL_MODES.includes(caller.mode)) {
         const decision = await requestApproval({
           conversationId,
           callerContext: caller,
@@ -2935,6 +3812,7 @@ export function createRemoteRelayDispatcher({
           args,
           summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
           signal,
+          ...(group ? { group } : {}),
         });
         const approved = decision === true || decision?.approved === true;
         if (!approved) {
@@ -2945,7 +3823,7 @@ export function createRemoteRelayDispatcher({
         }
       }
 
-      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate, ...(catalog ? { catalog } : {}), ...(settledModel ? { settledModel } : {}) };
+      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate, ...(catalog ? { catalog } : {}), ...(settledModel ? { settledModel } : {}), ...(group ? { group } : {}), ...(updatePlan ? { updatePlan } : {}) };
       const body = await ACTIONS[action](ctx, args);
       if (prompting) agentPrompts(conversationId).count += 1;
       const { summary, ...rest } = body;
@@ -2973,6 +3851,43 @@ export function createRemoteRelayDispatcher({
   }
 
   /**
+   * Whether a call is an ask action about the caller's own conversation on
+   * this relay: an ask or list_questions without another session, or a
+   * withdraw here. Such a call touches nothing but the conversation's own
+   * questions, so it needs neither the agent sessions setting nor a mention.
+   */
+  async function isOwnAskCall(conversationId, action, args) {
+    if (!REMOTE_RELAY_ASK_ACTIONS.includes(action)) return false;
+    const query = toText(args?.relay).replace(/^@/, '').toLowerCase();
+    if (query !== REMOTE_RELAY_LOCAL_ALIAS) {
+      const resolved = await registry.resolve(args.relay);
+      if (resolved?.relay || resolved?.error === 'ambiguous') return false;
+      const selfName = toText(await registry.selfName?.()).toLowerCase();
+      if (!selfName || selfName !== query) return false;
+    }
+    return action === 'withdraw' || !toText(args.session) || isOwnConversation({ conversationId }, args.session);
+  }
+
+  /** An ask action on the caller's own conversation (isOwnAskCall): the rate limit, then the action. */
+  async function runOwnAskAction({ conversationId, action, args, req, signal }) {
+    const relay = await localTarget();
+    const retryAfterSeconds = consumeRateLimit(conversationId, false);
+    if (retryAfterSeconds !== null) {
+      return failure(429, REMOTE_RELAY_ERROR_CODES.rateLimited,
+        `Too many remote relay calls from this conversation (at most ${REMOTE_RELAY_LIMITS.callsPerMinute} a minute). Try again in ${retryAfterSeconds} s.`,
+        { relay: relay.name, retryAfterSeconds });
+    }
+    const caller = { conversationId, ...((await getCallerContext(conversationId, req)) || {}) };
+    try {
+      const { summary, ...rest } = await ACTIONS[action]({ relay, caller, hops: nonNegativeInt(caller.hops), conversationId, signal }, args);
+      return { status: 200, body: { ok: true, relay: relay.name, summary, ...rest } };
+    } catch (error) {
+      if (error instanceof DispatchFailure) return failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra });
+      throw error;
+    }
+  }
+
+  /**
    * One tool call. Never throws: resolves to `{ status, body }` for the route
    * to send as is. `signal` (optional) aborts approval and reply waits when
    * the caller hangs up.
@@ -2982,6 +3897,14 @@ export function createRemoteRelayDispatcher({
     // target: the waiting is done here, by polling the target.
     const { maxWaitSeconds } = agentSessions();
     const validation = validateRemoteRelayToolInput({ ...(isPlainObject(args) ? args : {}), action }, { maxWaitSeconds });
+    const result = await runValidated({ conversationId, req, signal }, validation);
+    // The arguments the action does not take, named on the answer (a call
+    // that came through a worker's tool had them named there already).
+    if (!validation.ignored?.length || !isPlainObject(result?.body)) return result;
+    return { ...result, body: { ...result.body, ignored: validation.ignored } };
+  }
+
+  async function runValidated({ conversationId, req, signal }, validation) {
     if (!validation.ok) return failure(400, validation.code, validation.error);
     const requestedConversationId = toText(conversationId);
     let callerConversationId = requestedConversationId;
@@ -2996,6 +3919,9 @@ export function createRemoteRelayDispatcher({
       : '';
     try {
       if (validation.action === 'list_relays') return await listRelays(callerConversationId);
+      if (await isOwnAskCall(callerConversationId, validation.action, validation.args)) {
+        return await runOwnAskAction({ conversationId: callerConversationId, action: validation.action, args: validation.args, req, signal });
+      }
       return await runRelayAction({
         conversationId: callerConversationId,
         action: validation.action,
@@ -3012,5 +3938,5 @@ export function createRemoteRelayDispatcher({
     }
   }
 
-  return { dispatch, inflight };
+  return { dispatch, inflight, admitScheduledFiring };
 }

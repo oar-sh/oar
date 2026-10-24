@@ -24,6 +24,11 @@ import { migrateConversationGroupPosition } from './migrations/0015-conversation
 import { migrateShareAccessLog } from './migrations/0016-share-access-log.mjs';
 import { migrateConversationHistoryIndexes } from './migrations/0017-conversation-history-indexes.mjs';
 import { migrateBackgroundTaskRows } from './migrations/0018-background-task-rows.mjs';
+import { migrateRelayEventSubscriptionOptions } from './migrations/0019-relay-event-subscription-options.mjs';
+import { migrateConversationMayCreateSessions } from './migrations/0020-conversation-may-create-sessions.mjs';
+import { migrateConversationGroupAgentMarks } from './migrations/0021-conversation-group-agent-marks.mjs';
+import { migrateRelaySchedules } from './migrations/0022-relay-schedules.mjs';
+import { migrateRelayAsks } from './migrations/0023-relay-asks.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -853,6 +858,53 @@ try {
   migrateBackgroundTaskRows(db);
 } catch (error) {
   console.warn(`[background-tasks] migration 0018 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Options of relay event subscriptions (digest, quiet hours, exclude) and the
+// watcher's own prompts: columns on 0011's table and one table. The event
+// service checks for them and refuses the options without them, so a failure
+// is logged and retried next boot like 0018.
+try {
+  migrateRelayEventSubscriptionOptions(db);
+} catch (error) {
+  console.warn(`[relay-events] migration 0019 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The owner's "agents in this conversation may start sessions": one column.
+// Without it nobody can turn the switch on (the preferences route refuses
+// it) and the one-level rule holds for every session, so a failure is logged
+// and retried next boot like 0019.
+try {
+  migrateConversationMayCreateSessions(db);
+} catch (error) {
+  console.warn(`[remote-relays] migration 0020 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// What an agent's update_session may do to a group: two columns. Without
+// them an owner's group an agent emptied is kept until the next boot repair
+// only, so a failure is logged and retried next boot like 0020.
+try {
+  migrateConversationGroupAgentMarks(db);
+} catch (error) {
+  console.warn(`[session-groups] migration 0021 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Relay schedules: one new table. The schedule service checks for it and
+// refuses the schedule actions without it, so a failure is logged and
+// retried next boot like 0021.
+try {
+  migrateRelaySchedules(db);
+} catch (error) {
+  console.warn(`[relay-schedules] migration 0022 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Questions that don't block (remote_relay ask): one new table. The ask
+// service checks for it and refuses the ask actions without it, so a failure
+// is logged and retried next boot like 0022.
+try {
+  migrateRelayAsks(db);
+} catch (error) {
+  console.warn(`[relay-asks] migration 0023 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);

@@ -24,5 +24,6 @@ test('refuses to run without the base schema, and the schema boot applies it', (
   const db = new Database(':memory:');
   applySchema(db);
   assert.ok(columns(db, 'conversations').includes('group_id'));
-  assert.equal(columns(db, 'conversation_groups').length, 5);
+  // Its five, and the two migration 0021 adds (agent_made, kept_empty_at).
+  assert.equal(columns(db, 'conversation_groups').length, 7);
 });

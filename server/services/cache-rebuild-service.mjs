@@ -68,6 +68,9 @@ export function createCacheRebuildService({
   // Session groups: a purged head leaves its group, and a wipe is followed
   // by a repair of what the wiped rows headed. Absent in older wiring.
   conversationGroups = null,
+  // (conversationId, { deleted }) => void: a conversation this service
+  // archived or removed (its relay schedules end). Absent in older wiring.
+  onConversationGone = null,
 }) {
   const legacyConversationList = buildLegacyConversationList(db);
   const boundConversationList = buildBoundConversationList(db);
@@ -99,8 +102,17 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM conversations WHERE id = ?`).run(sid);
     })();
     closePreviews(sid);
+    noteGone(sid, { deleted: true });
     deleteOrphanedUploads(orphanedUploads);
     return orphanedUploads;
+  }
+
+  function noteGone(conversationId, options) {
+    try {
+      onConversationGone?.(conversationId, options);
+    } catch (error) {
+      console.warn(`[cache] the end of a conversation was not passed on: ${error?.message || error}`);
+    }
   }
 
   function closePreviews(conversationId) {
@@ -115,7 +127,9 @@ export function createCacheRebuildService({
     const sid = normalizeId(conversationId);
     if (!sid) return false;
     const result = db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ? AND status != 'deleted'`).run(new Date().toISOString(), sid);
-    return Number(result?.changes || 0) > 0;
+    const archived = Number(result?.changes || 0) > 0;
+    if (archived) noteGone(sid, { deleted: false });
+    return archived;
   }
 
   function fullWipeCache() {
@@ -176,7 +190,10 @@ export function createCacheRebuildService({
     })();
 
     for (const conversationId of conversationIds) {
-      if (!manualTitleConversationSet.has(conversationId)) closePreviews(conversationId);
+      if (!manualTitleConversationSet.has(conversationId)) {
+        closePreviews(conversationId);
+        noteGone(conversationId, { deleted: true });
+      }
     }
 
     deleteOrphanedUploads(uploadHashes);

@@ -79,6 +79,7 @@ function createRelayB() {
           match: body.match || '',
           stalledMinutes: body.stalled_minutes ?? null,
           heartbeatMinutes: body.heartbeat_minutes ?? null,
+          exclude: body.exclude ?? null,
           dryRun: body.dry_run === true,
         });
         return { ok: true, subscription };
@@ -191,6 +192,27 @@ test('subscribe on a paired relay: checked there, then the card names the relay,
   await new Promise((resolve) => setImmediate(resolve));
   const [message] = eventMessages(a.db);
   assert.match(message.text, /\[relay event\] linux-test · session "Orbit camera" \(conv-fixture-builder\): question_asked "Merge now\?"/);
+  link.stop();
+});
+
+test('on a paired relay, exclude goes to that relay too; digest and quiet hours stay on the watching side', async () => {
+  const { b, run, link } = setup();
+  const quiet = { from: '22:00', to: '07:00', tz: 'Europe/Berlin' };
+  const result = await run('subscribe', { sessions: ['all'], digest_minutes: 20, quiet_hours: quiet, exclude: [DOCS] });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const posts = b.state.calls.filter((call) => call.path === '/api/relay-events/remote/subscribe');
+  for (const post of posts) {
+    assert.deepEqual(post.body.exclude, [DOCS]);
+    assert.equal('digest_minutes' in post.body || 'quiet_hours' in post.body, false, 'the watched relay is not told');
+  }
+  const { subscription } = result.body;
+  assert.deepEqual([subscription.digestMinutes, subscription.quietHours, subscription.exclude], [20, quiet, [DOCS]]);
+  const [served] = b.service.listActive();
+  assert.deepEqual(served.exclude, [DOCS]);
+  assert.equal(served.digestMinutes, undefined);
+  const listed = await run('list_subscriptions');
+  assert.equal(listed.body.subscriptions[0].heldCount, 0);
+  assert.equal(listed.body.subscriptions[0].nextDeliveryAt, null);
   link.stop();
 });
 
