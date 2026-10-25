@@ -72,6 +72,7 @@ import {
   loadClaudeCloudBranches,
   loadClaudeCloudRepos,
   loadGrokSettings,
+  loadDeepSeekSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { isSetupRequired, updateProviderReadinessInputs } from './provider-readiness.mjs';
@@ -189,6 +190,7 @@ let newConversationOpenAISettingsCache = null;
 let newConversationClaudeSettingsCache = null;
 let newConversationCursorSettingsCache = null;
 let newConversationGrokSettingsCache = null;
+let newConversationDeepSeekSettingsCache = null;
 let newConversationClaudeCloudSettingsCache = null;
 // Claude Cloud fields of the New Chat modal: what the selected folder's git
 // remote said, and what was written into Repository/Branch from it (so a later
@@ -1237,6 +1239,7 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === CLAUDE_CLOUD_PROVIDER) return CLAUDE_CLOUD_PROVIDER;
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok') return 'grok';
+  if (normalized === 'deepseek') return 'deepseek';
   return 'github';
 }
 
@@ -1274,6 +1277,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const hasClaude = providers.includes('claude');
   const hasCursor = providers.includes('cursor');
   const hasGrok = providers.includes('grok');
+  const hasDeepSeek = providers.includes('deepseek');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -1309,16 +1313,26 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
       : [];
     return normalizedModelId === grokModel || grokModels.includes(normalizedModelId);
   }
+  if (normalizedProvider === 'deepseek') {
+    if (hasDeepSeek) return true;
+    const deepseekModel = String(newConversationDeepSeekSettingsCache?.model || '').trim();
+    const deepseekModels = Array.isArray(newConversationDeepSeekSettingsCache?.models)
+      ? newConversationDeepSeekSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === deepseekModel || deepseekModels.includes(normalizedModelId);
+  }
   const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
   if (claudeOnly) return false;
   const cursorOnly = hasCursor && providers.every((provider) => provider === 'cursor');
   if (cursorOnly) return false;
   const grokOnly = hasGrok && providers.every((provider) => provider === 'grok');
   if (grokOnly) return false;
+  const deepseekOnly = hasDeepSeek && providers.every((provider) => provider === 'deepseek');
+  if (deepseekOnly) return false;
   // Should a relay ever tag catalog rows for Claude Cloud, they are no more
   // Copilot's than the other runtimes' rows are.
   const exclusiveOnly = providers.length > 0 && providers.every((provider) => (
-    provider === 'claude' || provider === 'cursor' || provider === 'grok' || provider === CLAUDE_CLOUD_PROVIDER
+    provider === 'claude' || provider === 'cursor' || provider === 'grok' || provider === 'deepseek' || provider === CLAUDE_CLOUD_PROVIDER
   ));
   if (exclusiveOnly) return false;
   return providers.some((provider) => (
@@ -1326,6 +1340,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
     && provider !== 'claude'
     && provider !== 'cursor'
     && provider !== 'grok'
+    && provider !== 'deepseek'
     && provider !== CLAUDE_CLOUD_PROVIDER
   )) || !hasOpenAIByok;
 }
@@ -1443,8 +1458,10 @@ async function populateNewConversationReasoningSelect(selectedModel = '') {
     if (optionTitle) option.title = optionTitle;
     select.appendChild(option);
   }
+  // A DeepSeek chat with nothing remembered starts at DeepSeek's own default.
+  const storedEffort = localStorage.getItem(REASONING_STORAGE_KEY);
   const preferred = resolvePreferredReasoningEffort(efforts, [
-    localStorage.getItem(REASONING_STORAGE_KEY),
+    storedEffort || (provider === 'deepseek' ? 'high' : ''),
   ]);
   select.value = preferred || efforts[0];
   select.disabled = false;
@@ -1485,6 +1502,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
   }
   if (normalizedProvider === 'grok') {
     help.textContent = "Grok chats use the host machine's logged-in Grok credentials (grok login or XAI_API_KEY).";
+    return;
+  }
+  if (normalizedProvider === 'deepseek') {
+    help.textContent = "DeepSeek chats run Claude Code on the relay host against DeepSeek's API, billed to your saved DeepSeek key.";
     return;
   }
   help.textContent = 'Copilot models use your GitHub Copilot runtime.';
@@ -2094,7 +2115,7 @@ function applyNewConversationSetupState(setupRequired) {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings, deepseekSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
@@ -2102,6 +2123,8 @@ async function openNewConversationModelModal() {
     loadGrokSettings(),
     // null on a relay without Claude Cloud: the option is simply not offered.
     loadClaudeCloudSettings(),
+    // The same for a relay without DeepSeek.
+    loadDeepSeekSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
@@ -2109,6 +2132,7 @@ async function openNewConversationModelModal() {
   newConversationCursorSettingsCache = cursorSettings || null;
   newConversationGrokSettingsCache = grokSettings || null;
   newConversationClaudeCloudSettingsCache = claudeCloudSettings || null;
+  newConversationDeepSeekSettingsCache = deepseekSettings || null;
   // Fresh answers for the readiness question, shared with the empty screen
   // and the composer. With no provider known to be ready the modal opens in
   // its setup state: Settings is the main button, Start stays as "anyway".
@@ -2118,6 +2142,7 @@ async function openNewConversationModelModal() {
     claudeCloud: claudeCloudSettings || null,
     cursor: cursorSettings || null,
     grok: grokSettings || null,
+    deepseek: deepseekSettings || null,
     catalog: catalog || null,
   });
   applyNewConversationSetupState(isSetupRequired(readiness));
@@ -2142,6 +2167,9 @@ async function openNewConversationModelModal() {
     }
     if (grokSettings?.enabled === true) {
       options.push({ value: 'grok', label: 'Grok' });
+    }
+    if (deepseekSettings?.enabled === true) {
+      options.push({ value: 'deepseek', label: 'DeepSeek' });
     }
     providerSelect.innerHTML = '';
     for (const option of options) {

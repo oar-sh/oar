@@ -37,8 +37,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // READMEs left the package for GitHub on 2026-10-21: 519. 530 until
 // 2026-10-23; questions that don't block and the Inbox (migration 0023, the
 // ask service, its link and routes, the shared module, the Inbox view and
-// its page module) took it to 535.
-const MAX_ENTRIES = 540;
+// its page module) took it to 535. 540 until 2026-10-24; the DeepSeek
+// provider (settings service, API client, model table, its worker entry and
+// Claude-runner backend, and the Claude worker's shared main) took it to 541.
+const MAX_ENTRIES = 560;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -49,8 +51,9 @@ const MAX_ENTRIES = 540;
 // 2026-10-19; the same two changes took it to 7.48 MiB, too close to keep.
 // 7.75 MiB until 2026-10-21; the take-over of earlier databases, the
 // install-time copy, the lock checks and the 0.9.14 changelog took it just
-// over 7.75 MiB (8,126,967 bytes).
-const MAX_UNPACKED_BYTES = 8 * 1024 * 1024;
+// over 7.75 MiB (8,126,967 bytes). 8 MiB until 2026-10-24; the DeepSeek
+// provider's settings, discovery and catalogue took it to 8,401,377 bytes.
+const MAX_UNPACKED_BYTES = 9 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },

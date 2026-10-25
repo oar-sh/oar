@@ -242,6 +242,7 @@ test('result success and error map to result actions', () => {
     usage: null,
     modelUsage: null,
     totalCostUsd: null,
+    serverToolUse: [],
   });
 
   const failure = normalizer.normalize({
@@ -293,6 +294,38 @@ test('a refused turn\'s result carries what names the failure', () => {
 function assistantMessage(content, parentToolUseId = null) {
   return { type: 'assistant', parent_tool_use_id: parentToolUseId, message: { content } };
 }
+
+test('web searches and fetches are counted once per message and reported per model on the turn\'s result', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize({ type: 'system', subtype: 'init', session_id: 's1', model: 'deepseek-flash[1m]' });
+  const searched = (id, model, web_search_requests, web_fetch_requests, content) => ({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id, model, content, usage: { input_tokens: 5, output_tokens: 2, server_tool_use: { web_search_requests, web_fetch_requests } } },
+  });
+  // One message, two content blocks: the SDK repeats the message's usage.
+  normalizer.normalize(searched('msg_1', 'deepseek-flash[1m]', 2, 0, [{ type: 'text', text: 'Looking.' }]));
+  normalizer.normalize(searched('msg_1', 'deepseek-flash[1m]', 2, 0, [{ type: 'text', text: 'Found it.' }]));
+  // A second message on another model (a subagent's) fetched a page.
+  normalizer.normalize({ ...searched('msg_2', 'deepseek-v4-pro', 0, 1, [{ type: 'text', text: 'Read.' }]), parent_tool_use_id: 'toolu_1' });
+  // A message without searches adds nothing; one without a model counts under the turn's.
+  normalizer.normalize(searched('msg_3', 'deepseek-flash[1m]', 0, 0, [{ type: 'text', text: 'Plain.' }]));
+  normalizer.normalize(searched('msg_4', '', 1, 1, [{ type: 'text', text: 'Both.' }]));
+  const result = normalizer.normalize({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's1', num_turns: 2 });
+  assert.deepEqual(result[0].payload.serverToolUse, [
+    { model: 'deepseek-flash[1m]', webSearchRequests: 3, webFetchRequests: 1 },
+    { model: 'deepseek-v4-pro', webSearchRequests: 0, webFetchRequests: 1 },
+  ]);
+  // The next turn starts from zero: a result without assistant messages
+  // falls back to its own usage, under the turn's model.
+  const next = normalizer.normalize({
+    type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's1', num_turns: 1,
+    usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 4, web_fetch_requests: 0 } },
+  });
+  assert.deepEqual(next[0].payload.serverToolUse, [{ model: 'deepseek-flash[1m]', webSearchRequests: 4, webFetchRequests: 0 }]);
+  const quiet = normalizer.normalize({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's1', num_turns: 1, usage: { server_tool_use: null } });
+  assert.deepEqual(quiet[0].payload.serverToolUse, []);
+});
 
 test('thinking on a complete assistant message becomes a thought', () => {
   const normalizer = createSdkMessageNormalizer();

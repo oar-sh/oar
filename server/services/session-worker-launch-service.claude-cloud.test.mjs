@@ -1,5 +1,7 @@
 'use strict';
 
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,8 +21,18 @@ import {
   launchSessionCli,
   resolveClaudeCloudWorkerScriptPath,
   resolveWorkerKind,
+  withoutForeignWorkerSecrets,
   workerSecretEnvVarsFor,
 } from './session-worker-launch-service.mjs';
+
+// A tmux worker command starts with `unset <names>;` (buildTmuxWorkerShellCommand):
+// a name there is taken away from the worker, not handed to it. Split off so
+// a test can say "unset, and nowhere else in the command".
+function splitUnsetStatement(command) {
+  const match = command.match(/^unset ([^;]+); /);
+  assert.ok(match, 'command starts with an unset statement');
+  return { unsetNames: match[1].split(' '), rest: command.slice(match[0].length) };
+}
 
 test('applyClaudeCloudProviderEnvironment sets the worker kind and model when enabled', () => {
   const env = applyClaudeCloudProviderEnvironment({ PATH: '/bin' }, { enabled: true, model: 'claude-sonnet-5-5' });
@@ -66,13 +78,16 @@ test('the provider applier adds no login material to the cloud worker environmen
   assert.deepEqual(Object.keys(env).sort(), ['CLAUDE_CLOUD_RELAY_MODEL', 'COPILOT_WEB_RELAY_WORKER_KIND']);
 });
 
-test('a relay-level Claude login token is a secret of the cloud worker and of no other', () => {
+test('a relay-level Claude login token is a secret of the two Claude workers and of no other', () => {
   assert.equal(WORKER_SECRET_ENV_VARS.includes('CLAUDE_CODE_OAUTH_TOKEN'), true);
-  assert.deepEqual(
-    workerSecretEnvVarsFor({ COPILOT_WEB_RELAY_WORKER_KIND: 'claude-cloud' }),
-    ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'],
-  );
-  for (const kind of ['', 'claude', 'cursor', 'grok', 'copilot-sdk', 'unknown-kind']) {
+  for (const kind of ['claude-cloud', 'claude']) {
+    assert.deepEqual(
+      workerSecretEnvVarsFor({ COPILOT_WEB_RELAY_WORKER_KIND: kind }),
+      ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'],
+      kind,
+    );
+  }
+  for (const kind of ['', 'cursor', 'grok', 'copilot-sdk', 'unknown-kind']) {
     assert.deepEqual(
       workerSecretEnvVarsFor(kind ? { COPILOT_WEB_RELAY_WORKER_KIND: kind } : {}),
       ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY'],
@@ -120,7 +135,7 @@ test('the secret file of a cloud launch carries the login token, owner-only', ()
 });
 
 test('no other worker kind gets the login token: no secret file is written for it', () => {
-  for (const kind of ['', 'claude', 'cursor', 'grok', 'copilot-sdk']) {
+  for (const kind of ['', 'cursor', 'grok', 'copilot-sdk']) {
     const calls = [];
     const secret = createWorkerSecretEnvFile({
       ...(kind ? { COPILOT_WEB_RELAY_WORKER_KIND: kind } : {}),
@@ -195,12 +210,23 @@ test('a cloud launch with a login token and no secret file is refused, another k
     COPILOT_WEB_RELAY_ROOT: '/repo',
   };
   assert.throws(() => buildTmuxWorkerShellCommand('session-1', cloudEnv), /worker-secret-env-file-required/);
+  // The local Claude worker runs on the same login: it needs the file too.
+  assert.throws(
+    () => buildTmuxWorkerShellCommand('session-1', { ...cloudEnv, COPILOT_WEB_RELAY_WORKER_KIND: 'claude' }),
+    /worker-secret-env-file-required/,
+  );
   // The token in the relay's environment is not another worker's business:
-  // its command is built without a secret file and without the token.
-  for (const kind of ['claude', 'grok']) {
+  // its command is built without a secret file and without the token, and
+  // the name is unset (a tmux server started from a shell that exports it
+  // would hand it on), and appears nowhere else.
+  for (const kind of ['grok', 'cursor']) {
     const command = buildTmuxWorkerShellCommand('session-1', { ...cloudEnv, COPILOT_WEB_RELAY_WORKER_KIND: kind });
     assert.equal(command.includes('test-token-value'), false, kind);
-    assert.equal(command.includes('CLAUDE_CODE_OAUTH_TOKEN'), false, kind);
+    assert.equal(command.includes('export CLAUDE_CODE_OAUTH_TOKEN='), false, kind);
+    assert.doesNotMatch(command, /provider\.env/, kind);
+    const { unsetNames, rest } = splitUnsetStatement(command);
+    assert.ok(unsetNames.includes('CLAUDE_CODE_OAUTH_TOKEN'), `${kind}: the login token is unset`);
+    assert.equal(rest.includes('CLAUDE_CODE_OAUTH_TOKEN'), false, kind);
   }
 });
 
@@ -211,12 +237,17 @@ test('the fake-API base URL of a test relay reaches the tmux worker as a plain e
     OAR_CLAUDE_CLOUD_API_BASE_URL: 'http://127.0.0.1:4010',
   });
   assert.match(command, /export OAR_CLAUDE_CLOUD_API_BASE_URL='http:\/\/127\.0\.0\.1:4010';/);
-  // Unset on the relay, unset for the worker.
+  assert.ok(!splitUnsetStatement(command).unsetNames.includes('OAR_CLAUDE_CLOUD_API_BASE_URL'), 'exported, not unset');
+  // Unset on the relay, unset for the worker: in the unset statement, never exported.
   const plain = buildTmuxWorkerShellCommand('session-1', {
     COPILOT_WEB_RELAY_WORKER_KIND: 'claude-cloud',
     COPILOT_WEB_RELAY_ROOT: '/repo',
   });
-  assert.equal(plain.includes('OAR_CLAUDE_CLOUD_API_BASE_URL'), false);
+  assert.equal(plain.includes('127.0.0.1:4010'), false);
+  assert.equal(plain.includes('export OAR_CLAUDE_CLOUD_API_BASE_URL='), false);
+  const { unsetNames, rest } = splitUnsetStatement(plain);
+  assert.ok(unsetNames.includes('OAR_CLAUDE_CLOUD_API_BASE_URL'), 'the base URL is unset');
+  assert.equal(rest.includes('OAR_CLAUDE_CLOUD_API_BASE_URL'), false);
 });
 
 function tmuxLaunchHarness() {
@@ -321,7 +352,12 @@ test('launchSessionCli keeps the login token away from a worker of another kind'
   assert.deepEqual(harness.secretEnvs, [null]);
   const shellCommand = harness.calls.find((call) => call.args?.[0] === 'new-session').args.at(-1);
   assert.equal(shellCommand.includes('test-token-value'), false);
-  assert.doesNotMatch(shellCommand, /provider\.env|CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.doesNotMatch(shellCommand, /provider\.env/);
+  assert.equal(shellCommand.includes('export CLAUDE_CODE_OAUTH_TOKEN='), false);
+  // Its name only in the unset statement, which takes it away from the worker.
+  const { unsetNames, rest } = splitUnsetStatement(shellCommand);
+  assert.ok(unsetNames.includes('CLAUDE_CODE_OAUTH_TOKEN'), 'the login token is unset');
+  assert.equal(rest.includes('CLAUDE_CODE_OAUTH_TOKEN'), false);
 });
 
 test('launchSessionCli spawns the cloud worker script, never the Copilot CLI', async () => {
@@ -351,4 +387,121 @@ test('launchSessionCli spawns the cloud worker script, never the Copilot CLI', a
     'session-3',
   ]);
   assert.equal(spawnCalls[0].args.includes('--allow-all'), false);
+});
+
+// The kinds that must never see the relay's Claude login token, and the
+// environment each needs to get as far as the spawn.
+const FOREIGN_KINDS = Object.freeze({
+  copilot: { COPILOT_WEB_RELAY_WORKER_KIND: '' },
+  'copilot-sdk': { COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdk', COPILOT_SDK_PATH: '/opt/copilot-sdk' },
+  cursor: { COPILOT_WEB_RELAY_WORKER_KIND: 'cursor', CURSOR_API_KEY: 'cursor-test-key' },
+  grok: { COPILOT_WEB_RELAY_WORKER_KIND: 'grok' },
+});
+
+test('withoutForeignWorkerSecrets drops the login token for every kind but the two Claude workers', () => {
+  for (const [name, kindEnv] of Object.entries(FOREIGN_KINDS)) {
+    const input = { ...kindEnv, CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value', PATH: '/bin' };
+    const scrubbed = withoutForeignWorkerSecrets(input);
+    assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in scrubbed, false, name);
+    assert.equal(scrubbed.PATH, '/bin', name);
+    // The caller's environment is left as it was.
+    assert.equal(input.CLAUDE_CODE_OAUTH_TOKEN, 'test-token-value', name);
+  }
+  // A worker's own key is untouched: its applier is what put it there.
+  assert.equal(withoutForeignWorkerSecrets(FOREIGN_KINDS.cursor).CURSOR_API_KEY, 'cursor-test-key');
+  for (const kind of ['claude', 'claude-cloud']) {
+    const kept = withoutForeignWorkerSecrets({ COPILOT_WEB_RELAY_WORKER_KIND: kind, CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value' });
+    assert.equal(kept.CLAUDE_CODE_OAUTH_TOKEN, 'test-token-value', kind);
+  }
+});
+
+test('launchSessionCli starts tmux without the login token for a worker of another kind', async () => {
+  for (const [name, kindEnv] of Object.entries(FOREIGN_KINDS)) {
+    const harness = tmuxLaunchHarness();
+    await launchSessionCli({
+      targetSessionId: 'session-7',
+      cwd: '/workspace',
+      env: { ...kindEnv, COPILOT_WEB_RELAY_ROOT: '/repo', CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value' },
+      prepareOarMcpConfigImpl: () => null,
+      ...harness.options,
+    });
+    const newSessionCall = harness.calls.find((call) => call.args?.[0] === 'new-session');
+    // A tmux server this call starts keeps its client's environment as its
+    // global one, and every later pane would inherit it.
+    assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in newSessionCall.options.env, false, name);
+    assert.equal(JSON.stringify(newSessionCall.options.env).includes('test-token-value'), false, name);
+    assert.equal(newSessionCall.args.at(-1).includes('test-token-value'), false, name);
+    assert.equal(harness.secretEnvs.join('').includes('test-token-value'), false, name);
+  }
+});
+
+test('launchSessionCli hands a local Claude worker the login token through the secret file only', async () => {
+  const harness = tmuxLaunchHarness();
+  await launchSessionCli({
+    targetSessionId: 'session-7',
+    cwd: '/workspace',
+    env: {
+      COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+      COPILOT_WEB_RELAY_ROOT: '/repo',
+      CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value',
+    },
+    ...harness.options,
+  });
+  assert.deepEqual(harness.secretEnvs, ["export CLAUDE_CODE_OAUTH_TOKEN='test-token-value'\n"]);
+  const newSessionCall = harness.calls.find((call) => call.args?.[0] === 'new-session');
+  assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in newSessionCall.options.env, false);
+  const shellCommand = newSessionCall.args.at(-1);
+  assert.equal(shellCommand.includes('test-token-value'), false);
+  assert.match(shellCommand, /\. '\/tmp\/copilot-relay-worker-test\/provider\.env' \|\| exit \$\?; /);
+});
+
+async function detachedLaunchEnv(platform, env) {
+  const spawnCalls = [];
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-secret-scope-'));
+  try {
+    await launchSessionCli({
+      targetSessionId: 'session-9',
+      cwd: '/workspace',
+      env: {
+        ...env,
+        COPILOT_WEB_RELAY_ROOT: '/repo',
+        COPILOT_WEB_RELAY_LOG_DIR: logDir,
+        ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      },
+      platform,
+      spawnImpl: (command, args, options) => {
+        spawnCalls.push({ command, args, options });
+        return { pid: 4242, unref: () => {} };
+      },
+      execFileSyncImpl: () => { throw new Error('tmux missing'); },
+      processInspector: { findProcessForSessionAsync: () => (platform === 'win32' ? { processId: process.pid } : null) },
+      prepareOarMcpConfigImpl: () => null,
+      prepareWorkerLogFileImpl: () => null,
+      locateExecutableImpl: () => true,
+      allowProcessReuse: false,
+      detachedPollAttempts: 1,
+      detachedPollDelayMs: 1,
+    });
+  } finally {
+    fs.rmSync(logDir, { recursive: true, force: true });
+  }
+  assert.equal(spawnCalls.length, 1);
+  return spawnCalls[0].options.env;
+}
+
+test('the detached and Windows launches hand the login token to the two Claude workers only', async () => {
+  for (const platform of ['linux', 'win32']) {
+    for (const [name, kindEnv] of Object.entries(FOREIGN_KINDS)) {
+      const env = await detachedLaunchEnv(platform, { ...kindEnv, CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value' });
+      assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in env, false, `${platform} ${name}`);
+      assert.equal(JSON.stringify(env).includes('test-token-value'), false, `${platform} ${name}`);
+    }
+    for (const kind of ['claude', 'claude-cloud']) {
+      const env = await detachedLaunchEnv(platform, {
+        COPILOT_WEB_RELAY_WORKER_KIND: kind,
+        CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value',
+      });
+      assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, 'test-token-value', `${platform} ${kind}`);
+    }
+  }
 });

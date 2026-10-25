@@ -189,6 +189,42 @@ test.describe.serial("the Inbox", () => {
     expect(answered.payload.question.answer).toBe("Dark");
   });
 
+  test("the Inbox opens at the top, and comes back where it was left", async ({ page }, testInfo) => {
+    // A short window: the Inbox overflows, so there is a scroll height to
+    // remember. A long session is open first and scrolled down, as it is
+    // when the Inbox is used: its height must not become the Inbox's.
+    const { conversationId: long, messageId: first } = await conversation(apiA, `long chat ${suffix}`);
+    // Bound to its session, so later messages are accepted into it.
+    expect((await apiA("/api/session-sync", { method: "POST", body: { sdk_session_id: long, conversation_id: long } })).status).toBe(200);
+    let messageId = first;
+    for (let turn = 0; turn < 8; turn += 1) {
+      expect((await apiA("/api/response", { method: "POST", body: { messageId, conversationId: long, text: `reply ${turn}`, model: "gpt-5.4-mini", mode: "agent" } })).status).toBe(200);
+      const next = await apiA("/api/message", { method: "POST", body: { conversationId: long, text: `message ${turn}`, relayMode: "agent", model: "gpt-5.4-mini" } });
+      expect(next.status, JSON.stringify(next.payload)).toBe(200);
+      messageId = next.payload.messageId;
+    }
+    await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, long);
+    await openApp(page, { width: 1280, height: 360 });
+    const messages = page.locator("#messages");
+    await expect.poll(() => messages.locator("[data-message-id]").count()).toBeGreaterThan(10);
+    await messages.evaluate((node) => { node.scrollTop = 300; });
+    expect(await messages.evaluate((node) => node.scrollTop)).toBeGreaterThan(0);
+    await openInbox(page);
+    expect(await messages.evaluate((node) => node.scrollTop)).toBe(0);
+    await page.screenshot({ path: testInfo.outputPath("inbox-opens-at-top.png") });
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+    await page.screenshot({ path: testInfo.outputPath("inbox-opens-at-top-light.png") });
+    await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
+    await messages.evaluate((node) => { node.scrollTop = 120; });
+    const kept = await messages.evaluate((node) => node.scrollTop);
+    expect(kept).toBeGreaterThan(0);
+    // The button again leaves the Inbox; opening it once more finds the height.
+    await page.locator("#inbox-btn").click();
+    await expect(page.locator(".inbox-view")).toHaveCount(0);
+    await openInbox(page);
+    await expect.poll(() => messages.evaluate((node) => node.scrollTop)).toBe(kept);
+  });
+
   test("the ask's card in its session does not block it and answers in place", async ({ page }) => {
     const asked = await toolA(sessions.worker, "ask", { question: "Keep the old API for a release?", options: ["Yes", "No"] });
     expect(asked.status, JSON.stringify(asked.payload)).toBe(200);

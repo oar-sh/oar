@@ -52,7 +52,7 @@ async function getUsage(app, query = {}) {
   return res;
 }
 
-function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage } = {}) {
+function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage, deepseekEnabled = false, deepseekBalanceService, deepseekUsageImportService } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   // Only the runtime session rows matter here, so they go in without their conversations.
@@ -81,8 +81,11 @@ function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [],
     getClaudeProviderSettings: () => ({ enabled: true }),
     claudeCloudSettingsService: { getSettings: () => ({ enabled: cloudEnabled }) },
     ...(claudeAccountUsageService === undefined ? {} : { claudeAccountUsageService }),
+    deepseekSettingsService: { getSettings: () => ({ configured: deepseekEnabled, enabled: deepseekEnabled }) },
+    ...(deepseekBalanceService === undefined ? {} : { deepseekBalanceService }),
+    ...(deepseekUsageImportService === undefined ? {} : { deepseekUsageImportService }),
   });
-  return { app };
+  return { app, planUsageService };
 }
 
 test('the report carries the live Claude card and the Claude Cloud card after it', async () => {
@@ -161,7 +164,7 @@ test('the legacy answer never asks for the account usage', async () => {
 test('every provider is live when nothing is asked for, and the answer says so', async () => {
   const { app } = setup({ claudeAccountUsageService: { getAccountUsage: async () => ACCOUNT } });
   const res = await getUsage(app);
-  assert.deepEqual(res.body.live, ['github', 'claude', 'claude-cloud', 'cursor', 'grok']);
+  assert.deepEqual(res.body.live, ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek']);
   assert.equal(typeof res.body.fetchedAt.github, 'string');
   assert.equal(res.body.fetchedAt.claude, ACCOUNT.fetchedAt);
   assert.equal(res.body.providers[0].capturedAt, res.body.fetchedAt.github);
@@ -218,7 +221,7 @@ test('asked for one provider, the others come from the last live answer without 
 
   // Unknown ids are ignored; `all` means everything live.
   const fourth = await getUsage(app, { providers: 'all' });
-  assert.equal(fourth.body.live.length, 5);
+  assert.equal(fourth.body.live.length, 6);
   assert.deepEqual([quotaReads, billingReads, grokReads], [2, 2, 3]);
 });
 
@@ -248,4 +251,114 @@ test('a failed live read does not replace the last good answer', async () => {
   assert.equal(failed.body.providers[0].status, 'error');
   const cached = await getUsage(app, { providers: 'claude' });
   assert.equal(cached.body.providers[0].status, 'ok', 'the good answer is what the cache serves');
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek
+
+const DEEPSEEK_BALANCE = {
+  ok: true,
+  isAvailable: true,
+  balances: [{ currency: 'USD', total: 7.25, granted: 0.25, toppedUp: 7 }],
+  fetchedAt: '2026-10-02T10:00:50.000Z',
+  cached: false,
+};
+
+test('with DeepSeek on, its card carries the balance and the relay\'s spend, read live when asked for', async () => {
+  let reads = 0;
+  const { app, planUsageService } = setup({
+    cloudEnabled: false,
+    deepseekEnabled: true,
+    deepseekBalanceService: { getBalance: async () => { reads += 1; return DEEPSEEK_BALANCE; } },
+  });
+  planUsageService.recordDeepSeekUsageReport({
+    conversationId: 'conv-ds',
+    nativeSessionId: 'native-1',
+    at: '2026-10-02T09:00:00.000Z',
+    totals: [{ model: 'deepseek-flash', hitTokens: 0, missTokens: 1_000_000, outputTokens: 1_000_000 }],
+  });
+  const res = await getUsage(app, { providers: 'deepseek' });
+  assert.deepEqual(res.body.live, ['deepseek']);
+  assert.equal(reads, 1);
+  assert.deepEqual(res.body.providers.map((card) => card.provider), ['github', 'claude', 'cursor', 'deepseek']);
+  const card = res.body.providers.at(-1);
+  assert.equal(card.status, 'ok');
+  assert.equal(card.source, 'live');
+  assert.equal(res.body.fetchedAt.deepseek, DEEPSEEK_BALANCE.fetchedAt);
+  assert.equal(card.notes.find((note) => note.id === 'deepseek-balance-usd').text, 'Balance (USD): $7.25 (topped up $7.00, granted $0.25)');
+  // Friday 09:00 UTC is peak: 1M misses and 1M output of flash cost $1.50.
+  assert.match(card.notes.find((note) => note.id === 'deepseek-spend').text, /\$1\.50 since 2026-10-02/);
+
+  // Another tab: the balance is the earlier answer, not read again.
+  await getUsage(app, { providers: 'github' });
+  assert.equal(reads, 1);
+});
+
+test('a throwing balance service does not fail the modal; DeepSeek off has no card and reads nothing', async () => {
+  const failing = setup({
+    cloudEnabled: false,
+    deepseekEnabled: true,
+    deepseekBalanceService: { getBalance: async () => { throw new Error('boom'); } },
+  });
+  const res = await getUsage(failing.app);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.providers.at(-1).provider, 'deepseek');
+  assert.equal(res.body.providers.at(-1).status, 'unavailable');
+
+  let reads = 0;
+  const off = setup({ cloudEnabled: false, deepseekBalanceService: { getBalance: async () => { reads += 1; return DEEPSEEK_BALANCE; } } });
+  const offRes = await getUsage(off.app);
+  assert.equal(offRes.body.providers.some((card) => card.provider === 'deepseek'), false);
+  assert.equal(reads, 0);
+});
+
+test('an imported DeepSeek export shows on the card; one that cannot be read leaves the estimate', async () => {
+  const actuals = {
+    keyFp: 'sk-1a2b3…9c0d',
+    through: '2026-10-04T00:00:00+01:00',
+    rows: [
+      { day: '2026-09-30', model: 'deepseek-flash', hitTokens: 0, missTokens: 1000, outputTokens: 100, requestCount: 3, cost: 0.3, currency: 'USD' },
+      { day: '2026-10-02', model: 'deepseek-flash', hitTokens: 0, missTokens: 1000, outputTokens: 100, requestCount: 3, cost: 0.2, currency: 'USD' },
+      { day: '2026-10-03', model: 'deepseek-flash', hitTokens: 0, missTokens: 1000, outputTokens: 100, requestCount: 3, cost: 0.4, currency: 'USD' },
+    ],
+  };
+  const record = (planUsageService) => {
+    planUsageService.recordDeepSeekUsageReport({
+      conversationId: 'conv-ds',
+      nativeSessionId: 'native-1',
+      at: '2026-10-02T09:00:00.000Z',
+      totals: [{ model: 'deepseek-flash', hitTokens: 0, missTokens: 1_000_000, outputTokens: 1_000_000 }],
+    });
+    planUsageService.recordDeepSeekUsageReport({
+      conversationId: 'conv-ds',
+      nativeSessionId: 'native-1',
+      at: '2026-10-03T09:00:00.000Z',
+      totals: [{ model: 'deepseek-flash', hitTokens: 0, missTokens: 2_000_000, outputTokens: 2_000_000 }],
+    });
+  };
+  const withExport = setup({
+    cloudEnabled: false,
+    deepseekEnabled: true,
+    deepseekBalanceService: { getBalance: async () => DEEPSEEK_BALANCE },
+    deepseekUsageImportService: { readActuals: () => actuals },
+  });
+  record(withExport.planUsageService);
+  const card = (await getUsage(withExport.app, { providers: 'deepseek' })).body.providers.at(-1);
+  // The export's $0.40 instead of the estimate's $1.50 on the 3rd; its 30th
+  // and the 2nd, the first day of the daily history, are left out, so the
+  // 2nd keeps its estimate of $1.50.
+  assert.match(card.notes.find((note) => note.id === 'deepseek-spend').text, /actual and estimated: \$1\.90 since 2026-10-02/);
+  assert.match(card.notes.find((note) => note.id === 'deepseek-actual').text, /Export days through Oct 2, the day this relay's daily history starts, are left out/);
+
+  const broken = setup({
+    cloudEnabled: false,
+    deepseekEnabled: true,
+    deepseekBalanceService: { getBalance: async () => DEEPSEEK_BALANCE },
+    deepseekUsageImportService: { readActuals: () => { throw new Error('boom'); } },
+  });
+  record(broken.planUsageService);
+  const plain = (await getUsage(broken.app, { providers: 'deepseek' })).body.providers.at(-1);
+  // The 3rd is a Saturday: off-peak, $0.75.
+  assert.match(plain.notes.find((note) => note.id === 'deepseek-spend').text, /\$2\.25 since 2026-10-02/);
+  assert.equal(plain.notes.some((note) => note.id === 'deepseek-actual'), false);
 });

@@ -30,6 +30,7 @@ export const ABOUT_PROVIDER_LABELS = Object.freeze({
   'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
+  deepseek: 'DeepSeek',
 });
 
 // The CLI each provider runs, keyed as the CLI install service keys them.

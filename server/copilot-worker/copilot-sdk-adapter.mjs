@@ -392,8 +392,11 @@ export function isCopilotQuotaError(data) {
  * "Open Check Usage" pointer shipped in 37d2899. The structured quota verdict
  * is passed to that classifier as a hint rather than smuggled in as forged
  * prose, so a quota error is non-retryable however GitHub worded it.
+ *
+ * `provider` is the worker's provider (`openai` for a BYOK worker): the note
+ * names it, so an OpenAI turn does not read as a Copilot one.
  */
-export function classifyCopilotSessionError(data) {
+export function classifyCopilotSessionError(data, { provider = '' } = {}) {
   const detail = String(data?.message || '').trim() || 'the Copilot runtime reported a session error';
   const quota = isCopilotQuotaError(data);
   const probe = new Error(detail);
@@ -420,7 +423,7 @@ export function classifyCopilotSessionError(data) {
   return {
     code,
     stableCode: `copilot.${code}`,
-    text: `System note: the Copilot turn failed (${detail}). Retry or send a new message.`,
+    text: turnFailedText(detail, provider),
     // Without one the relay adds its default, which advises a retry.
     guidance: COPILOT_TURN_FAILURE_GUIDANCE,
     detail,
@@ -491,6 +494,17 @@ export function isCopilotAuthError(error) {
 }
 
 /**
+ * The generic failure note. On the SDK engine the provider is GitHub Copilot or,
+ * for a BYOK worker, OpenAI; the note names the one the turn ran on.
+ */
+function turnFailedText(detail, provider) {
+  const subject = String(provider || '').trim().toLowerCase() === 'openai'
+    ? 'the OpenAI turn on the Copilot SDK engine'
+    : 'the Copilot turn';
+  return `System note: ${subject} failed (${detail}). Retry or send a new message.`;
+}
+
+/**
  * What the relay appends to a failed Copilot turn in place of its own default
  * (which advises a retry). The worker deals with its runtime itself: a delivered
  * turn that failed tore it down and the next message starts a fresh one, so a
@@ -509,7 +523,7 @@ export const COPILOT_TURN_CONTINUE_GUIDANCE =
  * than a `session.error` event. Auth gets its own branch because the fix is a
  * user action on the relay host, not a retry.
  */
-export function classifyCopilotTurnException(error) {
+export function classifyCopilotTurnException(error, { provider = '' } = {}) {
   const detail = String(error?.message || error || '').trim() || 'unknown error';
   // The conversation's folder is gone; the message names it.
   if (isWorkingDirectoryMissingError(error)) {
@@ -563,7 +577,7 @@ export function classifyCopilotTurnException(error) {
   return {
     code: 'turn-error',
     stableCode: 'copilot.turn-error',
-    text: `System note: the Copilot turn failed (${detail}). Retry or send a new message.`,
+    text: turnFailedText(detail, provider),
     guidance: COPILOT_TURN_FAILURE_GUIDANCE,
     detail,
   };

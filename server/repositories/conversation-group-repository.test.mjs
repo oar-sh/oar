@@ -246,7 +246,7 @@ test('the head stays first: it cannot be reordered, a drop before it lands first
   assert.equal(repo.getGroup(groupId).name, 'Catalog import');
 });
 
-test('arrivals join the end of a hand order, else stay unplaced; leaving, dissolving clear; compaction carries the place', () => {
+test('arrivals join the top of a hand order, else stay unplaced; leaving, dissolving clear; compaction carries the place', () => {
   const { repo, conv, groupOf, positionOf } = setup();
   conv('conv-lead', 'Catalog import', at(1));
   conv('conv-child-1', 'Chat one', at(2));
@@ -257,14 +257,18 @@ test('arrivals join the end of a hand order, else stay unplaced; leaving, dissol
   assert.equal(positionOf('conv-child-2'), null);
   repo.moveConversation('conv-child-1', { groupId, beforeConversationId: 'conv-child-2' }, NOW);
   assert.deepEqual(['conv-child-1', 'conv-child-2'].map(positionOf), [10, 20]);
-  // An agent's new child, and a row moved in by the menu, join at the end.
+  // An agent's new child, and a row moved in by the menu, join at the top,
+  // right under the head; positions go below the first placed member.
   conv('conv-child-3', 'Chat three', at(9));
   repo.attachCreatedConversation('conv-child-3', 'conv-lead', NOW);
-  assert.equal(positionOf('conv-child-3'), 30);
+  assert.equal(positionOf('conv-child-3'), 0);
   conv('conv-menu', 'Chat by menu', at(8));
   assert.equal(repo.setMembership('conv-menu', groupId, NOW).changed, true);
-  assert.equal(positionOf('conv-menu'), 40);
-  assert.deepEqual(repo.orderOf(groupId), ['conv-lead', 'conv-child-1', 'conv-child-2', 'conv-child-3', 'conv-menu']);
+  assert.equal(positionOf('conv-menu'), -10);
+  assert.deepEqual(repo.orderOf(groupId), ['conv-lead', 'conv-menu', 'conv-child-3', 'conv-child-1', 'conv-child-2']);
+  // The next drag renumbers from 10 in the order that shows.
+  repo.moveConversation('conv-child-2', { groupId, beforeConversationId: 'conv-child-1' }, NOW);
+  assert.deepEqual(['conv-menu', 'conv-child-3', 'conv-child-2', 'conv-child-1'].map(positionOf), [10, 20, 30, 40]);
   // The menu into a group nobody ordered: unplaced.
   conv('conv-x', 'Chat X', at(4));
   conv('conv-y', 'Chat Y', at(5));
@@ -277,7 +281,7 @@ test('arrivals join the end of a hand order, else stay unplaced; leaving, dissol
   // Compaction: the new row takes the old one's place.
   conv('conv-child-2b', 'Chat two (compacted)', at(10));
   assert.equal(repo.carryToCompacted('conv-child-2', 'conv-child-2b', NOW), groupId);
-  assert.equal(positionOf('conv-child-2b'), 20);
+  assert.equal(positionOf('conv-child-2b'), 30);
   assert.equal(groupOf('conv-child-2'), groupId, 'the old row stays in the group');
   assert.equal(positionOf('conv-child-2'), null, 'without the place it handed on');
   // Dissolving clears every place.

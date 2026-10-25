@@ -1,6 +1,8 @@
 // Mirrors shared/model-id.mjs, which the browser cannot import (only
 // server/public is served).
 const CLAUDE_LONG_CONTEXT_LIMIT_TOKENS = 1000000;
+// Mirrors shared/deepseek-models.mjs for the same reason.
+const DEEPSEEK_CONTEXT_WINDOW_TOKENS = 1048576;
 export const UNKNOWN_WINDOW_LABEL = '—';
 
 // Shared by the context chip and both model pickers so a window reads the same
@@ -59,6 +61,8 @@ export function buildContextTierOptions({
   // metadata either (that number is Copilot's): one blank default, as for a
   // Claude model whose window is unknown.
   if (provider === 'claude-cloud') return [{ value: 'default', label: UNKNOWN_WINDOW_LABEL }];
+  // DeepSeek's models have one window, 1M: no tier to choose.
+  if (provider === 'deepseek') return [{ value: 'default', label: tokenLabel(DEEPSEEK_CONTEXT_WINDOW_TOKENS) }];
   const claudeTierList = provider === 'claude' ? claudeTiersForModel(modelId, claudeTiers) : null;
   if (claudeTierList) {
     return claudeTierList

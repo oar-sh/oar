@@ -515,12 +515,13 @@ test('a drag places a conversation before another or at the end, takes it out wi
   assert.equal(same.body.changed, false);
   assert.equal(fx.events('conversation_group_changed').length, eventsBefore + 1);
 
-  // The menu's body (no beforeConversationId) joins a hand-ordered group at the end, as before.
+  // The menu's body (no beforeConversationId) joins a hand-ordered group at the
+  // top: a step below the lowest position, which the next drag renumbers.
   const e = await fx.bootstrap({ title: 'Chat E' });
   const menu = await fx.call('PUT /api/conversation/:id/group', { params: { id: e }, body: { groupId } });
   assert.deepEqual(menu.body, { ok: true, groupId, previousGroupId: null, changed: true });
-  assert.deepEqual(fx.events('conversation_group_changed').at(-1).order, [a, c, b, d, e]);
-  assert.equal(fx.events('conversation_group_changed').at(-1).positions[e], 50);
+  assert.deepEqual(fx.events('conversation_group_changed').at(-1).order, [e, a, c, b, d]);
+  assert.equal(fx.events('conversation_group_changed').at(-1).positions[e], 0);
 
   // groupId null: out, with or without a place.
   const out = await fx.call('PUT /api/conversation/:id/group', { params: { id: e }, body: { groupId: null } });

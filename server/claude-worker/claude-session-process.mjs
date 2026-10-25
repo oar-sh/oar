@@ -532,6 +532,9 @@ export function createClaudeSessionRunner({
   // by the first turn to open regardless.
   compactReplayAdoptionMs = 60_000,
   continuationRetryDelayMs = 500,
+  // How long a delivered turn that opens over a finished continuation waits
+  // for that continuation's row to register, so its answer publishes first.
+  continuationRegistrationWaitMs = 10_000,
   // Backoff between attempts to save a consumed steer's settle marker (~31 s
   // in all); after the last one the row fails terminally instead.
   settleRetryDelaysMs = [1_000, 2_000, 4_000, 8_000, 8_000, 8_000],
@@ -574,13 +577,30 @@ export function createClaudeSessionRunner({
   // Records every sub-agent's frames as its timeline, run-scoped (see
   // subagent-timeline-recorder.mjs). Injectable for tests.
   subagentTimelineRecorder = null,
+  // Another endpoint for the CLI (../deepseek-worker/deepseek-claude-backend.mjs):
+  // its spawn environment, model ids and effort, and what it reports. null is
+  // Claude through the host's login.
+  backend = null,
   dbg = () => {},
 } = {}) {
+  // Neither Claude's plan windows nor its usage limit exist on another backend.
+  const readPlanUsageForTurn = backend && !backend.reportsPlanUsage ? async () => null : readPlanUsageImpl;
   const timelineRecorder = subagentTimelineRecorder || createSubagentTimelineRecorder({ api, conversationId: sdkSessionId, dbg });
   const publisher = createClaudeTurnPublisher({
     api,
     dbg,
     takeWorkflowRuns: () => drainSettledWorkflowRuns(),
+    ...(backend
+      ? {
+          describeFailure: backend.describeFailure,
+          runtimeLabel: backend.label || 'DeepSeek',
+          failureCodePrefix: backend.id || 'deepseek',
+          reportsPlanUsage: backend.reportsPlanUsage !== false,
+          usageRoute: backend.usageRoute || null,
+          usageModelKey: backend.relayModel,
+          relayModel: (value) => (value ? backend.relayModel(value) : value),
+        }
+      : {}),
   });
   // `remote_relay` is registered only while this relay has paired remotes.
   // Asked once when the worker starts, and again whenever a CLI process winds
@@ -591,7 +611,9 @@ export function createClaudeSessionRunner({
   void remoteRelayGate.refresh();
   // The subscription's usage limit as the CLI reports it. Runner-level: the
   // limit is the account's, not the CLI process's.
-  const usageLimit = createUsageLimitTracker();
+  const usageLimit = backend && !backend.reportsUsageLimit
+    ? { observe: () => null, classifyResult: () => null, classifyException: () => null }
+    : createUsageLimitTracker();
   const resolveWorkflowSessionDir = resolveWorkflowSessionDirImpl || createDefaultWorkflowSessionDirResolver();
   let claudeNativeSessionId = '';
   let proc = null;
@@ -657,13 +679,19 @@ export function createClaudeSessionRunner({
   // Row id → the latest in-flight /api/queue-consumed POST touching it.
   const consumedMarkChains = new Map();
 
-  async function persistNativeSessionId(conversationId, sessionId) {
+  /**
+   * `cliStartedAt` (ms) is a backend CLI's spawn time, sent at its first
+   * init even when the session id is the known one: the relay records each
+   * CLI start of a DeepSeek session to find its shell snapshot on delete.
+   */
+  async function persistNativeSessionId(conversationId, sessionId, { cliStartedAt = null } = {}) {
     const normalized = String(sessionId || '').trim();
-    if (!normalized || normalized === claudeNativeSessionId) return;
+    if (!normalized || (normalized === claudeNativeSessionId && !cliStartedAt)) return;
     try {
       await api('POST', '/api/claude-native-session', {
         conversationId,
         claudeNativeSessionId: normalized,
+        ...(cliStartedAt ? { cliStartedAt } : {}),
       });
       // Only cache after the server accepted it, so a failed persist is
       // retried on the next init — resume across worker restarts depends on
@@ -678,7 +706,8 @@ export function createClaudeSessionRunner({
     // Per-message model wins so the composer can switch Claude models between
     // turns; the conversation's provider model and worker default are fallbacks.
     const requestedModel = String(message.model || '').trim();
-    const perTurnModel = requestedModel.toLowerCase() !== 'auto' && requestedModel.toLowerCase().startsWith('claude-')
+    const ownModel = backend ? backend.isModel(requestedModel) : requestedModel.toLowerCase().startsWith('claude-');
+    const perTurnModel = requestedModel.toLowerCase() !== 'auto' && ownModel
       ? requestedModel
       : '';
     return perTurnModel
@@ -813,6 +842,12 @@ export function createClaudeSessionRunner({
         modelUsage: null,
       },
       planBoardPosted: false,
+      // The CLI process the turn ran in, as its usage report names it: taken
+      // from the process here and again when the context is made active, and
+      // read from the context at finalize — a late continuation flush
+      // finalizes after the process died, when `proc` is null or a newer one.
+      runId: proc?.runId || '',
+      resumedSessionId: proc?.resumedSessionId || '',
       // Set only on a context attached by post-compaction adoption, and only
       // until that turn produces output — see handBackAdoptedContext.
       adoptedFromCompaction: false,
@@ -846,6 +881,8 @@ export function createClaudeSessionRunner({
 
   function activateContext(ctx) {
     proc.activeCtx = ctx;
+    ctx.runId = proc.runId || '';
+    ctx.resumedSessionId = proc.resumedSessionId || '';
     proc.lastBoundary = null;
     proc.continuationInitPending = false;
     proc.notificationPendingAt = 0;
@@ -1173,7 +1210,7 @@ export function createClaudeSessionRunner({
   }
 
   /** Wait until a continuation context has its relay queue row (or gave up). */
-  async function waitForContextRegistration(ctx, timeoutMs = 10_000) {
+  async function waitForContextRegistration(ctx, timeoutMs = continuationRegistrationWaitMs) {
     const deadline = Date.now() + timeoutMs;
     while (!ctx.registered && !ctx.discarded && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1432,9 +1469,13 @@ export function createClaudeSessionRunner({
     ctx.finalized = true;
     controlPoller?.stop?.(ctx.controlState);
     // A late continuation flush can land after the process died; usage reads
-    // and model fallbacks must survive that.
+    // and model fallbacks must survive that. The process the report names is
+    // the context's own (set when it was made active), never the one that
+    // happens to be current now.
     const turnRef = proc?.turn || null;
     const procModel = proc?.model || null;
+    const runId = ctx.runId || '';
+    const resumedSessionId = ctx.resumedSessionId || '';
     // Steers pushed into this turn and still unsettled: the CLI has their
     // prompts, so the relay marks them consumed with this turn's commit and
     // never re-runs them even if this worker dies before settling them.
@@ -1461,12 +1502,12 @@ export function createClaudeSessionRunner({
         await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
         const [contextUsage, planUsage] = await Promise.all([
           readContextUsageImpl(turnRef, dbg),
-          readPlanUsageImpl(turnRef, dbg),
+          readPlanUsageForTurn(turnRef, dbg),
         ]);
         ctx.state.contextUsage = contextUsage;
         ctx.state.planUsage = planUsage;
         await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
-        await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
+        await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId, runId, resumedSessionId });
       })().catch((error) => dbg('stopped-turn publish failed', error?.message || String(error)));
       lingerStoppedRow(ctx, publishChain);
       closeContext(ctx, true);
@@ -1478,13 +1519,13 @@ export function createClaudeSessionRunner({
     // indicator updates with each reply.
     const [contextUsage, planUsage] = await Promise.all([
       readContextUsageImpl(turnRef, dbg),
-      readPlanUsageImpl(turnRef, dbg),
+      readPlanUsageForTurn(turnRef, dbg),
     ]);
     ctx.state.contextUsage = contextUsage;
     ctx.state.planUsage = planUsage;
     const responseModel = ctx.state.responseModel || procModel || null;
     await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model: procModel, sdkSessionId });
-    await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId });
+    await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId, runId, resumedSessionId });
 
     if (ctx.state.result?.isError) {
       await publisher.publishErrorResult({ message: ctx.message, state: ctx.state, responseModel, consumedSteerIds });
@@ -1511,10 +1552,17 @@ export function createClaudeSessionRunner({
     }
     // The transport is gone, so nothing new can be read — but usage already
     // captured on this context (a result seen before the stream died) still
-    // reaches the relay. Best-effort by definition of this path.
+    // reaches the relay, under the process the context ran in. Best-effort by
+    // definition of this path.
     if (ctx.state.contextUsage || ctx.state.planUsage) {
       await publisher.publishContextUsage({ message: ctx.message, state: ctx.state, model, sdkSessionId }).catch(() => {});
-      await publisher.publishPlanUsage({ message: ctx.message, state: ctx.state, sdkSessionId }).catch(() => {});
+      await publisher.publishPlanUsage({
+        message: ctx.message,
+        state: ctx.state,
+        sdkSessionId,
+        runId: ctx.runId || '',
+        resumedSessionId: ctx.resumedSessionId || '',
+      }).catch(() => {});
     }
     if (ctx.interrupted || aborted) {
       await publisher.publishFinalStream(ctx.message, ctx.state.lastStreamedText);
@@ -1769,7 +1817,13 @@ export function createClaudeSessionRunner({
         const agentLike = SUBAGENT_TASK_TYPES.has(String(task.taskType || ''));
         const pinnedModel = (task.toolUseId && processRef.subagentSpawns.get(task.toolUseId)) || '';
         const activity = (task.toolUseId && processRef.subagentActivity.get(task.toolUseId)) || {};
-        const model = agentLike ? (activity.model || pinnedModel || processRef.initModel || null) : null;
+        const knownModel = agentLike ? (activity.model || pinnedModel || processRef.initModel || null) : null;
+        // A backend's CLI names a sub-agent's model in Claude's terms (the
+        // spawn's "opus", a Claude id of a CLI without the alias pins): the
+        // badge shows the backend's model that runs it.
+        const model = knownModel && backend?.subagentModel
+          ? (backend.subagentModel(knownModel, processRef.initModel || processRef.model) || knownModel)
+          : knownModel;
         return {
           taskId,
           taskType: task.taskType,
@@ -2393,7 +2447,9 @@ export function createClaudeSessionRunner({
       // init lands, and skipping that init settled the message with a pointer
       // and dropped its real answer.
       if (!firstInit && proc.pendingDelivered.length) turnStartedForWaitingDeliveries();
-      persistNativeSessionId(sdkSessionId, sdkMessage.session_id).catch(() => {});
+      persistNativeSessionId(sdkSessionId, sdkMessage.session_id, {
+        cliStartedAt: backend && firstInit ? proc.spawnedAt : null,
+      }).catch(() => {});
       // Tracked on the process too (not only through the persist round-trip):
       // the workflow poller needs the native id to find the session dir even
       // when the persist call is still in flight or failed.
@@ -2402,7 +2458,9 @@ export function createClaudeSessionRunner({
       // normalizer never sees it — capture the CLI's actual model here and
       // seed it into every context at activation. Without this, a composer
       // set to `auto` published responses with model: null.
-      proc.initModel = String(sdkMessage.model || '').trim() || proc.initModel;
+      // A backend's CLI names the model in its own terms ("deepseek-flash[1m]").
+      const initModel = String(sdkMessage.model || '').trim();
+      proc.initModel = (backend && initModel ? backend.relayModel(initModel) : initModel) || proc.initModel;
       // A fresh init with no active turn AND nothing queued to deliver is the CLI
       // opening a turn on its own — a background-task continuation ("you will be
       // notified"). The real SDK does NOT emit a user-message replay for these
@@ -2541,7 +2599,8 @@ export function createClaudeSessionRunner({
       // the composer pinned a model (adaptProcess repins via setModel). An
       // `auto` composer keeps the CLI's own behavior — only the recorded
       // model follows the switch.
-      const fallbackModel = String(sdkMessage.fallbackModel || '').trim();
+      const reportedFallback = String(sdkMessage.fallbackModel || '').trim();
+      const fallbackModel = backend && reportedFallback ? backend.relayModel(reportedFallback) : reportedFallback;
       if (fallbackModel) {
         proc.initModel = fallbackModel;
         if (String(sdkMessage.scope || '').trim().toLowerCase() === 'session') {
@@ -3522,10 +3581,7 @@ export function createClaudeSessionRunner({
         }
         continue;
       }
-      await finalizeContextOnStreamEnd(ctx, {
-        aborted: processRef.aborted,
-        model: processRef.model,
-      }).catch(() => {});
+      await finalizeContextOnStreamEnd(ctx, { aborted: processRef.aborted, model: processRef.model }).catch(() => {});
     }
     for (const entry of stoppedSteers) {
       await settleFoldedSteeredEntry(entry).catch((error) => {
@@ -3546,10 +3602,12 @@ export function createClaudeSessionRunner({
     if (missingFolder) throw missingFolder;
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
-    const effort = normalizeClaudeEffort(message.reasoningEffort);
+    // A backend's effort is its own (DeepSeek: low/high/max), and so is its
+    // thinking switch (DeepSeek: always on).
+    const effort = backend ? backend.effortFor(message.reasoningEffort) : normalizeClaudeEffort(message.reasoningEffort);
     const autoCompactWindow = normalizeAutoCompactWindow(getAutoCompactWindow());
     const thinkingState = getThinking() || {};
-    const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
+    const thinkingEnabled = backend ? backend.thinkingEnabled(effort) : parseThinkingEnabled(thinkingState.enabled);
     const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
     const attribution = getAttribution() || null;
     const backgroundCommandLimitMs = getBackgroundCommandLimitMs() ?? null;
@@ -3557,6 +3615,13 @@ export function createClaudeSessionRunner({
     const processRef = {
       turn: null,
       abortController,
+      // Names this CLI process in its usage reports: the relay tells a
+      // report that fell behind one of the same process from a process
+      // that started counting over.
+      runId: randomUUID(),
+      // When the CLI was spawned, reported with its first init (see
+      // persistNativeSessionId).
+      spawnedAt: Date.now(),
       model,
       relayMode,
       effort,
@@ -3574,6 +3639,8 @@ export function createClaudeSessionRunner({
       thinkingBudget: null,
       appendClass: modeAppendClass(relayMode),
       permissionMode: permissionModeForRelayMode(relayMode),
+      // What only a fresh CLI of the backend takes (adaptProcess compares it).
+      spawnKey: backend ? backend.spawnKey(message, { model }) : '',
       liveTasks: new Map(),
       knownTasks: new Set(),
       // taskId → the row of a task that left the live set, until its
@@ -3602,6 +3669,8 @@ export function createClaudeSessionRunner({
       // from `resume`, updated on init) — the workflow poller's key into
       // `~/.claude/projects`.
       nativeSessionId: '',
+      // The session the process was spawned to resume ('' for a fresh one).
+      resumedSessionId: '',
       // tool_use id → explicitly pinned model of a subagent spawn block; the
       // task panel's model column resolves through this at publish time.
       subagentSpawns: new Map(),
@@ -3721,6 +3790,10 @@ export function createClaudeSessionRunner({
 
     const resume = String(resumeOverride || message.claudeNativeSessionId || claudeNativeSessionId || '').trim();
     processRef.nativeSessionId = resume;
+    // The session this process continues, for its usage reports: the CLI's
+    // first result then carries that session's earlier totals (see
+    // claude-turn-publisher.mjs, runningCounts).
+    processRef.resumedSessionId = resume;
     // The CLI resolves `resume` inside the project directory for *this* CWD, so
     // a session whose workspace root changed has to bring its transcript along
     // or every turn from here on fails with "No conversation found".
@@ -3752,6 +3825,7 @@ export function createClaudeSessionRunner({
         || '',
       ),
       remoteRelayTool: remoteRelayGate.isEnabled(),
+      backend,
       dbg,
     });
     processRef.lifecycleTimer = setInterval(() => evaluateLifecycle(), lifecyclePollMs);
@@ -3773,6 +3847,11 @@ export function createClaudeSessionRunner({
         try {
           processRef.turn.endInput?.();
         } catch {}
+        // The CLI refused a backend's live flag settings (its key and
+        // endpoint pins, claude-sdk-adapter.mjs): nothing was sent, and the
+        // SDK aborted the query, which reads like a stop. The open turns fail
+        // with that note instead.
+        if (!streamError && processRef.turn?.liveFlagSettingsError) streamError = processRef.turn.liveFlagSettingsError;
         await cleanupProcess(processRef, streamError);
       }
     })();
@@ -3821,7 +3900,18 @@ export function createClaudeSessionRunner({
   async function adaptProcess(message, delivery = {}) {
     const relayMode = message.relayMode || 'agent';
     const model = resolvePerTurnModel(message);
-    const effort = normalizeClaudeEffort(message.reasoningEffort);
+    const effort = backend ? backend.effortFor(message.reasoningEffort) : normalizeClaudeEffort(message.reasoningEffort);
+
+    // A backend's effort, and the model its CLI pins Claude Code's aliases
+    // to, are read by the CLI at spawn only: a change takes a fresh process
+    // on the same session, when nothing lives in the old one. Busy, the
+    // delivery runs on the old process (setModel below) and the next
+    // turn-opening one tries again.
+    if (backend && backend.spawnKey(message, { model }) !== proc.spawnKey && canReleaseForRespawn()) {
+      gracefulShutdown('backend-spawn');
+      await drainClosingProcess(10_000);
+      return null;
+    }
 
     // A mode change that would alter the spawn-time system prompt append gets
     // a fresh process — but only when nothing lives in the old one.
@@ -3874,13 +3964,14 @@ export function createClaudeSessionRunner({
     const repinAfterFallback = Boolean(proc.modelFallback) && Boolean(model);
     if (model !== proc.model || repinAfterFallback) {
       expectSettingsReinit();
-      await Promise.resolve(proc.turn.setModel?.(model || undefined)).catch((error) => {
+      const cliModel = backend && model ? backend.cliModel(model) : model;
+      await Promise.resolve(proc.turn.setModel?.(cliModel || undefined)).catch((error) => {
         dbg('setModel failed', error?.message || String(error));
       });
       proc.model = model;
       if (model) proc.modelFallback = '';
     }
-    if (effort !== proc.effort) {
+    if (!backend && effort !== proc.effort) {
       // 'ultracode' is not an effortLevel the CLI accepts — it maps to the
       // session-scoped ultracode/enableWorkflows flags (with the effort pinned
       // to the xhigh the flag implies); every other change clears those flags
@@ -3922,7 +4013,8 @@ export function createClaudeSessionRunner({
     const thinkingEnabled = parseThinkingEnabled(thinkingState.enabled);
     const thinkingDisplay = parseThinkingDisplay(thinkingState.display);
     let reassertDisplay = false;
-    if (thinkingEnabled !== proc.thinkingEnabled) {
+    // A backend's thinking is fixed at spawn (above).
+    if (!backend && thinkingEnabled !== proc.thinkingEnabled) {
       if (thinkingEnabled === true) {
         // Enabling applies live. The display MUST be re-sent afterwards, in
         // this order: a session spawned with thinking off carries no display
@@ -4175,14 +4267,20 @@ export function createClaudeSessionRunner({
         // seconds (transcript load + first request); say so instead of
         // showing bare dots. Posted once here — not in spawnProcess — so a
         // push-race respawn cannot duplicate the line.
+        // In a DeepSeek chat the CLI is Claude Code talking to DeepSeek; the
+        // line names the backend so the wait is not read as a Claude turn.
+        const startingWhat = backend ? `Claude Code for ${backend.label || 'DeepSeek'}` : 'the Claude CLI';
         publisher.postActivity(message, (respawnResume || message.claudeNativeSessionId || claudeNativeSessionId)
-          ? 'Starting the Claude CLI (cold start — resuming the session transcript)…'
-          : 'Starting the Claude CLI (cold start)…');
+          ? `Starting ${startingWhat} (cold start — resuming the session transcript)…`
+          : `Starting ${startingWhat} (cold start)…`);
       }
       // Released for the window, then joined a process another delivery
       // spawned in the meantime.
       noteWindowRespawn();
-      const content = buildClaudeUserContent(message);
+      // A model that takes no image input gets every image by its path.
+      const content = buildClaudeUserContent(message, {
+        embedImages: backend ? backend.acceptsImages(resolvePerTurnModel(message)) : true,
+      });
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const procRef = proc;
         const ctx = createDeliveredContext(message);

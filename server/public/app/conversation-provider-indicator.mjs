@@ -23,6 +23,10 @@ export function isConversationUsingGrokProvider(conversation = null) {
   return resolveConversationProviderType(conversation) === 'grok';
 }
 
+export function isConversationUsingDeepSeekProvider(conversation = null) {
+  return resolveConversationProviderType(conversation) === 'deepseek';
+}
+
 // Its own provider, never a flavour of `claude`: the session runs in a sandbox
 // at Anthropic, so nothing that is true of a local Claude worker (modes,
 // effort, steering, a working directory) may be assumed for it.
@@ -39,6 +43,7 @@ const PROVIDER_NAMES = Object.freeze({
   'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
+  deepseek: 'DeepSeek',
   github: 'Copilot',
   'github-copilot': 'Copilot',
 });
@@ -76,6 +81,7 @@ const SESSION_LOCK_LABELS = {
   claude: 'Claude SDK',
   cursor: 'Cursor SDK',
   grok: 'Grok',
+  deepseek: 'DeepSeek',
   'claude-cloud': `${CLAUDE_CLOUD_MARKER} Claude Cloud`,
 };
 
@@ -96,6 +102,7 @@ export function sessionLockProviderKey({ providerType = '', model = '' } = {}) {
   if (normalized === 'claude-cloud') return 'claude-cloud';
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
+  if (normalized === 'deepseek') return 'deepseek';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }

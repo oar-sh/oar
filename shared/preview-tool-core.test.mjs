@@ -78,6 +78,9 @@ test('execute create(port) posts and returns url + base-path hint', async () => 
   assert.equal(result.url, `https://p.example.com/test_${TOKEN}/`);
   assert.equal(result.token, TOKEN);
   assert.match(result.hint, /Serve the app under/);
+  // The dev server is reached by the relay's proxy only; on a host with a
+  // public address a 0.0.0.0 bind would expose it a second time.
+  assert.match(result.hint, /Bind the dev server to 127\.0\.0\.1/);
   assert.match(result.hint, /public/);
   assert.deepEqual(calls[0].body, { conversationId: 'conv-1', label: 'web app', port: 5173 });
 });

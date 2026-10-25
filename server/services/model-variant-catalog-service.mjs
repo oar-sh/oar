@@ -130,6 +130,7 @@ export function modelProviderForId(modelId) {
   if (text.startsWith('mai-')) return 'microsoft';
   if (text.startsWith('grok-')) return 'xai';
   if (text.startsWith('kimi-')) return 'moonshot';
+  if (text.startsWith('deepseek-')) return 'deepseek';
   return 'other';
 }
 

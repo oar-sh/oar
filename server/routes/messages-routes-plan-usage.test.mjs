@@ -15,6 +15,8 @@ function makePlanUsageDeps(overrides = {}) {
     'conv-cursor': { id: 'rs-2', provider_type: 'cursor', provider_model: 'composer-2.5' },
     'conv-copilot': { id: 'rs-3', provider_type: 'github', provider_model: 'gpt-5.4-mini' },
     'conv-byok': { id: 'rs-4', provider_type: 'openai', provider_model: 'gpt-5.4-mini' },
+    'conv-ds': { id: 'rs-5', provider_type: 'deepseek', provider_model: 'deepseek-flash' },
+    'conv-claude': { id: 'rs-6', provider_type: 'claude', provider_model: 'claude-sonnet-5' },
   };
   return {
     db,
@@ -350,4 +352,151 @@ test('buildReport includes Grok only when configured', () => {
   assert.ok(grok);
   assert.equal(grok.meters[0]?.id, 'grok-monthly-spend');
   assert.ok(grok.links.some((link) => link.url === 'https://console.x.ai'));
+});
+
+// ─── DeepSeek ────────────────────────────────────────────────────────────────
+
+const deepseekUsageBody = (overrides = {}) => ({
+  conversationId: 'conv-ds',
+  sdkSessionId: 'conv-ds',
+  claudeNativeSessionId: 'native-1',
+  // A Wednesday, 02:00 UTC: peak.
+  at: '2026-08-05T02:00:00.000Z',
+  totals: [{ model: 'deepseek-flash', hitTokens: 1_000_000, missTokens: 1_000_000, outputTokens: 1_000_000 }],
+  ...overrides,
+});
+
+test('deepseek-plan-usage books what the session\'s totals add, at the price of the report\'s time', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  const peak = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody());
+  assert.equal(peak.status, 200);
+  assert.deepEqual(peak.body, { ok: true, at: '2026-08-05T02:00:00.000Z', models: ['deepseek-flash'] });
+  // Saturday: off-peak, half the price; the session's totals doubled.
+  const offPeak = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({
+    at: '2026-08-08T02:00:00.000Z',
+    totals: [{ model: 'deepseek-flash', hitTokens: 2_000_000, missTokens: 2_000_000, outputTokens: 2_000_000 }],
+  }));
+  assert.equal(offPeak.status, 200);
+  // The same totals again (a restarted worker): accepted, nothing booked.
+  const repeated = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({
+    at: '2026-08-08T02:01:00.000Z',
+    totals: [{ model: 'deepseek-flash', hitTokens: 2_000_000, missTokens: 2_000_000, outputTokens: 2_000_000 }],
+  }));
+  assert.equal(repeated.status, 200);
+  assert.deepEqual(repeated.body.models, []);
+  // Totals below the checkpoint: a CLI counting from zero again on the same
+  // session, booked in full (Saturday, off-peak).
+  const restarted = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({
+    at: '2026-08-08T03:00:00.000Z',
+    totals: [{ model: 'deepseek-flash', hitTokens: 1_000_000, missTokens: 1_000_000, outputTokens: 1_000_000 }],
+  }));
+  assert.equal(restarted.status, 200);
+  assert.deepEqual(restarted.body.models, ['deepseek-flash']);
+  // The turn's web searches and fetches ride along; before 2026-10-31 16:00
+  // UTC they are counted and cost nothing, and the totals unchanged book no tokens.
+  const searched = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({
+    at: '2026-08-08T04:00:00.000Z',
+    totals: [{ model: 'deepseek-flash', hitTokens: 1_000_000, missTokens: 1_000_000, outputTokens: 1_000_000 }],
+    requests: [{ model: 'deepseek-flash', searchRequests: 3, fetchRequests: 1 }],
+  }));
+  assert.equal(searched.status, 200);
+  assert.deepEqual(searched.body.models, ['deepseek-flash']);
+  const [flash] = planUsageService.readDeepSeekUsageTotals().models;
+  assert.deepEqual(flash, {
+    model: 'deepseek-flash',
+    hitTokens: 3_000_000,
+    missTokens: 3_000_000,
+    outputTokens: 3_000_000,
+    searchRequests: 3,
+    fetchRequests: 1,
+    turnCount: 4,
+    // Peak 1.506 + off-peak 0.753 + off-peak 0.753 (flash: $0.006/$0.30/$1.20 and $0.003/$0.15/$0.60 per 1M).
+    costUsd: 3.012,
+    costCny: 20.08,
+    toolsCostUsd: 0,
+    toolsCostCny: 0,
+    firstSeenAt: '2026-08-05T02:00:00.000Z',
+    lastSeenAt: '2026-08-08T04:00:00.000Z',
+  });
+  // Requests alone, on a model without token totals, are a turn of their own.
+  // (The price from the cutoff is the service test's: a turn time ahead of
+  // the relay's clock is taken as the relay's time here.)
+  const requestsOnly = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({
+    at: '2026-08-08T05:00:00.000Z',
+    totals: [],
+    requests: [{ model: 'deepseek-v4-pro', searchRequests: 100, fetchRequests: 100 }],
+  }));
+  assert.equal(requestsOnly.status, 200);
+  assert.deepEqual(requestsOnly.body.models, ['deepseek-v4-pro']);
+  const pro = planUsageService.readDeepSeekUsageTotals().models.find((entry) => entry.model === 'deepseek-v4-pro');
+  assert.deepEqual([pro.searchRequests, pro.fetchRequests, pro.toolsCostUsd, pro.toolsCostCny, pro.costUsd, pro.turnCount], [100, 100, 0, 0, null, 1]);
+});
+
+test('deepseek-plan-usage reads a drop by the run id: stale under the same process, a fresh run under another', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  const flash = (missTokens, searchRequests = 0) => ({
+    totals: [{ model: 'deepseek-flash', hitTokens: 0, missTokens, outputTokens: 0 }],
+    ...(searchRequests ? { requests: [{ model: 'deepseek-flash', searchRequests, fetchRequests: 0 }] } : {}),
+  });
+  // Turn 2's report reaches the relay before turn 1's (a retried post).
+  const second = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ runId: 'run-a', ...flash(2_000_000, 2) }));
+  assert.deepEqual(second.body.models, ['deepseek-flash']);
+  const first = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ runId: 'run-a', ...flash(1_000_000, 1) }));
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.body.models, []);
+  // The same report twice adds nothing either, searches included.
+  const again = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ runId: 'run-a', ...flash(2_000_000, 2) }));
+  assert.deepEqual(again.body.models, []);
+  let [row] = planUsageService.readDeepSeekUsageTotals().models;
+  assert.deepEqual([row.missTokens, row.searchRequests, row.turnCount], [2_000_000, 2, 1]);
+  // A respawned CLI (another run id) counting from zero on the same session
+  // is a fresh run, booked in full, its searches from zero too.
+  const fresh = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ runId: 'run-b', ...flash(500_000, 1) }));
+  assert.deepEqual(fresh.body.models, ['deepseek-flash']);
+  [row] = planUsageService.readDeepSeekUsageTotals().models;
+  assert.deepEqual([row.missTokens, row.searchRequests, row.turnCount], [2_500_000, 3, 2]);
+  const malformed = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ runId: 'run a' }));
+  assert.equal(malformed.status, 400);
+  assert.equal(malformed.body.error, 'runId must be a short id');
+});
+
+test('deepseek-plan-usage validates the conversation binding', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  const missing = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ conversationId: '' }));
+  assert.equal(missing.status, 400);
+  assert.equal(missing.body.error, 'Missing conversationId');
+  const unknown = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ conversationId: 'conv-unknown' }));
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.body.error, 'Runtime session not found for conversation');
+  for (const conversationId of ['conv-claude', 'conv-g', 'conv-copilot']) {
+    const wrong = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody({ conversationId }));
+    assert.equal(wrong.status, 409, conversationId);
+    assert.equal(wrong.body.error, 'Conversation is not bound to the DeepSeek provider');
+  }
+  assert.deepEqual(planUsageService.readDeepSeekUsageTotals().models, []);
+});
+
+test('deepseek-plan-usage refuses a malformed body and books nothing', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  for (const [overrides, error] of [
+    [{ totals: null }, 'totals must be a list'],
+    [{ totals: [{ model: '', missTokens: 5 }] }, 'Every totals entry needs a valid model id'],
+    [{ totals: [{ model: 'deepseek-flash', missTokens: -5 }] }, 'Missing usable usage metrics'],
+    [{ requests: 'two' }, 'requests must be a list'],
+    [{ requests: [{ model: 'x y', searchRequests: 1 }] }, 'Every requests entry needs a valid model id'],
+    [{ claudeNativeSessionId: undefined }, 'Missing or invalid claudeNativeSessionId'],
+    [{ at: 'soon' }, 'at must be an ISO time'],
+  ]) {
+    const { status, body } = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody(overrides));
+    assert.equal(status, 400, error);
+    assert.equal(body.error, error);
+  }
+  assert.deepEqual(planUsageService.readDeepSeekUsageTotals().models, []);
+});
+
+test('deepseek-plan-usage reports 500 when plan usage storage is absent', async () => {
+  const { deps } = makePlanUsageDeps({ planUsageService: null });
+  const { status, body } = await invokePost('/api/deepseek-plan-usage', deps, deepseekUsageBody());
+  assert.equal(status, 500);
+  assert.equal(body.error, 'Plan usage storage is unavailable');
 });

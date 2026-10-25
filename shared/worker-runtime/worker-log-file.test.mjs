@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { WORKER_LOG_FILE_ENV, installWorkerLogFile } from './worker-log-file.mjs';
+import { WORKER_LOG_FILE_ENV, installWorkerLogFile, installWorkerLogRedaction } from './worker-log-file.mjs';
 
 const WIN32_LOG = path.win32.join('C:\\work\\demo', 'logs', 'worker-abc-123.log');
 
@@ -159,4 +159,49 @@ test('a restarted worker appends to the file the previous one left', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+const LOG_SECRET = 'sk-test-log-00000000';
+
+test('the log redaction replaces a secret in what reaches the console and the log file', () => {
+  const processImpl = fakeProcess();
+  const fsImpl = recordingFs();
+  const logFile = installWorkerLogFile({ env: { [WORKER_LOG_FILE_ENV]: WIN32_LOG }, processImpl, fsImpl });
+  const redaction = installWorkerLogRedaction({ secrets: [LOG_SECRET], processImpl });
+  assert.ok(redaction);
+  processImpl.stdout.write(`cli said: ${LOG_SECRET}\n`);
+  processImpl.stderr.write(Buffer.from(`stderr ${LOG_SECRET}\n`, 'utf8'));
+  processImpl.stdout.write('nothing to hide\n');
+  const consoleText = processImpl.console.map(([, chunk]) => String(chunk)).join('');
+  const fileText = fsImpl.writes.map(([, chunk]) => String(chunk)).join('');
+  for (const text of [consoleText, fileText]) {
+    assert.equal(text.includes(LOG_SECRET), false);
+    assert.match(text, /cli said: \[redacted\]\nstderr \[redacted\]\nnothing to hide\n/);
+  }
+  redaction.uninstall();
+  logFile.uninstall();
+});
+
+test('the log redaction keeps a write\'s callback and leaves chunks without the secret as they came', () => {
+  const processImpl = fakeProcess();
+  installWorkerLogRedaction({ secrets: [LOG_SECRET], processImpl });
+  let called = 0;
+  processImpl.stdout.write(Buffer.from(`a ${LOG_SECRET}`), () => { called += 1; });
+  processImpl.stdout.write(`b ${LOG_SECRET}`, 'utf8', () => { called += 1; });
+  assert.equal(called, 2);
+  const plain = Buffer.from('plain bytes');
+  processImpl.stdout.write(plain);
+  assert.equal(processImpl.console.at(-1)[1], plain);
+});
+
+test('no secret, or one too short, installs nothing; uninstall puts the streams back', () => {
+  const processImpl = fakeProcess();
+  const originalWrite = processImpl.stdout.write;
+  assert.equal(installWorkerLogRedaction({ secrets: [], processImpl }), null);
+  assert.equal(installWorkerLogRedaction({ secrets: ['', undefined, 'short'], processImpl }), null);
+  assert.equal(processImpl.stdout.write, originalWrite);
+  const installed = installWorkerLogRedaction({ secrets: [LOG_SECRET], processImpl });
+  assert.notEqual(processImpl.stdout.write, originalWrite);
+  installed.uninstall();
+  assert.equal(processImpl.stdout.write, originalWrite);
 });

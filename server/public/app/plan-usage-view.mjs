@@ -35,6 +35,7 @@ const TAB_LABELS = Object.freeze(Object.assign(Object.create(null), {
   'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
+  deepseek: 'DeepSeek',
 }));
 
 // The composer speaks 'github'/'openai'/… while the usage report keys Copilot as
@@ -86,9 +87,9 @@ export function utilizationColor(utilization) {
 export function formatAmount(value, unit) {
   const n = toNullableNumber(value);
   if (n === null) return null;
-  if (unit === 'usd') {
+  if (unit === 'usd' || unit === 'cny') {
     const rounded = Math.round(n * 100) / 100;
-    return `${rounded < 0 ? '-' : ''}$${Math.abs(rounded).toFixed(2)}`;
+    return `${rounded < 0 ? '-' : ''}${unit === 'cny' ? '¥' : '$'}${Math.abs(rounded).toFixed(2)}`;
   }
   if (unit === 'percent') return `${Math.round(n * 10) / 10}%`;
   const abs = Math.abs(n);
@@ -189,15 +190,103 @@ function renderMeter(meter, now) {
   `;
 }
 
+/**
+ * A chart from `buildChart` data: stacked `columns` (one per item, e.g. a
+ * day) or horizontal stacked `bars` (one per item, e.g. a model), drawn with
+ * plain HTML and CSS. Colours come from the theme's series variables (fixed
+ * order, so a series keeps its colour between reads); every item has a text
+ * equivalent as its label, a tooltip on hover, focus or tap, and the chart
+ * has a legend for more than one series and a table view of the same data.
+ */
+function renderChart(chart) {
+  const series = Array.isArray(chart?.series) ? chart.series.filter((entry) => entry && entry.key) : [];
+  const items = Array.isArray(chart?.items) ? chart.items.filter((entry) => entry && entry.key) : [];
+  if (!series.length || !items.length) return '';
+  const unit = chart.unit || 'credits';
+  // Money under a cent keeps four decimals, as the card's estimates do.
+  const amount = (value) => {
+    const n = toNullableNumber(value) ?? 0;
+    if ((unit === 'usd' || unit === 'cny') && n !== 0 && Math.abs(n) < 0.01) {
+      return `${n < 0 ? '-' : ''}${unit === 'cny' ? '¥' : '$'}${Math.abs(n).toFixed(4)}`;
+    }
+    return formatAmount(n, unit) ?? '0';
+  };
+  const valueOf = (item, key) => Math.max(0, toNullableNumber(item.values?.[key]) ?? 0);
+  const totalOf = (item) => series.reduce((sum, entry) => sum + valueOf(item, entry.key), 0);
+  const seriesColor = (index) => `var(--plan-usage-series-${Math.min(index + 1, 5)})`;
+  const partsText = (item) => {
+    const total = totalOf(item);
+    return series
+      .map((entry) => ({ entry, value: valueOf(item, entry.key) }))
+      .filter(({ value }) => value > 0)
+      .map(({ entry, value }) => `${entry.label} ${amount(value)}${series.length > 1 && total > 0 ? ` (${Math.round((value / total) * 100)}%)` : ''}`)
+      .join(', ');
+  };
+  const itemText = (item) => {
+    const total = totalOf(item);
+    if (total <= 0) return `${item.label}: nothing`;
+    const parts = series.length > 1 ? partsText(item) : '';
+    return `${item.label}: ${amount(total)}${parts ? ` (${parts})` : ''}`;
+  };
+  const max = Math.max(0, ...items.map(totalOf));
+  const segments = (item, dimension) => series.map((entry, index) => {
+    const value = valueOf(item, entry.key);
+    if (value <= 0) return '';
+    const base = dimension === 'height' ? max : totalOf(item);
+    const share = base > 0 ? (value / base) * 100 : 0;
+    return `<span class="plan-usage-chart-seg" data-series="${escapeHtml(entry.key)}" style="${dimension}:${share.toFixed(2)}%;background:${seriesColor(index)}" title="${escapeHtml(`${entry.label} ${amount(value)}`)}"></span>`;
+  }).join('');
+
+  const plot = chart.kind === 'bars'
+    ? `<div class="plan-usage-chart-bars">${items.map((item) => `
+        <div class="plan-usage-chart-row" tabindex="0" aria-label="${escapeHtml(itemText(item))}">
+          <span class="plan-usage-chart-row-label">${escapeHtml(item.label)}</span>
+          <span class="plan-usage-chart-bar" aria-hidden="true">${segments(item, 'width')}</span>
+          <span class="plan-usage-chart-row-value">${escapeHtml(amount(totalOf(item)))}</span>
+          <span class="plan-usage-chart-tip" role="tooltip">${escapeHtml(itemText(item))}</span>
+        </div>`).join('')}</div>`
+    : `<div class="plan-usage-chart-columns" style="--plan-usage-columns:${items.length}">${items.map((item) => `
+        <div class="plan-usage-chart-col${totalOf(item) > 0 ? '' : ' plan-usage-chart-col-empty'}" tabindex="0" aria-label="${escapeHtml(itemText(item))}" data-item="${escapeHtml(item.key)}">
+          <span class="plan-usage-chart-stack" aria-hidden="true">${segments(item, 'height')}</span>
+          <span class="plan-usage-chart-tip" role="tooltip">${escapeHtml(itemText(item))}</span>
+        </div>`).join('')}
+        <span class="plan-usage-chart-axis" aria-hidden="true"><span>${escapeHtml(items[0].label)}</span><span>${escapeHtml(items[items.length - 1].label)}</span></span>
+      </div>`;
+
+  const legend = series.length > 1
+    ? `<ul class="plan-usage-chart-legend">${series.map((entry, index) => `<li><span class="plan-usage-chart-swatch" style="background:${seriesColor(index)}" aria-hidden="true"></span>${escapeHtml(entry.label)}</li>`).join('')}</ul>`
+    : '';
+  const table = `
+    <details class="plan-usage-chart-table">
+      <summary>As a table</summary>
+      <table class="plan-usage-detail-table">
+        <thead><tr><th scope="col"></th>${series.map((entry) => `<th scope="col">${escapeHtml(entry.label)}</th>`).join('')}${series.length > 1 ? '<th scope="col">Total</th>' : ''}</tr></thead>
+        <tbody>${items.filter((item) => totalOf(item) > 0).map((item) => `<tr><th scope="row">${escapeHtml(item.label)}</th>${series.map((entry) => `<td class="plan-usage-detail-value">${escapeHtml(amount(valueOf(item, entry.key)))}</td>`).join('')}${series.length > 1 ? `<td class="plan-usage-detail-value">${escapeHtml(amount(totalOf(item)))}</td>` : ''}</tr>`).join('')}</tbody>
+      </table>
+    </details>`;
+  return `
+    <figure class="plan-usage-chart plan-usage-chart-kind-${chart.kind === 'bars' ? 'bars' : 'columns'}" data-chart-id="${escapeHtml(chart.id)}" role="group" aria-label="${escapeHtml(chart.label)}">
+      <figcaption class="plan-usage-chart-head">
+        <span class="plan-usage-chart-label">${escapeHtml(chart.label)}</span>
+        ${chart.summary ? `<span class="plan-usage-chart-summary">${escapeHtml(chart.summary)}</span>` : ''}
+      </figcaption>
+      ${plot}
+      ${legend}
+      ${chart.note ? `<div class="plan-usage-meter-note">${escapeHtml(chart.note)}</div>` : ''}
+      ${table}
+    </figure>
+  `;
+}
+
 function renderDetailSection(section) {
   const rows = section.rows.map((row) => `
     <tr>
       <td class="plan-usage-detail-label">${escapeHtml(row.label)}${row.hint ? `<span class="plan-usage-detail-hint">${escapeHtml(row.hint)}</span>` : ''}</td>
-      <td class="plan-usage-detail-value">${escapeHtml(row.value)}</td>
+      <td class="plan-usage-detail-value">${String(row.value).split(' · ').map((part) => `<span class="plan-usage-detail-part">${escapeHtml(part)}</span>`).join(' · ')}</td>
     </tr>
   `).join('');
   return `
-    <details class="plan-usage-details" data-section-id="${escapeHtml(section.id)}">
+    <details class="plan-usage-details" data-section-id="${escapeHtml(section.id)}"${section.open ? ' open' : ''}>
       <summary>${escapeHtml(section.label)}</summary>
       ${section.note ? `<div class="plan-usage-detail-note">${escapeHtml(section.note)}</div>` : ''}
       <table class="plan-usage-detail-table"><tbody>${rows}</tbody></table>
@@ -205,9 +294,59 @@ function renderDetailSection(section) {
   `;
 }
 
-/** A line of text on the card itself, with an optional link behind it. */
-function renderNote(note) {
+/**
+ * Hours of the day the card note names, shown in the reader's own time zone.
+ * `utcRanges` are `[start, end)` whole hours in UTC; the day is `now`'s, so
+ * daylight-saving time is the reader's current one. "03:00–06:00 and
+ * 08:00–12:00 in your time zone" for `[[1, 4], [6, 10]]` read in Berlin in
+ * summer. `timeZone` is for tests; the browser leaves it to Intl.
+ */
+export function formatLocalHourRanges(utcRanges, { now = new Date(), timeZone = undefined } = {}) {
+  if (!Array.isArray(utcRanges) || !utcRanges.length) return null;
+  let formatter;
+  try {
+    formatter = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone });
+  } catch {
+    return null;
+  }
+  const day = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date();
+  const clock = (hour) => formatter.format(new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour, 0, 0)));
+  const parts = [];
+  for (const range of utcRanges) {
+    if (!Array.isArray(range) || range.length !== 2) return null;
+    const start = Number(range[0]);
+    const end = Number(range[1]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 24 || start >= end) return null;
+    parts.push(`${clock(start)}–${clock(end)}`);
+  }
+  const joined = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+  return `${joined} in your time zone`;
+}
+
+/** The note's text with its UTC hours replaced by the reader's local ones, when it names any. */
+function noteTextForReader(note, { now, timeZone } = {}) {
   const text = String(note?.text ?? '').trim();
+  const utcText = String(note?.hours?.utcText ?? '').trim();
+  if (!text || !utcText || !text.includes(utcText)) return text;
+  const local = formatLocalHourRanges(note.hours.utcRanges, { now, timeZone });
+  return local ? text.split(utcText).join(local) : text;
+}
+
+/**
+ * A note that is a figure (buildCardNote's label and value): one row of the
+ * card's figures, the hint under the label, the whole sentence as its title.
+ */
+function renderFact(note) {
+  const hint = String(note?.hint ?? '').trim();
+  return `<div class="plan-usage-fact" data-note-id="${escapeHtml(note?.id ?? '')}" title="${escapeHtml(String(note?.text ?? '').trim())}">`
+    + `<dt>${escapeHtml(note.label)}${hint ? `<span class="plan-usage-fact-hint">${escapeHtml(hint)}</span>` : ''}</dt>`
+    + `<dd>${escapeHtml(note.value)}</dd></div>`;
+}
+
+const isFactNote = (note) => Boolean(String(note?.label ?? '').trim() && String(note?.value ?? '').trim());
+
+function renderNote(note, { now, timeZone } = {}) {
+  const text = noteTextForReader(note, { now, timeZone });
   if (!text) return '';
   const url = String(note?.link?.url ?? '').trim();
   const label = String(note?.link?.label ?? '').trim();
@@ -215,7 +354,11 @@ function renderNote(note) {
   const link = label && /^https:\/\//i.test(url)
     ? ` <a class="plan-usage-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
     : '';
-  return `<div class="plan-usage-detail-note plan-usage-note" data-note-id="${escapeHtml(note?.id ?? '')}">${escapeHtml(text)}${link}</div>`;
+  // The UTC wording stays on the element for a reader who wants it.
+  const utcTitle = note?.hours?.utcText && text !== String(note.text ?? '').trim()
+    ? ` title="${escapeHtml(String(note.text).trim())}"`
+    : '';
+  return `<div class="plan-usage-detail-note plan-usage-note" data-note-id="${escapeHtml(note?.id ?? '')}"${utcTitle}>${escapeHtml(text)}${link}</div>`;
 }
 
 /**
@@ -240,10 +383,18 @@ function renderAccountLine(account) {
   return `<span class="plan-usage-account">${parts.map(escapeHtml).join(' · ')}</span>`;
 }
 
-function renderCard(card, now, { active = true } = {}) {
+function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
   const meters = Array.isArray(card.meters) ? card.meters : [];
+  const charts = Array.isArray(card.charts) ? card.charts.filter(Boolean) : [];
   const details = Array.isArray(card.details) ? card.details : [];
-  const notes = Array.isArray(card.notes) ? card.notes.filter(Boolean) : [];
+  const allNotes = Array.isArray(card.notes) ? card.notes.filter(Boolean) : [];
+  // Figures go in one list under the bars; sentences stay notes, and on a
+  // card with figures they come last, after the tables, so the numbers read
+  // first.
+  const facts = allNotes.filter(isFactNote);
+  const notes = allNotes.filter((note) => !isFactNote(note));
+  const notesHtml = notes.map((note) => renderNote(note, { now, timeZone })).join('');
+  const detailsHtml = details.map(renderDetailSection).join('');
   const links = Array.isArray(card.links) ? card.links : [];
 
   const statusBadge = STATUS_BADGES[card.status];
@@ -281,8 +432,9 @@ function renderCard(card, now, { active = true } = {}) {
       </header>
       ${card.message ? `<div class="plan-usage-message">${escapeHtml(card.message)}</div>` : ''}
       ${metersHtml}
-      ${notes.map(renderNote).join('')}
-      ${details.map(renderDetailSection).join('')}
+      ${facts.length ? `<dl class="plan-usage-facts">${facts.map(renderFact).join('')}</dl>` : ''}
+      ${charts.map(renderChart).join('')}
+      ${facts.length ? `${detailsHtml}${notesHtml}` : `${notesHtml}${detailsHtml}`}
       <div class="plan-usage-card-foot">
         ${capturedLabel ? `<span class="plan-usage-captured">${capturedLabel}</span>` : ''}
         ${links.map((link) => `<a class="plan-usage-link" href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)}</a>`).join('')}
@@ -306,13 +458,13 @@ function renderTab(card, activeProvider) {
  *   tab when that provider has a card
  * @returns {string} modal body HTML, or '' when there is nothing to render
  */
-export function renderPlanUsageHtml(report, { now = new Date(), activeProvider = '' } = {}) {
+export function renderPlanUsageHtml(report, { now = new Date(), activeProvider = '', timeZone = undefined } = {}) {
   const providers = Array.isArray(report?.providers) ? report.providers.filter(Boolean) : [];
   if (!providers.length) return '';
   const active = resolveActiveUsageProvider(providers, activeProvider);
   const tabs = providers.map((card) => renderTab(card, active)).join('');
   const cards = providers
-    .map((card) => renderCard(card, now, { active: normalizeUsageProvider(card.provider) === active }))
+    .map((card) => renderCard(card, now, { active: normalizeUsageProvider(card.provider) === active, timeZone }))
     .join('');
   return `<div class="plan-usage"><div class="plan-usage-tab-strip" role="tablist" aria-label="Usage providers">${tabs}</div>${cards}</div>`;
 }

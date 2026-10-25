@@ -115,6 +115,11 @@ import { withSteerNote } from '../../shared/steer-note.mjs';
 import { isRelayAutomatedDelivery } from '../../shared/relay-events.mjs';
 import { isTransientRelayError } from '../../shared/worker-runtime/relay-errors.mjs';
 import {
+  isOpenAIImageTerminalError,
+  runDirectOpenAIImageTurn,
+  shouldUseDirectOpenAIImageApi,
+} from '../../shared/worker-runtime/direct-openai-image.mjs';
+import {
   createTurnLiveness,
   createTurnStalledError,
   probeRuntime,
@@ -556,6 +561,12 @@ export function createCopilotSdkSessionRunner({
   // terminal error until the publish lands, so recovery can never re-run them
   // (see publishSettleMarker).
   const settlingMessages = new Map();
+  // Image-model rows running on the relay's image routes (id → message). They
+  // never reach the runtime, so no turn owns them; the heartbeat and the crash
+  // guard still have to.
+  const directImageMessages = new Map();
+  // `openai` on a BYOK worker; the failure notes name the provider.
+  const workerProvider = String(env.COPILOT_PROVIDER_TYPE || '').trim().toLowerCase();
   // Settle markers that could not be posted even terminally; the heartbeat
   // hands them to the relay to fail (id → terminalError).
   const settleFailedTerminals = new Map();
@@ -3728,7 +3739,7 @@ export function createCopilotSdkSessionRunner({
     // afterwards: a runtime that died or went silent under a Stop used to put
     // the watchdog's failure on every row instead.
     if (failure && !turn.aborted) {
-      const classified = classifyCopilotTurnException(failure);
+      const classified = classifyCopilotTurnException(failure, { provider: workerProvider });
       dbg('copilot turn failed', turn.message?.id || '(continuation)', classified.detail);
       const running = turn.currentOwner || turn.primaryEntry;
       for (const entry of pending) {
@@ -3747,7 +3758,7 @@ export function createCopilotSdkSessionRunner({
       return;
     }
     if (result?.isError) {
-      const classified = classifyCopilotSessionError(result.errorData || { message: result.errorMessage });
+      const classified = classifyCopilotSessionError(result.errorData || { message: result.errorMessage }, { provider: workerProvider });
       dbg('turn failed', turn.message?.id || '(continuation)', classified.stableCode);
       const running = turn.currentOwner || turn.primaryEntry;
       for (const entry of pending) {
@@ -4117,6 +4128,7 @@ export function createCopilotSdkSessionRunner({
           dbg('continuation output dropped (no relay row)');
           const classified = classifyCopilotTurnException(
             turn.failure || new Error('the relay refused a continuation row for this turn'),
+            { provider: workerProvider },
           );
           for (const entry of turn.entries) {
             if (entry.settled || entry.turn !== turn) continue;
@@ -4821,6 +4833,9 @@ export function createCopilotSdkSessionRunner({
   async function handlePendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
+    // An image model is no chat model: its row goes to the relay's image
+    // routes, whatever the runtime is doing, and never into the runtime.
+    if (shouldUseDirectOpenAIImageApi(message)) return runDirectImageTurn(message);
     // Held (a card is open, a compaction is running, a tool of the main agent
     // is running, the turn-opening prompt is not sent yet): hand the row back
     // with no retry penalty; the relay re-delivers it when the hold ends. An
@@ -4850,7 +4865,7 @@ export function createCopilotSdkSessionRunner({
         if (outcome !== NOT_STEERED) return outcome;
       } catch (error) {
         dbg('steering failed', message.id, error?.message || String(error));
-        const classified = classifyCopilotTurnException(error);
+        const classified = classifyCopilotTurnException(error, { provider: workerProvider });
         await publishResponse(message, {
           text: classified.text,
           model: null,
@@ -4863,6 +4878,54 @@ export function createCopilotSdkSessionRunner({
     return runTurn(turn);
   }
 
+  /**
+   * One image-model row (shared/worker-runtime/direct-openai-image.mjs). With
+   * an image operation the relay's execute route publishes the reply, the
+   * failure or the requeue itself; without one the shared helper publishes
+   * the reply, and a refusal by the provider is published here as the row's
+   * failure. Anything else requeues the row, as on the extension engine.
+   */
+  async function runDirectImageTurn(message) {
+    const id = String(message.id || '');
+    directImageMessages.set(id, message);
+    touch();
+    try {
+      const result = await runDirectOpenAIImageTurn({
+        api,
+        message,
+        // An edit can take minutes, longer than fetch waits for headers.
+        requestOptions: { longCall: true },
+        responseFields: attemptFields(message),
+      });
+      dbg('image turn', message.id, result.via, result.outcome);
+    } catch (error) {
+      if (isOpenAIImageTerminalError(error)) {
+        dbg('image turn refused by OpenAI', message.id, error.message);
+        await publishResponse(message, {
+          text: error.message,
+          model: null,
+          terminalError: {
+            kind: 'openai-image-failed',
+            // The code the relay's image operation uses for the same refusal.
+            code: 'image-provider-rejected',
+            stableCode: 'image-provider-rejected',
+            message: error.message,
+            ...(error.detail ? { detail: String(error.detail) } : {}),
+            failedAt: new Date().toISOString(),
+            queueMessageId: id || null,
+          },
+        });
+      } else {
+        dbg('image turn failed; requeueing', message.id, error?.message || String(error));
+        await api('POST', '/api/requeue', { messageId: message.id, ...attemptFields(message) }).catch(() => {});
+      }
+    } finally {
+      directImageMessages.delete(id);
+      touch();
+    }
+    return true;
+  }
+
   // --------------------------------------------------------------- teardown --
 
   function getActiveQueueMessageId() {
@@ -4872,6 +4935,7 @@ export function createCopilotSdkSessionRunner({
       const id = String(entry.message?.id || '');
       if (id && !entry.released) return id;
     }
+    for (const id of directImageMessages.keys()) return id;
     return '';
   }
 
@@ -4911,6 +4975,7 @@ export function createCopilotSdkSessionRunner({
     for (const { message, variant } of settlingMessages.values()) {
       push(message, buildSteerSettleFailure(message, { variant, agentLabel: SETTLE_AGENT_LABEL }));
     }
+    for (const message of directImageMessages.values()) push(message);
     return entries;
   }
 
@@ -4949,8 +5014,9 @@ export function createCopilotSdkSessionRunner({
     // registry and refuses ids it does not know.
     stopBackgroundTask,
     // "Active" spans both ownerships: a settled turn still publishing must
-    // keep the worker's idle/shutdown gates closed just like a running one.
-    isTurnActive: () => !!activeTurn || publishingTurns.size > 0,
+    // keep the worker's idle/shutdown gates closed just like a running one,
+    // and so must an image row on the relay's image routes.
+    isTurnActive: () => !!activeTurn || publishingTurns.size > 0 || directImageMessages.size > 0,
     dispose,
     // The turn's tokens/cost/TTFT, as posted to `/api/copilot-plan-usage`.
     getLastTurnUsage: () => lastTurnUsage,

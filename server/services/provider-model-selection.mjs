@@ -99,6 +99,7 @@ const PROVIDER_LABELS = Object.freeze({
   cursor: 'Cursor',
   grok: 'Grok',
   'claude-cloud': 'Claude Cloud',
+  deepseek: 'DeepSeek',
 });
 const CLAUDE_PROVIDERS = new Set(['claude', 'claude-cloud']);
 const LONG_CONTEXT_SUFFIX = /\[1m\]$/i;

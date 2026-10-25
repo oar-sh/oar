@@ -6,6 +6,9 @@ import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructi
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
 import { createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
+import { CLAUDE_LIVE_FLAG_SETTINGS_CODE, CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE } from './claude-turn-failure.mjs';
+
+export { CLAUDE_LIVE_FLAG_SETTINGS_CODE };
 
 // The name the in-process MCP server is registered under; it prefixes every
 // tool it carries on the wire (`mcp__relay__preview`, `mcp__relay__remote_relay`).
@@ -229,14 +232,25 @@ export function createRelayMcpServer({ api, getConversationId, dbg, remoteRelayT
  * emitted, which also closes the control transport (canUseTool, context
  * usage), so the session process keeps this open while background tasks or
  * queued continuations still need the process alive.
+ *
+ * `held`: nothing is sent until `release()` (the messages pushed meanwhile
+ * wait in order). `fail(error)` instead makes the stream throw it, which the
+ * SDK answers by aborting the query; nothing held is ever sent, and neither
+ * is it when the stream ends while still held.
  */
-function createPushableUserMessageStream() {
+function createPushableUserMessageStream({ held = false } = {}) {
   const queued = [];
   let wake = null;
   let ended = false;
+  let holding = held;
+  let failure = null;
   async function* stream() {
     for (;;) {
-      while (queued.length) yield queued.shift();
+      if (failure) throw failure;
+      if (!holding) {
+        while (queued.length && !failure) yield queued.shift();
+        if (failure) continue;
+      }
       if (ended) return;
       await new Promise((resolve) => { wake = resolve; });
       wake = null;
@@ -257,7 +271,78 @@ function createPushableUserMessageStream() {
       ended = true;
       wake?.();
     },
+    release() {
+      holding = false;
+      wake?.();
+    },
+    fail(error) {
+      failure = error;
+      wake?.();
+    },
   };
+}
+
+/** Every string in a settings object, for taking them out of a text. */
+function settingsStrings(value, found = []) {
+  if (typeof value === 'string') {
+    if (value) found.push(value);
+  } else if (value && typeof value === 'object') {
+    for (const item of Object.values(value)) settingsStrings(item, found);
+  }
+  return found;
+}
+
+/**
+ * The blanked keys of a backend's live flag settings (top-level and `env`
+ * values that are ''), for the spawn's `settings` too: an empty value holds
+ * no secret, and the CLI acts on some settings at startup, before the live
+ * ones land (it runs a folder's apiKeyHelper then; CLI 2.1.304,
+ * scripts/deepseek-cli-proof.mjs). Null when there is none.
+ */
+function liveSettingsBlanks(live) {
+  if (!live) return null;
+  const blanks = {};
+  for (const [key, value] of Object.entries(live)) {
+    if (value === '') blanks[key] = '';
+  }
+  const env = Object.entries(live.env && typeof live.env === 'object' ? live.env : {}).filter(([, value]) => value === '');
+  if (env.length) blanks.env = Object.fromEntries(env);
+  return Object.keys(blanks).length ? blanks : null;
+}
+
+/** The spawn's `settings` with the live settings' blanks on top. */
+function withLiveSettingsBlanks(spawnSettings, live) {
+  const blanks = liveSettingsBlanks(live);
+  if (!blanks) return spawnSettings;
+  const settings = { ...(spawnSettings || {}), ...blanks };
+  if (spawnSettings?.env || blanks.env) settings.env = { ...(spawnSettings?.env || {}), ...(blanks.env || {}) };
+  return settings;
+}
+
+/**
+ * How long the CLI may take to answer a backend's live flag settings (ms).
+ * It answers in well under a second (CLI 2.1.304); one that never does fails
+ * the turn like a refusal, and the held message is never sent.
+ */
+export const LIVE_FLAG_SETTINGS_TIMEOUT_MS = 60_000;
+
+/**
+ * The Error a spawn fails with when the CLI refused its live flag settings.
+ * The message names no value; `detail` is the CLI's own words with every
+ * value of the settings taken out.
+ */
+function liveFlagSettingsError(cause, settings, label = '') {
+  const error = new Error(
+    `Claude Code did not take the ${label ? `${label} ` : ''}connection settings before the first message, so nothing was sent.`,
+  );
+  error.code = CLAUDE_LIVE_FLAG_SETTINGS_CODE;
+  error.guidance = CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE;
+  let detail = String(cause?.message || cause || '');
+  for (const value of settingsStrings(settings).sort((a, b) => b.length - a.length)) {
+    detail = detail.split(value).join('[redacted]');
+  }
+  error.detail = detail.slice(0, 200);
+  return error;
 }
 
 /**
@@ -293,13 +378,19 @@ export function startClaudeSession({
   // Whether this process carries `remote_relay` (the worker's registration
   // decision). Fixed for the process: the tool list is part of the spawn.
   remoteRelayTool = false,
+  // Another endpoint for the CLI (null = Anthropic through the host's Claude
+  // login): it builds the CLI's environment and maps model and effort into
+  // its terms (../deepseek-worker/deepseek-claude-backend.mjs).
+  backend = null,
+  liveFlagSettingsTimeoutMs = LIVE_FLAG_SETTINGS_TIMEOUT_MS,
   queryImpl = query,
   dbg = () => {},
 } = {}) {
   const normalizedModel = String(model || '').trim().toLowerCase();
-  const effort = normalizeClaudeEffort(reasoningEffort);
+  const effort = backend ? '' : normalizeClaudeEffort(reasoningEffort);
   const ultracode = effort === CLAUDE_ULTRACODE_EFFORT;
-  const effortOption = ultracode ? 'xhigh' : effort;
+  const effortOption = backend ? backend.effortOption(reasoningEffort) : (ultracode ? 'xhigh' : effort);
+  const cliModel = backend ? backend.cliModel(model) : String(model || '').trim();
   // Spawn-time twin of the flag-settings helpers: the settings layer is the
   // only way to hand a fresh CLI the session-scoped ultracode flag, the
   // auto-compact window and the thinking pin, and all three share one
@@ -310,17 +401,40 @@ export function startClaudeSession({
   const relayMcpServer = typeof api === 'function'
     ? createRelayMcpServer({ api, getConversationId, dbg, remoteRelayTool: remoteRelayTool === true })
     : null;
-  const env = claudeSpawnEnv({ backgroundCommandLimitMs });
+  // A backend's CLI always gets an environment of its own: the worker's
+  // carries the backend's secret and maybe the host's Anthropic settings.
+  // The model goes in as well: the backend pins Claude Code's model aliases to
+  // it, so a sub-agent asked for as "opus" runs on the session's model. The
+  // Bash limits go on top: the backend drops a host session's Bash cap, not
+  // the relay's own.
+  const backendEnv = backend ? backend.spawnEnv(process.env, { effort: reasoningEffort, model }) : null;
+  const limitEnv = claudeSpawnEnv({ backgroundCommandLimitMs, baseEnv: backendEnv || process.env });
+  const env = limitEnv || backendEnv;
+  // A backend's pins that may not go on the command line (a key): `settings`
+  // below is the CLI's `--settings` argument, which other users of the host
+  // can read. These go into the same flag layer over the control channel
+  // (stdin), and no user message is sent before the CLI has taken them: the
+  // first API request of the process comes after (measured on CLI 2.1.304,
+  // the CLI proofs in scripts/). The layer outranks the user's, the
+  // project's and the local settings and holds through their reloads and
+  // through later applyFlagSettings calls of other keys. A refusal ends the
+  // process before anything is sent (CLAUDE_LIVE_FLAG_SETTINGS_CODE), and so
+  // does no answer within liveFlagSettingsTimeoutMs. Their blanks go on the
+  // command line as well, for what the CLI does at startup. They are built
+  // from the CLI's environment: a pin holds the value the CLI starts with.
+  const liveSettings = typeof backend?.liveFlagSettings === 'function' ? backend.liveFlagSettings(env || process.env) : null;
+  const live = liveSettings && typeof liveSettings === 'object' && Object.keys(liveSettings).length ? liveSettings : null;
+  const settings = withLiveSettingsBlanks(spawnSettings, live);
   const options = {
     cwd,
     permissionMode: permissionModeForRelayMode(relayMode),
-    systemPrompt: systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs: env ? backgroundCommandLimitMs : null }),
+    systemPrompt: systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs: limitEnv ? backgroundCommandLimitMs : null }),
     includePartialMessages: true,
     forwardSubagentText: true,
     ...(effortOption ? { effort: effortOption } : {}),
-    ...(spawnSettings ? { settings: spawnSettings } : {}),
+    ...(settings ? { settings } : {}),
     ...(env ? { env } : {}),
-    ...(normalizedModel && normalizedModel !== 'auto' ? { model: String(model).trim() } : {}),
+    ...(normalizedModel && normalizedModel !== 'auto' && cliModel ? { model: cliModel } : {}),
     ...(String(resume || '').trim() ? { resume: String(resume).trim() } : {}),
     ...(abortController ? { abortController } : {}),
     ...(typeof canUseTool === 'function' ? { canUseTool } : {}),
@@ -329,8 +443,52 @@ export function startClaudeSession({
       ? { pathToClaudeCodeExecutable: String(pathToClaudeCodeExecutable).trim() }
       : {}),
   };
-  const { stream, push, end } = createPushableUserMessageStream();
+  const { stream, push, end, release, fail } = createPushableUserMessageStream({ held: Boolean(live) });
   const turn = queryImpl({ prompt: stream, options });
+  if (live) {
+    // The wait ends with the answer, the timeout or the session's abort,
+    // whichever comes first; each one clears the others.
+    const signal = abortController?.signal || null;
+    let timer = null;
+    let onAbort = null;
+    const settled = () => {
+      clearTimeout(timer);
+      timer = null;
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      onAbort = null;
+    };
+    const unanswered = new Promise((resolve, reject) => {
+      const waitMs = Math.max(0, Number(liveFlagSettingsTimeoutMs) || 0);
+      timer = setTimeout(() => {
+        timer = null;
+        reject(new Error(`no answer within ${Math.ceil(waitMs / 1000)} s`));
+      }, waitMs);
+      timer.unref?.();
+      if (signal) {
+        onAbort = settled;
+        if (signal.aborted) settled();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+    turn.liveFlagSettingsApplied = Promise.race([
+      Promise.resolve().then(() => {
+        if (typeof turn.applyFlagSettings !== 'function') throw new Error('applyFlagSettings is not available');
+        return turn.applyFlagSettings(live);
+      }),
+      unanswered,
+    ])
+      .finally(settled)
+      .then(() => {
+        release();
+        return true;
+      }, (error) => {
+        const refused = liveFlagSettingsError(error, live, backend?.label || '');
+        turn.liveFlagSettingsError = refused;
+        dbg('live flag settings refused', refused.detail);
+        fail(refused);
+        return false;
+      });
+  }
   applyThinkingDisplay(turn, thinkingDisplay, { dbg });
   turn.pushUserMessage = push;
   // The session process MUST call this on every teardown path or the CLI

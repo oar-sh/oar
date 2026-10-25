@@ -9,6 +9,14 @@ import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout
 import { waitForRelayQuestion } from "../../../../shared/question-wait.mjs";
 import { EMPTY_TURN_COMPLETION_NOTE } from "../../../../shared/empty-turn-completion.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
+import {
+  isOpenAIImageTerminalError,
+  runDirectOpenAIImageTurn,
+  shouldUseDirectOpenAIImageApi,
+} from "../../../../shared/worker-runtime/direct-openai-image.mjs";
+
+// Re-exported for the extension's tests, which import it from here.
+export { shouldUseDirectOpenAIImageApi };
 
 function isImageAttachment(att) {
   const type = String(att?.type || "").toLowerCase();
@@ -255,28 +263,6 @@ export function resolveEmptyFinalTextHandling({ lastStreamedSent = "", lastActiv
     action: "requeue",
     reason: "empty-final-text:no-stream-or-text",
   };
-}
-
-export function shouldUseDirectOpenAIImageApi(message = {}) {
-  const providerType = String(message?.providerType || "").trim().toLowerCase();
-  if (providerType !== "openai") return false;
-  const model = String(message?.providerModel || message?.model || "").trim().toLowerCase();
-  return model.startsWith("gpt-image-") || model.startsWith("dall-e-");
-}
-
-function isDirectOpenAIImageTerminalStatus(status) {
-  const numeric = Number(status);
-  if (!Number.isFinite(numeric)) return false;
-  return (
-    numeric === 400
-    || numeric === 401
-    || numeric === 403
-    || numeric === 404
-    || numeric === 409
-    || numeric === 422
-    || numeric === 429
-    || numeric === 503
-  );
 }
 
 export async function publishRelayStreamEvent({
@@ -681,71 +667,12 @@ export function createPollingLoop({
     let sendAndWaitStartedAtMs = 0;
     const processDirectOpenAIImageRequest = async () => {
       if (!shouldUseDirectOpenAIImageApi(message)) return false;
-      if (message?.imageOperationId) {
-        const result = await api(
-          "POST",
-          `/api/image-operations/${encodeURIComponent(message.imageOperationId)}/execute`,
-          { messageId: message.id },
-        ).catch((error) => {
-          if (error?.status === 409 || error?.status === 503) {
-            return error?.payload || { outcome: error?.status === 503 ? "retryable" : "terminal" };
-          }
-          throw error;
-        });
-        const outcome = String(result?.outcome || "").trim().toLowerCase();
-        if (!["completed", "executing", "terminal", "uncertain", "retryable"].includes(outcome)) {
-          throw new Error("Image operation returned an invalid outcome");
-        }
-        await session.log(`Image operation ${outcome}`, {
-          ephemeral: true,
-        });
-        return true;
+      const result = await runDirectOpenAIImageTurn({ api, message });
+      if (result.via === "operation") {
+        await session.log(`Image operation ${result.outcome}`, { ephemeral: true });
+      } else {
+        await session.log(`✅ Sent generated image response (${result.imageCount} image${result.imageCount === 1 ? "" : "s"})`, { ephemeral: true });
       }
-      const directModel = String(message?.providerModel || requestedManualModelOrNull(message) || message?.model || "").trim();
-      const prompt = String(message?.text || "").trim();
-      if (!directModel) throw new Error("OpenAI image request is missing model");
-      if (!prompt) throw new Error("OpenAI image request is missing prompt");
-      await api("POST", "/api/activity", {
-        messageId: message.id,
-        conversationId: message.conversationId,
-        mode: message.relayMode || "agent",
-        text: `Calling OpenAI image API directly (${directModel})`,
-      }).catch(() => {});
-      let directResult;
-      try {
-        directResult = await api("POST", "/api/openai/images/generate", {
-          messageId: message.id,
-          conversationId: message.conversationId,
-          model: directModel,
-          prompt,
-          n: message?.n,
-          size: message?.size || message?.contextTier,
-          quality: message?.quality || message?.reasoningEffort,
-          attachments: Array.isArray(message?.attachments) ? message.attachments : [],
-        });
-      } catch (error) {
-        if (isDirectOpenAIImageTerminalStatus(error?.status)) {
-          const terminalError = new Error(
-            `OpenAI image request failed: ${error?.detail || `HTTP ${error?.status || "error"}`}`,
-          );
-          terminalError.code = "RELAY_OPENAI_IMAGE_TERMINAL";
-          throw terminalError;
-        }
-        throw error;
-      }
-      const generatedImages = Array.isArray(directResult?.generatedImages) ? directResult.generatedImages : [];
-      if (!generatedImages.length) {
-        throw new Error("OpenAI image API returned no images");
-      }
-      await api("POST", "/api/response", {
-        messageId: message.id,
-        conversationId: message.conversationId,
-        text: "",
-        generatedImages,
-        model: String(directResult?.model || directModel).trim() || directModel,
-        modelOrigin: isAutoRequestedModel(message?.model) ? "auto" : "manual",
-      });
-      await session.log(`✅ Sent generated image response (${generatedImages.length} image${generatedImages.length === 1 ? "" : "s"})`, { ephemeral: true });
       return true;
     };
 
@@ -988,7 +915,7 @@ export function createPollingLoop({
         }).catch(async () => {
           await api("POST", "/api/requeue", { messageId: message.id }).catch(() => {});
         });
-      } else if (String(e?.code || "").trim() === "RELAY_OPENAI_IMAGE_TERMINAL") {
+      } else if (isOpenAIImageTerminalError(e)) {
         await pushRelayStream(lastStreamedSent, true);
         await api("POST", "/api/response", {
           messageId: message.id,

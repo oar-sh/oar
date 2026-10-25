@@ -14,6 +14,8 @@ import {
   prepareOarMcpConfigFile,
   resolveOarMcpServerScriptPath,
   resolveOpenAIWireApi,
+  WORKER_SECRET_ENV_VARS,
+  workerSecretEnvVarsFor,
 } from './session-worker-launch-service.mjs';
 import { OAR_MCP_SERVER_SCRIPT_PATH, OAR_MCP_TOOL_TIMEOUT_MS } from '../mcp/oar-mcp-server.mjs';
 
@@ -316,6 +318,129 @@ test('buildTmuxWorkerShellCommand quotes extra CLI args through both shells', ()
 test('buildTmuxWorkerShellCommand forwards the OAR MCP kill switch to workers', () => {
   const command = buildTmuxWorkerShellCommand('abc-123', { OAR_MCP_SERVER: '0', COPILOT_WEB_RELAY_WORKER_KIND: 'grok' });
   assert.match(command, /export OAR_MCP_SERVER='0';/);
+});
+
+test('buildTmuxWorkerShellCommand unsets the host Claude session and unexported relay variables first', () => {
+  // A new tmux session inherits the tmux server's global environment, so the
+  // worker command itself has to drop what the host session and earlier
+  // launches may have left there.
+  const command = buildTmuxWorkerShellCommand('abc-123', {
+    SESSION_ID: 'abc-123',
+    COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
+    CLAUDE_RELAY_MODEL: 'claude-sonnet-5-5',
+    COPILOT_PROVIDER_API_KEY: 'sk-secret',
+  }, { secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env' });
+  const unsetStatement = command.match(/^unset ([^;]+);/);
+  assert.ok(unsetStatement, 'command starts with an unset statement');
+  const unsetNames = unsetStatement[1].split(' ');
+  for (const name of [
+    'CLAUDECODE',
+    'CLAUDE_CODE_SESSION_ID',
+    'CLAUDE_CODE_MESSAGING_SOCKET',
+    'CLAUDE_CODE_MESSAGING_TOKEN',
+    'CLAUDE_CODE_CHILD_SESSION',
+    'CLAUDE_CODE_ENTRYPOINT',
+    'CLAUDE_PID',
+    'CLAUDE_EFFORT',
+    'DEEPSEEK_RELAY_MODEL',
+    'COPILOT_RELAY_MODEL',
+    'CURSOR_RELAY_MODEL',
+    'GROK_RELAY_MODEL',
+    'OAR_MCP_SERVER',
+  ]) {
+    assert.ok(unsetNames.includes(name), `${name} is unset`);
+  }
+  for (const name of ['SESSION_ID', 'COPILOT_WEB_RELAY_WORKER_KIND', 'CLAUDE_RELAY_MODEL']) {
+    assert.ok(!unsetNames.includes(name), `${name} is exported, not unset`);
+  }
+  assert.ok(command.indexOf('unset ') < command.indexOf('export '), 'unset precedes the exports');
+  assert.match(command, /export CLAUDE_RELAY_MODEL='claude-sonnet-5-5';/);
+  assert.doesNotMatch(command, /sk-secret|COPILOT_PROVIDER_API_KEY/);
+});
+
+test('buildTmuxWorkerShellCommand unsets the inherited worker log file and the secrets of other worker kinds, by name only', () => {
+  // The tmux server's environment may carry a worker log from the session the
+  // relay was started in, and the secrets a shell exported for every kind.
+  const unsetNamesOf = (env) => buildTmuxWorkerShellCommand('abc-123', env, { secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env' })
+    .match(/^unset ([^;]+);/)[1].split(' ');
+  const deepseek = unsetNamesOf({
+    SESSION_ID: 'abc-123',
+    COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek',
+    COPILOT_WEB_RELAY_WORKER_LOG_FILE: '/var/log/oar/worker-host.log',
+    DEEPSEEK_API_KEY: 'sk-test-0000000000000000',
+    CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token',
+  });
+  assert.ok(deepseek.includes('COPILOT_WEB_RELAY_WORKER_LOG_FILE'));
+  assert.ok(deepseek.includes('CLAUDE_CODE_OAUTH_TOKEN'), 'the Claude workers\' login is unset for DeepSeek');
+  // The worker's own secret the launch carries (workerSecretEnvVarsFor) is
+  // left to the secret file, and never exported; its own secrets the launch
+  // has no value for are unset like the other kinds'.
+  assert.ok(workerSecretEnvVarsFor({ COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek' }).includes('DEEPSEEK_API_KEY'));
+  assert.ok(!deepseek.includes('DEEPSEEK_API_KEY'));
+  assert.ok(deepseek.includes('COPILOT_PROVIDER_API_KEY') && deepseek.includes('CURSOR_API_KEY'));
+  const command = buildTmuxWorkerShellCommand('abc-123', {
+    SESSION_ID: 'abc-123',
+    COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek',
+    COPILOT_WEB_RELAY_WORKER_LOG_FILE: '/var/log/oar/worker-host.log',
+    DEEPSEEK_API_KEY: 'sk-test-0000000000000000',
+    CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token',
+  }, { secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env' });
+  assert.doesNotMatch(command, /sk-test-0000000000000000|oauth-test-token|worker-host\.log/, 'no value of any of them');
+  // The Claude worker keeps its login token and loses DeepSeek's key.
+  const claude = unsetNamesOf({ SESSION_ID: 'abc-123', COPILOT_WEB_RELAY_WORKER_KIND: 'claude', CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token' });
+  assert.ok(claude.includes('DEEPSEEK_API_KEY'));
+  assert.ok(!claude.includes('CLAUDE_CODE_OAUTH_TOKEN'));
+  // Every kind gets the log file unset, with or without a value for it; a
+  // kind with no secret of its own among the kind-bound ones loses them all.
+  const grok = unsetNamesOf({ SESSION_ID: 'abc-123', COPILOT_WEB_RELAY_WORKER_KIND: 'grok' });
+  assert.ok(grok.includes('COPILOT_WEB_RELAY_WORKER_LOG_FILE'));
+  assert.ok(grok.includes('DEEPSEEK_API_KEY') && grok.includes('CLAUDE_CODE_OAUTH_TOKEN'));
+});
+
+test('buildTmuxWorkerShellCommand unsets every secret the launch carries no value for, its own kind\'s included', () => {
+  // A tmux server started from a shell that exported the Copilot or Cursor
+  // key hands it to every worker; a launch without a value for it unsets the
+  // name, whatever the kind. With a value the name stays set for the secret
+  // file to fill, and the value itself is never in the command.
+  const secretFile = { secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env' };
+  const commandFor = (env) => buildTmuxWorkerShellCommand('abc-123', { SESSION_ID: 'abc-123', ...env }, secretFile);
+  const unsetNamesOf = (env) => commandFor(env).match(/^unset ([^;]+);/)[1].split(' ');
+  for (const kind of ['claude', 'cursor', 'copilot']) {
+    const names = unsetNamesOf({ COPILOT_WEB_RELAY_WORKER_KIND: kind });
+    assert.ok(names.includes('COPILOT_PROVIDER_API_KEY'), `${kind}: the Copilot key is unset without a value`);
+    assert.ok(names.includes('CURSOR_API_KEY'), `${kind}: the Cursor key is unset without a value`);
+    for (const name of WORKER_SECRET_ENV_VARS) assert.ok(names.includes(name), `${kind}: ${name} is unset without a value`);
+  }
+  const cursor = unsetNamesOf({ COPILOT_WEB_RELAY_WORKER_KIND: 'cursor', CURSOR_API_KEY: 'cursor-test-key' });
+  assert.ok(!cursor.includes('CURSOR_API_KEY'), 'the Cursor worker keeps its own key');
+  assert.ok(cursor.includes('COPILOT_PROVIDER_API_KEY'));
+  const copilot = unsetNamesOf({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot', COPILOT_PROVIDER_API_KEY: 'sk-secret' });
+  assert.ok(!copilot.includes('COPILOT_PROVIDER_API_KEY'), 'the Copilot worker keeps its own key');
+  assert.ok(copilot.includes('CURSOR_API_KEY'));
+  const claude = unsetNamesOf({ COPILOT_WEB_RELAY_WORKER_KIND: 'claude', CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token', COPILOT_PROVIDER_API_KEY: 'sk-secret' });
+  assert.ok(!claude.includes('CLAUDE_CODE_OAUTH_TOKEN') && !claude.includes('COPILOT_PROVIDER_API_KEY'));
+  assert.ok(claude.includes('CURSOR_API_KEY') && claude.includes('DEEPSEEK_API_KEY'));
+  // A blank value is no value.
+  assert.ok(unsetNamesOf({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot', COPILOT_PROVIDER_API_KEY: '  ' }).includes('COPILOT_PROVIDER_API_KEY'));
+  // Names only: no value of any secret reaches the command, and the unset
+  // comes before the secret file is read.
+  for (const env of [
+    { COPILOT_WEB_RELAY_WORKER_KIND: 'cursor', CURSOR_API_KEY: 'cursor-test-key' },
+    { COPILOT_WEB_RELAY_WORKER_KIND: 'copilot', COPILOT_PROVIDER_API_KEY: 'sk-secret' },
+    { COPILOT_WEB_RELAY_WORKER_KIND: 'claude', CLAUDE_CODE_OAUTH_TOKEN: 'oauth-test-token' },
+  ]) {
+    const command = commandFor(env);
+    assert.doesNotMatch(command, /cursor-test-key|sk-secret|oauth-test-token/);
+    assert.ok(command.indexOf('unset ') < command.indexOf(secretFile.secretEnvFilePath));
+  }
+});
+
+test('buildTmuxWorkerShellCommand unsets a relay variable the launch has no value for', () => {
+  const command = buildTmuxWorkerShellCommand('abc-123', { SESSION_ID: 'abc-123', COPILOT_WEB_RELAY_WORKER_KIND: 'grok' });
+  const unsetNames = command.match(/^unset ([^;]+);/)[1].split(' ');
+  assert.ok(unsetNames.includes('CLAUDE_RELAY_MODEL'));
+  assert.ok(unsetNames.includes('COPILOT_MODEL'));
+  assert.ok(!unsetNames.includes('COPILOT_WEB_RELAY_WORKER_KIND'));
 });
 
 test('launchSessionCli falls back to detached spawn when tmux is unavailable', async () => {

@@ -49,6 +49,14 @@ export const CLAUDE_ACCOUNT_GUIDANCE =
   + 'another one. Then send the message again.';
 export const CLAUDE_MODEL_GUIDANCE = 'Choose another model for this conversation, then send the message again.';
 
+// A spawn stopped because Claude Code did not take a backend's connection
+// settings over its control channel (claude-sdk-adapter.mjs,
+// `liveFlagSettings`): nothing was sent.
+export const CLAUDE_LIVE_FLAG_SETTINGS_CODE = 'claude-live-flag-settings';
+export const CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE =
+  'Send the message again. If it fails again, the Claude Code the relay runs does not take these settings: '
+  + 'update the relay, and check its log for the reason.';
+
 function codeFromText(text) {
   if (ACCOUNT_ACCESS_TEXT.test(text)) return 'account-access';
   if (BILLING_TEXT.test(text)) return 'billing_error';

@@ -250,3 +250,12 @@ test('a missing projects root resolves to null instead of throwing', () => {
   const { resolveClaudeSessionRoot } = makeResolver(path.join(os.tmpdir(), 'claude-config-does-not-exist'));
   assert.equal(resolveClaudeSessionRoot({ claudeNativeSessionId: NATIVE_ID, workspaceRootPath: '/x' }), null);
 });
+
+test('the DeepSeek resolver\'s roots are its config dir alone, never a home ~/.claude', () => {
+  // How server-runtime.mjs builds it: the DeepSeek workers' config dir and no
+  // home, so neither HOME nor USERPROFILE can add the host's own folder.
+  assert.deepEqual(
+    resolveClaudeProjectsRoots({ env: { CLAUDE_CONFIG_DIR: '/srv/oar/data/deepseek-claude' }, homedir: () => '', path: path.posix }),
+    ['/srv/oar/data/deepseek-claude/projects'],
+  );
+});

@@ -28,6 +28,7 @@ test('each settings provider counts as ready when its payload says enabled', () 
     ['claudeCloud', 'claude-cloud'],
     ['cursor', 'cursor'],
     ['grok', 'grok'],
+    ['deepseek', 'deepseek'],
   ];
   for (const [key, providerId] of cases) {
     const readiness = resolveProviderReadiness({ ...nothingReady, [key]: { enabled: true } });

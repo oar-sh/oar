@@ -17,7 +17,7 @@ On Windows, run `irm oar.sh/install.ps1 | iex` in PowerShell. Other ways to inst
 
 ## What OAR does
 
-Coding agents such as GitHub Copilot, Claude Code, Cursor and Grok usually live in a terminal. OAR puts them into a chat you can open anywhere: start a task at your desk, follow it from the sofa, answer the agent's question from your phone. The agents keep running on your own computer, with your files and your logins; OAR passes the conversation back and forth.
+Coding agents such as GitHub Copilot, Claude Code, Cursor, Grok and DeepSeek usually live in a terminal. OAR puts them into a chat you can open anywhere: start a task at your desk, follow it from the sofa, answer the agent's question from your phone. The agents keep running on your own computer, with your files and your logins; OAR passes the conversation back and forth.
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
   end
   subgraph host["Your computer"]
     relay["OAR relay<br/>chats, queue, history, files"]
-    agents["Copilot · OpenAI · Claude<br/>Cursor · Grok"]
+    agents["Copilot · OpenAI · Claude<br/>Cursor · Grok · DeepSeek"]
   end
   cloud["☁️ Claude Cloud<br/>sandbox at Anthropic"]
   phone <--> relay
@@ -45,29 +45,29 @@ flowchart LR
 <table>
 <tr>
 <td width="42%" rowspan="4" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-mobile.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.16" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-mobile.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.17" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></picture></a>
 <br><sub>On a phone: the same conversations, installable as an app.</sub>
 </td>
 <td width="58%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-agents.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.16" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-agents.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.17" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></picture></a>
 <br><sub>Agents working in parallel, each with live token counts and its own Stop.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-question.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.16" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-question.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.17" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></picture></a>
 <br><sub>When the agent needs a decision, it asks, and waits for your answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pingcf-thoughts.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.16" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></picture></a>
+<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pingcf-thoughts.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.17" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></picture></a>
 <br><sub>Read the reasoning, not just the answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-watching.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.16" alt="A session watching two other sessions: a finished reply arrives as a compact relay-event row, the watching 2 sessions list is open with Unsubscribe, and a request to also watch a session on a paired relay waits on an Allow / Deny card"></picture></a>
+<a href="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-watching.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.17" alt="A session watching two other sessions: a finished reply arrives as a compact relay-event row, the watching 2 sessions list is open with Unsubscribe, and a request to also watch a session on a paired relay waits on an Allow / Deny card"></picture></a>
 <br><sub>Agents that watch agents: woken by events, approving nothing.</sub>
 </td>
 </tr>
@@ -105,6 +105,7 @@ The runtime (the *provider* in the UI) is chosen in **New Chat** and stays fixed
 | [**Claude Cloud**](docs/providers.md#claude-cloud) (experimental) | Claude Code in a sandbox at Anthropic, on a GitHub repository | A claude.ai account with GitHub connected |
 | [**Cursor**](docs/providers.md#cursor-agent-sdk) | Cursor's agent | A Cursor API key |
 | [**Grok**](docs/providers.md#grok-cli-acp) | xAI's Grok CLI | A Grok sign-in, made from **⚙️ Settings** |
+| [**DeepSeek**](docs/providers.md#deepseek) | Claude Code on your machine, thinking with DeepSeek's models | A DeepSeek API key |
 
 API keys are entered in **⚙️ Settings** and stay on the relay host. The Claude and Grok CLIs can be [installed and signed in to from the browser](docs/providers.md#installing-a-provider-cli-from-the-relay), so no shell on the host is needed. Each runtime discovers its own [models](docs/providers.md#models). The full picture of each runtime is in [Providers](docs/providers.md).
 
@@ -116,11 +117,11 @@ API keys are entered in **⚙️ Settings** and stay on the relay host. The Clau
 <table>
 <tr>
 <td width="62%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-steering.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.16" alt="A running Claude turn with a message steered into it mid-turn, the reply streaming with its tool calls, and the Steer button in the composer"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-steering.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.17" alt="A running Claude turn with a message steered into it mid-turn, the reply streaming with its tool calls, and the Steer button in the composer"></picture></a>
 <br><sub>Send a message while the agent works, and it steers the running turn.</sub>
 </td>
 <td width="38%" valign="top">
-<a href="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/usage-copilot-compact.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.16" alt="The GitHub Copilot card in Check Usage: premium requests and plan quota with reset dates, and the cost of the last turn"></picture></a>
+<a href="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/usage-copilot-compact.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.17" alt="The GitHub Copilot card in Check Usage: premium requests and plan quota with reset dates, and the cost of the last turn"></picture></a>
 <br><sub>What each plan has left, in one place.</sub>
 </td>
 </tr>
@@ -137,7 +138,7 @@ API keys are entered in **⚙️ Settings** and stay on the relay host. The Clau
 - **Share** a conversation as a read-only link, hide single messages and the host's paths from it, and see when it was opened ([Sharing](docs/web-ui.md#sharing)).
 - **On your phone**: install OAR as an app and get push notifications ([Notifications and the app](docs/web-ui.md#notifications-and-the-app)).
 
-The full tour is in [Using the web UI](docs/web-ui.md); every setting and config key is in [Settings and configuration](docs/configuration.md). What changed in each release is in the [changelog](CHANGELOG.md), with [0.9.16](CHANGELOG.md#0916--2026-10-24) as the latest.
+The full tour is in [Using the web UI](docs/web-ui.md); every setting and config key is in [Settings and configuration](docs/configuration.md). What changed in each release is in the [changelog](CHANGELOG.md), with [0.9.17](CHANGELOG.md#0917--2026-10-25) as the latest.
 
 ## Remote access
 
@@ -188,7 +189,7 @@ flowchart LR
 
 You stay in charge: per paired relay you decide whether agents may only read, also prompt, or do everything, and in the `ask` and `plan` modes every write asks you first. A subscription only notifies; it approves nothing.
 
-<p><a href="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.16"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-cross-relay.light.png?v=0.9.16"><img src="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.16" alt="A session watching two sessions on a paired relay: a reply arrives as a relay-event row, and after a short outage the events the other relay kept arrive as one replayed row" width="720"></picture></a></p>
+<p><a href="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.17"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-cross-relay.light.png?v=0.9.17"><img src="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.17" alt="A session watching two sessions on a paired relay: a reply arrives as a relay-event row, and after a short outage the events the other relay kept arrive as one replayed row" width="720"></picture></a></p>
 
 How pairing, permissions and limits work is in [Agents working together](docs/agents-together.md).
 

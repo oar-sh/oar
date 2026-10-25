@@ -19,7 +19,9 @@ function sliceBetween(startMarker, endMarker) {
 test('every provider scope has a relay-mode list covering the shared vocabulary', () => {
   const tableSource = sliceBetween('const RELAY_MODES_BY_PROVIDER = {', '\nfunction relayModesForProvider(');
   const modes = new Function(`${tableSource}\nreturn RELAY_MODES_BY_PROVIDER;`)();
-  assert.deepEqual(Object.keys(modes).sort(), ['claude', 'claude-cloud', 'cursor', 'github', 'grok', 'openai']);
+  assert.deepEqual(Object.keys(modes).sort(), ['claude', 'claude-cloud', 'cursor', 'deepseek', 'github', 'grok', 'openai']);
+  // A DeepSeek chat runs Claude Code: all four modes, as for Claude.
+  assert.deepEqual(modes.deepseek, modes.claude);
   // A cloud session ignores relay modes: one entry, and the selector is hidden.
   assert.deepEqual(modes['claude-cloud'], ['agent']);
   for (const [provider, list] of Object.entries(modes)) {
@@ -41,6 +43,7 @@ test('a cloud conversation resolves to its own provider scope, not to Copilot', 
   // Every existing scope is untouched: `claude` stays Claude-only.
   assert.equal(normalize('claude'), 'claude');
   assert.equal(normalize('grok'), 'grok');
+  assert.equal(normalize('deepseek'), 'deepseek');
   assert.equal(normalize('something-new'), 'github');
 });
 

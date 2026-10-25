@@ -40,8 +40,8 @@ unlocked that relay yourself; reading and waiting are never limited. When the ag
 conversation has sent 30 prompts to agents on other relays without a message from you, the next
 one asks you first with a question card; **Allow** starts the count again.
 
-**What agents can do.** Every provider gets the same `remote_relay` tool (Claude, Cursor and
-Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Sessions get it
+**What agents can do.** Every provider gets the same `remote_relay` tool (Claude, DeepSeek, Cursor
+and Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, change their settings, answer questions, stop turns, archive). In the *ask* and *plan* relay
@@ -158,7 +158,7 @@ and archive it. Switching the setting off closes this relay to the tool again.
   on this relay.
 
 **What it can start.** A session with any provider that is enabled on this relay (Copilot,
-OpenAI, Claude, Cursor, Grok or Claude Cloud; not an OpenAI Image chat): in a folder
+OpenAI, Claude, Cursor, Grok, DeepSeek or Claude Cloud; not an OpenAI Image chat): in a folder
 (the relay's default folder when the agent names none), or a [Claude Cloud](providers.md#claude-cloud) chat
 with `provider: "claude-cloud"`, `repo` and an optional `branch`. A new session knows nothing of
 the conversation it was started from. Sessions an agent starts use this relay's accounts and

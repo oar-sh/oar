@@ -129,7 +129,8 @@ export function registerConversationGroupRoutes(app, deps) {
   // a conversation into a group. `groupId: null` takes it out (as DELETE).
   // With `beforeConversationId` in the body (null: to the end) it is a drag:
   // the row lands before that one and the group gets a hand order; without
-  // it the row joins at the end of a hand-ordered group, as the menu does.
+  // it the row joins a hand-ordered group first, under the head, as the menu
+  // does (and the next drag renumbers).
   app.put('/api/conversation/:id/group', auth, (req, res) => {
     if (refuseRemote(req, res)) return;
     if (!conversationGroups?.enabled) return unavailable(res);

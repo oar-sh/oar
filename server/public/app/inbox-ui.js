@@ -41,6 +41,10 @@ const drafts = new Map();
 // replaces it; the socket updates single asks in between).
 let sessionAsks = new Map();
 let sessionCardKey = '';
+// Where the Inbox was scrolled when it was last left; the next opening
+// starts there (the first one at the top). The transcript's own scroll
+// height is the transcript's, never the Inbox's.
+let inboxScrollTop = 0;
 
 function readFilter() {
   try {
@@ -90,12 +94,17 @@ function restoreDrafts(host, focusedKey) {
   }
 }
 
-function renderInboxNow() {
+/**
+ * Draws the Inbox into the transcript's place. A re-render keeps the scroll
+ * height; the render that opens the view (`opening`) takes the height the
+ * Inbox had when it was last left, not the one the transcript showed.
+ */
+function renderInboxNow({ opening = false } = {}) {
   if (!inboxActive) return;
   const host = document.getElementById('messages');
   if (!host) return;
   const focused = captureDrafts(host);
-  const top = host.scrollTop;
+  const top = opening ? inboxScrollTop : host.scrollTop;
   host.replaceChildren(renderInbox(document, { relays, filter, now: Date.now(), loading: !loaded }));
   restoreDrafts(host, focused);
   host.scrollTop = top;
@@ -153,6 +162,8 @@ export function noteInboxQuestionsChanged() {
 export function leaveInboxView() {
   const wasActive = inboxActive;
   if (!wasActive) return false;
+  const host = document.getElementById('messages');
+  if (host) inboxScrollTop = Math.max(0, Number(host.scrollTop) || 0);
   inboxActive = false;
   document.body.classList.remove('inbox-view-active');
   document.getElementById('input-area')?.removeAttribute('hidden');
@@ -187,7 +198,7 @@ export async function toggleInboxView() {
     }
   }
   syncInboxBadge();
-  renderInboxNow();
+  renderInboxNow({ opening: true });
   document.getElementById('sidebar')?.classList.remove('open');
   document.getElementById('sidebar-overlay')?.classList.remove('visible');
   await refreshInbox();

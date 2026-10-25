@@ -173,3 +173,33 @@ test('the provider check is case-insensitive', () => {
   });
   assert.equal(payload?.sessionRootPath, '/claude/session');
 });
+
+test('a deepseek conversation resolves in the DeepSeek workers\' own config root, never in Claude\'s', () => {
+  const sessionRootPath = '/srv/oar/data/deepseek-claude/projects/-home-dev-git-demo/11111111';
+  const resolveDeepSeekSessionRoot = spyResolver({ sessionRootPath, sessionRootName: 'Session' });
+  const resolveClaudeSessionRoot = spyResolver({ sessionRootPath: '/home/dev/.claude/projects/x', sessionRootName: 'Session' });
+  const resolveSessionStateRoot = spyResolver('/should/not/be/used');
+
+  const payload = buildConversationSessionRootPayload({
+    conversationId: 'conv-1',
+    sdkSessionId: SDK_SESSION_ID,
+    resolveSessionStateRoot,
+    providerType: 'deepseek',
+    claudeNativeSessionId: CLAUDE_NATIVE_ID,
+    workspaceRootPath: '/home/dev/git/demo',
+    resolveClaudeSessionRoot,
+    resolveDeepSeekSessionRoot,
+  });
+
+  assert.deepEqual(payload, { sdkSessionId: SDK_SESSION_ID, sessionRootPath, sessionRootName: 'Session' });
+  assert.equal(resolveDeepSeekSessionRoot.calls.length, 1);
+  assert.equal(resolveClaudeSessionRoot.calls.length, 0);
+  assert.equal(resolveSessionStateRoot.calls.length, 0);
+  // Without its resolver there is no folder, rather than Claude's.
+  assert.equal(buildConversationSessionRootPayload({
+    sdkSessionId: SDK_SESSION_ID,
+    providerType: 'deepseek',
+    claudeNativeSessionId: CLAUDE_NATIVE_ID,
+    resolveClaudeSessionRoot,
+  }), null);
+});

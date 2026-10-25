@@ -38,6 +38,7 @@ import { claudePlanUsageFromResult, normalizeClaudePlanUsage } from '../services
 import { isUsageLimitTerminalError } from '../services/usage-limit-pause-service.mjs';
 import { normalizeCopilotWorkerUsage } from '../services/plan-usage-copilot.mjs';
 import { normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
+import { normalizeDeepSeekUsageReport } from '../services/plan-usage-deepseek.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning-effort.mjs';
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
@@ -71,7 +72,15 @@ import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limi
 import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
 import { createLocalRequestCheck } from '../services/request-boundary.mjs';
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
+import {
+  DEEPSEEK_REASONING_EFFORTS,
+  DEFAULT_DEEPSEEK_REASONING_EFFORT,
+  deepseekModelAcceptsImages,
+  deepseekModelLabel,
+  deepseekReasoningEffortFor,
+} from '../../shared/deepseek-models.mjs';
 import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
+import { recordClaudeCliStart } from '../services/claude-session-leftovers.mjs';
 import {
   admitRemoteRelayRequest,
   readRemoteRelayRequest,
@@ -151,6 +160,7 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'claude' || normalized === 'anthropic') return 'claude';
   // Its own provider, never read as `claude`.
   if (normalized === 'claude-cloud') return 'claude-cloud';
+  if (normalized === 'deepseek') return 'deepseek';
   return '';
 }
 
@@ -159,6 +169,7 @@ const BOOTSTRAP_ONLY_PROVIDER_LABELS = Object.freeze({
   grok: 'Grok',
   claude: 'Claude',
   'claude-cloud': 'Claude Cloud',
+  deepseek: 'DeepSeek',
 });
 
 function deriveModelOrigin(model) {
@@ -1832,6 +1843,7 @@ export function registerMessagesRoutes(app, deps) {
     getCursorProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     getGrokProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     getClaudeCloudProviderSettings = () => ({ enabled: false, defaultModel: '', environmentId: '', models: [] }),
+    getDeepSeekProviderSettings = () => ({ enabled: false, model: '', models: [] }),
     rebindUnstartedOpenAIConversationModel = null,
     normalizeRelayMode,
     DEFAULT_RELAY_MODE,
@@ -1891,6 +1903,10 @@ export function registerMessagesRoutes(app, deps) {
     sessionActivityTracker = null,
     // A worker's SDK session id or a conversation id → the conversation row.
     resolveConversationRecord = null,
+    // DeepSeek's Claude Code config directory, which the relay owns: each CLI
+    // start a DeepSeek worker reports is recorded there for the delete
+    // (claude-session-leftovers.mjs).
+    deepseekClaudeConfigDir = '',
   } = deps;
 
   const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
@@ -1982,6 +1998,22 @@ export function registerMessagesRoutes(app, deps) {
     if (toolMatch) return { kind: 'tool_call', toolName: toolMatch[1], text: value };
     if (/^Tool failed:/i.test(value)) return { kind: 'tool_result', text: value, metadata: { isError: true } };
     return { kind: 'note', text: value };
+  }
+  // Whether a conversation's history holds an image the user attached. Read
+  // only for a DeepSeek model switch; prepared on first use, so a database
+  // without the messages table (tests) is answered with "no".
+  let conversationHasImageStatement = null;
+  function conversationHasImageAttachment(conversationId) {
+    try {
+      conversationHasImageStatement ||= db.prepare(`
+        SELECT 1 FROM messages
+        WHERE conversation_id = ? AND role = 'user' AND attachments LIKE '%"image/%'
+        LIMIT 1
+      `);
+      return !!conversationHasImageStatement.get(conversationId);
+    } catch {
+      return false;
+    }
   }
   const getMessageAttachmentsByConversation = db.prepare(`
     SELECT attachments
@@ -4549,7 +4581,8 @@ export function registerMessagesRoutes(app, deps) {
       || runtimeProviderType === 'claude'
       || runtimeProviderType === 'cursor'
       || runtimeProviderType === 'grok'
-      || runtimeProviderType === 'claude-cloud';
+      || runtimeProviderType === 'claude-cloud'
+      || runtimeProviderType === 'deepseek';
     const configuredOpenAIModel = String(configuredOpenAI?.model || '').trim();
     const availableOpenAIModels = new Set(
       (Array.isArray(configuredOpenAI?.models) ? configuredOpenAI.models : [])
@@ -4670,6 +4703,32 @@ export function registerMessagesRoutes(app, deps) {
         return res.status(409).json({
           error: 'Grok model selection requires creating a new Grok conversation',
           code: 'GROK_MODEL_REQUIRES_NEW_CONVERSATION',
+        });
+      }
+    }
+    // DeepSeek conversations are bootstrap-created only too. Its ids are its
+    // own ("deepseek-*"), so an id alone may name it for an unbound session.
+    const runtimeUsesDeepSeek = runtimeProviderType === 'deepseek';
+    if (!shouldCreateConversation && !runtimeUsesDeepSeek) {
+      let requestTargetsDeepSeek = requestedProviderType === 'deepseek';
+      if (
+        !requestTargetsDeepSeek
+        && !runtimeBoundToExplicitProvider
+        && requestedOpenAIModel
+        && !requestedModelAvailableInGitHub
+      ) {
+        const deepseekSettings = getDeepSeekProviderSettings();
+        const deepseekOnlyModels = new Set([
+          String(deepseekSettings?.model || '').trim(),
+          ...(Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : [])
+            .map((value) => String(value || '').trim()),
+        ].filter(Boolean));
+        requestTargetsDeepSeek = deepseekSettings?.enabled === true && deepseekOnlyModels.has(requestedOpenAIModel);
+      }
+      if (requestTargetsDeepSeek) {
+        return res.status(409).json({
+          error: 'DeepSeek model selection requires creating a new DeepSeek conversation',
+          code: 'DEEPSEEK_MODEL_REQUIRES_NEW_CONVERSATION',
         });
       }
     }
@@ -4842,6 +4901,45 @@ export function registerMessagesRoutes(app, deps) {
     // sends set_model before the message), so a changed model is taken as
     // for a local Claude chat.
     const claudeCloudModel = claudeCloudModelSelection ? claudeCloudModelSelection.model : '';
+    // DeepSeek conversations resolve models against the DeepSeek catalog and
+    // may switch between turns, like Claude ones (the worker's CLI switches
+    // before the next message). A model DeepSeek does not offer is refused.
+    const configuredDeepSeek = runtimeUsesDeepSeek ? getDeepSeekProviderSettings() : null;
+    const pinnedDeepSeekModel = runtimeUsesDeepSeek ? String(existingRuntimeSession?.provider_model || '').trim() : '';
+    const deepseekModelSelection = runtimeUsesDeepSeek
+      ? resolveProviderModelSelection({
+          requestedModel: String(model || '').trim(),
+          configuredModel: pinnedDeepSeekModel || String(configuredDeepSeek?.model || '').trim(),
+          availableModels: [
+            String(configuredDeepSeek?.model || '').trim(),
+            pinnedDeepSeekModel,
+            ...(Array.isArray(configuredDeepSeek?.models) ? configuredDeepSeek.models : []),
+          ].map((value) => String(value || '').trim()).filter(Boolean),
+        })
+      : null;
+    if (deepseekModelSelection && !deepseekModelSelection.ok) {
+      return res.status(400).json({
+        error: `DeepSeek model "${deepseekModelSelection.requestedModel}" is not available`,
+        code: 'DEEPSEEK_MODEL_UNAVAILABLE',
+        supportedModels: deepseekModelSelection.availableModels || [],
+      });
+    }
+    const deepseekModel = deepseekModelSelection ? deepseekModelSelection.model : '';
+    // A model without image input cannot take over a session whose transcript
+    // carries images: the resumed history would fail the whole request.
+    if (
+      runtimeUsesDeepSeek
+      && deepseekModel
+      && pinnedDeepSeekModel
+      && deepseekModel.toLowerCase() !== pinnedDeepSeekModel.toLowerCase()
+      && !deepseekModelAcceptsImages(deepseekModel)
+      && conversationHasImageAttachment(conversationId)
+    ) {
+      return res.status(409).json({
+        error: `${deepseekModelLabel(deepseekModel)} takes no images, and this conversation already has some. Stay on ${deepseekModelLabel(pinnedDeepSeekModel)}, or start a new DeepSeek conversation for ${deepseekModelLabel(deepseekModel)}.`,
+        code: 'DEEPSEEK_MODEL_TEXT_ONLY',
+      });
+    }
     // What the request itself chose. Only these are saved as the
     // conversation's preference; a value filled in below never is.
     const explicitModelGiven = !!requestedOpenAIModel;
@@ -4910,7 +5008,15 @@ export function registerMessagesRoutes(app, deps) {
                   reasoningEffort: null,
                   error: claudeCloudModel ? null : 'Claude Cloud model is not configured',
                 }
-              : githubModelResolution))));
+              : (runtimeUsesDeepSeek
+                ? {
+                    ok: !!deepseekModel,
+                    model: deepseekModel,
+                    modelVariantId: deepseekModel,
+                    reasoningEffort: null,
+                    error: deepseekModel ? null : 'DeepSeek model is not configured',
+                  }
+                : githubModelResolution)))));
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;
@@ -4987,6 +5093,16 @@ export function registerMessagesRoutes(app, deps) {
       const effort = supported.includes(requestedEffort) ? requestedEffort : 'none';
       return { ok: true, effort, supported };
     };
+    // DeepSeek takes none/low/high/max for every model; other names map to
+    // what DeepSeek would run ("medium" is high), and no stated effort is the
+    // conversation's own, else high, DeepSeek's default.
+    const resolveDeepSeekReasoningEffort = () => {
+      const supported = [...DEEPSEEK_REASONING_EFFORTS];
+      const requestedEffort = deepseekReasoningEffortFor(explicitReasoningEffort);
+      if (requestedEffort) return { ok: true, effort: requestedEffort, supported };
+      const kept = deepseekReasoningEffortFor(conversationReasoningEffort);
+      return { ok: true, effort: kept || DEFAULT_DEEPSEEK_REASONING_EFFORT, supported };
+    };
     let reasoningResolution = useOpenAIProvider
       ? resolveOpenAIReasoningEffort(
           explicitReasoningEffort || conversationEffortFor(openAIReasoningEffortsForModel(openAIModel)) || '',
@@ -5001,10 +5117,12 @@ export function registerMessagesRoutes(app, deps) {
             // A cloud session takes no effort: whatever was asked, it is none.
             : (runtimeUsesClaudeCloud
               ? { ok: true, effort: 'none', supported: ['none'] }
-              : resolveRequestedReasoningEffort(
-                  requestedModel,
-                  explicitReasoningEffort || modelResolution.reasoningEffort || null,
-                )))));
+              : (runtimeUsesDeepSeek
+                ? resolveDeepSeekReasoningEffort()
+                : resolveRequestedReasoningEffort(
+                    requestedModel,
+                    explicitReasoningEffort || modelResolution.reasoningEffort || null,
+                  ))))));
     // No effort sent (or the model's variant carried one it lacks): the
     // conversation's own effort, clamped to the model's levels, else its
     // lowest level that is not 'none'. Some models list 'none' and the API
@@ -5040,8 +5158,9 @@ export function registerMessagesRoutes(app, deps) {
       }
     } else if (!['default', 'long_context'].includes(requestedContextTier)) {
       return res.status(400).json({ error: 'Unsupported context tier' });
-    } else if (runtimeUsesClaudeCloud) {
-      // The cloud has no long-context tier to pick.
+    } else if (runtimeUsesClaudeCloud || runtimeUsesDeepSeek) {
+      // The cloud has no long-context tier to pick, and DeepSeek's one window
+      // is already 1M.
       normalizedContextTier = 'default';
     }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
@@ -5276,6 +5395,17 @@ export function registerMessagesRoutes(app, deps) {
         && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
       ) {
         stmts.updateRuntimeSessionProvider.run('claude', claudeModel, claudeModel, now, runtimeSession.id);
+      }
+      // DeepSeek follows the composer the same way: a relaunched worker reads
+      // provider_model, so it has to be the model last used.
+      if (
+        runtimeUsesDeepSeek
+        && deepseekModel
+        && runtimeSession?.id
+        && deepseekModel !== String(existingRuntimeSession?.provider_model || '').trim()
+        && typeof stmts.updateRuntimeSessionProvider?.run === 'function'
+      ) {
+        stmts.updateRuntimeSessionProvider.run('deepseek', deepseekModel, deepseekModel, now, runtimeSession.id);
       }
       // A cloud conversation follows the composer like a Claude one: the
       // worker switches the sandbox's model before the message.
@@ -5784,7 +5914,10 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   // POST /api/claude-native-session — Claude worker persists the native Agent
-  // SDK session id so later turns can resume it across worker restarts.
+  // SDK session id so later turns can resume it across worker restarts. A
+  // DeepSeek worker also reports each CLI start (`cliStartedAt`, ms), which
+  // the relay records so deleting the conversation finds every CLI's shell
+  // snapshot.
   app.post('/api/claude-native-session', auth, (req, res) => {
     touchCli();
     const conversationId = String(req.body?.conversationId || '').trim();
@@ -5796,7 +5929,10 @@ export function registerMessagesRoutes(app, deps) {
     if (!runtimeSession) {
       return res.status(404).json({ error: 'Runtime session not found for conversation' });
     }
-    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'claude') {
+    // The DeepSeek worker runs the same CLI (against DeepSeek) and resumes
+    // its sessions the same way.
+    const nativeSessionProvider = String(runtimeSession.provider_type || 'github').trim().toLowerCase();
+    if (nativeSessionProvider !== 'claude' && nativeSessionProvider !== 'deepseek') {
       return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
     }
     if (typeof stmts.updateRuntimeSessionClaudeNativeSessionId?.run !== 'function') {
@@ -5807,6 +5943,10 @@ export function registerMessagesRoutes(app, deps) {
       new Date().toISOString(),
       conversationId,
     );
+    const cliStartedAt = Number(req.body?.cliStartedAt);
+    if (nativeSessionProvider === 'deepseek' && Number.isFinite(cliStartedAt) && cliStartedAt > 0 && cliStartedAt <= Date.now() + 60_000) {
+      recordClaudeCliStart({ configRoot: deepseekClaudeConfigDir, nativeSessionId: claudeNativeSessionId, startedAt: cliStartedAt });
+    }
     res.json({ ok: true });
   });
 
@@ -5834,9 +5974,9 @@ export function registerMessagesRoutes(app, deps) {
       return res.status(404).json({ error: 'Runtime session not found for conversation' });
     }
     // The Claude Cloud worker reports the same shape (the cloud session's
-    // context and token usage), so both providers are taken here.
+    // context and token usage), and so does the DeepSeek one (the same CLI).
     const contextUsageProvider = String(runtimeSession.provider_type || 'github').trim().toLowerCase();
-    if (contextUsageProvider !== 'claude' && contextUsageProvider !== 'claude-cloud') {
+    if (contextUsageProvider !== 'claude' && contextUsageProvider !== 'claude-cloud' && contextUsageProvider !== 'deepseek') {
       return res.status(409).json({ error: 'Conversation is not bound to the Claude provider' });
     }
     if (typeof stmts.updateRuntimeSessionContextUsage?.run !== 'function') {
@@ -5881,6 +6021,40 @@ export function registerMessagesRoutes(app, deps) {
     });
     if (!applied) return res.status(400).json({ error: 'Missing usable usage metrics' });
     res.json({ ok: true, cycle: applied.cycle.key });
+  });
+
+  // POST /api/deepseek-plan-usage — DeepSeek worker reports, after a turn,
+  // the CLI's running token totals per model (cache hit, cache miss, output)
+  // for its Claude Code session, with the time and the id of the CLI
+  // process (`runId`). The relay books what they add to the totals last
+  // reported for that session (a resumed CLI starts from its session's
+  // earlier totals), with the estimated cost at the price of that time
+  // (shared/deepseek-pricing.mjs). Totals below the checkpoint under the
+  // checkpoint's run id are a stale report (retried or out of order) and
+  // book nothing; under another run id, or without one, they are a CLI
+  // counting from zero again, booked in full. The web searches and fetches
+  // come as `requests`: with a run id the process's running counts, booked
+  // like the tokens; without one the turn's counts, booked as they are.
+  // Priced from 2026-10-31 16:00 UTC.
+  app.post('/api/deepseek-plan-usage', auth, (req, res) => {
+    touchCli();
+    if (!planUsageService?.recordDeepSeekUsageReport) {
+      return res.status(500).json({ error: 'Plan usage storage is unavailable' });
+    }
+    const conversationId = String(req.body?.conversationId || '').trim();
+    if (!conversationId) return res.status(400).json({ error: 'Missing conversationId' });
+    const runtimeSession = stmts.getRuntimeSessionByConversation.get(conversationId);
+    if (!runtimeSession) {
+      return res.status(404).json({ error: 'Runtime session not found for conversation' });
+    }
+    if (String(runtimeSession.provider_type || 'github').trim().toLowerCase() !== 'deepseek') {
+      return res.status(409).json({ error: 'Conversation is not bound to the DeepSeek provider' });
+    }
+    const parsed = normalizeDeepSeekUsageReport(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const booked = planUsageService.recordDeepSeekUsageReport({ ...parsed.report, conversationId });
+    if (!booked) return res.status(400).json({ error: 'Missing usable usage metrics' });
+    res.json({ ok: true, at: booked.at, models: booked.models.map((entry) => entry.model) });
   });
 
   // POST /api/claude-plan-usage — Claude worker reports the session's
@@ -6795,7 +6969,10 @@ export function registerMessagesRoutes(app, deps) {
         body: JSON.stringify({
           messageId: operation.queue_message_id,
           conversationId: operation.conversation_id,
-          terminalFailure: {
+          // `terminalError` is the field /api/response reads; under any other
+          // name the failure was refused as an empty reply and the row stayed
+          // processing until the relay recovered and re-ran it.
+          terminalError: {
             code: 'IMAGE_ATTEMPT_INTERRUPTED',
             message: 'Image generation may have completed before the relay was interrupted. It was not retried to avoid duplicate images.',
             retryable: false,
@@ -6956,7 +7133,7 @@ export function registerMessagesRoutes(app, deps) {
           body: JSON.stringify({
             messageId: operation.queue_message_id,
             conversationId: operation.conversation_id,
-            terminalFailure: failure,
+            terminalError: failure,
           }),
         }).catch(() => null);
         if (!failResponse?.ok) {
@@ -8031,7 +8208,7 @@ export function registerMessagesRoutes(app, deps) {
   // The providers whose workers name a shell task's output (a file, a spool
   // or a snapshot). A task of theirs without one comes from a worker that
   // started before the console existed.
-  const TASK_OUTPUT_PROVIDERS = new Set(['claude', 'github', 'copilot', 'grok']);
+  const TASK_OUTPUT_PROVIDERS = new Set(['claude', 'github', 'copilot', 'grok', 'deepseek']);
   const SUBAGENT_OUTPUT_MESSAGE = TASK_OUTPUT_NONE_MESSAGES.subagent;
 
   // Why a task has no output to show, for the console's `none` answer. The

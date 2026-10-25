@@ -295,6 +295,16 @@
     --provider-cursor: #a78bfa;
     --provider-grok: #e879f9;
     --provider-claude-cloud: #7dd3fc;
+    /* DeepSeek's blue, toward indigo so it reads apart from Copilot's. */
+    --provider-deepseek: #8b9dff;
+    /* The usage charts' series, in a fixed order (blue, orange, green,
+       amber; grey for "other"), stepped for the dark surface and checked
+       for colour-vision deficiency and contrast against it. */
+    --plan-usage-series-1: #3987e5;
+    --plan-usage-series-2: #d95926;
+    --plan-usage-series-3: #199e70;
+    --plan-usage-series-4: #c98500;
+    --plan-usage-series-5: #8b949e;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     --chat-header-top-base-desktop: 14px;
@@ -359,6 +369,13 @@
     --provider-cursor: #6b3fd4;
     --provider-grok: #a21caf;
     --provider-claude-cloud: #0369a1;
+    --provider-deepseek: #3b5bdb;
+    /* The same series order, stepped for the white surface. */
+    --plan-usage-series-1: #2a78d6;
+    --plan-usage-series-2: #eb6834;
+    --plan-usage-series-3: #1baf7a;
+    --plan-usage-series-4: #eda100;
+    --plan-usage-series-5: #656d76;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -987,6 +1004,7 @@
   .conv-provider-indicator[data-provider="claude"] { color: var(--provider-claude); }
   .conv-provider-indicator[data-provider="cursor"] { color: var(--provider-cursor); }
   .conv-provider-indicator[data-provider="grok"] { color: var(--provider-grok); }
+  .conv-provider-indicator[data-provider="deepseek"] { color: var(--provider-deepseek); }
   .conv-provider-indicator[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
@@ -1454,6 +1472,74 @@
     outline: none;
     font-size: var(--fs-meta-md);
     width: min(260px, 100%);
+  }
+  /* The DeepSeek tab's key, base URL and monthly budget take the text
+     inputs' look (an input left to the browser is a white box in dark). */
+  #settings-provider-panel-deepseek input[type="password"],
+  #settings-provider-panel-deepseek input[type="url"],
+  #settings-provider-panel-deepseek input[type="number"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    outline: none;
+    font-size: var(--fs-meta-md);
+    width: min(360px, 100%);
+  }
+  /* A select is as wide as its longest option (the commit attribution's
+     runs to ~290 px): kept inside the panel on a narrow phone. */
+  #settings-provider-panel-deepseek select {
+    max-width: 100%;
+  }
+  /* "No longer used" under the starting balance: the warning look of the
+     composer's model banner, apart from the help text above it. */
+  #deepseek-starting-balance-status {
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-top: 6px;
+  }
+  /* Import usage export: the two file pickers in the panel's colours, their
+     button drawn like the panel's other buttons. */
+  .deepseek-usage-import {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .deepseek-usage-import-files {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 6px 10px;
+    align-items: center;
+  }
+  .deepseek-usage-import input[type="file"] {
+    color: var(--text);
+    font-size: var(--fs-meta-md);
+    min-width: 0;
+    max-width: 100%;
+  }
+  .deepseek-usage-import input[type="file"]::file-selector-button {
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: 8px;
+    height: 30px;
+    padding: 0 10px;
+    margin-right: 8px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .deepseek-usage-import-status:empty { display: none; }
+  @media (max-width: 520px) {
+    .deepseek-usage-import-files { grid-template-columns: minmax(0, 1fr); }
   }
   .settings-row input[type="checkbox"] {
     width: 18px;
@@ -2863,6 +2949,25 @@
     padding: 2px 0;
   }
   .plan-usage-details summary:hover { color: var(--text); }
+  /* A card's figures (plan-usage-view.mjs renderFact): label and hint on the
+     left, the value on the right, one row each. */
+  .plan-usage-facts {
+    display: grid;
+    gap: 8px;
+    margin: 12px 0 0;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .plan-usage-fact {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 0.84rem;
+  }
+  .plan-usage-fact dt { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-weight: 500; }
+  .plan-usage-fact-hint { font-size: 0.72rem; font-weight: 400; color: var(--muted); }
+  .plan-usage-fact dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .plan-usage-detail-note {
     font-size: 0.74rem;
     color: var(--muted);
@@ -2872,14 +2977,22 @@
   .plan-usage-detail-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
   .plan-usage-detail-table td { padding: 5px 2px; border-bottom: 1px solid var(--border); }
   .plan-usage-detail-table tr:last-child td { border-bottom: none; }
-  .plan-usage-detail-label { display: flex; flex-direction: column; gap: 2px; }
-  .plan-usage-detail-hint { font-size: 0.7rem; color: var(--muted); }
+  /* The label cell stays a table cell (a flex cell does not stretch to the
+     row, and its border then steps against the value's): the hint goes
+     under the label as a block. */
+  .plan-usage-detail-hint { display: block; margin-top: 2px; font-size: 0.7rem; color: var(--muted); }
   .plan-usage-detail-value {
     text-align: right;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     vertical-align: top;
   }
+  /* On a phone a long value (tokens by model) wraps instead of pushing the
+     card wider than the screen. */
+  @media (max-width: 520px) {
+    .plan-usage-details .plan-usage-detail-value { white-space: normal; }
+  }
+  .plan-usage-detail-part { white-space: nowrap; }
   .plan-usage-card-foot {
     display: flex;
     align-items: center;
@@ -2892,6 +3005,145 @@
   }
   .plan-usage-link { color: var(--accent); text-decoration: none; }
   .plan-usage-link:hover { text-decoration: underline; }
+  /* Usage charts (plan-usage-view.mjs renderChart): stacked columns and
+     bars from the theme's series colours; text stays in the text colours. */
+  .plan-usage-chart {
+    margin: 12px 0 0;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .plan-usage-chart-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .plan-usage-chart-label { font-size: 0.88rem; font-weight: 600; }
+  .plan-usage-chart-summary { font-size: 0.82rem; color: var(--text); font-variant-numeric: tabular-nums; }
+  .plan-usage-chart-columns {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(var(--plan-usage-columns, 30), minmax(0, 1fr));
+    gap: 2px;
+    height: 72px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .plan-usage-chart-col {
+    position: relative;
+    display: flex;
+    align-items: flex-end;
+    min-width: 0;
+    height: 100%;
+    border-radius: 2px;
+    outline: none;
+  }
+  .plan-usage-chart-col:hover, .plan-usage-chart-col:focus-visible { background: var(--bg3); }
+  .plan-usage-chart-col:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  .plan-usage-chart-stack {
+    display: flex;
+    flex-direction: column-reverse;
+    width: 100%;
+    height: 100%;
+    justify-content: flex-start;
+  }
+  .plan-usage-chart-col-empty .plan-usage-chart-stack::before {
+    content: '';
+    display: block;
+    height: 2px;
+    background: var(--border);
+  }
+  .plan-usage-chart-columns .plan-usage-chart-seg {
+    display: block;
+    width: 100%;
+    min-height: 2px;
+    margin-top: 2px;
+  }
+  .plan-usage-chart-columns .plan-usage-chart-seg:last-child { border-radius: 4px 4px 0 0; }
+  .plan-usage-chart-axis {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.68rem;
+    color: var(--muted);
+  }
+  .plan-usage-chart-bars { display: flex; flex-direction: column; gap: 8px; }
+  .plan-usage-chart-row {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(80px, 1fr) 3fr auto;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.82rem;
+    border-radius: 4px;
+    outline: none;
+  }
+  .plan-usage-chart-row:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  /* A model's name wraps on a narrow screen rather than being cut. */
+  .plan-usage-chart-row-label { min-width: 0; line-height: 1.25; overflow-wrap: anywhere; }
+  .plan-usage-chart-row-value { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .plan-usage-chart-bar {
+    display: flex;
+    gap: 2px;
+    height: 14px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--bg3);
+  }
+  .plan-usage-chart-bar .plan-usage-chart-seg { display: block; height: 100%; min-width: 2px; }
+  .plan-usage-chart-bar .plan-usage-chart-seg:first-child { border-radius: 4px 0 0 4px; }
+  .plan-usage-chart-bar .plan-usage-chart-seg:last-child { border-radius: 0 4px 4px 0; }
+  .plan-usage-chart-tip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 2;
+    max-width: 260px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg2);
+    color: var(--text);
+    font-size: 0.74rem;
+    line-height: 1.4;
+    white-space: normal;
+    text-align: center;
+    pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  }
+  .plan-usage-chart-col:hover .plan-usage-chart-tip,
+  .plan-usage-chart-col:focus .plan-usage-chart-tip,
+  .plan-usage-chart-row:hover .plan-usage-chart-tip,
+  .plan-usage-chart-row:focus .plan-usage-chart-tip { display: block; }
+  .plan-usage-chart-col .plan-usage-chart-tip { width: 180px; }
+  .plan-usage-chart-col:first-child .plan-usage-chart-tip,
+  .plan-usage-chart-col:nth-child(-n+6) .plan-usage-chart-tip { left: 0; transform: none; text-align: left; }
+  .plan-usage-chart-col:nth-last-child(-n+7):not(.plan-usage-chart-axis) .plan-usage-chart-tip { left: auto; right: 0; transform: none; text-align: right; }
+  .plan-usage-chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: 0.74rem;
+    color: var(--muted);
+  }
+  .plan-usage-chart-legend li { display: inline-flex; align-items: center; gap: 5px; }
+  .plan-usage-chart-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+  /* A table wider than a narrow screen scrolls inside the card. */
+  .plan-usage-chart-table { margin-top: 6px; font-size: 0.78rem; max-width: 100%; overflow-x: auto; }
+  .plan-usage-chart-table summary { cursor: pointer; color: var(--muted); padding: 2px 0; }
+  .plan-usage-chart-table summary:hover { color: var(--text); }
+  .plan-usage-chart-table th { text-align: left; font-weight: 500; color: var(--muted); padding: 4px 2px; border-bottom: 1px solid var(--border); }
+  .plan-usage-chart-table thead th:not(:first-child) { text-align: right; }
   /* About OAR: the plan-usage cards and tables, stacked. */
   .about-modal { display: flex; flex-direction: column; gap: 12px; }
   .about-section .plan-usage-card-head { margin-bottom: 4px; }
@@ -3186,6 +3438,7 @@
   #model-lock-note[data-provider="claude"] { color: var(--provider-claude); }
   #model-lock-note[data-provider="cursor"] { color: var(--provider-cursor); }
   #model-lock-note[data-provider="grok"] { color: var(--provider-grok); }
+  #model-lock-note[data-provider="deepseek"] { color: var(--provider-deepseek); }
   #model-lock-note[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
   /* Claude Cloud conversations (claude-cloud-conversation-ui.js): where the
      session runs and what it pushed, above the composer like the lock note.
@@ -6389,37 +6642,51 @@
     .conv-item.conv-drag-ghost { margin: -18px 0 0; }
     .conv-item.conv-drop-before::before,
     .conv-item.conv-drop-after::after { height: 4px; }
+    /* Two rows on a phone: ☰, the title and the buttons on the first; the
+       origin line, the chips and the folder on a second row across the whole
+       header. The title column dissolves (display: contents) so its lines
+       become the header's own flex items; ::after breaks the row after the
+       buttons. The row gap is 0 and the second row's items carry their own
+       top margin, so a header with nothing below the title stays one row. */
     #chat-header {
       padding: var(--chat-header-top-pad-mobile) 10px 10px;
-      gap: 6px 8px;
-      flex-wrap: nowrap;
+      gap: 0 8px;
+      flex-wrap: wrap;
       align-items: center;
       position: relative;
       z-index: 30;
     }
-    #chat-title-wrap {
-      flex: 1 1 auto;
-      width: auto;
-      min-width: 0;
-      flex-wrap: nowrap;
-      align-items: flex-start;
-      gap: 6px;
+    #chat-header::after {
+      content: '';
+      order: 4;
+      flex: 0 0 100%;
+      height: 0;
     }
-    #chat-title-slot {
-      display: flex;
-      flex-direction: column;
-      flex: 1 1 auto;
-      width: auto;
-      margin: 0;
-      min-width: 0;
-    }
+    #chat-title-wrap,
+    #chat-title-slot { display: contents; }
     #chat-title-primary {
-      display: block;
+      order: 2;
+      flex: 1 1 0;
       min-width: 0;
     }
+    #chat-title-origin,
+    #chat-title-relay-events,
+    #chat-title-relay-schedules,
+    #chat-title-cwd,
+    #chat-title-session-usage {
+      order: 5;
+      flex: 0 1 auto;
+      max-width: 100%;
+      margin-top: 4px;
+    }
+    #chat-title-relay-events,
+    #chat-title-relay-schedules { flex-shrink: 0; }
+    #chat-title-relay-events .relay-watch-chip,
+    #chat-title-relay-events .conv-watched-badge,
+    #chat-title-relay-schedules .relay-watch-chip { white-space: nowrap; }
+    #chat-title-primary { display: block; }
     #chat-title-cwd {
       display: block;
-      margin-top: 1px;
       font-size: clamp(0.62rem, 2vw, 0.7rem);
       line-height: 1.2;
       min-width: 0;
@@ -6429,7 +6696,6 @@
     }
     #chat-title-session-usage {
       display: block;
-      margin-top: 1px;
       font-size: clamp(0.62rem, 2vw, 0.7rem);
       line-height: 1.2;
       min-width: 0;
@@ -6437,10 +6703,7 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    #chat-title-origin {
-      margin-top: 1px;
-      font-size: clamp(0.62rem, 2vw, 0.7rem);
-    }
+    #chat-title-origin { font-size: clamp(0.62rem, 2vw, 0.7rem); }
     #chat-header-actions {
       margin-left: auto;
     }
@@ -6449,6 +6712,7 @@
       flex: 0 0 auto;
     }
     #chat-title-editor {
+      order: 2;
       flex: 1 0 100%;
       width: 100%;
       flex-wrap: wrap;
@@ -6456,9 +6720,6 @@
     }
     body.chat-title-editing #chat-header-actions {
       align-self: flex-start;
-    }
-    body.chat-title-editing #chat-title-wrap {
-      z-index: 40;
     }
     body.chat-title-editing #chat-title-editor {
       position: fixed;
@@ -6504,7 +6765,6 @@
       color: var(--relay-tone-tunnelled);
       text-shadow: 0 0 8px rgba(210, 153, 34, 0.35);
     }
-    #chat-title-wrap { order: 2; }
     #chat-header-actions { order: 3; }
     #chat-title { font-size: clamp(0.92rem, 3vw, 0.98rem); }
     #chat-title-input,
@@ -6777,13 +7037,20 @@
       flex: 0 0 auto;
       min-width: 40px;
     }
-    /* About OAR: the same, with Refresh beside the close button. */
-    #summary-modal[data-kind="about"] .summary-header-actions {
+    /* About OAR, Plan usage and Settings: the same, with Refresh (where
+       there is one) beside the close button, and the title cut with an
+       ellipsis if it must be. */
+    #summary-modal[data-kind="about"] .summary-header-actions,
+    #summary-modal[data-kind="usage"] .summary-header-actions,
+    #settings-modal .summary-header-actions {
       width: auto;
       flex: 0 0 auto;
     }
     #summary-modal[data-kind="about"] .summary-header-actions .summary-btn,
-    #summary-modal[data-kind="about"] .summary-header-actions .summary-close {
+    #summary-modal[data-kind="about"] .summary-header-actions .summary-close,
+    #summary-modal[data-kind="usage"] .summary-header-actions .summary-btn,
+    #summary-modal[data-kind="usage"] .summary-header-actions .summary-close,
+    #settings-modal .summary-header-actions .summary-close {
       flex: 0 0 auto;
       min-width: 40px;
     }
@@ -7610,6 +7877,16 @@
             tabindex="-1"
             data-settings-provider-tab="cursor"
           >Cursor</button>
+          <button
+            id="settings-provider-tab-deepseek"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-deepseek"
+            tabindex="-1"
+            data-settings-provider-tab="deepseek"
+          >DeepSeek</button>
         </div>
         <div
           id="settings-provider-panel-copilot"
@@ -8045,6 +8322,104 @@
               <button id="cursor-dashboard-token-remove-btn" type="button" class="summary-btn" onclick="removeCursorDashboardToken()">Remove</button>
             </div>
             <div class="settings-help">Unlocks the live percentage bars on Check Usage: "Plan usage (total)", "Auto + Composer" and "API". Detected automatically from this machine's Cursor IDE login when one exists; paste the <code>WorkosCursorSessionToken</code> cookie from a logged-in cursor.com tab (DevTools → Application → Cookies) only for headless relay hosts or to use a different account. Headless hosts can also set <code>CURSOR_SESSION_TOKEN</code> in the relay environment. Tokens stay on the relay.</div>
+          </div>
+        </div>
+        <div
+          id="settings-provider-panel-deepseek"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-deepseek"
+          data-settings-provider-panel="deepseek"
+          hidden
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="deepseek-api-key-input">DeepSeek</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="deepseek-enabled-toggle">Enable DeepSeek for New Chat model selection</label>
+              <input id="deepseek-enabled-toggle" type="checkbox" onchange="toggleDeepSeekProvider(this.checked)" disabled>
+            </div>
+            <input
+              id="deepseek-api-key-input"
+              type="password"
+              autocomplete="off"
+              placeholder="DeepSeek API key…"
+              aria-label="DeepSeek API key"
+            >
+            <label for="deepseek-model-select" style="margin-top: 8px;">Default model</label>
+            <select id="deepseek-model-select" aria-label="DeepSeek default model">
+              <option value="deepseek-flash">deepseek-flash</option>
+              <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+            </select>
+            <label for="deepseek-attribution-select" style="margin-top: 8px;">Commit attribution</label>
+            <select id="deepseek-attribution-select" aria-label="DeepSeek commit attribution">
+              <option value="oar">OAR: Co-authored-by: Open Agent Relay (DeepSeek …)</option>
+              <option value="off">Off: no attribution</option>
+            </select>
+            <label for="deepseek-monthly-budget-input" style="margin-top: 8px;">Monthly budget (optional)</label>
+            <input
+              id="deepseek-monthly-budget-input"
+              type="number"
+              inputmode="decimal"
+              min="0"
+              step="0.01"
+              autocomplete="off"
+              placeholder="No budget bar"
+              aria-label="DeepSeek monthly budget"
+            >
+            <label for="deepseek-monthly-budget-currency-select" style="margin-top: 8px;">Budget currency</label>
+            <select id="deepseek-monthly-budget-currency-select" aria-label="DeepSeek monthly budget currency">
+              <option value="USD">USD ($)</option>
+              <option value="CNY">CNY (¥)</option>
+              <option value="">The balance's currency (may change)</option>
+            </select>
+            <div class="settings-help">The usage card shows this relay's estimated DeepSeek spend of the calendar month (UTC) against the budget, in the budget's currency, amber near the budget and red over it. Leave the amount empty for no budget bar.</div>
+            <label for="deepseek-starting-balance-input" style="margin-top: 8px;">Starting balance (optional)</label>
+            <input
+              id="deepseek-starting-balance-input"
+              type="number"
+              inputmode="decimal"
+              min="0"
+              step="0.01"
+              autocomplete="off"
+              placeholder="The balance after the last top-up"
+              aria-label="DeepSeek starting balance"
+              aria-describedby="deepseek-starting-balance-help"
+            >
+            <div id="deepseek-starting-balance-help" class="settings-help">The usage card's balance bar measures what is left against this amount, in the balance's currency, for example your first top-up. Leave it empty to measure from the balance after the last top-up this relay has seen (before it has seen one, the highest balance it has read).</div>
+            <div id="deepseek-starting-balance-status" class="settings-help" hidden></div>
+            <details id="deepseek-advanced" style="margin-top: 8px;">
+              <summary>Advanced</summary>
+              <label for="deepseek-base-url-input" style="margin-top: 8px;">Base URL</label>
+              <input
+                id="deepseek-base-url-input"
+                type="url"
+                autocomplete="off"
+                placeholder="https://api.deepseek.com"
+                aria-label="DeepSeek base URL"
+              >
+              <div class="settings-help">Leave empty for DeepSeek's own API. Another address must use https (http only on this machine, for a local proxy); the key is sent there and nowhere else.</div>
+            </details>
+            <div id="deepseek-settings-status" class="settings-help settings-provider-status">Loading DeepSeek settings…</div>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+              <button id="deepseek-save-btn" type="button" class="summary-btn" onclick="saveDeepSeekSettings()">Save DeepSeek settings</button>
+              <button id="deepseek-remove-btn" type="button" class="summary-btn" onclick="removeDeepSeekSettings()">Remove saved key</button>
+            </div>
+            <div class="settings-help">DeepSeek chats run Claude Code on the relay host against DeepSeek's Anthropic-compatible API, with all four modes, tools and question cards. The key is stored on the relay host and never sent to browsers; saving it lists DeepSeek's models. Turns are billed to the DeepSeek account the key belongs to.</div>
+            <div id="deepseek-usage-import" class="deepseek-usage-import" role="group" aria-labelledby="deepseek-usage-import-title">
+              <label id="deepseek-usage-import-title">Import usage export</label>
+              <div class="settings-help">DeepSeek's usage page exports two files for a period, amount and cost. Imported here, their figures for the saved key replace the estimate on the usage card for the days they cover; the other days stay estimated.</div>
+              <div class="deepseek-usage-import-files">
+                <label for="deepseek-usage-amount-input" class="settings-help">Amount file</label>
+                <input id="deepseek-usage-amount-input" type="file" accept=".csv,text/csv" aria-label="DeepSeek usage export: amount file">
+                <label for="deepseek-usage-cost-input" class="settings-help">Cost file</label>
+                <input id="deepseek-usage-cost-input" type="file" accept=".csv,text/csv" aria-label="DeepSeek usage export: cost file">
+              </div>
+              <div>
+                <button id="deepseek-usage-import-btn" type="button" class="summary-btn" onclick="importDeepSeekUsageExport()">Import usage export</button>
+              </div>
+              <div id="deepseek-usage-import-status" class="settings-help settings-provider-status deepseek-usage-import-status" role="status" aria-live="polite"></div>
+            </div>
           </div>
         </div>
       </div>

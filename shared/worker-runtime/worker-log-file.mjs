@@ -95,3 +95,63 @@ export function installWorkerLogFile({
     },
   };
 }
+
+const REDACTED_SECRET_TEXT = '[redacted]';
+// As the relay's redaction of worker posts (server/services/worker-secret-redaction.mjs):
+// a shorter value would mangle ordinary text.
+const MIN_REDACTED_SECRET_LENGTH = 8;
+
+/**
+ * Replaces each secret's exact text with `[redacted]` in what the worker
+ * writes to stdout/stderr, on every platform: the console, the Linux
+ * launcher's redirect into the worker log, and the Windows copy above (install
+ * this after installWorkerLogFile so the copy gets the redacted text). A
+ * secret split across two writes is not caught; the worker logs whole lines.
+ * Returns null when there is no secret of at least 8 characters.
+ */
+export function installWorkerLogRedaction({
+  secrets = [],
+  processImpl = process,
+} = {}) {
+  const values = [...new Set((Array.isArray(secrets) ? secrets : [])
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => value.length >= MIN_REDACTED_SECRET_LENGTH))]
+    .sort((a, b) => b.length - a.length);
+  if (!values.length) return null;
+
+  const redact = (text) => {
+    let output = text;
+    for (const value of values) {
+      if (output.includes(value)) output = output.split(value).join(REDACTED_SECRET_TEXT);
+    }
+    return output;
+  };
+
+  const restores = [];
+  for (const stream of [processImpl.stdout, processImpl.stderr]) {
+    if (!stream || typeof stream.write !== 'function') continue;
+    const originalWrite = stream.write;
+    const redactingWrite = function redactingWrite(chunk, encoding, callback) {
+      if (typeof chunk === 'string') {
+        return originalWrite.call(this, redact(chunk), encoding, callback);
+      }
+      if (chunk instanceof Uint8Array) {
+        const bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        if (values.some((value) => bytes.includes(value))) {
+          const done = typeof encoding === 'function' ? encoding : callback;
+          return originalWrite.call(this, redact(bytes.toString('utf8')), 'utf8', done);
+        }
+      }
+      return originalWrite.call(this, chunk, encoding, callback);
+    };
+    stream.write = redactingWrite;
+    restores.push(() => {
+      if (stream.write === redactingWrite) stream.write = originalWrite;
+    });
+  }
+  return {
+    uninstall() {
+      for (const restore of restores) restore();
+    },
+  };
+}

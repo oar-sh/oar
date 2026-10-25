@@ -10,7 +10,7 @@
 import { isSetupRequired } from './provider-readiness.mjs';
 
 export const SETUP_HEADING = 'Set up a provider';
-export const SETUP_TEXT = 'Turn on Claude, Cursor, OpenAI or Grok in Settings → Providers, or sign in to the Copilot CLI on the relay host.';
+export const SETUP_TEXT = 'Turn on Claude, Cursor, OpenAI, Grok or DeepSeek in Settings → Providers, or sign in to the Copilot CLI on the relay host.';
 
 const ACTIONS = Object.freeze({
   openSettings: (primary) => ({ id: 'empty-state-open-settings', action: 'open-settings', label: primary ? 'Open Settings' : 'Settings', primary, link: !primary }),

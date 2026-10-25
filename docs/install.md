@@ -15,6 +15,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | A Claude login on the relay host | Claude chats | Log in from **⚙️ Settings → Providers → Claude → Relogin** (the panel can install the Claude Code CLI first), or run `claude` once on the host. Turns run on the Claude Code build that comes with OAR, so the CLI is needed for the login, not for the chats (see [Claude](providers.md#claude-agent-sdk)). The relay stores no Claude key |
 | The same Claude login, from a claude.ai account with GitHub connected | Claude Cloud chats | The Claude GitHub app must be allowed on each repository a cloud chat works on (see [Claude Cloud](providers.md#claude-cloud)) |
 | Cursor API key | Cursor chats | Entered in **⚙️ Settings**, stored in the relay database |
+| DeepSeek API key | DeepSeek chats | Entered in **⚙️ Settings**, stored in the relay database. No CLI is needed: the turns run on the Claude Code build that comes with OAR (see [DeepSeek](providers.md#deepseek)) |
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
 | `cloudflared` (optional) | the built-in Cloudflare tunnel | Not included; install it yourself (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)) |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
@@ -41,7 +42,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.16 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.17 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -54,7 +55,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.16'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.17'` before the command.
 
 ## npm
 

@@ -114,7 +114,7 @@ const TITLE_MAX = 80;
 
 // The provider settings routes a relay serves; github (Copilot) has none with
 // models — its catalogue is /api/models plus /api/status defaultModel.
-const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud']);
+const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud', 'deepseek']);
 // A Claude Cloud session clones a GitHub repository instead of opening a
 // folder: create_session takes `repo` and `branch` for it.
 const CLOUD_PROVIDER = REMOTE_RELAY_CLOUD_PROVIDER;
@@ -140,6 +140,7 @@ const CATALOG_PROVIDER_LABELS = Object.freeze({
   cursor: 'cursor',
   grok: 'grok',
   'claude-cloud': 'claude-cloud',
+  deepseek: 'deepseek',
 });
 // Worker statuses that mean "working on something right now" (scope active).
 const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);

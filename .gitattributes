@@ -8,3 +8,6 @@ scripts/git-hooks/* text eol=lf
 # cmd.exe mis-reads labels in LF-only batch files.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# The DeepSeek usage export as the platform writes it: BOM and CRLF, kept as is.
+tests/fixtures/deepseek-usage-export/*.csv -text

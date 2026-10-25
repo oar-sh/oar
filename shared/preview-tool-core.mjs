@@ -173,7 +173,7 @@ export async function executePreviewTool(input, { api, conversationId = '' } = {
     const response = await api('POST', '/api/previews', body);
     const existing = response?.existing === true;
     const hint = parsed.port
-      ? `Serve the app under ${response?.basePath} (the proxy strips the prefix and sends X-Forwarded-Prefix). Tell the user the URL and that the link is public.`
+      ? `Serve the app under ${response?.basePath} (the proxy strips the prefix and sends X-Forwarded-Prefix). Bind the dev server to 127.0.0.1, not 0.0.0.0: the relay's proxy reaches it there and nothing else should. Tell the user the URL and that the link is public.`
       : 'The directory is served as-is; relative asset paths work, root-absolute ones do not. Tell the user the URL and that the link is public.';
     return {
       ok: true,

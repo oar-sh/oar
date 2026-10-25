@@ -165,3 +165,14 @@ test('question cards name the runtime that asks, not always Copilot', () => {
   assert.equal(questionCardHeadLabel(null), 'Question');
   assert.equal(questionCardHeadLabel({}), 'Question');
 });
+
+test('a DeepSeek conversation has its own name, pill key and lock note', async () => {
+  const indicator = await import('./conversation-provider-indicator.mjs');
+  const conversation = { runtimeProviderType: 'deepseek', runtimeProviderModel: 'deepseek-flash' };
+  assert.equal(indicator.isConversationUsingDeepSeekProvider(conversation), true);
+  assert.equal(indicator.conversationProviderIndicatorLabel(conversation), 'DeepSeek');
+  assert.equal(indicator.conversationProviderIndicatorKey(conversation), 'deepseek');
+  assert.equal(indicator.questionCardHeadLabel(conversation), 'DeepSeek question');
+  // Models switch between turns, so the note names no pinned model.
+  assert.equal(indicator.sessionLockNoteText({ providerType: 'deepseek' }), '🔒 Session locked to DeepSeek models.');
+});

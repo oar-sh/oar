@@ -55,6 +55,16 @@ import { refreshPushSettingsSection } from './push-settings.js';
 import { selectSettingsTab } from './settings-tabs.js';
 import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
+import { syncDeepSeekSettingsInputs } from './deepseek-settings-ui.js';
+
+export {
+  applyDeepSeekSettingsState,
+  importDeepSeekUsageExport,
+  refreshDeepSeekSettingsState,
+  removeDeepSeekSettings,
+  saveDeepSeekSettings,
+  toggleDeepSeekProvider,
+} from './deepseek-settings-ui.js';
 import { openClaudeCloudSettingsSection } from './claude-cloud-settings-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
@@ -1949,6 +1959,7 @@ export function openSettingsModal(tab, providerTab) {
   cursorSettingsInputsDirty = false;
   ensureCursorSettingsInputTracking();
   void syncCursorSettingsInputs();
+  void syncDeepSeekSettingsInputs();
   void refreshCursorAllowanceState();
   void refreshCursorDashboardTokenState();
   void refreshGrokAllowanceState();

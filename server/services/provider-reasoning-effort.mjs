@@ -1,5 +1,6 @@
 'use strict';
 
+import { DEEPSEEK_REASONING_EFFORTS } from '../../shared/deepseek-models.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
 
 // 'ultracode' is not an Agent SDK EffortLevel: it is a relay-side sentinel for
@@ -57,6 +58,8 @@ export function supportedReasoningEffortsForProviderModel({
   }
   // A cloud session takes no effort choice: the only tier is the default one.
   if (provider === 'claude-cloud') return [...CLAUDE_CLOUD_REASONING_EFFORTS];
+  // DeepSeek's levels are the same for every model it serves.
+  if (provider === 'deepseek') return [...DEEPSEEK_REASONING_EFFORTS];
   if (provider === 'openai' || provider === 'openai-image') {
     const efforts = openAIReasoningEffortsForModel(model);
     return Array.isArray(efforts) && efforts.length ? efforts.map(normalizeEffort).filter(Boolean) : null;
@@ -72,18 +75,28 @@ export function supportedReasoningEffortsForProviderModel({
 // `strict` reproduces the one provider that refuses rather than clamps: OpenAI
 // answers an unsupported effort with a 400, so bootstrap must not store a value
 // the first send would reject.
+//
+// `defaultEffort` replaces the off-switch as the answer to an unstated effort
+// (DeepSeek thinks at `high` unless told otherwise), and `aliasFor` maps a
+// request into the provider's own levels before it is checked.
 export function resolveProviderReasoningEffort({
   requestedEffort = '',
   supportedEfforts = null,
   strict = false,
+  defaultEffort = '',
+  aliasFor = null,
 } = {}) {
-  const requested = normalizeEffort(requestedEffort);
+  const raw = normalizeEffort(requestedEffort);
+  const requested = raw && typeof aliasFor === 'function' ? (normalizeEffort(aliasFor(raw)) || raw) : raw;
   const supported = Array.isArray(supportedEfforts)
     ? supportedEfforts.map(normalizeEffort).filter(Boolean)
     : null;
   if (!supported) return { ok: true, effort: requested, supported: [] };
   const providerDefault = supported.includes('none') ? 'none' : (supported[0] || '');
-  if (!requested) return { ok: true, effort: providerDefault, supported };
+  const preferredDefault = normalizeEffort(defaultEffort);
+  if (!requested) {
+    return { ok: true, effort: supported.includes(preferredDefault) ? preferredDefault : providerDefault, supported };
+  }
   if (supported.includes(requested)) return { ok: true, effort: requested, supported };
   if (strict) {
     return {

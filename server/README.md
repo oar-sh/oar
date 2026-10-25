@@ -678,10 +678,11 @@ one client (`server-runtime.mjs`), whose `nudge` lets the CLI look at its own st
 its own reader, without a nudge. `applyClaudeCloudProviderEnvironment` adds no credential to the
 launch environment (`COPILOT_WEB_RELAY_WORKER_KIND=claude-cloud` and `CLAUDE_CLOUD_RELAY_MODEL`,
 nothing else). Only a relay that itself runs on `CLAUDE_CODE_OAUTH_TOKEN` passes a login on: the
-variable is one of `WORKER_SECRET_ENV_VARS`, restricted to the `claude-cloud` worker kind
-(`workerSecretEnvVarsFor`), so under tmux it reaches a cloud worker through the owner-only secret
-env file, never as an `export` and never in the environment tmux is started with, and no other
-worker kind gets it that way. `redact()` takes the token out of every error text.
+variable is one of `WORKER_SECRET_ENV_VARS`, restricted to the `claude-cloud` and `claude` worker
+kinds (`workerSecretEnvVarsFor`), so under tmux it reaches those workers through the owner-only
+secret env file, never as an `export` and never in the environment tmux is started with. Every
+other kind has it taken out of its launch environment before any launch path sees it
+(`withoutForeignWorkerSecrets`), so the detached and Windows launches do not pass it on either. `redact()` takes the token out of every error text.
 
 The client's base URL is the Anthropic API. `shared/claude-cloud/base-url.mjs`
 (`resolveClaudeCloudBaseUrl`) lets `OAR_CLAUDE_CLOUD_API_BASE_URL` replace it for tests, and only
@@ -1444,10 +1445,12 @@ start it again at once; the launch route clears that block.
 The launch environment is the relay's own, taken once at boot (`buildSessionWorkerLaunchEnv`), plus
 per launch the conversation's working directory as `COPILOT_WORKSPACE_ROOT` and `INIT_CWD`,
 `SESSION_ID`, `COPILOT_ALLOW_ALL`, and the bound provider's worker kind, model and credentials
-(`buildSessionWorkerLaunchEnvForSession`). The detached and Windows launches pass all of it. Under
-tmux the worker's login shell gets only the variables `buildTmuxWorkerShellCommand` exports, and
-the secrets (`COPILOT_PROVIDER_API_KEY`, `CURSOR_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` for cloud
-workers) through an owner-only file it reads and deletes; any other variable, such as
+(`buildSessionWorkerLaunchEnvForSession`), minus the secrets that are another worker kind's
+(`withoutForeignWorkerSecrets`). The detached and Windows launches pass all of that. Under tmux
+the worker's login shell gets only the variables `buildTmuxWorkerShellCommand` exports, and the
+secrets (`COPILOT_PROVIDER_API_KEY`, `CURSOR_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` for cloud and
+Claude workers, `DEEPSEEK_API_KEY` for DeepSeek workers) through an owner-only file it reads and deletes, never in the environment tmux is
+started with; any other variable, such as
 `OAR_TURN_STALL_*_MS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `XAI_API_KEY`, only from the tmux
 server's environment or the login profile (see [Session workers under
 tmux](../docs/configuration.md#environment-variables)). `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN` makes
@@ -1641,7 +1644,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
 | GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored, and so are Cursor, Grok and Claude Cloud sessions. All return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars', unit, series[], items[{ key, label, values }], note, summary }`) are `deepseek-daily-spend` (30 UTC days stacked by model) and `deepseek-spend-shares` (per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); `?providers=deepseek` reads it live. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`, `attributionMode`, `backgroundCommandLimitMinutes` with the slider bounds `backgroundCommandLimitMinMinutes`, `backgroundCommandLimitMaxMinutes`, `backgroundCommandLimitStepMinutes`, `backgroundCommandLimitDefaultMinutes`) |
@@ -1650,17 +1653,20 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/settings/claude-cloud` | `{ enabled?, defaultModel?, environmentId? }` → `{ ok: true, …the GET body }`. Enabling without a Claude login on the host is `400` with `code: 'claude_cloud_login_missing'`; an empty `environmentId` clears the stored one. Emits `claude_cloud_settings_updated` |
 | GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
+| GET | `/api/settings/deepseek` | Read DeepSeek settings: `{ configured, enabled, model, models, availableModels, discovered, baseUrl, defaultBaseUrl, attribution, monthlyBudget, monthlyBudgetCurrency, efforts, providerType }`. `monthlyBudgetCurrency` is `USD` or `CNY`, or `null` for a budget saved before the currency was stored (read in the balance's currency). `models` is the enabled subset (the default model always in it), `availableModels` what `GET {baseUrl}/models` listed (or the built-in `deepseek-flash`, `deepseek-v4-pro`). The key is never in it: `configured` says whether one is stored |
+| POST | `/api/settings/deepseek` | `{ apiKey?, enabled?, model?, enabledModels?, baseUrl?, attribution?, monthlyBudget?, monthlyBudgetCurrency?, remove? }` → `{ ok: true, …the GET body, reconciliation, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live DeepSeek workers. `baseUrl` must be `https:` (`http:` only on a loopback host), without credentials, query or fragment; `attribution` is `oar` or `off`; `monthlyBudget` is an amount of zero or more (rounded to cents; `null`, empty or zero clears it and its currency, which removes the usage card's budget bar); `monthlyBudgetCurrency` is `USD` or `CNY` (`null` or empty: the balance's currency), stored with the budget and shown on the bar; else `400`. Removing the key is `409` (`deepseek-key-removal-blocked`) while a DeepSeek conversation has a message or a queued one, and moves unstarted DeepSeek conversations back to Copilot. Emits `deepseek_settings_updated` and `models_updated` |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | GET | `/api/settings/relay-restart-max-wait` | How long a queued relay restart waits before it asks: `{ maxWaitMinutes, choices: [5, 10, 15, 30, 60, 120, 240, 0], defaultMinutes: 30, overrideMs }`; `0` = no limit; `overrideMs` is `OAR_RELAY_RESTART_MAX_WAIT_MS` when set |
 | POST | `/api/settings/relay-restart-max-wait` | `{ maxWaitMinutes }` → the GET body; anything but one of `choices` is `400`. A queued request measures its current period against the new value at once |
 | GET | `/api/settings/subagent-record-retention` | How long sub-agent records keep tool inputs and output: `{ retentionDays, choices: [0, 7, 14, 30, 90], defaultDays: 90 }`; `0` = keep for good |
 | POST | `/api/settings/subagent-record-retention` | `{ retentionDays }` → the GET body; anything but one of `choices` is `400`. Runs a retention sweep 5 s later |
-| POST | `/api/claude-native-session` | (Claude worker) Persist the native Agent SDK session id for resume |
-| POST | `/api/claude-context-usage` | (Claude and Claude Cloud workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
+| POST | `/api/claude-native-session` | (Claude and DeepSeek workers) Persist the native Agent SDK session id for resume |
+| POST | `/api/claude-context-usage` | (Claude, Claude Cloud and DeepSeek workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
 | POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot; a Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
 | POST | `/api/claude-cloud-session` | (Claude Cloud worker) Report the cloud session a conversation is bound to: `{ conversationId, cloudSessionId, sessionUrl?, lastSequence, pushedBranch?, costUsd?, model? }` → `{ ok, cloud }`. Sent after the session was created, after every `result` and on a push; emits `claude_cloud_session`. `404` without a runtime session, `409` for a conversation that is not a cloud one |
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
+| POST | `/api/deepseek-plan-usage` | (DeepSeek worker) Report, after a turn, the CLI's running token totals per model for its Claude Code session: `{ conversationId, sdkSessionId?, claudeNativeSessionId, runId?, at?, totals: [{ model, hitTokens, missTokens, outputTokens }], requests?: [{ model, searchRequests, fetchRequests }] }` (cache hits, cache misses, output; the web searches and fetches). `runId` names the worker's Claude Code process. A Claude model name (`claude-opus-5-5`, from a Claude Code spawned without the alias pins) is booked under the DeepSeek model that served it (`claude-opus*` → `deepseek-v4-pro`, `claude-sonnet*` / `claude-haiku*` → `deepseek-flash`), entries of one model summed. With a run id the totals are that process's own, counted from zero by the worker (the CLI's `modelUsage` is the session's running total, which a resumed CLI continues from its transcript; the worker reports what it grows by per result, and for the first result of a process resumed on its session the turn's own `usage`, so a CLI that died before writing its cost state and restored an older snapshot books nothing of the history again). The relay keeps the totals last reported per (conversation, session, model), with the run id, in `deepseek_usage_checkpoints` and books, under the checkpoint's run id, only the increase, field by field, into `deepseek_usage_totals` with the estimate in USD and CNY at DeepSeek's price for `at` (peak or off-peak; the relay's time when it is missing or more than five minutes ahead). A total below its checkpoint under the checkpoint's run id is a stale report (retried, or delivered after a later one): nothing is booked and the checkpoint keeps its high-water mark. Under another run id the report is a new process, booked in full, from which the checkpoint starts over. Known limits: a late report of an earlier process after a newer one started is booked in full, and the newer run's next report is also booked in full (the checkpoint had moved back to the earlier run, so the relay cannot tell either from a new process); the first result of a process resumed on its session reports the main loop's `usage` under the turn's model, so what sub-agents spent in that one turn is left out. Without a run id (an older worker) the totals are the CLI's session totals: the increase is booked, and a drop is a CLI counting from zero again on the same session, booked in full. A new session starts from zero. With a run id the requests are the process's running counts, booked like the tokens under a run id of their own (`request_run_id`; a repeated post adds nothing, an entry with counts only leaves the token checkpoint's run alone); without one they are the turn's counts, booked as they come. Requests are counted from the first turn and priced at $0.75 / ¥5 per 1,000 from 2026-10-31 16:00 UTC (no peak price); the same sums go into `deepseek_usage_days` per UTC day in the same transaction. A repeated report answers `200` with nothing booked. `400` on a malformed body, `404` without a runtime session, `409` for a conversation not bound to DeepSeek |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run. A new run needs the spawning turn's `messageId`; an update to a known run may omit it (a background agent's end arrives between turns). Optional header fields: `subagentType`, `model`, `modelInherited`, `taskId`, `background`, `timelineOwner`; a post without `status` leaves the run's state alone. Emits `subagent_status` with the whole header |
 | POST | `/api/subagent-timeline` | (Worker) `{ conversationId, subagentRunId, taskId?, entries: [{ key, kind, text, done?, toolName?, toolUseId?, metadata? }], header? }` → `{ ok, stored, truncated }`. Kinds: `thought`, `tool_call`, `tool_result`, `text`, `child`, `note`. Fenced by the run row, not by an open turn; an unknown run whose `header.parentSubagentId` is known is created under the parent's turn, an unknown run whose `taskId` (or `header.taskId`) a run of the conversation carries is written to that run (a resumed agent; when the post sets that finished run `running` again, the relay adds a note where it resumed), anything else is `404 unknown_run`. `header.status: 'running'` clears the run's end time. Sends `subagent_timeline` `{ conversationId, messageId, subagentRunId, entries, truncated }`, volatile, only to the pages watching the run (`subagent_viewer_watch`) |
 | GET | `/api/conversation/:conversationId/subagent/:subagentRunId` | One run's record for the viewer: `?after=<seq>&limit=<n>` (default 500, max 2000) → `{ run, entries, children, nextAfter, complete }`. `entries` are those after `after` plus any still open; `run.legacy` marks a record rebuilt from the lane rows |
@@ -2406,6 +2412,47 @@ four indexes (one unique on `relay_id`, `remote_id`): see
 [Questions that don't block](#questions-that-dont-block). Additive and idempotent; a failure is
 logged and retried on the next boot, and the ask actions answer that they are not available
 meanwhile. An older build ignores the table.
+`0024-deepseek-usage-totals.mjs` adds `deepseek_usage_totals` (`model` as the key, `hit_tokens`,
+`miss_tokens`, `output_tokens`, `turn_count`, `cost_usd` and `cost_cny` (NULL while no turn of the
+model could be priced), `first_seen_at`, `last_seen_at`, `updated_at`): what
+`POST /api/deepseek-plan-usage` adds up for the DeepSeek card; and `deepseek_usage_checkpoints`
+(`conversation_id`, `native_session_id`, `model` as the key, `hit_tokens`, `miss_tokens`,
+`output_tokens`, `updated_at`): the totals a CLI session last reported, which a report is
+diffed against. Additive and idempotent; the plan usage service creates the tables too, so a
+failed boot run is logged and retried on the next boot. An older build ignores both tables.
+`0025-deepseek-usage-requests-daily.mjs` adds to `deepseek_usage_totals` the columns
+`search_requests`, `fetch_requests` (Claude Code's web searches and fetches on DeepSeek's Search
+API), `tools_cost_usd` and `tools_cost_cny` (their cost, 0 before 2026-10-31 16:00 UTC); the table
+`deepseek_usage_days` (`day` in UTC and `model` as the key, then the same token, request, turn and
+cost columns as the totals): the sums per day the DeepSeek card's daily chart and monthly budget
+read, booked in the same transaction as the totals; and `deepseek_balance_reference` (`currency`
+as the key, `reference_total`, `last_total`, `reference_at`, `updated_at`): the balance after the
+latest top-up, which the card's balance meter measures against. Additive and idempotent, handled
+like 0024. An older build ignores the columns and tables.
+`0026-deepseek-usage-served-models.mjs` folds rows of `deepseek_usage_totals`, `deepseek_usage_days`
+and `deepseek_usage_checkpoints` booked under a Claude model name (`claude-opus*`, which DeepSeek's
+Anthropic-compatible endpoint serves with `deepseek-v4-pro`; `claude-sonnet*` and `claude-haiku*`,
+served with `deepseek-flash`) into the DeepSeek model's row: tokens, requests and turns are summed,
+the folded tokens priced at the DeepSeek model's price for the row's last turn time (`last_seen_at`,
+or `updated_at` of a daily row), and the Claude-named row deleted. A session's Claude-named and
+DeepSeek-named checkpoints add up to what its worker reports once it names the DeepSeek model.
+Idempotent, handled like 0024; the plan usage service runs it too when it opens a database. The folded
+tokens and requests are priced at one time, the row's last: a row that spans peak and off-peak turns
+is approximated (at most 2× off on the token part).
+`0027-deepseek-usage-checkpoint-runs.mjs` adds to `deepseek_usage_checkpoints` the columns `run_id`
+(the worker's id of the Claude Code process the totals came from, '' for an older worker's report),
+`search_requests` and `fetch_requests` (that process's running counts of web searches and fetches):
+a report below the checkpoint under the same run id is stale and books nothing, under another run id
+it is a process counting from zero, booked in full; before, every drop was booked in full, so a pair
+of reports delivered out of order booked the earlier turns twice. Additive and idempotent, handled
+like 0024. An older build ignores the columns.
+`0028-deepseek-usage-checkpoint-request-runs.mjs` adds to `deepseek_usage_checkpoints` the column
+`request_run_id`: the run id of the checkpoint's search and fetch counts, kept apart from `run_id`,
+the run id of its token totals. With 0027 one run id served both, so a report that carried only
+counts for a model (a sub-agent's model that searched without a token entry of its own) moved the
+run id of that model's token totals too, and a later token report of the earlier process was read as
+a new process and booked in full instead of as a stale one. Additive and idempotent, handled like
+0024 (it applies 0027 first on a database that skipped it). An older build ignores the column.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next

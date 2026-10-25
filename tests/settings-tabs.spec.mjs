@@ -70,6 +70,19 @@ const LEGACY_SETTINGS_IDS = [
   "cursor-dashboard-token-status",
   "cursor-dashboard-token-save-btn",
   "cursor-dashboard-token-remove-btn",
+  // Providers → DeepSeek
+  "deepseek-enabled-toggle",
+  "deepseek-api-key-input",
+  "deepseek-model-select",
+  "deepseek-attribution-select",
+  "deepseek-base-url-input",
+  "deepseek-settings-status",
+  "deepseek-save-btn",
+  "deepseek-remove-btn",
+  "deepseek-usage-amount-input",
+  "deepseek-usage-cost-input",
+  "deepseek-usage-import-btn",
+  "deepseek-usage-import-status",
   // Previews
   "previews-settings-section",
   "settings-previews-list",
@@ -138,7 +151,7 @@ const LEGACY_SETTINGS_IDS = [
 const TABS = ["general", "providers", "relays", "previews", "shares", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
-const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-cloud", "grok", "cursor"];
+const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-cloud", "grok", "cursor", "deepseek"];
 
 async function loadApp(page) {
   await page.goto(`/?token=${encodeURIComponent(relayToken())}`);

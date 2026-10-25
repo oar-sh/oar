@@ -50,6 +50,9 @@ export const MODEL_FALLBACK_LIMITS = Object.freeze({
   // (public xAI docs values); also reachable through the Cursor catalog.
   'grok-4': 256000,
   'grok-code-fast-1': 256000,
+  // DeepSeek (api-docs.deepseek.com, list-models: context_window 1048576).
+  'deepseek-flash': 1048576,
+  'deepseek-v4-pro': 1048576,
 });
 
 /**

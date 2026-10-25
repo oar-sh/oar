@@ -153,6 +153,7 @@ let deps = null;
  * @property {(payload?: object) => void} applyOpenAISettingsState
  * @property {(payload?: object) => void} applyClaudeSettingsState
  * @property {(payload?: object) => void} applyGrokSettingsState
+ * @property {(payload?: object) => void} applyDeepSeekSettingsState
  * @property {(payload?: object) => void} applyCursorSettingsState
  */
 
@@ -491,6 +492,15 @@ export async function connectSocket(overrideDeps) {
   socket.on('grok_settings_updated', (payload) => {
     const state = deps?.applyGrokSettingsState?.(payload || {});
     updateProviderReadinessInputs({ grok: state || payload || null });
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
+  socket.on('deepseek_settings_updated', (payload) => {
+    const state = deps?.applyDeepSeekSettingsState?.(payload || {});
+    updateProviderReadinessInputs({ deepseek: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())

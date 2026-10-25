@@ -3,6 +3,226 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.17] — 2026-10-25
+
+Highlights: DeepSeek is a provider of its own. Paste a DeepSeek API key and
+New Chat offers DeepSeek's models, with all four modes, tools, question
+cards, sub-agents and reasoning effort, the 1M context window, a usage card
+with the balance and the estimated spend, and an import of earlier usage
+from DeepSeek's usage export. A new session in a group now shows
+at the top of the group. And the relay's own Anthropic credentials
+(`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`) no longer reach the agents it
+starts.
+
+### Added
+
+- **DeepSeek is a provider of its own.** Paste a DeepSeek API key in
+  Settings → Providers → DeepSeek, and New Chat offers DeepSeek with the
+  models DeepSeek lists (`deepseek-flash` by default, `deepseek-v4-pro`).
+  - A DeepSeek chat runs Claude Code on the relay host against DeepSeek's
+    Anthropic-compatible API, so it has all four modes, tools, question
+    cards, sub-agents, steering, Stop and background tasks.
+  - Reasoning effort is low, high or max (high by default). The model can
+    change between turns; a switch to a model without image input is
+    refused once the chat holds images.
+  - The context panel shows the 1M window, and the chat compacts at 400K
+    unless you set another window there.
+  - Commits carry `Open Agent Relay (DeepSeek Flash)` or no attribution, as
+    set on the DeepSeek tab.
+  - The key is stored on the relay host, is never sent to browsers, and
+    reaches only DeepSeek's workers. Their Claude Code keeps its state in a
+    directory of its own, without your Claude login. The tab's Advanced
+    section takes another base URL (https, or http on the same machine).
+  - The chat folder's settings can't route the key elsewhere. A
+    `.claude/settings.json` or `.claude/settings.local.json` there that sets
+    `ANTHROPIC_BASE_URL`, a key of its own or an `apiKeyHelper` took the
+    DeepSeek key to that endpoint, or replaced it; the relay now pins
+    DeepSeek's endpoint and key over the folder's settings, and with them
+    the proxy, TLS trust, provider and credential settings, without putting
+    the key on the command line, and sends nothing when Claude Code doesn't
+    take them within a minute (`scripts/deepseek-cli-proof.mjs` shows it on
+    the bundled Claude Code). This covers settings, not commands: hooks and
+    a status line in those files still run as the relay's user, as in any
+    Claude Code chat, so use DeepSeek chats only in folders you trust.
+  - The agent's own commands can read the key from their environment, as
+    with any key a CLI holds. The relay replaces it with `[redacted]` in
+    everything a worker posts (replies, thoughts, tool activity, sub-agent
+    text, questions, task output), including the first part of a key cut
+    short at a text's end or before an ellipsis, the last part of one a
+    text starts with, and keys changed since the relay started, before it
+    stores or shows it; the DeepSeek worker does the same in its log. Task
+    output the relay reads from a task's file is scrubbed by shape only
+    (`sk-` keys and other long tokens), not by the saved key's exact text.
+    This keeps the key out of what the relay stores and shows; it is no
+    barrier against the agent, which can change the text, call the relay's
+    local API without the worker header or read the relay's database.
+  - The usage view has a DeepSeek card: the account balance, read with the
+    saved key, and the estimated spend of DeepSeek turns on this relay, by
+    model, from DeepSeek's published prices with peak and off-peak hours
+    (the card names the peak hours in your browser's time zone). On Chinese
+    public holidays DeepSeek charges off-peak prices all day; the estimate
+    doesn't know those dates, so turns at peak hours on a holiday are
+    counted at double the real price. Only WebSearch runs on DeepSeek's
+    servers: its searches are counted at $0.75 / ¥5 per 1,000 requests from
+    2026-10-31 16:00 UTC, on a "Search" row of their own, taken from Claude
+    Code's own totals, which count the request its WebSearch tool makes.
+    WebFetch reads the page on the relay host and costs only tokens, and
+    DeepSeek does not bill count_tokens requests.
+  - The card draws the money: a balance bar per currency, measured against
+    the balance after its last top-up (kept on the relay; migration 0029
+    notes when it rose), or against a starting balance set on the DeepSeek
+    tab, such as the first top-up, until the next top-up replaces it (typed
+    in again, the same amount too, it counts from then on); the
+    daily spend of the last 30 days as columns stacked by model, with the
+    day's total on hover or tap; where the money goes per model (cache hits, misses,
+    output, searches) with what the cache saved; and a monthly
+    budget bar when a budget is set on the DeepSeek tab, in the currency
+    chosen with it (USD or CNY, named on the bar; a budget saved without one
+    follows the balance's currency), amber near it and red over it, starting
+    over on the 1st (UTC). No chart library; every bar has a text equivalent
+    and every chart a table, in both themes. The card shows everything at
+    once, figures first (the balance and the spend as label-and-value rows,
+    the tables by model open, the note on the estimate last), and fits a
+    phone's width.
+  - A DeepSeek chat's cold start reads "Starting Claude Code for DeepSeek",
+    and the `preview` tool tells the agent to bind its dev server to
+    127.0.0.1 (every provider).
+  - Sub-agents stay on the chat's model. Claude Code's model aliases are
+    pinned to it, so a sub-agent the agent asks for as "opus" or "sonnet",
+    or one without a model, runs on the chat's model, and one asked for as
+    "haiku" on DeepSeek Flash; before, an alias went to DeepSeek as a Claude
+    model id, which DeepSeek serves by its own mapping (a Flash chat got a
+    V4 Pro sub-agent). A model switch between turns now restarts the chat's
+    Claude Code, like an effort change. A sub-agent's badge names the
+    DeepSeek model, and usage a Claude Code still reports under a Claude
+    name is booked and priced under the DeepSeek model that served it;
+    rows booked under a Claude name earlier are folded in at start-up
+    (migration 0026). The folded rows are priced at one time each, the
+    row's last turn, so a row that spans peak and off-peak turns is
+    approximated (the token part by up to 2×).
+  - **Import usage export** on the DeepSeek tab takes the two CSV files
+    DeepSeek's usage page exports (amount and cost) and shows what was
+    imported. The usage card then shows DeepSeek's own figures for the saved
+    key on the days the export covers, by the export's days, and the
+    estimate on the other days; the card says through when. Only rows in
+    the card's currency are used, and the import says when they won't be.
+    A re-import replaces the key's days it covers, a day with a period that
+    has not ended is left out, and so are export days up to and including
+    the first day of the relay's daily history.
+    `npm run deepseek:import -- amount.csv cost.csv [db-path]` does the same
+    from the shell. The relay's own usage logging is unchanged (migration
+    0030 adds a table of its own).
+
+### Changed
+
+- **A new session in a group shows at the top of the group.** In a group
+  you ordered by hand, a session an agent creates there, one started with
+  the group chosen, or one moved in by its menu used to join at the end;
+  it now comes first, right under the group's first session. The order you
+  set stays, and the next drag numbers the members again from there.
+- **A host's `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` no longer reach
+  any worker.** A relay started with either in its environment handed it to
+  every worker it started (Copilot, OpenAI, Cursor, Grok, Claude, Claude
+  Cloud, DeepSeek), on every platform, and Claude Code prefers either to the
+  Claude login. Now no worker gets them, and under tmux the worker's shell
+  also unsets them, so they cannot come back from a tmux server that was
+  already running or from your login profile. Claude chats that ran on such
+  a key now run on the host's Claude login.
+
+### Fixed
+
+- **The Inbox opens at the top, or where you left it.** It used to open at
+  the scroll height of the transcript it replaced, somewhere in the middle of
+  the list. It now opens at the top the first time and afterwards where it
+  was scrolled when you last left it.
+- **The session header on a phone comes in two rows.** ☰, the title and the
+  buttons share the first row, so the title gets the width left after the
+  buttons. The "via agent" line, the watching, watched and scheduled chips
+  and the folder sit side by side on a second row across the header, and a
+  chip no longer breaks inside its text. The desktop header is unchanged.
+- **A DeepSeek chat's failures carry DeepSeek's codes, and their buttons
+  show.** A refused DeepSeek request printed as `relay.claude-api-error`,
+  and a used-up balance or a refused key as `relay.claude-deepseek-balance`
+  or `relay.claude-deepseek-api-key`, which the **Top up DeepSeek** and
+  **DeepSeek settings** buttons never matched. They now print as
+  `relay.deepseek-balance`, `relay.deepseek-api-key`,
+  `relay.deepseek-api-error` and so on, without the Claude account advice.
+- **A relay's Claude login token no longer reaches workers that are not
+  Claude's.** On a relay started with `CLAUDE_CODE_OAUTH_TOKEN` in its
+  environment, the Copilot, OpenAI, Cursor and Grok workers got the token too:
+  on Windows and without tmux through the environment they inherit, and under
+  tmux whenever the launch started the tmux server, which then kept it for
+  every later session. Now only Claude Cloud and Claude workers get it, under
+  tmux through the owner-only file. Local Claude chats on a host that runs on
+  the token alone now get it under tmux as well.
+- **A relay started from inside a Claude Code session no longer hands that
+  session to its workers.** Its variables (`CLAUDECODE`, the session id, the
+  messaging socket and token, entrypoint, `CLAUDE_PID`, `CLAUDE_EFFORT`)
+  reached every worker, with and without tmux, and a DeepSeek chat's Claude
+  Code took itself for a child of the host's session. The launcher now drops
+  them for every provider, and the DeepSeek backend drops them again. The
+  values of one launch (worker kind, model, folder) go into that session's
+  command only, no longer into the environment a tmux server started by the
+  relay kept for every later session. Under tmux that was not enough: a new
+  tmux session starts from the tmux server's own environment, which a
+  server started from inside a Claude Code session, or by an older relay,
+  carried on to every worker. Every worker's command now begins by unsetting
+  the host session's variables and the launch variables it sets no value
+  for, so a stale model or worker kind from an earlier launch is gone too.
+  The host session's variables are matched by family as well as by name
+  (every `CLAUDE_CODE_SESSION_*`, `CLAUDE_CODE_*_SESSION_ID` and
+  `CLAUDE_CODE_MESSAGING_*`, with the SDK host's version and app markers
+  and the Bash cap a relay's Claude worker gives its CLI), so a name a
+  newer Claude Code adds is dropped too; your own `CLAUDE_CODE_*` and
+  `CLAUDE_AGENT_SDK_*` settings stay. A DeepSeek chat's Claude Code also no
+  longer gets the relay's settings for its worker (worker kind, the relay's
+  folders and tools file, `COPILOT_ALLOW_ALL`, `SESSION_ID`);
+  with them the worker log file a relay started from inside a worker
+  session inherited, and, by name, every secret the launch carries no value
+  for (other kinds' and its own alike) that a shell may have exported into
+  the tmux server's environment; the worker's own keys come from its secret
+  file, read after that.
+- **The DeepSeek spend no longer undercounts a Claude Code that started
+  counting over, and no longer double-counts a report that fell behind.**
+  The relay books what a worker's report adds to the session's last totals;
+  totals below them were booked as nothing. Now the worker names its Claude
+  Code process in each report (`runId`; migration 0027 keeps it with the
+  checkpoint): totals below the checkpoint from the same process are a
+  stale report (a retried post, or one delivered after a later one) and
+  book nothing, while from another process they are a CLI counting from
+  zero again on the same session id, booked in full. The web searches and
+  fetches are reported as the process's running counts and booked the same
+  way, so a retried post no longer counts them twice.
+- **The DeepSeek spend no longer books a session's history again after a
+  Claude Code died hard.** Claude Code writes its cost state at exit, so a
+  resumed CLI that was killed left an older snapshot, and the next resume
+  restored totals below what the relay had booked: read as a process
+  counting from zero, the whole restored history was booked once more. The
+  worker no longer reports what the CLI restored: it reports each process's
+  own totals, counted from zero (what the session totals grow by per
+  result; for the first result of a resumed process the turn's own usage,
+  which leaves out what sub-agents spent in that one turn), and the relay
+  books a new process in full and the increase within one. The search and
+  fetch counts keep a run id of their own in the checkpoint (migration
+  0028), so a report with counts only no longer moves the token totals' run
+  id, and a `/clear` in the CLI, which starts a new session id, starts the
+  worker's counts over with it instead of booking the old session's under
+  the new one. A turn that finishes after its Claude Code died (a background
+  task's continuation whose row was still registering) reports under that
+  process, not under the one running by then or as a report from no
+  process, and a result that arrives behind a newer one never lowers the
+  worker's baseline. A late report of an earlier process after a later one
+  started is booked in full, and the later process's next report is booked
+  in full too: the relay cannot tell either from a new process.
+- **OpenAI image models work on the SDK engine again.** A turn on
+  `gpt-image-*` or `dall-e-*` went to the Copilot runtime as a chat turn
+  and failed ("No available capacity was found for the model", or a request
+  rejected as invalid). It now goes to the OpenAI Images API, as on the
+  Extension engine, and an attached image is edited. A refused image request
+  now fails its turn with `relay.image-provider-rejected` instead of staying
+  in progress until the relay ran it again, and an OpenAI chat turn that
+  fails on the SDK engine says OpenAI rather than Copilot.
+
 ## [0.9.16] — 2026-10-24
 
 Highlights: agents can file the sessions they start into your session

@@ -134,3 +134,31 @@ test('a claude cloud session has no effort choice, whatever the Claude provider 
     ['none', 'low', 'high', 'xhigh'],
   );
 });
+
+test('DeepSeek offers its three levels for every model, defaults to high and maps other names', async () => {
+  const { deepseekReasoningEffortFor } = await import('../../shared/deepseek-models.mjs');
+  const supported = supportedReasoningEffortsForProviderModel({ providerType: 'deepseek', model: 'deepseek-v9-ultra' });
+  assert.deepEqual(supported, ['low', 'high', 'max']);
+  const resolve = (requestedEffort) => resolveProviderReasoningEffort({
+    requestedEffort,
+    supportedEfforts: supported,
+    defaultEffort: 'high',
+    aliasFor: deepseekReasoningEffortFor,
+  });
+  assert.deepEqual(resolve(''), { ok: true, effort: 'high', supported });
+  assert.equal(resolve('max').effort, 'max');
+  // DeepSeek runs medium and xhigh as high, minimal as low, ultracode as max;
+  // its thinking cannot be switched off through Claude Code, so none is low.
+  assert.equal(resolve('medium').effort, 'high');
+  assert.equal(resolve('xhigh').effort, 'high');
+  assert.equal(resolve('minimal').effort, 'low');
+  assert.equal(resolve('none').effort, 'low');
+  assert.equal(resolve('ultracode').effort, 'max');
+  // A name DeepSeek has no level for clamps to the lowest one.
+  assert.equal(resolve('turbo').effort, 'low');
+});
+
+test('defaultEffort only applies when the provider has that level', () => {
+  assert.equal(resolveProviderReasoningEffort({ supportedEfforts: ['low', 'medium'], defaultEffort: 'high' }).effort, 'low');
+  assert.equal(resolveProviderReasoningEffort({ supportedEfforts: ['none', 'high'] }).effort, 'none');
+});

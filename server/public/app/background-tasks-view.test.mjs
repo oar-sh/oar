@@ -362,6 +362,9 @@ test('model labels humanize full ids and capitalize bare spawn aliases', () => {
   assert.equal(formatTaskModelLabel('claude-opus-5-5[1m]'), 'Opus 5.5 [1m]');
   assert.equal(formatTaskModelLabel('claude-haiku-4-5-20251001'), 'Haiku 4.5');
   assert.equal(formatTaskModelLabel('opus'), 'Opus');
+  // A DeepSeek chat's sub-agents are published under DeepSeek's ids.
+  assert.equal(formatTaskModelLabel('deepseek-flash'), 'DeepSeek Flash');
+  assert.equal(formatTaskModelLabel('deepseek-v4-pro'), 'DeepSeek V4 Pro');
   assert.equal(formatTaskModelLabel(''), '');
 });
 

@@ -78,7 +78,7 @@ test('provider reconciliation manages cursor conversations', () => {
     'async function reconcileUnstartedConversationProviders(',
     '\nasync function rebindUnstartedOpenAIConversationModel(',
   );
-  assert.match(reconcileSource, /\['claude', 'cursor', 'grok'\]\.includes\(normalizedProvider\)/);
+  assert.match(reconcileSource, /\['claude', 'cursor', 'grok', 'deepseek'\]\.includes\(normalizedProvider\)/);
   assert.match(reconcileSource, /cursor: DEFAULT_CURSOR_MODEL,/);
   assert.match(
     reconcileSource,

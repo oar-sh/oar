@@ -2050,9 +2050,11 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   assert.equal(result.body.platform, 'linux');
   assert.equal(result.body.protocol, 0, 'no identity route: an older relay');
   const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
-  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud']);
+  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek']);
   assert.deepEqual(byName['claude-cloud'], { provider: 'claude-cloud', configured: false, defaultModel: null, models: [] },
     'a relay without the Claude Cloud settings route has no such provider');
+  assert.deepEqual(byName.deepseek, { provider: 'deepseek', configured: false, defaultModel: null, models: [] },
+    'a relay without the DeepSeek settings route has no such provider');
   assert.deepEqual(byName.github, {
     provider: 'github',
     configured: true,
@@ -2071,6 +2073,26 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   });
   assert.deepEqual(result.body.relayModes, ['plan', 'ask', 'agent', 'autopilot']);
   assert.match(result.body.summary, /OAR 0\.9\.4, providers github, openai, claude/);
+});
+
+test('relay_info lists DeepSeek with its models while the remote has it switched on', async () => {
+  const { run, remote } = setup();
+  remote.settings.deepseek = {
+    configured: true,
+    enabled: true,
+    model: 'deepseek-flash',
+    models: ['deepseek-flash', 'deepseek-v4-pro'],
+  };
+  const result = await run('relay_info', { relay: 'linux-test' });
+  const deepseek = result.body.providers.find((entry) => entry.provider === 'deepseek');
+  assert.equal(deepseek.configured, true);
+  assert.equal(deepseek.defaultModel, 'deepseek-flash');
+  assert.deepEqual(deepseek.models, ['deepseek-flash', 'deepseek-v4-pro']);
+
+  // Saved key, switched off: listed, but not as a provider to start with.
+  remote.settings.deepseek = { ...remote.settings.deepseek, enabled: false };
+  const off = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(off.body.providers.find((entry) => entry.provider === 'deepseek').configured, false);
 });
 
 test('relay_info lists Claude Cloud when the remote has it switched on, without efforts', async () => {

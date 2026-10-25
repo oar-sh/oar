@@ -36,6 +36,14 @@ const RELAY_ERROR_CTAS = Object.freeze({
   'claude-account-on-hold': CLAUDE_SETTINGS_CTA,
   'claude-verification-required': CLAUDE_SETTINGS_CTA,
   'claude-account-access': CLAUDE_SETTINGS_CTA,
+  // A DeepSeek turn refused for its key or its balance (deepseek-claude-backend.mjs).
+  'deepseek-api-key': Object.freeze([
+    Object.freeze({ action: 'open-deepseek-settings', label: 'DeepSeek settings' }),
+  ]),
+  'deepseek-balance': Object.freeze([
+    Object.freeze({ action: 'open-deepseek-top-up', label: 'Top up DeepSeek' }),
+    Object.freeze({ action: 'open-deepseek-settings', label: 'DeepSeek settings' }),
+  ]),
 });
 
 const STABLE_CODE_PATTERN = /error code:\s*relay\.([a-z0-9-]+)/i;

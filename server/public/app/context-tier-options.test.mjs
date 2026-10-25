@@ -286,3 +286,10 @@ test('resolveContextTierValue yields an empty value when nothing is offered', ()
   assert.equal(resolveContextTierValue([], 'default'), '');
   assert.equal(resolveContextTierValue(), '');
 });
+
+test('a DeepSeek chat has one tier, its 1M window, whatever the merged metadata says', () => {
+  assert.deepEqual(
+    buildContextTierOptions({ modelId: 'deepseek-flash', providerType: 'deepseek', metadata: { contextWindowTokens: 128000 } }),
+    [{ value: 'default', label: '1.05M' }],
+  );
+});

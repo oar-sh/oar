@@ -1,7 +1,7 @@
 // Which providers are known to be ready to run a chat, from what the client
 // already loads: the provider settings payloads and the model catalog. No DOM.
 //
-// OpenAI, Claude, Claude Cloud, Cursor and Grok say so themselves: their
+// OpenAI, Claude, Claude Cloud, Cursor, Grok and DeepSeek say so themselves: their
 // settings carry `enabled`. Copilot has no such flag and the relay never asks
 // whether the Copilot CLI is signed in, so the best signal is indirect: has a
 // real Copilot model list ever reached the catalog? A fresh database is seeded
@@ -23,6 +23,7 @@ const SETTINGS_PROVIDERS = Object.freeze([
   ['claudeCloud', 'claude-cloud'],
   ['cursor', 'cursor'],
   ['grok', 'grok'],
+  ['deepseek', 'deepseek'],
 ]);
 
 /** Payloads whose absence means "could not be loaded" rather than "not offered". */
@@ -35,6 +36,7 @@ const REQUIRED_INPUTS = Object.freeze(['openai', 'claude', 'cursor', 'grok', 'ca
  * @param {object|null} [input.claudeCloud] null on a relay without Claude Cloud: not offered, not unknown
  * @param {object|null} [input.cursor]
  * @param {object|null} [input.grok]
+ * @param {object|null} [input.deepseek] null on a relay without DeepSeek: not offered, not unknown
  * @param {object|null} [input.catalog]
  * @returns {{ known: boolean, anyReady: boolean, ready: string[], copilot: 'ready' | 'unknown' }}
  */
@@ -69,6 +71,7 @@ const inputs = {
   claudeCloud: undefined,
   cursor: undefined,
   grok: undefined,
+  deepseek: undefined,
   catalog: undefined,
 };
 let current = resolveProviderReadiness(inputs);

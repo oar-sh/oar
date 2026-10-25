@@ -16,11 +16,13 @@ export function composerPlaceholderFor({ modelId = '', providerType = '' } = {})
     if (provider === 'grok') return 'Message Grok…';
     if (provider === 'openai' || provider === 'openai-byok') return 'Message OpenAI…';
     if (provider === 'cursor') return 'Message Cursor…';
+    if (provider === 'deepseek') return 'Message DeepSeek…';
     return 'Message Copilot…';
   };
   if (!id || id === 'auto') return providerFallback();
   if (id.startsWith('claude-')) return 'Message Claude…';
   if (id.startsWith('grok-')) return 'Message Grok…';
+  if (id.startsWith('deepseek-')) return 'Message DeepSeek…';
   if (id.startsWith('gpt-')) return 'Message GPT…';
   if (id.startsWith('gemini-')) return 'Message Gemini…';
   // Composer is Cursor's house model family.
@@ -64,6 +66,15 @@ export function humanizeModelLabel(modelId = '') {
     }
     const label = words.map((word) => word.text).join(' ');
     return suffixMatch ? `${label} [${suffixMatch[1]}]` : label;
+  }
+  // "deepseek-flash" → "DeepSeek Flash", "deepseek-v4-pro" → "DeepSeek V4 Pro".
+  if (/^deepseek-/i.test(text)) {
+    return `DeepSeek ${text
+      .replace(/^deepseek-/i, '')
+      .split('-')
+      .filter(Boolean)
+      .map((part) => (/^v\d/i.test(part) ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1)))
+      .join(' ')}`;
   }
   if (/^gemini-/i.test(text)) {
     return text

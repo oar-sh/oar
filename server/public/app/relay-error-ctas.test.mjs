@@ -74,3 +74,15 @@ test('the bubble renders the CTA for owners only, escaped, and routes the click'
   assert.match(source, /void startGrokSignIn\(\)/);
   assert.match(source, /openSettingsModal\('providers', 'claude'\)/);
 });
+
+test('a DeepSeek key or balance failure links to its settings and to the top-up page', () => {
+  const balance = 'The DeepSeek account balance is used up. Error code: relay.deepseek-balance. Top it up, then send the message again.';
+  assert.deepEqual(
+    relayErrorCtaActions(balance).map((item) => item.action),
+    ['open-deepseek-top-up', 'open-deepseek-settings'],
+  );
+  assert.deepEqual(
+    relayErrorCtaActionsForCode('deepseek-api-key').map((item) => item.action),
+    ['open-deepseek-settings'],
+  );
+});

@@ -34,7 +34,7 @@ test('server-runtime exposes grok settings and launch binding', () => {
   // The schema/migration block (including the grok_native_session_id column)
   // moved verbatim to db-schema.mjs.
   assert.match(dbSchemaSource, /grok_native_session_id/);
-  assert.match(runtimeSource, /managedProvider = \['claude', 'cursor', 'grok'\]/);
+  assert.match(runtimeSource, /managedProvider = \['claude', 'cursor', 'grok', 'deepseek'\]/);
 });
 
 test('sessions-routes bootstrap and settings accept grok', () => {

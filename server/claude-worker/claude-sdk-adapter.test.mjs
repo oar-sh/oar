@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   CLAUDE_AUTO_BACKGROUND_TIMEOUT_MS,
   CLAUDE_BASH_MAX_TIMEOUT_MS,
+  CLAUDE_LIVE_FLAG_SETTINGS_CODE,
   CLAUDE_ULTRACODE_EFFORT,
+  LIVE_FLAG_SETTINGS_TIMEOUT_MS,
   RELAY_MCP_SERVER_NAME,
   RELAY_MCP_TOOL_TIMEOUT_MS,
   applyThinkingDisplay,
@@ -505,4 +507,370 @@ test('the long command note asks for a log file and nohup, with the limit when k
     assert.match(append, /stopped after 2 h/);
     assert.match(append, /nohup/);
   }
+});
+
+// A query stand-in whose applyFlagSettings the test settles by hand.
+function liveFlagQuery() {
+  const fake = { captured: null, applied: [], settle: null };
+  fake.queryImpl = (params) => {
+    fake.captured = params;
+    return {
+      applyFlagSettings: (settings) => new Promise((resolve, reject) => {
+        fake.applied.push(settings);
+        fake.settle = { resolve, reject };
+      }),
+    };
+  };
+  return fake;
+}
+
+async function liveFlagBackend(live) {
+  const { createDeepSeekClaudeBackend } = await import('../deepseek-worker/deepseek-claude-backend.mjs');
+  return {
+    ...createDeepSeekClaudeBackend({
+      env: { DEEPSEEK_API_KEY: 'sk-test-0000', DEEPSEEK_CLAUDE_CONFIG_DIR: '/srv/oar/data/deepseek-claude' },
+    }),
+    liveFlagSettings: () => live,
+  };
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('a backend\'s live flag settings reach the CLI over the control channel before any message', async () => {
+  const live = { env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9', ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' }, apiKeyHelper: '' };
+  const fake = liveFlagQuery();
+  const turn = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    queryImpl: fake.queryImpl,
+  });
+  // They are not on the command line.
+  assert.equal(JSON.stringify(fake.captured.options.settings || {}).includes('sk-test-0000'), false);
+  const messages = [];
+  const drained = (async () => {
+    for await (const message of fake.captured.prompt) messages.push(message);
+  })();
+  turn.pushUserMessage([{ type: 'text', text: 'second' }]);
+  await tick();
+  assert.deepEqual(fake.applied, [live]);
+  // Held until the CLI has taken them, in order.
+  assert.equal(messages.length, 0);
+  fake.settle.resolve();
+  assert.equal(await turn.liveFlagSettingsApplied, true);
+  await tick();
+  assert.deepEqual(messages.map((message) => message.message.content[0].text), ['hi', 'second']);
+  turn.endInput();
+  await drained;
+  assert.equal(turn.liveFlagSettingsError, undefined);
+});
+
+test('the blanks of a backend\'s live flag settings go on the command line too, the values do not', async () => {
+  const live = {
+    env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9', ANTHROPIC_AUTH_TOKEN: 'sk-test-0000', ANTHROPIC_API_KEY: '' },
+    apiKeyHelper: '',
+  };
+  const fake = liveFlagQuery();
+  startClaudeSession({
+    content: null,
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    thinkingEnabled: true,
+    backend: await liveFlagBackend(live),
+    queryImpl: fake.queryImpl,
+  });
+  const { settings } = fake.captured.options;
+  assert.equal(settings.alwaysThinkingEnabled, true);
+  assert.equal(settings.apiKeyHelper, '');
+  assert.deepEqual(settings.env, { ANTHROPIC_API_KEY: '' });
+  assert.equal(JSON.stringify(settings).includes('sk-test-0000'), false);
+  assert.equal(JSON.stringify(settings).includes('127.0.0.1'), false);
+
+  // Live settings without a blank leave the spawn's settings alone.
+  const plain = liveFlagQuery();
+  startClaudeSession({
+    content: null,
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend({ env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' } }),
+    queryImpl: plain.queryImpl,
+  });
+  assert.equal('settings' in plain.captured.options, false);
+});
+
+test('the DeepSeek pins are built from the CLI\'s environment, and only their blanks reach the command line', async () => {
+  const { createDeepSeekClaudeBackend, DEEPSEEK_CLI_PINNED_ENV } = await import('../deepseek-worker/deepseek-claude-backend.mjs');
+  const backend = createDeepSeekClaudeBackend({
+    env: {
+      DEEPSEEK_API_KEY: 'sk-test-0000',
+      DEEPSEEK_BASE_URL: 'http://127.0.0.1:9',
+      DEEPSEEK_CLAUDE_CONFIG_DIR: '/srv/oar/data/deepseek-claude',
+    },
+  });
+  const fake = liveFlagQuery();
+  // The CLI's environment is built from the worker's process environment.
+  const saved = process.env.https_proxy;
+  process.env.https_proxy = 'http://127.0.0.1:3128';
+  try {
+    startClaudeSession({ content: null, cwd: '/tmp', model: 'deepseek-flash', backend, queryImpl: fake.queryImpl });
+  } finally {
+    if (saved === undefined) delete process.env.https_proxy;
+    else process.env.https_proxy = saved;
+  }
+  const { env, settings } = fake.captured.options;
+  // The pins hold the values the CLI starts with: its proxy, in both cases.
+  assert.equal(env.https_proxy, 'http://127.0.0.1:3128');
+  const live = backend.liveFlagSettings(env);
+  assert.equal(live.env.https_proxy, 'http://127.0.0.1:3128');
+  assert.equal(live.env.HTTPS_PROXY, process.env.HTTPS_PROXY ?? 'http://127.0.0.1:3128');
+  assert.equal(live.env.ANTHROPIC_AUTH_TOKEN, 'sk-test-0000');
+  // On the command line: every blank pin and nothing with a value.
+  assert.equal(settings.apiKeyHelper, '');
+  assert.deepEqual(
+    Object.keys(settings.env).sort(),
+    Object.entries(live.env).filter(([, value]) => value === '').map(([name]) => name).sort(),
+  );
+  assert.ok(Object.keys(settings.env).length > 50);
+  assert.ok(Object.keys(settings.env).every((name) => DEEPSEEK_CLI_PINNED_ENV.includes(name)));
+  assert.ok(Object.values(settings.env).every((value) => value === ''));
+  for (const value of ['sk-test-0000', '127.0.0.1']) assert.equal(JSON.stringify(settings).includes(value), false, value);
+});
+
+test('refused live flag settings send nothing and fail with a coded error that names no value', async () => {
+  const live = { env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' }, apiKeyHelper: '' };
+  const fake = liveFlagQuery();
+  const turn = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    queryImpl: fake.queryImpl,
+  });
+  const messages = [];
+  const drained = (async () => {
+    for await (const message of fake.captured.prompt) messages.push(message);
+  })();
+  await tick();
+  fake.settle.reject(new Error('Invalid settings: env.ANTHROPIC_AUTH_TOKEN sk-test-0000 rejected'));
+  assert.equal(await turn.liveFlagSettingsApplied, false);
+  // The stream throws (the SDK aborts the query on that) and sent nothing.
+  await assert.rejects(drained, (error) => error === turn.liveFlagSettingsError);
+  assert.equal(messages.length, 0);
+  const error = turn.liveFlagSettingsError;
+  assert.equal(error.code, CLAUDE_LIVE_FLAG_SETTINGS_CODE);
+  assert.match(error.message, /did not take the DeepSeek connection settings before the first message, so nothing was sent/);
+  assert.equal(error.detail, 'Invalid settings: env.ANTHROPIC_AUTH_TOKEN [redacted] rejected');
+  assert.equal(`${error.message} ${error.detail}`.includes('sk-test-0000'), false);
+});
+
+test('live flag settings the CLI never answers fail closed after the timeout and send nothing', async () => {
+  const live = { env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' }, apiKeyHelper: '' };
+  const fake = liveFlagQuery();
+  const turn = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    liveFlagSettingsTimeoutMs: 20,
+    queryImpl: fake.queryImpl,
+  });
+  const messages = [];
+  const drained = (async () => {
+    for await (const message of fake.captured.prompt) messages.push(message);
+  })();
+  turn.pushUserMessage([{ type: 'text', text: 'second' }]);
+  // applyFlagSettings was called and is never settled.
+  assert.equal(await turn.liveFlagSettingsApplied, false);
+  assert.deepEqual(fake.applied, [live]);
+  await assert.rejects(drained, (error) => error === turn.liveFlagSettingsError);
+  assert.equal(messages.length, 0);
+  const error = turn.liveFlagSettingsError;
+  assert.equal(error.code, CLAUDE_LIVE_FLAG_SETTINGS_CODE);
+  assert.match(error.message, /so nothing was sent/);
+  assert.equal(error.detail, 'no answer within 1 s');
+  // A late answer changes nothing.
+  fake.settle.resolve();
+  await tick();
+  assert.equal(messages.length, 0);
+  assert.equal(LIVE_FLAG_SETTINGS_TIMEOUT_MS, 60_000);
+});
+
+test('the live flag settings timer is cleared on the answer and on abort', async (t) => {
+  const started = [];
+  const cleared = [];
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+    const timer = realSetTimeout(fn, ms, ...args);
+    if (ms === LIVE_FLAG_SETTINGS_TIMEOUT_MS) started.push(timer);
+    return timer;
+  });
+  t.mock.method(globalThis, 'clearTimeout', (timer) => {
+    if (started.includes(timer)) cleared.push(timer);
+    return realClearTimeout(timer);
+  });
+  const live = { env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' }, apiKeyHelper: '' };
+
+  const answered = liveFlagQuery();
+  const turn = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    queryImpl: answered.queryImpl,
+  });
+  assert.equal(started.length, 1);
+  await tick();
+  answered.settle.resolve();
+  assert.equal(await turn.liveFlagSettingsApplied, true);
+  assert.deepEqual(cleared, [started[0]]);
+  turn.endInput();
+
+  const abortController = new AbortController();
+  const aborted = liveFlagQuery();
+  startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    abortController,
+    backend: await liveFlagBackend(live),
+    queryImpl: aborted.queryImpl,
+  }).endInput();
+  assert.equal(started.length, 2);
+  abortController.abort();
+  assert.deepEqual(cleared, [started[0], started[1]]);
+});
+
+test('without applyFlagSettings live flag settings fail closed; a stream ended while held sends nothing', async () => {
+  const live = { env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' } };
+  let captured = null;
+  const turn = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal(await turn.liveFlagSettingsApplied, false);
+  assert.equal(turn.liveFlagSettingsError.code, CLAUDE_LIVE_FLAG_SETTINGS_CODE);
+  await assert.rejects((async () => { for await (const message of captured.prompt) assert.fail(message); })());
+
+  const fake = liveFlagQuery();
+  const held = startClaudeSession({
+    content: [{ type: 'text', text: 'hi' }],
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    backend: await liveFlagBackend(live),
+    queryImpl: fake.queryImpl,
+  });
+  const messages = [];
+  const drained = (async () => {
+    for await (const message of fake.captured.prompt) messages.push(message);
+  })();
+  held.endInput();
+  await drained;
+  assert.equal(messages.length, 0);
+});
+
+test('a backend without live flag settings sends at once and never calls applyFlagSettings', async () => {
+  for (const live of [null, {}]) {
+    const fake = liveFlagQuery();
+    const turn = startClaudeSession({
+      content: [{ type: 'text', text: 'hi' }],
+      cwd: '/tmp',
+      model: 'deepseek-flash',
+      backend: await liveFlagBackend(live),
+      queryImpl: fake.queryImpl,
+    });
+    const messages = [];
+    const drained = (async () => {
+      for await (const message of fake.captured.prompt) messages.push(message);
+    })();
+    turn.endInput();
+    await drained;
+    assert.equal(messages.length, 1);
+    assert.deepEqual(fake.applied, []);
+    assert.equal('liveFlagSettingsApplied' in turn, false);
+  }
+});
+
+test('a backend builds the CLI environment and maps the model and effort into its terms', async () => {
+  const { createDeepSeekClaudeBackend } = await import('../deepseek-worker/deepseek-claude-backend.mjs');
+  const backend = createDeepSeekClaudeBackend({
+    env: { DEEPSEEK_API_KEY: 'sk-test-6666666666666666', DEEPSEEK_CLAUDE_CONFIG_DIR: '/srv/oar/data/deepseek-claude' },
+  });
+  let captured = null;
+  startClaudeSession({
+    content: null,
+    cwd: '/tmp',
+    model: 'deepseek-v4-pro',
+    reasoningEffort: 'max',
+    backend,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal(captured.options.model, 'deepseek-v4-pro[1m]');
+  assert.equal(captured.options.effort, 'max');
+  assert.equal(captured.options.env.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic');
+  assert.equal(captured.options.env.ANTHROPIC_AUTH_TOKEN, 'sk-test-6666666666666666');
+  assert.equal(captured.options.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+  // The session's model reaches the backend: its alias pins follow it.
+  assert.equal(captured.options.env.ANTHROPIC_MODEL, 'deepseek-v4-pro[1m]');
+  assert.equal(captured.options.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'deepseek-v4-pro[1m]');
+  assert.equal(captured.options.env.CLAUDE_CODE_SUBAGENT_MODEL, 'deepseek-v4-pro[1m]');
+  assert.equal(captured.options.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'deepseek-flash');
+  // No relay limit set: the environment is still the backend's own, never
+  // the worker's as it is (which carries the DeepSeek key under its own name).
+  assert.equal('DEEPSEEK_API_KEY' in captured.options.env, false);
+
+  // With a relay limit the Bash limits go on top of the backend's
+  // environment: the relay's own auto-background cap reaches the CLI, while
+  // the backend still drops a host session's variables and the worker's.
+  const hostKeys = { CLAUDECODE: '1', CLAUDE_AGENT_SDK_VERSION: '0.0.0', COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek' };
+  const saved = Object.fromEntries(Object.keys(hostKeys).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, hostKeys);
+  try {
+    startClaudeSession({
+      content: null,
+      cwd: '/tmp',
+      model: 'deepseek-flash',
+      backgroundCommandLimitMs: 3_600_000,
+      backend,
+      queryImpl: (params) => { captured = params; return {}; },
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.equal(captured.options.env.CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS, '120000');
+  assert.equal(captured.options.env.BASH_DEFAULT_TIMEOUT_MS, '3600000');
+  assert.equal(captured.options.env.ANTHROPIC_AUTH_TOKEN, 'sk-test-6666666666666666');
+  for (const key of Object.keys(hostKeys)) assert.equal(key in captured.options.env, false, key);
+
+  // DeepSeek's thinking cannot be switched off through Claude Code: none is low.
+  startClaudeSession({
+    content: null,
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    reasoningEffort: 'none',
+    backend,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal(captured.options.effort, 'low');
+  assert.equal('thinking' in captured.options, false);
+  assert.equal(captured.options.env.CLAUDE_CODE_EFFORT_LEVEL, 'low');
+
+  // Ultracode is Claude's: a backend never turns it into flags.
+  startClaudeSession({
+    content: null,
+    cwd: '/tmp',
+    model: 'deepseek-flash',
+    reasoningEffort: CLAUDE_ULTRACODE_EFFORT,
+    backend,
+    queryImpl: (params) => { captured = params; return {}; },
+  });
+  assert.equal(captured.options.settings?.ultracode, undefined);
+  assert.equal(captured.options.effort, 'max');
 });

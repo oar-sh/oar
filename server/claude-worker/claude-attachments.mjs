@@ -52,6 +52,9 @@ function imageBlockFromDataUrl(att, maxInlineImageBytes) {
 export function buildClaudeAttachmentContent(rawAttachments, {
   fsImpl = fs,
   maxInlineImageBytes = MAX_INLINE_IMAGE_BYTES,
+  // False for a model that takes no image input: an image block would fail
+  // the whole request, so every image goes by its path instead.
+  embedImages = true,
 } = {}) {
   const input = Array.isArray(rawAttachments) ? rawAttachments : [];
   const imageBlocks = [];
@@ -67,7 +70,7 @@ export function buildClaudeAttachmentContent(rawAttachments, {
       // Only media types the Anthropic image block accepts are embedded;
       // everything else (svg, bmp, heic, …) would 400 the whole turn and
       // falls back to a path reference instead.
-      if (filePath && isEmbeddableImageMediaType(mime) && fsImpl.existsSync(filePath)) {
+      if (embedImages && filePath && isEmbeddableImageMediaType(mime) && fsImpl.existsSync(filePath)) {
         try {
           const bytes = fsImpl.readFileSync(filePath);
           if (Buffer.isBuffer(bytes) && bytes.length && bytes.length <= maxInlineImageBytes) {
@@ -85,7 +88,7 @@ export function buildClaudeAttachmentContent(rawAttachments, {
           embedded = false;
         }
       }
-      if (!embedded) {
+      if (!embedded && embedImages) {
         const blockFromDataUrl = imageBlockFromDataUrl(att, maxInlineImageBytes);
         if (blockFromDataUrl) {
           imageBlocks.push(blockFromDataUrl);
@@ -118,9 +121,9 @@ export function buildClaudeAttachmentContent(rawAttachments, {
  * Text first (user text + attachment notes + server-provided attachment
  * context), then inline image blocks.
  */
-export function buildClaudeUserContent(message, { fsImpl = fs, maxInlineImageBytes = MAX_INLINE_IMAGE_BYTES } = {}) {
+export function buildClaudeUserContent(message, { fsImpl = fs, maxInlineImageBytes = MAX_INLINE_IMAGE_BYTES, embedImages = true } = {}) {
   const text = String(message?.text || '').trim();
-  const { imageBlocks, noteLines } = buildClaudeAttachmentContent(message?.attachments, { fsImpl, maxInlineImageBytes });
+  const { imageBlocks, noteLines } = buildClaudeAttachmentContent(message?.attachments, { fsImpl, maxInlineImageBytes, embedImages });
   const attachmentPromptContext = String(message?.attachmentPromptContext || '').trim();
   const textParts = [text];
   if (noteLines.length) textParts.push(noteLines.join('\n'));

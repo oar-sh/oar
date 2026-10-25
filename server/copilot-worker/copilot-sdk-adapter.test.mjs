@@ -174,6 +174,28 @@ test('a non-terminal session error gets a provider-scoped stable code', () => {
   assert.equal(classified.quota, false);
 });
 
+test('a failed turn on a BYOK OpenAI worker names OpenAI and the engine, with the same codes', () => {
+  // The runtime's capacity refusal as an OpenAI turn received it.
+  const event = classifyCopilotSessionError(
+    { errorType: 'query', message: '503 No available capacity was found for the model' },
+    { provider: 'openai' },
+  );
+  assert.equal(event.stableCode, 'copilot.query');
+  assert.match(event.text, /^System note: the OpenAI turn on the Copilot SDK engine failed \(503 No available capacity/);
+  assert.doesNotMatch(event.text, /the Copilot turn/);
+
+  const thrown = classifyCopilotTurnException(new Error('connection reset'), { provider: 'openai' });
+  assert.equal(thrown.stableCode, 'copilot.turn-error');
+  assert.match(thrown.text, /the OpenAI turn on the Copilot SDK engine failed \(connection reset\)/);
+
+  // A Copilot worker keeps its wording.
+  assert.match(classifyCopilotTurnException(new Error('connection reset')).text, /the Copilot turn failed \(connection reset\)/);
+  assert.match(
+    classifyCopilotSessionError({ errorType: 'network', message: 'reset' }, { provider: '' }).text,
+    /the Copilot turn failed \(reset\)/,
+  );
+});
+
 test('a session error does not send the user to restart the relay', () => {
   // The runtime's answer to an empty model reply, as it arrived on a live turn.
   const classified = classifyCopilotSessionError({

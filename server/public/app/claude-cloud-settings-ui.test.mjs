@@ -63,7 +63,7 @@ const optionLabels = (id) => Array.from(el(id).options).map((option) => option.t
 test('the Claude Cloud sub-tab sits after Claude and opens its own panel', () => {
   const order = Array.from(document.querySelectorAll('#settings-modal [data-settings-provider-tab]'))
     .map((button) => button.dataset.settingsProviderTab);
-  assert.deepEqual(order, ['copilot', 'openai', 'claude', 'claude-cloud', 'grok', 'cursor']);
+  assert.deepEqual(order, ['copilot', 'openai', 'claude', 'claude-cloud', 'grok', 'cursor', 'deepseek']);
   assert.equal(el('settings-provider-tab-claude-cloud').textContent.trim(), 'Claude Cloud');
   assert.equal(el('settings-provider-panel-claude-cloud').hasAttribute('hidden'), true);
 

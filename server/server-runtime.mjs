@@ -46,6 +46,7 @@ import { createPreviewScopeResolver, registerPreviewRoutes } from './routes/prev
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
 import { registerRelayEventRoutes } from './routes/relay-event-routes.mjs';
 import { registerRelayScheduleRoutes } from './routes/relay-schedule-routes.mjs';
+import { registerDeepSeekUsageImportRoutes } from './routes/deepseek-usage-import-routes.mjs';
 import { registerRelayAskRoutes } from './routes/relay-ask-routes.mjs';
 import { createRemoteRelayRepository } from './repositories/remote-relay-repository.mjs';
 import { createConversationGroupRepository } from './repositories/conversation-group-repository.mjs';
@@ -64,6 +65,12 @@ import { createClaudeCloudCredentials } from '../shared/claude-cloud/credentials
 import { createClaudeCloudClient } from '../shared/claude-cloud/api-client.mjs';
 import { resolveClaudeCloudBaseUrl } from '../shared/claude-cloud/base-url.mjs';
 import { createClaudeCloudSettingsService } from './services/claude-cloud-settings-service.mjs';
+import { createDeepSeekSettingsService } from './services/deepseek-settings-service.mjs';
+import { createWorkerPostRedaction } from './services/worker-secret-redaction.mjs';
+import { createDeepSeekBalanceService } from './services/deepseek-balance-service.mjs';
+import { deepseekCardCurrency } from './services/plan-usage-deepseek.mjs';
+import { createDeepSeekUsageImportService } from './services/deepseek-usage-import.mjs';
+import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, DEFAULT_DEEPSEEK_MODEL, deepseekModelLabel } from '../shared/deepseek-models.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
 import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } from './services/claude-cloud-repo-service.mjs';
 import { createClaudeAccountUsageService } from './services/claude-account-usage-service.mjs';
@@ -138,7 +145,7 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import { applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -2830,6 +2837,58 @@ const claudeCloudRepoService = createClaudeCloudRepoService({
   isEnabled: () => claudeCloudSettingsService.getSettings().enabled === true,
   listRecentCloudSources: () => listRecentCloudSourcesFromStatements(stmts),
 });
+// What a session worker posts loses every key a provider saved in Settings
+// (worker-secret-redaction.mjs). Built here, at the start, so it reads the
+// saved keys now, and the DeepSeek save below notes each key it writes: one
+// changed before any worker has posted is still redacted.
+const workerPostRedaction = createWorkerPostRedaction({ readSetting: readAppSettingValue });
+// DeepSeek: one API key per relay, its models and its endpoint. The key stays
+// in the settings table; GET routes answer `configured`, never the key.
+const deepseekSettingsService = createDeepSeekSettingsService({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => {
+    stmts.upsertAppSetting.run(key, String(value), new Date().toISOString());
+    workerPostRedaction.noteSavedSetting(key, value);
+  },
+  deleteSetting: (key) => stmts.deleteAppSetting.run(key),
+  listProviderCandidates: () => stmts.listRuntimeSessionProviderCandidates?.all?.() || [],
+});
+function getDeepSeekProviderSettings() {
+  return deepseekSettingsService.getSettings();
+}
+// The DeepSeek balance for Check Usage: read with the saved key only while
+// DeepSeek is on, kept for a minute.
+const deepseekBalanceService = createDeepSeekBalanceService({ getSettings: getDeepSeekProviderSettings });
+// DeepSeek's own usage export, imported in Settings (or with
+// `npm run deepseek:import`): the usage card shows its figures for the days
+// it covers, for the saved key only, and the estimate after.
+const deepseekUsageImportService = createDeepSeekUsageImportService({
+  db,
+  getApiKey: () => getDeepSeekProviderSettings()?.apiKey || '',
+});
+// Where DeepSeek workers keep their Claude Code state (sessions, transcripts,
+// settings): a directory of the relay's own, so no Claude login is in reach
+// of a CLI that talks to DeepSeek and their sessions stay out of Claude's.
+const DEEPSEEK_CLAUDE_CONFIG_DIR = path.join(DATA_DIR, 'deepseek-claude');
+
+/**
+ * What a DeepSeek session's commits and PRs say: the DeepSeek tab's mode
+ * (OAR or off), the folder override on top, the DeepSeek model's name in the
+ * trailer. A folder set to vanilla gets OAR's: Claude Code's own lines would
+ * credit Claude for DeepSeek's work.
+ */
+function deepseekAttributionForConversation(conv, modelId) {
+  const root = String(conv?.runtime_workspace_root_path || conv?.configured_workspace_root_path || '').trim()
+    || currentWorkspaceRootPath();
+  const resolved = resolveClaudeAttributionMode({
+    providerMode: getDeepSeekProviderSettings().attribution,
+    folderMode: workspaceRootAttributionMode(root),
+  });
+  return buildClaudeAttributionSettings({
+    mode: resolved === 'vanilla' ? 'oar' : resolved,
+    modelLabel: deepseekModelLabel(modelId),
+  });
+}
 // The account's live usage for the Check Usage modal. The Claude Cloud switch
 // is the consent to use the Claude CLI's login, so nothing is read while it
 // is off.
@@ -3058,7 +3117,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
   // Clear every provider's variables first (the appliers' kind-guarded deletes
   // keep the chained clears order-independent), then apply only the bound one.
-  const cleared = applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))))));
+  const cleared = applyDeepSeekProviderEnvironment(applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)))))));
   // A Claude Cloud conversation gets its own worker and nothing else: it must
   // never reach the Copilot CLI fall-through at the end of this function. The
   // environment names the worker and the model, no credential.
@@ -3086,6 +3145,19 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       model: cursorModel,
       apiKey: cursorSettings.apiKey,
       dataDir: DATA_DIR,
+    });
+  }
+  // A DeepSeek conversation gets its own worker and must never reach the
+  // Copilot fall-through below. Without a key the applier throws, and the
+  // conversation gets the launch note.
+  if (providerType === 'deepseek') {
+    const deepseekSettings = getDeepSeekProviderSettings();
+    return applyDeepSeekProviderEnvironment(cleared, {
+      enabled: true,
+      model: String(runtimeSession?.provider_model || runtimeSession?.model || deepseekSettings.model).trim(),
+      apiKey: deepseekSettings.apiKey,
+      baseUrl: deepseekSettings.baseUrl,
+      configDir: DEEPSEEK_CLAUDE_CONFIG_DIR,
     });
   }
   if (providerType === 'grok') {
@@ -3316,12 +3388,13 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
 
 async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
   const normalizedProvider = String(provider || 'openai').trim().toLowerCase();
-  const managedProvider = ['claude', 'cursor', 'grok'].includes(normalizedProvider) ? normalizedProvider : 'openai';
+  const managedProvider = ['claude', 'cursor', 'grok', 'deepseek'].includes(normalizedProvider) ? normalizedProvider : 'openai';
   const managedDefaultModel = {
     openai: DEFAULT_OPENAI_MODEL,
     claude: DEFAULT_CLAUDE_MODEL,
     cursor: DEFAULT_CURSOR_MODEL,
     grok: DEFAULT_GROK_MODEL,
+    deepseek: DEFAULT_DEEPSEEK_MODEL,
   }[managedProvider];
   const providerType = enabled === true ? managedProvider : 'github';
   const providerModel = enabled === true
@@ -3395,7 +3468,9 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
           ? getCursorProviderSettings().configured === true
           : (currentProvider === 'grok'
             ? getGrokProviderSettings().enabled === true
-            : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true)));
+            : (currentProvider === 'deepseek'
+              ? getDeepSeekProviderSettings().configured === true
+              : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true))));
       if (providerWasUpdated && canRestorePreviousProvider) {
         stmts.updateRuntimeSessionProvider.run(
           currentProvider,
@@ -5984,6 +6059,14 @@ const readContextFromSessionEvents = contextSnapshotService.readContextFromSessi
 // Claude-provider sessions live under the Agent SDK's project layout rather than
 // ~/.copilot/session-state, so their browsable session folder resolves separately.
 const claudeSessionRootResolver = createClaudeSessionRootResolver({ fs, path });
+// DeepSeek chats run Claude Code with a config dir of their own: only that
+// root, never the host's ~/.claude.
+const deepseekSessionRootResolver = createClaudeSessionRootResolver({
+  fs,
+  path,
+  env: { CLAUDE_CONFIG_DIR: DEEPSEEK_CLAUDE_CONFIG_DIR },
+  homedir: () => '',
+});
 const cursorSessionRootResolver = createCursorSessionRootResolver({ fs, path, serverDir: __dirname, dataDir: DATA_DIR });
 
 // ─── Express + Socket.io Setup ────────────────────────────────────────────────
@@ -6371,8 +6454,12 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       // without a new queue column or push channel. null = Auto.
       ...((() => {
         const conv = out.conversationId ? stmts.getConvAnyStatus.get(out.conversationId) : null;
+        const deliveredProvider = String(out.providerType || '').trim().toLowerCase();
         return {
-          autoCompactWindow: parseAutoCompactWindow(conv?.auto_compact_window),
+          // DeepSeek's window is 1M; its sessions compact at 400K unless the
+          // conversation pins another window.
+          autoCompactWindow: parseAutoCompactWindow(conv?.auto_compact_window)
+            ?? (deliveredProvider === 'deepseek' ? DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW : null),
           // Per-conversation thinking control, same delivery scoping. An
           // explicit null on thinkingEnabled means Host default — the worker
           // distinguishes it from an absent key (an older relay), so both
@@ -6384,7 +6471,14 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
           // attribution. Always present on such a delivery, so the worker can
           // tell "left as it was" (absent) from "vanilla" (null).
           ...((() => {
-            const deliveredProvider = String(out.providerType || '').trim().toLowerCase();
+            // A DeepSeek session runs Claude Code on the host like a Claude
+            // one: the same two settings, with DeepSeek's attribution.
+            if (deliveredProvider === 'deepseek') {
+              return {
+                attribution: deepseekAttributionForConversation(conv, out.providerModel || out.model),
+                claudeBackgroundCommandLimitMs: claudeBackgroundCommandLimitMinutesToMs(getClaudeBackgroundCommandLimitMinutes()),
+              };
+            }
             if (deliveredProvider !== 'claude' && deliveredProvider !== 'claude-cloud') return {};
             return {
               attribution: claudeAttributionForConversation(conv, out.providerModel || out.model, {
@@ -6740,6 +6834,9 @@ app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
   next();
 });
+// What a session worker posts loses every key a provider saved in Settings
+// before any route stores, broadcasts or logs it (worker-secret-redaction.mjs).
+app.use(workerPostRedaction);
 function isApiRequestPath(requestPath) {
   return /^\/api(?:\/|$)/.test(String(requestPath || ''));
 }
@@ -7074,6 +7171,10 @@ const sharedRouteDeps = {
   getClaudeCloudProviderSettings,
   claudeCloudSettingsService,
   claudeCloudSessionService,
+  getDeepSeekProviderSettings,
+  deepseekSettingsService,
+  deepseekBalanceService,
+  deepseekUsageImportService,
   claudeCloudRepoService,
   // The login's state for the workers' nudge route (never the token).
   claudeCloudLoginStatus: { describe: () => claudeCloudCredentials.describe() },
@@ -7198,6 +7299,8 @@ const sharedRouteDeps = {
   relayRestartOrchestrator,
   resolveSessionStateRoot,
   resolveClaudeSessionRoot: claudeSessionRootResolver.resolveClaudeSessionRoot,
+  resolveDeepSeekSessionRoot: deepseekSessionRootResolver.resolveClaudeSessionRoot,
+  deepseekClaudeConfigDir: DEEPSEEK_CLAUDE_CONFIG_DIR,
   resolveCursorSessionRoot: cursorSessionRootResolver.resolveCursorSessionRoot,
   getTurnCeilingMinutes,
   setTurnCeilingMinutes,
@@ -7270,6 +7373,14 @@ registerRelayScheduleRoutes(app, {
   auth,
   relayScheduleService,
   remoteRelayInbound,
+});
+registerDeepSeekUsageImportRoutes(app, {
+  auth,
+  deepseekUsageImportService,
+  remoteRelayInbound,
+  // The usage card's currency (the balance's), so the import's answer can
+  // say whether the card uses the export's rows.
+  getCardCurrency: async () => deepseekCardCurrency(await deepseekBalanceService.getBalance()),
 });
 registerRelayAskRoutes(app, {
   auth,
@@ -7552,10 +7663,12 @@ function ensureRuntimeSessionBinding(
           // default below and bind a GitHub (Copilot CLI) session.
           : (normalizedRequestedProviderType === 'claude-cloud'
             ? 'claude-cloud'
-            : (normalizedRequestedProviderType === 'github'
-              ? 'github'
-              : (openAISettings?.enabled ? 'openai' : 'github'))))));
-  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok' || resolvedProviderType === 'claude-cloud')
+            : (normalizedRequestedProviderType === 'deepseek'
+              ? 'deepseek'
+              : (normalizedRequestedProviderType === 'github'
+                ? 'github'
+                : (openAISettings?.enabled ? 'openai' : 'github')))))));
+  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok' || resolvedProviderType === 'claude-cloud' || resolvedProviderType === 'deepseek')
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {

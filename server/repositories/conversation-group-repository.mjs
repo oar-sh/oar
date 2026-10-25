@@ -18,7 +18,9 @@ import { compareGroupMembers } from '../public/app/conversation-group-order.mjs'
 //
 // A group can have a hand order (migration 0015): once the owner drags a row
 // into place, every member after the head gets a `group_position` (10, 20,
-// 30, ...) and keeps it; later arrivals join at the end. A group nobody
+// 30, ...) and keeps it; a later arrival (a session created in the group, a
+// row the menu moves in) goes first, right under the head, and the next
+// drag renumbers from 10 again. A group nobody
 // reordered keeps NULL positions and the activity order. Without the column
 // the hand order is off and moves only change the membership.
 //
@@ -141,8 +143,8 @@ export function createConversationGroupRepository(db) {
     WHERE group_id = ? AND status != 'deleted'
     ORDER BY updated_at DESC
   `);
-  const maxPosition = hasPosition
-    ? db.prepare(`SELECT MAX(group_position) AS n FROM conversations WHERE group_id = ? AND status != 'deleted'`)
+  const minPosition = hasPosition
+    ? db.prepare(`SELECT MIN(group_position) AS n FROM conversations WHERE group_id = ? AND status != 'deleted'`)
     : null;
   const countMembers = db.prepare(`SELECT COUNT(*) AS n FROM conversations WHERE group_id = ? AND status != 'deleted'`);
   // Groups with a live member, the one with the latest activity first, then
@@ -188,11 +190,16 @@ export function createConversationGroupRepository(db) {
 
   const positionValue = (row) => (row?.group_position == null ? null : Number(row.group_position));
 
-  /** Where a row joining `groupId` goes: after the last placed member, or NULL when nobody ordered the group. */
+  /**
+   * Where a row joining `groupId` goes: before the first placed member (the
+   * owner sees a new session at the top of its group, under the head), or
+   * NULL when nobody ordered the group, where newest-first puts it on top
+   * anyway. Positions may go to zero and below; the next drag renumbers.
+   */
   function joiningPosition(groupId) {
     if (!hasPosition) return null;
-    const max = maxPosition.get(toText(groupId))?.n;
-    return max == null ? null : Number(max) + POSITION_STEP;
+    const min = minPosition.get(toText(groupId))?.n;
+    return min == null ? null : Number(min) - POSITION_STEP;
   }
 
   const liveConversation = (id) => {

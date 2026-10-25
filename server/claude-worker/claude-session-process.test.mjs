@@ -4396,6 +4396,9 @@ test('a cold start posts an activity so the wait is explained', async () => {
     { label: 'cold start activity' },
   );
   assert.equal(activity.body.messageId, 'q-1');
+  // A Claude chat keeps its wording; a DeepSeek chat names its backend
+  // (claude-session-process.deepseek.test.mjs).
+  assert.equal(activity.body.text, 'Starting the Claude CLI (cold start)…');
   turn.emit(initMessage('native-1'));
   turn.emit(userReplay('hello'));
   turn.emit(resultMessage('done', 'native-1'));

@@ -530,6 +530,59 @@ export async function updateCursorSettings({
   return settingsRequest('/api/settings/cursor', payload, 'Failed to update Cursor settings');
 }
 
+export async function loadDeepSeekSettings() {
+  return apiFetch('/api/settings/deepseek');
+}
+
+/**
+ * Saves what the caller names: a key (written, never read back), the switch,
+ * the default model, the enabled models, the base URL (null = DeepSeek's
+ * own), the attribution and the monthly budget (null = none); `remove`
+ * takes the key out.
+ */
+export async function updateDeepSeekSettings({
+  apiKey = '',
+  model = undefined,
+  enabled = undefined,
+  enabledModels = undefined,
+  baseUrl = undefined,
+  attribution = undefined,
+  monthlyBudget = undefined,
+  monthlyBudgetCurrency = undefined,
+  startingBalance = undefined,
+  startingBalanceEdited = undefined,
+  remove = false,
+} = {}) {
+  // Only the fields named here reach the relay: a field the DeepSeek tab
+  // shows needs its line below (api-client.deepseek-settings.test.mjs).
+  const payload = remove === true ? { remove: true } : {};
+  if (!payload.remove) {
+    const key = String(apiKey || '').trim();
+    if (key) payload.apiKey = key;
+    if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+    if (typeof enabled === 'boolean') payload.enabled = enabled;
+    if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+    if (baseUrl === null || typeof baseUrl === 'string') payload.baseUrl = baseUrl === null ? null : String(baseUrl).trim();
+    if (typeof attribution === 'string' && attribution.trim()) payload.attribution = attribution.trim();
+    if (monthlyBudget === null || (typeof monthlyBudget === 'number' && Number.isFinite(monthlyBudget))) payload.monthlyBudget = monthlyBudget;
+    // 'USD' or 'CNY'; null is the balance's currency.
+    if (monthlyBudgetCurrency === null || typeof monthlyBudgetCurrency === 'string') {
+      payload.monthlyBudgetCurrency = String(monthlyBudgetCurrency ?? '').trim() || null;
+    }
+    if (startingBalance === null || (typeof startingBalance === 'number' && Number.isFinite(startingBalance))) payload.startingBalance = startingBalance;
+    if (typeof startingBalanceEdited === 'boolean') payload.startingBalanceEdited = startingBalanceEdited;
+  }
+  return settingsRequest('/api/settings/deepseek', payload, 'Failed to update DeepSeek settings');
+}
+
+/**
+ * Imports DeepSeek's usage export: the texts of its amount and cost files.
+ * Answers `{ ok, summary }`; a refused export throws with the relay's reason.
+ */
+export async function importDeepSeekUsageExport({ amount, cost }) {
+  return settingsRequest('/api/deepseek-usage-import', { amount, cost }, 'Failed to import the DeepSeek usage export');
+}
+
 export async function loadWindowsAutostartSetting() {
   return apiFetchOrThrow('/api/settings/windows-autostart');
 }

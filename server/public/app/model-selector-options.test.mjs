@@ -197,3 +197,10 @@ test('Auto and unknown models fall back to the bound provider', () => {
   assert.equal(composerPlaceholderFor({ modelId: 'my-custom-endpoint-model', providerType: 'github' }), 'Message Copilot…');
   assert.equal(composerPlaceholderFor(), 'Message Copilot…');
 });
+
+test('DeepSeek ids get readable labels and their own composer placeholder', () => {
+  assert.equal(humanizeModelLabel('deepseek-flash'), 'DeepSeek Flash');
+  assert.equal(humanizeModelLabel('deepseek-v4-pro'), 'DeepSeek V4 Pro');
+  assert.equal(composerPlaceholderFor({ modelId: 'deepseek-v4-pro', providerType: 'deepseek' }), 'Message DeepSeek…');
+  assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'deepseek' }), 'Message DeepSeek…');
+});

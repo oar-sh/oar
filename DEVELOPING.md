@@ -56,6 +56,7 @@ oar/
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
 │   ├── copilot-worker/             # Copilot SDK engine session worker (steering, background tasks, questions)
 │   ├── cursor-worker/              # Cursor Agent SDK session worker (turn runner, mode nudges, auth retry)
+│   ├── deepseek-worker/            # DeepSeek session worker (the Claude worker against DeepSeek's Anthropic-compatible API)
 │   ├── grok-worker/                # Grok CLI session worker over ACP
 │   ├── migrations/                 # Database migrations
 │   ├── public/                     # Browser app (index.html, app/ modules, PWA shell)
@@ -85,7 +86,8 @@ Operator and developer detail moved here from the README.
 2. **Session workers** (`server/copilot-worker/`, `server/claude-worker/`, `server/cursor-worker/`,
    `server/grok-worker/`): one Node process per conversation that runs its turns through the
    Copilot SDK engine, the Claude Agent SDK, the Cursor Agent SDK, or the Grok CLI over ACP, and
-   speaks the same relay contracts as the Copilot workers. The Claude Cloud worker
+   speaks the same relay contracts as the Copilot workers. The DeepSeek worker
+   (`server/deepseek-worker/`) is the Claude worker with its CLI pointed at DeepSeek. The Claude Cloud worker
    (`server/claude-cloud-worker/`) speaks them too but runs no agent: it sends messages to a
    session in Anthropic's cloud and follows that session's event stream.
 3. **Copilot CLI extension** (`.github/extensions/web-relay/`): the Extension engine. It polls the
@@ -222,10 +224,11 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/claude-cloud`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/claude-cloud`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/deepseek`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
 - Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- DeepSeek worker: the Claude worker's `/api/claude-native-session` and `/api/claude-context-usage`
 - Claude Cloud worker: `/api/claude-cloud-session`, plus the Claude worker's `/api/claude-context-usage` and `/api/claude-plan-usage`
 - Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
 - Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
@@ -388,6 +391,90 @@ as it is: a waiting message whose boundary is held for its turn reads "Compactin
 the end of the compaction until that turn opens — normally milliseconds, longer only when the turn
 start is delayed (API retries).
 
+### DeepSeek workers
+
+DeepSeek conversations run `server/deepseek-worker/deepseek-session-worker.mjs`. It is the Claude
+worker (both entries run `claude-session-worker-main.mjs`) with a backend that points its Claude
+Code CLI at DeepSeek's Anthropic-compatible endpoint (`deepseek-claude-backend.mjs`). Its log lines
+read `[deepseek-worker …]`, under `tmux attach` and in `worker-<sdk-session-id>.log`.
+
+- **What the relay hands it.** `applyDeepSeekProviderEnvironment` sets
+  `COPILOT_WEB_RELAY_WORKER_KIND=deepseek`, `DEEPSEEK_RELAY_MODEL`, `DEEPSEEK_BASE_URL` (only when
+  the settings change it) and `DEEPSEEK_CLAUDE_CONFIG_DIR` (`<data dir>/deepseek-claude`).
+  `DEEPSEEK_API_KEY` is a secret of this kind alone: under tmux it comes through the owner-only
+  secret file, and every other kind is started without it.
+- **What the CLI gets.** The backend builds the CLI's environment from the worker's, without any
+  `ANTHROPIC_*` variable, the host's `CLAUDE_CODE_OAUTH_TOKEN`, any `DEEPSEEK_*`, the relay's
+  settings for its worker (`COPILOT_WEB_RELAY_*`, `COPILOT_ALLOW_ALL`, `SESSION_ID`, the other
+  kinds' models, `OAR_*`: what the launcher hands a worker, which neither Claude Code nor the
+  agent's commands read) or a host Claude Code session's variables
+  (`shared/host-claude-session-env.mjs`). It then sets:
+  - `ANTHROPIC_BASE_URL=<base URL>/anthropic` and `ANTHROPIC_AUTH_TOKEN` (the key);
+  - `ANTHROPIC_DEFAULT_HAIKU_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`, `deepseek-flash`, for helper
+    calls and sub-agents asked for as "haiku";
+  - `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+    `ANTHROPIC_DEFAULT_FABLE_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` and
+    `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`: the session's model (with the suffix below), so every
+    alias Claude Code resolves on its own, and every sub-agent, stays on it. Without the pins the
+    CLI sends a Claude id, which DeepSeek serves by its own mapping (`claude-opus*` on V4 Pro,
+    `claude-sonnet*` and `claude-haiku*` on Flash). `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is not set,
+    so "haiku" keeps the helper model. The pins are read at spawn, so a model switch respawns the
+    CLI between turns like an effort change (`spawnKey`);
+  - `CLAUDE_CONFIG_DIR` (the directory above, which holds no Claude login);
+  - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
+  - `CLAUDE_CODE_EFFORT_LEVEL`.
+
+  The model goes to the CLI with Claude Code's `[1m]` suffix (`deepseek-flash[1m]`), and comes back
+  without it. A Claude id the CLI still names (a process spawned before the pins, in a usage report
+  or a sub-agent's frames) is read as the DeepSeek model that served it (`deepseekServedModel` in
+  `shared/deepseek-models.mjs`): the worker's report, the relay's booking
+  (`recordDeepSeekUsageReport`) and the sub-agent badge all use DeepSeek's ids.
+- **Effort.** DeepSeek's `low`/`high`/`max`, which the CLI sends as `output_config.effort` with
+  adaptive thinking. It is a spawn-time setting, so a changed effort restarts the CLI between turns,
+  on the same session (`backend-spawn` in the log, as for a model switch), as a changed compaction window does. There is
+  no thinking-off level: Claude Code never sends `thinking: {type: disabled}` for a DeepSeek model
+  (captured 2026-10-24), and DeepSeek thinks unless told not to, so a requested `none` runs as
+  `low`.
+- **Usage.** After each turn the worker posts the CLI's running token totals per model (cache hit,
+  cache miss, output) with the CLI's session id to `POST /api/deepseek-plan-usage`
+  (`claude-usage-totals.mjs`). A CLI resumed on a session starts from that session's earlier totals,
+  so the relay diffs each report against the totals last reported for the session and books only the
+  increase; a total below the checkpoint is a CLI counting from zero again, booked in full. Web
+  searches go along as `requests`. They come from the same place as the tokens: the CLI's per-model
+  `webSearchRequests`, which also counts the internal API request the WebSearch tool makes. That
+  request never shows up in the message stream. Claude Code's WebFetch is no DeepSeek request: it
+  reads the page on the relay host and has the helper model summarise it, booked as Flash tokens,
+  and DeepSeek's API refuses a server-side fetch tool (422). `requests` still carries a fetch count
+  from the API's `usage.server_tool_use` per streamed message (counted once per message id), for a
+  fetch DeepSeek might report one day; so does a search where the tokens fall back to a turn's own
+  usage. Known limit: in the first turn after
+  a resume, a WebSearch tool call counts 0, because the stream misses its request and the restored
+  total cannot be told apart from earlier turns. Claude Code's `total_cost_usd` is at
+  Claude's prices and is not sent; the relay estimates the cost from `shared/deepseek-pricing.mjs`,
+  searches (and a fetch, should DeepSeek ever report one) at $0.75 / ¥5 per 1,000 from 2026-10-31
+  16:00 UTC.
+- **Left out.** No Claude plan usage and no Claude usage-limit reports. A refused request is
+  explained in DeepSeek's terms: `deepseek-balance` (402), `deepseek-api-key` (401) and
+  `deepseek-rate-limit` (429). Every failure of a DeepSeek chat prints as `relay.deepseek-<code>`
+  (`failureCodePrefix`; any other refusal is `relay.deepseek-api-error`), never as Claude's
+  `relay.claude-<code>`, and carries no Claude account advice. An image goes to the model inline only when the model takes images
+  (`deepseek-flash`); otherwise it goes by its path.
+
+The relay delivers these per conversation on every delivery: DeepSeek's attribution, the Claude tab's
+background command limit, and the compaction window (400K unless the conversation pins one). The same
+rule as for the other worker entries applies: never run the entry bare from an agent's shell (see
+[Claude Cloud workers](#claude-cloud-workers)); `node --check` checks that it parses.
+
+**Checking a running relay.** `scripts/deepseek-live-check.mjs --relay <url> --cwd <scratch folder>`
+(token in `OAR_RELAY_TOKEN`) runs four short turns on `deepseek-flash`, on the key saved in the relay:
+- a tool turn that writes and reads a file;
+- a follow-up, which DeepSeek refuses with 400 when the tool turn's reasoning is not sent back;
+- a turn at effort `low`;
+- a switch to `deepseek-v4-pro` (`--switch-model none` skips it).
+
+It then checks the context panel and deletes the chat. It costs real money on the DeepSeek account:
+run it only with the account owner's go-ahead.
+
 ### Claude Cloud workers
 
 Claude Cloud conversations run `server/claude-cloud-worker/claude-cloud-session-worker.mjs`, a
@@ -402,7 +489,8 @@ The provider adds `COPILOT_WEB_RELAY_WORKER_KIND=claude-cloud` and `CLAUDE_CLOUD
 the launch environment, and no credential. The worker reads the Claude CLI's login itself
 (`shared/claude-cloud/credentials.mjs`; `CLAUDE_CONFIG_DIR` says where), and the token is in no log
 line and no error text. Only a relay that runs on `CLAUDE_CODE_OAUTH_TOKEN` passes that variable
-on, to cloud workers only and, under tmux, through the secret env file (`workerSecretEnvVarsFor`).
+on, to cloud and Claude workers only and, under tmux, through the secret env file (`workerSecretEnvVarsFor`);
+every other kind has it taken out of its launch environment on every path (`withoutForeignWorkerSecrets`).
 Overrides: `COPILOT_WEB_RELAY_CLAUDE_CLOUD_WORKER_PATH` (worker script location),
 `COPILOT_WEB_RELAY_CONFIG`, and for tests `OAR_CLAUDE_CLOUD_API_BASE_URL`, which points the relay's
 and the worker's cloud client at a fake API on the same machine; a value that is not a loopback
@@ -774,10 +862,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **6873 pass / 0 fail / 10 skip on Linux (0.9.16, 2026-10-24)** — the count
+Expected: **0 fail** everywhere; **7193 pass / 0 fail / 10 skip on Linux (0.9.17, 2026-10-25)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
-cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **8 skips** that
-are host-gated (0600 file modes, symlinks, `ps`) and run on Linux (0.9.16: **6875 pass / 0 fail / 8 skip**).
+cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **11 skips** that
+are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`) and run on Linux (0.9.17: **7192 pass / 0 fail / 11 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

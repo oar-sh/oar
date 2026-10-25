@@ -198,6 +198,57 @@ export function createSdkMessageNormalizer() {
   // The `error` of the turn's last main-thread assistant message: the SDK's
   // name for the failure a refused turn ended on.
   let lastAssistantError = '';
+  // The turn's web searches and fetches, per API message id: the API counts
+  // them in each message's `usage.server_tool_use`, and the SDK repeats a
+  // message's usage with every content block it delivers, so a message is
+  // counted once. Summed per model on the result; DeepSeek bills them per
+  // request (shared/deepseek-pricing.mjs).
+  const serverToolUse = new Map(); // message id -> { model, webSearchRequests, webFetchRequests }
+  let unnamedServerToolUseMessages = 0;
+
+  function requestCount(value) {
+    const number = Number(value ?? 0);
+    return Number.isFinite(number) && number > 0 ? Math.round(number) : 0;
+  }
+
+  function noteServerToolUse(messageId, message) {
+    const use = message?.usage?.server_tool_use;
+    if (!use || typeof use !== 'object') return;
+    const webSearchRequests = requestCount(use.web_search_requests);
+    const webFetchRequests = requestCount(use.web_fetch_requests);
+    if (!webSearchRequests && !webFetchRequests) return;
+    const key = messageId || `unnamed-${++unnamedServerToolUseMessages}`;
+    const current = serverToolUse.get(key)
+      || { model: String(message?.model || '').trim() || initModel, webSearchRequests: 0, webFetchRequests: 0 };
+    // A message's usage is the message's total, so repeats do not add up.
+    current.webSearchRequests = Math.max(current.webSearchRequests, webSearchRequests);
+    current.webFetchRequests = Math.max(current.webFetchRequests, webFetchRequests);
+    serverToolUse.set(key, current);
+  }
+
+  /** The turn's `[{ model, webSearchRequests, webFetchRequests }]`, and the count starts over. */
+  function takeServerToolUse(resultUsage) {
+    const byModel = new Map();
+    const add = (model, webSearchRequests, webFetchRequests) => {
+      const key = String(model || '').trim() || initModel;
+      const current = byModel.get(key) || { model: key, webSearchRequests: 0, webFetchRequests: 0 };
+      current.webSearchRequests += webSearchRequests;
+      current.webFetchRequests += webFetchRequests;
+      byModel.set(key, current);
+    };
+    for (const entry of serverToolUse.values()) add(entry.model, entry.webSearchRequests, entry.webFetchRequests);
+    serverToolUse.clear();
+    unnamedServerToolUseMessages = 0;
+    // A result without assistant messages seen still carries the turn's
+    // counts in its own usage, under the turn's model.
+    const use = resultUsage?.server_tool_use;
+    if (!byModel.size && use && typeof use === 'object') {
+      const webSearchRequests = requestCount(use.web_search_requests);
+      const webFetchRequests = requestCount(use.web_fetch_requests);
+      if (webSearchRequests || webFetchRequests) add(initModel, webSearchRequests, webFetchRequests);
+    }
+    return [...byModel.values()];
+  }
 
   function threadKeyFor(parentToolUseId) {
     return String(parentToolUseId || '').trim() || 'main';
@@ -592,6 +643,7 @@ export function createSdkMessageNormalizer() {
       const content = Array.isArray(sdkMessage?.message?.content) ? sdkMessage.message.content : [];
       const messageId = String(sdkMessage?.message?.id || '').trim();
       if (!parentToolUseId) lastAssistantError = String(sdkMessage?.error || '').trim();
+      noteServerToolUse(messageId, sdkMessage?.message);
       return actionsForAssistantMessage(content, parentToolUseId, messageId);
     }
 
@@ -683,6 +735,9 @@ export function createSdkMessageNormalizer() {
           totalCostUsd: Number.isFinite(Number(sdkMessage.total_cost_usd))
             ? Number(sdkMessage.total_cost_usd)
             : null,
+          // This turn's web searches and fetches per model (not running
+          // totals): `[{ model, webSearchRequests, webFetchRequests }]`.
+          serverToolUse: takeServerToolUse(sdkMessage.usage),
         },
       }];
     }

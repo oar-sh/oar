@@ -14,6 +14,11 @@ import {
   isOarMcpServerDisabled,
 } from '../mcp/oar-mcp-server.mjs';
 import { WORKER_LOG_FILE_ENV } from '../../shared/worker-runtime/worker-log-file.mjs';
+import {
+  HOST_CLAUDE_SESSION_ENV_VARS,
+  hostClaudeSessionUnsetStatement,
+  withoutHostClaudeSessionVariables,
+} from '../../shared/host-claude-session-env.mjs';
 import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 import {
   describeSpawnEnvironment,
@@ -271,6 +276,42 @@ export function applyClaudeCloudProviderEnvironment(env = {}, {
 }
 
 /**
+ * DeepSeek: the Claude worker's runner against DeepSeek's Anthropic-compatible
+ * endpoint (server/deepseek-worker/). The key travels as DEEPSEEK_API_KEY,
+ * through the secret file under tmux, and becomes the CLI's bearer token
+ * only inside its spawn environment (deepseek-claude-backend.mjs). The worker
+ * keeps its Claude Code state in a directory of its own, which holds no
+ * Claude login.
+ */
+export function applyDeepSeekProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+  apiKey = '',
+  baseUrl = '',
+  configDir = '',
+} = {}) {
+  const next = { ...env };
+  if (resolveWorkerKind(next) === 'deepseek') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.DEEPSEEK_RELAY_MODEL;
+  delete next.DEEPSEEK_API_KEY;
+  delete next.DEEPSEEK_BASE_URL;
+  delete next.DEEPSEEK_CLAUDE_CONFIG_DIR;
+  if (!enabled) return next;
+  const normalizedApiKey = normalizeText(apiKey);
+  if (!normalizedApiKey) throw new Error('deepseek-api-key-not-configured');
+  const normalizedConfigDir = normalizeText(configDir);
+  if (!normalizedConfigDir) throw new Error('deepseek-config-dir-not-configured');
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'deepseek';
+  next.DEEPSEEK_API_KEY = normalizedApiKey;
+  next.DEEPSEEK_CLAUDE_CONFIG_DIR = path.resolve(normalizedConfigDir);
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.DEEPSEEK_RELAY_MODEL = normalizedModel;
+  const normalizedBaseUrl = normalizeText(baseUrl);
+  if (normalizedBaseUrl) next.DEEPSEEK_BASE_URL = normalizedBaseUrl;
+  return next;
+}
+
+/**
  * The Copilot SDK engine: the same `github`/`openai` providers the extension
  * serves, run as a plain Node worker against the CLI's headless runtime.
  *
@@ -359,6 +400,10 @@ export function isClaudeCloudWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'claude-cloud';
 }
 
+export function isDeepSeekWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'deepseek';
+}
+
 export function isCopilotSdkWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'copilot-sdk';
 }
@@ -403,6 +448,16 @@ export function resolveClaudeCloudWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'claude-cloud-worker', 'claude-cloud-session-worker.mjs');
 }
 
+export function resolveDeepSeekWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_DEEPSEEK_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'deepseek-worker', 'deepseek-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'deepseek-worker', 'deepseek-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'deepseek-worker', 'deepseek-session-worker.mjs');
+}
+
 export function resolveCopilotSdkWorkerScriptPath(env = {}) {
   const explicit = normalizeText(env?.COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH);
   if (explicit) return explicit;
@@ -431,6 +486,7 @@ const NODE_WORKER_DESCRIPTORS = Object.freeze({
     resolveScriptPath: resolveCopilotSdkWorkerScriptPath,
     windowsTitle: 'Copilot SDK Worker',
   }),
+  deepseek: Object.freeze({ resolveScriptPath: resolveDeepSeekWorkerScriptPath, windowsTitle: 'DeepSeek Worker' }),
 });
 
 function resolveNodeWorkerDescriptor(env = {}) {
@@ -601,17 +657,42 @@ export function getTmuxPanePid(sessionName, {
   }
 }
 
-export const WORKER_SECRET_ENV_VARS = Object.freeze(['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
+export const WORKER_SECRET_ENV_VARS = Object.freeze([
+  'COPILOT_PROVIDER_API_KEY',
+  'CURSOR_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'DEEPSEEK_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+]);
 
-// Secrets that are not every worker's. The two API keys are put into the
-// launch environment by their own provider's applier and cleared for every
-// other one, so they need no entry. The Claude login token is different: it
-// sits in the relay's own environment (a relay run on CLAUDE_CODE_OAUTH_TOKEN
-// instead of the CLI's credentials file), so it would otherwise travel with
-// every launch. Only the Claude Cloud worker gets it: its cloud client reads
-// the login from there exactly as the relay's does (credentials.mjs).
+// Secrets that are not every worker's: each entry names the kinds that get
+// it, and every other kind has it taken out of its launch environment on
+// every path (withoutForeignWorkerSecrets), and out of the tmux shell
+// (buildTmuxWorkerShellCommand). A secret with no entry is every kind's.
+//
+// - The two API keys without an entry are put into the launch environment by
+//   their own provider's applier and cleared for every other one.
+// - The Claude login token sits in the relay's own environment (a relay run on
+//   CLAUDE_CODE_OAUTH_TOKEN instead of the CLI's credentials file), so it
+//   would otherwise travel with every launch. Only the two workers of the
+//   host's own Claude account get it: the Claude Cloud worker's client reads
+//   the login from there exactly as the relay's does (credentials.mjs), and
+//   the Claude worker's CLI prefers it to the credentials file.
+// - The DeepSeek key is put there by its own applier, but the same name could
+//   also sit in the relay's environment (a shell that exports it); it is the
+//   DeepSeek worker's alone either way.
+// - A host's ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are no worker's (an
+//   empty list): Claude Code prefers either to the Claude login, so a Claude
+//   chat would run, and be billed, on a key nobody chose for it, and every
+//   other kind has no use for them. A key a provider saves in the relay's
+//   settings goes to its own kind under a name of its own, with an entry
+//   here naming that kind alone.
 const WORKER_SECRET_ENV_VAR_KINDS = Object.freeze({
-  CLAUDE_CODE_OAUTH_TOKEN: Object.freeze(['claude-cloud']),
+  CLAUDE_CODE_OAUTH_TOKEN: Object.freeze(['claude', 'claude-cloud']),
+  DEEPSEEK_API_KEY: Object.freeze(['deepseek']),
+  ANTHROPIC_API_KEY: Object.freeze([]),
+  ANTHROPIC_AUTH_TOKEN: Object.freeze([]),
 });
 
 /**
@@ -626,6 +707,29 @@ export function workerSecretEnvVarsFor(env = {}) {
     return !kinds || kinds.includes(kind);
   });
 }
+
+/**
+ * The launch environment without the secrets that are another kind's. They
+ * would otherwise reach the worker on the detached and Windows paths, which
+ * hand the environment over as it is, and under tmux through the environment
+ * a tmux server started by the launch keeps as its global one.
+ */
+export function withoutForeignWorkerSecrets(env = {}) {
+  const own = new Set(workerSecretEnvVarsFor(env));
+  const next = { ...env };
+  for (const key of WORKER_SECRET_ENV_VARS) {
+    if (!own.has(key)) delete next[key];
+  }
+  return next;
+}
+
+// The host Claude Code session's variables (a relay started from inside a
+// Claude Code session) are dropped from every launch path, for every kind:
+// the names and families are in shared/host-claude-session-env.mjs, with
+// what stays and why. Under tmux the worker's command unsets them again, by
+// family too, from whatever the tmux server's environment holds
+// (buildTmuxWorkerShellCommand).
+export { HOST_CLAUDE_SESSION_ENV_VARS, withoutHostClaudeSessionVariables };
 
 export function createWorkerSecretEnvFile(env = {}, {
   fsImpl = fs,
@@ -697,6 +801,84 @@ export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
   }
 }
 
+// What a tmux worker is handed as `export`s in its own shell command. These
+// are the values of one launch (the kind of worker, its model, its folder),
+// so they never go into the environment tmux itself is started with: a tmux
+// server started by a launch keeps that as its global environment, and every
+// later session on the server would inherit the first launch's values where
+// its own command exports none (launchSessionCli takes them out).
+export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
+  'COPILOT_ALLOW_ALL',
+  'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
+  'COPILOT_WEB_RELAY_ROOT',
+  'COPILOT_WEB_RELAY_SERVER_DIR',
+  'COPILOT_WEB_RELAY_CONFIG',
+  'COPILOT_WEB_RELAY_TOOLS',
+  'COPILOT_WEB_RELAY_LOG_DIR',
+  // The Cursor worker keeps its agent stores in the relay's data dir
+  // (applyCursorProviderEnvironment).
+  'COPILOT_WEB_RELAY_DATA_DIR',
+  'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
+  'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
+  'COPILOT_SDK_PATH',
+  'EXTENSION_PATH',
+  'COPILOT_PROVIDER_TYPE',
+  'COPILOT_PROVIDER_BASE_URL',
+  'COPILOT_PROVIDER_WIRE_API',
+  'COPILOT_MODEL',
+  'COPILOT_WEB_RELAY_WORKER_KIND',
+  // The SDK worker's own model and BYOK context overrides. `COPILOT_MODEL`
+  // above is the extension engine's model variable and is read by the CLI's
+  // startup layer; the SDK worker takes its default model from
+  // `COPILOT_RELAY_MODEL`, matching every other Node worker's
+  // `*_RELAY_MODEL`. Without it here the model would silently drop to the
+  // runtime default on the tmux path while working on the detached path,
+  // which inherits the whole environment.
+  'COPILOT_RELAY_MODEL',
+  'COPILOT_PROVIDER_MAX_PROMPT_TOKENS',
+  'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
+  // Without this the tmux path would fall back to ~/.claude while the relay
+  // (and the detached spawn path, which inherits the full environment) uses
+  // the override — worker and relay would read different config roots.
+  'CLAUDE_CONFIG_DIR',
+  // Same divergence, one variable over: the relay binds a resolved `claude`
+  // binary onto its own environment (cli-install-service.mjs §4.3), and the
+  // detached path inherits it for free. Without it here a bound binary would
+  // be silently dropped on the tmux path and the worker would fall back to
+  // whatever `claude` PATH happens to resolve — exactly the failure mode
+  // CLAUDE_CONFIG_DIR above was added for. GROK_CLI_COMMAND, its Grok
+  // counterpart, has always been on this list.
+  'CLAUDE_CODE_EXECUTABLE',
+  'CLAUDE_RELAY_MODEL',
+  // The Claude Cloud worker's model. Its login is not listed here: the
+  // worker reads the CLI's credentials file (CLAUDE_CONFIG_DIR above tells
+  // it where), and a relay-level CLAUDE_CODE_OAUTH_TOKEN is a secret
+  // (workerSecretEnvVarsFor), so it comes through the secret file.
+  'CLAUDE_CLOUD_RELAY_MODEL',
+  // Tests point the relay's cloud client at a fake API on this machine;
+  // the worker's client has to follow, or the relay would talk to the fake
+  // and its worker to the real API. Not a secret, and harmless as a value:
+  // shared/claude-cloud/base-url.mjs ignores everything but a loopback URL.
+  'OAR_CLAUDE_CLOUD_API_BASE_URL',
+  'CURSOR_RELAY_MODEL',
+  'CURSOR_AGENT_STORE_DIR',
+  // The DeepSeek worker's model, endpoint and Claude Code state directory.
+  // Its key is a secret (workerSecretEnvVarsFor) and comes through the file.
+  'DEEPSEEK_RELAY_MODEL',
+  'DEEPSEEK_BASE_URL',
+  'DEEPSEEK_CLAUDE_CONFIG_DIR',
+  'GROK_RELAY_MODEL',
+  'GROK_CLI_COMMAND',
+  'GROK_ALWAYS_APPROVE',
+  // The OAR MCP server kill switch (the Grok worker reads it too), and the
+  // extension engine's "it is attached" marker.
+  'OAR_MCP_SERVER',
+  'OAR_MCP_SERVER_ATTACHED',
+  'SESSION_ID',
+  'COPILOT_WORKSPACE_ROOT',
+  'INIT_CWD',
+]);
+
 export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   secretEnvFilePath = '',
   workerLogPath = '',
@@ -715,80 +897,41 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
     throw new Error('worker-secret-env-file-required');
   }
   const exports = [];
-  for (const key of [
-    'COPILOT_ALLOW_ALL',
-    'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
-    'COPILOT_WEB_RELAY_ROOT',
-    'COPILOT_WEB_RELAY_SERVER_DIR',
-    'COPILOT_WEB_RELAY_CONFIG',
-    'COPILOT_WEB_RELAY_TOOLS',
-    'COPILOT_WEB_RELAY_LOG_DIR',
-    // The Cursor worker keeps its agent stores in the relay's data dir
-    // (applyCursorProviderEnvironment).
-    'COPILOT_WEB_RELAY_DATA_DIR',
-    'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
-    'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
-    'COPILOT_SDK_PATH',
-    'EXTENSION_PATH',
-    'COPILOT_PROVIDER_TYPE',
-    'COPILOT_PROVIDER_BASE_URL',
-    'COPILOT_PROVIDER_WIRE_API',
-    'COPILOT_MODEL',
-    'COPILOT_WEB_RELAY_WORKER_KIND',
-    // The SDK worker's own model and BYOK context overrides. `COPILOT_MODEL`
-    // above is the extension engine's model variable and is read by the CLI's
-    // startup layer; the SDK worker takes its default model from
-    // `COPILOT_RELAY_MODEL`, matching every other Node worker's
-    // `*_RELAY_MODEL`. Without it here the model would silently drop to the
-    // runtime default on the tmux path while working on the detached path,
-    // which inherits the whole environment.
-    'COPILOT_RELAY_MODEL',
-    'COPILOT_PROVIDER_MAX_PROMPT_TOKENS',
-    'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
-    // Without this the tmux path would fall back to ~/.claude while the relay
-    // (and the detached spawn path, which inherits the full environment) uses
-    // the override — worker and relay would read different config roots.
-    'CLAUDE_CONFIG_DIR',
-    // Same divergence, one variable over: the relay binds a resolved `claude`
-    // binary onto its own environment (cli-install-service.mjs §4.3), and the
-    // detached path inherits it for free. Without it here a bound binary would
-    // be silently dropped on the tmux path and the worker would fall back to
-    // whatever `claude` PATH happens to resolve — exactly the failure mode
-    // CLAUDE_CONFIG_DIR above was added for. GROK_CLI_COMMAND, its Grok
-    // counterpart, has always been on this list.
-    'CLAUDE_CODE_EXECUTABLE',
-    'CLAUDE_RELAY_MODEL',
-    // The Claude Cloud worker's model. Its login is not listed here: the
-    // worker reads the CLI's credentials file (CLAUDE_CONFIG_DIR above tells
-    // it where), and a relay-level CLAUDE_CODE_OAUTH_TOKEN is a secret
-    // (workerSecretEnvVarsFor), so it comes through the secret file.
-    'CLAUDE_CLOUD_RELAY_MODEL',
-    // Tests point the relay's cloud client at a fake API on this machine;
-    // the worker's client has to follow, or the relay would talk to the fake
-    // and its worker to the real API. Not a secret, and harmless as a value:
-    // shared/claude-cloud/base-url.mjs ignores everything but a loopback URL.
-    'OAR_CLAUDE_CLOUD_API_BASE_URL',
-    'CURSOR_RELAY_MODEL',
-    'CURSOR_AGENT_STORE_DIR',
-    'GROK_RELAY_MODEL',
-    'GROK_CLI_COMMAND',
-    'GROK_ALWAYS_APPROVE',
-    // The OAR MCP server kill switch (the Grok worker reads it too), and the
-    // extension engine's "it is attached" marker.
-    'OAR_MCP_SERVER',
-    'OAR_MCP_SERVER_ATTACHED',
-    'SESSION_ID',
-    'COPILOT_WORKSPACE_ROOT',
-    'INIT_CWD',
-  ]) {
+  const exported = new Set();
+  for (const key of TMUX_WORKER_EXPORTED_ENV_VARS) {
     const value = String(launchEnv?.[key] || '').trim();
     if (!value) continue;
     exports.push(`${key}=${shellQuote(value)}`);
+    exported.add(key);
   }
+  // A new tmux session starts from the server's global environment, which is
+  // the environment the server was started with: tmux takes the environment
+  // of `new-session` only when it starts the server. So the cleaning of that
+  // environment (launchSessionCli) reaches a worker only on the first launch;
+  // a server that was started from inside a Claude Code session, or by an
+  // older relay, hands every later worker the host session's variables and
+  // the first launch's values. The command therefore unsets, before anything
+  // else, the host session's variables and every per-launch variable this
+  // launch exports no value for (unset of an absent name is a no-op in sh).
+  // With them the worker log file a relay started from inside a worker
+  // session inherited, and every secret this launch carries no value for —
+  // other kinds' and its own alike — which a tmux server started from a shell
+  // that exports them keeps: names only. The worker's own secrets come
+  // through the secret file alone, sourced after the unset, so a key the
+  // launch does carry is restored from there. A second statement then unsets
+  // every variable of the host session's families the shell holds, names a
+  // fixed list would miss included.
+  const ownSecrets = new Set(workerSecretEnvVarsFor(launchEnv));
+  const unset = [
+    ...HOST_CLAUDE_SESSION_ENV_VARS,
+    WORKER_LOG_FILE_ENV,
+    ...TMUX_WORKER_EXPORTED_ENV_VARS.filter((key) => !exported.has(key)),
+    ...WORKER_SECRET_ENV_VARS.filter((key) => !ownSecrets.has(key) || !String(launchEnv?.[key] ?? '').trim()),
+  ];
   // `sh -lc` builds PATH from the login profile, not from the relay's; the
   // relay's Node folder goes at its end when it is not on it (see
   // appendNodeDirectoryToPath).
-  const statements = exports.map((entry) => `export ${entry};`);
+  const statements = [`unset ${unset.join(' ')};`, hostClaudeSessionUnsetStatement(), ...exports.map((entry) => `export ${entry};`)];
   const nodeDirectory = resolveWorkerNodeDirectory(launchEnv);
   if (nodeDirectory) {
     const quotedDir = shellQuote(nodeDirectory);
@@ -971,10 +1114,13 @@ export async function launchSessionCli({
     workspaceRoot: launchWorkspaceRoot,
     env,
   });
-  const launchSessionEnv = {
+  // Every path below starts from this environment, so a secret that is not
+  // this kind's, and the host Claude Code session's variables, are gone
+  // before any of them sees it.
+  const launchSessionEnv = withoutHostClaudeSessionVariables(withoutForeignWorkerSecrets({
     ...appendNodeDirectoryToPath(launchEnv, resolveWorkerNodeDirectory(launchEnv, { platform }), { platform }),
     SESSION_ID: target,
-  };
+  }));
   const explain = (message) => {
     try { log?.(`worker launcher: session=${target.slice(0, 8)} ${message}`); } catch {}
   };
@@ -1007,9 +1153,14 @@ export async function launchSessionCli({
     const tmuxEnv = { ...launchSessionEnv };
     delete tmuxEnv.TMUX;
     delete tmuxEnv.TMUX_PANE;
-    // What the secret file carries is in no environment tmux is started with
-    // (a tmux server started by this call would keep it as its global one).
-    for (const key of workerSecretEnvVarsFor(launchSessionEnv)) delete tmuxEnv[key];
+    // No secret is in the environment tmux is started with (a tmux server
+    // started by this call would keep it as its global one): this kind's go
+    // through the secret file, the others are already gone. Nor is anything
+    // of this launch alone (worker kind, model, folder): the shell command
+    // exports those per session.
+    for (const key of WORKER_SECRET_ENV_VARS) delete tmuxEnv[key];
+    for (const key of TMUX_WORKER_EXPORTED_ENV_VARS) delete tmuxEnv[key];
+    delete tmuxEnv.PWD;
     if (allowProcessReuse) {
       const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
       if (existingPanePid && isPidAlive(existingPanePid)) {

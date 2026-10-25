@@ -77,6 +77,13 @@ export function isSafeGrokModelId(value) {
   return isSafeProviderModelId(value);
 }
 
+// DeepSeek model ids ("deepseek-flash", "deepseek-v4-pro") follow the same
+// safe-token rules; that they are DeepSeek's is checked by the provider
+// (shared/deepseek-models.mjs).
+export function isSafeDeepSeekModelId(value) {
+  return isSafeProviderModelId(value);
+}
+
 // The "[1m]" suffix marks the 1M-context variant of a Claude model. The UI
 // treats it as a context tier of the base model, not a separate model.
 export const CLAUDE_LONG_CONTEXT_SUFFIX = '[1m]';

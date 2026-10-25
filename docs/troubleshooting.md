@@ -21,6 +21,8 @@ Symptoms and what to check. This is the detail behind the [README](../README.md#
 | New Chat says *No cloud environment is set* | Choose one in **⚙️ Settings → Providers → Claude Cloud**; an account without any gets its default one when you open claude.ai/code once |
 | Grok reply says the CLI was not found | Press **Install Grok CLI** on the failed reply, or install it from **⚙️ Settings → Providers → Grok**; no relay restart is needed afterwards |
 | Grok reply says authentication failed | Press **Sign in to Grok** on the failed reply and confirm the device code in a browser |
+| DeepSeek reply says the balance is used up (`relay.deepseek-balance`) | Press **Top up DeepSeek** on the failed reply, top up on platform.deepseek.com, then send the message again |
+| DeepSeek reply says the key was not accepted (`relay.deepseek-api-key`) | Press **DeepSeek settings** on the failed reply and paste a valid key |
 | New messages stay queued and a banner says *Relay restart queued — waiting for N sessions* | A restart is queued and waits for the running turns of the sessions it links; until then no message is handed to a session. Wait, or press **Restart now** or **Cancel restart** in the banner. After **Ask after a queued relay restart has waited** (Settings › General, 30 min by default) the banner asks instead of waiting on |
 | Long turn requeued unexpectedly    | Raise or clear **Max turn duration** in Settings (0 = no limit)                  |
 | Background agent or shell stopped on its own | It reached the **Background task timeout** (default 4 h); raise it or set 0 for no limit |
@@ -39,4 +41,4 @@ Symptoms and what to check. This is the detail behind the [README](../README.md#
 | The relay does not start after an install with npm 12 (a `better-sqlite3` error in `server-err.log` in the log directory, or under the systemd service in `journalctl --user -u oar`) | npm 12 skipped the install scripts of OAR's native dependencies. Reinstall with `npm install -g --allow-scripts=@oar-sh/oar,better-sqlite3,koffi @oar-sh/oar` |
 | The Cloudflare tunnel stays off and the status dot's tooltip says `cloudflared is not installed` | OAR runs the `cloudflared` on the relay host and ships none. Install it (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)); the tunnel starts within a minute |
 | `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
-| No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, and Grok turns; only Copilot turns record plan usage |
+| No usage line under a reply        | Expected for OpenAI, Claude, Claude Cloud, Cursor, Grok, and DeepSeek turns; only Copilot turns record plan usage |

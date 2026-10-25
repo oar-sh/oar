@@ -14,7 +14,9 @@ const KNOWN_TEXT_ONLY_PATTERNS = [
   /^code-davinci/,
   /^text-davinci/,
   /-instruct-text$/,
+  // DeepSeek's text-only models (deepseek-flash takes images).
   /^deepseek-coder/,
+  /^deepseek-v4-pro/,
   /^qwen[\w.-]*-coder/,
 ];
 

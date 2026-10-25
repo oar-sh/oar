@@ -3523,6 +3523,8 @@ function runRelayErrorCta(cta) {
   }
   if (cta === 'open-grok-settings') openSettingsModal('providers', 'grok');
   if (cta === 'open-claude-settings') openSettingsModal('providers', 'claude');
+  if (cta === 'open-deepseek-settings') openSettingsModal('providers', 'deepseek');
+  if (cta === 'open-deepseek-top-up') window.open('https://platform.deepseek.com/top_up', '_blank', 'noopener');
 }
 
 function handleBubbleActionClick(event) {

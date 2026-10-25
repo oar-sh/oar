@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildCardNote,
+  formatUtcHourRanges,
   buildMeter,
   buildProviderCard,
   buildDetailSection,
@@ -113,7 +114,7 @@ test('toSeverity keeps a simple word and drops everything else', () => {
 test('card notes keep their text and only an https link', () => {
   assert.deepEqual(
     buildCardNote({ id: 'n1', text: ' Shown elsewhere. ', link: { label: 'Open', url: 'https://example.com/usage' } }),
-    { id: 'n1', text: 'Shown elsewhere.', link: { label: 'Open', url: 'https://example.com/usage' } },
+    { id: 'n1', text: 'Shown elsewhere.', link: { label: 'Open', url: 'https://example.com/usage' }, hours: null },
   );
   assert.equal(buildCardNote({ id: 'n2', text: 'x', link: { label: 'bad', url: 'javascript:alert(1)' } }).link, null);
   assert.equal(buildCardNote({ id: 'n3', text: 'x' }).link, null);
@@ -125,8 +126,23 @@ test('card notes keep their text and only an https link', () => {
     label: 'Claude',
     notes: [{ id: 'a', text: 'kept' }, null, { id: 'b' }],
   });
-  assert.deepEqual(card.notes, [{ id: 'a', text: 'kept', link: null }]);
+  assert.deepEqual(card.notes, [{ id: 'a', text: 'kept', link: null, hours: null }]);
   assert.deepEqual(buildProviderCard({ provider: 'claude', label: 'Claude' }).notes, []);
+});
+
+test('a note that names hours of the day carries them as data, with the UTC wording the browser replaces', () => {
+  assert.equal(formatUtcHourRanges([[1, 4], [6, 10]]), '01:00–04:00 and 06:00–10:00 UTC');
+  assert.equal(formatUtcHourRanges([[9, 17]]), '09:00–17:00 UTC');
+  assert.equal(formatUtcHourRanges([[0, 1], [2, 3], [22, 24]]), '00:00–01:00, 02:00–03:00 and 22:00–00:00 UTC');
+  assert.equal(formatUtcHourRanges([]), null);
+  assert.equal(formatUtcHourRanges([[4, 1]]), null);
+  assert.equal(formatUtcHourRanges([[1.5, 4]]), null);
+  assert.equal(formatUtcHourRanges([[1, 25]]), null);
+  const note = buildCardNote({ id: 'h', text: `Busy ${formatUtcHourRanges([[1, 4]])}.`, hours: { utcRanges: [[1, 4]] } });
+  assert.deepEqual(note, { id: 'h', text: 'Busy 01:00–04:00 UTC.', link: null, hours: { utcRanges: [[1, 4]], utcText: '01:00–04:00 UTC' } });
+  // Ranges the text does not name, or that are not ranges, are no data.
+  assert.equal(buildCardNote({ id: 'h2', text: 'No hours here.', hours: { utcRanges: [[1, 4]] } }).hours, null);
+  assert.equal(buildCardNote({ id: 'h3', text: 'x', hours: { utcRanges: 'later' } }).hours, null);
 });
 
 // ─── Copilot ─────────────────────────────────────────────────────────────────
@@ -579,6 +595,7 @@ test('with live account usage the Claude card is live, and the snapshot only sup
     id: 'claude-limit-resets',
     text: 'Limit resets (full / 5-hour) are shown on claude.ai only.',
     link: { label: 'Open the usage page', url: 'https://claude.ai/settings/usage' },
+    hours: null,
   }]);
 });
 

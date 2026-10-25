@@ -287,6 +287,35 @@ for (const profile of [
       await expect.poll(() => membersInList(page, groups.gamma)).toEqual([ids.gamma1, ids.loose5]);
     });
 
+    test("a session created in a hand-ordered group, or moved in by its menu, shows first under the head", async ({ page }, testInfo) => {
+      await openApp(page);
+      const before = await membersInList(page, groups.alpha);
+      const rowsBefore = await relayRows();
+      expect(before.every((id) => typeof rowsBefore[id].groupPosition === "number"), "Alpha batch has a hand order").toBe(true);
+      // The menu's route (agents' update_session and a clerk's placing use it too).
+      const moved = await api(`/api/conversation/${encodeURIComponent(ids.loose4)}/group`, { method: "PUT", body: { groupId: groups.alpha } });
+      expect(moved.status, JSON.stringify(moved.payload)).toBe(200);
+      await expect.poll(() => membersInList(page, groups.alpha)).toEqual([ids.loose4, ...before]);
+      // A session started with the group chosen (create_session's `group`).
+      const bootstrap = await api("/api/conversation/bootstrap", { method: "POST", body: { title: "Started in Alpha batch", model: "gpt-5.4-mini", group: groups.alpha } });
+      expect(bootstrap.status, JSON.stringify(bootstrap.payload)).toBe(200);
+      const created = bootstrap.payload.conversationId;
+      expect(await groupOf(created)).toBe(groups.alpha);
+      // The row is listed once it has a message and a reply, as the other chats here.
+      const queued = await api("/api/message", { method: "POST", body: { conversationId: created, text: "Started in Alpha batch", relayMode: "agent", model: "gpt-5.4-mini" } });
+      expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
+      const replied = await api("/api/response", { method: "POST", body: { messageId: queued.payload.messageId, conversationId: created, text: "reply", model: "gpt-5.4-mini", mode: "agent" } });
+      expect(replied.status).toBe(200);
+      await expect.poll(() => membersInList(page, groups.alpha)).toEqual([created, ids.loose4, ...before]);
+      const rows = await relayRows();
+      expect(rows[created].groupPosition).toBeLessThan(rows[ids.loose4].groupPosition);
+      expect(rows[ids.loose4].groupPosition).toBeLessThan(Math.min(...before.map((id) => rows[id].groupPosition)));
+      await page.screenshot({ path: testInfo.outputPath(`group-new-on-top-${profile.name}.png`) });
+      await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+      await page.screenshot({ path: testInfo.outputPath(`group-new-on-top-${profile.name}-light.png`) });
+      await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
+    });
+
     test("Escape gives the row back; the list scrolls by itself near its edge", async ({ page }) => {
       await openApp(page);
       const before = await membersInList(page, groups.alpha);

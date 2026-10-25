@@ -65,6 +65,9 @@ function createRecordingDb(state, events) {
           if (/COUNT\(\*\) AS count FROM queue WHERE conversation_id = \? AND status = 'processing'/.test(text)) {
             return { count: state.processingCount || 0 };
           }
+          if (/FROM sqlite_master WHERE type = 'table' AND name = \?/.test(text)) {
+            return (state.tables || []).includes(args[0]) ? { name: args[0] } : null;
+          }
           if (/FROM conversations WHERE sdk_session_id = \? AND id != \? AND status != 'deleted'/.test(text)) {
             return state.sharedWithConversationId ? { id: state.sharedWithConversationId } : null;
           }
@@ -192,6 +195,8 @@ function setup(state = {}) {
     sdkSessionImportService: state.sdkSessionImportService || null,
     claudeCloudSessionService: state.claudeCloudSessionService || null,
     resolveClaudeSessionRoot: state.resolveClaudeSessionRoot || null,
+    resolveDeepSeekSessionRoot: state.resolveDeepSeekSessionRoot || null,
+    deepseekClaudeConfigDir: state.deepseekClaudeConfigDir || '',
     resolveSessionStateRoot: () => state.sessionStateRoot || path.join(os.tmpdir(), 'oar-delete-lifecycle-state'),
     markSharedViewerPresence: () => ({ ok: true, watcherCount: 0 }),
     getSharedWatcherCount: () => 0,
@@ -460,6 +465,88 @@ test('a Claude conversation loses its transcript and session folder, and only th
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('a DeepSeek conversation takes along what its killed Claude Code left in the relay\'s config dir, and its usage checkpoints', async () => {
+  await withTmpDir(async (tmp) => {
+    const configDir = path.join(tmp, 'deepseek-claude');
+    const workspace = path.join(tmp, 'workspace');
+    const projectDir = path.join(configDir, 'projects', claudeProjectDirSlug(workspace));
+    const write = (file, text = '') => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, text);
+    };
+    const startedAt = Date.parse('2026-10-25T08:00:00.000Z');
+    const otherStartedAt = startedAt + 3_600_000;
+    write(path.join(projectDir, 'native-ds.jsonl'), '{}\n');
+    fs.mkdirSync(path.join(projectDir, 'native-ds', 'tool-results'), { recursive: true });
+    fs.mkdirSync(path.join(projectDir, 'memory'), { recursive: true });
+    fs.mkdirSync(path.join(configDir, 'session-env', 'native-ds'), { recursive: true });
+    fs.mkdirSync(path.join(configDir, 'session-env', 'native-other'), { recursive: true });
+    const key = (pid) => path.join(configDir, 'sessions', `${pid}.${'a'.repeat(64)}.key`);
+    // The killed CLI's registration and key, and a live one's of another session.
+    write(path.join(configDir, 'sessions', `${DEAD_PID}.json`), JSON.stringify({ pid: DEAD_PID, sessionId: 'native-ds', cwd: workspace, startedAt }));
+    write(key(DEAD_PID), 'k');
+    write(path.join(configDir, 'sessions', `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: 'native-other', cwd: workspace, startedAt: otherStartedAt }));
+    write(key(process.pid), 'k');
+    const ownSnapshot = path.join(configDir, 'shell-snapshots', `snapshot-bash-${startedAt + 800}-a1b2c3.sh`);
+    const otherSnapshot = path.join(configDir, 'shell-snapshots', `snapshot-bash-${otherStartedAt + 800}-d4e5f6.sh`);
+    write(ownSnapshot, '# snapshot');
+    write(otherSnapshot, '# snapshot');
+    const resolver = createClaudeSessionRootResolver({ env: { CLAUDE_CONFIG_DIR: configDir }, homedir: () => '' });
+
+    const { del, events } = setup({
+      workspaceRootPath: workspace,
+      conversation: { sdk_session_id: 'conv-1' },
+      runtimeSession: { provider_type: 'deepseek', claude_native_session_id: 'native-ds' },
+      resolveDeepSeekSessionRoot: resolver.resolveClaudeSessionRoot,
+      deepseekClaudeConfigDir: configDir,
+      tables: ['deepseek_usage_checkpoints'],
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, true);
+    for (const gone of [
+      projectDir,
+      path.join(configDir, 'session-env', 'native-ds'),
+      path.join(configDir, 'sessions', `${DEAD_PID}.json`),
+      key(DEAD_PID),
+      ownSnapshot,
+    ]) assert.equal(fs.existsSync(gone), false, gone);
+    for (const kept of [
+      path.join(configDir, 'session-env', 'native-other'),
+      path.join(configDir, 'sessions', `${process.pid}.json`),
+      key(process.pid),
+      otherSnapshot,
+    ]) assert.equal(fs.existsSync(kept), true, kept);
+    // The checkpoints go with the conversation's rows; totals and days are
+    // history and are not touched.
+    assert.ok(deletedRows(events).includes('sql:DELETE FROM deepseek_usage_checkpoints'));
+    assert.equal(deletedRows(events).some((event) => /deepseek_usage_(totals|days)/.test(event)), false);
+  });
+});
+
+test('a DeepSeek project folder another session still uses stays', async () => {
+  await withTmpDir(async (tmp) => {
+    const configDir = path.join(tmp, 'deepseek-claude');
+    const workspace = path.join(tmp, 'workspace');
+    const projectDir = path.join(configDir, 'projects', claudeProjectDirSlug(workspace));
+    fs.mkdirSync(path.join(projectDir, 'memory'), { recursive: true });
+    fs.writeFileSync(path.join(projectDir, 'native-ds.jsonl'), '{}\n');
+    fs.writeFileSync(path.join(projectDir, 'native-other.jsonl'), '{}\n');
+    const resolver = createClaudeSessionRootResolver({ env: { CLAUDE_CONFIG_DIR: configDir }, homedir: () => '' });
+    const { del } = setup({
+      workspaceRootPath: workspace,
+      conversation: { sdk_session_id: 'conv-1' },
+      runtimeSession: { provider_type: 'deepseek', claude_native_session_id: 'native-ds' },
+      resolveDeepSeekSessionRoot: resolver.resolveClaudeSessionRoot,
+      deepseekClaudeConfigDir: configDir,
+    });
+    assert.equal((await del()).statusCode, 200);
+    assert.equal(fs.existsSync(path.join(projectDir, 'native-ds.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(projectDir, 'native-other.jsonl')), true);
+    assert.equal(fs.existsSync(path.join(projectDir, 'memory')), true);
+  });
 });
 
 test('a CLI session that cannot be removed does not leave the conversation half deleted', async () => {

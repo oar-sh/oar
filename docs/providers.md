@@ -2,9 +2,9 @@
 
 The runtimes OAR drives, what each needs, and what each conversation can do with it. This is the detail behind the [README](../README.md#runtimes); the most complete guide is [Providers on oar.sh](https://oar.sh/docs/providers/overview/).
 
-The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation, also before its first message: the composer offers only that provider's models and states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / ☁ Claude Cloud / Cursor SDK / Grok models.`, colour-coded per provider. For another provider, start a new chat. OpenAI and Grok sessions also pin one exact model once the first message is sent, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
+The runtime (called the *provider* in the UI) is chosen in **New Chat** and then fixed for that conversation, also before its first message: the composer offers only that provider's models and states this above the input — `🔒 Session locked to GitHub Copilot / OpenAI / OpenAI Image / Claude SDK / ☁ Claude Cloud / Cursor SDK / Grok / DeepSeek models.`, colour-coded per provider. For another provider, start a new chat. OpenAI and Grok sessions also pin one exact model once the first message is sent, which the note names in parentheses and the model dropdown shows as a disabled `🔒` entry.
 
-A conversation that has no message and nothing queued yet is moved back to Copilot when its provider goes away, so it never points at a runtime that cannot start: Claude and Grok when you switch them off, OpenAI and Cursor when you remove their key (switching those off only takes them out of **New Chat**). Removing the OpenAI or Cursor key is refused as long as any conversation of that provider, archived ones and OpenAI Image chats included, has a message or a queued one; switch the provider off instead. Conversations of other providers are left alone, and so are Claude Cloud's: switching it off only takes it out of **New Chat**.
+A conversation that has no message and nothing queued yet is moved back to Copilot when its provider goes away, so it never points at a runtime that cannot start: Claude and Grok when you switch them off, OpenAI, Cursor and DeepSeek when you remove their key (switching those off only takes them out of **New Chat**). Removing the OpenAI, Cursor or DeepSeek key is refused as long as any conversation of that provider, archived ones and OpenAI Image chats included, has a message or a queued one; switch the provider off instead. Conversations of other providers are left alone, and so are Claude Cloud's: switching it off only takes it out of **New Chat**.
 
 | Runtime | Enable via | Auth | Notes |
 | ------- | ---------- | ---- | ----- |
@@ -15,6 +15,7 @@ A conversation that has no message and nothing queued yet is moved back to Copil
 | **Claude Cloud** | ⚙️ Settings → Providers → Claude Cloud (off by default) | the relay host's Claude login (a claude.ai account), read from the Claude CLI | Claude Code in a sandbox at Anthropic, on a clone of a GitHub repository. Results come back as pushed branches; billed to that Claude account. Uses API endpoints that are not a documented public API (see [Claude Cloud](#claude-cloud)) |
 | **Cursor (Agent SDK)** | ⚙️ Settings → Providers → Cursor | your Cursor API key, stored in the relay database | A dedicated Node worker per conversation through the Cursor Agent SDK |
 | **Grok (CLI ACP)** | ⚙️ Settings → Providers → Grok | the relay host's Grok CLI login, **sign in and out from the panel** | Drives the Grok CLI's `grok agent stdio` over ACP. The CLI can be installed and updated from the panel |
+| **DeepSeek** | ⚙️ Settings → Providers → DeepSeek | your DeepSeek API key, stored in the relay database | Runs Claude Code (bundled with the Agent SDK) on the relay host against DeepSeek's Anthropic-compatible API; billed to the DeepSeek account |
 
 ## GitHub Copilot — engine choice
 
@@ -43,7 +44,7 @@ SDK-engine turns report their own per-turn billing to the relay, which appears a
 Save your key in **⚙️ Settings → Providers → OpenAI**, together with the **OpenAI model ID** (default `gpt-4o`) and an optional **Base URL** (default `https://api.openai.com/v1`). **Enable OpenAI API key for New Chat model selection** is on once a key is saved, and saving discovers the endpoint's models from `/v1/models`.
 
 - **OpenAI (BYOK)** conversations run the Copilot runtime against that endpoint with your key, on whichever Copilot engine is selected.
-- **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it.
+- **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it. The relay calls the OpenAI Images API itself (`/images/generations`, or `/images/edits` with an attached or generated image) on both Copilot engines; these turns never go to the Copilot runtime.
 
 ## Claude (Agent SDK)
 
@@ -146,7 +147,7 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 - While the switch is off, the relay asks Anthropic for nothing with this login: it lists no environments and reads no account usage. Only a cloud conversation from before still talks to its session, when you write to it, delete it or archive it.
 - The provider is off by default. Switching it on is the consent for all of the above.
 
-`CLAUDE_CODE_OAUTH_TOKEN` in the relay's environment is used instead of the credentials file when it is set. That is the one case in which the relay passes the login on: a cloud worker started under tmux gets the variable through a file only the relay's user can read, which the worker's shell reads once and deletes; workers of other providers are not given it that way (see [Environment variables](configuration.md#environment-variables)).
+`CLAUDE_CODE_OAUTH_TOKEN` in the relay's environment is used instead of the credentials file when it is set. That is the one case in which the relay passes the login on, and only to Claude Cloud and Claude workers: under tmux they get the variable through a file only the relay's user can read, which the worker's shell reads once and deletes. Workers of other providers are started without it, with or without tmux (see [Environment variables](configuration.md#environment-variables)).
 
 ## Cursor (Agent SDK)
 
@@ -191,6 +192,38 @@ Grok conversations support live reply streaming, thoughts, plan boards, subagent
 **Stop**, session resume across worker restarts, per-turn context metrics, and the live weekly quota
 bar in **Check Usage**. The model is fixed per conversation (ACP has no mid-session switch; the default
 is `grok-4.5`), and question cards are not available — the protocol has no ask-user surface.
+
+## DeepSeek
+
+Paste your DeepSeek API key in **⚙️ Settings → Providers → DeepSeek**; **Enable DeepSeek for New Chat model selection** is on once a key is saved. Saving the key asks DeepSeek which models it serves (`GET /models`), and **🤗 Select Models → DeepSeek** chooses which of them appear in the composer. Without an answer from DeepSeek the tab offers `deepseek-flash` and `deepseek-v4-pro`. The default model is `deepseek-flash` unless you choose another one on the tab.
+
+A DeepSeek chat runs Claude Code on the relay host, the build bundled with the Agent SDK, against DeepSeek's [Anthropic-compatible API](https://api-docs.deepseek.com/guides/anthropic_api). The agent works in the chat's folder with Claude Code's tools, and DeepSeek's model does the thinking. The turns are billed to the DeepSeek account the key belongs to.
+
+What DeepSeek conversations support:
+
+- All four relay modes. `plan` produces a **Plan ready** board, as in a Claude chat.
+- Tools on the relay host, question cards (including multi-select), sub-agents, live reply streaming with thoughts, **Mid-turn steering**, **Stop**, and background tasks in the composer's task panel. The preview and `remote_relay` tools are there as well.
+- Per-message reasoning effort: `low`, `high` or `max`, with `high` the default. A changed effort restarts the session's Claude Code between turns; the conversation continues where it was. DeepSeek's thinking cannot be switched off from OAR, because Claude Code never asks DeepSeek for that. An effort of `none` coming from another relay runs as `low`.
+- Switching models between turns, which restarts the session's Claude Code like an effort change. `deepseek-v4-pro` takes no images: an image you attach goes to it as a file path, and a switch to it is refused once the chat holds images.
+- Sub-agents run on the chat's model: one the agent asks for as "opus" or "sonnet", or without a model, gets the chat's model; one asked for as "haiku" gets DeepSeek Flash. Their badges name the DeepSeek model.
+- Context metrics with DeepSeek's 1M window. The chat compacts at 400K tokens unless you set another window in the **🧠** modal.
+- Session continuity across worker restarts.
+- Commit attribution: commits end with `Co-authored-by: Open Agent Relay (DeepSeek Flash) <no-reply@oar.sh>`, with the name of the model in use. **Off** on the DeepSeek tab leaves the line out. A folder's override from the **🧠** modal applies as for Claude; its *vanilla* setting is read as OAR, because Claude Code's own lines would credit Claude.
+- A turn that DeepSeek refuses because the balance is used up or the key is not accepted ends with a note and buttons: **Top up DeepSeek** and **DeepSeek settings**.
+
+What stays on the relay host and what goes to DeepSeek:
+
+- The key stays in the relay database and is never sent to browsers. It reaches only the workers of DeepSeek chats, under tmux through a file only the relay's user can read. Inside a worker it becomes Claude Code's bearer token for DeepSeek's endpoint and nothing else.
+- Claude Code in a DeepSeek chat keeps its state (sessions, transcripts, settings) in `deepseek-claude` in the relay's data folder. Your own `~/.claude` stays out of it: the host's Claude login, global skills, plugins and MCP servers are not used. The repository's own `CLAUDE.md` and `.claude/` folder still apply.
+- Deleting a DeepSeek chat removes its Claude Code session from `deepseek-claude`: the transcript, the session's folders, the files its stopped Claude Code left (its registration, hook environment and shell snapshot), and the project folder once no other session uses it. The spend it added stays in the DeepSeek card's totals.
+- The relay switches off Claude Code's own traffic to Anthropic (updates, telemetry). With that, a DeepSeek turn talked to DeepSeek only (measured 2026-10-24).
+- Everything the agent reads and writes as part of a turn goes to DeepSeek: the prompts, the files it opens and the output of its commands.
+- DeepSeek gets the same session context as any Claude Code chat: the system prompt with the folder's path, the date and the git status of the folder's repository (branch, recent commits, changed files), the `CLAUDE.md` files and the tool results.
+- Claude Code's WebSearch runs on DeepSeek's Search API: DeepSeek bills each search from 2026-10-31, and the DeepSeek card counts them. WebFetch does not: Claude Code fetches the page itself from the relay host and has the helper model (DeepSeek Flash) summarise it. That costs Flash tokens, booked like any other turn's, and no fetch request.
+
+The **Advanced** section of the tab takes another base URL, for a proxy for example. It must be `https:`, or `http:` on the same machine. The key is sent to that address and nowhere else.
+
+Like Claude chats, DeepSeek turns are not included in the Copilot usage line. The Claude plan limits and the usage-limit pause do not apply to them either.
 
 ## Installing a provider CLI from the relay
 
@@ -237,5 +270,6 @@ The composer's model picker is the union of every enabled provider's catalog, fi
 - **Claude Cloud** has no discovery of its own: its picker offers the Claude provider's models under their plain ids, plus the tab's default model.
 - **Cursor** models (and their per-model reasoning-effort tiers) are discovered when the API key is saved or the provider is re-enabled.
 - **Grok** models are discovered from the Grok CLI over ACP when the provider is enabled, after a sign-in, and after a CLI install from the panel.
+- **DeepSeek** models are discovered from DeepSeek's `/models` when the key is saved, the provider is re-enabled, or the base URL changes. When discovery fails the stored list is kept, and before the first discovery the tab offers `deepseek-flash` and `deepseek-v4-pro`.
 
-Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation. Claude Cloud has no tab there.
+Use **🤗 Select Models** to choose which variants show up in the composer, then **💾 Save enabled models**; **Refresh** reruns discovery for every enabled runtime. The modal has one tab per runtime — **Copilot**, **OpenAI**, **Claude SDK**, **Cursor SDK**, **Grok**, **DeepSeek** — and each tab lists only the models that runtime serves; there is no cross-runtime switching inside a conversation. Claude Cloud has no tab there.

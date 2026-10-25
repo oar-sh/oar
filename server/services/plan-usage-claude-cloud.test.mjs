@@ -172,6 +172,7 @@ test('an open offer is a note with the amount and the link, only while there is 
     id: 'claude-cloud-credit-offer',
     text: 'A cloud credit of $120.00 is available to claim on claude.ai.',
     link: { label: 'Open the usage page', url: 'https://claude.ai/settings/usage' },
+    hours: null,
   });
   assert.equal(card.message, 'This account holds no cloud credit, and no cloud conversation on this relay has run yet.');
 
@@ -199,6 +200,7 @@ test('the card always says how cloud turns are billed', () => {
     id: 'claude-cloud-billing',
     text: 'Cloud turns spend the cloud credit first; without a credit they count against the Claude limits (5-hour and weekly).',
     link: null,
+    hours: null,
   }]);
 });
 

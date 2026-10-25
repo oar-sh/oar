@@ -46,6 +46,14 @@ import { stopSessionWorkerProcesses } from '../services/session-worker-stop-serv
 import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
 import { createCliInstallService } from '../services/cli-install-service.mjs';
 import { createGrokAuthService } from '../services/grok-auth-service.mjs';
+import { parseDeepSeekSettingsUpdateRequest } from '../services/deepseek-settings-service.mjs';
+import {
+  DEEPSEEK_PROVIDER_TYPE,
+  DEEPSEEK_REASONING_EFFORTS,
+  DEFAULT_DEEPSEEK_MODEL,
+  DEFAULT_DEEPSEEK_REASONING_EFFORT,
+  deepseekReasoningEffortFor,
+} from '../../shared/deepseek-models.mjs';
 import {
   isWithinAllowedPrefix,
   readWorkspaceRootPathFromBody,
@@ -133,6 +141,10 @@ import {
   derivePwaShortName,
 } from '../../shared/pwa-app-name.mjs';
 import { parseRestartResumeUpdate } from '../services/restart-resume-service.mjs';
+import { removeClaudeSessionLeftovers } from '../services/claude-session-leftovers.mjs';
+import { deepseekStartingBalanceNote } from '../services/plan-usage-deepseek.mjs';
+import { DEEPSEEK_USAGE_CHECKPOINTS_TABLE } from '../migrations/0024-deepseek-usage-totals.mjs';
+import { claudeProjectDirSlug } from '../services/claude-session-root-service.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -794,6 +806,55 @@ export function buildModelCatalogWithGrokProvider(modelState = {}, grokSettings 
   };
 }
 
+export function buildModelCatalogWithDeepSeekProvider(modelState = {}, deepseekSettings = {}) {
+  const configured = deepseekSettings?.enabled === true;
+  const model = String(deepseekSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const deepseekModels = [];
+  const seenDeepSeekModels = new Set();
+  const listed = Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : [];
+  for (const candidate of [model, ...listed]) {
+    const modelId = String(candidate || '').trim();
+    const lowerId = modelId.toLowerCase();
+    if (!modelId || seenDeepSeekModels.has(lowerId)) continue;
+    seenDeepSeekModels.add(lowerId);
+    deepseekModels.push(modelId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...deepseekModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const deepseekReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  // DeepSeek's ids are its own ("deepseek-*"): no other provider lists them,
+  // so the provider tag is never shared with Copilot.
+  for (const deepseekModel of deepseekModels) {
+    const lowerKey = deepseekModel.toLowerCase();
+    deepseekReasoningByModel[lowerKey] = [...DEEPSEEK_REASONING_EFFORTS];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...DEEPSEEK_REASONING_EFFORTS];
+    }
+    const existingProviders = Array.isArray(providersByModel[deepseekModel])
+      ? providersByModel[deepseekModel]
+      : (Array.isArray(providersByModel[lowerKey]) ? providersByModel[lowerKey] : []);
+    providersByModel[deepseekModel] = Array.from(new Set([...existingProviders, DEEPSEEK_PROVIDER_TYPE]));
+    modelMetadataByModel[deepseekModel] = {
+      ...(modelMetadataByModel[deepseekModel] || {}),
+      provider: modelMetadataByModel[deepseekModel]?.provider || DEEPSEEK_PROVIDER_TYPE,
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      [DEEPSEEK_PROVIDER_TYPE]: deepseekReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+  };
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
@@ -803,6 +864,7 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'claude-cloud') return 'claude-cloud';
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
+  if (normalized === 'deepseek') return 'deepseek';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -1421,6 +1483,8 @@ export function buildConversationSessionRootPayload({
   claudeNativeSessionId = '',
   workspaceRootPath = '',
   resolveClaudeSessionRoot = null,
+  // The same Claude Code layout, in the DeepSeek workers' own config dir.
+  resolveDeepSeekSessionRoot = null,
   resolveCursorSessionRoot = null,
 } = {}) {
   const sid = String(sdkSessionId || '').trim() || String(conversationId || '').trim();
@@ -1443,10 +1507,12 @@ export function buildConversationSessionRootPayload({
   // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
   // CLI creates those — so they resolve against the Agent SDK's own layout and
   // never fall through to the branch below.
-  if (String(providerType || '').trim().toLowerCase() === 'claude') {
+  const claudeCodeProvider = String(providerType || '').trim().toLowerCase();
+  if (claudeCodeProvider === 'claude' || claudeCodeProvider === 'deepseek') {
     const nativeSessionId = String(claudeNativeSessionId || '').trim();
-    if (!nativeSessionId || typeof resolveClaudeSessionRoot !== 'function') return null;
-    const claudeRoot = resolveClaudeSessionRoot({
+    const resolveRoot = claudeCodeProvider === 'deepseek' ? resolveDeepSeekSessionRoot : resolveClaudeSessionRoot;
+    if (!nativeSessionId || typeof resolveRoot !== 'function') return null;
+    const claudeRoot = resolveRoot({
       claudeNativeSessionId: nativeSessionId,
       workspaceRootPath: String(workspaceRootPath || '').trim(),
     });
@@ -2068,6 +2134,10 @@ export function registerSessionsRoutes(app, deps) {
     // is simply off.
     claudeCloudSettingsService = null,
     claudeCloudSessionService = null,
+    // DeepSeek (provider `deepseek`): its key, models, base URL and
+    // attribution (services/deepseek-settings-service.mjs). Absent in older
+    // wiring and most tests, where the provider is simply off.
+    deepseekSettingsService = null,
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -2108,6 +2178,13 @@ export function registerSessionsRoutes(app, deps) {
     // nothing while Claude Cloud is off, and absent (tests, older wiring) the
     // Claude card stays the last turn's snapshot.
     claudeAccountUsageService = null,
+    // Optional DeepSeek balance (deepseek-balance-service.mjs); it reads
+    // nothing while DeepSeek is off, and absent (tests, older wiring) the
+    // DeepSeek card shows the relay's estimated spend alone.
+    deepseekBalanceService = null,
+    // Optional DeepSeek usage export (deepseek-usage-import.mjs): its figures
+    // replace the estimate on the days it covers; absent, the card is the estimate.
+    deepseekUsageImportService = null,
     getCursorPlanAllowanceSettings = () => ({ cursorModelsUsd: null, otherModelsUsd: null, resetDay: 1 }),
     setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
     getGrokPlanAllowanceSettings = () => ({ monthlyUsd: null, resetDay: 1 }),
@@ -2139,6 +2216,10 @@ export function registerSessionsRoutes(app, deps) {
     sessionWorkerStopOverrides = null,
     resolveSessionStateRoot,
     resolveClaudeSessionRoot = null,
+    resolveDeepSeekSessionRoot = null,
+    // DeepSeek's Claude Code config directory, which the relay owns: a deleted
+    // conversation's leftovers there go with it (claude-session-leftovers.mjs).
+    deepseekClaudeConfigDir = '',
     resolveCursorSessionRoot = null,
     getTurnCeilingMinutes = () => DEFAULT_TURN_CEILING_MINUTES,
     setTurnCeilingMinutes = () => ({ ok: false, error: 'Turn ceiling settings are unavailable' }),
@@ -2356,6 +2437,9 @@ export function registerSessionsRoutes(app, deps) {
     FROM message_usage_snapshots
     WHERE conversation_id = ?
   `);
+  // Asked on each delete: the usage service creates the table at its own
+  // start, which may come after these routes'.
+  const findDeepSeekUsageCheckpointsTable = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`);
   const hardDeleteConversationRows = db.transaction((conversationId) => {
     if (typeof stmts.deleteConvQuestions?.run === 'function') {
       stmts.deleteConvQuestions.run(conversationId);
@@ -2385,6 +2469,11 @@ export function registerSessionsRoutes(app, deps) {
     db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
     db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
+    // A DeepSeek conversation's usage checkpoints are only good for diffing its
+    // later reports; the totals and days they fed stay, as history.
+    if (findDeepSeekUsageCheckpointsTable.get(DEEPSEEK_USAGE_CHECKPOINTS_TABLE)) {
+      db.prepare(`DELETE FROM ${DEEPSEEK_USAGE_CHECKPOINTS_TABLE} WHERE conversation_id = ?`).run(conversationId);
+    }
     // The share access log goes with it; the share rows follow the foreign key.
     shares().forgetConversation(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
@@ -2410,17 +2499,25 @@ export function registerSessionsRoutes(app, deps) {
   const sessionLaunchMutex = createKeyedMutex();
   const relaunchCoalescer = createRelaunchCoalescer({ windowMs: RELAUNCH_COALESCE_WINDOW_MS });
 
+  function getDeepSeekProviderSettings() {
+    return deepseekSettingsService?.getSettings?.()
+      || { configured: false, enabled: false, model: DEFAULT_DEEPSEEK_MODEL, models: [], availableModels: [] };
+  }
+
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
-    return buildModelCatalogWithGrokProvider(
-      buildModelCatalogWithCursorProvider(
-        buildModelCatalogWithClaudeProvider(
-          buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
-          getClaudeProviderSettings(),
+    return buildModelCatalogWithDeepSeekProvider(
+      buildModelCatalogWithGrokProvider(
+        buildModelCatalogWithCursorProvider(
+          buildModelCatalogWithClaudeProvider(
+            buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+            getClaudeProviderSettings(),
+          ),
+          getCursorProviderSettings(),
         ),
-        getCursorProviderSettings(),
+        getGrokProviderSettings(),
       ),
-      getGrokProviderSettings(),
+      getDeepSeekProviderSettings(),
     );
   }
 
@@ -2536,10 +2633,10 @@ export function registerSessionsRoutes(app, deps) {
    * it. Nothing else in the project folder is touched — it holds every other
    * session of that workspace and the project memory.
    */
-  function deleteClaudeCliSession({ conversation, runtimeSession }) {
+  function deleteClaudeCliSession({ conversation, runtimeSession, resolveRoot = resolveClaudeSessionRoot }) {
     const nativeSessionId = String(runtimeSession?.claude_native_session_id || '').trim();
-    if (!nativeSessionId || typeof resolveClaudeSessionRoot !== 'function') return { deleted: null };
-    const anchors = resolveClaudeSessionRoot({
+    if (!nativeSessionId || typeof resolveRoot !== 'function') return { deleted: null };
+    const anchors = resolveRoot({
       claudeNativeSessionId: nativeSessionId,
       workspaceRootPath: String(
         conversation?.runtime_workspace_root_path || conversation?.configured_workspace_root_path || '',
@@ -2553,7 +2650,25 @@ export function registerSessionsRoutes(app, deps) {
       .filter((target) => path.dirname(target) === projectDir
         && [nativeSessionId, `${nativeSessionId}.jsonl`].includes(path.basename(target)));
     for (const target of targets) fs.rmSync(target, { recursive: true, force: true });
-    return { deleted: targets.length > 0 };
+    return { deleted: targets.length > 0, projectDirPath: projectDir };
+  }
+
+  /**
+   * A DeepSeek conversation's Claude Code session: the transcript as for
+   * Claude, then what the killed CLI left in the relay's own config directory
+   * (its hook environment, registration, shell snapshot, and the project
+   * folder once no session is left in it).
+   */
+  function deleteDeepSeekCliSession({ conversation, runtimeSession }) {
+    const outcome = deleteClaudeCliSession({ conversation, runtimeSession, resolveRoot: resolveDeepSeekSessionRoot });
+    const configRoot = String(deepseekClaudeConfigDir || '').trim();
+    const nativeSessionId = String(runtimeSession?.claude_native_session_id || '').trim();
+    if (!configRoot || !nativeSessionId) return { deleted: outcome.deleted };
+    const workspaceRoot = String(conversation?.runtime_workspace_root_path || conversation?.configured_workspace_root_path || '').trim();
+    const projectDirPath = outcome.projectDirPath
+      || (workspaceRoot ? path.join(configRoot, 'projects', claudeProjectDirSlug(workspaceRoot)) : '');
+    const removed = removeClaudeSessionLeftovers({ configRoot, nativeSessionId, projectDirPath });
+    return { deleted: outcome.deleted === null && removed.length ? true : outcome.deleted };
   }
 
   /**
@@ -2594,6 +2709,7 @@ export function registerSessionsRoutes(app, deps) {
     const provider = String(runtimeSession?.provider_type || '').trim().toLowerCase();
     try {
       if (provider === 'claude') return deleteClaudeCliSession({ conversation, runtimeSession });
+      if (provider === 'deepseek') return deleteDeepSeekCliSession({ conversation, runtimeSession });
       if (!sdkSessionId) return { deleted: null };
       if (!provider || provider === 'github' || provider === 'openai') {
         return await deleteCopilotCliSession({ sdkSessionId, conversationId });
@@ -3527,9 +3643,10 @@ export function registerSessionsRoutes(app, deps) {
     const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
     // The cursor and grok workers post the same Claude-shaped usage blob, and
     // so does the Claude Cloud worker (the cloud session's context and token
-    // usage), so all four providers share the stored reader.
+    // usage), and so does the DeepSeek worker (the Claude one, pointed at
+    // DeepSeek), so all five providers share the stored reader.
     const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor'
-      || providerType === 'grok' || providerType === 'claude-cloud';
+      || providerType === 'grok' || providerType === 'claude-cloud' || providerType === 'deepseek';
 
     const parsed = usesStoredContextUsage
       ? (() => {
@@ -3558,11 +3675,12 @@ export function registerSessionsRoutes(app, deps) {
       String(runtimeSession?.conversation_id || '').trim() || lookupId,
     );
     const autoCompactWindow = parseAutoCompactWindow(conversationRow?.auto_compact_window);
-    // Only the local Claude worker runs a CLI whose window the slider sets;
-    // it reports that CLI on its heartbeat's steering snapshot.
+    // Only the local Claude worker (and the DeepSeek one, the same runner)
+    // runs a CLI whose window the slider sets; it reports that CLI on its
+    // heartbeat's steering snapshot.
     const windowStatus = resolveAutoCompactWindowStatus({
       storedWindow: autoCompactWindow,
-      steering: providerType === 'claude' && copilotSessionId
+      steering: (providerType === 'claude' || providerType === 'deepseek') && copilotSessionId
         ? sessionWorkerRegistry?.getWorker?.(copilotSessionId)?.steering || null
         : null,
     });
@@ -3813,6 +3931,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveDeepSeekSessionRoot,
       resolveCursorSessionRoot,
     });
     const dbMessages = stmts.getMessages.all(conversationId);
@@ -4486,6 +4605,7 @@ export function registerSessionsRoutes(app, deps) {
       claudeNativeSessionId: runtimeSession?.claude_native_session_id || '',
       workspaceRootPath: workspaceState?.currentWorkspaceRootPath || '',
       resolveClaudeSessionRoot,
+      resolveDeepSeekSessionRoot,
       resolveCursorSessionRoot,
     });
     const historyCursor = { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId };
@@ -6186,6 +6306,12 @@ export function registerSessionsRoutes(app, deps) {
       ...(Array.isArray(grokSettings?.models) ? grokSettings.models : []),
     ].map((value) => String(value || '').trim()).filter(Boolean);
     const availableGrokModels = new Set(grokModelCatalog.map((value) => value.toLowerCase()));
+    const deepseekSettings = getDeepSeekProviderSettings();
+    const deepseekModelCatalog = [
+      String(deepseekSettings?.model || '').trim(),
+      ...(Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    const availableDeepSeekModels = new Set(deepseekModelCatalog.map((value) => value.toLowerCase()));
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
@@ -6219,6 +6345,15 @@ export function registerSessionsRoutes(app, deps) {
         && requestedBootstrapModel
         && requestedBootstrapModel.toLowerCase() !== 'auto'
         && availableGrokModels.has(requestedBootstrapModel.toLowerCase())
+      )
+    );
+    const useDeepSeekProvider = !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider && (
+      requestedProviderType === 'deepseek'
+      || (
+        requestedProviderType === ''
+        && requestedBootstrapModel
+        && requestedBootstrapModel.toLowerCase() !== 'auto'
+        && availableDeepSeekModels.has(requestedBootstrapModel.toLowerCase())
       )
     );
     // Managed providers resolve the request against their own catalog only.
@@ -6266,7 +6401,13 @@ export function registerSessionsRoutes(app, deps) {
                 configuredModel: grokSettings.model,
                 availableModels: grokModelCatalog,
               })
-            : null)));
+            : (useDeepSeekProvider
+              ? resolveProviderModelSelection({
+                  requestedModel: providerRequestedModel(deepseekModelCatalog),
+                  configuredModel: deepseekSettings.model,
+                  availableModels: deepseekModelCatalog,
+                })
+              : null))));
     // The single rejection for "this provider does not offer that model".
     // Per-provider pre-checks used to duplicate it and had drifted apart in
     // wording, casing rules and whether they listed the alternatives.
@@ -6275,14 +6416,16 @@ export function registerSessionsRoutes(app, deps) {
         ? 'Claude Cloud'
         : (useOpenAIProvider
           ? 'OpenAI'
-          : (useClaudeProvider ? 'Claude' : (useCursorProvider ? 'Cursor' : 'Grok')));
+          : (useClaudeProvider ? 'Claude' : (useCursorProvider ? 'Cursor' : (useGrokProvider ? 'Grok' : 'DeepSeek'))));
       const providerCode = useClaudeCloudProvider
         ? 'CLAUDE_CLOUD_MODEL_UNAVAILABLE'
         : (useOpenAIProvider
           ? 'OPENAI_MODEL_UNAVAILABLE'
           : (useClaudeProvider
             ? 'CLAUDE_MODEL_UNAVAILABLE'
-            : (useCursorProvider ? 'CURSOR_MODEL_UNAVAILABLE' : 'GROK_MODEL_UNAVAILABLE')));
+            : (useCursorProvider
+              ? 'CURSOR_MODEL_UNAVAILABLE'
+              : (useGrokProvider ? 'GROK_MODEL_UNAVAILABLE' : 'DEEPSEEK_MODEL_UNAVAILABLE'))));
       return res.status(400).json({
         ok: false,
         error: `${providerLabel} model "${providerModelSelection.requestedModel}" is not available`,
@@ -6302,6 +6445,7 @@ export function registerSessionsRoutes(app, deps) {
     if (
       remoteRequest.remote
       && !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider
+      && !useDeepSeekProvider
     ) {
       const mergedModels = Array.isArray(modelState?.models) ? modelState.models : [];
       const providersByModel = modelState?.providersByModel && typeof modelState.providersByModel === 'object'
@@ -6367,6 +6511,15 @@ export function registerSessionsRoutes(app, deps) {
         code: 'GROK_NOT_CONFIGURED',
       });
     }
+    if (useDeepSeekProvider && deepseekSettings?.enabled !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: deepseekSettings?.configured === true
+          ? 'DeepSeek is switched off for new conversations'
+          : 'DeepSeek API key is not configured',
+        code: 'DEEPSEEK_NOT_CONFIGURED',
+      });
+    }
 
     // The session group an agent's create_session names (an id or an exact
     // name): resolved before anything is written, so an unknown one creates
@@ -6421,7 +6574,7 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider) {
+    if (!useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider && !useDeepSeekProvider) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -6461,6 +6614,15 @@ export function registerSessionsRoutes(app, deps) {
           code: 'GROK_PROVIDER_REQUIRED',
         });
       }
+      const deepseekOnlySelection = selectedProviders.length > 0
+        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === DEEPSEEK_PROVIDER_TYPE);
+      if (deepseekOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the DeepSeek provider`,
+          code: 'DEEPSEEK_PROVIDER_REQUIRED',
+        });
+      }
     }
 
     const bootstrapProviderType = useClaudeCloudProvider
@@ -6471,7 +6633,7 @@ export function registerSessionsRoutes(app, deps) {
           ? 'claude'
           : (useCursorProvider
             ? 'cursor'
-            : (useGrokProvider ? 'grok' : 'github'))));
+            : (useGrokProvider ? 'grok' : (useDeepSeekProvider ? 'deepseek' : 'github')))));
     // Preferences are written in the same transaction as the conversation, so
     // the caller's current mode has to arrive with the request: without it every
     // new chat would be stored as the default one and reset the composer. An
@@ -6487,6 +6649,9 @@ export function registerSessionsRoutes(app, deps) {
     const bootstrapReasoning = resolveProviderReasoningEffort({
       requestedEffort: req.body?.reasoningEffort || copilotVariantEffort,
       strict: bootstrapProviderType === 'openai',
+      ...(bootstrapProviderType === 'deepseek'
+        ? { defaultEffort: DEFAULT_DEEPSEEK_REASONING_EFFORT, aliasFor: deepseekReasoningEffortFor }
+        : {}),
       supportedEfforts: supportedReasoningEffortsForProviderModel({
         providerType: bootstrapProviderType,
         model: selectedModel,
@@ -6536,7 +6701,7 @@ export function registerSessionsRoutes(app, deps) {
           {
             assignConfiguredProvider: true,
             providerType: bootstrapProviderType,
-            providerModel: (useClaudeCloudProvider || useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider) ? selectedModel : null,
+            providerModel: (useClaudeCloudProvider || useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider || useDeepSeekProvider) ? selectedModel : null,
           },
         );
         // What the cloud session will clone, stored with the conversation so
@@ -7511,6 +7676,40 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // A rotated API key only reaches a worker's environment at spawn: live
+  // workers of the provider keep the old key and fail each turn after the
+  // rotation. Stops them; the primer or the next delivery respawns them with
+  // the fresh key from settings.
+  async function stopLiveProviderWorkersForKeyRotation(providerType) {
+    const rows = db.prepare(`
+      SELECT DISTINCT NULLIF(sdk_session_id, '') AS sdk_session_id
+      FROM runtime_sessions
+      WHERE LOWER(COALESCE(provider_type, '')) = ?
+        AND NULLIF(sdk_session_id, '') IS NOT NULL
+    `).all(providerType);
+    for (const row of rows) {
+      const sid = String(row.sdk_session_id || '').trim();
+      if (!sid) continue;
+      const workerState = sessionWorkerSupervisor?.getWorkerState?.(sid) || null;
+      if (!workerState) continue;
+      try {
+        const stopped = await stopIdleWorkspaceRootSession({
+          sdkSessionId: sid,
+          worker: sessionWorkerRegistry?.getWorker?.(sid) || null,
+          sessionWorkerSupervisor,
+          sessionWorkerRegistry,
+          sessionWorkerProcessInspector,
+        });
+        if (stopped.ok) {
+          sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+          console.log(`[sessions] ${providerType} worker ${sid.slice(0, 8)} stopped for API key rotation`);
+        }
+      } catch (error) {
+        console.warn(`[sessions] ${providerType} worker ${sid.slice(0, 8)} stop failed on key rotation: ${error?.message || error}`);
+      }
+    }
+  }
+
   app.get('/api/settings/cursor', auth, (_req, res) => {
     const settings = getCursorProviderSettings();
     return res.json({
@@ -7542,33 +7741,7 @@ export function registerSessionsRoutes(app, deps) {
     // fail each turn after the rotation. Stop them now; the primer or the
     // next delivery respawns them with the fresh key from settings.
     if (parsed.apiKey && previous?.configured === true) {
-      const cursorSessionRows = db.prepare(`
-        SELECT DISTINCT NULLIF(sdk_session_id, '') AS sdk_session_id
-        FROM runtime_sessions
-        WHERE LOWER(COALESCE(provider_type, '')) = 'cursor'
-          AND NULLIF(sdk_session_id, '') IS NOT NULL
-      `).all();
-      for (const row of cursorSessionRows) {
-        const sid = String(row.sdk_session_id || '').trim();
-        if (!sid) continue;
-        const workerState = sessionWorkerSupervisor?.getWorkerState?.(sid) || null;
-        if (!workerState) continue;
-        try {
-          const stopped = await stopIdleWorkspaceRootSession({
-            sdkSessionId: sid,
-            worker: sessionWorkerRegistry?.getWorker?.(sid) || null,
-            sessionWorkerSupervisor,
-            sessionWorkerRegistry,
-            sessionWorkerProcessInspector,
-          });
-          if (stopped.ok) {
-            sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
-            console.log(`[sessions] cursor worker ${sid.slice(0, 8)} stopped for API key rotation`);
-          }
-        } catch (error) {
-          console.warn(`[sessions] cursor worker ${sid.slice(0, 8)} stop failed on key rotation: ${error?.message || error}`);
-        }
-      }
+      await stopLiveProviderWorkersForKeyRotation('cursor');
     }
     const shouldDiscover = result.enabled === true && (
       !!parsed.apiKey
@@ -7623,6 +7796,96 @@ export function registerSessionsRoutes(app, deps) {
       warning: reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed')),
+    });
+  });
+
+  // --- DeepSeek ----------------------------------------------------------
+  // The key is written here and never read back: GET and every answer carry
+  // `configured` only. A rotated key reaches a worker only at spawn, so the
+  // live DeepSeek workers are stopped; the next message starts them again.
+  // What the tab shows: the stored settings, and whether the starting
+  // balance still applies (a top-up since it was set replaces it), judged
+  // on the currency the card's bar uses: the last balance read's main one.
+  function describeDeepSeekSettings() {
+    const described = deepseekSettingsService.describe();
+    let references = [];
+    try {
+      references = planUsageService?.readDeepSeekBalanceReferences?.() || [];
+    } catch {}
+    let balances = null;
+    try {
+      balances = deepseekBalanceService?.peekBalance?.()?.balances || null;
+    } catch {}
+    const startingBalanceNote = deepseekStartingBalanceNote(
+      described.startingBalance ? { amount: described.startingBalance, setAt: described.startingBalanceSetAt } : null,
+      references,
+      { balances },
+    );
+    return { ...described, startingBalanceNote };
+  }
+
+  app.get('/api/settings/deepseek', auth, (_req, res) => {
+    if (!deepseekSettingsService) return res.status(501).json({ error: 'DeepSeek settings are unavailable' });
+    return res.json(describeDeepSeekSettings());
+  });
+
+  app.post('/api/settings/deepseek', auth, async (req, res) => {
+    if (!deepseekSettingsService) return res.status(501).json({ error: 'DeepSeek settings are unavailable' });
+    const parsed = parseDeepSeekSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    // A starting balance a top-up has replaced is set anew when it is saved
+    // again, the same amount too.
+    const before = describeDeepSeekSettings();
+    const startingBalanceReplaced = !!before.startingBalanceNote;
+    const result = deepseekSettingsService.update(parsed, { startingBalanceReplaced });
+    if (!result?.ok) {
+      return res.status(result?.code === 'deepseek-key-removal-blocked' ? 409 : 400).json({
+        error: result?.error || 'Failed to update DeepSeek settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    if (result.keyChanged) await stopLiveProviderWorkersForKeyRotation(DEEPSEEK_PROVIDER_TYPE);
+    const discovery = result.discover
+      ? await deepseekSettingsService.refreshModels()
+      : { ok: true, models: [], error: null };
+    // A starting balance set anew: the balance is read right then and noted
+    // as the latest read, so a later top-up is a rise from a balance read
+    // after the setting, and one made before it is already in this read
+    // (deepseekStartingBalanceState). A failed read changes nothing: the
+    // setting then stays until a rise seen after a read that followed it.
+    const setAt = result.settings?.startingBalanceSetAt || null;
+    if (setAt && setAt !== before.startingBalanceSetAt) {
+      try {
+        const balance = await deepseekBalanceService?.getBalance?.({ force: true });
+        planUsageService?.recordDeepSeekBalance?.(balance);
+      } catch {}
+    }
+    // Removing the key moves unstarted DeepSeek conversations back to the
+    // default provider, as for OpenAI and Cursor.
+    const reconciliationResult = parsed.remove === true
+      ? await reconcileUnstartedConversationProviders({ enabled: false, model: DEFAULT_DEEPSEEK_MODEL, provider: DEEPSEEK_PROVIDER_TYPE })
+      : { updatedUnstartedConversations: 0, skippedStartedConversations: 0, skippedActiveQueueConversations: 0, failedConversations: [] };
+    const failedConversations = Array.isArray(reconciliationResult?.failedConversations) ? reconciliationResult.failedConversations : [];
+    const settingsPayload = {
+      ...describeDeepSeekSettings(),
+      reconciliation: {
+        updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+        skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+        skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+        failedConversations,
+      },
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('deepseek_settings_updated', settingsPayload);
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      warning: failedConversations.length
+        ? `${failedConversations.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'DeepSeek model discovery failed')),
     });
   });
 
@@ -8193,6 +8456,7 @@ export function registerSessionsRoutes(app, deps) {
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
     const grokSettings = getGrokProviderSettings();
+    const deepseekSettings = getDeepSeekProviderSettings();
     return {
       ...buildModelVariantCatalogPayload({
         rows,
@@ -8222,6 +8486,13 @@ export function registerSessionsRoutes(app, deps) {
             enabledModels: Array.isArray(grokSettings.models) ? grokSettings.models : [],
           }
         : null,
+      deepseekModels: deepseekSettings?.enabled === true
+        ? {
+            defaultModel: deepseekSettings.model,
+            availableModels: Array.isArray(deepseekSettings.availableModels) ? deepseekSettings.availableModels : [],
+            enabledModels: Array.isArray(deepseekSettings.models) ? deepseekSettings.models : [],
+          }
+        : null,
     };
   }
 
@@ -8240,6 +8511,7 @@ export function registerSessionsRoutes(app, deps) {
       const claudeSettings = getClaudeProviderSettings();
       const cursorSettings = getCursorProviderSettings();
       const grokSettings = getGrokProviderSettings();
+      const deepseekSettings = getDeepSeekProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
@@ -8260,8 +8532,11 @@ export function registerSessionsRoutes(app, deps) {
         typeof copilotModelDiscoveryService?.refresh === 'function'
           ? copilotModelDiscoveryService.refresh('manual-refresh')
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        deepseekSettings?.enabled === true && deepseekSettingsService
+          ? deepseekSettingsService.refreshModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh] = await Promise.allSettled(refreshTasks);
+      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh, deepseekRefresh] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -8291,6 +8566,13 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(grokSettings?.models) ? grokSettings.models : [],
             error: grokRefresh.reason?.message || 'Grok model discovery failed',
           };
+      const deepseekModelDiscovery = deepseekRefresh.status === 'fulfilled'
+        ? deepseekRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : [],
+            error: deepseekRefresh.reason?.message || 'DeepSeek model discovery failed',
+          };
       const copilotModelDiscovery = copilotDiscoveryRefresh.status === 'fulfilled'
         ? copilotDiscoveryRefresh.value
         : { ok: false, models: [], error: copilotDiscoveryRefresh.reason?.message || 'Copilot model discovery failed' };
@@ -8304,6 +8586,7 @@ export function registerSessionsRoutes(app, deps) {
         claudeModelDiscovery,
         cursorModelDiscovery,
         grokModelDiscovery,
+        deepseekModelDiscovery,
         copilotModelDiscovery,
       });
     } catch (error) {
@@ -8399,8 +8682,9 @@ export function registerSessionsRoutes(app, deps) {
     copilotBilling: null, // { value, at }
     grokBilling: null,
     cursorBilling: null,
+    deepseekBalance: null,
   };
-  const USAGE_PROVIDER_IDS = ['github', 'claude', 'claude-cloud', 'cursor', 'grok'];
+  const USAGE_PROVIDER_IDS = ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek'];
 
   function parseUsageProviders(raw) {
     const text = Array.isArray(raw) ? raw.join(',') : String(raw ?? '');
@@ -8455,6 +8739,16 @@ export function registerSessionsRoutes(app, deps) {
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
     const grokSettings = getGrokProviderSettings();
+    const deepseekSettings = getDeepSeekProviderSettings();
+    const deepseekEnabled = deepseekSettings?.enabled === true;
+    // An unreadable export is no reason to lose the card: the estimate stays.
+    const readDeepSeekActuals = () => {
+      try {
+        return deepseekUsageImportService?.readActuals?.() ?? null;
+      } catch {
+        return null;
+      }
+    };
     let claudeCloudEnabled = false;
     try {
       claudeCloudEnabled = claudeCloudSettingsService?.getSettings?.()?.enabled === true;
@@ -8476,7 +8770,7 @@ export function registerSessionsRoutes(app, deps) {
       : Promise.resolve(null);
 
     // All reads side by side: the modal waits for the slowest, not the sum.
-    const [copilot, billingEntry, grokEntry, cursorEntry, claudeAccount] = await Promise.all([
+    const [copilot, billingEntry, grokEntry, cursorEntry, deepseekEntry, claudeAccount] = await Promise.all([
       readCopilotSummary(),
       cachedOrLive('copilotBilling', live('github'), () => (
         typeof fetchCopilotBillingUsage === 'function'
@@ -8488,6 +8782,12 @@ export function registerSessionsRoutes(app, deps) {
       )),
       cachedOrLive('cursorBilling', live('cursor'), () => (
         cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function' ? fetchCursorDashboardUsage() : null
+      )),
+      // The service keeps its own minute of cache and answers a failure as
+      // `{ ok: false, … }`, so a failed read replaces the earlier answer here
+      // (which it carries as `previous`).
+      cachedOrLive('deepseekBalance', live('deepseek'), () => (
+        deepseekEnabled && typeof deepseekBalanceService?.getBalance === 'function' ? deepseekBalanceService.getBalance() : null
       )),
       claudeAccountPromise,
     ]);
@@ -8521,6 +8821,14 @@ export function registerSessionsRoutes(app, deps) {
       grokConfigured: grokSettings?.enabled === true,
       grokAllowances: getGrokPlanAllowanceSettings(),
       grokBilling: grokEntry.value,
+      deepseekConfigured: deepseekEnabled,
+      deepseekBalance: deepseekEnabled ? deepseekEntry.value : null,
+      deepseekMonthlyBudget: deepseekEnabled ? (deepseekSettings?.monthlyBudget ?? null) : null,
+      deepseekMonthlyBudgetCurrency: deepseekEnabled ? (deepseekSettings?.monthlyBudgetCurrency ?? null) : null,
+      deepseekStartingBalance: deepseekEnabled && deepseekSettings?.startingBalance
+        ? { amount: deepseekSettings.startingBalance, setAt: deepseekSettings.startingBalanceSetAt }
+        : null,
+      deepseekActuals: deepseekEnabled ? readDeepSeekActuals() : null,
     });
 
     // Legacy top-level fields stay alongside `providers` so an older cached
@@ -8535,6 +8843,7 @@ export function registerSessionsRoutes(app, deps) {
         'claude-cloud': claudeAccount?.fetchedAt || null,
         cursor: cursorEntry.at,
         grok: grokEntry.at,
+        deepseek: deepseekEntry.value?.fetchedAt || deepseekEntry.at,
       },
     });
   });

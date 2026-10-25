@@ -29,6 +29,13 @@ import { migrateConversationMayCreateSessions } from './migrations/0020-conversa
 import { migrateConversationGroupAgentMarks } from './migrations/0021-conversation-group-agent-marks.mjs';
 import { migrateRelaySchedules } from './migrations/0022-relay-schedules.mjs';
 import { migrateRelayAsks } from './migrations/0023-relay-asks.mjs';
+import { migrateDeepSeekUsageTotals } from './migrations/0024-deepseek-usage-totals.mjs';
+import { migrateDeepSeekUsageRequestsDaily } from './migrations/0025-deepseek-usage-requests-daily.mjs';
+import { migrateDeepSeekUsageServedModels } from './migrations/0026-deepseek-usage-served-models.mjs';
+import { migrateDeepSeekUsageCheckpointRuns } from './migrations/0027-deepseek-usage-checkpoint-runs.mjs';
+import { migrateDeepSeekUsageCheckpointRequestRuns } from './migrations/0028-deepseek-usage-checkpoint-request-runs.mjs';
+import { migrateDeepSeekBalanceRises } from './migrations/0029-deepseek-balance-rises.mjs';
+import { migrateDeepSeekUsageActuals } from './migrations/0030-deepseek-usage-actuals.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -905,6 +912,62 @@ try {
   migrateRelayAsks(db);
 } catch (error) {
   console.warn(`[relay-asks] migration 0023 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// DeepSeek usage totals: one new table. The plan usage service creates it
+// itself as well, so a failure here is logged and retried next boot like 0023.
+try {
+  migrateDeepSeekUsageTotals(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0024 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// DeepSeek search/fetch counts, daily spend and balance reference: four
+// columns on 0024's table and two tables, handled like 0024.
+try {
+  migrateDeepSeekUsageRequestsDaily(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0025 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// DeepSeek usage booked under a Claude model name is folded into the DeepSeek
+// model that served it, handled like 0024.
+try {
+  migrateDeepSeekUsageServedModels(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0026 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The DeepSeek usage checkpoint learns the worker process's run id and its
+// search and fetch counts: three columns on 0024's table, handled like 0024.
+try {
+  migrateDeepSeekUsageCheckpointRuns(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0027 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The checkpoint's search and fetch counts get a run id of their own: one
+// column on 0024's table, handled like 0024.
+try {
+  migrateDeepSeekUsageCheckpointRequestRuns(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0028 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The balance reference notes when the balance last rose: one column on
+// 0025's table, handled like 0025.
+try {
+  migrateDeepSeekBalanceRises(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0029 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The imported figures of DeepSeek's usage export: a table of its own, handled
+// like 0024.
+try {
+  migrateDeepSeekUsageActuals(db);
+} catch (error) {
+  console.warn(`[deepseek-usage] migration 0030 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const runtimeSessionColumns = db.prepare(`PRAGMA table_info(runtime_sessions)`).all().map((c) => c.name);
