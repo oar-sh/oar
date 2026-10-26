@@ -36,7 +36,7 @@ import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
 import { createImageConversationRepository } from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
-import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
+import { buildDequeuedRelayMessage, claudeApiRemedyText, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
@@ -70,6 +70,11 @@ import { createWorkerPostRedaction } from './services/worker-secret-redaction.mj
 import { createDeepSeekBalanceService } from './services/deepseek-balance-service.mjs';
 import { deepseekCardCurrency } from './services/plan-usage-deepseek.mjs';
 import { createDeepSeekUsageImportService } from './services/deepseek-usage-import.mjs';
+import { createClaudeApiSettingsService } from './services/claude-api-settings-service.mjs';
+import { createClaudeBillingSwitchService, normalizeClaudeBilling } from './services/claude-billing-switch-service.mjs';
+import { createClaudeBillingSwapService } from './services/claude-billing-swap-service.mjs';
+import { createClaudeApiUsageService } from './services/claude-api-usage-service.mjs';
+import { createClaudeApiCapWatch, createClaudeApiPlanUsage, createClaudeApiStopNoteLedger } from './services/plan-usage-claude-api.mjs';
 import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, DEFAULT_DEEPSEEK_MODEL, deepseekModelLabel } from '../shared/deepseek-models.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
 import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } from './services/claude-cloud-repo-service.mjs';
@@ -142,10 +147,10 @@ import { mergeStrayMigratedUploads } from './services/oar-state-migration-servic
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
 import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
-import { createSessionWorkerRegistry } from './services/session-worker-registry-service.mjs';
+import { createSessionWorkerRegistry, normalizeWorkerKind } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import { applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -1943,6 +1948,7 @@ const runtimeTimers = {
   pendingWorkerPrime: null,
   sharedViewerPrune: null,
   restoredTaskSettle: null,
+  claudeApiCapClock: null,
 };
 
 function normalizeRemotePath(value) {
@@ -2839,7 +2845,8 @@ const claudeCloudRepoService = createClaudeCloudRepoService({
 });
 // What a session worker posts loses every key a provider saved in Settings
 // (worker-secret-redaction.mjs). Built here, at the start, so it reads the
-// saved keys now, and the DeepSeek save below notes each key it writes: one
+// saved keys now, and the DeepSeek and Claude API saves below note each key
+// they write: one
 // changed before any worker has posted is still redacted.
 const workerPostRedaction = createWorkerPostRedaction({ readSetting: readAppSettingValue });
 // DeepSeek: one API key per relay, its models and its endpoint. The key stays
@@ -2855,6 +2862,23 @@ const deepseekSettingsService = createDeepSeekSettingsService({
 });
 function getDeepSeekProviderSettings() {
   return deepseekSettingsService.getSettings();
+}
+// Claude API: Claude chats on a Console API key, one key per relay. The key
+// stays in the settings table; GET routes answer `configured`, never the key.
+// Before its own discovery the Claude provider's models stand in.
+const claudeApiSettingsService = createClaudeApiSettingsService({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => {
+    stmts.upsertAppSetting.run(key, String(value), new Date().toISOString());
+    workerPostRedaction.noteSavedSetting(key, value);
+  },
+  deleteSetting: (key) => stmts.deleteAppSetting.run(key),
+  listProviderCandidates: () => stmts.listRuntimeSessionProviderCandidates?.all?.() || [],
+  countLiveKeyWorkers: () => (sessionWorkerRegistry?.listWorkers?.() || []).filter((worker) => worker?.kind === 'claude-api').length,
+  getClaudeProviderSettings: () => getClaudeProviderSettings(),
+});
+function getClaudeApiProviderSettings() {
+  return claudeApiSettingsService.getSettings();
 }
 // The DeepSeek balance for Check Usage: read with the saved key only while
 // DeepSeek is on, kept for a minute.
@@ -3117,7 +3141,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const providerType = String(runtimeSession?.provider_type || 'github').trim().toLowerCase();
   // Clear every provider's variables first (the appliers' kind-guarded deletes
   // keep the chained clears order-independent), then apply only the bound one.
-  const cleared = applyDeepSeekProviderEnvironment(applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv)))))));
+  const cleared = applyClaudeApiProviderEnvironment(applyDeepSeekProviderEnvironment(applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))))))));
   // A Claude Cloud conversation gets its own worker and nothing else: it must
   // never reach the Copilot CLI fall-through at the end of this function. The
   // environment names the worker and the model, no credential.
@@ -3158,6 +3182,19 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       apiKey: deepseekSettings.apiKey,
       baseUrl: deepseekSettings.baseUrl,
       configDir: DEEPSEEK_CLAUDE_CONFIG_DIR,
+    });
+  }
+  // A Claude API conversation gets its own worker, never the Copilot
+  // fall-through below nor a Claude one on the host's subscription login.
+  // Without a key the applier throws, and the conversation gets the launch
+  // note. No config dir of its own: the chat is a Claude chat in the host's
+  // Claude Code state, billed to the key.
+  if (providerType === 'claude-api') {
+    const claudeApiSettings = getClaudeApiProviderSettings();
+    return applyClaudeApiProviderEnvironment(cleared, {
+      enabled: true,
+      model: String(runtimeSession?.provider_model || runtimeSession?.model || claudeApiSettings.model).trim(),
+      apiKey: claudeApiSettings.apiKey,
     });
   }
   if (providerType === 'grok') {
@@ -3388,14 +3425,16 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
 
 async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
   const normalizedProvider = String(provider || 'openai').trim().toLowerCase();
-  const managedProvider = ['claude', 'cursor', 'grok', 'deepseek'].includes(normalizedProvider) ? normalizedProvider : 'openai';
-  const managedDefaultModel = {
-    openai: DEFAULT_OPENAI_MODEL,
-    claude: DEFAULT_CLAUDE_MODEL,
-    cursor: DEFAULT_CURSOR_MODEL,
-    grok: DEFAULT_GROK_MODEL,
-    deepseek: DEFAULT_DEEPSEEK_MODEL,
-  }[managedProvider];
+  const managedProvider = ['claude', 'cursor', 'grok', 'deepseek', 'claude-api'].includes(normalizedProvider) ? normalizedProvider : 'openai';
+  const managedDefaultModel = managedProvider === 'claude-api'
+    ? getClaudeApiProviderSettings().model
+    : {
+        openai: DEFAULT_OPENAI_MODEL,
+        claude: DEFAULT_CLAUDE_MODEL,
+        cursor: DEFAULT_CURSOR_MODEL,
+        grok: DEFAULT_GROK_MODEL,
+        deepseek: DEFAULT_DEEPSEEK_MODEL,
+      }[managedProvider];
   const providerType = enabled === true ? managedProvider : 'github';
   const providerModel = enabled === true
     ? (String(model || '').trim() || managedDefaultModel)
@@ -3470,7 +3509,9 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
             ? getGrokProviderSettings().enabled === true
             : (currentProvider === 'deepseek'
               ? getDeepSeekProviderSettings().configured === true
-              : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true))));
+              : (currentProvider === 'claude-api'
+                ? getClaudeApiProviderSettings().enabled === true
+                : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true)))));
       if (providerWasUpdated && canRestorePreviousProvider) {
         stmts.updateRuntimeSessionProvider.run(
           currentProvider,
@@ -5205,7 +5246,18 @@ function createCompactedConversation(sourceConversationId) {
     // The new conversation stays in the old one's session group, and heads
     // it if the old one did; the archived source stays a member.
     conversationGroups.carryToCompacted(sourceConversationId, targetConversationId, now);
-    targetRuntimeSession = ensureRuntimeSessionBinding(targetConversationId, null, now);
+    // A Claude chat keeps its billing (the subscription or the API key, a
+    // pending swap's included): the new chat's first worker launches on it,
+    // and it is never guessed again from a Claude model id. Other providers
+    // bind as before.
+    const sourceRuntime = stmts.getRuntimeSessionByConversation.get(sourceConversationId) || null;
+    const sourceBilling = normalizeClaudeBilling(sourceRuntime?.provider_type);
+    targetRuntimeSession = ensureRuntimeSessionBinding(targetConversationId, null, now, null, sourceBilling
+      ? {
+          providerType: sourceBilling,
+          providerModel: String(sourceRuntime?.provider_model || sourceRuntime?.model || '').trim() || null,
+        }
+      : {});
   });
   tx();
   // Its schedules go on in the new conversation, both the ones that fire
@@ -5491,6 +5543,67 @@ const usageLimitPauseService = createUsageLimitPauseService({
   logger: console,
 });
 
+// What turns on the saved Claude API key cost, booked from both Claude
+// workers' reports (services/claude-api-usage-service.mjs); the Claude API
+// card and its cap read it.
+const claudeApiUsageService = createClaudeApiUsageService({ db, logger: console });
+// This month's spend on the key against the cap, and the Check Usage card
+// (services/plan-usage-claude-api.mjs), over the same local days.
+const claudeApiPlanUsage = createClaudeApiPlanUsage({
+  usageService: claudeApiUsageService,
+  getSettings: () => getClaudeApiProviderSettings(),
+});
+
+// A Claude chat's billing: the subscription or the saved API key, switched
+// between turns (services/claude-billing-switch-service.mjs). A switch to the
+// key releases a turn held at the subscription's usage limit.
+const claudeBillingSwitchService = createClaudeBillingSwitchService({
+  db,
+  stmts,
+  emit: (event, payload) => io.emit(event, payload),
+  getClaudeProviderSettings: () => getClaudeProviderSettings(),
+  getClaudeApiProviderSettings: () => getClaudeApiProviderSettings(),
+  getClaudeApiCapState: () => getClaudeApiCapState(),
+  releaseUsageLimitPause: (args) => usageLimitPauseService.releaseForBillingSwitch(args),
+  // What the swap waits for: a turn, a question, a compaction, background tasks.
+  getPending: (runtime) => claudeBillingSwapService.pendingFor(runtime?.sdk_session_id || runtime?.conversation_id),
+  onQueueChanged: (reason) => {
+    void primePendingSessionWorkers(reason);
+    sessionWorkerWebSocketService?.emitQueueChanged?.(reason);
+  },
+  logger: console,
+});
+
+// When the Claude API cap flips (a booked report, the cap setting, a new
+// month), every open Claude chat's billing state is announced again: the
+// composer's toggle and the usage-limit banner's switch button follow it.
+const listOpenClaudeChats = db.prepare(`
+  SELECT rs.conversation_id AS id FROM runtime_sessions rs
+  JOIN conversations c ON c.id = rs.conversation_id
+  WHERE rs.provider_type IN ('claude', 'claude-api') AND COALESCE(c.archived, 0) = 0
+    AND COALESCE(c.status, '') != 'deleted'
+`);
+// The notes for self-started turns stopped on the key, once per chat per
+// episode: a cap that clears ends every chat's episode (the settings route
+// clears it on a save, a claimed turn on the key for its chat).
+const claudeApiStopLedger = createClaudeApiStopNoteLedger();
+const claudeApiCapWatch = createClaudeApiCapWatch({
+  getCapState: () => getClaudeApiCapState(),
+  onChange: ({ reached, reason }) => {
+    if (!reached) claudeApiStopLedger.clearAll();
+    const chats = listOpenClaudeChats.all();
+    console.log(`[claude-api-cap] ${reached ? 'reached' : 'cleared'} (${reason}): announcing ${chats.length} Claude chat(s)`);
+    for (const { id } of chats) {
+      const billing = claudeBillingSwitchService.billingState(id);
+      if (billing) io.emit('conversation_billing', { conversationId: id, billing });
+    }
+  },
+  logger: console,
+});
+claudeApiCapWatch.check('boot');
+runtimeTimers.claudeApiCapClock = setInterval(() => claudeApiCapWatch.check('clock'), 5 * 60 * 1000);
+runtimeTimers.claudeApiCapClock.unref?.();
+
 // Turns a restart cut off for good (their worker went with the relay, and a
 // second delivery would run the prompt twice): with the setting on, their
 // session gets one note to carry on. The rows processing right now are the
@@ -5544,7 +5657,7 @@ relayEventService = createRelayEventService({
 });
 
 // ─── Relay schedules ──────────────────────────────────────────────────────────
-// Prompts agents scheduled with remote_relay's `schedule`: kept in the
+// Prompts agents scheduled with relay_tool's `schedule`: kept in the
 // database, their timers rebuilt at boot (services/relay-schedule-service.mjs).
 const relayScheduleService = createRelayScheduleService({
   db,
@@ -5562,7 +5675,7 @@ const relayScheduleService = createRelayScheduleService({
 });
 
 // ─── Questions that don't block ───────────────────────────────────────────────
-// remote_relay's `ask`: a card in the session and the Inbox; the answer
+// relay_tool's `ask`: a card in the session and the Inbox; the answer
 // reaches the askers as a relay event (services/relay-ask-service.mjs).
 const relayAskService = createRelayAskService({
   db,
@@ -6309,7 +6422,7 @@ function markSharedViewerPresence({ conversationId, token, viewerId } = {}) {
   }
   return { ok: true, watcherCount, capped: false };
 }
-async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'worker-ready' } = {}) {
+async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'worker-ready', workerKind = null } = {}) {
   const requesterSessionId = String(sessionId || '').trim();
   if (!requesterSessionId) return { message: null, reason: 'missing-session-id' };
   touchCli();
@@ -6367,6 +6480,10 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
 
   const counts = queueCounts();
   const existingWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+  // The kind the socket's worker stated is registered with it, so what a
+  // response ran on is known from the first turn on (not from its first
+  // heartbeat).
+  const statedKind = normalizeWorkerKind(workerKind);
   if (!existingWorker) {
     sessionWorkerRegistry?.upsertWorker?.({
       sdkSessionId: requesterSessionId,
@@ -6374,6 +6491,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       status: 'ready',
       pid: pid || null,
       queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
+      ...(statedKind ? { kind: statedKind } : {}),
     });
   } else if (pid && existingWorker.pid !== pid) {
     sessionWorkerRegistry?.upsertWorker?.({
@@ -6382,7 +6500,10 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       pid,
       status: existingWorker.status || 'ready',
       queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
+      kind: statedKind,
     });
+  } else if (statedKind && existingWorker.kind !== statedKind) {
+    sessionWorkerRegistry?.upsertWorker?.({ ...existingWorker, kind: statedKind });
   }
 
   const dequeueResult = await dequeuePendingMessageForWorkerLoop({
@@ -6396,6 +6517,11 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     sessionWorkerSupervisor,
     relayRestartOrchestrator,
     inFlightProcessingCount: Number(counts.processingCount || 0),
+    // A Claude chat's row goes only to a worker of its billing: the socket's
+    // own word, else what the worker last said in a heartbeat.
+    workerKind: workerKind || sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.kind || null,
+    claudeApiClaimCheck,
+    onBillingFence: handleClaudeBillingFence,
   });
   if (!dequeueResult?.message) {
     return {
@@ -6439,11 +6565,14 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   }
   console.log(`${runtimeLogPrefix()}WS DEQUEUE ${out.id.slice(0, 8)} session=${requesterSessionId.slice(0, 8)} reason=${String(reason || 'worker-ready')}`);
   io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
+  // The first message after a billing swap tells the new worker so.
+  const billingSwap = out?.ownerSessionId ? claudeBillingSwapService.takeSwapNote(out.ownerSessionId) : null;
   return {
     message: out,
     // Piggybacked settings so workers pick up slider changes on the next
     // delivery without a restart.
     settings: {
+      ...(billingSwap ? { billingSwap } : {}),
       backgroundTaskTimeoutMs: backgroundTaskTimeoutMinutesToMs(getBackgroundTaskTimeoutMinutes()),
       // The user's max-turn-duration ceiling (0 = no limit): worker-local
       // watchdogs (Grok's prompt ceiling) must honor it rather than imposing
@@ -6479,15 +6608,18 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
                 claudeBackgroundCommandLimitMs: claudeBackgroundCommandLimitMinutesToMs(getClaudeBackgroundCommandLimitMinutes()),
               };
             }
-            if (deliveredProvider !== 'claude' && deliveredProvider !== 'claude-cloud') return {};
+            // A Claude API session is a Claude session on another bill:
+            // Claude's attribution and background command limit.
+            const localClaude = deliveredProvider === 'claude' || deliveredProvider === 'claude-api';
+            if (!localClaude && deliveredProvider !== 'claude-cloud') return {};
             return {
               attribution: claudeAttributionForConversation(conv, out.providerModel || out.model, {
-                relayFolderFallback: deliveredProvider === 'claude',
+                relayFolderFallback: localClaude,
               }),
               // The Claude tab's background command limit; the worker
               // hands it to the CLI it spawns next. Claude Cloud runs no
               // local CLI, so it does not get one.
-              ...(deliveredProvider === 'claude'
+              ...(localClaude
                 ? { claudeBackgroundCommandLimitMs: claudeBackgroundCommandLimitMinutesToMs(getClaudeBackgroundCommandLimitMinutes()) }
                 : {}),
             };
@@ -6699,6 +6831,177 @@ async function sweepDeadWorkerProcessingRowsOnce() {
   return recovered;
 }
 
+// The Claude billing switch's worker swap (services/
+// claude-billing-swap-service.mjs): a Claude chat's next row of the other
+// billing is refused to the worker it has, which is replaced, once idle, by
+// one of the row's kind. The old one is stopped like the kill route does, and
+// the new one launched only once every process of the session is gone.
+const claudeBillingSwapService = createClaudeBillingSwapService({
+  getWorker: (sid) => sessionWorkerRegistry?.getWorker?.(sid) || null,
+  // A row the session claimed and has not finished: never stopped under it.
+  hasRunningTurn: (sid) => (stmts.listProcessingRowsForOwner?.all?.(sid) || []).length > 0,
+  stopWorker: async (sid) => {
+    const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
+    // Nothing may start the session while it is being stopped: a launch then
+    // would adopt the old process, kind and all.
+    sessionWorkerSupervisor?.markKilled?.(sid);
+    // A stop that fails backs off (the swap service retries it): the killed
+    // marker goes with it, so the session's worker, alive or relaunched,
+    // keeps asking for work meanwhile. The fence still keeps the other
+    // billing's rows from it.
+    const backOff = (error, remainingPids = []) => {
+      sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+      console.warn(`${runtimeLogPrefix()}BILLING SWAP STOP FAILED session=${sid.slice(0, 8)} ${error}${remainingPids.length ? ` remaining=${remainingPids.join(',')}` : ''} — kill marker cleared, retrying with a backoff`);
+      return { ok: false, error, remainingPids };
+    };
+    let stopped = null;
+    try {
+      await sessionWorkerSupervisor?.cancelPendingStart?.(sid, { wait: true });
+      stopped = await stopSessionWorkerProcesses({
+        sdkSessionId: sid,
+        worker,
+        processInspector: sessionWorkerProcessInspector,
+        isPidAliveImpl: isProcessAlive,
+        killTmuxSessionImpl: killTmuxSession,
+      });
+    } catch (error) {
+      return backOff(String(error?.message || error || 'worker-stop-failed'));
+    }
+    if (!stopped.ok) return backOff(stopped.error || 'worker-survived-stop', stopped.remainingPids || []);
+    sessionWorkerRegistry?.removeWorker?.(sid);
+    sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
+    return { ok: true };
+  },
+  launchWorker: async (sid) => {
+    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+    const launched = await sessionWorkerSupervisor?.ensureWorker?.(sid, { allowProcessReuse: false });
+    return { ok: launched?.ok === true, error: launched?.error || null };
+  },
+  onStuck: ({ conversationId, rowBilling, attempts, reason }) => {
+    if (!conversationId) return;
+    const at = new Date().toISOString();
+    const messageId = uuidv4();
+    const cause = reason === 'probe'
+      ? `the relay cannot tell whether the old Claude process still runs a turn (${attempts} tries)`
+      : `the old Claude process did not stop (${attempts} tries)`;
+    const text = `⚠️ Could not restart the session on the ${rowBilling === 'claude-api' ? 'Claude API key' : 'Claude subscription'}: `
+      + `${cause}. The relay keeps trying; switching the billing back runs the queued messages on the old process.`;
+    try {
+      db.transaction(() => {
+        stmts.insertMsg.run(messageId, conversationId, 'assistant', text, null, null, null, at, null, null, null);
+        stmts.setMessageKind?.run?.('billing-switch-stuck', messageId);
+        stmts.updateConvTime?.run?.(at, conversationId);
+      })();
+      io.emit('assistant_message', {
+        conversationId,
+        messageId,
+        message: { id: messageId, role: 'assistant', text, kind: 'billing-switch-stuck', model: null, mode: null, attachments: [], timestamp: at },
+      });
+    } catch (error) {
+      console.warn(`[claude-billing] stuck note failed: ${error?.message || error}`);
+    }
+  },
+  onPendingChange: ({ conversationId }) => {
+    if (!conversationId) return;
+    io.emit('conversation_billing', { conversationId, billing: claudeBillingSwitchService.billingState(conversationId) });
+  },
+  logger: console,
+});
+
+// The Claude API monthly cap (plan decision 12): `{ reached, error? }`. The
+// one seam the claim check below, the billing switch, an agent's send and a
+// new Claude API chat ask: this month's priced estimate in
+// claude_api_usage_totals (relay local days, claudeApiUsageService.localDay)
+// against claude_api_monthly_cap_usd (services/plan-usage-claude-api.mjs).
+// It throws when the totals cannot be read; every caller counts that as reached.
+function getClaudeApiCapState() {
+  return claudeApiPlanUsage.getCapState();
+}
+
+// A Claude API row must not run while the provider is off, has no key, or
+// this month's cap is reached (getClaudeApiCapState): it is failed closed at
+// the claim, with the way out in its note.
+function claudeApiClaimCheck() {
+  const settings = getClaudeApiProviderSettings();
+  if (settings?.configured !== true) {
+    return { code: 'CLAUDE_API_NOT_CONFIGURED', error: 'Claude API has no key, so this turn did not run.' };
+  }
+  if (settings?.enabled !== true) {
+    return { code: 'CLAUDE_API_NOT_CONFIGURED', error: 'Claude API is switched off, so this turn did not run.', switchedOff: true };
+  }
+  let cap = null;
+  try { cap = getClaudeApiCapState() || null; } catch { cap = { reached: true }; }
+  if (cap?.reached === true) {
+    return {
+      code: 'CLAUDE_API_CAP_REACHED',
+      error: `${String(cap.error || '').trim() || 'This month\'s Claude API spend has reached its cap.'} This turn did not run.`,
+    };
+  }
+  return null;
+}
+
+// A Claude API chat's worker is not launched while Claude API cannot run a
+// turn (no key, switched off, the cap): its waiting rows on the key are
+// failed closed here, as the claim would, instead of a spawn that could only
+// refuse them. True when it was so.
+const listPendingClaudeApiRowsForOwner = db.prepare(`
+  SELECT id FROM queue
+  WHERE status = 'pending' AND NULLIF(owner_sdk_session_id, '') = ?
+    AND COALESCE(kind, '') != 'continuation'
+    AND LOWER(COALESCE(${stmts.setQueueProvider ? 'provider' : 'NULL'}, ?)) = 'claude-api'
+`);
+function failClaudeApiRowsWithoutLaunch(sdkSessionId) {
+  const runtime = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
+  if (normalizeClaudeBilling(runtime?.provider_type) !== 'claude-api') return false;
+  // A check that cannot answer fails this session's rows on the key closed,
+  // as the claim does (messages-routes.mjs, claudeBillingFence).
+  let refusal = null;
+  try {
+    refusal = claudeApiClaimCheck();
+  } catch (error) {
+    console.warn(`${runtimeLogPrefix()}Claude API claim check failed for session=${sdkSessionId.slice(0, 8)}: ${error?.message || error} — its rows on the key fail closed`);
+    refusal = {
+      code: 'CLAUDE_API_NOT_CONFIGURED',
+      error: 'The relay could not check Claude API (key, switch, cap), so this turn did not run.',
+    };
+  }
+  if (!refusal) return false;
+  for (const row of listPendingClaudeApiRowsForOwner.all(sdkSessionId, 'claude-api')) {
+    handleClaudeBillingFence({ reason: 'claude-api-unavailable', messageId: row.id, refusal });
+  }
+  console.warn(`${runtimeLogPrefix()}WORKER PRIME skipped session=${sdkSessionId.slice(0, 8)} reason=${refusal.code} — no Claude API worker while Claude API cannot run a turn`);
+  return true;
+}
+
+// The delivery refused a Claude chat's row to the worker that asked
+// (messages-routes.mjs, claudeBillingFence).
+function handleClaudeBillingFence(fence) {
+  if (fence?.reason === 'claude-api-unavailable') {
+    const row = stmts.findQById.get(fence.messageId);
+    if (!row || String(row.status || '') !== 'pending') return;
+    const code = String(fence.refusal?.code || 'CLAUDE_API_NOT_CONFIGURED');
+    failRecoveredRowTerminally(row, 'claude-api-unavailable', {
+      failureRecord: {
+        kind: 'claude-api-unavailable',
+        error: 'claude-api-unavailable',
+        code,
+        stableCode: `relay.${code.toLowerCase().replace(/_/g, '-')}`,
+        failedAt: new Date().toISOString(),
+      },
+      // The code ends the note's paragraph, where the transcript's buttons
+      // look for it (relay-error-ctas.mjs).
+      failureText: `${fence.refusal?.error || 'Claude API is unavailable, so this turn did not run.'} `
+        + `${claudeApiRemedyText({ code, switchedOff: fence.refusal?.switchedOff === true })}, then send the message again. `
+        + `Error code: relay.${code.toLowerCase().replace(/_/g, '-')}.`,
+    });
+    return;
+  }
+  const result = claudeBillingSwapService.request(fence);
+  if (result.state === 'swapping') {
+    console.log(`${runtimeLogPrefix()}BILLING SWAP session=${String(fence.requesterSessionId || '').slice(0, 8)} conv=${String(fence.conversationId || '').slice(0, 8)} ${fence.workerKind || 'unknown'} → ${fence.rowBilling}`);
+  }
+}
+
 // A worker alive without its socket while a message waits: replaced after a
 // grace time (see the service). Stops the way the kill route does, but only
 // names the registry's pid when the process list confirms it is the
@@ -6769,6 +7072,14 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
   onWorkerSocketClosed: handleWorkerSocketClosed,
   requestWork: requestSessionWorkerSocketDelivery,
+  // What a worker says it is ("claude", "claude-api", ...): the registry
+  // keeps it for the billing fence and for what a response ran on.
+  onWorkerKind: (sessionId, kind) => {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return;
+    const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
+    if (worker && worker.kind !== kind) sessionWorkerRegistry?.upsertWorker?.({ ...worker, kind });
+  },
   isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
   pollIntervalMs: 500,
@@ -6811,6 +7122,14 @@ async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
     const sdkSessionId = String(row?.sdk_session_id || '').trim();
     if (!sdkSessionId) continue;
     if (sessionWorkerSupervisor?.isKillBlocked?.(sdkSessionId) === true) continue;
+    try {
+      // Per session: a throw here costs this session its launch, never the
+      // rest of the pass.
+      if (failClaudeApiRowsWithoutLaunch(sdkSessionId)) continue;
+    } catch (error) {
+      console.warn(`${runtimeLogPrefix()}WORKER PRIME skipped session=${sdkSessionId.slice(0, 8)} err=${error?.message || error}`);
+      continue;
+    }
     requested += 1;
     try {
       const result = await sessionWorkerSupervisor.ensureWorker(sdkSessionId);
@@ -7057,7 +7376,7 @@ const remoteRelayInbound = {
   },
   repository: remoteRelayRepository,
 };
-// The remote_relay tool: who is calling (live turn, provider, model, mode,
+// The relay_tool: who is calling (live turn, provider, model, mode,
 // hops) and the Allow / Deny card write actions need in ask/plan mode.
 const remoteRelayCallerContext = createRemoteRelayCallerContext({
   db,
@@ -7175,6 +7494,8 @@ const sharedRouteDeps = {
   deepseekSettingsService,
   deepseekBalanceService,
   deepseekUsageImportService,
+  getClaudeApiProviderSettings,
+  claudeApiSettingsService,
   claudeCloudRepoService,
   // The login's state for the workers' nudge route (never the token).
   claudeCloudLoginStatus: { describe: () => claudeCloudCredentials.describe() },
@@ -7321,6 +7642,14 @@ const sharedRouteDeps = {
   hostSuspendService,
   collectHostActivity,
   usageLimitPauseService,
+  claudeBillingSwitchService,
+  claudeApiUsageService,
+  claudeApiClaimCheck,
+  onClaudeBillingFence: handleClaudeBillingFence,
+  claudeApiPlanUsage,
+  getClaudeApiCapState,
+  checkClaudeApiCap: (reason) => claudeApiCapWatch.check(reason),
+  claudeApiStopLedger,
   relayEventService,
   relayScheduleService,
   relayAskService,
@@ -7420,6 +7749,7 @@ registerAboutRoutes(app, {
       'claude-cloud': { enabled: getClaudeCloudProviderSettings()?.enabled === true },
       cursor: { enabled: getCursorProviderSettings()?.enabled === true },
       grok: { enabled: getGrokProviderSettings()?.enabled === true },
+      'claude-api': { enabled: getClaudeApiProviderSettings()?.enabled === true },
     }),
     getCachedCliProviders: () => cliInstallService.getCachedStatusSnapshot()?.providers || {},
     isRelayCliOnline: () => runtimeState.cliOnline === true,
@@ -7665,10 +7995,17 @@ function ensureRuntimeSessionBinding(
             ? 'claude-cloud'
             : (normalizedRequestedProviderType === 'deepseek'
               ? 'deepseek'
-              : (normalizedRequestedProviderType === 'github'
-                ? 'github'
-                : (openAISettings?.enabled ? 'openai' : 'github')))))));
-  const resolvedProviderModel = (resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor' || resolvedProviderType === 'grok' || resolvedProviderType === 'claude-cloud' || resolvedProviderType === 'deepseek')
+              // Never folded into `claude`: the two bill different accounts.
+              : (normalizedRequestedProviderType === 'claude-api'
+                ? 'claude-api'
+                : (normalizedRequestedProviderType === 'github'
+                  ? 'github'
+                  : (openAISettings?.enabled ? 'openai' : 'github'))))))));
+  const resolvedProviderModel = (
+    resolvedProviderType === 'openai' || resolvedProviderType === 'claude' || resolvedProviderType === 'cursor'
+    || resolvedProviderType === 'grok' || resolvedProviderType === 'claude-cloud' || resolvedProviderType === 'deepseek'
+    || resolvedProviderType === 'claude-api'
+  )
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
   try {

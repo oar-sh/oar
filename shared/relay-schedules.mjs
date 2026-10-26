@@ -1,5 +1,5 @@
 // Relay schedules: a prompt the relay queues into a session at a set time,
-// once or every N minutes. An agent sets one with remote_relay's `schedule`
+// once or every N minutes. An agent sets one with relay_tool's `schedule`
 // (its own conversation by default, or another session of this relay); the
 // relay keeps it in its database, so it outlives a restart that the agent's
 // own timers would not.
@@ -8,7 +8,7 @@
 // = 'relay-schedule'`) whose first line says what it is: automated, never the
 // user's, and it approves nothing.
 //
-// SDK-free and side-effect free: imported by the server and the remote_relay
+// SDK-free and side-effect free: imported by the server and the relay_tool
 // contract (the browser keeps its own copy of what it needs:
 // server/public/app/relay-schedule-view.mjs).
 

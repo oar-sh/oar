@@ -36,6 +36,10 @@ import { migrateDeepSeekUsageCheckpointRuns } from './migrations/0027-deepseek-u
 import { migrateDeepSeekUsageCheckpointRequestRuns } from './migrations/0028-deepseek-usage-checkpoint-request-runs.mjs';
 import { migrateDeepSeekBalanceRises } from './migrations/0029-deepseek-balance-rises.mjs';
 import { migrateDeepSeekUsageActuals } from './migrations/0030-deepseek-usage-actuals.mjs';
+import { migrateQueueProvider } from './migrations/0031-queue-provider.mjs';
+import { migrateRuntimeSessionBillingSwitch } from './migrations/0032-runtime-session-billing-switch.mjs';
+import { migrateClaudeApiUsageCheckpoints } from './migrations/0033-claude-api-usage-checkpoints.mjs';
+import { migrateClaudeApiUsageTotals } from './migrations/0034-claude-api-usage-totals.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -905,7 +909,7 @@ try {
   console.warn(`[relay-schedules] migration 0022 failed; retrying on next boot: ${error?.message || error}`);
 }
 
-// Questions that don't block (remote_relay ask): one new table. The ask
+// Questions that don't block (relay_tool ask): one new table. The ask
 // service checks for it and refuses the ask actions without it, so a failure
 // is logged and retried next boot like 0022.
 try {
@@ -1025,6 +1029,34 @@ if (runtimeSessionColumns.length) {
   if (!runtimeSessionColumns.includes('last_used_at')) {
     db.exec(`ALTER TABLE runtime_sessions ADD COLUMN last_used_at TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
   }
+}
+
+// The Claude billing switch: the billing a queue row runs on, and the chat's
+// last switch. After runtime_sessions has provider_type: 0031's back-fill
+// reads it. Every reader and writer of these columns checks for them, so a
+// failure is logged and retried next boot like 0004.
+try {
+  migrateQueueProvider(db);
+} catch (error) {
+  console.warn(`[claude-billing] migration 0031 failed; retrying on next boot: ${error?.message || error}`);
+}
+try {
+  migrateRuntimeSessionBillingSwitch(db);
+} catch (error) {
+  console.warn(`[claude-billing] migration 0032 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Claude API usage: the checkpoints across both Claude billings and the
+// booked totals per day and model, handled like 0024.
+try {
+  migrateClaudeApiUsageCheckpoints(db);
+} catch (error) {
+  console.warn(`[claude-api-usage] migration 0033 failed; retrying on next boot: ${error?.message || error}`);
+}
+try {
+  migrateClaudeApiUsageTotals(db);
+} catch (error) {
+  console.warn(`[claude-api-usage] migration 0034 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

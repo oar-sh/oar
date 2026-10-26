@@ -19,7 +19,7 @@ function httpError(status, routePath, text) {
   error.status = status;
   error.detail = detail;
   // The parsed error body, for callers that pass the relay's answer on as
-  // is (a refused remote_relay call carries its code there).
+  // is (a refused relay_tool call carries its code there).
   error.body = payload && typeof payload === "object" ? payload : null;
   return error;
 }
@@ -89,7 +89,7 @@ function requestWithoutTimeout({ url, method, headers, payload, signal }) {
 export function createApiClient({ serverUrl, token, getHeaders }) {
   /**
    * `options.longCall`: a call the relay may legitimately hold open for many
-   * minutes (the remote_relay tool) — it goes over node:http without any
+   * minutes (the relay_tool) — it goes over node:http without any
    * timeout instead of fetch. `options.signal` aborts either kind; an aborted
    * call rejects with an AbortError.
    */

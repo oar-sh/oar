@@ -45,6 +45,7 @@ export function supportedReasoningEffortsForProviderModel({
   model = '',
   cursorSettings = null,
   claudeSettings = null,
+  claudeApiSettings = null,
   grokSettings = null,
   reasoningByModel = null,
 } = {}) {
@@ -52,6 +53,14 @@ export function supportedReasoningEffortsForProviderModel({
   if (provider === 'cursor') return effortsForModel(cursorSettings?.effortsByModel, model);
   if (provider === 'claude') {
     return effortsForModel(claudeSettings?.effortsByModel, model) || [...DEFAULT_CLAUDE_REASONING_EFFORTS];
+  }
+  // Claude API runs the same CLI as Claude: its levels are the Claude
+  // provider's (Ultracode included), narrowed by what Anthropic's model list
+  // says about the model (claude-api-settings-service.mjs).
+  if (provider === 'claude-api') {
+    return effortsForModel(claudeApiSettings?.effortsByModel, model)
+      || effortsForModel(claudeSettings?.effortsByModel, model)
+      || [...DEFAULT_CLAUDE_REASONING_EFFORTS];
   }
   if (provider === 'grok') {
     return effortsForModel(grokSettings?.effortsByModel, model) || [...DEFAULT_GROK_REASONING_EFFORTS];

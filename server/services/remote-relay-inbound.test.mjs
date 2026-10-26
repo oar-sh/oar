@@ -293,7 +293,7 @@ test('the hint for one relay is one system reminder naming it, its state and ver
   assert.equal(
     formatRemoteRelayMentionHint([{ relayId: 'r-linux', name: 'linux-test', online: true, version: '0.9.4' }]),
     '<system_reminder>The user mentioned the remote OAR relay "linux-test" (online, OAR 0.9.4). '
-      + 'The remote_relay tool can list, read, prompt and create sessions there.</system_reminder>',
+      + 'The relay_tool tool can list, read, prompt and create sessions there.</system_reminder>',
   );
 });
 
@@ -304,7 +304,7 @@ test('the hint lists several relays in one block and omits an unknown version', 
       { relayId: 'r-linux', name: 'linux-test', online: true, version: '0.9.4' },
     ]),
     '<system_reminder>The user mentioned the remote OAR relays "lab-relay" (offline), "linux-test" (online, OAR 0.9.4). '
-      + 'The remote_relay tool can list, read, prompt and create sessions there.</system_reminder>',
+      + 'The relay_tool tool can list, read, prompt and create sessions there.</system_reminder>',
   );
   assert.equal(formatRemoteRelayMentionHint([]), '');
   assert.equal(formatRemoteRelayMentionHint(null), '');

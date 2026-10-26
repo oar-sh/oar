@@ -306,3 +306,144 @@ test.describe("New Chat offers Ultracode only on xhigh-capable Claude models", (
     await expect(reasoning.locator("option[value='xhigh']")).toHaveCount(0);
   });
 });
+
+// Claude API: the Claude worker on a Console API key. Seeded straight into
+// the settings (an invented key; nothing reaches Anthropic: the spec sends no
+// turn, and the test relay's Anthropic URL is a dead loopback port). Before
+// the key's own list is read, Claude API offers the Claude tab's models.
+const CLAUDE_API_SETTINGS = {
+  ...CLAUDE_SETTINGS,
+  claude_api_key: "e2e-claude-api-key-0000000000",
+  claude_api_enabled: "true",
+};
+
+test.describe("New Chat starts a Claude API chat, and its composer switches billing", () => {
+  const token = relayToken();
+  let db = null;
+  let bootstrapResponse = null;
+
+  test.beforeAll(() => {
+    db = new Database(relayDbPath());
+    const now = new Date().toISOString();
+    const upsert = db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+    for (const [key, value] of Object.entries(CLAUDE_API_SETTINGS)) upsert.run(key, value, now);
+  });
+
+  test.afterAll(() => {
+    if (!db) return;
+    // Its chats would block a key removal through the route: the rows go directly.
+    const remove = db.prepare(`DELETE FROM app_settings WHERE key = ?`);
+    for (const key of Object.keys(CLAUDE_API_SETTINGS)) remove.run(key);
+    db.close();
+    db = null;
+  });
+
+  test.beforeEach(async ({ page }) => {
+    bootstrapResponse = null;
+    // As above: the isolated server cannot spawn workers, so the committed
+    // conversation's 409 is turned into the answer a real relay gives.
+    await page.route("**/api/conversation/bootstrap", async (route) => {
+      const response = await route.fetch();
+      const text = await response.text();
+      try { bootstrapResponse = JSON.parse(text); } catch { bootstrapResponse = null; }
+      if (response.status() === 409 && bootstrapResponse?.conversationCreated) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...bootstrapResponse, ok: true }) });
+      }
+      return route.fulfill({ response, body: text });
+    });
+    await page.addInitScript(() => {
+      localStorage.removeItem("copilot_selected_model");
+      localStorage.removeItem("copilot_selected_reasoning_effort");
+      localStorage.removeItem("copilot_new_chat_cwd");
+    });
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("the entry, its models and efforts, the lock note, the pill and the toggle", async ({ page }) => {
+    await expect(page.locator("#new-conv-btn")).toBeEnabled();
+    await page.locator("#new-conv-btn").click();
+    await expect(page.locator("#new-conversation-model-modal")).toHaveClass(/visible/);
+    const providers = await page.locator("#new-conversation-provider-select option").evaluateAll(
+      (options) => options.map((option) => [option.value, option.textContent]),
+    );
+    expect(providers).toContainEqual(["claude-api", "Claude API"]);
+    expect(providers).toContainEqual(["claude", "Claude SDK"]);
+    await page.locator("#new-conversation-provider-select").selectOption("claude-api");
+    await expect(page.locator("#new-conversation-provider-help")).toContainText("API key saved in Settings");
+    const models = await page.locator("#new-conversation-model-select option").evaluateAll(
+      (options) => options.map((option) => option.value),
+    );
+    expect(models).toEqual(expect.arrayContaining(["claude-opus-5", "claude-haiku-4-5-20251001"]));
+    await page.locator("#new-conversation-model-select").selectOption("claude-opus-5");
+    // The Claude provider's ladder, Ultracode included and never preselected.
+    const reasoning = page.locator("#new-conversation-reasoning-select");
+    await expect(reasoning.locator("option[value='ultracode']")).toHaveText("Ultracode");
+    await expect(reasoning).not.toHaveValue("ultracode");
+    await reasoning.selectOption("high");
+
+    await page.locator("#new-conversation-model-confirm").click();
+    await expect.poll(() => bootstrapResponse !== null).toBe(true);
+    expect(bootstrapResponse?.selectedProviderType).toBe("claude-api");
+    expect(bootstrapResponse?.selectedModel).toBe("claude-opus-5");
+    const conversationId = String(bootstrapResponse?.conversationId || "");
+    const item = page.locator(`.conv-item.active[onclick*="${conversationId}"]`);
+    await expect(item).toHaveCount(1);
+    await expect(item.locator('.conv-provider-indicator[data-provider="claude-api"]')).toHaveText("Claude API");
+
+    await expect(page.locator("#model-lock-note")).toHaveText("🔒 Session locked to Claude API models.");
+    await expect(page.locator("#model-lock-note")).toHaveAttribute("data-provider", "claude-api");
+    await expect(page.locator("#msg-input")).toHaveAttribute("placeholder", "Message Claude…");
+    await expect(page.locator("#model-select")).toHaveValue("claude-opus-5");
+    await expect(page.locator("#reasoning-effort-select")).toHaveValue("high");
+
+    // The billing toggle: on the key, the subscription one press away.
+    const toggle = page.locator("#claude-billing-toggle");
+    await expect(toggle).toBeVisible();
+    await expect(toggle.locator('[data-billing="claude-api"]')).toHaveAttribute("aria-pressed", "true");
+    await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "false");
+    await expect(toggle.locator('[data-billing="claude"]')).not.toHaveAttribute("aria-disabled", "true");
+
+    // To the subscription: the chat, its note, its pill and its toggle follow.
+    await toggle.locator('[data-billing="claude"]').click();
+    await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator("#model-lock-note")).toHaveText("🔒 Session locked to Claude SDK models.");
+    await expect(page.locator("#model-lock-note")).toHaveAttribute("data-provider", "claude");
+    await expect(item.locator('.conv-provider-indicator[data-provider="claude"]')).toHaveText("Claude");
+    await expect(page.locator(".msg.assistant", { hasText: "runs on the Claude subscription from the next turn" })).toHaveCount(1);
+
+    // And back to the key: the first turn there costs more, and the toggle says so.
+    await toggle.locator('[data-billing="claude-api"]').click();
+    await expect(toggle.locator('[data-billing="claude-api"]')).toHaveAttribute("aria-pressed", "true");
+    await expect(toggle.locator(".claude-billing-status")).toContainText("no prompt cache and costs more");
+    await expect(page.locator("#model-lock-note")).toHaveText("🔒 Session locked to Claude API models.");
+  });
+
+  test("a Claude chat on the subscription offers the key only while Claude API is on", async ({ page, request }) => {
+    const headers = { Authorization: `Bearer ${token}` };
+    await expect(page.locator("#new-conv-btn")).toBeEnabled();
+    await page.locator("#new-conv-btn").click();
+    await page.locator("#new-conversation-provider-select").selectOption("claude");
+    await page.locator("#new-conversation-model-select").selectOption("claude-opus-5");
+    await page.locator("#new-conversation-model-confirm").click();
+    await expect.poll(() => bootstrapResponse !== null).toBe(true);
+    expect(bootstrapResponse?.selectedProviderType).toBe("claude");
+    const toggle = page.locator("#claude-billing-toggle");
+    await expect(toggle).toBeVisible();
+    await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "true");
+
+    // Claude API switched off (the tab's switch, from another page): the
+    // settings event takes the toggle away.
+    try {
+      expect((await request.post("/api/settings/claude-api", { headers, data: { enabled: false } })).ok()).toBe(true);
+      await expect(toggle).toBeHidden();
+    } finally {
+      // On again; its model discovery goes to the harness's dead loopback port.
+      await request.post("/api/settings/claude-api", { headers, data: { enabled: true } });
+    }
+    await expect(toggle).toBeVisible();
+  });
+});

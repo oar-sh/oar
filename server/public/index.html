@@ -297,6 +297,8 @@
     --provider-claude-cloud: #7dd3fc;
     /* DeepSeek's blue, toward indigo so it reads apart from Copilot's. */
     --provider-deepseek: #8b9dff;
+    /* Claude on an API key: gold, beside the subscription's terracotta. */
+    --provider-claude-api: #e3b341;
     /* The usage charts' series, in a fixed order (blue, orange, green,
        amber; grey for "other"), stepped for the dark surface and checked
        for colour-vision deficiency and contrast against it. */
@@ -370,6 +372,7 @@
     --provider-grok: #a21caf;
     --provider-claude-cloud: #0369a1;
     --provider-deepseek: #3b5bdb;
+    --provider-claude-api: #8a6100;
     /* The same series order, stepped for the white surface. */
     --plan-usage-series-1: #2a78d6;
     --plan-usage-series-2: #eb6834;
@@ -1006,6 +1009,7 @@
   .conv-provider-indicator[data-provider="grok"] { color: var(--provider-grok); }
   .conv-provider-indicator[data-provider="deepseek"] { color: var(--provider-deepseek); }
   .conv-provider-indicator[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
+  .conv-provider-indicator[data-provider="claude-api"] { color: var(--provider-claude-api); }
   .conv-item.worker-ui-offline .conv-title,
   #chat-title[data-ui-state="offline"] { color: var(--conversation-title-offline); }
   /* Ready and idle: the darker green. Ready and working (a turn or
@@ -1492,6 +1496,44 @@
   #settings-provider-panel-deepseek select {
     max-width: 100%;
   }
+  /* Its links in the accent colour, as the usage card's: the browser's own
+     blue is unreadable on the dark panel. */
+  #settings-provider-panel-claude-api .settings-help a { color: var(--accent); text-decoration: none; }
+  #settings-provider-panel-claude-api .settings-help a:hover { text-decoration: underline; }
+  /* The Claude API tab's key and cap: the same text-input look. */
+  #settings-provider-panel-claude-api input[type="password"],
+  #settings-provider-panel-claude-api input[type="number"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    outline: none;
+    font-size: var(--fs-meta-md);
+    width: min(360px, 100%);
+  }
+  #settings-provider-panel-claude-api select {
+    max-width: 100%;
+  }
+  /* A cap the tab refuses: said under the field, which is marked too. */
+  /* Two classes: .settings-help, later in this sheet, would grey it out. */
+  .settings-help.claude-api-field-error { color: var(--danger); }
+  .settings-help.claude-api-field-error[hidden] { display: none; }
+  /* The native spin buttons of a number field follow the theme: light ones
+     on a dark field read as a glitch. */
+  :root:not([data-theme="light"]) input[type="number"] { color-scheme: dark; }
+  #settings-provider-panel-claude-api input[aria-invalid="true"] { border-color: var(--danger); }
+  /* Three buttons: they wrap on a phone instead of pushing the panel wide. */
+  .claude-api-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .claude-api-shared-note .summary-btn {
+    margin-left: 6px;
+    padding: 2px 10px;
+  }
   /* "No longer used" under the starting balance: the warning look of the
      composer's model banner, apart from the help text above it. */
   #deepseek-starting-balance-status {
@@ -1562,9 +1604,9 @@
     font-size: var(--fs-meta-sm);
     line-height: 1.35;
   }
-  .settings-provider-status[data-state="active"] { color: #3fb950; }
+  .settings-provider-status[data-state="active"] { color: var(--success); }
   .settings-provider-status[data-state="saved"] { color: var(--accent); }
-  .settings-provider-status[data-state="error"] { color: #f85149; }
+  .settings-provider-status[data-state="error"] { color: var(--danger); }
   /* These rows are laid out as flex and hidden from script via `.hidden = true`.
      Their `display: flex` lives HERE rather than in a style="" attribute on
      purpose: an inline declaration outranks every selector-based rule (short of
@@ -3335,6 +3377,9 @@
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
     pointer-events: none;
   }
+  /* The light theme's --warn on the toast's tinted ground is about 3.6:1;
+     its text takes a darker amber (about 5.6:1), the border keeps --warn. */
+  :root[data-theme="light"] #relay-toast { color: #7d4e00; }
   #relay-toast.visible { display: block; }
   #relay-toast.has-action { pointer-events: auto; }
   .relay-toast-action {
@@ -3440,6 +3485,48 @@
   #model-lock-note[data-provider="grok"] { color: var(--provider-grok); }
   #model-lock-note[data-provider="deepseek"] { color: var(--provider-deepseek); }
   #model-lock-note[data-provider="claude-cloud"] { color: var(--provider-claude-cloud); }
+  #model-lock-note[data-provider="claude-api"] { color: var(--provider-claude-api); }
+  /* The billing toggle of a Claude chat: a two-way switch in the provider
+     colours, with what a pending switch waits for beside it. It wraps under
+     the switch on a phone instead of widening the composer. */
+  .claude-billing-toggle {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    margin-bottom: 6px;
+    min-width: 0;
+    font-size: var(--fs-meta-sm);
+  }
+  .claude-billing-toggle[hidden] { display: none; }
+  .claude-billing-label { color: var(--muted); font-weight: 600; }
+  .claude-billing-options {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    flex: 0 0 auto;
+  }
+  .claude-billing-option {
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-weight: 600;
+    padding: 3px 12px;
+    min-height: 26px;
+    cursor: pointer;
+  }
+  .claude-billing-option + .claude-billing-option { border-left: 1px solid var(--border); }
+  .claude-billing-option[aria-pressed="true"] { cursor: default; color: var(--bg); }
+  .claude-billing-option[aria-pressed="true"][data-billing="claude"] { background: var(--provider-claude); }
+  .claude-billing-option[aria-pressed="true"][data-billing="claude-api"] { background: var(--provider-claude-api); }
+  .claude-billing-option[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
+  .claude-billing-option:not([aria-pressed="true"]):not([aria-disabled="true"]):hover { color: var(--text); }
+  .claude-billing-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .claude-billing-status { flex: 1 1 14em; min-width: 0; color: var(--muted); line-height: 1.4; }
+  .claude-billing-status:empty { display: none; }
+  .claude-billing-status[data-kind="warning"] { color: var(--warn); }
   /* Claude Cloud conversations (claude-cloud-conversation-ui.js): where the
      session runs and what it pushed, above the composer like the lock note.
      The items wrap instead of scrolling, so a long branch name can never push
@@ -4345,6 +4432,7 @@
   body.shared-reader-mode #reasoning-effort-select,
   body.shared-reader-mode #send-btn,
   body.shared-reader-mode #model-lock-note,
+  body.shared-reader-mode #claude-billing-toggle,
   body.shared-reader-mode #cloud-session-line,
   body.shared-reader-mode #model-pricing-details {
     display: none !important;
@@ -4831,6 +4919,14 @@
     min-height: 42px;
     margin-top: 8px;
   }
+  /* The selects take the inputs' look too: left to the browser they stay a
+     white box with black text in the dark theme. */
+  #new-conversation-provider-select,
+  #new-conversation-model-select,
+  #new-conversation-reasoning-select,
+  #new-conversation-context-select,
+  #new-conversation-size-select,
+  #new-conversation-cwd-select,
   #new-conversation-cwd-manual,
   #new-conversation-cloud-repo,
   #new-conversation-cloud-branch {
@@ -4842,6 +4938,18 @@
     color: var(--text);
   }
   #new-conversation-cwd-manual[hidden] { display: none; }
+  /* With the inputs' colours a disabled select (the read-only context row,
+     the effort before a model is chosen) would look editable: dimmed as in
+     the composer. */
+  #new-conversation-provider-select:disabled,
+  #new-conversation-model-select:disabled,
+  #new-conversation-reasoning-select:disabled,
+  #new-conversation-context-select:disabled,
+  #new-conversation-size-select:disabled,
+  #new-conversation-cwd-select:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
   #new-conversation-cloud-repo[aria-invalid="true"],
   #new-conversation-cloud-branch[aria-invalid="true"] { border-color: var(--danger); }
   /* Warning lines under Repository/Branch: what the cloud clone will not see. */
@@ -5214,6 +5322,13 @@
     line-height: 1.5;
   }
   .new-conversation-setup-note[hidden] { display: none; }
+  .new-conversation-refusal { border-left-color: var(--warn); }
+  .new-conversation-refusal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
   .summary-close {
     width: 32px;
     padding: 0;
@@ -7378,6 +7493,8 @@
       <div id="model-banner"></div>
       <div id="usage-limit-banner" role="status" aria-live="polite" hidden></div>
       <div id="model-lock-note" hidden></div>
+      <!-- Subscription | API key in a Claude chat (claude-billing-toggle-ui.js). -->
+      <div id="claude-billing-toggle" class="claude-billing-toggle" hidden></div>
       <div id="cloud-session-line" aria-label="Cloud session" hidden></div>
       <div id="model-metadata-blocker" aria-live="polite">
         <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>
@@ -7848,6 +7965,16 @@
             data-settings-provider-tab="claude"
           >Claude</button>
           <button
+            id="settings-provider-tab-claude-api"
+            class="settings-tab settings-subtab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="settings-provider-panel-claude-api"
+            tabindex="-1"
+            data-settings-provider-tab="claude-api"
+          >Claude API</button>
+          <button
             id="settings-provider-tab-claude-cloud"
             class="settings-tab settings-subtab"
             type="button"
@@ -8079,6 +8206,63 @@
               <button id="claude-save-btn" type="button" class="summary-btn" onclick="saveClaudeSettings()">Save Claude settings</button>
             </div>
             <div class="settings-help">Runs Claude conversations through the Claude Agent SDK using the relay host's logged-in Claude credentials (no API key stored). Disabling also rebinds conversations that have not sent a message yet.</div>
+          </div>
+        </div>
+        <!-- Claude API (claude-api-settings-ui.js): Claude chats on a Claude Console
+             API key. The key is write-only; the relay never sends it back. -->
+        <div
+          id="settings-provider-panel-claude-api"
+          class="settings-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="settings-provider-tab-claude-api"
+          data-settings-provider-panel="claude-api"
+          hidden
+        >
+          <div class="settings-row settings-row-column" style="margin-top: 12px; margin-bottom: 0;">
+            <label for="claude-api-key-input">Claude API</label>
+            <div class="settings-row" style="width: 100%; margin-bottom: 8px;">
+              <label for="claude-api-enabled-toggle">Enable Claude API for New Chat and the billing switch</label>
+              <input id="claude-api-enabled-toggle" type="checkbox" onchange="toggleClaudeApiProvider(this.checked)" disabled>
+            </div>
+            <input
+              id="claude-api-key-input"
+              type="password"
+              autocomplete="new-password"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Claude Console API key…"
+              aria-label="Claude API key"
+              aria-describedby="claude-api-key-help"
+            >
+            <div id="claude-api-key-help" class="settings-help">An API key from the Claude Console (<a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener noreferrer">platform.claude.com → API keys</a>). It is stored on the relay host, never sent back to a browser, and used only for Claude API chats and for listing the key's models. Claude login tokens and Admin keys are refused.</div>
+            <label for="claude-api-model-select" style="margin-top: 8px;">Default model</label>
+            <select id="claude-api-model-select" aria-label="Claude API default model"></select>
+            <div id="claude-api-models-status" class="settings-help" hidden></div>
+            <label for="claude-api-monthly-cap-input" style="margin-top: 8px;">Monthly cap in US dollars (optional)</label>
+            <input
+              id="claude-api-monthly-cap-input"
+              type="number"
+              inputmode="decimal"
+              min="0.01"
+              max="1000000"
+              step="0.01"
+              placeholder="No cap"
+              aria-label="Claude API monthly cap in US dollars"
+              aria-describedby="claude-api-monthly-cap-error claude-api-monthly-cap-help"
+            >
+            <div id="claude-api-monthly-cap-error" class="settings-help claude-api-field-error" role="alert" hidden></div>
+            <div id="claude-api-monthly-cap-help" class="settings-help">Once this relay's estimated Claude API spend of the calendar month reaches the cap, new API key turns and switches to the API key are refused; a running turn finishes. Leave it empty for no cap. Spend limits set in the Claude Console apply on top.</div>
+            <div id="claude-api-settings-status" class="settings-help settings-provider-status">Loading Claude API settings…</div>
+            <div class="claude-api-actions">
+              <button id="claude-api-save-btn" type="button" class="summary-btn" onclick="saveClaudeApiSettings()">Save Claude API settings</button>
+              <button id="claude-api-refresh-btn" type="button" class="summary-btn" onclick="refreshClaudeApiModels()" disabled>Refresh models</button>
+              <button id="claude-api-remove-btn" type="button" class="summary-btn" onclick="removeClaudeApiSettings()" disabled>Remove saved key</button>
+            </div>
+            <div class="settings-help">Claude API chats run Claude Code on the relay host like Claude chats, on this key instead of the host's Claude login, and are billed to the Claude Console organisation the key belongs to. A Claude chat can switch between the subscription and the API key from its composer. Credit and spend limits are in the Console: <a href="https://platform.claude.com/settings/billing" target="_blank" rel="noopener noreferrer">billing</a>, <a href="https://platform.claude.com/settings/limits" target="_blank" rel="noopener noreferrer">limits</a>.</div>
+            <div class="settings-help claude-api-shared-note">Commit attribution, the background command limit, the effort levels and the compaction window are shared with Claude chats and set on the Claude tab.
+              <button id="claude-api-open-claude-tab-btn" type="button" class="summary-btn" onclick="openClaudeTabFromClaudeApi()">Claude tab</button>
+            </div>
           </div>
         </div>
         <!-- Claude Cloud (claude-cloud-settings-ui.js). The login itself is managed on
@@ -8373,7 +8557,7 @@
               <option value="CNY">CNY (¥)</option>
               <option value="">The balance's currency (may change)</option>
             </select>
-            <div class="settings-help">The usage card shows this relay's estimated DeepSeek spend of the calendar month (UTC) against the budget, in the budget's currency, amber near the budget and red over it. Leave the amount empty for no budget bar.</div>
+            <div class="settings-help">The usage card shows this relay's estimated DeepSeek spend of the calendar month (UTC) against the budget, in the budget's currency. The bar changes colour at 50 % and 75 % of the budget and turns red at 90 %. Leave the amount empty for no budget bar.</div>
             <label for="deepseek-starting-balance-input" style="margin-top: 8px;">Starting balance (optional)</label>
             <input
               id="deepseek-starting-balance-input"
@@ -8758,6 +8942,8 @@
            Settings is the main button; Start stays as "anyway", because the
            Copilot signal can be wrong. -->
       <div id="new-conversation-setup-note" class="new-conversation-setup-note" role="status" hidden></div>
+      <!-- Claude API refused to start the chat (journal-view.js). -->
+      <div id="new-conversation-refusal" class="new-conversation-setup-note new-conversation-refusal" role="alert" hidden></div>
       <div class="summary-modal-actions">
         <button type="button" class="summary-btn" onclick="closeNewConversationModelModal()">Cancel</button>
         <button id="new-conversation-open-settings" type="button" class="summary-btn summary-btn-accent" hidden>Open Settings → Providers</button>

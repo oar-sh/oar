@@ -48,6 +48,11 @@ import { createCliInstallService } from '../services/cli-install-service.mjs';
 import { createGrokAuthService } from '../services/grok-auth-service.mjs';
 import { parseDeepSeekSettingsUpdateRequest } from '../services/deepseek-settings-service.mjs';
 import {
+  CLAUDE_API_PROVIDER_LABEL,
+  CLAUDE_API_PROVIDER_TYPE,
+  parseClaudeApiSettingsUpdateRequest,
+} from '../services/claude-api-settings-service.mjs';
+import {
   DEEPSEEK_PROVIDER_TYPE,
   DEEPSEEK_REASONING_EFFORTS,
   DEFAULT_DEEPSEEK_MODEL,
@@ -855,6 +860,82 @@ export function buildModelCatalogWithDeepSeekProvider(modelState = {}, deepseekS
   };
 }
 
+/**
+ * Claude API (provider `claude-api`) serves the Claude provider's model ids
+ * on an API key. Its layer tags them `claude-api` beside whatever else serves
+ * them and keeps its own efforts and context tiers: `[1m]` variants fold into
+ * their base model as a long_context tier, as on the Claude layer. An id is
+ * never enough to pick this provider; only an explicit `claude-api` does.
+ */
+export function buildModelCatalogWithClaudeApiProvider(modelState = {}, claudeApiSettings = {}) {
+  const configured = claudeApiSettings?.enabled === true;
+  const model = String(claudeApiSettings?.model || '').trim();
+  if (!configured || !model) return { ...modelState };
+  const listed = Array.isArray(claudeApiSettings?.models) ? claudeApiSettings.models : [];
+  const longContextBases = new Set();
+  const defaultContextBases = new Set();
+  const baseModels = [];
+  const seenBases = new Set();
+  for (const candidate of [model, ...listed]) {
+    const modelId = String(candidate || '').trim();
+    if (!modelId) continue;
+    const isLongContextVariant = CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN.test(modelId);
+    const baseId = modelId.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '');
+    if (!baseId) continue;
+    if (isLongContextVariant) longContextBases.add(baseId.toLowerCase());
+    else defaultContextBases.add(baseId.toLowerCase());
+    if (seenBases.has(baseId.toLowerCase())) continue;
+    seenBases.add(baseId.toLowerCase());
+    baseModels.push(baseId);
+  }
+  const models = Array.from(new Set([...(Array.isArray(modelState?.models) ? modelState.models : []), ...baseModels]));
+  const reasoningByModel = { ...(modelState?.reasoningByModel || {}) };
+  const claudeApiReasoningByModel = {};
+  const modelMetadataByModel = { ...(modelState?.modelMetadataByModel || {}) };
+  const providersByModel = { ...(modelState?.providersByModel || {}) };
+  const claudeApiContextTiersByModel = {};
+  const effortsByModel = claudeApiSettings?.effortsByModel && typeof claudeApiSettings.effortsByModel === 'object'
+    ? claudeApiSettings.effortsByModel
+    : {};
+  for (const baseId of baseModels) {
+    const lowerKey = baseId.toLowerCase();
+    claudeApiContextTiersByModel[lowerKey] = [
+      ...(defaultContextBases.has(lowerKey) ? [{ value: 'default' }] : []),
+      ...(longContextBases.has(lowerKey) ? [{ value: 'long_context' }] : []),
+    ];
+    const efforts = Array.isArray(effortsByModel[lowerKey]) && effortsByModel[lowerKey].length
+      ? effortsByModel[lowerKey]
+      : effortsByModel[`${lowerKey}[1m]`];
+    const claudeApiEfforts = Array.isArray(efforts) && efforts.length
+      ? withClaudeUltracodeTier(efforts)
+      : [...DEFAULT_CLAUDE_REASONING_EFFORTS];
+    claudeApiReasoningByModel[lowerKey] = [...claudeApiEfforts];
+    if (!Array.isArray(reasoningByModel[lowerKey]) || reasoningByModel[lowerKey].length === 0) {
+      reasoningByModel[lowerKey] = [...claudeApiEfforts];
+    }
+    const existingProviders = Array.isArray(providersByModel[baseId])
+      ? providersByModel[baseId]
+      : (Array.isArray(providersByModel[lowerKey]) ? providersByModel[lowerKey] : []);
+    providersByModel[baseId] = Array.from(new Set([...existingProviders, CLAUDE_API_PROVIDER_TYPE]));
+    modelMetadataByModel[baseId] = {
+      ...(modelMetadataByModel[baseId] || {}),
+      provider: modelMetadataByModel[baseId]?.provider || CLAUDE_API_PROVIDER_TYPE,
+    };
+  }
+  return {
+    ...modelState,
+    models,
+    reasoningByModel,
+    reasoningByProvider: {
+      ...(modelState?.reasoningByProvider || {}),
+      [CLAUDE_API_PROVIDER_TYPE]: claudeApiReasoningByModel,
+    },
+    modelMetadataByModel,
+    providersByModel,
+    claudeApiContextTiersByModel,
+  };
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
@@ -865,6 +946,8 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';
   if (normalized === 'deepseek') return 'deepseek';
+  // Its own provider, never read as `claude`.
+  if (normalized === 'claude-api') return 'claude-api';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
 }
@@ -1506,9 +1589,10 @@ export function buildConversationSessionRootPayload({
   }
   // Claude sessions have no ~/.copilot/session-state entry — only the Copilot
   // CLI creates those — so they resolve against the Agent SDK's own layout and
-  // never fall through to the branch below.
+  // never fall through to the branch below. A Claude API session is a Claude
+  // session on an API key, in the same place.
   const claudeCodeProvider = String(providerType || '').trim().toLowerCase();
-  if (claudeCodeProvider === 'claude' || claudeCodeProvider === 'deepseek') {
+  if (claudeCodeProvider === 'claude' || claudeCodeProvider === 'deepseek' || claudeCodeProvider === 'claude-api') {
     const nativeSessionId = String(claudeNativeSessionId || '').trim();
     const resolveRoot = claudeCodeProvider === 'deepseek' ? resolveDeepSeekSessionRoot : resolveClaudeSessionRoot;
     if (!nativeSessionId || typeof resolveRoot !== 'function') return null;
@@ -2138,6 +2222,20 @@ export function registerSessionsRoutes(app, deps) {
     // attribution (services/deepseek-settings-service.mjs). Absent in older
     // wiring and most tests, where the provider is simply off.
     deepseekSettingsService = null,
+    // Claude API (provider `claude-api`): its key, models and monthly cap
+    // (services/claude-api-settings-service.mjs). Absent in older wiring and
+    // most tests, where the provider is simply off.
+    claudeApiSettingsService = null,
+    // The Claude API card and monthly cap (services/plan-usage-claude-api.mjs),
+    // and the cap's one seam (`{ reached, error? }`; a throw counts as
+    // reached). Absent in older wiring and most tests: no card, no cap.
+    claudeApiPlanUsage = null,
+    getClaudeApiCapState = () => ({ reached: false }),
+    // Asks whether the cap flipped after the Claude API settings changed.
+    checkClaudeApiCap = () => {},
+    // The once-per-episode notes for stopped self-started turns on the key
+    // (plan-usage-claude-api.mjs): a saved setting starts every chat afresh.
+    claudeApiStopLedger = null,
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -2248,6 +2346,7 @@ export function registerSessionsRoutes(app, deps) {
     hostSuspendService = null,
     collectHostActivity = null,
     usageLimitPauseService = null,
+    claudeBillingSwitchService = null,
     hostSuspendPlatform = process.platform,
     // Remote relays (server/services/remote-relay-inbound.mjs): origin on
     // conversations another relay's agent created, and the inbound switch.
@@ -2504,20 +2603,28 @@ export function registerSessionsRoutes(app, deps) {
       || { configured: false, enabled: false, model: DEFAULT_DEEPSEEK_MODEL, models: [], availableModels: [] };
   }
 
+  function getClaudeApiProviderSettings() {
+    return claudeApiSettingsService?.getSettings?.()
+      || { configured: false, enabled: false, model: '', models: [], availableModels: [], effortsByModel: {} };
+  }
+
   // Layer every enabled provider's models onto the base Copilot catalog.
   function buildModelCatalogWithProviders(modelState, openAISettings = getOpenAIProviderSettings()) {
-    return buildModelCatalogWithDeepSeekProvider(
-      buildModelCatalogWithGrokProvider(
-        buildModelCatalogWithCursorProvider(
-          buildModelCatalogWithClaudeProvider(
-            buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
-            getClaudeProviderSettings(),
+    return buildModelCatalogWithClaudeApiProvider(
+      buildModelCatalogWithDeepSeekProvider(
+        buildModelCatalogWithGrokProvider(
+          buildModelCatalogWithCursorProvider(
+            buildModelCatalogWithClaudeProvider(
+              buildModelCatalogWithOpenAIProvider(modelState, openAISettings),
+              getClaudeProviderSettings(),
+            ),
+            getCursorProviderSettings(),
           ),
-          getCursorProviderSettings(),
+          getGrokProviderSettings(),
         ),
-        getGrokProviderSettings(),
+        getDeepSeekProviderSettings(),
       ),
-      getDeepSeekProviderSettings(),
+      getClaudeApiProviderSettings(),
     );
   }
 
@@ -2708,7 +2815,7 @@ export function registerSessionsRoutes(app, deps) {
   async function deleteCliSession({ conversation, conversationId, sdkSessionId, runtimeSession }) {
     const provider = String(runtimeSession?.provider_type || '').trim().toLowerCase();
     try {
-      if (provider === 'claude') return deleteClaudeCliSession({ conversation, runtimeSession });
+      if (provider === 'claude' || provider === 'claude-api') return deleteClaudeCliSession({ conversation, runtimeSession });
       if (provider === 'deepseek') return deleteDeepSeekCliSession({ conversation, runtimeSession });
       if (!sdkSessionId) return { deleted: null };
       if (!provider || provider === 'github' || provider === 'openai') {
@@ -2782,7 +2889,7 @@ export function registerSessionsRoutes(app, deps) {
   /**
    * The `group` field of a single conversation payload: the summary and the
    * conversation's role. The live members, with what each is doing, only
-   * when asked for (`groupMembers=1`, the remote_relay tool's read_session)
+   * when asked for (`groupMembers=1`, the relay_tool's read_session)
    * and never for a paired relay's agent: the browser does not read them,
    * and archived members' titles stay on this relay.
    */
@@ -3644,9 +3751,11 @@ export function registerSessionsRoutes(app, deps) {
     // The cursor and grok workers post the same Claude-shaped usage blob, and
     // so does the Claude Cloud worker (the cloud session's context and token
     // usage), and so does the DeepSeek worker (the Claude one, pointed at
-    // DeepSeek), so all five providers share the stored reader.
+    // DeepSeek), and so does the Claude API one (the Claude worker on an API
+    // key), so all six providers share the stored reader.
     const usesStoredContextUsage = providerType === 'claude' || providerType === 'cursor'
-      || providerType === 'grok' || providerType === 'claude-cloud' || providerType === 'deepseek';
+      || providerType === 'grok' || providerType === 'claude-cloud' || providerType === 'deepseek'
+      || providerType === 'claude-api';
 
     const parsed = usesStoredContextUsage
       ? (() => {
@@ -3675,12 +3784,12 @@ export function registerSessionsRoutes(app, deps) {
       String(runtimeSession?.conversation_id || '').trim() || lookupId,
     );
     const autoCompactWindow = parseAutoCompactWindow(conversationRow?.auto_compact_window);
-    // Only the local Claude worker (and the DeepSeek one, the same runner)
-    // runs a CLI whose window the slider sets; it reports that CLI on its
-    // heartbeat's steering snapshot.
+    // Only the local Claude worker (and the DeepSeek and Claude API ones, the
+    // same runner) runs a CLI whose window the slider sets; it reports that
+    // CLI on its heartbeat's steering snapshot.
     const windowStatus = resolveAutoCompactWindowStatus({
       storedWindow: autoCompactWindow,
-      steering: (providerType === 'claude' || providerType === 'deepseek') && copilotSessionId
+      steering: (providerType === 'claude' || providerType === 'deepseek' || providerType === 'claude-api') && copilotSessionId
         ? sessionWorkerRegistry?.getWorker?.(copilotSessionId)?.steering || null
         : null,
     });
@@ -3700,7 +3809,7 @@ export function registerSessionsRoutes(app, deps) {
       // What this folder's Claude commits say (the 🧠 modal's override row).
       // A Claude Cloud chat has the row when it was started from a folder,
       // with its own model in the example.
-      ...(providerType === 'claude'
+      ...(providerType === 'claude' || providerType === 'claude-api'
         ? { attribution: workspaceRootAttributionFor(conversationRow) }
         : {}),
       ...(providerType === 'claude-cloud' && cloudConversationFolder(conversationRow)
@@ -4728,6 +4837,9 @@ export function registerSessionsRoutes(app, deps) {
         try { return getTaskStallMinutes(); } catch { return DEFAULT_TASK_STALL_MINUTES; }
       })(),
       usageLimitPause: usageLimitPauseService?.getPause?.(resolvedConversationId) || null,
+      // A Claude chat's billing (subscription or API key) and whether the
+      // composer's toggle may switch it now, with the reason when not.
+      billing: claudeBillingSwitchService?.billingState?.(resolvedConversationId) || null,
       previews: listConversationPreviews?.(resolvedConversationId) || [],
       // Every pin of the conversation, also those outside this history page.
       pins: listConversationPins(resolvedConversationId),
@@ -5014,7 +5126,7 @@ export function registerSessionsRoutes(app, deps) {
     return res.json({ ok: true, ...persisted });
   });
 
-  // ─── PATCH /api/conversation/:id/settings — the remote_relay tool's update_session ───
+  // ─── PATCH /api/conversation/:id/settings — the relay_tool's update_session ───
   //
   // `{ settings: { model, effort, mode, auto_compact_window, title, group,
   // thinking_enabled, thinking_display, cwd }, dry_run, owner_approved }`.
@@ -5135,7 +5247,7 @@ export function registerSessionsRoutes(app, deps) {
       plan.preferences.thinkingDisplay = wanted.thinking_display;
       change('thinking_display');
     }
-    if (provider !== 'claude' && ['auto_compact_window', 'thinking_enabled', 'thinking_display'].some((key) => wanted[key] !== undefined)) {
+    if (provider !== 'claude' && provider !== 'claude-api' && ['auto_compact_window', 'thinking_enabled', 'thinking_display'].some((key) => wanted[key] !== undefined)) {
       plan.notes.push(`auto_compact_window and thinking apply to Claude sessions only; this one runs on ${provider}, so they are stored but change nothing there.`);
     }
     if (wanted.title !== undefined) {
@@ -6267,6 +6379,35 @@ export function registerSessionsRoutes(app, deps) {
         environmentId: cloudEnvironmentId,
       });
     }
+    // Claude API is asked for by name only, like Claude Cloud: its model ids
+    // are the Claude provider's own, so a model never selects it. Refused
+    // first while it has no key or is switched off.
+    const useClaudeApiProvider = requestedProviderType === CLAUDE_API_PROVIDER_TYPE;
+    const claudeApiSettings = useClaudeApiProvider ? getClaudeApiProviderSettings() : null;
+    if (useClaudeApiProvider && claudeApiSettings?.enabled !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: claudeApiSettings?.configured === true
+          ? 'Claude API is switched off for new conversations.'
+          : 'Claude API key is not configured.',
+        code: 'CLAUDE_API_NOT_CONFIGURED',
+      });
+    }
+    // This month's cap (plan decision 12): no new Claude API chat while it is
+    // reached, for New Chat and an agent's create_session alike. A cap that
+    // cannot be read counts as reached.
+    if (useClaudeApiProvider) {
+      let cap = null;
+      try { cap = getClaudeApiCapState() || null; } catch { cap = { reached: true }; }
+      if (cap?.reached === true) {
+        return res.status(409).json({
+          ok: false,
+          // The remedy names the place, so the reason does not.
+          error: `${String(cap.reason || cap.error || '').trim() || 'This month\'s Claude API spend has reached its cap.'} No Claude API chat was started; start it on the Claude subscription, or raise the cap in Settings → Providers → Claude API.`,
+          code: 'CLAUDE_API_CAP_REACHED',
+        });
+      }
+    }
     const modelState = buildModelCatalogWithProviders(
       getModelCatalogState(),
       openAISettings,
@@ -6312,6 +6453,13 @@ export function registerSessionsRoutes(app, deps) {
       ...(Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : []),
     ].map((value) => String(value || '').trim()).filter(Boolean);
     const availableDeepSeekModels = new Set(deepseekModelCatalog.map((value) => value.toLowerCase()));
+    // Base ids of "[1m]" variants count too, as for the Claude provider.
+    const availableClaudeApiModels = new Set((useClaudeApiProvider ? [
+      String(claudeApiSettings?.model || '').trim(),
+      ...(Array.isArray(claudeApiSettings?.models) ? claudeApiSettings.models : []),
+    ] : []).map((value) => String(value || '').trim()).filter(Boolean)
+      .flatMap((value) => [value, value.replace(CLAUDE_LONG_CONTEXT_SUFFIX_PATTERN, '')])
+      .filter(Boolean));
     const useOpenAIProvider = requestedProviderType === 'openai'
       || requestedProviderType === 'openai-image'
       || (
@@ -6376,6 +6524,12 @@ export function registerSessionsRoutes(app, deps) {
           configuredModel: claudeCloudSettings.defaultModel,
           availableModels: Array.isArray(claudeCloudSettings.models) ? claudeCloudSettings.models : [],
         })
+      : useClaudeApiProvider
+      ? resolveProviderModelSelection({
+          requestedModel: providerRequestedModel(availableClaudeApiModels),
+          configuredModel: claudeApiSettings.model,
+          availableModels: availableClaudeApiModels,
+        })
       : useOpenAIProvider
       ? resolveProviderModelSelection({
           requestedModel: providerRequestedModel(availableOpenAIModels),
@@ -6414,11 +6568,15 @@ export function registerSessionsRoutes(app, deps) {
     if (providerModelSelection && !providerModelSelection.ok) {
       const providerLabel = useClaudeCloudProvider
         ? 'Claude Cloud'
+        : useClaudeApiProvider
+        ? CLAUDE_API_PROVIDER_LABEL
         : (useOpenAIProvider
           ? 'OpenAI'
           : (useClaudeProvider ? 'Claude' : (useCursorProvider ? 'Cursor' : (useGrokProvider ? 'Grok' : 'DeepSeek'))));
       const providerCode = useClaudeCloudProvider
         ? 'CLAUDE_CLOUD_MODEL_UNAVAILABLE'
+        : useClaudeApiProvider
+        ? 'CLAUDE_API_MODEL_UNAVAILABLE'
         : (useOpenAIProvider
           ? 'OPENAI_MODEL_UNAVAILABLE'
           : (useClaudeProvider
@@ -6445,7 +6603,7 @@ export function registerSessionsRoutes(app, deps) {
     if (
       remoteRequest.remote
       && !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider
-      && !useDeepSeekProvider
+      && !useDeepSeekProvider && !useClaudeApiProvider
     ) {
       const mergedModels = Array.isArray(modelState?.models) ? modelState.models : [];
       const providersByModel = modelState?.providersByModel && typeof modelState.providersByModel === 'object'
@@ -6574,7 +6732,10 @@ export function registerSessionsRoutes(app, deps) {
         code: 'OPENAI_IMAGE_MODEL_REQUIRED',
       });
     }
-    if (!useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider && !useDeepSeekProvider) {
+    if (
+      !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider
+      && !useDeepSeekProvider && !useClaudeApiProvider
+    ) {
       const selectedProviders = Array.isArray(modelState?.providersByModel?.[String(selectedModel || '').trim().toLowerCase()])
         ? modelState.providersByModel[String(selectedModel || '').trim().toLowerCase()]
         : [];
@@ -6587,13 +6748,26 @@ export function registerSessionsRoutes(app, deps) {
           code: 'OPENAI_PROVIDER_REQUIRED',
         });
       }
-      const claudeOnlySelection = selectedProviders.length > 0
-        && selectedProviders.every((provider) => String(provider || '').trim().toLowerCase() === 'claude');
+      // Claude API serves the Claude provider's ids: a model both list is
+      // still Claude's, and one only Claude API lists names that provider.
+      const selectedProviderIds = selectedProviders.map((provider) => String(provider || '').trim().toLowerCase());
+      const claudeOnlySelection = selectedProviderIds.length > 0
+        && selectedProviderIds.includes('claude')
+        && selectedProviderIds.every((provider) => provider === 'claude' || provider === CLAUDE_API_PROVIDER_TYPE);
       if (claudeOnlySelection) {
         return res.status(400).json({
           ok: false,
           error: `Model "${selectedModel}" requires the Claude provider`,
           code: 'CLAUDE_PROVIDER_REQUIRED',
+        });
+      }
+      const claudeApiOnlySelection = selectedProviderIds.length > 0
+        && selectedProviderIds.every((provider) => provider === CLAUDE_API_PROVIDER_TYPE);
+      if (claudeApiOnlySelection) {
+        return res.status(400).json({
+          ok: false,
+          error: `Model "${selectedModel}" requires the Claude API provider`,
+          code: 'CLAUDE_API_PROVIDER_REQUIRED',
         });
       }
       const cursorOnlySelection = selectedProviders.length > 0
@@ -6627,6 +6801,8 @@ export function registerSessionsRoutes(app, deps) {
 
     const bootstrapProviderType = useClaudeCloudProvider
       ? 'claude-cloud'
+      : useClaudeApiProvider
+      ? CLAUDE_API_PROVIDER_TYPE
       : (useOpenAIProvider
         ? 'openai'
         : (useClaudeProvider
@@ -6657,6 +6833,7 @@ export function registerSessionsRoutes(app, deps) {
         model: selectedModel,
         cursorSettings,
         claudeSettings,
+        claudeApiSettings,
         grokSettings,
         reasoningByModel: modelState?.reasoningByModel || null,
       }),
@@ -6701,7 +6878,10 @@ export function registerSessionsRoutes(app, deps) {
           {
             assignConfiguredProvider: true,
             providerType: bootstrapProviderType,
-            providerModel: (useClaudeCloudProvider || useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider || useDeepSeekProvider) ? selectedModel : null,
+            providerModel: (
+              useClaudeCloudProvider || useOpenAIProvider || useClaudeProvider || useCursorProvider || useGrokProvider
+              || useDeepSeekProvider || useClaudeApiProvider
+            ) ? selectedModel : null,
           },
         );
         // What the cloud session will clone, stored with the conversation so
@@ -7680,6 +7860,11 @@ export function registerSessionsRoutes(app, deps) {
   // workers of the provider keep the old key and fail each turn after the
   // rotation. Stops them; the primer or the next delivery respawns them with
   // the fresh key from settings.
+  //
+  // The workers are picked by what they run: a worker that states its kind
+  // is taken at its word (a Claude chat switched to the API key may still
+  // have its subscription worker finishing a turn, and one switched back
+  // its API worker); one that does not is taken at its chat's provider.
   async function stopLiveProviderWorkersForKeyRotation(providerType) {
     const rows = db.prepare(`
       SELECT DISTINCT NULLIF(sdk_session_id, '') AS sdk_session_id
@@ -7687,8 +7872,16 @@ export function registerSessionsRoutes(app, deps) {
       WHERE LOWER(COALESCE(provider_type, '')) = ?
         AND NULLIF(sdk_session_id, '') IS NOT NULL
     `).all(providerType);
+    const sids = new Set();
+    for (const worker of sessionWorkerRegistry?.listWorkers?.() || []) {
+      if (worker?.kind === providerType && worker.sdkSessionId) sids.add(worker.sdkSessionId);
+    }
     for (const row of rows) {
       const sid = String(row.sdk_session_id || '').trim();
+      const kind = sid ? (sessionWorkerRegistry?.getWorker?.(sid)?.kind || null) : null;
+      if (sid && (!kind || kind === providerType)) sids.add(sid);
+    }
+    for (const sid of sids) {
       if (!sid) continue;
       const workerState = sessionWorkerSupervisor?.getWorkerState?.(sid) || null;
       if (!workerState) continue;
@@ -7886,6 +8079,74 @@ export function registerSessionsRoutes(app, deps) {
       warning: failedConversations.length
         ? `${failedConversations.length} unstarted conversation(s) could not switch provider.`
         : (discovery?.ok ? null : (discovery?.error || 'DeepSeek model discovery failed')),
+    });
+  });
+
+  // --- Claude API ----------------------------------------------------------
+  // The key is written here and never read back: GET and every answer carry
+  // `configured` only. A pasted Claude login token or Admin key is refused by
+  // its prefix. A rotated key reaches a worker only at spawn, so the live
+  // Claude API workers are stopped; the next message starts them again.
+  app.get('/api/settings/claude-api', auth, (_req, res) => {
+    if (!claudeApiSettingsService) return res.status(501).json({ error: 'Claude API settings are unavailable' });
+    return res.json(claudeApiSettingsService.describe());
+  });
+
+  app.post('/api/settings/claude-api', auth, async (req, res) => {
+    if (!claudeApiSettingsService) return res.status(501).json({ error: 'Claude API settings are unavailable' });
+    const parsed = parseClaudeApiSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error, code: parsed.code || null });
+    const result = claudeApiSettingsService.update(parsed);
+    if (!result?.ok) {
+      return res.status(result?.code === 'claude-api-key-removal-blocked' ? 409 : 400).json({
+        error: result?.error || 'Failed to update Claude API settings',
+        code: result?.code || null,
+        activeConversationCount: Number(result?.activeConversationCount || 0),
+        startedConversationCount: Number(result?.startedConversationCount || 0),
+        activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
+      });
+    }
+    if (result.keyChanged) await stopLiveProviderWorkersForKeyRotation(CLAUDE_API_PROVIDER_TYPE);
+    const discovery = result.discover
+      ? await claudeApiSettingsService.refreshModels()
+      : { ok: true, models: [], error: null };
+    // Removing the key or switching the provider off moves unstarted Claude
+    // API conversations back to the default provider, as for Claude itself.
+    const reconciliationResult = result.removed === true || result.disabled === true
+      ? await reconcileUnstartedConversationProviders({ enabled: false, model: '', provider: CLAUDE_API_PROVIDER_TYPE })
+      : { updatedUnstartedConversations: 0, skippedStartedConversations: 0, skippedActiveQueueConversations: 0, failedConversations: [] };
+    const failedConversations = Array.isArray(reconciliationResult?.failedConversations) ? reconciliationResult.failedConversations : [];
+    const settingsPayload = {
+      ...claudeApiSettingsService.describe(),
+      reconciliation: {
+        updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
+        skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
+        skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
+        failedConversations,
+      },
+    };
+    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('claude_api_settings_updated', settingsPayload);
+    try { claudeApiStopLedger?.clearAll?.(); } catch {}
+    try { checkClaudeApiCap('settings'); } catch {}
+    // The key is saved whatever discovery said; Anthropic's refusal (a 401,
+    // a key that needs a workspace) is the tab's status until a discovery
+    // succeeds. A list dropped because the key changed meanwhile is no verdict.
+    // A default the fallback list could not keep is named with the refusal.
+    const previousModel = String(result.previousModel || '').trim();
+    const defaultModelChanged = previousModel && settingsPayload.model && previousModel !== settingsPayload.model
+      ? { from: previousModel, to: settingsPayload.model }
+      : null;
+    const discoveryError = result.discover && discovery?.ok === false && discovery?.stale !== true
+      ? { error: discovery.error || 'Claude API model discovery failed', code: discovery.code || null, defaultModelChanged }
+      : null;
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      discoveryError,
+      warning: failedConversations.length
+        ? `${failedConversations.length} unstarted conversation(s) could not switch provider.`
+        : (discovery?.ok ? null : (discovery?.error || 'Claude API model discovery failed')),
     });
   });
 
@@ -8457,6 +8718,7 @@ export function registerSessionsRoutes(app, deps) {
     const cursorSettings = getCursorProviderSettings();
     const grokSettings = getGrokProviderSettings();
     const deepseekSettings = getDeepSeekProviderSettings();
+    const claudeApiSettings = getClaudeApiProviderSettings();
     return {
       ...buildModelVariantCatalogPayload({
         rows,
@@ -8493,6 +8755,16 @@ export function registerSessionsRoutes(app, deps) {
             enabledModels: Array.isArray(deepseekSettings.models) ? deepseekSettings.models : [],
           }
         : null,
+      // The Select Models → Claude API tab: its own list, "[1m]" ids included
+      // (the tab shows them as on the Claude tab).
+      claudeApiModels: claudeApiSettings?.enabled === true
+        ? {
+            defaultModel: claudeApiSettings.model,
+            availableModels: Array.isArray(claudeApiSettings.availableModels) ? claudeApiSettings.availableModels : [],
+            enabledModels: Array.isArray(claudeApiSettings.models) ? claudeApiSettings.models : [],
+            discovered: claudeApiSettings.discovered === true,
+          }
+        : null,
     };
   }
 
@@ -8512,6 +8784,7 @@ export function registerSessionsRoutes(app, deps) {
       const cursorSettings = getCursorProviderSettings();
       const grokSettings = getGrokProviderSettings();
       const deepseekSettings = getDeepSeekProviderSettings();
+      const claudeApiSettings = getClaudeApiProviderSettings();
       const refreshTasks = [
         refreshModelVariantCatalogFromCli(),
         openAISettings?.enabled === true
@@ -8535,8 +8808,13 @@ export function registerSessionsRoutes(app, deps) {
         deepseekSettings?.enabled === true && deepseekSettingsService
           ? deepseekSettingsService.refreshModels()
           : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
+        claudeApiSettings?.enabled === true && claudeApiSettingsService
+          ? claudeApiSettingsService.refreshModels()
+          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
       ];
-      const [cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh, deepseekRefresh] = await Promise.allSettled(refreshTasks);
+      const [
+        cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh, deepseekRefresh, claudeApiRefresh,
+      ] = await Promise.allSettled(refreshTasks);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
       const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
         ? openAIRefresh.value
@@ -8573,6 +8851,13 @@ export function registerSessionsRoutes(app, deps) {
             models: Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : [],
             error: deepseekRefresh.reason?.message || 'DeepSeek model discovery failed',
           };
+      const claudeApiModelDiscovery = claudeApiRefresh.status === 'fulfilled'
+        ? claudeApiRefresh.value
+        : {
+            ok: false,
+            models: Array.isArray(claudeApiSettings?.models) ? claudeApiSettings.models : [],
+            error: claudeApiRefresh.reason?.message || 'Claude API model discovery failed',
+          };
       const copilotModelDiscovery = copilotDiscoveryRefresh.status === 'fulfilled'
         ? copilotDiscoveryRefresh.value
         : { ok: false, models: [], error: copilotDiscoveryRefresh.reason?.message || 'Copilot model discovery failed' };
@@ -8587,6 +8872,7 @@ export function registerSessionsRoutes(app, deps) {
         cursorModelDiscovery,
         grokModelDiscovery,
         deepseekModelDiscovery,
+        claudeApiModelDiscovery,
         copilotModelDiscovery,
       });
     } catch (error) {
@@ -8634,6 +8920,7 @@ export function registerSessionsRoutes(app, deps) {
       // stay in models[] (a selection must not vanish) but pickers grey them.
       unavailableModels: Array.isArray(modelState.unavailableModels) ? modelState.unavailableModels : [],
       claudeContextTiersByModel: modelState.claudeContextTiersByModel || {},
+      claudeApiContextTiersByModel: modelState.claudeApiContextTiersByModel || {},
       providersByModel: modelState.providersByModel || {},
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
@@ -8684,7 +8971,8 @@ export function registerSessionsRoutes(app, deps) {
     cursorBilling: null,
     deepseekBalance: null,
   };
-  const USAGE_PROVIDER_IDS = ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek'];
+  // `claude-api`'s card is read from the relay's own books on every answer.
+  const USAGE_PROVIDER_IDS = ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek', 'claude-api'];
 
   function parseUsageProviders(raw) {
     const text = Array.isArray(raw) ? raw.join(',') : String(raw ?? '');
@@ -8803,6 +9091,14 @@ export function registerSessionsRoutes(app, deps) {
       }
     }
 
+    // Built from the database on every answer, so it is always live.
+    let claudeApiCard = null;
+    try {
+      claudeApiCard = claudeApiPlanUsage?.buildCard?.() || null;
+    } catch {
+      claudeApiCard = null;
+    }
+
     const report = planUsageService.buildReport({
       copilotSummary: copilot.summary,
       copilotError: copilot.error,
@@ -8829,6 +9125,7 @@ export function registerSessionsRoutes(app, deps) {
         ? { amount: deepseekSettings.startingBalance, setAt: deepseekSettings.startingBalanceSetAt }
         : null,
       deepseekActuals: deepseekEnabled ? readDeepSeekActuals() : null,
+      claudeApiCard,
     });
 
     // Legacy top-level fields stay alongside `providers` so an older cached
@@ -8844,6 +9141,7 @@ export function registerSessionsRoutes(app, deps) {
         cursor: cursorEntry.at,
         grok: grokEntry.at,
         deepseek: deepseekEntry.value?.fetchedAt || deepseekEntry.at,
+        'claude-api': nowIso(),
       },
     });
   });

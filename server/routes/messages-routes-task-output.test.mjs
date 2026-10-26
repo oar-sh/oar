@@ -222,11 +222,12 @@ test('no file yet reads as no output; a session that named no file says so', asy
   assert.match(none.body.message, /did not report an output file .* need a restart/);
 });
 
-test('a provider without task output says so; Copilot and Claude sessions do not', async (t) => {
+test('a provider without task output says so; Copilot, Claude and Claude API sessions do not', async (t) => {
   for (const [provider, expected] of [
     ['openai', /^Output is not available for this provider\.$/],
     ['github', /did not report an output file/],
     ['claude', /did not report an output file/],
+    ['claude-api', /did not report an output file/],
   ]) {
     const fx = boot(t, { provider });
     fx.store.replace('sess-1', [{ taskId: 'task-n1', taskType: 'local_bash' }]);

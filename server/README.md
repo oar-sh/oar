@@ -636,7 +636,7 @@ a reply that never touched Copilot.
 
 ### Plan usage for agents
 
-`remote_relay`'s `usage {relay}` (permission `read`, like `relay_info`; this relay too, as `this`)
+`relay_tool`'s `usage {relay}` (permission `read`, like `relay_info`; this relay too, as `this`)
 reads `GET /api/usage` and `GET /api/usage-limit` on the target and answers per provider card
 (Copilot, Claude, Claude Cloud, Cursor, Grok): `status` (`not-configured` and `unavailable` say why
 in `message`), `plan`, `source`, `capturedAt`, the meters (`used`, `allowance`, `remaining`,
@@ -780,6 +780,247 @@ handed out while the provider is off):
 best effort and not waited for, so neither action ever depends on Anthropic. Nothing is deleted
 there.
 
+## Claude API provider
+
+Provider type `claude-api`: Claude Code on the relay host, billed to a Claude Console API key saved
+in **Settings → Providers → Claude API** instead of the host's Claude login. The worker,
+`server/claude-api-worker/claude-api-session-worker.mjs`, is the Claude worker (it runs
+`runClaudeSessionWorker` from `claude-session-worker-main.mjs`, as the DeepSeek worker does) with a
+backend of its own (`claude-api-backend.mjs`); its log lines read `[claude-api-worker …]`. A Claude
+API chat is a Claude chat on another bill: the Claude tab's models, efforts, `[1m]` ids, thinking,
+images, sub-agent models, attribution and background command limit (`claudeModels`), and the
+host's Claude Code state folder (`CLAUDE_CONFIG_DIR` is left as the relay set it, `~/.claude` by
+default), so its sessions, transcripts, resume and task output are where a Claude chat's are. A
+Claude chat can move between the subscription and the key ([Billing switch](#billing-switch)). The
+user-facing description is in the [providers guide](../docs/providers.md#claude-api); the tracker is
+[docs/feature-tracker/claude-api.md](../docs/feature-tracker/claude-api.md).
+
+### Settings and the key
+
+`services/claude-api-settings-service.mjs` keeps six `app_settings` rows: `claude_api_key`,
+`claude_api_enabled`, `claude_api_model`, `claude_api_models`, `claude_api_enabled_models` and
+`claude_api_monthly_cap_usd`; the routes are `GET`/`POST /api/settings/claude-api` (see the
+[API reference](#api-reference)). The key field takes any key that starts with `sk-ant-` except the
+prefixes it refuses (OAuth access and refresh tokens, Admin keys, session tokens); the discovery
+that follows is Anthropic's verdict on the key. A refused key stays saved, and the tab shows the
+refusal as its status.
+
+Model discovery is `shared/anthropic-api.mjs`, the only Anthropic endpoint the relay calls with the
+key itself: `GET /v1/models` (`anthropic-version: 2023-06-01`, a 10 s timeout, pages of 1000, at
+most 20 pages). Before the first discovery the Claude tab's list stands in; a failed discovery
+keeps the list stored before it. The key goes to `https://api.anthropic.com` only.
+`OAR_ANTHROPIC_API_BASE_URL` replaces that for tests, and only with a loopback URL (the rule of
+`shared/claude-cloud/base-url.mjs`); any other value is ignored, and there is no base-URL setting.
+The key is taken out of every error text the client produces.
+
+### What the relay hands the worker
+
+`applyClaudeApiProviderEnvironment` (`services/session-worker-launch-service.mjs`) sets
+`COPILOT_WEB_RELAY_WORKER_KIND=claude-api`, `OAR_CLAUDE_API_KEY` (the saved key) and
+`CLAUDE_API_RELAY_MODEL` (the conversation's model; without one the CLI picks its default).
+Without a key it throws `claude-api-key-not-configured`, and the conversation gets the launch note.
+`OAR_CLAUDE_API_KEY` is one of `WORKER_SECRET_ENV_VARS`, restricted to the `claude-api` kind: under
+tmux it reaches the worker only through the owner-only secret env file, and every other kind has it
+taken out of its launch environment (`withoutForeignWorkerSecrets`). The host's own
+`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are on that list with no kind at all, so no worker of
+any kind is started with them. `COPILOT_WEB_RELAY_CLAUDE_API_WORKER_PATH` overrides the worker
+script location; on Windows the console window is titled `Claude API Worker <id>`. The worker
+installs its log redaction with the key (`installWorkerLogRedaction`) before anything else runs.
+
+Per delivery the relay sends what it sends a Claude chat: Claude's attribution and the Claude tab's
+background command limit.
+
+### What the CLI gets
+
+`claudeApiCliEnv` builds the CLI's environment from the worker's, without:
+
+- any `ANTHROPIC_*` variable, the host's `CLAUDE_CODE_OAUTH_TOKEN` and the other ways to hand the
+  CLI a login or a key (`CLAUDE_CODE_OAUTH_*`, `CLAUDE_CODE_CUSTOM_OAUTH_URL`,
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `CLAUDE_CODE_API_KEY_HELPER_TTL_MS`);
+- the provider switches (`CLAUDE_CODE_USE_BEDROCK`, `…_VERTEX`, `…_FOUNDRY`, `…_ANTHROPIC_AWS`,
+  `…_ANTHROPIC_GOOGLE_CLOUD`, `…_GATEWAY`, `…_MANTLE`, `…_CCR_V2`), their `CLAUDE_CODE_SKIP_*_AUTH`
+  bypasses and `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`;
+- a host's model and effort pins (`CLAUDE_CODE_SUBAGENT_MODEL`, `…_SUBAGENT_MODEL_FORCE`,
+  `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`, `CLAUDE_CODE_EFFORT_LEVEL`,
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW`) and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`;
+- the relay's settings for its worker (`COPILOT_WEB_RELAY_*`, `COPILOT_PROVIDER_*`, `DEEPSEEK_*`,
+  `CLAUDE_GATEWAY_*`, `OAR_*`, the other kinds' models, `COPILOT_ALLOW_ALL`, `SESSION_ID`, …) and a
+  host Claude Code session's variables (`shared/host-claude-session-env.mjs`).
+
+It then sets `ANTHROPIC_API_KEY` (the key) and `ANTHROPIC_BASE_URL` (`https://api.anthropic.com`,
+or the loopback test URL).
+
+The user's settings and the chat folder's (`.claude/settings.json`, `settings.local.json`) can still
+set `env` (another base URL, another `ANTHROPIC_API_KEY`, an `ANTHROPIC_AUTH_TOKEN` that beats it, a
+proxy, another provider, custom headers, a CA) and an `apiKeyHelper`. The flag settings layer (the
+SDK's `settings`) outranks them all, and the backend pins it in two steps:
+
+- **On the command line** (`claudeApiFlagSettings`, the spawn's `--settings`, which other users of
+  the host can read): `disableAllHooks: true`, `env.ANTHROPIC_BASE_URL`, an empty
+  `env.ANTHROPIC_AUTH_TOKEN` and an empty `apiKeyHelper`. No key.
+- **Over stdin** (`claudeApiLiveFlagSettings`, the backend's `liveFlagSettings`, applied by
+  `claude-sdk-adapter.mjs` with `applyFlagSettings` while the first user message is held back):
+  the same layer plus `ANTHROPIC_API_KEY` and every
+  variable of `CLAUDE_CLI_PINNED_ENV` (`claude-worker/claude-cli-pinned-env.mjs`, shared with
+  DeepSeek: endpoints, provider switches, credentials, proxies, TLS trust) at the value the CLI was
+  spawned with, else `''`. The message goes out once the CLI has answered. A refusal, or no answer
+  within 60 s, fails the turn before anything is sent (`claude-live-flag-settings`).
+
+No hooks and no status line command run, neither the user's, the folder's nor a plugin's
+(`CLAUDE_CLI_KEY_CHAT_SETTINGS`); hooks in managed settings still do.
+`scripts/claude-api-cli-proof.mjs` and `scripts/claude-cli-hooks-proof.mjs` show both layers against
+the bundled CLI; see [DEVELOPING.md](../DEVELOPING.md#claude-api-workers). The agent's own commands
+inherit the CLI's environment, the key included.
+
+### The key source check
+
+The CLI's `system/init` names where it took its API key from (`apiKeySource`). On a Claude API
+turn anything but `ANTHROPIC_API_KEY` stops the turn as soon as the init is read (`checkInit`,
+`checkClaudeApiInit`), with the code `claude-api-key-source` and a note that names the source,
+never a key. The check limits a wrong credential; it does not prevent it. The CLI sends its first
+request some 50 to 90 ms after the init and does not wait for the verdict, so at most one model
+request may already be out on the other credential (the note says so when the turn had traffic
+before the init). The CLI's nonessential traffic is not a model request.
+
+A subscription turn gets the reverse check (`claude-worker/claude-subscription-key-check.mjs`): a
+Claude worker without a backend stops a turn whose source is `ANTHROPIC_API_KEY`, `apiKeyHelper` or
+`/login managed key` (a settings file's key, a key helper, a Console login), with the code
+`subscription-key-source` and the advice to remove that credential or to switch the chat's billing
+to API key. Any other source lets the turn go on; one the relay does not know is logged.
+
+### Failures
+
+`describeClaudeApiFailure` reads a refused request in the Claude API's terms, first match wins:
+
+| Code | When | Buttons on the note |
+| ---- | ---- | ------------------- |
+| `claude-api-key-source` | The CLI took another credential (above) | Claude API settings |
+| `claude-api-credit` | "credit balance is too low" | Add funds, Claude API settings |
+| `claude-api-spend-limit` | "API usage limits", `enforced_spend_limit_reached` | Console limits |
+| `claude-api-billing` | 402, `billing_error` | Console billing |
+| `claude-api-key` | 401, 403, `authentication_error`, `permission_error`, "invalid x-api-key" | Claude API settings |
+| `claude-api-rate-limit` | 429, 529, `rate_limit_error`, `overloaded_error` | Console limits |
+
+The relay adds two of its own, for a turn it refuses before a worker runs it:
+`claude-api-not-configured` (no key, or the provider is off) and `claude-api-cap-reached` (the
+monthly cap). Each gets **Claude API settings** (at the cap field for the cap) and **Switch to
+subscription**; on New Chat the second button is **Start on subscription**, and only when New Chat
+offers the Claude provider. The buttons are mapped
+in `public/app/relay-error-ctas.mjs`; the Console links go to `platform.claude.com/settings/billing`
+and `/settings/limits`. Every failure of a Claude API chat prints as `relay.claude-api-<code>`
+(`failureCodePrefix`), never as Claude's `relay.claude-<code>`, and carries no Claude account or
+sign-in advice. There is no usage-limit pause on the key: the worker reports no Claude plan usage
+and no usage limit (`reportsPlanUsage`, `reportsUsageLimit`), and the pause applies to `claude` and
+`claude-cloud` only.
+
+### Usage and the monthly cap
+
+Both Claude workers, the subscription one and the Claude API one, post after every turn to
+`POST /api/claude-api-usage` (the publisher's `billingUsageRoute`). The report carries the CLI's
+session id, the worker's id of the CLI process (`runId`), the process's own counts per model,
+counted from zero, with Claude Code's cost estimate (`runCounts`), and the CLI's session totals
+(`sessionTotals`). A report is booked under the posting worker's registered kind; a body that says
+otherwise is logged as `BILLING FENCE FAILURE`. `services/claude-api-usage-service.mjs`
+(`recordReport`) keeps a checkpoint per conversation, session, run and model
+(`claude_api_usage_checkpoints`) and books a run's rise over its checkpoint; a report at or below it
+books nothing. Only `claude-api` reports book spend; a subscription report only moves the
+checkpoints, so the session's mark (its checkpoint with the latest turn) stays current across a
+switch. A resumed run's first result re-reports the earlier turns. It is booked as its session
+totals over the mark when the mark covers the session's last finished turn, else from the run's own
+counts without a price (`stale-mark`, `no-mark`, logged). Bookings go per relay-local day and model
+into `claude_api_usage_totals`. Checkpoints older than 60 days are pruned hourly, keeping each
+session's newest run.
+
+`GET /api/usage` adds a Claude API card while a key is saved or the provider is on
+(`services/plan-usage-claude-api.mjs`): today and this month in relay-local days, spend and tokens
+per model, and the cap. Tokens Claude Code could not price are not $0: the card marks the estimate
+incomplete, and the cap counts only priced spend. The cap is reached when this month's estimate is
+at or above `claude_api_monthly_cap_usd`; while a cap is set, a spend that cannot be read counts as
+reached. While it is reached, these are refused with `CLAUDE_API_CAP_REACHED`: the claim of a row on
+the key, a switch to the key, an agent's send to a chat on the key, and a new Claude API chat. Turns
+Claude Code starts by itself after a background task reports are stopped, and so are live
+background tasks, each with a note; no worker is launched for a row that cannot run. A running turn
+finishes.
+
+### Billing switch
+
+`POST /api/conversation/:id/billing` moves a Claude chat between `claude` (the subscription) and
+`claude-api` (the key): `{ to: "claude" | "claude-api", by?: "user" | "agent" | "usage-limit",
+message? }` (`provider` is taken for `to`; `by` defaults to `user`). The composer's toggle, the
+usage-limit note's button (`by: "usage-limit"`, to the key only, else `400 CLAUDE_BILLING_INVALID`)
+and an agent's `send` with a provider use it. `checkSwitch`
+(`services/claude-billing-switch-service.mjs`) runs first, and a refusal answers with its status and
+`code`:
+
+- `400 CLAUDE_BILLING_INVALID`, `404 CONVERSATION_NOT_FOUND`;
+- `409 CLAUDE_BILLING_NOT_CLAUDE` (not a Claude chat), `409 CLAUDE_API_NOT_CONFIGURED` (no key, or
+  the provider is off), `409 CLAUDE_NOT_CONFIGURED`, `409 CLAUDE_API_CAP_REACHED`;
+- `409 CLAUDE_BILLING_MODEL_UNAVAILABLE` with `model`, when the target's list lacks the chat's
+  model (a `[1m]` model needs its `[1m]` id listed; a plain id is also found by its base);
+- `409 CLAUDE_BILLING_HISTORY` is kept for a direction whose rule is "blocked"; both directions are
+  allowed.
+
+With `message` (the body `/api/message` takes) the route runs the send with the switch, so the
+switch and the enqueue are one transaction: a refused send leaves the billing as it was, and a
+refused switch sends nothing. Without one it answers `{ ok, conversationId, changed, provider,
+released, billing }`; `501 CLAUDE_BILLING_UNAVAILABLE` without the service. The switch sets
+`runtime_sessions.provider_type`, `billing_switched_at` and `billing_switched_by`, re-stamps the
+chat's pending and parked rows, and writes one transcript note (kind `billing-switch`, rewritten on
+a switch back; the note to the key says the first turn there has no prompt cache). A switch to the
+key also releases a usage-limit pause. It emits `conversation_billing` and applies from the next
+turn; a running one finishes on its billing. `GET /api/conversation/:id` carries the same
+`billing`: `{ provider, pending, switchedAt, switchedBy, switchable: { to, allowed, code, reason } }`.
+
+Every queue row names the billing it runs on (`queue.provider`), and the delivery refuses a row to a
+worker of the other kind. `services/claude-billing-swap-service.mjs` then replaces the worker
+between turns. It waits while the session has a `processing` row or the worker holds a turn, a
+question, a compaction or background tasks. It then stops the worker and every process of the
+session and launches the new kind, never reusing a live one. A stop that fails is retried with a
+backoff (5 s up to 60 s), and after three failures the chat gets a note; a check for a running turn
+that fails counts as a running turn. While it waits,
+`billing.pending` is `{ to, waitingFor: "turn" | "question" | "compaction" | "background" | "stop" |
+null, backgroundTaskCount, swapping }`; it ages out after 15 s (`CLAUDE_BILLING_SWAP_WAIT_TTL_MS`).
+The first delivery to the new worker carries a note of the swap. A subscription turn stopped at the
+Claude usage limit carries on on the key at once when the chat was moved to it meanwhile.
+
+`POST /api/message` keeps the two apart:
+
+- a send to a Claude chat that names the other billing (`provider` or `providerType`) is `409
+  CLAUDE_BILLING_SWITCH_REQUIRED` (`{ code, conversationId, billing }`): it must go through the
+  billing route;
+- a send whose `billing` differs from the chat's (a stale tab) is `409 CLAUDE_BILLING_CHANGED` with
+  `keptInDraft: true`: the text goes into the conversation's draft (`conversation_draft_updated`).
+  A send without `billing` is not checked;
+- an agent's send to a chat on the key while the cap is reached is `409 CLAUDE_API_CAP_REACHED`, and
+  nothing is queued; a page's send is queued and refused at the claim, with a note;
+- the answer carries `billingSwitched: true` when a switch came with the send.
+
+A new chat with `providerType: 'claude-api'` (`POST /api/conversation/bootstrap`: New Chat and an
+agent's `create_session`) is `400 CLAUDE_API_NOT_CONFIGURED` without a key and `409
+CLAUDE_API_CAP_REACHED` at the cap. `relay_tool`'s `send` takes `provider` (`claude` or
+`claude-api`) for a Claude session: the other billing goes to the billing route with the message
+(`services/remote-relay-dispatcher.mjs`), and the approval card says "Switches billing to API key"
+or "Switches billing to subscription". A relay from before the switch answers
+`REMOTE_RELAY_UNSUPPORTED`; `CLAUDE_BILLING_MODEL_UNAVAILABLE` maps to
+`REMOTE_RELAY_UNKNOWN_MODEL`, and `CLAUDE_API_NOT_CONFIGURED`, `CLAUDE_NOT_CONFIGURED` and
+`CLAUDE_API_CAP_REACHED` to `REMOTE_RELAY_PROVIDER_UNAVAILABLE`.
+
+### Redaction of the saved key
+
+`services/worker-secret-redaction.mjs` is a middleware after the JSON parser. On every worker post
+(a request with `X-Relay-Session-Id`) it replaces each saved key (DeepSeek and Claude API,
+`SAVED_PROVIDER_KEY_SETTINGS`) with `[redacted]`, in values and property names. It also catches a
+key's first part at the end of a cut text or before an ellipsis, and its last part at the start of
+a text. It knows every key saved since the relay started, from the moment the settings route stores
+it (`noteSavedSetting`). Keys shorter than 8 characters are left alone, and the settings routes are
+never rewritten. Task output read from files goes through `cleanTaskOutput` instead.
+
+### Checking a running relay
+
+`scripts/claude-api-live-check.mjs` runs a tool turn, a follow-up and the refusal of an OAuth token
+on a running relay, on the key saved there, with the cap and a refused key as options. It costs real
+money; see [DEVELOPING.md](../DEVELOPING.md#claude-api-workers).
+
 ## Cursor Agent SDK provider
 
 Cursor conversations run through `server/cursor-worker/cursor-session-worker.mjs`, a per-conversation
@@ -870,7 +1111,7 @@ client's optimistic state. Relay shutdown also waits 300 ms before disconnecting
 ## Relay event subscriptions
 
 A session (the **watcher**) can ask to be told what happens in other sessions of this relay or of a
-paired relay, through `remote_relay`. The relay tells it by writing a short event message into the
+paired relay, through `relay_tool`. The relay tells it by writing a short event message into the
 watcher's conversation; nothing reads transcripts on disk, and it works for every provider.
 
 **Actions** (`relay` may be left out and means `this`; on this relay the agent-sessions setting must
@@ -1006,7 +1247,7 @@ free text, and agents do not know their conversation id), while the tool knows t
 The watching relay (**A**, it holds the watcher) and the watched one (**B**) each keep a row of the
 subscription. Only A calls, over its pairing: a pairing in one direction is enough.
 
-- **Gate.** The four actions with `relay: <paired relay>` pass the same checks as any `remote_relay`
+- **Gate.** The four actions with `relay: <paired relay>` pass the same checks as any `relay_tool`
   call there: the relay unlocked in the watcher's conversation (the user named it, or its agent wrote
   there), A's permission for it at least `read`, and B's inbound switch on (B refuses with
   `REMOTE_INBOUND_DISABLED`). `subscribe` first asks B with a dry run (sessions, limits, switch,
@@ -1078,7 +1319,7 @@ turn processing, or queued and not held by a usage-limit pause; `background_only
 `idle`), `sessionTasks` (running tasks, then up to five that ended within the hour: `kind`
 `subagent` | `shell`, `description`, `startedAt`, `lastActivityAt`, `status` `running` |
 `completed` | `failed` | `stopped`, `exitCode`, `summary`, `endedAt`) and `lastActivityAt`.
-`remote_relay`'s `list_sessions` and `read_session` pass them on as `state`, `tasks` and
+`relay_tool`'s `list_sessions` and `read_session` pass them on as `state`, `tasks` and
 `lastActivityAt`; `active` stays and is true for background work too. `read_session` adds to each
 task its `taskId`, `output` (whether it has output to read), a shell task's `command` (its command
 line where the worker reports one, scrubbed of credentials and cut at 2,000 characters by the relay
@@ -1120,7 +1361,7 @@ parent) opens it.
 
 ## Relay schedules
 
-An agent's own timers (a cron job inside its CLI) die with the relay. `remote_relay`'s `schedule`
+An agent's own timers (a cron job inside its CLI) die with the relay. `relay_tool`'s `schedule`
 (`services/relay-schedule-service.mjs`, table `relay_schedules` from migration 0022) keeps a prompt
 in the relay's database and queues it into a session at a set time: `at` (an ISO time with a zone),
 `every_minutes` (5 to 10080; with `at`, `at` is the first time), `once` (default true for `at`
@@ -1167,7 +1408,7 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
 
 ## Questions that don't block
 
-`remote_relay`'s `ask` (`services/relay-ask-service.mjs`, table `relay_asks` from migration 0023,
+`relay_tool`'s `ask` (`services/relay-ask-service.mjs`, table `relay_asks` from migration 0023,
 `shared/relay-asks.mjs`) puts a question for the owner into a session and returns at once with
 `question_id` and `status: "pending"`. It is not a `relay_questions` row: those belong to a turn
 (`queue_id`) that waits on them, and the queue, the stall check and the expiry treat them so.
@@ -1449,8 +1690,10 @@ per launch the conversation's working directory as `COPILOT_WORKSPACE_ROOT` and 
 (`withoutForeignWorkerSecrets`). The detached and Windows launches pass all of that. Under tmux
 the worker's login shell gets only the variables `buildTmuxWorkerShellCommand` exports, and the
 secrets (`COPILOT_PROVIDER_API_KEY`, `CURSOR_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` for cloud and
-Claude workers, `DEEPSEEK_API_KEY` for DeepSeek workers) through an owner-only file it reads and deletes, never in the environment tmux is
-started with; any other variable, such as
+Claude workers, `DEEPSEEK_API_KEY` for DeepSeek workers, `OAR_CLAUDE_API_KEY` for Claude API
+workers) through an owner-only file it reads and deletes, never in the environment tmux is
+started with. The host's `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are secrets of no kind: no
+worker is started with them. Any other variable, such as
 `OAR_TURN_STALL_*_MS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `XAI_API_KEY`, only from the tmux
 server's environment or the login profile (see [Session workers under
 tmux](../docs/configuration.md#environment-variables)). `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN` makes
@@ -1585,7 +1828,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/message` | Send a message from the browser |
+| POST | `/api/message` | Send a message from the browser. A Claude chat's send that names the other billing is `409 CLAUDE_BILLING_SWITCH_REQUIRED`, one whose `billing` is stale `409 CLAUDE_BILLING_CHANGED` (kept in the draft); see [Billing switch](#billing-switch) |
 | POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
 | PATCH | `/api/conversation/:id/draft` | Save composer draft text and optional `draftAttachments` |
@@ -1613,8 +1856,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/conversation/:id` | Get conversation message windows (`before*`, `after*`, or `aroundMessageId`) plus session-root metadata |
 | GET | `/api/search/messages` | Search message text across all conversations (`q`, `limit`, `offset`) |
 | PATCH | `/api/conversation/:id` | Update a conversation title |
+| POST | `/api/conversation/:id/billing` | Move a Claude chat between the subscription and the saved API key: `{ to: "claude" \| "claude-api", by?: "user" \| "agent" \| "usage-limit", message? }` → `{ ok, conversationId, changed, provider, released, billing }`; with `message` (an `/api/message` body) the switch and the send are one transaction and the answer is the send's. Refusals are `400`/`404`/`409` with a `code` (`CLAUDE_BILLING_*`, `CLAUDE_API_NOT_CONFIGURED`, `CLAUDE_NOT_CONFIGURED`, `CLAUDE_API_CAP_REACHED`); emits `conversation_billing`. See [Billing switch](#billing-switch) |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
-| DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. A Claude Cloud conversation's cloud session is archived at Anthropic in the background (never waited for). A Copilot session the relay only imported and never ran is hidden and tombstoned instead: nothing is stopped and its CLI session is kept. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
+| DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. A Claude API conversation's Claude Code session is deleted as a Claude one's (it is in the same place). A Claude Cloud conversation's cloud session is archived at Anthropic in the background (never waited for). A Copilot session the relay only imported and never ran is hidden and tombstoned instead: nothing is stopped and its CLI session is kept. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
 | GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
 | POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
 | POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |
@@ -1642,9 +1886,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
-| GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored, and so are Cursor, Grok and Claude Cloud sessions. All return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
+| GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored, and so are Cursor, Grok, Claude Cloud and Claude API sessions; a Claude API session also gets the Claude session's running auto-compact window and the folder's commit attribution. All return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars', unit, series[], items[{ key, label, values }], note, summary }`) are `deepseek-daily-spend` (30 UTC days stacked by model) and `deepseek-spend-shares` (per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); `?providers=deepseek` reads it live. Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars', unit, series[], items[{ key, label, values }], note, summary }`) are `deepseek-daily-spend` (30 UTC days stacked by model) and `deepseek-spend-shares` (per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); `?providers=deepseek` reads it live. While a Claude API key is saved or the provider is on, a Claude API card is added: today's and this month's estimated spend and tokens per model in relay-local days, and the monthly cap (see [Usage and the monthly cap](#usage-and-the-monthly-cap)). Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`, `attributionMode`, `backgroundCommandLimitMinutes` with the slider bounds `backgroundCommandLimitMinMinutes`, `backgroundCommandLimitMaxMinutes`, `backgroundCommandLimitStepMinutes`, `backgroundCommandLimitDefaultMinutes`) |
@@ -1655,17 +1899,20 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/deepseek` | Read DeepSeek settings: `{ configured, enabled, model, models, availableModels, discovered, baseUrl, defaultBaseUrl, attribution, monthlyBudget, monthlyBudgetCurrency, efforts, providerType }`. `monthlyBudgetCurrency` is `USD` or `CNY`, or `null` for a budget saved before the currency was stored (read in the balance's currency). `models` is the enabled subset (the default model always in it), `availableModels` what `GET {baseUrl}/models` listed (or the built-in `deepseek-flash`, `deepseek-v4-pro`). The key is never in it: `configured` says whether one is stored |
 | POST | `/api/settings/deepseek` | `{ apiKey?, enabled?, model?, enabledModels?, baseUrl?, attribution?, monthlyBudget?, monthlyBudgetCurrency?, remove? }` → `{ ok: true, …the GET body, reconciliation, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live DeepSeek workers. `baseUrl` must be `https:` (`http:` only on a loopback host), without credentials, query or fragment; `attribution` is `oar` or `off`; `monthlyBudget` is an amount of zero or more (rounded to cents; `null`, empty or zero clears it and its currency, which removes the usage card's budget bar); `monthlyBudgetCurrency` is `USD` or `CNY` (`null` or empty: the balance's currency), stored with the budget and shown on the bar; else `400`. Removing the key is `409` (`deepseek-key-removal-blocked`) while a DeepSeek conversation has a message or a queued one, and moves unstarted DeepSeek conversations back to Copilot. Emits `deepseek_settings_updated` and `models_updated` |
+| GET | `/api/settings/claude-api` | Read Claude API settings (Claude chats on a Claude Console API key): `{ configured, enabled, model, models, availableModels, enabledModels, discovered, effortsByModel, contextWindowsByModel, modelDetails, monthlyCapUsd, providerType, label }`. `availableModels` is what `GET https://api.anthropic.com/v1/models` listed for the key (with a `[1m]` id beside a model with a 1M window or one the Claude tab lists so), or the Claude tab's list before the first discovery; `models` is the enabled subset (the default model always in it). The default model is the Claude tab's when offered, else the first Sonnet. The efforts are the Claude provider's, narrowed by what Anthropic reports per model. The key is never in it: `configured` says whether one is stored |
+| POST | `/api/settings/claude-api` | `{ apiKey?, enabled?, model?, enabledModels?, monthlyCapUsd?, remove? }` → `{ ok: true, …the GET body, reconciliation, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live Claude API workers. Claude OAuth access and refresh tokens (`sk-ant-oat`, `sk-ant-ort`), Admin keys (`sk-ant-admin`), claude.ai and Claude Code session tokens (`sk-ant-sid`, `sk-ant-si-`, `sk-ant-cc-`, `sk-ant-ccsr-`) and any key that does not start with `sk-ant-` (another vendor's; `claude-api-key-not-console-key`) are refused by prefix (`400`, `claude-api-key-<kind>`), never quoted back. Any other `sk-ant-` key is saved, and the discovery that follows is Anthropic's verdict on it: a key Anthropic refuses stays saved, and the answer carries the refusal in `warning` and in `discoveryError` (`{ error, code }`, null when discovery did not run or went through), which the tab shows as its status. A model list asked for with a key that was changed or removed before the answer came is dropped, and `warning` says so. `monthlyCapUsd` is empty/null for no cap, else a positive amount with at most two decimals up to 1,000,000. Removing the key is `409` (`claude-api-key-removal-blocked`) while a Claude API conversation has a message or a queued one; removing it or switching the provider off moves unstarted Claude API conversations back to Copilot. Emits `claude_api_settings_updated` and `models_updated` |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | GET | `/api/settings/relay-restart-max-wait` | How long a queued relay restart waits before it asks: `{ maxWaitMinutes, choices: [5, 10, 15, 30, 60, 120, 240, 0], defaultMinutes: 30, overrideMs }`; `0` = no limit; `overrideMs` is `OAR_RELAY_RESTART_MAX_WAIT_MS` when set |
 | POST | `/api/settings/relay-restart-max-wait` | `{ maxWaitMinutes }` → the GET body; anything but one of `choices` is `400`. A queued request measures its current period against the new value at once |
 | GET | `/api/settings/subagent-record-retention` | How long sub-agent records keep tool inputs and output: `{ retentionDays, choices: [0, 7, 14, 30, 90], defaultDays: 90 }`; `0` = keep for good |
 | POST | `/api/settings/subagent-record-retention` | `{ retentionDays }` → the GET body; anything but one of `choices` is `400`. Runs a retention sweep 5 s later |
-| POST | `/api/claude-native-session` | (Claude and DeepSeek workers) Persist the native Agent SDK session id for resume |
-| POST | `/api/claude-context-usage` | (Claude, Claude Cloud and DeepSeek workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
+| POST | `/api/claude-native-session` | (Claude, DeepSeek and Claude API workers) Persist the native Agent SDK session id for resume |
+| POST | `/api/claude-context-usage` | (Claude, Claude Cloud, DeepSeek and Claude API workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
 | POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot; a Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
 | POST | `/api/claude-cloud-session` | (Claude Cloud worker) Report the cloud session a conversation is bound to: `{ conversationId, cloudSessionId, sessionUrl?, lastSequence, pushedBranch?, costUsd?, model? }` → `{ ok, cloud }`. Sent after the session was created, after every `result` and on a push; emits `claude_cloud_session`. `404` without a runtime session, `409` for a conversation that is not a cloud one |
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
+| POST | `/api/claude-api-usage` | (Claude and Claude API workers) Report, after every turn, what the turn's Claude Code process ran: `{ conversationId, claudeNativeSessionId, runId, at, turnId?, firstResultOfRun?, resumedSessionId?, billing, runCounts: [{ model, hitTokens, missTokens, outputTokens, costUsd, costUnknown? }], sessionTotals: [ … ] }` → `{ ok, billing, basis, models }`. The billing is the posting worker's registered kind (the body's only without one); only `claude-api` reports book spend, a subscription report keeps the session's mark. See [Usage and the monthly cap](#usage-and-the-monthly-cap). `400` on a malformed body, `404` without a runtime session, `409` for a conversation that is not a Claude one, `501` without the usage service |
 | POST | `/api/deepseek-plan-usage` | (DeepSeek worker) Report, after a turn, the CLI's running token totals per model for its Claude Code session: `{ conversationId, sdkSessionId?, claudeNativeSessionId, runId?, at?, totals: [{ model, hitTokens, missTokens, outputTokens }], requests?: [{ model, searchRequests, fetchRequests }] }` (cache hits, cache misses, output; the web searches and fetches). `runId` names the worker's Claude Code process. A Claude model name (`claude-opus-5-5`, from a Claude Code spawned without the alias pins) is booked under the DeepSeek model that served it (`claude-opus*` → `deepseek-v4-pro`, `claude-sonnet*` / `claude-haiku*` → `deepseek-flash`), entries of one model summed. With a run id the totals are that process's own, counted from zero by the worker (the CLI's `modelUsage` is the session's running total, which a resumed CLI continues from its transcript; the worker reports what it grows by per result, and for the first result of a process resumed on its session the turn's own `usage`, so a CLI that died before writing its cost state and restored an older snapshot books nothing of the history again). The relay keeps the totals last reported per (conversation, session, model), with the run id, in `deepseek_usage_checkpoints` and books, under the checkpoint's run id, only the increase, field by field, into `deepseek_usage_totals` with the estimate in USD and CNY at DeepSeek's price for `at` (peak or off-peak; the relay's time when it is missing or more than five minutes ahead). A total below its checkpoint under the checkpoint's run id is a stale report (retried, or delivered after a later one): nothing is booked and the checkpoint keeps its high-water mark. Under another run id the report is a new process, booked in full, from which the checkpoint starts over. Known limits: a late report of an earlier process after a newer one started is booked in full, and the newer run's next report is also booked in full (the checkpoint had moved back to the earlier run, so the relay cannot tell either from a new process); the first result of a process resumed on its session reports the main loop's `usage` under the turn's model, so what sub-agents spent in that one turn is left out. Without a run id (an older worker) the totals are the CLI's session totals: the increase is booked, and a drop is a CLI counting from zero again on the same session, booked in full. A new session starts from zero. With a run id the requests are the process's running counts, booked like the tokens under a run id of their own (`request_run_id`; a repeated post adds nothing, an entry with counts only leaves the token checkpoint's run alone); without one they are the turn's counts, booked as they come. Requests are counted from the first turn and priced at $0.75 / ¥5 per 1,000 from 2026-10-31 16:00 UTC (no peak price); the same sums go into `deepseek_usage_days` per UTC day in the same transaction. A repeated report answers `200` with nothing booked. `400` on a malformed body, `404` without a runtime session, `409` for a conversation not bound to DeepSeek |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run. A new run needs the spawning turn's `messageId`; an update to a known run may omit it (a background agent's end arrives between turns). Optional header fields: `subagentType`, `model`, `modelInherited`, `taskId`, `background`, `timelineOwner`; a post without `status` leaves the run's state alone. Emits `subagent_status` with the whole header |
 | POST | `/api/subagent-timeline` | (Worker) `{ conversationId, subagentRunId, taskId?, entries: [{ key, kind, text, done?, toolName?, toolUseId?, metadata? }], header? }` → `{ ok, stored, truncated }`. Kinds: `thought`, `tool_call`, `tool_result`, `text`, `child`, `note`. Fenced by the run row, not by an open turn; an unknown run whose `header.parentSubagentId` is known is created under the parent's turn, an unknown run whose `taskId` (or `header.taskId`) a run of the conversation carries is written to that run (a resumed agent; when the post sets that finished run `running` again, the relay adds a note where it resumed), anything else is `404 unknown_run`. `header.status: 'running'` clears the run's end time. Sends `subagent_timeline` `{ conversationId, messageId, subagentRunId, entries, truncated }`, volatile, only to the pages watching the run (`subagent_viewer_watch`) |
@@ -1691,8 +1938,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | DELETE | `/api/remote-relays/:id` | Remove a paired relay here (the other side keeps its entry) |
 | POST | `/api/remote-relays/:id/check` | Probe a paired relay now |
 | POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
-| GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `remote_relay` when `count` is above zero or `localEnabled` is `true` |
-| POST | `/api/remote-relays/tool` | (Worker) One `remote_relay` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
+| GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `relay_tool` when `count` is above zero or `localEnabled` is `true` |
+| POST | `/api/remote-relays/tool` | (Worker) One `relay_tool` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
 | GET | `/api/relay-events/subscriptions` | Every active [relay event subscription](#relay-event-subscriptions) (`{ available, subscriptions }`); refused to other relays' agents |
 | DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
 | POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
@@ -1707,9 +1954,9 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/relay-asks/remote/answer` | (Relay to relay) That relay's user answers an ask of this relay from its Inbox: `{ id, answer, choice, via }` (`/dismiss`: `{ id, via }`). Asks only: any other id is not found |
 | GET | `/api/relay-asks/remote/inbox` | (Relay to relay) What a paired relay's Inbox shows of this relay: `{ ok, items, pending }` |
 | POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, taskRunId?, status, summary?, reason?, description?, taskType?, startedAt? }` (Claude worker, from `task_notification`; the last three describe a task that was in its published set) |
-| GET | `/api/remote-relays/inflight` | (Worker) Number of `remote_relay` calls running for `conversationId` |
+| GET | `/api/remote-relays/inflight` | (Worker) Number of `relay_tool` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
-| GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `remote_relay`; `maxWaitSeconds` (default `600`) is the longest wait of one `remote_relay` call, for this relay and paired ones |
+| GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `relay_tool`; `maxWaitSeconds` (default `600`) is the longest wait of one `relay_tool` call, for this relay and paired ones |
 | POST | `/api/settings/agent-sessions` | `{ enabled?, maxWaitSeconds? }` → `{ ok: true, …the GET body }`, and the socket event `agent_sessions_settings_updated` with the GET body. `enabled` must be a boolean and `maxWaitSeconds` a whole number of seconds inside `limits` and on its step; anything else is `400` with `{ ok: false, error }` and nothing is stored |
 
 ### Manual relay shutdown / self-restart
@@ -2383,7 +2630,7 @@ memory meanwhile. An older build ignores the table.
 
 `0020-conversation-may-create-sessions.mjs` adds `conversations.may_create_sessions` (INTEGER, 1 =
 allowed): the owner's "Agents in this conversation may start sessions" for a session an agent
-started, which lifts the remote_relay tool's one-level rule for it. Only the preferences route
+started, which lifts the relay_tool's one-level rule for it. Only the preferences route
 writes it, and only for the owner (a request of an agent or a paired relay is refused). Without the
 column the switch cannot be turned on and the rule holds everywhere; an older build ignores it.
 
@@ -2453,6 +2700,53 @@ counts for a model (a sub-agent's model that searched without a token entry of i
 run id of that model's token totals too, and a later token report of the earlier process was read as
 a new process and booked in full instead of as a stale one. Additive and idempotent, handled like
 0024 (it applies 0027 first on a database that skipped it). An older build ignores the column.
+`0029-deepseek-balance-rises.mjs` adds to `deepseek_balance_reference` the columns `rose_at` (when
+a read last found the balance above the read before it: a top-up or a grant; NULL while no rise was
+seen), `last_read_at` (when `last_total` was read) and `rose_from_at` (when the balance before that
+rise was read): a starting balance set on the DeepSeek tab counts until the balance rises after it
+was set. Additive and idempotent; a failure is logged and retried on the next boot (it applies 0025
+first on a database that skipped it). An older build ignores the columns.
+`0030-deepseek-usage-actuals.mjs` adds `deepseek_usage_actuals` (`day`, `period_start`,
+`period_end`, `model`, `key_fp` (the key masked), `key_name`, `hit_tokens`, `miss_tokens`,
+`output_tokens`, `request_count`, `cost`, `currency`, `imported_at`): one row per export day, model
+and API key, imported from the two CSV files of DeepSeek's usage export
+(`services/deepseek-usage-import.mjs`). The DeepSeek card shows them instead of the relay's estimate
+for the days and models they cover; the relay's own usage tables are not touched. Additive and
+idempotent; a failure is logged and retried on the next boot, and the import runs it too. An older
+build ignores the table.
+`0031-queue-provider.mjs` adds `queue.provider`: the billing a row runs on, `claude` or
+`claude-api` for a Claude chat (see [Billing switch](#billing-switch)). Two triggers keep it without
+every writer knowing it: `queue_provider_after_insert` gives a row inserted without one its chat's
+provider when the chat is a Claude or Claude API one (a writer that names one keeps it), and
+`queue_provider_after_requeue` gives a row going back from `processing` to `pending` or `parked` the
+chat's provider of that moment. The back-fill stamps the unfinished rows of Claude and Claude API
+chats; finished rows and other providers' rows stay NULL, which means the chat's billing. Additive
+and idempotent; a failure is logged and retried on the next boot. An older build ignores the column,
+and the triggers still stamp its rows.
+`0032-runtime-session-billing-switch.mjs` adds to `runtime_sessions` the columns
+`billing_switched_at` (when the chat last moved between the subscription and the key; NULL for a
+chat that never did) and `billing_switched_by` (`user`, `agent` or `usage-limit`). On a switched
+chat a worker that reports no kind cannot be read from `provider_type`, so the relay replaces it
+once, when it is idle. Additive and idempotent, handled like 0031. An older build ignores the
+columns.
+`0033-claude-api-usage-checkpoints.mjs` adds `claude_api_usage_checkpoints` (`conversation_id`,
+`native_session_id`, `run_id`, `model` as the key, then `billing`, `run_hit_tokens`,
+`run_miss_tokens`, `run_output_tokens`, `run_cost_usd`, `session_hit_tokens`,
+`session_miss_tokens`, `session_output_tokens`, `session_cost_usd`, `cost_unknown`, `last_turn_id`,
+`last_turn_at`, `updated_at`) and the index `idx_claude_api_usage_checkpoints_mark` on
+(`native_session_id`, `last_turn_at`): what each Claude Code process of a session last reported, as
+far as it was booked, and the session's mark (the row with the latest `last_turn_at`), which a
+resumed run's first result is measured against. Both Claude workers' reports write it; see
+[Usage and the monthly cap](#usage-and-the-monthly-cap). Additive and idempotent; a failure is
+logged and retried on the next boot, and `services/claude-api-usage-service.mjs` runs it too before
+it prepares its statements. An older build ignores the table.
+`0034-claude-api-usage-totals.mjs` adds `claude_api_usage_totals` (`day`, the relay's local date,
+and `model`, lower case without `[1m]`, as the key, then `hit_tokens`, `miss_tokens`,
+`output_tokens`, `cost_usd` (Claude Code's own estimate, for the turns it could price),
+`unknown_cost_tokens`, `turn_count`, `first_seen_at`, `last_seen_at`, `updated_at`): what turns on
+the saved Claude API key ran, which the Claude API card and the monthly cap read. Subscription
+turns are never booked here. Additive and idempotent, handled like 0033. An older build ignores the
+table.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next
@@ -2503,11 +2797,19 @@ working with the corresponding feature inert rather than crashing at startup.
 | `services/claude-cloud-settings-service.mjs` | Claude Cloud switch, default model and environment |
 | `services/claude-cloud-session-service.mjs` | What the relay keeps per cloud conversation: worker reports, the `cloud` payload field, archiving |
 | `services/claude-account-usage-service.mjs` | Live Claude account usage for Check Usage (only while Claude Cloud is on) |
+| `claude-api-worker/` | Claude API session worker: the Claude worker with a backend that runs Claude Code on the saved Claude API key |
+| `../shared/anthropic-api.mjs` | The Claude API key's model discovery (`GET /v1/models`) |
+| `services/claude-api-settings-service.mjs` | Claude API key, switch, models and monthly cap |
+| `services/claude-api-usage-service.mjs` | Books the Claude workers' usage reports (checkpoints, the mark, daily totals) |
+| `services/plan-usage-claude-api.mjs` | The Claude API card in Check Usage and the monthly cap |
+| `services/claude-billing-switch-service.mjs` | Moves a Claude chat between the subscription and the key |
+| `services/claude-billing-swap-service.mjs` | Replaces a switched chat's worker between turns |
+| `services/worker-secret-redaction.mjs` | Takes the saved provider keys out of every worker post |
 | `services/git-remote-service.mjs` | GitHub remote and branch of a folder, for the New Chat modal |
 | `services/relay-event-service.mjs` | Relay event subscriptions: subscribe / transfer, recording, coalescing, the hourly cap and digest, delivery into the watcher's conversation, stalled / all_idle / heartbeat sweeps |
 | `services/session-activity-tracker.mjs` | What each session is doing: `state`, tasks, task edges and the activity clock |
 | `../shared/relay-events.mjs` | Relay event types, limits and the text of an event message |
-| `services/remote-relay-loopback.mjs` | The `remote_relay` client for this relay itself (agent sessions): hands the dispatcher's requests to the relay's own HTTP handler in-process instead of opening a connection |
+| `services/remote-relay-loopback.mjs` | The `relay_tool` client for this relay itself (agent sessions): hands the dispatcher's requests to the relay's own HTTP handler in-process instead of opening a connection |
 | `services/claude-session-root-service.mjs` | Resolves the browsable session folder for Claude conversations |
 | `services/context-usage-view.mjs` | Normalizes Copilot and Claude context data into one payload |
 | `services/cloudflared-tunnel-service.mjs` | Supervises the `cloudflared` child process for the Cloudflare Tunnel mode |

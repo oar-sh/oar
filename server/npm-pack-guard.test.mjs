@@ -40,7 +40,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // its page module) took it to 535. 540 until 2026-10-24; the DeepSeek
 // provider (settings service, API client, model table, its worker entry and
 // Claude-runner backend, and the Claude worker's shared main) took it to 541.
-const MAX_ENTRIES = 560;
+// 560 until 2026-10-25; the Claude API provider (its settings service, the
+// Anthropic API client, its worker entry and Claude-runner backend, and the
+// CLI pins it shares with DeepSeek) took it to 564, and the rest of the
+// Claude API work (the billing switch and its swap, the subscription key
+// check, the usage service and spend card, four migrations) to 573. 590
+// leaves room for the fixes that follow.
+const MAX_ENTRIES = 590;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -53,6 +59,8 @@ const MAX_ENTRIES = 560;
 // install-time copy, the lock checks and the 0.9.14 changelog took it just
 // over 7.75 MiB (8,126,967 bytes). 8 MiB until 2026-10-24; the DeepSeek
 // provider's settings, discovery and catalogue took it to 8,401,377 bytes.
+// The Claude API provider took it to 8,819,122 bytes, the rest of the Claude
+// API work to 8,971,493 (8.56 MiB): about 0.44 MiB left under 9 MiB.
 const MAX_UNPACKED_BYTES = 9 * 1024 * 1024;
 
 const FORBIDDEN = [

@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 
 import {
   RELAY_ASK_LIMITS,
+  REMOTE_RELAY_APPROVAL_SOURCE,
   isRelayAskId,
   normalizeRelayAskAnswer,
   normalizeRelayAskInput,
   relayQuestionKind,
 } from './relay-asks.mjs';
+import * as contract from './remote-relay-contract.mjs';
 
 test('an ask takes a question, up to eight options, a recommendation, a detail and an urgency', () => {
   const checked = normalizeRelayAskInput({
@@ -58,6 +60,10 @@ test('ask ids and the kinds of question cards', () => {
   assert.equal(isRelayAskId('ask_../x'), false);
   assert.equal(relayQuestionKind({ kind: 'ask' }), 'ask');
   assert.equal(relayQuestionKind({ context: { source: 'remote_relay' } }), 'approval');
+  // One value: the contract re-exports this module's, which kept the old name.
+  assert.equal(contract.REMOTE_RELAY_APPROVAL_SOURCE, REMOTE_RELAY_APPROVAL_SOURCE);
+  assert.equal(relayQuestionKind({ context: { source: REMOTE_RELAY_APPROVAL_SOURCE } }), 'approval');
+  assert.equal(relayQuestionKind({ context: { source: 'relay_tool' } }), 'ask_user');
   assert.equal(relayQuestionKind({ context: null }), 'ask_user');
   assert.equal(relayQuestionKind(null), 'ask_user');
 });

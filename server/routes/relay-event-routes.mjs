@@ -2,7 +2,7 @@
 
 // Relay event subscriptions, for the browser: the active subscriptions (the
 // "watching" chip and the "watched" badges) and Unsubscribe. Agents use the
-// remote_relay tool instead; a request from another relay's agent is
+// relay_tool instead; a request from another relay's agent is
 // refused here, so only this relay's user ends a subscription from outside
 // its conversation.
 //
@@ -69,7 +69,7 @@ export function registerRelayEventRoutes(app, deps) {
     if (!request) return null;
     if (!request.remote || request.local) {
       res.status(403).json({
-        error: 'Only another relay subscribes to sessions here this way; this relay\'s own agents use the remote_relay tool.',
+        error: 'Only another relay subscribes to sessions here this way; this relay\'s own agents use the relay_tool.',
         code: REMOTE_RELAY_ERROR_CODES.forbidden,
       });
       return null;

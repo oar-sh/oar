@@ -1,4 +1,4 @@
-// The relay's `remote_relay` tool for Copilot SDK sessions: a plain SDK
+// The relay's `relay_tool` tool for Copilot SDK sessions: a plain SDK
 // `Tool` (`{ name, description, parameters, skipPermission, handler }`) built
 // from the shared contract and forwarded through the shared tool core. The
 // module never imports the SDK; the session process hands the definition to
@@ -50,7 +50,7 @@ export function buildCopilotRemoteRelayTool({
         }));
       } catch (error) {
         const message = error?.message || String(error);
-        dbg('remote_relay tool failed', message);
+        dbg('relay_tool failed', message);
         result = { ok: false, code: REMOTE_RELAY_CALL_FAILED, error: message };
       }
       return formatRemoteRelayToolResult(result);

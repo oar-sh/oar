@@ -1,4 +1,4 @@
-// The relay's `remote_relay` for Copilot SDK sessions: the pure definition,
+// The relay's `relay_tool` for Copilot SDK sessions: the pure definition,
 // and the runner wiring (registration, the ask_user fallback keeping it, the
 // stall-watchdog hold while a call runs).
 import { test } from 'node:test';
@@ -22,7 +22,7 @@ import { createRemoteRelayToolGate } from '../../shared/remote-relay-tool-core.m
 
 test('the definition is the contract tool, approved by the relay rather than the runtime', () => {
   const tool = buildCopilotRemoteRelayTool({ api: async () => ({}) });
-  assert.equal(tool.name, 'remote_relay');
+  assert.equal(tool.name, 'relay_tool');
   assert.equal(tool.description, REMOTE_RELAY_TOOL_DESCRIPTION);
   assert.deepEqual(tool.parameters, REMOTE_RELAY_TOOL_INPUT_SCHEMA);
   assert.notEqual(tool.parameters, REMOTE_RELAY_TOOL_INPUT_SCHEMA, 'the SDK gets its own copy');
@@ -108,14 +108,14 @@ async function openTurn(client, runner, message = baseMessage) {
 }
 
 function remoteTool(config) {
-  return (config.tools || []).find((tool) => tool.name === 'remote_relay') || null;
+  return (config.tools || []).find((tool) => tool.name === 'relay_tool') || null;
 }
 
-test('sessions carry remote_relay next to ask_user when the relay reported a paired remote', async () => {
+test('sessions carry relay_tool next to ask_user when the relay reported a paired remote', async () => {
   const { client, runner, stub } = setup({ summary: { count: 1 } });
   const { pending } = await openTurn(client, runner);
   const tools = client.createAttempts[0].tools;
-  assert.deepEqual(tools.map((tool) => tool.name), ['ask_user', 'remote_relay']);
+  assert.deepEqual(tools.map((tool) => tool.name), ['ask_user', 'relay_tool']);
   assert.equal(remoteTool(client.createAttempts[0]).skipPermission, true);
   assert.equal(stub.calls.some((call) => call.routePath === '/api/remote-relays/summary'), true);
   client.session.emit({ type: 'session.idle', data: {} });
@@ -136,15 +136,15 @@ test('no paired remote, a failing summary, or a pinned-off gate leave the tool o
   }
 });
 
-test('without the ask_user override the session still carries remote_relay alone', async () => {
+test('without the ask_user override the session still carries relay_tool alone', async () => {
   const { client, runner } = setup({ relayAskUserTool: false });
   const { pending } = await openTurn(client, runner);
-  assert.deepEqual(client.createAttempts[0].tools.map((tool) => tool.name), ['remote_relay']);
+  assert.deepEqual(client.createAttempts[0].tools.map((tool) => tool.name), ['relay_tool']);
   client.session.emit({ type: 'session.idle', data: {} });
   await pending;
 });
 
-test('a runtime that refuses the ask_user override keeps remote_relay in the fallback session', async () => {
+test('a runtime that refuses the ask_user override keeps relay_tool in the fallback session', async () => {
   const { client, runner } = setup();
   const createSession = client.createSession.bind(client);
   let refusals = 0;
@@ -159,7 +159,7 @@ test('a runtime that refuses the ask_user override keeps remote_relay in the fal
   const { pending } = await openTurn(client, runner);
   assert.equal(refusals, 1);
   const fallback = client.session.config;
-  assert.deepEqual(fallback.tools.map((tool) => tool.name), ['remote_relay'], 'only the override is dropped');
+  assert.deepEqual(fallback.tools.map((tool) => tool.name), ['relay_tool'], 'only the override is dropped');
   assert.equal(typeof fallback.onUserInputRequest, 'function', 'the built-in ask_user path answers instead');
   client.session.emit({ type: 'session.idle', data: {} });
   await pending;
@@ -176,7 +176,7 @@ test('a refusal that is not about the override is not retried', async () => {
   assert.equal(attempts, 1);
 });
 
-test('a remote_relay call between turns keeps the runtime from idling out under it', async () => {
+test('a relay_tool call between turns keeps the runtime from idling out under it', async () => {
   let release = () => {};
   const remoteTurn = new Promise((resolve) => { release = resolve; });
   const { client, runner } = setup({
@@ -201,7 +201,7 @@ test('a remote_relay call between turns keeps the runtime from idling out under 
   await waitFor(() => client.stopped === 1, { label: 'idle shutdown after the call' });
 });
 
-test('a running remote_relay call holds the stall watchdog', async () => {
+test('a running relay_tool call holds the stall watchdog', async () => {
   let release = () => {};
   const remoteTurn = new Promise((resolve) => { release = resolve; });
   const { client, runner, stub } = setup({
@@ -233,7 +233,7 @@ test('a running remote_relay call holds the stall watchdog', async () => {
 });
 
 /**
- * A runner whose relay holds every remote_relay call open until the call's
+ * A runner whose relay holds every relay_tool call open until the call's
  * signal aborts (or the test answers it), recording each call's signal.
  */
 function setupHeldCalls({ onAbort = null } = {}) {
@@ -258,7 +258,7 @@ function setupHeldCalls({ onAbort = null } = {}) {
   return { client, runner, held, stop: (control) => abortTurn(control) };
 }
 
-test('a Stop cancels the pending remote_relay call and releases the hold', async () => {
+test('a Stop cancels the pending relay_tool call and releases the hold', async () => {
   const events = loadFixture('abort-turn');
   const afterAbort = events.slice(events.findIndex((event) => event.type === 'abort'));
   const { client, runner, held, stop } = setupHeldCalls({ onAbort: (session) => session.replay(afterAbort) });
@@ -291,7 +291,7 @@ test('a call still running when its turn settles normally is not cancelled', asy
   assert.equal(runner._getState().pendingRelayToolCalls, 0);
 });
 
-test('a failed remote_relay call releases the hold, and the watchdog works again', async () => {
+test('a failed relay_tool call releases the hold, and the watchdog works again', async () => {
   const { client, runner, stub } = setup({
     turnStallTimeoutMs: 25,
     toolReply: () => { throw new TypeError('fetch failed'); },

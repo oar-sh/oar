@@ -175,10 +175,11 @@ export function createUsageLimitPauseService({
    * Decide whether a refused turn is paused. Returns the plan, or null when
    * the response is to be handled as the terminal failure it says it is.
    */
-  function planPause({ terminalError, conversationId, providerType, queueRow = null, partialText = '' } = {}) {
+  function planPause({ terminalError, conversationId, providerType, chatProviderType = null, queueRow = null, partialText = '' } = {}) {
     if (!isUsageLimitTerminalError(terminalError)) return null;
     // Claude sessions, local and in the cloud: both run Claude Code on the
-    // same account and report the same limit.
+    // same account and report the same limit. `providerType` is what the
+    // refused turn ran on.
     if (!['claude', 'claude-cloud'].includes(String(providerType || '').trim().toLowerCase())) return null;
     if (!String(conversationId || '').trim()) return null;
     const at = now();
@@ -187,6 +188,21 @@ export function createUsageLimitPauseService({
     // What the turn had written before the refusal stays above the note.
     const written = String(partialText || '').trim();
     const withWritten = (note) => (written ? `${written}\n\n${note}` : note);
+    // The chat moved to the API key while this subscription turn ran: its
+    // follow-up is not held for the subscription's reset, it runs on the key
+    // at once (a row on the key is never held for the usage limit).
+    if (String(chatProviderType || '').trim().toLowerCase() === 'claude-api') {
+      return {
+        conversationId: String(conversationId),
+        rateLimitType,
+        resetsAt: null,
+        resumeAt: null,
+        auto: false,
+        retries: 0,
+        onApiKey: true,
+        noteText: withWritten(`⏸ Stopped at the Claude ${label}. This chat now runs on the Claude API key, so the turn carries on there.`),
+      };
+    }
     const resetsAtMs = Date.parse(String(terminalError.resetsAt || ''));
     if (!Number.isFinite(resetsAtMs) || resetsAtMs <= at) {
       // Counted along the follow-ups: the refused row is one itself when the
@@ -232,7 +248,8 @@ export function createUsageLimitPauseService({
   function schedulePause(plan, { queueRow = null } = {}) {
     if (!plan?.conversationId) return null;
     const at = new Date(now()).toISOString();
-    const heldUntil = plan.auto ? plan.resumeAt : HELD_UNTIL_RESUMED;
+    // On the key: due now, never held.
+    const heldUntil = plan.onApiKey ? null : (plan.auto ? plan.resumeAt : HELD_UNTIL_RESUMED);
     // What this refusal cut off. A refused follow-up stands for what it
     // quoted; a turn of the CLI's own has no prompt.
     const refusedFollowUp = parseJson(queueRow?.usage_limit_pause);
@@ -251,6 +268,7 @@ export function createUsageLimitPauseService({
         resetsAt: plan.resetsAt,
         auto: plan.auto,
         retries: Number(plan.retries || 0),
+        ...(plan.onApiKey ? { onApiKey: true, resumedAt: at, resumedBy: 'billing-switch' } : {}),
         pausedAt: at,
         refusedMessageId: queueRow?.id ? String(queueRow.id) : null,
         prompts,
@@ -345,8 +363,15 @@ export function createUsageLimitPauseService({
       } catch {}
     }
     const state = getPause(plan.conversationId);
-    try { logger.log?.(`[usage-limit] conv=${plan.conversationId.slice(0, 8)} paused at the ${usageLimitWindowLabel(plan.rateLimitType)}; ${plan.auto ? `resumes ${plan.resumeAt}` : `resets ${plan.resetsAt}, waits for the user`}`); } catch {}
+    try {
+      logger.log?.(`[usage-limit] conv=${plan.conversationId.slice(0, 8)} ${plan.onApiKey
+        ? `stopped at the ${usageLimitWindowLabel(plan.rateLimitType)}; carries on on the API key`
+        : `paused at the ${usageLimitWindowLabel(plan.rateLimitType)}; ${plan.auto ? `resumes ${plan.resumeAt}` : `resets ${plan.resetsAt}, waits for the user`}`}`);
+    } catch {}
     emitPause(plan.conversationId, state);
+    if (plan.onApiKey) {
+      try { onQueueChanged('usage-limit-on-api-key'); } catch {}
+    }
     return { messageId, created: Boolean(created), state };
   }
 
@@ -373,6 +398,31 @@ export function createUsageLimitPauseService({
     try { emit('message_status', { messageId: String(row.id), conversationId: id, status: 'pending' }); } catch {}
     try { onQueueChanged('usage-limit-resume'); } catch {}
     return { resumed: true, messageId: String(row.id), state: null };
+  }
+
+  /**
+   * Release the held follow-up because the chat moved to the API key: it
+   * runs now, on the key (the billing switch re-stamped it). Called inside
+   * the switch's transaction; `announce()` tells the clients once that has
+   * committed. Null when nothing is held.
+   */
+  function releaseForBillingSwitch({ conversationId, by = 'billing-switch' } = {}) {
+    const id = String(conversationId || '').trim();
+    const row = id ? findPausedRowForConversation.get(id) : null;
+    if (!row || !stateFromRow(row)) return null;
+    const pause = parseJson(row.usage_limit_pause) || {};
+    const at = new Date(now()).toISOString();
+    setPause.run(null, JSON.stringify({ ...pause, resumedAt: at, resumedBy: String(by || 'billing-switch') }), row.id);
+    const messageId = String(row.id);
+    return {
+      messageId,
+      announce() {
+        try { logger.log?.(`[usage-limit] conv=${id.slice(0, 8)} released by the switch to the API key`); } catch {}
+        emitPause(id, null);
+        try { emit('message_status', { messageId, conversationId: id, status: 'pending' }); } catch {}
+        try { onQueueChanged('usage-limit-billing-switch'); } catch {}
+      },
+    };
   }
 
   /** Drop the held follow-up: the paused turn is not carried on. */
@@ -436,6 +486,7 @@ export function createUsageLimitPauseService({
     getPause,
     listPauses,
     resumeNow,
+    releaseForBillingSwitch,
     cancel,
     recordReport,
     getAccountState: accountState,

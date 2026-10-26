@@ -2,13 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  DEEPSEEK_CLI_PINNED_ENV,
   createDeepSeekClaudeBackend,
   deepseekCliModel,
-  deepseekPinnedEnv,
   deepseekRelayModel,
   describeDeepSeekFailure,
 } from './deepseek-claude-backend.mjs';
+import { CLAUDE_CLI_KEY_CHAT_SETTINGS, CLAUDE_CLI_PINNED_ENV } from '../claude-worker/claude-cli-pinned-env.mjs';
 import { createClaudeTurnPublisher } from '../claude-worker/claude-turn-publisher.mjs';
 
 const TEST_KEY = 'sk-test-5555555555555555';
@@ -229,27 +228,17 @@ test('the endpoint and the key are pinned again in the CLI\'s flag layer, the ot
   // so each is blanked, but for the two whose blank is not unset.
   assert.deepEqual(
     Object.keys(live.env).sort(),
-    DEEPSEEK_CLI_PINNED_ENV.filter((name) => !['SSL_CERT_FILE', 'SSL_CERT_DIR'].includes(name)).sort(),
+    CLAUDE_CLI_PINNED_ENV.filter((name) => !['SSL_CERT_FILE', 'SSL_CERT_DIR'].includes(name)).sort(),
   );
   for (const [name, value] of Object.entries(live.env)) {
     if (name !== 'ANTHROPIC_BASE_URL' && name !== 'ANTHROPIC_AUTH_TOKEN') assert.equal(value, '', name);
   }
   // Called without the CLI's environment it builds it from the worker's.
   assert.deepEqual(backend.liveFlagSettings(), live);
-  // The key never goes on the command line: no argv flag settings of its own.
-  assert.equal(typeof backend.flagSettings, 'undefined');
-});
-
-test('the pinned names cover the routing, trust and credential variables, and the list is frozen', () => {
-  assert.equal(Object.isFrozen(DEEPSEEK_CLI_PINNED_ENV), true);
-  assert.equal(new Set(DEEPSEEK_CLI_PINNED_ENV).size, DEEPSEEK_CLI_PINNED_ENV.length);
-  for (const name of [
-    'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
-    'CLAUDE_CODE_USE_GATEWAY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY',
-    'no_proxy', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS', 'CLAUDE_CODE_CERT_STORE', 'SSL_CERT_FILE',
-  ]) assert.ok(DEEPSEEK_CLI_PINNED_ENV.includes(name), name);
-  // Left to the folder: the model choice, and NODE_OPTIONS (see the list).
-  for (const name of ['ANTHROPIC_MODEL', 'NODE_OPTIONS', 'CLAUDE_CONFIG_DIR']) assert.equal(DEEPSEEK_CLI_PINNED_ENV.includes(name), false, name);
+  // The key never goes on the command line: the argv flag settings only turn
+  // hooks off.
+  assert.deepEqual(backend.flagSettings(), { disableAllHooks: true });
+  assert.notEqual(backend.flagSettings(), CLAUDE_CLI_KEY_CHAT_SETTINGS);
 });
 
 test('a pin holds the CLI\'s own value: the worker\'s proxy and CA, a proxy in the other case, SSL_CERT_* only when set', () => {
@@ -280,7 +269,6 @@ test('a pin holds the CLI\'s own value: the worker\'s proxy and CA, a proxy in t
   assert.equal('NODE_OPTIONS' in env, false);
   // An ANTHROPIC_* of the worker's never becomes a pin: spawnEnv drops it.
   assert.equal(backend.liveFlagSettings({ ...cliEnv, ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }).env.ANTHROPIC_BASE_URL, cliEnv.ANTHROPIC_BASE_URL);
-  assert.deepEqual(deepseekPinnedEnv({ http_proxy: 'http://127.0.0.1:1' }).HTTP_PROXY, 'http://127.0.0.1:1');
 });
 
 test('without its key or state directory the backend refuses to build a CLI environment', () => {

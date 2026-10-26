@@ -16,6 +16,14 @@
 const CLAUDE_SETTINGS_CTA = Object.freeze([
   Object.freeze({ action: 'open-claude-settings', label: 'Claude settings' }),
 ]);
+const CLAUDE_API_SETTINGS_CTA = Object.freeze([
+  Object.freeze({ action: 'open-claude-api-settings', label: 'Claude API settings' }),
+]);
+const SWITCH_TO_SUBSCRIPTION_CTA = Object.freeze({ action: 'switch-claude-billing-to-subscription', label: 'Switch to subscription' });
+const CLAUDE_API_UNAVAILABLE_CTA = Object.freeze([
+  Object.freeze({ action: 'open-claude-api-settings', label: 'Claude API settings' }),
+  SWITCH_TO_SUBSCRIPTION_CTA,
+]);
 
 const RELAY_ERROR_CTAS = Object.freeze({
   'grok-cli-missing': Object.freeze([
@@ -43,6 +51,31 @@ const RELAY_ERROR_CTAS = Object.freeze({
   'deepseek-balance': Object.freeze([
     Object.freeze({ action: 'open-deepseek-top-up', label: 'Top up DeepSeek' }),
     Object.freeze({ action: 'open-deepseek-settings', label: 'DeepSeek settings' }),
+  ]),
+  // A Claude API row failed closed at the claim (server-runtime.mjs,
+  // claudeApiClaimCheck): no key or the provider switched off, or this
+  // month's cap reached. The way out is the tab (at its cap field for the
+  // cap), or the subscription, which the cap never blocks.
+  'claude-api-not-configured': CLAUDE_API_UNAVAILABLE_CTA,
+  'claude-api-cap-reached': Object.freeze([
+    Object.freeze({ action: 'open-claude-api-cap', label: 'Claude API settings' }),
+    SWITCH_TO_SUBSCRIPTION_CTA,
+  ]),
+  // A turn the Claude API refused (claude-api-backend.mjs, describeClaudeApiFailure).
+  'claude-api-key': CLAUDE_API_SETTINGS_CTA,
+  'claude-api-key-source': CLAUDE_API_SETTINGS_CTA,
+  'claude-api-credit': Object.freeze([
+    Object.freeze({ action: 'open-claude-api-billing', label: 'Add funds' }),
+    Object.freeze({ action: 'open-claude-api-settings', label: 'Claude API settings' }),
+  ]),
+  'claude-api-billing': Object.freeze([
+    Object.freeze({ action: 'open-claude-api-billing', label: 'Console billing' }),
+  ]),
+  'claude-api-spend-limit': Object.freeze([
+    Object.freeze({ action: 'open-claude-api-limits', label: 'Console limits' }),
+  ]),
+  'claude-api-rate-limit': Object.freeze([
+    Object.freeze({ action: 'open-claude-api-limits', label: 'Console limits' }),
   ]),
 });
 
@@ -80,4 +113,21 @@ export function relayErrorCtaActions(text) {
 export function relayErrorCtaActionsForCode(code) {
   const normalized = String(code || '').trim().toLowerCase().replace(/^relay\./, '');
   return RELAY_ERROR_CTAS[normalized] || [];
+}
+
+export const START_ON_SUBSCRIPTION_ACTION = 'start-new-chat-on-subscription';
+
+/**
+ * The buttons of New Chat when the relay refused to start a Claude API chat
+ * (its 409 code, CLAUDE_API_CAP_REACHED or CLAUDE_API_NOT_CONFIGURED; nothing
+ * was bound): the transcript's buttons for that code, where "Switch to
+ * subscription" becomes "Start on subscription" (the same new chat on the
+ * Claude provider), offered only when New Chat offers the Claude provider.
+ */
+export function newChatClaudeApiRefusalActions(code, { subscriptionOffered = false } = {}) {
+  const normalized = String(code || '').trim().toLowerCase().replace(/_/g, '-');
+  return relayErrorCtaActionsForCode(normalized).flatMap((item) => {
+    if (item.action !== 'switch-claude-billing-to-subscription') return [item];
+    return subscriptionOffered ? [{ action: START_ON_SUBSCRIPTION_ACTION, label: 'Start on subscription' }] : [];
+  });
 }

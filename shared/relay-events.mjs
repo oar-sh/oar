@@ -8,7 +8,7 @@
 // then start with the relay's name). `replayed: true` marks an event a paired
 // relay kept while the link to it was down.
 //
-// SDK-free and side-effect free: imported by the server, the remote_relay
+// SDK-free and side-effect free: imported by the server, the relay_tool
 // contract and the browser (which renders the event rows).
 
 import { RELAY_SCHEDULE_MESSAGE_KIND } from './relay-schedules.mjs';
@@ -22,7 +22,7 @@ export const RELAY_EVENT_MESSAGE_KIND = 'relay-event';
 
 export const RELAY_EVENT_TYPES = Object.freeze([
   'question_asked',
-  // The owner answered or dismissed a question that does not block (remote_relay
+  // The owner answered or dismissed a question that does not block (relay_tool
   // `ask`). The asking session is always told, without a subscription; a
   // subscription that takes question_asked takes it too.
   'question_answered',

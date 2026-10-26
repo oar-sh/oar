@@ -192,7 +192,7 @@ export function registerAskUserRoutes(app, deps) {
   });
 
   /**
-   * An ask (remote_relay `ask`) is the user's to answer: from this relay's
+   * An ask (relay_tool `ask`) is the user's to answer: from this relay's
    * own UI here, from a paired relay's Inbox through its own route
    * (relay-ask-routes.mjs). Never from an agent, this relay's or another's.
    */

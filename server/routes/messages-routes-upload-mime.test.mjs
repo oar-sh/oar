@@ -56,7 +56,11 @@ test('sending a message clears the draft attachment cache and its references', (
 });
 
 test('the draft cleared broadcast reports empty attachments', () => {
-  const emitBlock = /io\.emit\('conversation_draft_updated', \{[\s\S]*?\}\);/.exec(source);
+  // The send's own clear (draftText ''), not the billing refusal's, which
+  // keeps the draft's attachments as they are.
+  const emitBlock = [...source.matchAll(/io\.emit\('conversation_draft_updated', \{[\s\S]*?\}\);/g)]
+    .map((match) => match[0])
+    .find((block) => /draftText: ''/.test(block));
   assert.ok(emitBlock);
-  assert.match(emitBlock[0], /draftAttachments: \[\]/);
+  assert.match(emitBlock, /draftAttachments: \[\]/);
 });

@@ -302,6 +302,10 @@ export function buildRelayServerEnv({
     // its own relay: the URL of its fake API and a token only the fake knows.
     OAR_CLAUDE_CLOUD_API_BASE_URL: "http://127.0.0.1:9",
     CLAUDE_CODE_OAUTH_TOKEN: "",
+    // The same for Claude API: a key saved in its tab is sent to this URL
+    // when the relay lists the key's models. tests/claude-api-settings.spec.mjs
+    // overrides it for its own relay with the URL of its fake API.
+    OAR_ANTHROPIC_API_BASE_URL: "http://127.0.0.1:9",
     // The branch suggestions of New Chat → Claude Cloud come from
     // `git ls-remote` against GitHub; no e2e run may talk to it.
     OAR_CLAUDE_CLOUD_BRANCH_LOOKUP: "off",

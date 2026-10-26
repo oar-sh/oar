@@ -7,7 +7,7 @@
 // (messages-routes.mjs), next to the code they reuse.
 //
 // The owner's action only: every route is behind `auth`, and a request that
-// arrived from a paired relay is refused, as the remote_relay tool's own
+// arrived from a paired relay is refused, as the relay_tool's own
 // route refuses calls from other relays. The tool reads groups, names an
 // existing one for a session it creates (the bootstrap route), and moves one
 // session into a group, out of it, or into a new group of a name it gives

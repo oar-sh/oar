@@ -473,6 +473,15 @@ test('the card says how the remote turn would run: mode, provider, model and fol
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { session: 'conv-remote-1', text: 'Run it', mode: 'autopilot', model: 'claude-opus-5' }, caller }),
     'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\nMode: autopilot · Model: claude-opus-5\n\n“Run it”',
   );
+  // A send that names a Claude billing says what it does to the bill.
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { session: 'conv-remote-1', text: 'Go on', provider: 'claude-api' }, caller }),
+    'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\nMode: plan · Switches billing to API key\n\n“Go on”',
+  );
+  assert.match(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { session: 'conv-remote-1', text: 'Go on', provider: 'claude' }, caller }),
+    /Switches billing to subscription/,
+  );
   assert.equal(
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'stop', args: { session: 'abcdef123456', mode: 'autopilot' }, caller }),
     'Allow the agent to stop the running turn on relay "linux-test" (session abcdef12)?',

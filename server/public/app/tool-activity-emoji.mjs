@@ -31,10 +31,11 @@ export function prefixToolActivityEmoji(text) {
   if (/^Tool \((create_file|write)\)/i.test(value)) return `🆕 ${value}`;
   if (/^Tool \((bash|shell|terminal)\)/i.test(value)) return `🔧 ${value}`;
   if (/^Tool \((sql|sqlite)\)/i.test(value)) return `🗄️ ${value}`;
-  // Work on another OAR relay. Claude's raw name is mcp__relay__remote_relay and
-  // the Copilot CLI names MCP tools <server>-<tool> (oar-remote_relay); the
+  // Work on another OAR relay. Claude's raw name is mcp__relay__relay_tool and
+  // the Copilot CLI names MCP tools <server>-<tool> (oar-relay_tool); the
   // activity normalisers strip both, but a line that kept one matches too.
-  if (/^Tool \((?:mcp__[a-z0-9_-]+__|[a-z0-9_]+-)?remote_relay\)/i.test(value)) return `🛰️ ${value}`;
+  // Lines written up to 0.9.17 carry the old name, remote_relay.
+  if (/^Tool \((?:mcp__[a-z0-9_-]+__|[a-z0-9_]+-)?(?:relay_tool|remote_relay)\)/i.test(value)) return `🛰️ ${value}`;
   if (/^Tool \(/i.test(value)) return `🛠️ ${value}`;
   return `ℹ️ ${value}`;
 }

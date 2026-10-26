@@ -9,7 +9,7 @@ import { formatRemoteRelayApprovalPrompt } from './remote-relay-caller-context.m
 import { createRelayAskService } from './relay-ask-service.mjs';
 import { RELAY_ASK_REMOTE_PATHS } from './relay-ask-link-service.mjs';
 
-// remote_relay ask / list_questions / withdraw through the dispatcher, on this
+// relay_tool ask / list_questions / withdraw through the dispatcher, on this
 // relay's real ask service (an in-memory database) and a stub paired relay.
 
 const CALLER = 'conv-fixture-caller';

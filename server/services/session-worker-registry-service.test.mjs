@@ -261,3 +261,23 @@ test('a steering snapshot does not outlive the worker process it describes', () 
   assert.equal(registry.clearSteering('sdk-1'), false);
   assert.equal(registry.clearSteering('missing'), false);
 });
+
+test('a worker\'s kind is its own word: kept across upserts that do not state it, dropped with its process', async () => {
+  const { normalizeWorkerKind, normalizeWorkerSteeringSnapshot } = await import('./session-worker-registry-service.mjs');
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sid-1', pid: 10, status: 'ready', kind: 'Claude-API' });
+  assert.equal(registry.getWorker('sid-1').kind, 'claude-api');
+  registry.upsertWorker({ sdkSessionId: 'sid-1', pid: 10, status: 'processing' });
+  assert.equal(registry.getWorker('sid-1').kind, 'claude-api');
+  // Another process for the session: the old one's word is gone until the new one speaks.
+  registry.upsertWorker({ sdkSessionId: 'sid-1', pid: 11, status: 'ready' });
+  assert.equal(registry.getWorker('sid-1').kind, null);
+  assert.equal(normalizeWorkerKind('claude'), 'claude');
+  assert.equal(normalizeWorkerKind('not a kind!'), null);
+  // The releasable keys survive normalization only when the worker reports them.
+  assert.deepEqual(
+    normalizeWorkerSteeringSnapshot({ turnActive: false, releasable: false, releaseHold: 'background', backgroundTaskCount: 2 }),
+    { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: false, cancellableIds: [], releasable: false, releaseHold: 'background', backgroundTaskCount: 2 },
+  );
+  assert.equal('releasable' in normalizeWorkerSteeringSnapshot({ turnActive: true }), false);
+});

@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   buildNewConversationModelChoices,
   newConversationContextTierState,
+  preselectNewConversationModel,
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
   shouldPromptForNewConversationModel,
@@ -105,4 +106,16 @@ test('ultracode is selectable when remembered but never a silent default', () =>
     resolvePreferredReasoningEffort(claudeLadder, ['']),
     'low',
   );
+});
+
+test('New Chat starts on the stored model, else the provider default, else Auto', () => {
+  // Claude API's list is sorted by name: Haiku first, the default elsewhere.
+  const claudeApi = ['claude-haiku-4-5-20251001', 'claude-opus-5-5', 'claude-sonnet-5-5'];
+  assert.equal(preselectNewConversationModel(claudeApi, { providerDefault: 'claude-sonnet-5-5' }), 'claude-sonnet-5-5');
+  assert.equal(preselectNewConversationModel(claudeApi, { storedModel: 'claude-opus-5-5', providerDefault: 'claude-sonnet-5-5' }), 'claude-opus-5-5');
+  // A stored model of another provider does not count; nor a default the list lacks.
+  assert.equal(preselectNewConversationModel(claudeApi, { storedModel: 'gpt-5.4-mini', providerDefault: 'claude-sonnet-5-5' }), 'claude-sonnet-5-5');
+  assert.equal(preselectNewConversationModel(claudeApi, { providerDefault: 'claude-opus-4' }), '');
+  assert.equal(preselectNewConversationModel(['auto', 'gpt-5.4-mini'], {}), 'auto');
+  assert.equal(preselectNewConversationModel(['auto', 'gpt-image-2'], { allowAuto: false }), '');
 });

@@ -1,7 +1,7 @@
 // The Inbox, as DOM: every pending question across this relay and its paired
 // relays (GET /api/inbox), grouped by relay, newest first; what was answered
 // or dismissed in the last day under a divider. And the card a question that
-// does not block (remote_relay `ask`) shows in its own session.
+// does not block (relay_tool `ask`) shows in its own session.
 //
 // Every text here is written by an agent, some on other relays: it goes into
 // the page through textContent only, never as HTML or a link. Buttons carry

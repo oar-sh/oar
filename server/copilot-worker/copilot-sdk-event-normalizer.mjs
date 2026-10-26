@@ -84,7 +84,7 @@ export function summarizeToolInput(input) {
 
 export function formatToolActivityText(toolName, input) {
   const rawName = String(toolName || '').trim() || 'tool';
-  // `remote_relay` (bare, or namespaced by an MCP server) reads as what it
+  // `relay_tool` (bare, or namespaced by an MCP server) reads as what it
   // does on which relay (`send → linux-test session 01234567: “…”`); its
   // arguments may arrive as a JSON string.
   const isRemoteRelay = isRemoteRelayToolName(rawName);

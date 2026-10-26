@@ -1,5 +1,5 @@
 // Pure helpers for Settings → Relays → Agent sessions: whether agents may
-// start and use sessions on this relay, and the longest time one remote_relay
+// start and use sessions on this relay, and the longest time one relay_tool
 // call may wait. DOM-free on purpose, like claude-cloud-ui.mjs: the section
 // (agent-sessions-settings-ui.js) owns the elements, this module the decisions.
 //

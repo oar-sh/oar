@@ -10,7 +10,7 @@ import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.m
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
 import { buildUsageLimitFailure } from '../../shared/claude-usage-limit.mjs';
 import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
-import { claudeSearchTotals, claudeToolRequests, claudeUsageTotals } from './claude-usage-totals.mjs';
+import { claudeBillingTotals, claudeSearchTotals, claudeToolRequests, claudeUsageTotals } from './claude-usage-totals.mjs';
 
 const PLAN_BOARD_ACTIONS = [
   { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
@@ -72,7 +72,8 @@ export function createClaudeTurnPublisher({
   dbg = () => {},
   takeWorkflowRuns = null,
   // A backend's own reading of a failed request (`{ code, guidance }` or
-  // null) and its name in the notes; null for Claude.
+  // null) and its name in the notes; null for Claude. It gets the error a
+  // turn ended with, when there is one, beside its text and status.
   describeFailure = null,
   runtimeLabel = 'Claude',
   // The namespace of a backend's failure codes (DeepSeek: `deepseek`): its
@@ -89,6 +90,12 @@ export function createClaudeTurnPublisher({
   // The relay's id of a model the backend's CLI names ("deepseek-flash[1m]"
   // → "deepseek-flash"); identity for Claude, whose `[1m]` is a real tier.
   relayModel = (value) => value,
+  // The Claude API booking (POST /api/claude-api-usage), which both Claude
+  // workers report to after every turn, whatever else they report: a chat
+  // moves between the subscription and the key and keeps its session.
+  // `billingKind` is the worker's kind.
+  billingUsageRoute = null,
+  billingKind = null,
 } = {}) {
   /** `{ code, stableCode }` of a failure code, in the backend's namespace. */
   function failureCodes(code) {
@@ -108,9 +115,9 @@ export function createClaudeTurnPublisher({
     return { ...failureCodes(classified.code), guidance: classified.code === 'model_not_found' ? classified.guidance : null };
   }
 
-  function backendFailure(errorText, status = null) {
+  function backendFailure(errorText, status = null, error = null) {
     if (typeof describeFailure !== 'function') return null;
-    const described = describeFailure(errorText, { status });
+    const described = describeFailure(errorText, { status, ...(error ? { error } : {}) });
     return described?.code ? described : null;
   }
 
@@ -223,6 +230,7 @@ export function createClaudeTurnPublisher({
    * Advisory: a failure here must not disturb the turn's response.
    */
   async function publishPlanUsage({ message, state, sdkSessionId, runId = '', resumedSessionId = '' }) {
+    if (billingUsageRoute) await publishBillingUsage({ message, state, sdkSessionId, runId, resumedSessionId });
     if (usageRoute) {
       await publishBackendUsage({ message, state, sdkSessionId, runId, resumedSessionId });
       return;
@@ -414,6 +422,110 @@ export function createClaudeTurnPublisher({
       ...(requests.length ? { requests } : {}),
     }).catch((error) => {
       dbg('backend usage publish failed', error?.message || String(error));
+    });
+  }
+
+  // The process's own totals per model with their cost, for the Claude API
+  // booking: counted like `run` above, per process and CLI session, with the
+  // CLI's cost estimate beside the tokens. A resumed process's first result
+  // adds the turn's `usage` (its main agent loop, no cost); the relay books
+  // that turn from the session totals the report carries as well.
+  const billingRun = { key: '', results: 0, totals: new Map(), lastSession: new Map() };
+  const billedStates = new WeakSet();
+
+  function billingCounts(state, result, { runId, sessionId, resumedSessionId }) {
+    const model = result.model || state.responseModel;
+    const key = `${runId}\n${sessionId}`;
+    if (billingRun.key !== key) {
+      billingRun.key = key;
+      billingRun.results = 0;
+      billingRun.totals = new Map();
+      billingRun.lastSession = new Map();
+    }
+    const firstResultOfRun = billingRun.results === 0;
+    const session = claudeBillingTotals(result.modelUsage, { usage: result.usage, model });
+    const add = (entries) => {
+      for (const entry of entries) {
+        const current = billingRun.totals.get(entry.model) || { model: entry.model, hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0, costUnknown: false };
+        current.hitTokens += entry.hitTokens;
+        current.missTokens += entry.missTokens;
+        current.outputTokens += entry.outputTokens;
+        current.costUsd += entry.costUsd;
+        current.costUnknown = current.costUnknown || entry.costUnknown;
+        billingRun.totals.set(entry.model, current);
+      }
+    };
+    if (!billedStates.has(state)) {
+      billedStates.add(state);
+      const hasModelUsage = Boolean(result.modelUsage) && typeof result.modelUsage === 'object' && !Array.isArray(result.modelUsage);
+      const resumed = firstResultOfRun && Boolean(resumedSessionId) && sessionId === resumedSessionId;
+      if (!hasModelUsage || resumed) {
+        add(claudeBillingTotals(null, { usage: result.usage, model }));
+      } else {
+        add(session.map((entry) => {
+          const last = billingRun.lastSession.get(entry.model) || { hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0 };
+          return {
+            model: entry.model,
+            hitTokens: Math.max(0, entry.hitTokens - last.hitTokens),
+            missTokens: Math.max(0, entry.missTokens - last.missTokens),
+            outputTokens: Math.max(0, entry.outputTokens - last.outputTokens),
+            costUsd: Math.max(0, entry.costUsd - last.costUsd),
+            costUnknown: entry.costUnknown,
+          };
+        }));
+      }
+      // The baseline only rises: a late result of an older turn below it
+      // must not make the next one count twice.
+      if (hasModelUsage) {
+        for (const entry of session) {
+          const last = billingRun.lastSession.get(entry.model) || { hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0 };
+          billingRun.lastSession.set(entry.model, {
+            hitTokens: Math.max(last.hitTokens, entry.hitTokens),
+            missTokens: Math.max(last.missTokens, entry.missTokens),
+            outputTokens: Math.max(last.outputTokens, entry.outputTokens),
+            costUsd: Math.max(last.costUsd, entry.costUsd),
+          });
+        }
+      }
+      billingRun.results += 1;
+    }
+    return {
+      firstResultOfRun,
+      runCounts: [...billingRun.totals.values()].map((entry) => ({ ...entry })),
+      sessionTotals: session,
+    };
+  }
+
+  /**
+   * Ship the turn's counts to the Claude API booking: the process's own
+   * running totals (`runCounts`) and the CLI's session totals
+   * (`sessionTotals`), with the worker's kind, the process (`runId`), the
+   * session it resumed, and the turn (`turnId`). Advisory, like the plan usage.
+   */
+  async function publishBillingUsage({ message, state, sdkSessionId, runId = '', resumedSessionId = '' }) {
+    const result = state.result;
+    const claudeNativeSessionId = String(result?.sessionId || '').trim();
+    if (!billingUsageRoute || !claudeNativeSessionId || !runId) return;
+    const { firstResultOfRun, runCounts, sessionTotals } = billingCounts(state, result, {
+      runId: String(runId),
+      sessionId: claudeNativeSessionId,
+      resumedSessionId: String(resumedSessionId || '').trim(),
+    });
+    if (!runCounts.length && !sessionTotals.length) return;
+    await api('POST', billingUsageRoute, {
+      conversationId: message.conversationId,
+      sdkSessionId,
+      claudeNativeSessionId,
+      runId: String(runId),
+      billing: billingKind || null,
+      turnId: String(message.id || '') || null,
+      at: new Date().toISOString(),
+      firstResultOfRun,
+      ...(resumedSessionId ? { resumedSessionId: String(resumedSessionId) } : {}),
+      runCounts,
+      sessionTotals,
+    }).catch((error) => {
+      dbg('billing usage publish failed', error?.message || String(error));
     });
   }
 
@@ -670,7 +782,7 @@ export function createClaudeTurnPublisher({
       });
       return;
     }
-    const described = backendFailure(errorText);
+    const described = backendFailure(errorText, null, error);
     if (described) {
       await publishResponse(message, {
         text: `System note: the ${runtimeLabel} turn failed (${errorText}). ${described.guidance}`,

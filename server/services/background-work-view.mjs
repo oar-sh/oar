@@ -25,7 +25,8 @@ import {
 // Providers whose worker lists every running background sub-agent in its
 // task set, by the run's id. Others may run background agents no set lists
 // (their run rows are their only trace), so a set says nothing about a row.
-const RUN_LISTING_PROVIDERS = new Set(['claude']);
+// The Claude API worker is the Claude one on an API key.
+const RUN_LISTING_PROVIDERS = new Set(['claude', 'claude-api']);
 
 function toText(value) {
   return String(value ?? '').trim();

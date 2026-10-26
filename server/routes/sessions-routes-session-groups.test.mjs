@@ -499,7 +499,7 @@ test('a drag places a conversation before another or at the end, takes it out wi
   assert.deepEqual(list.body.conversations.map((row) => [row.id, row.groupPosition]), [[d, null], [a, 10], [c, 20], [b, 30]]);
   const single = await fx.call('GET /api/conversation/:id', { params: { id: c } });
   assert.equal(single.body.groupPosition, 20);
-  // read_session's members (the remote_relay tool) follow the same order.
+  // read_session's members (the relay_tool tool) follow the same order.
   const withMembers = await fx.call('GET /api/conversation/:id', { params: { id: c }, query: { groupMembers: '1' } });
   assert.deepEqual(withMembers.body.group.members.map((member) => member.id), [a, c, b]);
   assert.equal((await fx.call('GET /api/conversation/:id', { params: { id: d } })).body.groupPosition, null);

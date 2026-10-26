@@ -15,7 +15,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 
 /**
  * Agent sessions: an agent creates and drives sessions on its OWN relay with
- * the `remote_relay` tool (the "local target", named by the relay's name or
+ * the `relay_tool` tool (the "local target", named by the relay's name or
  * `this`), behind the setting "Agents may start and use sessions on this
  * relay".
  *

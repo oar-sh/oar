@@ -33,6 +33,7 @@ const KINDS = Object.freeze({
   cursor: { COPILOT_WEB_RELAY_WORKER_KIND: 'cursor', CURSOR_API_KEY: 'cursor-test-key' },
   grok: { COPILOT_WEB_RELAY_WORKER_KIND: 'grok' },
   deepseek: { COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek', DEEPSEEK_API_KEY: 'deepseek-test-key' },
+  'claude-api': { COPILOT_WEB_RELAY_WORKER_KIND: 'claude-api', OAR_CLAUDE_API_KEY: 'claude-api-test-key' },
 });
 
 function assertNoHostAnthropic(value, label) {

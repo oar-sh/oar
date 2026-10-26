@@ -575,6 +575,37 @@ export async function updateDeepSeekSettings({
   return settingsRequest('/api/settings/deepseek', payload, 'Failed to update DeepSeek settings');
 }
 
+export async function loadClaudeApiSettings() {
+  return apiFetch('/api/settings/claude-api');
+}
+
+/**
+ * Saves what the caller names on the Claude API tab: a key (written, never
+ * read back), the switch, the default model, the enabled models and the
+ * monthly cap in US dollars (null = no cap); `remove` takes the key out.
+ */
+export async function updateClaudeApiSettings({
+  apiKey = '',
+  model = undefined,
+  enabled = undefined,
+  enabledModels = undefined,
+  monthlyCapUsd = undefined,
+  remove = false,
+} = {}) {
+  // Only the fields named here reach the relay: a field the Claude API tab
+  // shows needs its line below (api-client.claude-api-settings.test.mjs).
+  const payload = remove === true ? { remove: true } : {};
+  if (!payload.remove) {
+    const key = String(apiKey || '').trim();
+    if (key) payload.apiKey = key;
+    if (typeof model === 'string' && model.trim()) payload.model = model.trim();
+    if (typeof enabled === 'boolean') payload.enabled = enabled;
+    if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+    if (monthlyCapUsd === null || (typeof monthlyCapUsd === 'number' && Number.isFinite(monthlyCapUsd))) payload.monthlyCapUsd = monthlyCapUsd;
+  }
+  return settingsRequest('/api/settings/claude-api', payload, 'Failed to update Claude API settings');
+}
+
 /**
  * Imports DeepSeek's usage export: the texts of its amount and cost files.
  * Answers `{ ok, summary }`; a refused export throws with the relay's reason.
@@ -1477,6 +1508,27 @@ export async function resumeUsageLimitPause(conversationId) {
     method: 'POST',
     body: JSON.stringify({ conversationId }),
   });
+}
+
+// Move a Claude chat between the subscription ("claude") and the saved API
+// key ("claude-api"), from its next turn. `by: "usage-limit"` is the
+// usage-limit note's button. `{ ok: true, ... }`, else `{ ok: false, error,
+// code }` with the relay's reason (the key, the model, the cap).
+export async function switchConversationBilling(conversationId, { to, by = 'user' } = {}) {
+  let refusal = null;
+  const result = await apiFetch(`/api/conversation/${encodeURIComponent(String(conversationId || ''))}/billing`, {
+    method: 'POST',
+    body: JSON.stringify({ to, by }),
+    onErrorResponse: async (response) => {
+      const payload = await response.json().catch(() => null);
+      refusal = {
+        ok: false,
+        error: readableServerError(payload?.error) || `The relay answered ${response.status}.`,
+        code: payload?.code || null,
+      };
+    },
+  });
+  return result || refusal || { ok: false, error: 'The relay could not be reached.', code: null };
 }
 
 export async function cancelUsageLimitPause(conversationId) {

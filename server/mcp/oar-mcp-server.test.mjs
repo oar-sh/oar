@@ -183,14 +183,14 @@ test('initialize echoes a supported protocol version and announces the tools cap
   });
 });
 
-test('tools/list offers remote_relay and preview with the shared schemas', async () => {
+test('tools/list offers relay_tool and preview with the shared schemas', async () => {
   await withMcp({ remoteCount: 2 }, async ({ mcp, relay }) => {
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const listed = await mcp.request('tools/list', {});
     const byName = Object.fromEntries(listed.result.tools.map((tool) => [tool.name, tool]));
-    assert.deepEqual(Object.keys(byName).sort(), ['preview', 'remote_relay']);
-    assert.equal(byName.remote_relay.description, REMOTE_RELAY_TOOL_DESCRIPTION);
-    assert.deepEqual(byName.remote_relay.inputSchema, REMOTE_RELAY_TOOL_INPUT_SCHEMA);
+    assert.deepEqual(Object.keys(byName).sort(), ['preview', 'relay_tool']);
+    assert.equal(byName.relay_tool.description, REMOTE_RELAY_TOOL_DESCRIPTION);
+    assert.deepEqual(byName.relay_tool.inputSchema, REMOTE_RELAY_TOOL_INPUT_SCHEMA);
     assert.equal(byName.preview.description, PREVIEW_TOOL_DESCRIPTION);
     assert.deepEqual(byName.preview.inputSchema, PREVIEW_TOOL_INPUT_SCHEMA);
 
@@ -200,11 +200,11 @@ test('tools/list offers remote_relay and preview with the shared schemas', async
   });
 });
 
-test('tools/call remote_relay forwards { conversationId, action, args } with the relay token', async () => {
+test('tools/call relay_tool forwards { conversationId, action, args } with the relay token', async () => {
   await withMcp({}, async ({ mcp, relay }) => {
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const called = await mcp.request('tools/call', {
-      name: 'remote_relay',
+      name: 'relay_tool',
       arguments: { action: 'send', relay: 'linux-test', session: 'sess-7', text: 'run the report builder tests' },
     });
     assert.equal(called.result.isError, undefined);
@@ -232,11 +232,24 @@ test('tools/call remote_relay forwards { conversationId, action, args } with the
   });
 });
 
+test('the old name remote_relay still dispatches, but only relay_tool is listed', async () => {
+  await withMcp({}, async ({ mcp, relay }) => {
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const listed = await mcp.request('tools/list', {});
+    assert.ok(!listed.result.tools.some((tool) => tool.name === 'remote_relay'), 'never listed');
+    const called = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'list_relays' } });
+    assert.equal(called.error, undefined);
+    assert.equal(JSON.parse(called.result.content[0].text).ok, true);
+    const forwarded = relay.requests.filter((request) => request.url === '/api/remote-relays/tool');
+    assert.deepEqual(forwarded.map((request) => request.body.action), ['list_relays']);
+  });
+});
+
 test('a refusal from the relay reaches the model as a readable result', async () => {
   await withMcp({}, async ({ mcp }) => {
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const refused = await mcp.request('tools/call', {
-      name: 'remote_relay',
+      name: 'relay_tool',
       arguments: { action: 'list_sessions', relay: 'linux-test' },
     });
     assert.equal(refused.error, undefined, 'a refusal is a result, not a protocol error');
@@ -246,7 +259,7 @@ test('a refusal from the relay reaches the model as a readable result', async ()
     // LOCKED once the api client keeps the error body; the generic code until then.
     assert.ok(['REMOTE_RELAY_LOCKED', 'REMOTE_RELAY_CALL_FAILED'].includes(payload.code), payload.code);
 
-    const invalid = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'destroy' } });
+    const invalid = await mcp.request('tools/call', { name: 'relay_tool', arguments: { action: 'destroy' } });
     assert.equal(JSON.parse(invalid.result.content[0].text).code, 'REMOTE_RELAY_INVALID_INPUT');
   });
 });
@@ -280,13 +293,16 @@ test('protocol errors: unknown method, unknown tool, bad JSON, invalid request',
   });
 });
 
-test('without a paired remote only preview is offered and remote_relay is unknown', async () => {
+test('without a paired remote only preview is offered and relay_tool is unknown', async () => {
   await withMcp({ remoteCount: 0 }, async ({ mcp }) => {
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const listed = await mcp.request('tools/list', {});
     assert.deepEqual(listed.result.tools.map((tool) => tool.name), ['preview']);
-    const refused = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'list_relays' } });
+    const refused = await mcp.request('tools/call', { name: 'relay_tool', arguments: { action: 'list_relays' } });
     assert.equal(refused.error.code, -32602);
+    const legacy = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'list_relays' } });
+    assert.equal(legacy.error.code, -32602);
+    assert.equal(legacy.error.message, 'Unknown tool: remote_relay', 'the name the client called');
   });
 });
 
@@ -297,7 +313,7 @@ test('a host that hangs up mid-call does not keep the server alive', async () =>
       jsonrpc: '2.0',
       id: 5,
       method: 'tools/call',
-      params: { name: 'remote_relay', arguments: { action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' } },
+      params: { name: 'relay_tool', arguments: { action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' } },
     });
     const deadline = Date.now() + 5_000;
     while (!relay.requests.some((request) => request.url === '/api/remote-relays/tool')) {
@@ -333,7 +349,7 @@ test('notifications/cancelled drops the call at the relay and leaves it unanswer
       jsonrpc: '2.0',
       id: 'call-9',
       method: 'tools/call',
-      params: { name: 'remote_relay', arguments: { action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' } },
+      params: { name: 'relay_tool', arguments: { action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' } },
     });
     await waitUntil(() => relay.requests.some((request) => request.url === '/api/remote-relays/tool'), 'the call reached the relay');
     mcp.notify('notifications/cancelled', { requestId: 'call-9', reason: 'user stopped the turn' });
@@ -408,7 +424,7 @@ test('a long call sends progress when asked for it, and stops when it settles', 
     jsonrpc: '2.0',
     id: 'call-1',
     method: 'tools/call',
-    params: { name: 'remote_relay', arguments: { action: 'list_relays' }, _meta: { progressToken: 'tok-1' } },
+    params: { name: 'relay_tool', arguments: { action: 'list_relays' }, _meta: { progressToken: 'tok-1' } },
   });
   await new Promise((resolve) => setTimeout(resolve, 45));
   const progress = sent.filter((message) => message.method === 'notifications/progress');
@@ -434,7 +450,7 @@ test('a cancelled call is not answered; batches answer their requests only', asy
     jsonrpc: '2.0',
     id: 7,
     method: 'tools/call',
-    params: { name: 'remote_relay', arguments: { action: 'list_relays' } },
+    params: { name: 'relay_tool', arguments: { action: 'list_relays' } },
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(await server.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 } }), null);
@@ -466,7 +482,7 @@ test('a cancel aborts the relay request; cancelAll aborts every running call', a
     jsonrpc: '2.0',
     id,
     method: 'tools/call',
-    params: { name: 'remote_relay', arguments: { action: 'list_relays' } },
+    params: { name: 'relay_tool', arguments: { action: 'list_relays' } },
   });
 
   const first = call(1);
@@ -490,5 +506,5 @@ test('the tool list waits for the registration decision, which fails closed', as
   const undecided = createOarMcpServer({ api: async () => ({}), remoteRelay: Promise.reject(new Error('down')) });
   assert.deepEqual((await undecided.listTools()).map((tool) => tool.name), ['preview']);
   const decided = createOarMcpServer({ api: async () => ({}), remoteRelay: Promise.resolve(true) });
-  assert.deepEqual((await decided.listTools()).map((tool) => tool.name), ['remote_relay', 'preview']);
+  assert.deepEqual((await decided.listTools()).map((tool) => tool.name), ['relay_tool', 'preview']);
 });

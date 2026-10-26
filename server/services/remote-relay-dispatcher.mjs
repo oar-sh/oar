@@ -14,6 +14,7 @@ import {
   REMOTE_RELAY_LOCAL_ALIAS,
   REMOTE_RELAY_LOCAL_ID,
   REMOTE_RELAY_PROVIDERS,
+  REMOTE_RELAY_SEND_PROVIDERS,
   REMOTE_RELAY_SESSION_SETTINGS,
   formatSessionGroupList,
   isRemoteRelayApprovalQuestion,
@@ -45,7 +46,7 @@ import {
 import { RELAY_ASK_KIND, relayQuestionKind } from '../../shared/relay-asks.mjs';
 import { RELAY_ASK_REMOTE_PATHS, isMissingRelayAskRoute, relayWithoutAsksText } from './relay-ask-link-service.mjs';
 
-// The one place a `remote_relay` tool call is decided and carried out (plan
+// The one place a `relay_tool` tool call is decided and carried out (plan
 // §5.6). Every provider adapter ends up at POST /api/remote-relays/tool, whose
 // handler calls dispatch(). In order:
 //
@@ -114,7 +115,7 @@ const TITLE_MAX = 80;
 
 // The provider settings routes a relay serves; github (Copilot) has none with
 // models — its catalogue is /api/models plus /api/status defaultModel.
-const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud', 'deepseek']);
+const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud', 'deepseek', 'claude-api']);
 // A Claude Cloud session clones a GitHub repository instead of opening a
 // folder: create_session takes `repo` and `branch` for it.
 const CLOUD_PROVIDER = REMOTE_RELAY_CLOUD_PROVIDER;
@@ -141,6 +142,7 @@ const CATALOG_PROVIDER_LABELS = Object.freeze({
   grok: 'grok',
   'claude-cloud': 'claude-cloud',
   deepseek: 'deepseek',
+  'claude-api': 'claude-api',
 });
 // Worker statuses that mean "working on something right now" (scope active).
 const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);
@@ -1926,7 +1928,7 @@ export function createRemoteRelayDispatcher({
    * When the replay fails too, nobody knows; the error carries the session
    * and message id so the agent checks with wait instead of sending again.
    */
-  async function postPrompt(ctx, { session, text, origin, model, mode, effort }) {
+  async function postPrompt(ctx, { session, text, origin, model, mode, effort, billing = '' }) {
     const messageId = String(randomUUID());
     const body = {
       conversationId: session,
@@ -1937,13 +1939,18 @@ export function createRemoteRelayDispatcher({
       ...(mode ? { relayMode: mode } : {}),
       ...(effort ? { reasoningEffort: effort } : {}),
     };
+    // A Claude session moved to another billing with this message: one call,
+    // which switches and enqueues together on the target, or does neither.
+    const post = () => (billing
+      ? postBillingSwitch(ctx, session, { to: billing, by: 'agent', message: body })
+      : call(ctx, 'POST', '/api/message', { body }));
     let sent;
     try {
-      sent = await call(ctx, 'POST', '/api/message', { body });
+      sent = await post();
     } catch (error) {
       if (!isTransientRemoteError(error)) throw error;
       try {
-        sent = await call(ctx, 'POST', '/api/message', { body });
+        sent = await post();
       } catch (retryError) {
         if (isOwnDuplicateMessage(retryError, messageId)) return { duplicate: false, messageId };
         if (!isTransientRemoteError(retryError)) throw retryError;
@@ -1967,6 +1974,36 @@ export function createRemoteRelayDispatcher({
       messageId: toText(sent?.messageId) || messageId,
       effort: normalizeEffort(sent?.selectedReasoningEffort),
     };
+  }
+
+  /**
+   * POST /api/conversation/:id/billing with a message. A relay older than the
+   * switch answers 404 without a code: nothing was switched or sent. Its
+   * refusals (the billing not set up there, the model, the cap, the
+   * history) keep the remote's words.
+   */
+  async function postBillingSwitch(ctx, session, body) {
+    try {
+      return await call(ctx, 'POST', sessionPath(session, '/billing'), { body });
+    } catch (error) {
+      if (isTransientRemoteError(error)) throw error;
+      const remoteCode = toText(error?.remoteBody?.code);
+      const label = body.to === 'claude-api' ? 'the API key' : 'the subscription';
+      if (Number(error?.status) === 404 && !remoteCode) {
+        throw new DispatchFailure(409, REMOTE_RELAY_ERROR_CODES.unsupported,
+          `Relay "${ctx.relay.name}" cannot switch a session's billing (it runs an OAR from before the switch); nothing was sent. Send without provider to keep the session's billing.`,
+          { session });
+      }
+      const remoteText = toText(error?.remoteBody?.error) || toText(error?.message);
+      const code = remoteCode === 'CLAUDE_BILLING_MODEL_UNAVAILABLE'
+        ? REMOTE_RELAY_ERROR_CODES.unknownModel
+        : (['CLAUDE_API_NOT_CONFIGURED', 'CLAUDE_NOT_CONFIGURED', 'CLAUDE_API_CAP_REACHED'].includes(remoteCode)
+          ? REMOTE_RELAY_ERROR_CODES.providerUnavailable
+          : (Number(error?.status) === 404 ? REMOTE_RELAY_ERROR_CODES.notFound : REMOTE_RELAY_ERROR_CODES.invalidInput));
+      throw new DispatchFailure(Number(error?.status) || 409, code,
+        `Relay "${ctx.relay.name}" did not switch session ${session} to ${label}: ${remoteText || 'refused'}. Nothing was sent.`,
+        { session, ...(remoteCode ? { remoteCode } : {}) });
+    }
   }
 
   /**
@@ -2090,10 +2127,19 @@ export function createRemoteRelayDispatcher({
     }
     const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
     const provider = toText(runtime.providerType).toLowerCase() || 'github';
+    // `provider` on a send is a Claude session's billing: the subscription
+    // or the API key. The other one switches the session with this message.
+    const billing = toText(args.provider).toLowerCase();
+    if (billing && !REMOTE_RELAY_SEND_PROVIDERS.includes(provider)) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+        `Session ${session} on relay "${ctx.relay.name}" runs on ${provider}: provider on send switches a Claude session's billing only. Nothing was sent.`,
+        { session, provider });
+    }
+    const switchTo = billing && billing !== provider ? billing : '';
     // Checked before any approval card (runRelayAction) when the session
-    // could be read there; here otherwise.
+    // could be read there; here otherwise. Against the billing it moves to.
     const settled = args.model
-      ? (ctx.settledModel || await settleSendModel(ctx, conversation, args.model))
+      ? (ctx.settledModel || await settleSendModel(ctx, conversation, args.model, { provider: billing }))
       : null;
     const requestedModel = settled?.model || '';
     const modelNote = settled?.note || null;
@@ -2110,16 +2156,25 @@ export function createRemoteRelayDispatcher({
     const requested = normalizeEffort(args.effort) || normalizeEffort(settled?.effort);
     const own = requested ? '' : normalizeEffort(conversation?.preferredReasoningEffort);
     const origin = await buildOrigin(ctx);
-    const { sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model, mode }, {
+    const { sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model, mode, billing: switchTo }, {
       effort: requested || own,
       source: requested ? EFFORT_SOURCES.requested : (own ? EFFORT_SOURCES.remote : ''),
       note: null,
     });
+    const billingNote = switchTo
+      ? `Session ${session} now runs on ${switchTo === 'claude-api' ? 'the API key' : 'the subscription'}, from this message on (a running turn finishes on the old billing).`
+      : '';
     return deliverAndWait('send', ctx, {
       session,
       sent,
       waitSeconds: args.wait_seconds,
-      extra: { ...(modelNote ? { modelNote } : {}), ...effortResult(choice) },
+      extra: {
+        ...(modelNote ? { modelNote } : {}),
+        ...(billing && REMOTE_RELAY_SEND_PROVIDERS.includes(provider) ? { provider: switchTo || provider } : {}),
+        ...(switchTo ? { billingSwitched: true } : {}),
+        ...effortResult(choice),
+        ...(billingNote ? { note: [effortResult(choice).note, billingNote].filter(Boolean).join(' ') } : {}),
+      },
     });
   }
 
@@ -2178,9 +2233,11 @@ export function createRemoteRelayDispatcher({
   }
 
   /** settleRequestedModel for a send to `conversation` (its detail payload); an unread catalogue leaves it unchecked. */
-  async function settleSendModel(ctx, conversation, requested) {
+  async function settleSendModel(ctx, conversation, requested, { provider: billing = '' } = {}) {
     const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
-    const provider = toText(runtime.providerType).toLowerCase() || 'github';
+    const own = toText(runtime.providerType).toLowerCase() || 'github';
+    // A Claude session moving to its other billing takes that billing's list.
+    const provider = billing && REMOTE_RELAY_SEND_PROVIDERS.includes(own) ? billing : own;
     let catalog = null;
     try {
       catalog = await loadCatalog(ctx);
@@ -3711,7 +3768,7 @@ export function createRemoteRelayDispatcher({
           }
         } else {
           const conversation = await call(early, 'GET', sessionPath(args.session), { query: { limit: 1 } });
-          settledModel = await settleSendModel(early, conversation, args.model);
+          settledModel = await settleSendModel(early, conversation, args.model, { provider: args.provider });
         }
       } catch (error) {
         if (error instanceof DispatchFailure) {
@@ -3721,6 +3778,18 @@ export function createRemoteRelayDispatcher({
         catalog = null;
         settledModel = null;
       }
+    }
+    // The card names a billing switch only when the send makes one: a
+    // provider that is already the session's billing changes nothing. Read
+    // off the target before anyone is asked; a target that cannot be read
+    // keeps the line (the send itself then answers).
+    let cardArgs = args;
+    if (action === 'send' && args.provider) {
+      try {
+        const conversation = await call({ relay, caller, hops, conversationId, signal }, 'GET', sessionPath(args.session), { query: { limit: 1 } });
+        const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
+        if (toText(runtime.providerType).toLowerCase() === args.provider) cardArgs = { ...args, provider: undefined };
+      } catch {}
     }
     // What an update_session would change, settled on the target before
     // anyone is asked: an unknown model or group, a busy session or a change
@@ -3788,7 +3857,7 @@ export function createRemoteRelayDispatcher({
           callerContext: caller,
           relay: relayTarget(relay),
           action,
-          args,
+          args: cardArgs,
           summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
           signal,
           agentPrompts: agentPrompts(conversationId).count,
@@ -3810,7 +3879,7 @@ export function createRemoteRelayDispatcher({
           callerContext: caller,
           relay: relayTarget(relay),
           action,
-          args,
+          args: cardArgs,
           summary: summarizeRemoteRelayCall({ action, ...args, relay: relay.name }),
           signal,
           ...(group ? { group } : {}),

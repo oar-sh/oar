@@ -108,6 +108,9 @@ export function createSessionWorkerWebSocketService({
   onDeliverySendFailed = async () => {},
   onWorkerSocketClosed = async () => {},
   requestWork = async () => null,
+  // A worker stated its kind ("claude", "claude-api", ...) in a hello or a
+  // ready: (sessionId, kind, pid). The registry keeps it.
+  onWorkerKind = () => {},
   // Liveness probe for a socket's worker process. A killed worker's socket
   // survives its process by an event-loop turn (the kill path blocks the loop,
   // so this service's timer runs before the socket close lands), and asking for
@@ -233,6 +236,15 @@ export function createSessionWorkerWebSocketService({
     }
   }
 
+  // The kind a hello or ready states, kept on the socket (a process does not
+  // change kind) and reported once per change.
+  function noteWorkerKind(meta, payload) {
+    const kind = String(payload?.kind || '').trim().toLowerCase();
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(kind) || meta.workerKind === kind) return;
+    meta.workerKind = kind;
+    try { onWorkerKind(meta.sessionId, kind, meta.pid); } catch {}
+  }
+
   function noteHeartbeat(meta, reason = 'worker-message') {
     if (!meta?.sessionId) return;
     try {
@@ -258,6 +270,9 @@ export function createSessionWorkerWebSocketService({
         sessionId: meta.sessionId,
         pid: meta.pid,
         reason,
+        // What this socket's worker said it is: a Claude chat's row goes only
+        // to a worker of its billing.
+        workerKind: meta.workerKind || null,
       });
       touchCli();
       if (!pending || typeof pending !== 'object') return false;
@@ -404,6 +419,7 @@ export function createSessionWorkerWebSocketService({
       if (payload.type === 'worker.hello') {
         if (!bindSocketIdentity(ws, meta, payload)) return;
         meta.lastSeenAtMs = nowMsSafe();
+        noteWorkerKind(meta, payload);
         // A worker holding deliveries (open question card, compaction) binds
         // its identity with hello but must not be handed work.
         meta.ready = payload.ready !== false;
@@ -423,6 +439,7 @@ export function createSessionWorkerWebSocketService({
       if (payload.type === 'worker.ready') {
         if (!bindSocketIdentity(ws, meta, payload)) return;
         meta.lastSeenAtMs = nowMsSafe();
+        noteWorkerKind(meta, payload);
         meta.ready = true;
         meta.lastReadyAt = nowIso();
         noteHeartbeat(meta, String(payload.reason || 'worker-ready'));

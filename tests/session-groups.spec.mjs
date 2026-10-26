@@ -8,7 +8,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  * Session groups in the sidebar, on a desktop and on a phone viewport, each
  * against a relay of its own (the agent-sessions setting is switched on):
  *
- *  - a session an agent creates with the remote_relay tool sits under the
+ *  - a session an agent creates with the relay_tool tool sits under the
  *    session that created it: the head row with a fold button and a pill that
  *    sums up the members, the members indented, open while a member works;
  *  - the fold is the user's and survives a reload; a waiting card in a folded

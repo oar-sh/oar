@@ -560,3 +560,12 @@ test('a runtime still starting at shutdown is disposed once it is up', async () 
   assert.equal(counters.clientCreations, 1);
   assert.equal(counters.clientDisposals, 1);
 });
+
+test('the importer reads the Copilot runtime\'s sessions only, never Claude Code transcripts (they bypass redaction)', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('./sdk-session-import-service.mjs', import.meta.url), 'utf8');
+  // Claude chat content reaches the database only through worker posts, which
+  // the relay redacts. An importer of ~/.claude transcripts would have to
+  // redact the saved keys itself.
+  assert.doesNotMatch(source, /\.claude|claude-session-root|projects\//);
+});

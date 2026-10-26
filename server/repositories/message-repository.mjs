@@ -15,6 +15,8 @@ export function createMessageRepository(db) {
     // worker, so it neither keeps one warm nor counts as queued.
     const queueHasUsageLimitPause = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'usage_limit_pause');
+    const queueHasProvider = db.prepare(`PRAGMA table_info(queue)`).all()
+        .some((column) => column.name === 'provider');
     const notHeldForUsageLimit = (alias = '') => (queueHasUsageLimitPause
         ? `AND NOT (${alias}usage_limit_pause IS NOT NULL AND ${alias}status = 'pending' AND ${alias}next_attempt_at IS NOT NULL AND ${alias}next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
         : '');
@@ -351,6 +353,11 @@ export function createMessageRepository(db) {
           WHERE id = ?
         `),
         setQueueRuntimeSession: db.prepare(`UPDATE queue SET runtime_session_id = ? WHERE id = ?`),
+        // The billing a row runs on (migration 0031): a continuation is the
+        // kind of the worker whose CLI started it, whatever the chat's now.
+        setQueueProvider: queueHasProvider
+          ? db.prepare(`UPDATE queue SET provider = ? WHERE id = ?`)
+          : null,
         setQueueResponseMessageId: db.prepare(`UPDATE queue SET response_message_id = ? WHERE id = ?`),
         // Legacy (unfenced) finalization keeps 'pending' in the set so a
         // response landing after a stale-sweep requeue still finalizes; fenced

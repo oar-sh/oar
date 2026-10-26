@@ -153,3 +153,62 @@ test('a time on another day names the day', () => {
   assert.ok(ui.formatUsageLimitTime(later, now).endsWith(`, ${new Date(later).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`));
   assert.equal(ui.formatUsageLimitTime('', now), '');
 });
+
+const billing = (overrides = {}) => ({
+  provider: 'claude',
+  pending: null,
+  switchable: { to: 'claude-api', allowed: true, code: null, reason: null },
+  ...overrides,
+});
+
+test('a paused subscription chat that may move to the key offers Switch this chat to API key', () => {
+  ui.setUsageLimitConversation(CONV, { pause: pauseFor(CONV), providerType: 'claude', billing: billing() });
+  assert.deepEqual(buttons(), ['Resume now', 'Switch this chat to API key', 'Cancel']);
+  assert.equal(ui.usageLimitSwitchOffered(CONV), true);
+});
+
+test('no switch button when the relay says the switch is not allowed, or the chat is a cloud one', () => {
+  ui.setUsageLimitConversation(CONV, {
+    pause: pauseFor(CONV),
+    providerType: 'claude',
+    billing: billing({ switchable: { to: 'claude-api', allowed: false, code: 'CLAUDE_API_CAP_REACHED', reason: 'cap' } }),
+  });
+  assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
+  ui.setUsageLimitConversation(CONV, { pause: pauseFor(CONV), providerType: 'claude-cloud', billing: billing() });
+  assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
+  // An older relay sends no billing: no button.
+  ui.setUsageLimitConversation(OTHER, { pause: pauseFor(OTHER), providerType: 'claude' });
+  assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
+});
+
+test('the socket\'s billing turns the offer on and off; a refused send teaches the page the new billing', () => {
+  ui.setUsageLimitConversation(CONV, { pause: pauseFor(CONV), providerType: 'claude', billing: null });
+  assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
+  ui.applyConversationBilling({ conversationId: CONV, billing: billing() });
+  assert.deepEqual(buttons(), ['Resume now', 'Switch this chat to API key', 'Cancel']);
+  assert.equal(ui.knownConversationBilling(CONV), 'claude');
+  ui.noteConversationBilling(CONV, 'claude-api');
+  assert.equal(ui.knownConversationBilling(CONV), 'claude-api');
+  assert.equal(ui.usageLimitSwitchOffered(CONV), false);
+  ui.noteConversationBilling(CONV, 'deepseek');
+  assert.equal(ui.knownConversationBilling(CONV), 'claude-api');
+});
+
+test('at the Claude API cap the paused chat says why it cannot move to the key', () => {
+  ui.setUsageLimitConversation(CONV, {
+    pause: pauseFor(CONV),
+    providerType: 'claude',
+    billing: billing({ switchable: { to: 'claude-api', allowed: false, code: 'CLAUDE_API_CAP_REACHED', reason: 'cap' } }),
+  });
+  assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
+  assert.match(banner().querySelector('.usage-limit-switch-blocked').textContent, /monthly|cap is reached/);
+  assert.match(ui.usageLimitSwitchBlockedText(CONV), /Claude API cap is reached/);
+  // Claude API off or without a key: no line, as before.
+  ui.setUsageLimitConversation(CONV, {
+    pause: pauseFor(CONV),
+    providerType: 'claude',
+    billing: billing({ switchable: { to: 'claude-api', allowed: false, code: 'CLAUDE_API_NOT_CONFIGURED', reason: 'off' } }),
+  });
+  assert.equal(banner().querySelector('.usage-limit-switch-blocked'), null);
+  assert.equal(ui.usageLimitSwitchBlockedText(CONV), '');
+});

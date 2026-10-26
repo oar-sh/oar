@@ -15,7 +15,7 @@ import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { registerConversationGroupRoutes } from './conversation-group-routes.mjs';
 
-// PATCH /api/conversation/:id/settings (the remote_relay tool's
+// PATCH /api/conversation/:id/settings (the relay_tool tool's
 // update_session) and the owner's "agents in this conversation may start
 // sessions" on PATCH …/preferences, against the REAL schema. Relay names,
 // titles and folders are fictional.

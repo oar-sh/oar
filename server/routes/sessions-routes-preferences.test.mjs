@@ -356,3 +356,29 @@ test('the context payload reports the running CLI\'s window, why a change waits,
   assert.equal(legacy.body.activeAutoCompactWindow, null);
   assert.equal(legacy.body.autoCompactWindowDeferred, null);
 });
+
+test('a Claude API session\'s context is a Claude one\'s: the stored breakdown, the running window, the folder\'s attribution', async () => {
+  const { db, stmts, patch, getContext, sessionWorkerRegistry } = setup();
+  db.prepare(`
+    INSERT INTO runtime_sessions (id, conversation_id, sdk_session_id, runtime_key, provider_type, provider_model, created_at, last_used_at)
+    VALUES ('rs-1', ?, ?, 'rk-1', 'claude-api', 'claude-opus-5', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+  `).run(CONV, CONV);
+  stmts.updateRuntimeSessionContextUsage.run(JSON.stringify({
+    model: 'claude-opus-5',
+    contextUsage: { totalTokens: 60900, maxTokens: 200000, rawMaxTokens: 200000, categories: [] },
+    modelUsage: { 'claude-opus-5': { inputTokens: 1, outputTokens: 1, contextWindow: 200000 } },
+  }), '2026-01-01T00:00:00.000Z', CONV);
+  await patch({ clientId: 'client-a', autoCompactWindow: 150000 });
+  sessionWorkerRegistry.upsertWorker({
+    sdkSessionId: CONV,
+    status: 'ready',
+    steering: { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: { active: 100000, backgroundWork: false } },
+  });
+
+  const context = await getContext();
+  assert.equal(context.body.providerType, 'claude-api');
+  assert.equal(context.body.snapshot.max_context_tokens, 200000);
+  assert.equal(context.body.activeAutoCompactWindow, 100000);
+  assert.equal(context.body.autoCompactWindowDeferred, 'next-message');
+  assert.equal('attribution' in context.body, true);
+});

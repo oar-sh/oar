@@ -16,6 +16,7 @@ import {
   claudeUltracodeFlagSettings,
   createCanUseTool,
   longCommandInstructionText,
+  mergeSpawnSettings,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
   startClaudeSession,
@@ -114,7 +115,7 @@ test('an injected api registers the relay MCP server carrying the preview tool',
   assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, enabled: true, previews: [] });
 });
 
-test('the relay MCP server carries remote_relay only when the worker registered it', async () => {
+test('the relay MCP server carries relay_tool only when the worker registered it', async () => {
   const calls = [];
   const capture = (remoteRelayTool) => {
     let captured = null;
@@ -136,9 +137,9 @@ test('the relay MCP server carries remote_relay only when the worker registered 
   assert.deepEqual(Object.keys(capture(false).instance._registeredTools), ['preview']);
   const server = capture(true);
   const registered = server.instance._registeredTools;
-  assert.deepEqual(Object.keys(registered), ['preview', 'remote_relay']);
+  assert.deepEqual(Object.keys(registered), ['preview', 'relay_tool']);
 
-  const result = await registered.remote_relay.handler({ action: 'list_relays' }, {});
+  const result = await registered.relay_tool.handler({ action: 'list_relays' }, {});
   assert.deepEqual(calls, [{
     method: 'POST',
     routePath: '/api/remote-relays/tool',
@@ -147,7 +148,7 @@ test('the relay MCP server carries remote_relay only when the worker registered 
   assert.deepEqual(JSON.parse(result.content[0].text), { ok: true, relays: [] });
 });
 
-test('the relay MCP server pins its own tool-call timeout above any remote_relay wait', () => {
+test('the relay MCP server pins its own tool-call timeout above any relay_tool wait', () => {
   let captured = null;
   startClaudeSession({
     content: null,
@@ -587,7 +588,8 @@ test('the blanks of a backend\'s live flag settings go on the command line too, 
   assert.equal(JSON.stringify(settings).includes('sk-test-0000'), false);
   assert.equal(JSON.stringify(settings).includes('127.0.0.1'), false);
 
-  // Live settings without a blank leave the spawn's settings alone.
+  // Live settings without a blank leave the spawn's settings alone: here only
+  // the backend's own.
   const plain = liveFlagQuery();
   startClaudeSession({
     content: null,
@@ -596,11 +598,12 @@ test('the blanks of a backend\'s live flag settings go on the command line too, 
     backend: await liveFlagBackend({ env: { ANTHROPIC_AUTH_TOKEN: 'sk-test-0000' } }),
     queryImpl: plain.queryImpl,
   });
-  assert.equal('settings' in plain.captured.options, false);
+  assert.deepEqual(plain.captured.options.settings, { disableAllHooks: true });
 });
 
 test('the DeepSeek pins are built from the CLI\'s environment, and only their blanks reach the command line', async () => {
-  const { createDeepSeekClaudeBackend, DEEPSEEK_CLI_PINNED_ENV } = await import('../deepseek-worker/deepseek-claude-backend.mjs');
+  const { createDeepSeekClaudeBackend } = await import('../deepseek-worker/deepseek-claude-backend.mjs');
+  const { CLAUDE_CLI_PINNED_ENV } = await import('./claude-cli-pinned-env.mjs');
   const backend = createDeepSeekClaudeBackend({
     env: {
       DEEPSEEK_API_KEY: 'sk-test-0000',
@@ -625,14 +628,15 @@ test('the DeepSeek pins are built from the CLI\'s environment, and only their bl
   assert.equal(live.env.https_proxy, 'http://127.0.0.1:3128');
   assert.equal(live.env.HTTPS_PROXY, process.env.HTTPS_PROXY ?? 'http://127.0.0.1:3128');
   assert.equal(live.env.ANTHROPIC_AUTH_TOKEN, 'sk-test-0000');
-  // On the command line: every blank pin and nothing with a value.
+  // On the command line: no hooks, every blank pin and nothing with a value.
+  assert.equal(settings.disableAllHooks, true);
   assert.equal(settings.apiKeyHelper, '');
   assert.deepEqual(
     Object.keys(settings.env).sort(),
     Object.entries(live.env).filter(([, value]) => value === '').map(([name]) => name).sort(),
   );
   assert.ok(Object.keys(settings.env).length > 50);
-  assert.ok(Object.keys(settings.env).every((name) => DEEPSEEK_CLI_PINNED_ENV.includes(name)));
+  assert.ok(Object.keys(settings.env).every((name) => CLAUDE_CLI_PINNED_ENV.includes(name)));
   assert.ok(Object.values(settings.env).every((value) => value === ''));
   for (const value of ['sk-test-0000', '127.0.0.1']) assert.equal(JSON.stringify(settings).includes(value), false, value);
 });
@@ -873,4 +877,93 @@ test('a backend builds the CLI environment and maps the model and effort into it
   });
   assert.equal(captured.options.settings?.ultracode, undefined);
   assert.equal(captured.options.effort, 'max');
+});
+
+test('mergeSpawnSettings adds a backend\'s settings on top and merges env by name', () => {
+  assert.equal(mergeSpawnSettings(null, null), null);
+  assert.equal(mergeSpawnSettings(null, {}), null);
+  const own = { autoCompactWindow: 400_000, alwaysThinkingEnabled: true };
+  assert.equal(mergeSpawnSettings(own, null), own);
+  assert.equal(mergeSpawnSettings(own, {}), own);
+  assert.deepEqual(mergeSpawnSettings(null, { apiKeyHelper: '' }), { apiKeyHelper: '' });
+  assert.deepEqual(
+    mergeSpawnSettings({ ...own, env: { KEEP: '1', CLASH: 'relay' } }, { env: { CLASH: 'backend' }, apiKeyHelper: '' }),
+    { ...own, env: { KEEP: '1', CLASH: 'backend' }, apiKeyHelper: '' },
+  );
+});
+
+test('the Claude API backend changes the environment and adds its settings pins, nothing else', async () => {
+  const { createClaudeApiClaudeBackend } = await import('../claude-api-worker/claude-api-backend.mjs');
+  const backend = createClaudeApiClaudeBackend({ env: { OAR_CLAUDE_API_KEY: 'sk-ant-api03-test-0000' } });
+  const spawn = (extra) => {
+    let captured = null;
+    startClaudeSession({
+      content: null,
+      cwd: '/tmp',
+      model: 'claude-opus-5-5[1m]',
+      reasoningEffort: CLAUDE_ULTRACODE_EFFORT,
+      autoCompactWindow: 400_000,
+      thinkingEnabled: true,
+      relayMode: 'plan',
+      queryImpl: (params) => { captured = params; return {}; },
+      ...extra,
+    });
+    return captured.options;
+  };
+  const plain = spawn({});
+  const api = spawn({ backend });
+  // The model, the effort (ultracode included), the mode and the relay's
+  // settings are Claude's, exactly as without a backend.
+  assert.equal(api.model, 'claude-opus-5-5[1m]');
+  assert.equal(api.model, plain.model);
+  assert.equal(api.effort, plain.effort);
+  assert.equal(api.effort, 'xhigh');
+  assert.equal(api.permissionMode, 'plan');
+  const { env: pins, apiKeyHelper, disableAllHooks, ...relaySettings } = api.settings;
+  assert.deepEqual(relaySettings, plain.settings);
+  assert.equal(relaySettings.ultracode, true);
+  // No hooks run in an API-key chat; a subscription chat keeps them.
+  assert.equal(disableAllHooks, true);
+  assert.equal('disableAllHooks' in plain.settings, false);
+  // The pins: the endpoint, a blank bearer token, a blank key helper and the
+  // blanks of the routing and trust pins. The key is not among them (the
+  // settings layer is a CLI argument), nor any pin with a value.
+  const live = backend.liveFlagSettings(api.env);
+  assert.deepEqual(pins, {
+    ...Object.fromEntries(Object.entries(live.env).filter(([, value]) => value === '')),
+    ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+  });
+  assert.ok(Object.keys(pins).length > 50);
+  assert.equal(pins.ANTHROPIC_AUTH_TOKEN, '');
+  assert.equal(pins.CLAUDE_CODE_USE_BEDROCK, '');
+  assert.equal(apiKeyHelper, '');
+  assert.equal(JSON.stringify(api.settings).includes('sk-ant-api03-test-0000'), false);
+  // The key is in the environment, under the CLI's name only.
+  assert.equal(api.env.ANTHROPIC_API_KEY, 'sk-ant-api03-test-0000');
+  assert.equal(api.env.ANTHROPIC_BASE_URL, 'https://api.anthropic.com');
+  assert.equal('OAR_CLAUDE_API_KEY' in api.env, false);
+  // Without a backend nothing of it is there: no env option, no pins.
+  assert.equal('env' in plain, false);
+  assert.equal('env' in plain.settings, false);
+  assert.equal('apiKeyHelper' in plain.settings, false);
+  // Nothing else of the options differs.
+  const rest = (options) => {
+    const { env, settings, ...others } = options;
+    return JSON.stringify(others, (key, value) => (typeof value === 'function' ? 'fn' : value));
+  };
+  assert.equal(rest(api), rest(plain));
+
+  // The key goes into the same layer over the control channel, before the
+  // first message, so a settings file's ANTHROPIC_API_KEY cannot replace it.
+  const fake = liveFlagQuery();
+  const turn = startClaudeSession({ content: 'hi', cwd: '/tmp', model: 'claude-opus-5-5', backend, queryImpl: fake.queryImpl });
+  await tick();
+  assert.deepEqual(fake.applied, [backend.liveFlagSettings(fake.captured.options.env)]);
+  assert.equal(fake.applied[0].env.ANTHROPIC_API_KEY, 'sk-ant-api03-test-0000');
+  assert.equal(fake.applied[0].env.ANTHROPIC_AUTH_TOKEN, '');
+  assert.equal(fake.applied[0].apiKeyHelper, '');
+  assert.equal(JSON.stringify(fake.captured.options.settings).includes('sk-ant-api03-test-0000'), false);
+  fake.settle.resolve();
+  assert.equal(await turn.liveFlagSettingsApplied, true);
+  turn.endInput();
 });

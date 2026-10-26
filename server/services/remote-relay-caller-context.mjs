@@ -118,6 +118,13 @@ function describeRemoteTurn(action, args, caller, group = null) {
     const provider = requested || (REMOTE_RELAY_PROVIDERS.includes(callerProvider) ? callerProvider : 'github');
     parts.push(`Provider: ${provider}`);
   }
+  // A send that names a Claude billing moves the session to it with the
+  // message: who pays for its turns changes, so the card says so.
+  if (action === 'send') {
+    const billing = toText(args.provider).toLowerCase();
+    if (billing === 'claude-api') parts.push('Switches billing to API key');
+    else if (billing === 'claude') parts.push('Switches billing to subscription');
+  }
   if (toText(args.model)) parts.push(`Model: ${excerpt(args.model)}`);
   if (toText(args.cwd)) parts.push(`Folder: ${excerpt(args.cwd)}`);
   if (action === 'create_session') {

@@ -382,3 +382,13 @@ test('the fake clock refuses a timer that re-arms without progress instead of ha
   rearm();
   assert.throws(() => clock.advance(MIN), /re-arms without progress/);
 });
+
+test('a schedule set before a billing switch fires on the chat\'s billing of then (the queue stamps it)', () => {
+  const { db, service, clock } = setup();
+  service.create({ conversationId: AGENT, createdBy: AGENT, text: 'Run the nightly report.', at: iso(T0 + 30 * MIN), title: 'Nightly' });
+  // The chat moves to the API key before the schedule comes due.
+  db.prepare(`UPDATE runtime_sessions SET provider_type = 'claude-api' WHERE conversation_id = ?`).run(AGENT);
+  clock.advance(30 * MIN);
+  const [message] = scheduledMessages(db, AGENT);
+  assert.equal(db.prepare(`SELECT provider FROM queue WHERE id = ?`).get(message.id).provider, 'claude-api');
+});

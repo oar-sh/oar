@@ -950,7 +950,7 @@ test('the extension-engine MCP config registers the OAR server the way the CLI e
           COPILOT_WEB_RELAY_ROOT: '/srv/oar',
         },
         tools: ['*'],
-        // The CLI's own per-call default is 180 s: far below one remote_relay wait.
+        // The CLI's own per-call default is 180 s: far below one relay_tool wait.
         timeout: OAR_MCP_TOOL_TIMEOUT_MS,
       },
     },

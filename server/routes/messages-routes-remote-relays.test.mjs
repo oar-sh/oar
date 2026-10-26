@@ -60,7 +60,7 @@ const ORIGIN = {
 };
 
 const LINUX_HINT = '<system_reminder>The user mentioned the remote OAR relay "linux-test" (online, OAR 0.9.4). '
-  + 'The remote_relay tool can list, read, prompt and create sessions there.</system_reminder>';
+  + 'The relay_tool tool can list, read, prompt and create sessions there.</system_reminder>';
 
 function seedConversation(db) {
   db.prepare(`
@@ -263,7 +263,7 @@ test('the plain name and the URL host unlock too; this relay\'s own name does no
 
   const second = await fx.send('and check https://relay-c.example.test/status');
   assert.equal(second.status, 200);
-  assert.match(fx.queueRow(second.body.messageId).text, /"lab-relay" \(offline\)\. The remote_relay tool/);
+  assert.match(fx.queueRow(second.body.messageId).text, /"lab-relay" \(offline\)\. The relay_tool tool/);
 
   const own = await fx.send('this runs on win-test itself');
   assert.equal(own.status, 200);

@@ -12,7 +12,7 @@ export function composerPlaceholderFor({ modelId = '', providerType = '' } = {})
   const provider = String(providerType || '').trim().toLowerCase();
   const id = String(modelId || '').trim().toLowerCase().replace(/\[[^\]]*\]$/, '');
   const providerFallback = () => {
-    if (provider === 'claude' || provider === 'claude-cloud') return 'Message Claude…';
+    if (provider === 'claude' || provider === 'claude-api' || provider === 'claude-cloud') return 'Message Claude…';
     if (provider === 'grok') return 'Message Grok…';
     if (provider === 'openai' || provider === 'openai-byok') return 'Message OpenAI…';
     if (provider === 'cursor') return 'Message Cursor…';
@@ -193,6 +193,22 @@ export function normalizeModelSelectorOptions(models = [], {
     const suffix = option.value === normalizedAuto ? '' : String(suffixFor(option.value) || '');
     return { value: option.value, label: `${label}${suffix}` };
   });
+}
+
+/**
+ * `humanizeModelLabel` for a list of ids, where two ids that would read the
+ * same (two dated snapshots of one model) keep their ids instead: a Map of
+ * id → label.
+ */
+export function distinctModelLabels(modelIds = []) {
+  const ids = (Array.isArray(modelIds) ? modelIds : []).map((id) => String(id || '').trim()).filter(Boolean);
+  const labels = new Map(ids.map((id) => [id, humanizeModelLabel(id) || id]));
+  const counts = new Map();
+  for (const label of labels.values()) counts.set(label, (counts.get(label) || 0) + 1);
+  for (const [id, label] of labels) {
+    if (counts.get(label) > 1) labels.set(id, id);
+  }
+  return labels;
 }
 
 /**

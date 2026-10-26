@@ -358,7 +358,7 @@ export class AcpClient extends EventEmitter {
    * `holdStall` (async, optional) is asked once the inactivity window has run
    * out: `true` re-arms the full window instead of failing the prompt. It is
    * for work the agent is blocked on that this client cannot see — a
-   * remote_relay call the agent runs through its MCP server, which the relay
+   * relay_tool call the agent runs through its MCP server, which the relay
    * reports as in flight. A question that fails or takes longer than
    * `holdCheckTimeoutMs` counts as `false`.
    *

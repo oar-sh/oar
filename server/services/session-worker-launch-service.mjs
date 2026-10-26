@@ -312,6 +312,34 @@ export function applyDeepSeekProviderEnvironment(env = {}, {
 }
 
 /**
+ * Claude API: the Claude worker's runner on an API key from the Claude
+ * Console instead of the host's subscription login
+ * (server/claude-api-worker/). The key travels as OAR_CLAUDE_API_KEY, through
+ * the secret file under tmux, and becomes the CLI's ANTHROPIC_API_KEY only
+ * inside its spawn environment (claude-api-backend.mjs). The worker shares the
+ * host's Claude Code state directory with the Claude provider: transcripts,
+ * resume and task output are found where a Claude chat's are.
+ */
+export function applyClaudeApiProviderEnvironment(env = {}, {
+  enabled = false,
+  model = '',
+  apiKey = '',
+} = {}) {
+  const next = { ...env };
+  if (resolveWorkerKind(next) === 'claude-api') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
+  delete next.CLAUDE_API_RELAY_MODEL;
+  delete next.OAR_CLAUDE_API_KEY;
+  if (!enabled) return next;
+  const normalizedApiKey = normalizeText(apiKey);
+  if (!normalizedApiKey) throw new Error('claude-api-key-not-configured');
+  next.COPILOT_WEB_RELAY_WORKER_KIND = 'claude-api';
+  next.OAR_CLAUDE_API_KEY = normalizedApiKey;
+  const normalizedModel = normalizeText(model);
+  if (normalizedModel) next.CLAUDE_API_RELAY_MODEL = normalizedModel;
+  return next;
+}
+
+/**
  * The Copilot SDK engine: the same `github`/`openai` providers the extension
  * serves, run as a plain Node worker against the CLI's headless runtime.
  *
@@ -404,6 +432,10 @@ export function isDeepSeekWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'deepseek';
 }
 
+export function isClaudeApiWorkerEnvironment(env = {}) {
+  return resolveWorkerKind(env) === 'claude-api';
+}
+
 export function isCopilotSdkWorkerEnvironment(env = {}) {
   return resolveWorkerKind(env) === 'copilot-sdk';
 }
@@ -458,6 +490,16 @@ export function resolveDeepSeekWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'deepseek-worker', 'deepseek-session-worker.mjs');
 }
 
+export function resolveClaudeApiWorkerScriptPath(env = {}) {
+  const explicit = normalizeText(env?.COPILOT_WEB_RELAY_CLAUDE_API_WORKER_PATH);
+  if (explicit) return explicit;
+  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
+  if (repoRoot) return path.join(repoRoot, 'server', 'claude-api-worker', 'claude-api-session-worker.mjs');
+  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
+  if (serverDir) return path.join(serverDir, 'claude-api-worker', 'claude-api-session-worker.mjs');
+  return path.join(process.cwd(), 'server', 'claude-api-worker', 'claude-api-session-worker.mjs');
+}
+
 export function resolveCopilotSdkWorkerScriptPath(env = {}) {
   const explicit = normalizeText(env?.COPILOT_WEB_RELAY_COPILOT_SDK_WORKER_PATH);
   if (explicit) return explicit;
@@ -487,6 +529,10 @@ const NODE_WORKER_DESCRIPTORS = Object.freeze({
     windowsTitle: 'Copilot SDK Worker',
   }),
   deepseek: Object.freeze({ resolveScriptPath: resolveDeepSeekWorkerScriptPath, windowsTitle: 'DeepSeek Worker' }),
+  'claude-api': Object.freeze({
+    resolveScriptPath: resolveClaudeApiWorkerScriptPath,
+    windowsTitle: 'Claude API Worker',
+  }),
 });
 
 function resolveNodeWorkerDescriptor(env = {}) {
@@ -525,7 +571,7 @@ function buildPosixWorkerLaunchCommand(targetSessionId, env = {}, extraCliArgs =
 // Server entry shape (the CLI's own `copilot mcp add` writes the same):
 // `{ type: 'local', command, args, env, tools: ['*'], timeout }`. `timeout` is
 // the per-call limit in ms; without it the CLI cuts a tool call off at 180 s,
-// shorter than one remote_relay wait.
+// shorter than one relay_tool wait.
 
 export function resolveOarMcpServerScriptPath(env = {}, { pathImpl = path } = {}) {
   const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
@@ -662,6 +708,7 @@ export const WORKER_SECRET_ENV_VARS = Object.freeze([
   'CURSOR_API_KEY',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'DEEPSEEK_API_KEY',
+  'OAR_CLAUDE_API_KEY',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
 ]);
@@ -682,6 +729,11 @@ export const WORKER_SECRET_ENV_VARS = Object.freeze([
 // - The DeepSeek key is put there by its own applier, but the same name could
 //   also sit in the relay's environment (a shell that exports it); it is the
 //   DeepSeek worker's alone either way.
+// - The Claude API key is the Claude API worker's alone, the same way. It
+//   travels under a name of the relay's (OAR_CLAUDE_API_KEY), never as
+//   ANTHROPIC_API_KEY: the worker's CLI is the only process that gets it under
+//   that name (claude-api-backend.mjs), and a host's ANTHROPIC_API_KEY stays
+//   what it is below, no worker's.
 // - A host's ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are no worker's (an
 //   empty list): Claude Code prefers either to the Claude login, so a Claude
 //   chat would run, and be billed, on a key nobody chose for it, and every
@@ -691,6 +743,7 @@ export const WORKER_SECRET_ENV_VARS = Object.freeze([
 const WORKER_SECRET_ENV_VAR_KINDS = Object.freeze({
   CLAUDE_CODE_OAUTH_TOKEN: Object.freeze(['claude', 'claude-cloud']),
   DEEPSEEK_API_KEY: Object.freeze(['deepseek']),
+  OAR_CLAUDE_API_KEY: Object.freeze(['claude-api']),
   ANTHROPIC_API_KEY: Object.freeze([]),
   ANTHROPIC_AUTH_TOKEN: Object.freeze([]),
 });
@@ -867,6 +920,12 @@ export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
   'DEEPSEEK_RELAY_MODEL',
   'DEEPSEEK_BASE_URL',
   'DEEPSEEK_CLAUDE_CONFIG_DIR',
+  // The Claude API worker's model; its key comes through the file like
+  // DeepSeek's. Tests point the worker's CLI at a fake Anthropic API on this
+  // machine the way they point the cloud client (shared/anthropic-api.mjs
+  // takes a loopback URL only, and so does the worker).
+  'CLAUDE_API_RELAY_MODEL',
+  'OAR_ANTHROPIC_API_BASE_URL',
   'GROK_RELAY_MODEL',
   'GROK_CLI_COMMAND',
   'GROK_ALWAYS_APPROVE',
@@ -1128,7 +1187,7 @@ export async function launchSessionCli({
   // Set per launch below, never inherited: a relay started from inside a
   // worker session would otherwise hand its workers that session's log.
   delete launchSessionEnv[WORKER_LOG_FILE_ENV];
-  // The extension engine gets the OAR MCP server (remote_relay + preview) the
+  // The extension engine gets the OAR MCP server (relay_tool + preview) the
   // node workers carry in-process; every launch path appends the same args.
   const extensionCliArgs = resolveNodeWorkerDescriptor(launchSessionEnv)
     ? []

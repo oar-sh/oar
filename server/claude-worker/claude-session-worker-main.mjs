@@ -143,6 +143,8 @@ export async function runClaudeSessionWorker({
   let heartbeatTimer = null;
   heartbeat = createHeartbeatController({
     api,
+    // What this worker runs on: the relay hands it only rows of that billing.
+    workerKind: turnRunner.workerKind,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
@@ -188,6 +190,7 @@ export async function runClaudeSessionWorker({
     onServerHello: () => heartbeat.requestPulse(),
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
+    workerKind: turnRunner.workerKind,
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
       const deliveredTimeout = Number(pending?.settings?.backgroundTaskTimeoutMs);

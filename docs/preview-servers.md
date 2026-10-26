@@ -94,12 +94,12 @@ argument, so none of them degrade to a warning.
 Three ways in, all backed by the same API:
 
 1. **Ask the agent.** "Show me a preview of this" / "start the dev server and host
-   it". Claude and Cursor sessions have a first-class `preview` tool, and so do
-   Grok and Copilot's Extension engine, through OAR's MCP server (unless the
-   relay runs with `OAR_MCP_SERVER=0`). Copilot's SDK engine, and the other two
-   without the MCP server, are taught the HTTP API through injected
-   instructions. Tool and instructions drive the same API, so the semantics are
-   identical.
+   it". Claude, Claude API and Cursor sessions have a first-class `preview`
+   tool, and so do Grok and Copilot's Extension engine, through OAR's MCP
+   server (unless the relay runs with `OAR_MCP_SERVER=0`). Copilot's SDK
+   engine, and the other two without the MCP server, are taught the HTTP API
+   through injected instructions. Tool and instructions drive the same API,
+   so the semantics are identical.
 2. **`/preview` in the composer.** Client-side, works on every provider, costs no
    agent turn:
 

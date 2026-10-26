@@ -456,7 +456,7 @@ export function createCopilotSdkSessionRunner({
   // runtime's built-in one. A runtime that refuses the override falls back
   // to the built-in for the rest of this worker's life.
   relayAskUserTool = true,
-  // Whether sessions carry the relay's `remote_relay` tool
+  // Whether sessions carry the relay's `relay_tool` tool
   // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
   remoteRelayToolGate = null,
   taskRefreshMs = DEFAULT_TASK_REFRESH_MS,
@@ -696,12 +696,12 @@ export function createCopilotSdkSessionRunner({
   // the human's eventual answer to a runtime whose row is already settled.
   // Same guard the Cursor worker's `hasPendingClientWork` provides.
   let pendingHumanRequests = 0;
-  // Running `remote_relay` calls. The runtime is just as silent while one
+  // Running `relay_tool` calls. The runtime is just as silent while one
   // runs (the relay may wait up to 600 s for a remote turn, plus an approval
   // card), so they hold the stall watchdog and the idle shutdown too — but
   // not steering: nobody is answering a card here.
   let pendingRelayToolCalls = 0;
-  // `remote_relay` is registered only while this relay has paired remotes.
+  // `relay_tool` is registered only while this relay has paired remotes.
   // Asked once when the worker starts; a session build waits for that first
   // answer (it is async anyway), and every runtime stop asks again so the
   // next session picks up a remote paired in the meantime.
@@ -2306,7 +2306,7 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * The relay's `remote_relay` tool (copilot-remote-relay-tool.mjs). Every call
+   * The relay's `relay_tool` tool (copilot-remote-relay-tool.mjs). Every call
    * is counted while it runs: the stall watchdog re-arms instead of failing the
    * row, and the lifecycle keeps the runtime up. The clock restarts from the
    * answer, like after a card. A call is cancelled by the runtime (its
@@ -2349,7 +2349,7 @@ export function createCopilotSdkSessionRunner({
    * runtime refuses the override (an older runtime). The refusal is
    * remembered until the runtime is stopped — the next runtime (possibly
    * auto-updated under the relay) gets another try. Only the override goes:
-   * the relay's other tools (`remote_relay`) override nothing and stay.
+   * the relay's other tools (`relay_tool`) override nothing and stay.
    */
   async function openSession(open, config) {
     try {
@@ -3198,7 +3198,7 @@ export function createCopilotSdkSessionRunner({
       // Cancels any relay question card this turn is blocked on, so an aborted
       // turn does not leave a human answering into the void.
       abortController: new AbortController(),
-      // Cancels the `remote_relay` calls that started under this turn — on the
+      // Cancels the `relay_tool` calls that started under this turn — on the
       // user's Stop only. Not `abortController`: that one also fires when the
       // turn settles normally, and a background agent's call must outlive that.
       remoteRelayStop: new AbortController(),
@@ -3369,7 +3369,7 @@ export function createCopilotSdkSessionRunner({
     if (turn.settled) return;
     // A human staring at a question card is not a stalled runtime: the card
     // has its own (much longer) timeout, and failing the row here would
-    // settle it while the answer is still coming. A remote_relay call waiting
+    // settle it while the answer is still coming. A relay_tool call waiting
     // on another relay is the same kind of silence; the relay bounds that
     // wait itself. So is a compaction, bounded by its stale cap, and the wait
     // for the previous runtime to stop, bounded by the teardown's own limits.
@@ -3912,7 +3912,7 @@ export function createCopilotSdkSessionRunner({
     }
     turn.aborted = true;
     turn.abortedRowId = rowId;
-    // A pending `remote_relay` call ends now rather than when the runtime gets
+    // A pending `relay_tool` call ends now rather than when the runtime gets
     // round to it: the relay drops the request, withdraws its approval card
     // and stops waiting on the remote, and the watchdog hold is released.
     turn.remoteRelayStop?.abort();
@@ -4564,7 +4564,7 @@ export function createCopilotSdkSessionRunner({
    *    is not waiting for its tools, so a steer interrupts nothing. A
    *    subagent the main agent runs in the foreground is covered by the main
    *    agent's own tool call that started it.
-   *  - `remote_relay`, which holds the stall watchdog but never held steering
+   *  - `relay_tool`, which holds the stall watchdog but never held steering
    *    (see `pendingRelayToolCalls`).
    */
   function mainToolsInFlight(turn = activeTurn) {

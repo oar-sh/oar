@@ -66,7 +66,7 @@ import { updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { applyCliInstallState } from './cli-install-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
-import { applyClaudeUsageLimit, applyUsageLimitPause } from './usage-limit-ui.js';
+import { applyClaudeUsageLimit, applyConversationBilling, applyUsageLimitPause } from './usage-limit-ui.js';
 import {
   showThinking,
   removeThinking,
@@ -154,6 +154,7 @@ let deps = null;
  * @property {(payload?: object) => void} applyClaudeSettingsState
  * @property {(payload?: object) => void} applyGrokSettingsState
  * @property {(payload?: object) => void} applyDeepSeekSettingsState
+ * @property {(payload?: object) => void} applyClaudeApiSettingsState
  * @property {(payload?: object) => void} applyCursorSettingsState
  */
 
@@ -466,6 +467,11 @@ export async function connectSocket(overrideDeps) {
   });
   // The Claude usage limit: a conversation's paused turn, and the account's
   // latest report (also sent on connect).
+  // A Claude chat moved between the subscription and the API key, or what it
+  // may switch to changed (a swap waiting, the key removed).
+  socket.on('conversation_billing', (payload) => {
+    applyConversationBilling(payload || null);
+  });
   socket.on('usage_limit_pause', (payload) => {
     applyUsageLimitPause(payload || null);
   });
@@ -501,6 +507,17 @@ export async function connectSocket(overrideDeps) {
   socket.on('deepseek_settings_updated', (payload) => {
     const state = deps?.applyDeepSeekSettingsState?.(payload || {});
     updateProviderReadinessInputs({ deepseek: state || payload || null });
+    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
+      void Promise.resolve()
+        .then(() => deps?.refreshCurrentView?.())
+        .catch(() => {});
+    }
+  });
+  // The Claude API tab saved (a key, the switch, the cap): the tab, New
+  // Chat's readiness and the composer's billing toggle follow.
+  socket.on('claude_api_settings_updated', (payload) => {
+    const state = deps?.applyClaudeApiSettingsState?.(payload || {});
+    updateProviderReadinessInputs({ claudeApi: state || payload || null });
     if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
       void Promise.resolve()
         .then(() => deps?.refreshCurrentView?.())

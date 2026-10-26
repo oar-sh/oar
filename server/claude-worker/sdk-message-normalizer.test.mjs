@@ -118,7 +118,7 @@ test('MCP tool names lose their server prefix in the chip', () => {
   assert.equal(actions[0].payload.text, 'Tool (preview): {"action":"create","port":5173}');
 });
 
-test('a remote_relay call reads as its action and target, not its first argument', () => {
+test('a relay_tool call reads as its action and target, not its first argument', () => {
   const normalizer = createSdkMessageNormalizer();
   const actions = normalizer.normalize({
     type: 'assistant',
@@ -128,16 +128,17 @@ test('a remote_relay call reads as its action and target, not its first argument
         {
           type: 'tool_use',
           id: 'toolu_remote_1',
-          name: 'mcp__relay__remote_relay',
+          name: 'mcp__relay__relay_tool',
           input: { action: 'send', relay: 'linux-test', session: '0123456789abcdef', text: 'run the report builder tests' },
         },
       ],
     },
   });
-  assert.equal(actions[0].payload.text, 'Tool (remote_relay): send → linux-test session 01234567: “run the report builder tests”');
-  assert.equal(summarizeToolInput('remote_relay', { action: 'list_relays' }), 'list_relays');
+  assert.equal(actions[0].payload.text, 'Tool (relay_tool): send → linux-test session 01234567: “run the report builder tests”');
+  assert.equal(summarizeToolInput('relay_tool', { action: 'list_relays' }), 'list_relays');
+  assert.equal(summarizeToolInput('mcp__relay__remote_relay', { action: 'list_relays' }), 'list_relays', 'the old name');
   // A frame without an action yet keeps the generic summary.
-  assert.equal(summarizeToolInput('remote_relay', { relay: 'linux-test' }), '{"relay":"linux-test"}');
+  assert.equal(summarizeToolInput('relay_tool', { relay: 'linux-test' }), '{"relay":"linux-test"}');
 });
 
 test('activity text is capped at 140 characters', () => {

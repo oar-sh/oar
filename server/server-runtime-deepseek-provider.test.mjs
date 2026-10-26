@@ -33,7 +33,7 @@ test('a DeepSeek conversation gets its own worker and never falls through to a C
     '\nconst relayCliLauncherService = ',
   );
   // Cleared for every other launch, whatever its provider.
-  assert.match(launchSource, /const cleared = applyDeepSeekProviderEnvironment\(/);
+  assert.match(launchSource, /const cleared = [^;]*applyDeepSeekProviderEnvironment\(/);
   const deepseekBranch = launchSource.indexOf("if (providerType === 'deepseek') {");
   const copilotFallThrough = launchSource.indexOf("const copilotSdkEngine = getCopilotEngine() === 'sdk';");
   assert.notEqual(deepseekBranch, -1);
@@ -68,7 +68,7 @@ test('provider reconciliation and runtime binding know deepseek', () => {
   );
   const bindingSource = sliceBetween('function ensureRuntimeSessionBinding(', '\nfunction bootstrapRuntimeSessionBindings(');
   assert.match(bindingSource, /normalizedRequestedProviderType === 'deepseek'\s*\?\s*'deepseek'/);
-  assert.match(bindingSource, /resolvedProviderType === 'deepseek'\)/);
+  assert.match(bindingSource, /resolvedProviderType === 'deepseek'\s*(?:\)|\|\|)/);
 });
 
 test('the DeepSeek session-root resolver is built over the DeepSeek config dir with no home', () => {

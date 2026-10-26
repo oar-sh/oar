@@ -6,7 +6,7 @@ import { relayBaseUrl, relayToken } from "./e2e-env.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
- * The remote_relay tool path end to end, without a model
+ * The relay_tool tool path end to end, without a model
  * (docs/plans/2026-09-27-remote-relays.md §10): the shared e2e relay ("A",
  * win-test) is paired with a throwaway relay ("B", linux-test), and the spec
  * calls A's POST /api/remote-relays/tool the way a worker's tool adapter does.
@@ -65,7 +65,7 @@ async function removeAllRemotes(baseUrl, token) {
   }
 }
 
-test.describe.serial("remote_relay tool between two relays", () => {
+test.describe.serial("relay_tool tool between two relays", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relayB = null;

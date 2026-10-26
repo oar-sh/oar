@@ -1,6 +1,6 @@
 'use strict';
 
-// Questions that don't block (remote_relay `ask`) and the Inbox.
+// Questions that don't block (relay_tool `ask`) and the Inbox.
 //
 // For the browser (this relay's user; a request from another relay's agent,
 // or this relay's own through the loopback, is refused):
@@ -175,7 +175,7 @@ export function registerRelayAskRoutes(app, deps) {
   function refuseRemote(req, res) {
     const request = readRemoteRelayRequest(req, remoteRelayInbound || {});
     if (!request.remote) return false;
-    res.status(403).json({ error: 'The Inbox is this relay\'s user\'s; agents use the remote_relay tool.', code: REMOTE_RELAY_ERROR_CODES.forbidden });
+    res.status(403).json({ error: 'The Inbox is this relay\'s user\'s; agents use the relay_tool.', code: REMOTE_RELAY_ERROR_CODES.forbidden });
     return true;
   }
 
@@ -189,7 +189,7 @@ export function registerRelayAskRoutes(app, deps) {
     if (!request) return null;
     if (!request.remote || request.local) {
       res.status(403).json({
-        error: 'Only another relay calls these routes; this relay\'s own agents use the remote_relay tool and its user the Inbox.',
+        error: 'Only another relay calls these routes; this relay\'s own agents use the relay_tool and its user the Inbox.',
         code: REMOTE_RELAY_ERROR_CODES.forbidden,
       });
       return null;

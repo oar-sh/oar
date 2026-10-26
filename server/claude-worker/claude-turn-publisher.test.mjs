@@ -414,3 +414,87 @@ test('a result published behind a newer one never lowers the baseline: out-of-or
     [{ model: 'deepseek-flash', hitTokens: 500, missTokens: 210, outputTokens: 21 }, { model: 'deepseek-v4-pro', hitTokens: 0, missTokens: 300, outputTokens: 30 }],
   ]);
 });
+
+// The Claude API booking's report: both Claude billings send it after every
+// turn, beside (not instead of) the subscription's plan usage.
+function billingPublisher(extra = {}) {
+  const calls = [];
+  const publisher = createClaudeTurnPublisher({
+    api: async (method, routePath, body) => { calls.push({ routePath, body }); return { ok: true }; },
+    billingUsageRoute: '/api/claude-api-usage',
+    billingKind: 'claude',
+    ...extra,
+  });
+  return { publisher, calls };
+}
+
+const sonnetUsage = (input, output, costUSD, extra = {}) => ({
+  inputTokens: input, outputTokens: output, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD, ...extra,
+});
+
+function turnState(modelUsage, usage = { input_tokens: 0, output_tokens: 0 }) {
+  return {
+    result: { sessionId: 'native-1', model: 'claude-sonnet-5-5', modelUsage, usage },
+    planUsage: null,
+    modelUsage,
+  };
+}
+
+test('the billing report goes out beside the plan usage, with the worker\'s kind, the run and the turn', async () => {
+  const { publisher, calls } = billingPublisher();
+  await publisher.publishPlanUsage({
+    message, state: turnState({ 'claude-sonnet-5-5': sonnetUsage(1000, 200, 0.05) }), sdkSessionId: 'sid-1', runId: 'run-1',
+  });
+  assert.deepEqual(calls.map((call) => call.routePath), ['/api/claude-api-usage', '/api/claude-plan-usage']);
+  const report = calls[0].body;
+  assert.equal(report.billing, 'claude');
+  assert.equal(report.runId, 'run-1');
+  assert.equal(report.turnId, 'q-1');
+  assert.equal(report.claudeNativeSessionId, 'native-1');
+  assert.equal(report.firstResultOfRun, true);
+  assert.deepEqual(report.runCounts, [{ model: 'claude-sonnet-5-5', hitTokens: 0, missTokens: 1000, outputTokens: 200, costUsd: 0.05, costUnknown: false }]);
+  assert.deepEqual(report.sessionTotals, report.runCounts);
+});
+
+test('a run counts its own rise, cost included; a turn published twice counts once', async () => {
+  const { publisher, calls } = billingPublisher({ billingKind: 'claude-api' });
+  const first = turnState({ 'claude-sonnet-5-5': sonnetUsage(1000, 200, 0.05) });
+  const second = turnState({ 'claude-sonnet-5-5': sonnetUsage(1600, 330, 0.09), 'claude-haiku-4-5': sonnetUsage(50, 5, 0.001) });
+  for (const state of [first, second, second]) {
+    await publisher.publishPlanUsage({ message, state, sdkSessionId: 'sid-1', runId: 'run-1' });
+  }
+  const reports = calls.filter((call) => call.routePath === '/api/claude-api-usage').map((call) => call.body);
+  assert.equal(reports[1].firstResultOfRun, false);
+  const sonnet = reports[1].runCounts.find((entry) => entry.model === 'claude-sonnet-5-5');
+  assert.equal(sonnet.missTokens, 1600);
+  assert.equal(sonnet.outputTokens, 330);
+  assert.ok(Math.abs(sonnet.costUsd - 0.09) < 1e-9);
+  assert.deepEqual(reports[2].runCounts, reports[1].runCounts);
+});
+
+test('a resumed run\'s first result: its own counts are the turn\'s main loop, unpriced; the session totals carry the rest', async () => {
+  const { publisher, calls } = billingPublisher({ billingKind: 'claude-api' });
+  const state = turnState(
+    { 'claude-sonnet-5-5': sonnetUsage(3000, 600, 0.3), 'claude-haiku-4-5': sonnetUsage(100, 10, 0.001, { costBasis: 'unknown' }) },
+    { input_tokens: 800, output_tokens: 150 },
+  );
+  await publisher.publishPlanUsage({ message, state, sdkSessionId: 'sid-1', runId: 'run-2', resumedSessionId: 'native-1' });
+  const [report] = calls.filter((call) => call.routePath === '/api/claude-api-usage').map((call) => call.body);
+  assert.equal(report.resumedSessionId, 'native-1');
+  assert.equal(report.firstResultOfRun, true);
+  assert.deepEqual(report.runCounts, [{ model: 'claude-sonnet-5-5', hitTokens: 0, missTokens: 800, outputTokens: 150, costUsd: 0, costUnknown: false }]);
+  const haiku = report.sessionTotals.find((entry) => entry.model === 'claude-haiku-4-5');
+  assert.equal(haiku.costUnknown, true);
+  assert.equal(report.sessionTotals.find((entry) => entry.model === 'claude-sonnet-5-5').missTokens, 3000);
+});
+
+test('no billing report without the route (DeepSeek) or without a run', async () => {
+  const deepseek = billingPublisher({ billingUsageRoute: null, usageRoute: '/api/deepseek-plan-usage' });
+  await deepseek.publisher.publishPlanUsage({
+    message, state: turnState({ 'claude-sonnet-5-5': sonnetUsage(1, 1, 0) }), sdkSessionId: 'sid-1', runId: 'run-1',
+  });
+  assert.deepEqual(deepseek.calls.map((call) => call.routePath), ['/api/deepseek-plan-usage']);
+  const noRun = billingPublisher();
+  await noRun.publisher.publishPlanUsage({ message, state: turnState({ 'claude-sonnet-5-5': sonnetUsage(1, 1, 0) }), sdkSessionId: 'sid-1' });
+  assert.deepEqual(noRun.calls.map((call) => call.routePath), ['/api/claude-plan-usage']);
+});

@@ -12,7 +12,7 @@ import { REMOTE_RELAY_PROVIDERS } from './remote-relay-contract.mjs';
 import { steerAgentLabelForProvider } from './steer-settle-failure.mjs';
 
 test('every session-worker provider is kept away from the legacy relay', () => {
-  for (const provider of ['claude', 'cursor', 'grok', 'claude-cloud', 'deepseek']) {
+  for (const provider of ['claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api']) {
     assert.equal(SESSION_WORKER_PROVIDER_TYPES.includes(provider), true, provider);
     assert.equal(isSessionWorkerProviderType(provider), true, provider);
     assert.equal(isSessionWorkerProviderType(` ${provider.toUpperCase()} `), true, provider);
@@ -35,7 +35,7 @@ test('the legacy relay still takes github, openai and an unbound row', () => {
 });
 
 test('the SQL list names every session-worker provider, quoted', () => {
-  assert.equal(sessionWorkerProviderSqlList(), `'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek'`);
+  assert.equal(sessionWorkerProviderSqlList(), `'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api'`);
 });
 
 test('the lists other modules keep per provider know claude-cloud too', () => {
@@ -50,4 +50,13 @@ test('the lists other modules keep per provider know deepseek too', () => {
   assert.equal(steerAgentLabelForProvider('deepseek'), 'DeepSeek');
   // A DeepSeek turn never goes to the legacy Copilot relay.
   assert.equal(isLegacyRelayProviderType('deepseek'), false);
+});
+
+test('claude-api is its own provider, kept away from the legacy relay, and the lists know it', () => {
+  assert.equal(SESSION_WORKER_PROVIDER_TYPES.filter((provider) => provider === 'claude-api').length, 1);
+  assert.equal(isSessionWorkerProviderType('claude api'), false);
+  assert.equal(isLegacyRelayProviderType('claude-api'), false);
+  assert.equal(REMOTE_RELAY_PROVIDERS.includes('claude-api'), true);
+  assert.equal(steerAgentLabelForProvider('claude-api'), 'Claude API');
+  assert.equal(steerAgentLabelForProvider('claude'), 'Claude');
 });

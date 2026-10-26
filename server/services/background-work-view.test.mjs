@@ -342,6 +342,18 @@ test('a running background row the worker\'s set does not list, quiet for 15 min
   assert.deepEqual(t.blockers(), [], 'the suspend blocker');
 });
 
+test('a Claude API worker\'s set lists its runs as a Claude worker\'s does', () => {
+  const t = setup();
+  t.db.prepare(`UPDATE runtime_sessions SET provider_type = 'claude-api' WHERE conversation_id = ?`).run(RENDER);
+  t.advance(BOOT_REPORTING_WINDOW_MS);
+  seedQuietRun(t, RENDER);
+  t.worker(RENDER_SESSION);
+  assert.equal(t.store.matches(backgroundTaskDigest([]), RENDER_SESSION), true);
+  assert.equal(t.view.runListed(RENDER, { id: 'toolu_fixture_orbit' }), false);
+  assert.equal(t.tracker.describe(RENDER).state, 'idle');
+  assert.deepEqual(t.blockers(), []);
+});
+
 test('a quiet running row stays running work while the set lists it, while it is fresh, and for a provider whose sets list no runs', () => {
   const t = setup();
   t.advance(BOOT_REPORTING_WINDOW_MS);

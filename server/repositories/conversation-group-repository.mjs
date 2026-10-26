@@ -7,7 +7,7 @@ import { compareGroupMembers } from '../public/app/conversation-group-order.mjs'
 // Session groups (migration 0014): the set of conversations that share a
 // `group_id`, with a row in `conversation_groups` for what the set itself
 // needs: a name given by hand, and the head (the session that created the
-// others with the remote_relay tool; NULL for a group made by hand or once
+// others with the relay_tool; NULL for a group made by hand or once
 // the head is deleted).
 //
 // A session an agent creates on this relay joins its creator's group at

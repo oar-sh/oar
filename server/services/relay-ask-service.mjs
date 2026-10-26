@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Questions that don't block: remote_relay's `ask` (shared/relay-asks.mjs).
+ * Questions that don't block: relay_tool's `ask` (shared/relay-asks.mjs).
  * An agent asks the owner something and goes on working; the question shows
  * as a card in its session and in the Inbox, and when the owner answers or
  * dismisses it the relay tells the session the ask is in and the

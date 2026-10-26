@@ -3,6 +3,198 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.18] — 2026-10-26
+
+Highlights: Claude chats can run on a Claude Console API key. Claude API is
+a provider beside your subscription, with an optional monthly spend cap and
+a card in Check Usage with the estimated spend. A Claude chat can switch
+between the subscription and the key and keep its Claude Code session, also
+when it is paused at the usage limit. The relay's agent tool is now called
+`relay_tool`. DeepSeek and Claude API chats start with all hooks off, and a
+subscription chat no longer runs on an API key that Claude Code's settings
+hand it.
+
+### Added
+
+- **Claude API: Claude chats on a Claude Console API key.** A provider
+  beside Claude (your subscription), billed to the Console organisation
+  the key belongs to.
+  - Settings → Providers → Claude API holds the key, the switch, the
+    default model and an optional monthly spend cap in US dollars. The key
+    is stored on the relay host and never shown again: the tab only says
+    that one is saved. Any `sk-ant-` Console key is taken; Claude login
+    and session tokens and Admin keys are refused when you save. A key
+    Anthropic itself refuses stays saved, and the tab's status line says
+    so until a save or Refresh models goes through. A cap the field cannot
+    take is named under the field.
+  - The relay lists the key's models from Anthropic when the key is saved,
+    when Claude API is switched on again, and on Refresh models. Until
+    then it offers the Claude tab's models.
+  - Commit attribution, the background command limit, the effort levels
+    and the compaction window stay on the Claude tab, shared by both; the
+    Claude API tab links there.
+  - New Chat offers Claude API, Select Models has a Claude API tab, and
+    its chats show a gold "Claude API" pill and "🔒 Session locked to
+    Claude API models."
+  - A turn that Claude API refuses or could not run ends with buttons:
+    Claude API settings (at the cap field when the monthly cap is
+    reached), Switch to subscription, Add funds, Console billing or
+    Console limits, as fits the reason.
+  - When the relay refuses to start a Claude API chat (the monthly cap, no
+    key, switched off), New Chat stays open with the reason, Claude API
+    settings, and Start on subscription, which starts the same chat on
+    the Claude provider; on a phone the dialog scrolls to it.
+- **Switch a Claude chat between your subscription and the Claude API
+  key.** `POST /api/conversation/:id/billing` moves a chat between
+  `claude` (the subscription) and `claude-api` (the saved key). It keeps
+  its Claude Code session.
+  - In the browser, a Claude chat has a `Subscription | API key` toggle
+    under the lock note while Claude API is on with a saved key. It says
+    what a pending switch waits for, and why a side cannot be chosen; at
+    the monthly cap it says the chat stays on the subscription, and so
+    does the usage-limit banner.
+  - The switch applies from the next turn: a running turn finishes on the
+    billing it started on. Messages already queued run on the new one.
+  - The relay restarts the chat's Claude Code between turns. It waits
+    while a turn, a question, a compaction or a background task is still
+    running.
+  - The transcript notes each switch. The first turn on the key has no
+    prompt cache and costs more.
+  - The switch is refused, with the reason, when the key is missing or
+    Claude API is off, when the monthly cap is reached, or when the
+    chat's model is not on the target's model list.
+- **Switch this chat to API key at the usage limit.** When a subscription
+  chat is paused at the Claude usage limit, the banner offers the switch
+  if the chat may move to the key. The paused turn then carries on on
+  the key at once. Nothing switches by itself.
+- **Agents can switch a Claude session's billing.** `relay_tool` `send`
+  takes `provider` (`claude` or `claude-api`) for a Claude session. The
+  other billing switches the session together with the message:
+  - in one call, so a refused switch sends nothing and a refused message
+    switches nothing;
+  - the approval card says "Switches billing to API key";
+  - a relay from before this version refuses it and sends nothing.
+- **A Claude API card in Check Usage.** It shows what this relay's turns
+  on the Claude API key are estimated to have cost today and this month,
+  per model, with the tokens, and the monthly cap as a bar when one is set.
+  - The figures are Claude Code's own estimate from its price table, so
+    sub-agents, compaction and web search are in them. The Console's
+    billing page (linked) has the real figures and the balance.
+  - Days and the month follow the relay's time zone, and the cap starts
+    over at local midnight on the 1st.
+  - Tokens Claude Code has no price for show as "no price known" or
+    "estimate incomplete", never as $0.
+  - Turns paid from a Max or Team plan's subscriber API credit are counted
+    too; OAR cannot see that credit.
+  - The card stays while a key is saved, also with Claude API switched
+    off, so the month's spend stays in view (DeepSeek's card goes with the
+    provider).
+- **A monthly cap for Claude API.** Once this month's estimate reaches the
+  cap set in Settings → Providers → Claude API:
+  - a new turn on the key does not run: the chat gets a note with the code
+    `relay.claude-api-cap-reached`. A turn Claude Code starts by itself,
+    when a background task reports back, gets the note and that chat's
+    background tasks are stopped as soon as the relay hears of the turn,
+    since each report would start another such turn; the turn itself is
+    stopped when the worker takes the stop. Its first request may already
+    be billed, and a short turn can end before the stop arrives. The note
+    also mentions tasks no stop reaches, since they can keep starting such
+    turns and keep a switch to the subscription waiting. The note comes
+    once per chat until the cap clears, a Claude API setting is saved, or a
+    turn of that chat runs on the key again. The same stop applies when
+    Claude API has no key or is switched off;
+  - a switch to the key is refused;
+  - an agent's send to a session on the key and a new Claude API chat (New
+    Chat or an agent's `create_session`) get 409 `CLAUDE_API_CAP_REACHED`,
+    and nothing is queued or created.
+
+  A turn that is already running finishes. A turn's cost is booked when it
+  ends, so running turns can take the month past the cap. The cap counts
+  only the priced part of the estimate. If the spend cannot be read, the cap counts as
+  reached. Console spend limits still apply on top.
+
+### Changed
+
+- **A send does not switch a Claude chat's billing.** A message that
+  names the other billing gets 409 `CLAUDE_BILLING_SWITCH_REQUIRED`
+  (before, a Claude API chat ignored `provider: "claude"`). A message
+  from a page that still showed the other billing gets 409
+  `CLAUDE_BILLING_CHANGED`. Its text goes into the chat's draft, so the
+  page, and a send replayed from the offline outbox, lose nothing. The
+  outbox keeps the text only, not attachments.
+
+- **No hooks or status line run in DeepSeek chats.** In 0.9.17, Claude Code
+  in a DeepSeek chat ran the hooks and the `statusLine` command of
+  DeepSeek's settings folder, of the chat folder's `.claude/settings.json`
+  and `settings.local.json`, and of plugins, as the relay's user with the
+  DeepSeek key in their environment; a folder's `SessionStart` hook ran
+  before the relay had pinned the endpoint and key. Now those chats start
+  with all hooks off, and so do Claude API chats. The setting is on Claude
+  Code's command line, so it is in force from the start, and a folder's
+  settings can't turn it back on (`scripts/claude-cli-hooks-proof.mjs`
+  shows it on the bundled Claude Code). Hooks in managed settings still
+  run. Chats on your Claude login keep their hooks and status line. The
+  agent's own commands can still read the key; the relay redacts it in
+  what it shows.
+- **The relay's agent tool is now called `relay_tool`.** It was
+  `remote_relay`, and it is listed under the new name on every provider
+  (Claude's `mcp__relay__relay_tool`), with the same actions and fields; the
+  docs and the agents' instructions use it too. OAR's own MCP server, which
+  Grok and the Copilot extension engine use, still runs a call to
+  `remote_relay` but no longer lists it. Tool lines written under the old
+  name still show as this tool.
+  - If your own instructions, permission rules or hooks name `remote_relay`
+    or `mcp__relay__remote_relay`, change them to `relay_tool` or
+    `mcp__relay__relay_tool`: outside OAR's MCP server the old name is
+    refused.
+- **A subscription chat never runs on an API key.** Claude Code takes an
+  API key over your Claude login when one of its settings hands it one:
+  - `env.ANTHROPIC_API_KEY` in `~/.claude/settings.json` or the chat
+    folder's `.claude/settings*.json`;
+  - an `apiKeyHelper`;
+  - a Console login.
+
+  Until now such a chat ran on that key and billed the key's owner. Now
+  the turn stops at Claude Code's start, with a note naming the source
+  and the setting to remove. At most one model request, sent a moment
+  after that start, can go out first.
+
+- **The docs cover Claude API.** The providers guide has a Claude API
+  section: the key, the models, the shared `~/.claude`, the billing switch
+  and when it applies, what fails closed, the monthly cap and the
+  subscriber API credit. The web UI, configuration, security,
+  agents-together and troubleshooting pages, the README, the server
+  README and DEVELOPING.md (the worker and its live check) cover it too,
+  and the feature tracker has a Claude API page. Troubleshooting has two
+  known gaps:
+  - a key that is not tied to a workspace gets HTTP 400 from Anthropic;
+    for now, create the key inside a workspace (naming the workspace in
+    OAR is planned);
+  - a model Claude Code has no price for (currently Claude Haiku 5.5)
+    shows "no price known" on the Claude API card, and its tokens are left
+    out of the estimate.
+- **Corrections to the 0.9.17 notes:**
+  - DeepSeek's budget bar changes colour at 50 % and 75 % of the budget
+    and turns red at 90 %; the notes said amber near it and red over it.
+  - The composer's context chip shows DeepSeek's 1M window (1,048,576
+    tokens) as `1.05M`.
+  - The `preview` tool's hint to bind a dev server to 127.0.0.1 reaches
+    only sessions that have the tool (Claude, Claude API, DeepSeek, Cursor,
+    and Grok and Copilot's Extension engine through OAR's MCP server), not
+    every provider. Copilot's SDK engine, and those two when the relay runs
+    with `OAR_MCP_SERVER=0`, are taught the preview API without it.
+
+### Upgrade notes
+
+- **Downgrading to 0.9.17:** first switch Claude chats on the Claude API
+  key back to Subscription. 0.9.17 does not know Claude API, so a chat
+  left on the key runs as a Copilot chat there. That now includes a chat
+  that started on the subscription and was switched to the key. 0.9.17
+  ignores the new database columns and tables. The two triggers on the
+  queue table keep stamping its new column there, which does no harm.
+- **Downgrading to 0.9.17 turns hooks back on in DeepSeek chats:** they
+  run the hooks and status line of their settings folders again.
+
 ## [0.9.17] — 2026-10-25
 
 Highlights: DeepSeek is a provider of its own. Paste a DeepSeek API key and

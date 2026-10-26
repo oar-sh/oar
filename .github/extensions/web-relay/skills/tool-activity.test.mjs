@@ -15,15 +15,17 @@ test('formats web search arguments with the query', () => {
   );
 });
 
-test('the OAR MCP remote_relay tool gets the same line as on every other engine', () => {
+test('the OAR MCP relay_tool tool gets the same line as on every other engine', () => {
   assert.equal(
     formatToolActivity({
-      toolName: 'oar-remote_relay',
+      toolName: 'oar-relay_tool',
       toolArgs: JSON.stringify({ action: 'send', relay: 'linux-test', session: '0123456789abcdef', text: 'run the suite' }),
     }),
-    'Tool (remote_relay): send → linux-test session 01234567: “run the suite”',
+    'Tool (relay_tool): send → linux-test session 01234567: “run the suite”',
   );
-  assert.equal(formatToolActivity({ toolName: 'oar-remote_relay', toolArgs: {} }), 'Tool (remote_relay): call');
+  assert.equal(formatToolActivity({ toolName: 'oar-relay_tool', toolArgs: {} }), 'Tool (relay_tool): call');
+  // A call under the old name reads as the tool's name now.
+  assert.equal(formatToolActivity({ toolName: 'oar-remote_relay', toolArgs: {} }), 'Tool (relay_tool): call');
 });
 
 test('formats web fetch arguments with the URL', () => {

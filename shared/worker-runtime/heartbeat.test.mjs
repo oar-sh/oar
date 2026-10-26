@@ -185,3 +185,22 @@ test('a resync that fails is asked for again by the next beat; a beat that fails
   assert.equal(attempts, 2);
   assert.deepEqual(log, ['answered', 'answered']);
 });
+
+test('a worker that states its kind says it in every beat; one that does not sends no key', async () => {
+  const calls = [];
+  let timer = null;
+  const controller = createHeartbeatController({
+    api: async (method, path, body) => { calls.push({ method, path, body }); },
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => timer,
+    setHeartbeatTimer: (value) => { timer = value; },
+    getActiveQueueMessageId: () => '',
+    workerKind: 'claude-api',
+  });
+  await controller.pulseHeartbeat();
+  assert.equal(calls[0].body.workerKind, 'claude-api');
+  const { controller: plain, calls: plainCalls } = makeController();
+  await plain.pulseHeartbeat();
+  assert.equal('workerKind' in plainCalls[0].body, false);
+});

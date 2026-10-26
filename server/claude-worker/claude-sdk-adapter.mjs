@@ -11,7 +11,7 @@ import { CLAUDE_LIVE_FLAG_SETTINGS_CODE, CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE } fr
 export { CLAUDE_LIVE_FLAG_SETTINGS_CODE };
 
 // The name the in-process MCP server is registered under; it prefixes every
-// tool it carries on the wire (`mcp__relay__preview`, `mcp__relay__remote_relay`).
+// tool it carries on the wire (`mcp__relay__preview`, `mcp__relay__relay_tool`).
 export const RELAY_MCP_SERVER_NAME = 'relay';
 
 // The per-server tool-call timeout the CLI applies to the relay's tools.
@@ -19,7 +19,7 @@ export const RELAY_MCP_SERVER_NAME = 'relay';
 // value, else by the MCP_TOOL_TIMEOUT environment variable, else by 1e8 ms —
 // and SDK servers are exempt from the idle timeout. Pinning it here keeps a
 // host-wide MCP_TOOL_TIMEOUT (set for some other server) from cutting off a
-// remote_relay wait: those run up to wait_seconds (≤ 600 s) plus however long
+// relay_tool wait: those run up to wait_seconds (≤ 600 s) plus however long
 // an approval card sits unanswered.
 export const RELAY_MCP_TOOL_TIMEOUT_MS = REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS;
 
@@ -123,6 +123,23 @@ export function claudeSpawnSettings({ ultracode = false, autoCompactWindow = nul
 }
 
 /**
+ * The spawn's `settings` with a backend's flag settings on top: null when
+ * neither has anything, the relay's object untouched when the backend has
+ * nothing to add. `env` is merged by name, so neither side drops the other's
+ * variables.
+ */
+export function mergeSpawnSettings(spawnSettings, backendSettings) {
+  const own = spawnSettings && typeof spawnSettings === 'object' ? spawnSettings : null;
+  const extra = backendSettings && typeof backendSettings === 'object' && Object.keys(backendSettings).length
+    ? backendSettings
+    : null;
+  if (!extra) return own;
+  const merged = { ...(own || {}), ...extra };
+  if (own?.env || extra.env) merged.env = { ...(own?.env || {}), ...(extra.env || {}) };
+  return merged;
+}
+
+/**
  * Live twin of the attribution spawn setting, for a value (OAR or off). A
  * running CLI takes a new text through the flag layer (it arrives as a fresh
  * system-reminder on the next user turn) but cannot UNSET a value it was
@@ -209,7 +226,7 @@ export function systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs =
  * payload. `getConversationId` is called per tool call because a process
  * outlives the turn it was spawned for.
  *
- * `remote_relay` is the exception: it rides along only when the worker found
+ * `relay_tool` is the exception: it rides along only when the worker found
  * at least one paired remote (`remoteRelayTool`), because a tool that can do
  * nothing on a relay without remotes would only cost context on every turn.
  */
@@ -375,7 +392,7 @@ export function startClaudeSession({
   pathToClaudeCodeExecutable = '',
   api = null,
   getConversationId = () => '',
-  // Whether this process carries `remote_relay` (the worker's registration
+  // Whether this process carries `relay_tool` (the worker's registration
   // decision). Fixed for the process: the tool list is part of the spawn.
   remoteRelayTool = false,
   // Another endpoint for the CLI (null = Anthropic through the host's Claude
@@ -387,15 +404,24 @@ export function startClaudeSession({
   dbg = () => {},
 } = {}) {
   const normalizedModel = String(model || '').trim().toLowerCase();
-  const effort = backend ? '' : normalizeClaudeEffort(reasoningEffort);
+  // A backend on Claude's own models (the Claude API backend) takes the
+  // model and the effort exactly as Claude does; only another provider's
+  // backend maps them into its terms.
+  const modelBackend = backend && backend.claudeModels !== true ? backend : null;
+  const effort = modelBackend ? '' : normalizeClaudeEffort(reasoningEffort);
   const ultracode = effort === CLAUDE_ULTRACODE_EFFORT;
-  const effortOption = backend ? backend.effortOption(reasoningEffort) : (ultracode ? 'xhigh' : effort);
-  const cliModel = backend ? backend.cliModel(model) : String(model || '').trim();
+  const effortOption = modelBackend ? modelBackend.effortOption(reasoningEffort) : (ultracode ? 'xhigh' : effort);
+  const cliModel = modelBackend ? modelBackend.cliModel(model) : String(model || '').trim();
   // Spawn-time twin of the flag-settings helpers: the settings layer is the
   // only way to hand a fresh CLI the session-scoped ultracode flag, the
   // auto-compact window and the thinking pin, and all three share one
-  // `settings` object.
-  const spawnSettings = claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled, attribution });
+  // `settings` object. A backend's own pins (no hooks for both, the Claude
+  // API backend's endpoint and blanked credentials) join them; theirs win a
+  // clash.
+  const spawnSettings = mergeSpawnSettings(
+    claudeSpawnSettings({ ultracode, autoCompactWindow, thinkingEnabled, attribution }),
+    typeof backend?.flagSettings === 'function' ? backend.flagSettings() : null,
+  );
   // Relay tools need the worker's authenticated API helper; a caller that
   // passes none (tests, probes) gets a session without them.
   const relayMcpServer = typeof api === 'function'

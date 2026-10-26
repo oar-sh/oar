@@ -155,14 +155,16 @@ test('tmux shell command never embeds the cursor api key', () => {
 test('worker secret env vars cover the copilot provider and cursor keys', () => {
   // The Claude login token is the third; it goes to the two Claude workers
   // only (session-worker-launch-service.claude-cloud.test.mjs). The DeepSeek
-  // key is the fourth, the DeepSeek worker's alone (….deepseek.test.mjs). A
-  // host's Anthropic credentials are the last two, no worker's
-  // (….anthropic-env.test.mjs).
+  // key is the fourth, the DeepSeek worker's alone (….deepseek.test.mjs); the
+  // Claude API key the fifth, the Claude API worker's alone
+  // (….claude-api.test.mjs). A host's Anthropic credentials are the last two,
+  // no worker's (….anthropic-env.test.mjs).
   assert.deepEqual([...WORKER_SECRET_ENV_VARS], [
     'COPILOT_PROVIDER_API_KEY',
     'CURSOR_API_KEY',
     'CLAUDE_CODE_OAUTH_TOKEN',
     'DEEPSEEK_API_KEY',
+    'OAR_CLAUDE_API_KEY',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
   ]);
@@ -379,10 +381,12 @@ test('copilot tmux command output is byte-identical: the unset prefix, then the 
     + "COPILOT_RELAY_MODEL COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_PROVIDER_MAX_OUTPUT_TOKENS "
     + "CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE CLAUDE_RELAY_MODEL CLAUDE_CLOUD_RELAY_MODEL "
     + "OAR_CLAUDE_CLOUD_API_BASE_URL CURSOR_RELAY_MODEL CURSOR_AGENT_STORE_DIR DEEPSEEK_RELAY_MODEL "
-    + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
+    + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR CLAUDE_API_RELAY_MODEL OAR_ANTHROPIC_API_BASE_URL "
+    + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
     + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED COPILOT_WORKSPACE_ROOT INIT_CWD "
     // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
-    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
+    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
+    + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
     // Then the host session's variables by family, from whatever the shell holds.
     + HOST_FAMILY_UNSET
     + "export COPILOT_WEB_RELAY_CONFIG='/repo/server/config.json'; "
@@ -422,10 +426,12 @@ test('claude tmux command output is byte-identical: the unset prefix, then the p
     + "COPILOT_RELAY_MODEL COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_PROVIDER_MAX_OUTPUT_TOKENS "
     + "CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE CLAUDE_CLOUD_RELAY_MODEL "
     + "OAR_CLAUDE_CLOUD_API_BASE_URL CURSOR_RELAY_MODEL CURSOR_AGENT_STORE_DIR DEEPSEEK_RELAY_MODEL "
-    + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
+    + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR CLAUDE_API_RELAY_MODEL OAR_ANTHROPIC_API_BASE_URL "
+    + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
     + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED COPILOT_WORKSPACE_ROOT INIT_CWD "
     // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
-    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
+    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
+    + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
     // Then the host session's variables by family, from whatever the shell holds.
     + HOST_FAMILY_UNSET
     + "export COPILOT_WEB_RELAY_ROOT='/repo'; "

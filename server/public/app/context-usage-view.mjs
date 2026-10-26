@@ -352,7 +352,7 @@ ${renderThinkingButtons('display', THINKING_DISPLAY_CHOICES, displayKey)}
 
 /**
  * The owner's switch for a session an agent started: may its agents start
- * sessions themselves (the remote_relay tool's one-level rule lifted for it)?
+ * sessions themselves (the relay_tool's one-level rule lifted for it)?
  * Only the owner sets it; no agent can.
  */
 export function renderAgentSessionsControlHtml({ conversationId = '', mayCreateSessions = false } = {}) {

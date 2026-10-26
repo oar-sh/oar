@@ -463,6 +463,34 @@ function createFakeRemote() {
         };
       }
 
+      // POST /api/conversation/:id/billing, reduced: an older relay has no
+      // such route; a refusal leaves both the billing and the transcript.
+      const billingMatch = /^\/api\/conversation\/([^/]+)\/billing$/.exec(path);
+      if (method === 'POST' && billingMatch) {
+        if (remote.billingRouteMissing) throw notFound();
+        const conv = remote.conversations.get(decodeURIComponent(billingMatch[1]));
+        if (!conv) {
+          throw remoteError(`${CODES.httpPrefix}404`, `Relay "${relay.name}" answered HTTP 404`, 404, {
+            ok: false, code: 'CONVERSATION_NOT_FOUND', error: 'Conversation not found',
+          });
+        }
+        if (remote.billingRefusal) {
+          throw remoteError(`${CODES.httpPrefix}409`, `Relay "${relay.name}" answered HTTP 409`, 409, { ok: false, ...remote.billingRefusal });
+        }
+        conv.provider = body.to;
+        const message = body.message;
+        remote.addMessage(conv.id, {
+          id: message.messageId,
+          role: 'user',
+          text: message.text,
+          model: message.model,
+          mode: message.relayMode,
+          origin: message.origin,
+        });
+        conv.activeTurn = true;
+        return { ok: true, messageId: message.messageId, conversationId: conv.id, runtimeProviderType: body.to, billingSwitched: true };
+      }
+
       if (method === 'POST' && path === '/api/message') {
         const conv = remote.conversations.get(body.conversationId);
         if (!conv) throw notFound();
@@ -2050,11 +2078,13 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   assert.equal(result.body.platform, 'linux');
   assert.equal(result.body.protocol, 0, 'no identity route: an older relay');
   const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
-  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek']);
+  assert.deepEqual(Object.keys(byName), ['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api']);
   assert.deepEqual(byName['claude-cloud'], { provider: 'claude-cloud', configured: false, defaultModel: null, models: [] },
     'a relay without the Claude Cloud settings route has no such provider');
   assert.deepEqual(byName.deepseek, { provider: 'deepseek', configured: false, defaultModel: null, models: [] },
     'a relay without the DeepSeek settings route has no such provider');
+  assert.deepEqual(byName['claude-api'], { provider: 'claude-api', configured: false, defaultModel: null, models: [] },
+    'a relay without the Claude API settings route has no such provider');
   assert.deepEqual(byName.github, {
     provider: 'github',
     configured: true,
@@ -2093,6 +2123,26 @@ test('relay_info lists DeepSeek with its models while the remote has it switched
   remote.settings.deepseek = { ...remote.settings.deepseek, enabled: false };
   const off = await run('relay_info', { relay: 'linux-test' });
   assert.equal(off.body.providers.find((entry) => entry.provider === 'deepseek').configured, false);
+});
+
+test('relay_info lists Claude API with its models while the remote has it switched on', async () => {
+  const { run, remote } = setup();
+  remote.settings['claude-api'] = {
+    configured: true,
+    enabled: true,
+    model: 'claude-sonnet-5-5',
+    models: ['claude-sonnet-5-5', 'claude-opus-5-5'],
+  };
+  const result = await run('relay_info', { relay: 'linux-test' });
+  const claudeApi = result.body.providers.find((entry) => entry.provider === 'claude-api');
+  assert.equal(claudeApi.configured, true);
+  assert.equal(claudeApi.defaultModel, 'claude-sonnet-5-5');
+  assert.deepEqual(claudeApi.models, ['claude-sonnet-5-5', 'claude-opus-5-5']);
+
+  // Saved key, switched off: listed, but not as a provider to start with.
+  remote.settings['claude-api'] = { ...remote.settings['claude-api'], enabled: false };
+  const off = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(off.body.providers.find((entry) => entry.provider === 'claude-api').configured, false);
 });
 
 test('relay_info lists Claude Cloud when the remote has it switched on, without efforts', async () => {
@@ -3965,9 +4015,9 @@ test('dispatch adds ignored to the answer of other actions', async () => {
   const listed = await run('list_relays', { session: 'conv-1' });
   assert.deepEqual(listed.body.ignored, ['session']);
   // A refusal names them as well.
-  const refused = await run('send', { relay: 'linux-test', session: 'conv-1', provider: 'claude' });
+  const refused = await run('send', { relay: 'linux-test', session: 'conv-1', cwd: '/home/dev/other' });
   assert.equal(refused.status, 400);
-  assert.deepEqual(refused.body.ignored, ['provider']);
+  assert.deepEqual(refused.body.ignored, ['cwd']);
   // create_session refuses them instead, nothing created.
   const create = await run('create_session', { relay: 'linux-test', text: PROMPT, session: 'conv-1' });
   assert.equal(create.status, 400);
@@ -4293,4 +4343,97 @@ test('a partial write on the target and an unreadable process list come back as 
   const relaunch = await run('update_session', { relay: 'linux-test', session: 'conv-1', cwd: '/home/dev/other' });
   assert.equal(relaunch.body.ok, false);
   assert.deepEqual(relaunch.body.changed, ['cwd']);
+});
+
+// ─── send with provider: a Claude session's billing ──────────────────────────
+
+test('send with provider switches a Claude session\'s billing and sends in one call', async () => {
+  const { run, remote, approvals } = setup();
+  withSession(remote);
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', wait_seconds: 0 });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.status, 'queued');
+  assert.equal(result.body.provider, 'claude-api');
+  assert.equal(result.body.billingSwitched, true);
+  assert.match(result.body.note, /now runs on the API key/);
+  const [switchCall] = remote.callsTo('POST', '/api/conversation/conv-1/billing');
+  assert.equal(switchCall.body.to, 'claude-api');
+  assert.equal(switchCall.body.by, 'agent');
+  assert.equal(switchCall.body.message.conversationId, 'conv-1');
+  assert.ok(switchCall.body.message.text.endsWith(PROMPT));
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+  assert.equal(remote.conversations.get('conv-1').provider, 'claude-api');
+  // The approval card says what the send does to the bill.
+  assert.ok(approvals.length <= 1);
+});
+
+test('send with the session\'s own billing is an ordinary send', async () => {
+  const { run, remote } = setup();
+  withSession(remote, { provider: 'claude-api' });
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', wait_seconds: 0 });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.billingSwitched, undefined);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 1);
+  assert.equal(remote.callsTo('POST', '/api/conversation/conv-1/billing').length, 0);
+});
+
+test('an older relay without the switch: refused, nothing sent', async () => {
+  const { run, remote } = setup();
+  const conv = withSession(remote);
+  remote.billingRouteMissing = true;
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', wait_seconds: 0 });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, 'REMOTE_RELAY_UNSUPPORTED');
+  assert.match(result.body.error, /cannot switch a session's billing/);
+  assert.equal(conv.messages.length, 2);
+  assert.equal(conv.provider, 'claude');
+});
+
+test('a switch the target refuses sends nothing, with its reason', async () => {
+  const { run, remote } = setup();
+  const conv = withSession(remote);
+  remote.billingRefusal = { code: 'CLAUDE_API_NOT_CONFIGURED', error: 'Claude API has no key.' };
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', wait_seconds: 0 });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, 'REMOTE_RELAY_PROVIDER_UNAVAILABLE');
+  assert.match(result.body.error, /did not switch session conv-1 to the API key: Claude API has no key\./);
+  assert.equal(result.body.remoteCode, 'CLAUDE_API_NOT_CONFIGURED');
+  assert.equal(conv.messages.length, 2);
+});
+
+test('provider on a session that is no Claude one, or another provider: refused before anything is sent', async () => {
+  const { run, remote } = setup();
+  const conv = withSession(remote, { provider: 'cursor', model: 'composer-2.5' });
+  const onCursor = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude', wait_seconds: 0 });
+  assert.equal(onCursor.status, 400);
+  assert.equal(onCursor.body.code, 'REMOTE_RELAY_INVALID_INPUT');
+  const other = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'deepseek', wait_seconds: 0 });
+  assert.equal(other.status, 400);
+  assert.match(other.body.error, /send takes provider "claude"/);
+  assert.equal(conv.messages.length, 2);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+});
+
+test('a model sent with the switch is checked against the billing it moves to', async () => {
+  const { run, remote } = setup();
+  const conv = withSession(remote);
+  remote.settings['claude-api'] = { configured: true, enabled: true, model: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'], availableModels: ['claude-sonnet-5-5'] };
+  remote.models.providersByModel['claude-sonnet-5-5'] = ['claude-api'];
+  // claude-opus-5 is on the subscription's list, not on the key's.
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', model: 'claude-opus-5', wait_seconds: 0 });
+  assert.equal(result.status, 400, JSON.stringify(result.body));
+  assert.equal(result.body.code, 'REMOTE_RELAY_UNKNOWN_MODEL');
+  assert.equal(conv.messages.length, 2);
+  assert.equal(conv.provider, 'claude');
+});
+
+test('the approval card names a billing switch only when the send makes one', async () => {
+  for (const [current, expected] of [['claude', 'claude-api'], ['claude-api', undefined]]) {
+    const { run, remote, approvals } = setup({ caller: { mode: 'plan' } });
+    withSession(remote, { provider: current });
+    const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'claude-api', wait_seconds: 0 });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(approvals.length, 1, current);
+    assert.equal(approvals[0].args.provider, expected, current);
+  }
 });

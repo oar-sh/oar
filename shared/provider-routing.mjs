@@ -12,8 +12,10 @@
 export const LEGACY_RELAY_PROVIDER_TYPES = Object.freeze(['github', 'openai']);
 
 // `claude-cloud` is its own provider, never an alias of `claude`: its worker
-// drives a session in Anthropic's cloud and spawns no CLI.
-export const SESSION_WORKER_PROVIDER_TYPES = Object.freeze(['claude', 'cursor', 'grok', 'claude-cloud', 'deepseek']);
+// drives a session in Anthropic's cloud and spawns no CLI. `claude-api` is
+// its own too: the Claude worker on a Console API key instead of the host's
+// subscription login.
+export const SESSION_WORKER_PROVIDER_TYPES = Object.freeze(['claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api']);
 
 export function isLegacyRelayProviderType(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -25,7 +27,7 @@ export function isSessionWorkerProviderType(value) {
   return SESSION_WORKER_PROVIDER_TYPES.includes(String(value || '').trim().toLowerCase());
 }
 
-/** `'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek'` — for interpolation into SQL NOT IN (...) lists. */
+/** `'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api'` — for interpolation into SQL NOT IN (...) lists. */
 export function sessionWorkerProviderSqlList() {
   return SESSION_WORKER_PROVIDER_TYPES.map((provider) => `'${provider}'`).join(', ');
 }

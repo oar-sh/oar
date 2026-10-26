@@ -430,7 +430,9 @@ test('a worker that survives the stop leaves the conversation intact', async () 
   assert.ok(!events.includes('emit:conversation_deleted:conv-1'));
 });
 
-test('a Claude conversation loses its transcript and session folder, and only those', async () => {
+// A Claude API conversation is a Claude one on an API key: its CLI state is
+// in the same place and goes the same way.
+for (const providerType of ['claude', 'claude-api']) test(`a ${providerType} conversation loses its transcript and session folder, and only those`, async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-delete-claude-'));
   try {
     const workspace = path.join(tmp, 'workspace');
@@ -452,7 +454,7 @@ test('a Claude conversation loses its transcript and session folder, and only th
     const { del } = setup({
       workspaceRootPath: workspace,
       conversation: { sdk_session_id: 'conv-1' },
-      runtimeSession: { provider_type: 'claude', claude_native_session_id: 'native-abc' },
+      runtimeSession: { provider_type: providerType, claude_native_session_id: 'native-abc' },
       resolveClaudeSessionRoot: resolver.resolveClaudeSessionRoot,
     });
     const response = await del();

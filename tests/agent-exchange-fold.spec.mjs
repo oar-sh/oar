@@ -19,7 +19,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  * relay's agent's prompt carries its `origin` there), takes them off the
  * queue with GET /api/pending and answers with POST /api/response, as a
  * worker does. The prompt of an agent on this relay comes through the
- * remote_relay tool route, from a conversation whose turn is running.
+ * relay_tool tool route, from a conversation whose turn is running.
  */
 
 const REMOTE_ORIGIN = {

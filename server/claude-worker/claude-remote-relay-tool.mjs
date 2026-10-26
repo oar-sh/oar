@@ -1,8 +1,8 @@
 /**
- * The relay's `remote_relay` tool for the Claude worker, shaped as an SDK MCP
+ * The relay's `relay_tool` tool for the Claude worker, shaped as an SDK MCP
  * tool definition (`{ name, description, inputSchema, handler }`) so the
  * adapter can hand it to `createSdkMcpServer` next to the preview tool. On the
- * wire it is `mcp__relay__remote_relay`; the module never imports the SDK.
+ * wire it is `mcp__relay__relay_tool`; the module never imports the SDK.
  */
 
 import * as z from 'zod';
@@ -140,7 +140,7 @@ export function createRemoteRelayToolDefinition({ api, getConversationId = () =>
         // A tool exception would surface as a failed MCP call and can abort
         // the turn; a refusal the model can read cannot.
         const message = error?.message || String(error);
-        dbg('remote_relay tool failed', message);
+        dbg('relay_tool failed', message);
         result = { ok: false, code: REMOTE_RELAY_CALL_FAILED, error: message };
       }
       return { content: [{ type: 'text', text: formatRemoteRelayToolResult(result) }] };

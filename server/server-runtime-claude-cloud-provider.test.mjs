@@ -60,7 +60,7 @@ test('the cloud launch environment is the kind and the model: no login, no key',
 test('the clear chain the runtime runs removes a stale cloud kind before binding another provider', () => {
   assert.match(
     launchEnvSource,
-    /const cleared = applyDeepSeekProviderEnvironment\(applyClaudeCloudProviderEnvironment\(applyCopilotSdkProviderEnvironment\(applyGrokProviderEnvironment\(applyCursorProviderEnvironment\(applyClaudeProviderEnvironment\(applyOpenAIProviderEnvironment\(sessionWorkerLaunchEnv\)\)\)\)\)\)\);/,
+    /const cleared = applyClaudeApiProviderEnvironment\(applyDeepSeekProviderEnvironment\(applyClaudeCloudProviderEnvironment\(applyCopilotSdkProviderEnvironment\(applyGrokProviderEnvironment\(applyCursorProviderEnvironment\(applyClaudeProviderEnvironment\(applyOpenAIProviderEnvironment\(sessionWorkerLaunchEnv\)\)\)\)\)\)\)\);/,
   );
   // The same chain, run for real: a base environment that names the cloud
   // worker must not leak it into a GitHub session's launch.
@@ -97,7 +97,7 @@ test('unstarted conversations are never rebound to or from the cloud by a provid
   // A cloud conversation carries a repository: flipping another provider's
   // switch must leave it alone, and flipping the cloud's must not turn
   // GitHub conversations into cloud ones.
-  assert.match(source, /managedProvider = \['claude', 'cursor', 'grok', 'deepseek'\]/);
+  assert.match(source, /managedProvider = \['claude', 'cursor', 'grok', 'deepseek', 'claude-api'\]/);
   assert.doesNotMatch(source, /managedProvider = \[[^\]]*'claude-cloud'/);
   const reconcileSource = sliceBetween(
     'async function reconcileUnstartedConversationProviders(',

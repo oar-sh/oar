@@ -164,7 +164,7 @@ export function syncRelayScheduleHeader() {
   }
   const next = nextScheduledAt(mine);
   const nextText = next ? new Date(next).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-  line.innerHTML = `<button type="button" class="relay-watch-chip relay-schedule-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-schedule-panel" title="Prompts the relay queues at set times (agents set them with remote_relay schedule)">⏰ ${escHtml(chipText)}${nextText ? ` <span class="relay-watch-hint">next ${escHtml(nextText)}</span>` : ''}</button>`;
+  line.innerHTML = `<button type="button" class="relay-watch-chip relay-schedule-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-schedule-panel" title="Prompts the relay queues at set times (agents set them with relay_tool schedule)">⏰ ${escHtml(chipText)}${nextText ? ` <span class="relay-watch-hint">next ${escHtml(nextText)}</span>` : ''}</button>`;
   line.hidden = false;
   panel.innerHTML = panelOpen ? renderSchedulePanelHtml(schedules, id, { conversations, escHtml }) : '';
   panel.hidden = !panelOpen;

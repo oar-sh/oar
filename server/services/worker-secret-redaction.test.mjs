@@ -67,14 +67,14 @@ test('the first part of a key the worker clipped goes, wherever the ellipsis is 
   // The remote-relay activity line, as the workers build it: the text clipped
   // at 60 characters inside quotes, so the line goes on after the ellipsis.
   const text = `Please use this DeepSeek key for the job: ${DEEPSEEK_SHAPED_KEY}`;
-  const sent = `Tool (remote_relay): ${summarizeRemoteRelayCall({ action: 'send', relay: 'other-relay', session: 'session-0001', text })}`;
+  const sent = `Tool (relay_tool): ${summarizeRemoteRelayCall({ action: 'send', relay: 'other-relay', session: 'session-0001', text })}`;
   const clipped = DEEPSEEK_SHAPED_KEY.slice(0, 17);
   assert.ok(sent.endsWith(`${clipped}…”`), sent);
   assert.equal(
     redactSecretsInText(sent, [DEEPSEEK_SHAPED_KEY]),
     sent.replace(clipped, '[redacted]'),
   );
-  const asked = `Tool (remote_relay): ${summarizeRemoteRelayCall({ action: 'ask', relay: 'other-relay', question: text, urgency: 'now' })}`;
+  const asked = `Tool (relay_tool): ${summarizeRemoteRelayCall({ action: 'ask', relay: 'other-relay', question: text, urgency: 'now' })}`;
   assert.ok(asked.endsWith(`${clipped}…” (now)`), asked);
   assert.equal(redactSecretsInText(asked, [DEEPSEEK_SHAPED_KEY]), asked.replace(clipped, '[redacted]'));
 
@@ -106,7 +106,7 @@ test('the first part of a key the worker clipped goes, wherever the ellipsis is 
 test('the middleware takes a clipped key out of the remote-relay activity line', () => {
   const settings = { deepseek_api_key: DEEPSEEK_SHAPED_KEY };
   const middleware = createWorkerPostRedaction({ readSetting: (key) => settings[key] || '' });
-  const line = `Tool (remote_relay): ${summarizeRemoteRelayCall({
+  const line = `Tool (relay_tool): ${summarizeRemoteRelayCall({
     action: 'send',
     relay: 'other-relay',
     text: `Please use this DeepSeek key for the job: ${DEEPSEEK_SHAPED_KEY}`,
@@ -261,7 +261,7 @@ test('a key used as a property name is renamed, in order, without touching the o
 });
 
 test('the saved keys come from the registered settings; a provider registers by one entry', () => {
-  assert.deepEqual(SAVED_PROVIDER_KEY_SETTINGS.map((entry) => entry.provider), ['deepseek']);
+  assert.deepEqual(SAVED_PROVIDER_KEY_SETTINGS.map((entry) => entry.provider), ['deepseek', 'claude-api']);
   assert.deepEqual(readSavedProviderKeys({ readSetting }), [SAVED_KEY]);
   assert.deepEqual(readSavedProviderKeys({ readSetting: () => '' }), []);
   assert.deepEqual(readSavedProviderKeys({ readSetting: () => 'short' }), []);
@@ -338,6 +338,20 @@ test('the middleware takes the key out of every channel a worker posts on', () =
     if (body.messageId) assert.equal(out.messageId, body.messageId, routePath);
     if (body.conversationId) assert.equal(out.conversationId, body.conversationId, routePath);
   }
+});
+
+test('the Claude API key saved in the settings is taken out of a worker post too', () => {
+  const claudeApiKey = 'sk-ant-api03-test-7777';
+  const settings = { claude_api_key: claudeApiKey };
+  const middleware = createWorkerPostRedaction({ readSetting: (key) => settings[key] || '' });
+  const out = runMiddleware(middleware, {
+    method: 'POST',
+    path: '/api/activity',
+    headers: WORKER_HEADERS,
+    body: { messageId: 'm-1', conversationId: 'c-1', text: `Bash: echo ${claudeApiKey}` },
+  });
+  assert.equal(JSON.stringify(out).includes(claudeApiKey), false);
+  assert.equal(out.text, 'Bash: echo [redacted]');
 });
 
 test('the middleware leaves a browser request, a settings save, an unsaved key and a short key alone', () => {
@@ -526,18 +540,25 @@ test('behind express.json, a route sees the redacted body; a key saved later app
   }
 });
 
-test('the relay builds the redaction at its start, notes each DeepSeek save, and mounts it after the JSON body parser and before every route', () => {
+test('the relay builds the redaction at its start, notes each DeepSeek and Claude API save, and mounts it after the JSON body parser and before every route', () => {
   const runtimePath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server-runtime.mjs');
   const source = fs.readFileSync(runtimePath, 'utf8').replace(/\r\n/g, '\n');
   const built = source.indexOf('const workerPostRedaction = createWorkerPostRedaction({ readSetting: readAppSettingValue });');
-  const service = source.indexOf('const deepseekSettingsService = createDeepSeekSettingsService({');
   assert.notEqual(built, -1);
-  assert.ok(source.indexOf('\nconst stmts = {') < built && built < service);
-  const serviceSource = source.slice(service, source.indexOf('\n});', service));
-  assert.match(
-    serviceSource,
-    /writeSetting: \(key, value\) => \{\n    stmts\.upsertAppSetting\.run\(key, String\(value\), new Date\(\)\.toISOString\(\)\);\n    workerPostRedaction\.noteSavedSetting\(key, value\);\n  \},/,
-  );
+  assert.ok(source.indexOf('\nconst stmts = {') < built);
+  for (const start of [
+    'const deepseekSettingsService = createDeepSeekSettingsService({',
+    'const claudeApiSettingsService = createClaudeApiSettingsService({',
+  ]) {
+    const service = source.indexOf(start);
+    assert.ok(built < service, start);
+    const serviceSource = source.slice(service, source.indexOf('\n});', service));
+    assert.match(
+      serviceSource,
+      /writeSetting: \(key, value\) => \{\n    stmts\.upsertAppSetting\.run\(key, String\(value\), new Date\(\)\.toISOString\(\)\);\n    workerPostRedaction\.noteSavedSetting\(key, value\);\n  \},/,
+      start,
+    );
+  }
   const parser = source.indexOf("app.use(express.json({ limit: '20mb' }));");
   const redaction = source.indexOf('app.use(workerPostRedaction);');
   const firstRoutes = source.indexOf('registerMessagesRoutes(app, sharedRouteDeps);');

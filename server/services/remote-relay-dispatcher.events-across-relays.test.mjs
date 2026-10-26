@@ -12,7 +12,7 @@ import { createRemoteRelayDispatcher } from './remote-relay-dispatcher.mjs';
 import { createRelayEventLinkService } from './relay-event-link-service.mjs';
 import { RelayEventError, createRelayEventService, servedWatcherKey } from './relay-event-service.mjs';
 
-// remote_relay subscribe / unsubscribe / list_subscriptions /
+// relay_tool subscribe / unsubscribe / list_subscriptions /
 // transfer_subscriptions on a paired relay, through the dispatcher of relay
 // A ("win-test") and the event routes of relay B ("linux-test"), which the
 // fake client answers with B's own event service. B has no registry entry

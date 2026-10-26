@@ -47,8 +47,8 @@ export function summarizeToolInput(toolName, input) {
 /**
  * The relay's custom tools reach the stream as the SDK's generic MCP call
  * (`name: 'mcp'`, args `{ providerIdentifier: 'custom-user-tools', toolName,
- * args }`). `remote_relay` is shown as itself with the contract's one-line
- * summary, so the transcript reads `Tool (remote_relay): send → …` like every
+ * args }`). `relay_tool` is shown as itself with the contract's one-line
+ * summary, so the transcript reads `Tool (relay_tool): send → …` like every
  * other provider's; null for any other tool.
  */
 function remoteRelayCallArgs(toolName, input) {

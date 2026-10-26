@@ -565,3 +565,34 @@ test('a stale socket no longer counts as live without a fresh heartbeat or live 
   assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'a new heartbeat restores socket-backed liveness');
   service.stop();
 });
+
+test('a worker\'s stated kind rides every delivery request from its socket, and is reported once', async () => {
+  const httpServer = new EventEmitter();
+  const requests = [];
+  const kinds = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async (request) => { requests.push(request); return { message: null }; },
+    onWorkerKind: (sessionId, kind, pid) => kinds.push({ sessionId, kind, pid }),
+  });
+  service.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const socket = lastWss.sockets.at(-1);
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-kind', pid: 77, kind: 'claude-api' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-kind', pid: 77, kind: 'claude-api' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(requests.length >= 2);
+  assert.ok(requests.every((request) => request.workerKind === 'claude-api'));
+  assert.deepEqual(kinds, [{ sessionId: 'sdk-kind', kind: 'claude-api', pid: 77 }]);
+  // A worker that says no kind asks without one.
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const quiet = lastWss.sockets.at(-1);
+  quiet.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-quiet', pid: 78 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).workerKind, null);
+  service.stop();
+});

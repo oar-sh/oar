@@ -66,6 +66,10 @@ export function createWorkerWebSocketLink({
   onServerHello = () => {},
   getSessionId = () => null,
   getPid = () => null,
+  // The kind of worker this is ("claude", "claude-api", ...), stated in
+  // every hello and ready: the relay hands a Claude chat's row only to a
+  // worker of the row's billing.
+  workerKind = null,
   minBackoffMs = 1000,
   maxBackoffMs = 8_000,
   jitterMs = 250,
@@ -170,6 +174,7 @@ export function createWorkerWebSocketLink({
       reason,
       sessionId: normalizeText(getSessionId()),
       pid: normalizePositiveInt(getPid()),
+      ...(normalizeText(workerKind) ? { kind: normalizeText(workerKind) } : {}),
       ...(held ? { ready: false } : {}),
     });
     if (sent) lastHelloSentAt = getNowMs();
@@ -197,6 +202,7 @@ export function createWorkerWebSocketLink({
       reason,
       sessionId: normalizeText(getSessionId()),
       pid: normalizePositiveInt(getPid()),
+      ...(normalizeText(workerKind) ? { kind: normalizeText(workerKind) } : {}),
     });
     if (sent) lastReadySentAt = getNowMs();
     return sent;

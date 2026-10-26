@@ -862,6 +862,9 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     // (deepseek-usage-import.mjs readActuals()), or null: read only, laid
     // over the estimate by the card.
     deepseekActuals = null,
+    // The Claude API card, built by its own module (plan-usage-claude-api.mjs)
+    // from the Claude API booking; null while Claude API has no key and is off.
+    claudeApiCard = null,
   } = {}) {
     const generatedAt = nowIso();
     const claudeSnapshot = readSnapshot('claude');
@@ -911,6 +914,8 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
           configured: true,
         })
         : null,
+      // Opt-in too, and next to the Claude cards: the same models on a key.
+      claudeApiCard || null,
       buildCursorPlanCard({
         totals: cursorCycle.totals,
         allowances,

@@ -2,7 +2,7 @@
 
 /**
  * Relay schedules: a prompt the relay queues into a session at a set time,
- * once or every N minutes (remote_relay's `schedule`). An agent's own timers
+ * once or every N minutes (relay_tool's `schedule`). An agent's own timers
  * die with the relay; these live in the database (migrations/0022-relay-schedules.mjs)
  * and their timers are rebuilt at boot.
  *

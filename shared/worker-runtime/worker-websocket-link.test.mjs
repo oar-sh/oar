@@ -953,3 +953,25 @@ test("stop ends reconnecting for good: no timer, no deadline, no new socket", ()
   assert.equal(timers.length, timersBefore);
   assert.equal(pending().length, 0);
 });
+
+test("a worker's kind rides its hello and its ready", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-1",
+    getPid: () => 4242,
+    workerKind: "claude-api",
+    onDeliver: async () => {},
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = socket.sent.map((payload) => JSON.parse(payload));
+  assert.deepEqual(sent.map((payload) => [payload.type, payload.kind]), [["worker.hello", "claude-api"], ["worker.ready", "claude-api"]]);
+  link.stop();
+});

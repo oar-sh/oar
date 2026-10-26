@@ -43,6 +43,18 @@ const LEGACY_SETTINGS_IDS = [
   "claude-model-input",
   "claude-settings-status",
   "claude-save-btn",
+  // Providers → Claude API (claude-api-settings-ui.js looks these up by ID)
+  "claude-api-enabled-toggle",
+  "claude-api-key-input",
+  "claude-api-model-select",
+  "claude-api-models-status",
+  "claude-api-monthly-cap-input",
+  "claude-api-monthly-cap-error",
+  "claude-api-settings-status",
+  "claude-api-save-btn",
+  "claude-api-refresh-btn",
+  "claude-api-remove-btn",
+  "claude-api-open-claude-tab-btn",
   // Providers → Grok
   "grok-enabled-toggle",
   "grok-model-input",
@@ -151,7 +163,7 @@ const LEGACY_SETTINGS_IDS = [
 const TABS = ["general", "providers", "relays", "previews", "shares", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
-const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-cloud", "grok", "cursor", "deepseek"];
+const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-api", "claude-cloud", "grok", "cursor", "deepseek"];
 
 async function loadApp(page) {
   await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
@@ -309,6 +321,25 @@ test.describe("tabbed settings modal", () => {
     await openSettings(page, "nonsense", "nonsense");
     await expectActiveTab(page, "providers");
     await expectActiveProviderTab(page, "claude");
+  });
+
+  test("the Claude API refusal buttons deep-link to its panel, which points back to the Claude tab", async ({ page }) => {
+    await loadApp(page);
+    await openSettings(page, "notifications");
+    await page.evaluate(() => window.closeSettingsModal());
+
+    // The CTA a Claude API refusal renders (relay-error-ctas.mjs).
+    await openSettings(page, "providers", "claude-api");
+    await expectActiveTab(page, "providers");
+    await expectActiveProviderTab(page, "claude-api");
+    await expect(page.locator("#claude-api-key-input")).toBeVisible();
+    await expect(page.locator("#claude-api-key-input")).toHaveAttribute("type", "password");
+    await expect(providerPanel(page, "claude-api")).toContainText("set on the Claude tab");
+
+    // The shared settings live on the Claude tab, one press away.
+    await page.locator("#claude-api-open-claude-tab-btn").click();
+    await expectActiveProviderTab(page, "claude");
+    await expect(page.locator("#claude-background-command-limit-slider")).toBeVisible();
   });
 
   test("the Claude background command limit slider saves and survives a reload", async ({ page }) => {

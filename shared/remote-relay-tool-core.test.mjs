@@ -7,11 +7,13 @@ import {
   REMOTE_RELAY_CALL_FAILED,
   REMOTE_RELAY_CANCELLED,
   REMOTE_RELAY_INFLIGHT_PATH,
+  REMOTE_RELAY_LEGACY_TOOL_NAME,
   REMOTE_RELAY_SUMMARY_PATH,
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_ENDPOINT,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
   REMOTE_RELAY_TOOL_NAME,
+  canonicalRemoteRelayToolCallName,
   cloneRemoteRelayToolInputSchema,
   createRemoteRelayToolGate,
   executeRemoteRelayTool,
@@ -319,12 +321,28 @@ test('results are pretty JSON for every adapter', () => {
 });
 
 test('tool names: bare and namespaced spellings, nothing else', () => {
+  for (const name of ['relay_tool', 'mcp__relay__relay_tool', 'oar__relay_tool', 'oar/relay_tool', 'oar-relay_tool', 'OAR: relay_tool']) {
+    assert.equal(isRemoteRelayToolName(name), true, name);
+  }
+  for (const name of ['', 'preview', 'not_relay_tool', 'relay_tool_x', 'myrelay_tool']) {
+    assert.equal(isRemoteRelayToolName(name), false, name);
+  }
+});
+
+test('the old name, remote_relay, is recognised in every spelling, and dispatches as relay_tool', () => {
+  assert.equal(REMOTE_RELAY_TOOL_NAME, 'relay_tool');
+  assert.equal(REMOTE_RELAY_LEGACY_TOOL_NAME, 'remote_relay');
   for (const name of ['remote_relay', 'mcp__relay__remote_relay', 'oar__remote_relay', 'oar/remote_relay', 'oar-remote_relay', 'OAR: remote_relay']) {
     assert.equal(isRemoteRelayToolName(name), true, name);
   }
-  for (const name of ['', 'preview', 'not_remote_relay', 'remote_relay_x', 'myremote_relay']) {
+  for (const name of ['not_remote_relay', 'remote_relay_x', 'myremote_relay']) {
     assert.equal(isRemoteRelayToolName(name), false, name);
   }
+  assert.equal(canonicalRemoteRelayToolCallName('remote_relay'), 'relay_tool');
+  assert.equal(canonicalRemoteRelayToolCallName(' relay_tool '), 'relay_tool');
+  assert.equal(canonicalRemoteRelayToolCallName('preview'), 'preview');
+  assert.equal(canonicalRemoteRelayToolCallName('mcp__relay__remote_relay'), 'mcp__relay__remote_relay', 'bare names only');
+  assert.equal(canonicalRemoteRelayToolCallName(null), '');
 });
 
 test('activity summaries come from the contract and tolerate string arguments', () => {

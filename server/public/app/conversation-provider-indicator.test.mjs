@@ -176,3 +176,32 @@ test('a DeepSeek conversation has its own name, pill key and lock note', async (
   // Models switch between turns, so the note names no pinned model.
   assert.equal(indicator.sessionLockNoteText({ providerType: 'deepseek' }), '🔒 Session locked to DeepSeek models.');
 });
+
+test('a Claude API conversation has its own name, pill and lock note', async () => {
+  const indicator = await import('./conversation-provider-indicator.mjs');
+  const conversation = { runtimeProviderType: 'claude-api', runtimeProviderModel: 'claude-sonnet-5-5' };
+  assert.equal(indicator.isConversationUsingClaudeApiProvider(conversation), true);
+  // Never a subscription chat, and a subscription chat is never one.
+  assert.equal(indicator.isConversationUsingClaudeProvider(conversation), false);
+  assert.equal(indicator.isConversationUsingClaudeApiProvider({ runtimeProviderType: 'claude' }), false);
+  assert.equal(indicator.conversationProviderIndicatorLabel(conversation), 'Claude API');
+  assert.equal(indicator.conversationProviderIndicatorKey(conversation), 'claude-api');
+  assert.equal(indicator.questionCardHeadLabel(conversation), 'Claude API question');
+  assert.equal(indicator.providerDisplayName('claude-api'), 'Claude API');
+  assert.equal(indicator.sessionLockProviderKey({ providerType: 'Claude-API' }), 'claude-api');
+  assert.equal(indicator.sessionLockProviderLabel({ providerType: 'claude-api' }), 'Claude API');
+  // Named as the pill and New Chat name it.
+  assert.equal(indicator.sessionLockNoteText({ providerType: 'claude-api' }), '🔒 Session locked to Claude API models.');
+  // The subscription's note is unchanged.
+  assert.equal(indicator.sessionLockNoteText({ providerType: 'claude' }), '🔒 Session locked to Claude SDK models.');
+});
+
+test('every pill and lock-note key has its colour in light and dark', async () => {
+  const fs = await import('node:fs');
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const declared = html.match(/--provider-claude-api:\s*#[0-9a-f]{6};/gi) || [];
+  // The dark palette and the light one.
+  assert.equal(declared.length, 2);
+  assert.match(html, /\.conv-provider-indicator\[data-provider="claude-api"\] \{ color: var\(--provider-claude-api\); \}/);
+  assert.match(html, /#model-lock-note\[data-provider="claude-api"\] \{ color: var\(--provider-claude-api\); \}/);
+});

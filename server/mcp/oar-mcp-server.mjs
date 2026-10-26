@@ -2,7 +2,7 @@
 // OAR's own stdio MCP server. It gives the agents OAR launches without an
 // in-process tool surface — Grok (ACP `mcpServers`) and the Copilot CLI
 // extension engine (`--additional-mcp-config`) — the relay's real tools:
-// `remote_relay` and `preview`, bound to the one conversation it was started
+// `relay_tool` and `preview`, bound to the one conversation it was started
 // for, so the relay's mention gate and approval apply exactly as they do for
 // the Claude, Cursor and Copilot SDK workers.
 //
@@ -34,6 +34,7 @@ import {
   REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS,
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_NAME,
+  canonicalRemoteRelayToolCallName,
   cloneRemoteRelayToolInputSchema,
   executeRemoteRelayTool,
   formatRemoteRelayToolResult,
@@ -216,10 +217,15 @@ export function createOarMcpServer({
   }
 
   async function callTool(id, params) {
-    const name = toText(params?.name);
+    // `remote_relay`, the tool's name up to 0.9.17, still dispatches while
+    // the tool is on, but is never listed: a second definition would only
+    // cost context. The hosts in use (Grok, the Copilot CLI) call only what
+    // tools/list gave them, so for them the old name is gone; a client that
+    // kept it still works.
+    const name = canonicalRemoteRelayToolCallName(params?.name);
     const tools = await listTools();
     if (!tools.some((tool) => tool.name === name)) {
-      return fail(id, JSON_RPC.invalidParams, `Unknown tool: ${name || '(none)'}`);
+      return fail(id, JSON_RPC.invalidParams, `Unknown tool: ${toText(params?.name) || '(none)'}`);
     }
     const args = params?.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
       ? params.arguments
@@ -348,7 +354,7 @@ export function createOarMcpServer({
 
 /**
  * The stdio process: parse the arguments, reach the relay like a worker does,
- * decide whether `remote_relay` is listed (asked once, at startup), then serve
+ * decide whether `relay_tool` is listed (asked once, at startup), then serve
  * until stdin closes. Returns the server, or null after a startup failure.
  */
 export async function runOarMcpServer({
@@ -413,7 +419,7 @@ export async function runOarMcpServer({
     remoteRelay: Promise.resolve()
       .then(() => shouldRegisterRemoteRelayToolImpl({ api }))
       .then((enabled) => {
-        log(`serving conversation ${conversationId.slice(0, 8)}; remote_relay ${enabled ? 'on' : 'off'}`);
+        log(`serving conversation ${conversationId.slice(0, 8)}; relay_tool ${enabled ? 'on' : 'off'}`);
         return enabled;
       }),
     version: readPackageVersion(),

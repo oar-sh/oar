@@ -73,13 +73,15 @@ import {
   loadClaudeCloudRepos,
   loadGrokSettings,
   loadDeepSeekSettings,
+  loadClaudeApiSettings,
   loadOpenAISettings,
 } from './api-client.js';
 import { isSetupRequired, updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { SETUP_TEXT } from './no-conversation-state.mjs';
 import { openSettingsModal } from './settings-modal.js';
+import { START_ON_SUBSCRIPTION_ACTION, newChatClaudeApiRefusalActions } from './relay-error-ctas.mjs';
 import { captureReadingBlock, restoreReadingBlock } from './transcript-viewport-anchor.mjs';
-import { renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, getTranscriptJumpEpoch, getTranscriptLiveRowEpoch, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn, captureConversationReadingAnchor, restoreConversationReadingAnchor, detachConversationWindowFromTail, mergeMessagesIntoTranscript, isConversationWindowAtTail } from './conversation-view.js';
+import { runRelayErrorCta, renderMessages, renderNoConversationState, restoreInFlightThinking, focusConversationMessageById, noteTranscriptJump, getTranscriptJumpEpoch, getTranscriptLiveRowEpoch, flushConversationDraft, hydrateConversationDraft, beginConversationDraftSwitch, openStopTurnConfirmationForConversation, conversationHasActiveTurn, captureConversationReadingAnchor, restoreConversationReadingAnchor, detachConversationWindowFromTail, mergeMessagesIntoTranscript, isConversationWindowAtTail } from './conversation-view.js';
 import { mergeTailPage } from './transcript-reading-anchor.mjs';
 import { readWindowRetention } from './conversation-window-retention.mjs';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
@@ -105,6 +107,7 @@ import { createInfiniteLoader } from './infinite-loader.js';
 import {
   buildNewConversationModelChoices,
   newConversationContextTierState,
+  preselectNewConversationModel,
   reasoningChoicesForProviderModel,
   resolvePreferredReasoningEffort,
 } from './new-conversation-model-choice.mjs';
@@ -191,6 +194,7 @@ let newConversationClaudeSettingsCache = null;
 let newConversationCursorSettingsCache = null;
 let newConversationGrokSettingsCache = null;
 let newConversationDeepSeekSettingsCache = null;
+let newConversationClaudeApiSettingsCache = null;
 let newConversationClaudeCloudSettingsCache = null;
 // Claude Cloud fields of the New Chat modal: what the selected folder's git
 // remote said, and what was written into Repository/Branch from it (so a later
@@ -700,7 +704,7 @@ function paintConvList() {
       : renderConversationOriginMarkerHtml(c, { conversations });
     // "watched": a session another conversation watches by id (relay events).
     const watchedMarkerHtml = relayEventWatchedMarkerHtml(c.id);
-    // "scheduled": a schedule fires into this session (remote_relay schedule).
+    // "scheduled": a schedule fires into this session (relay_tool schedule).
     const scheduledMarkerHtml = relayScheduleMarkerHtml(c.id);
     const groupClass = item.kind === 'head' ? ' conv-group-head' : (item.kind === 'member' ? ' conv-group-member' : '');
     const groupAttr = item.kind === 'head' || item.kind === 'member' ? ` data-group-id="${escHtml(item.group.id)}"` : '';
@@ -926,6 +930,8 @@ export function applyLoadedConversationState(id, response, {
     // Absent from an older relay's payload: keep what the socket said.
     pause: 'usageLimitPause' in response ? response.usageLimitPause : undefined,
     providerType: response.runtimeSession?.providerType,
+    // A Claude chat's billing and whether it may switch (an older relay: absent).
+    billing: 'billing' in response ? response.billing : undefined,
   });
   // Merge, not replace: this payload only carries one conversation's previews.
   mergeConversationPreviews(id, response.previews || []);
@@ -1236,6 +1242,7 @@ function normalizeNewConversationProviderType(value = '') {
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'claude-api') return 'claude-api';
   if (normalized === CLAUDE_CLOUD_PROVIDER) return CLAUDE_CLOUD_PROVIDER;
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok') return 'grok';
@@ -1278,6 +1285,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   const hasCursor = providers.includes('cursor');
   const hasGrok = providers.includes('grok');
   const hasDeepSeek = providers.includes('deepseek');
+  const hasClaudeApi = providers.includes('claude-api');
   if (wantsOpenAI) {
     if (hasOpenAIByok) return true;
     const settingsModel = String(newConversationOpenAISettingsCache?.model || '').trim();
@@ -1321,7 +1329,16 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
       : [];
     return normalizedModelId === deepseekModel || deepseekModels.includes(normalizedModelId);
   }
-  const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude');
+  if (normalizedProvider === 'claude-api') {
+    if (hasClaudeApi) return true;
+    const claudeApiModel = String(newConversationClaudeApiSettingsCache?.model || '').trim();
+    const claudeApiModels = Array.isArray(newConversationClaudeApiSettingsCache?.models)
+      ? newConversationClaudeApiSettingsCache.models.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [];
+    return normalizedModelId === claudeApiModel || claudeApiModels.includes(normalizedModelId);
+  }
+  // Claude API serves the Claude provider's ids: still none of Copilot's.
+  const claudeOnly = hasClaude && providers.every((provider) => provider === 'claude' || provider === 'claude-api');
   if (claudeOnly) return false;
   const cursorOnly = hasCursor && providers.every((provider) => provider === 'cursor');
   if (cursorOnly) return false;
@@ -1332,7 +1349,8 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
   // Should a relay ever tag catalog rows for Claude Cloud, they are no more
   // Copilot's than the other runtimes' rows are.
   const exclusiveOnly = providers.length > 0 && providers.every((provider) => (
-    provider === 'claude' || provider === 'cursor' || provider === 'grok' || provider === 'deepseek' || provider === CLAUDE_CLOUD_PROVIDER
+    provider === 'claude' || provider === 'cursor' || provider === 'grok' || provider === 'deepseek'
+    || provider === 'claude-api' || provider === CLAUDE_CLOUD_PROVIDER
   ));
   if (exclusiveOnly) return false;
   return providers.some((provider) => (
@@ -1341,6 +1359,7 @@ function modelMatchesNewConversationProvider(catalog = {}, modelId = '', provide
     && provider !== 'cursor'
     && provider !== 'grok'
     && provider !== 'deepseek'
+    && provider !== 'claude-api'
     && provider !== CLAUDE_CLOUD_PROVIDER
   )) || !hasOpenAIByok;
 }
@@ -1492,6 +1511,10 @@ function updateNewConversationProviderHelp(provider = 'github') {
     help.textContent = "Claude chats run through the Claude Agent SDK with the relay host's Claude login.";
     return;
   }
+  if (normalizedProvider === 'claude-api') {
+    help.textContent = 'Claude API chats run through the Claude Agent SDK on the API key saved in Settings, billed to its Claude Console organisation. The chat can switch to the subscription later.';
+    return;
+  }
   if (normalizedProvider === CLAUDE_CLOUD_PROVIDER) {
     help.textContent = "Claude Cloud chats run in a sandbox at Anthropic on a clone of a GitHub repository, billed to the relay host's Claude account.";
     return;
@@ -1537,7 +1560,7 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     buildCatalogModelOptions(eligibleModels, {
       metadataByModel: catalog.modelMetadataByModel || {},
       // The merged metadata knows Copilot's windows, not Claude's or the cloud's.
-      annotateContextWindow: normalizedProvider !== 'claude' && !isCloud,
+      annotateContextWindow: normalizedProvider !== 'claude' && normalizedProvider !== 'claude-api' && !isCloud,
     }).filter((option) => hasAuto || option.value.toLowerCase() !== 'auto'),
   );
   for (const choice of choices) {
@@ -1555,10 +1578,13 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     // The tab's default, not the last model another provider's chat used.
     const cloudDefault = claudeCloudDefaultModel(newConversationClaudeCloudSettingsCache, eligibleModels);
     if (cloudDefault) target.value = cloudDefault;
-  } else if (storedModel && Array.from(target.options).some((option) => option.value === storedModel)) {
-    target.value = storedModel;
-  } else if (normalizedProvider !== 'openai-image' && Array.from(target.options).some((option) => option.value === 'auto')) {
-    target.value = 'auto';
+  } else {
+    const preselected = preselectNewConversationModel(Array.from(target.options, (option) => option.value), {
+      storedModel,
+      providerDefault: normalizedProvider === 'claude-api' ? newConversationClaudeApiSettingsCache?.model : '',
+      allowAuto: normalizedProvider !== 'openai-image',
+    });
+    if (preselected) target.value = preselected;
   }
   updateNewConversationProviderHelp(normalizedProvider);
   syncNewConversationReasoningLabel(normalizedProvider);
@@ -2115,7 +2141,7 @@ function applyNewConversationSetupState(setupRequired) {
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings, deepseekSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings, deepseekSettings, claudeApiSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
@@ -2125,6 +2151,8 @@ async function openNewConversationModelModal() {
     loadClaudeCloudSettings(),
     // The same for a relay without DeepSeek.
     loadDeepSeekSettings(),
+    // And without Claude API.
+    loadClaudeApiSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
@@ -2133,6 +2161,7 @@ async function openNewConversationModelModal() {
   newConversationGrokSettingsCache = grokSettings || null;
   newConversationClaudeCloudSettingsCache = claudeCloudSettings || null;
   newConversationDeepSeekSettingsCache = deepseekSettings || null;
+  newConversationClaudeApiSettingsCache = claudeApiSettings || null;
   // Fresh answers for the readiness question, shared with the empty screen
   // and the composer. With no provider known to be ready the modal opens in
   // its setup state: Settings is the main button, Start stays as "anyway".
@@ -2143,11 +2172,13 @@ async function openNewConversationModelModal() {
     cursor: cursorSettings || null,
     grok: grokSettings || null,
     deepseek: deepseekSettings || null,
+    claudeApi: claudeApiSettings || null,
     catalog: catalog || null,
   });
   applyNewConversationSetupState(isSetupRequired(readiness));
   // Every open starts from empty cloud fields; the folder lookup refills them.
   resetNewConversationCloudState();
+  clearNewConversationClaudeApiRefusal();
   bindNewConversationCloudInputs();
   const providerSelect = document.getElementById('new-conversation-provider-select');
   if (providerSelect) {
@@ -2158,6 +2189,9 @@ async function openNewConversationModelModal() {
     }
     if (claudeSettings?.enabled === true) {
       options.push({ value: 'claude', label: 'Claude SDK' });
+    }
+    if (claudeApiSettings?.enabled === true) {
+      options.push({ value: 'claude-api', label: 'Claude API' });
     }
     if (claudeCloudSettings?.enabled === true) {
       options.push({ value: CLAUDE_CLOUD_PROVIDER, label: 'Claude Cloud' });
@@ -2188,6 +2222,7 @@ async function openNewConversationModelModal() {
     if (providerSelect.dataset.modelsBound !== '1') {
       providerSelect.dataset.modelsBound = '1';
       providerSelect.addEventListener('change', () => {
+        clearNewConversationClaudeApiRefusal();
         void populateNewConversationModelSelect(providerSelect.value);
       });
     }
@@ -2376,6 +2411,18 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       showNewConversationCloudError(cloudError.text, cloudError.field ? [cloudError.field] : []);
       return;
     }
+    // Claude API refused to start (this month's cap, no key, switched off):
+    // nothing was bound. The relay's words stay in the modal, with the way
+    // to fix it and the same chat on the subscription.
+    const claudeApiActions = !recovered && selectedProvider === 'claude-api'
+      ? newChatClaudeApiRefusalActions(error?.payload?.code, {
+        subscriptionOffered: newConversationProviderOffered('claude'),
+      })
+      : [];
+    if (claudeApiActions.length) {
+      showNewConversationClaudeApiRefusal(error?.message || 'Claude API could not start this chat.', claudeApiActions, selectedModel);
+      return;
+    }
     showTransientRelayNotice(recovered
       // The chat is usable, but its worker did not start, so say what broke.
       ? `The chat was created, but its session could not start: ${error?.message || 'unknown error'}.`
@@ -2387,8 +2434,78 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
   }
 }
 
+function newConversationProviderOffered(provider) {
+  return Array.from(document.getElementById('new-conversation-provider-select')?.options || [])
+    .some((option) => option.value === provider);
+}
+
+function clearNewConversationClaudeApiRefusal() {
+  const note = document.getElementById('new-conversation-refusal');
+  if (!note) return;
+  note.replaceChildren();
+  note.hidden = true;
+}
+
+// The same chat, started on the Claude provider: its model when the Claude
+// list has it, the choices the modal holds otherwise.
+async function startNewConversationOnSubscription(model) {
+  const providerSelect = document.getElementById('new-conversation-provider-select');
+  if (!providerSelect || newConversationInFlight) return;
+  clearNewConversationClaudeApiRefusal();
+  // The effort chosen for the refused chat: rebuilding the lists for Claude
+  // would fall back to the stored one.
+  const effort = String(document.getElementById('new-conversation-reasoning-select')?.value || '').trim().toLowerCase();
+  providerSelect.value = 'claude';
+  await populateNewConversationModelSelect('claude');
+  const modelSelect = document.getElementById('new-conversation-model-select');
+  if (modelSelect && Array.from(modelSelect.options).some((option) => option.value === model)) {
+    modelSelect.value = model;
+    await populateNewConversationReasoningSelect(model);
+  }
+  const reasoningSelect = document.getElementById('new-conversation-reasoning-select');
+  if (effort && reasoningSelect && Array.from(reasoningSelect.options).some((option) => option.value === effort)) {
+    reasoningSelect.value = effort;
+  }
+  await confirmNewConversationModel();
+}
+
+function showNewConversationClaudeApiRefusal(message, actions, model) {
+  const note = document.getElementById('new-conversation-refusal');
+  if (!note) {
+    showTransientRelayNotice(message, 12000);
+    return;
+  }
+  const text = document.createElement('div');
+  text.className = 'new-conversation-refusal-text';
+  text.textContent = message;
+  const buttons = document.createElement('div');
+  buttons.className = 'new-conversation-refusal-actions';
+  for (const item of actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'summary-btn';
+    button.dataset.action = item.action;
+    button.textContent = item.label;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (item.action === START_ON_SUBSCRIPTION_ACTION) {
+        void startNewConversationOnSubscription(model);
+        return;
+      }
+      closeNewConversationModelModal();
+      runRelayErrorCta(item.action);
+    });
+    buttons.appendChild(button);
+  }
+  note.replaceChildren(text, buttons);
+  note.hidden = false;
+  // The modal's body scrolls: on a phone the note lands below the fold.
+  note.scrollIntoView?.({ block: 'nearest' });
+}
+
 export async function confirmNewConversationModel() {
   if (newConversationInFlight) return;
+  clearNewConversationClaudeApiRefusal();
   const selectedModel = String(document.getElementById('new-conversation-model-select')?.value || '').trim();
   const selectedReasoningEffort = String(document.getElementById('new-conversation-reasoning-select')?.value || '').trim().toLowerCase();
   if (!selectedModel) return;

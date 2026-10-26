@@ -135,6 +135,19 @@ test('a claude cloud session has no effort choice, whatever the Claude provider 
   );
 });
 
+test('Claude API offers the Claude levels: its own discovered ones, else the Claude tab\'s, else the full ladder', () => {
+  const claudeSettings = { effortsByModel: { 'claude-sonnet-5-5': ['none', 'low', 'high', 'xhigh', 'ultracode'] } };
+  const claudeApiSettings = { effortsByModel: { 'claude-haiku-5-5': ['none'] } };
+  const supported = (model) => supportedReasoningEffortsForProviderModel({ providerType: 'claude-api', model, claudeSettings, claudeApiSettings });
+  assert.deepEqual(supported('claude-haiku-5-5'), ['none']);
+  assert.deepEqual(supported('Claude-Sonnet-5-5'), ['none', 'low', 'high', 'xhigh', 'ultracode']);
+  assert.deepEqual(supported('claude-fable-5-1'), ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode']);
+  assert.deepEqual(
+    resolveProviderReasoningEffort({ requestedEffort: 'ultracode', supportedEfforts: supported('claude-fable-5-1') }),
+    { ok: true, effort: 'ultracode', supported: supported('claude-fable-5-1') },
+  );
+});
+
 test('DeepSeek offers its three levels for every model, defaults to high and maps other names', async () => {
   const { deepseekReasoningEffortFor } = await import('../../shared/deepseek-models.mjs');
   const supported = supportedReasoningEffortsForProviderModel({ providerType: 'deepseek', model: 'deepseek-v9-ultra' });

@@ -52,6 +52,7 @@ oar/
 ├── bin/                            # The `oar` command (oar.js) and a Windows cmd shim for checkouts (bat/oar.bat)
 ├── docs/                           # User guides behind the README, preview-server guide, Copilot BYOK notes, SDK feature tracker
 ├── server/
+│   ├── claude-api-worker/          # Claude API session worker (the Claude worker on a Claude Console API key)
 │   ├── claude-cloud-worker/        # Claude Cloud session worker (follows a cloud session's event stream; runs no agent itself)
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
 │   ├── copilot-worker/             # Copilot SDK engine session worker (steering, background tasks, questions)
@@ -87,7 +88,9 @@ Operator and developer detail moved here from the README.
    `server/grok-worker/`): one Node process per conversation that runs its turns through the
    Copilot SDK engine, the Claude Agent SDK, the Cursor Agent SDK, or the Grok CLI over ACP, and
    speaks the same relay contracts as the Copilot workers. The DeepSeek worker
-   (`server/deepseek-worker/`) is the Claude worker with its CLI pointed at DeepSeek. The Claude Cloud worker
+   (`server/deepseek-worker/`) is the Claude worker with its CLI pointed at DeepSeek, and the Claude
+   API worker (`server/claude-api-worker/`) is the Claude worker billed to an API key the relay
+   holds. The Claude Cloud worker
    (`server/claude-cloud-worker/`) speaks them too but runs no agent: it sends messages to a
    session in Anthropic's cloud and follows that session's event stream.
 3. **Copilot CLI extension** (`.github/extensions/web-relay/`): the Extension engine. It polls the
@@ -224,11 +227,13 @@ If the same extension is available both project-local (`.github/extensions/web-r
 Common routes:
 
 - Browser/API: `/api/message`, `/api/conversations`, `/api/conversation/:id`, `/api/status`, `/api/models`, `/api/usage`, `/api/context/:conversationId`
-- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/claude-cloud`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/deepseek`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
+- Settings: `/api/settings/openai`, `/api/settings/claude`, `/api/settings/claude-cloud`, `/api/settings/grok`, `/api/settings/cursor`, `/api/settings/deepseek`, `/api/settings/claude-api`, `/api/settings/copilot`, `/api/settings/turn-ceiling`, `/api/settings/windows-autostart`
 - Relay control: `/api/relay/shutdown`, `/api/relay/pause`, `/api/relay/resume`
 - Worker bridge: `/api/pending`, `/api/response`, `/api/activity`, `/api/stream`, `/api/thought`, `/api/heartbeat`
-- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`
+- Claude worker: `/api/claude-native-session`, `/api/claude-context-usage`, `/api/claude-plan-usage`, `/api/claude-api-usage`
 - DeepSeek worker: the Claude worker's `/api/claude-native-session` and `/api/claude-context-usage`
+- Claude API worker: the Claude worker's `/api/claude-native-session`, `/api/claude-context-usage` and `/api/claude-api-usage`
+- Claude billing: `/api/conversation/:id/billing` (a Claude chat between the subscription and the API key)
 - Claude Cloud worker: `/api/claude-cloud-session`, plus the Claude worker's `/api/claude-context-usage` and `/api/claude-plan-usage`
 - Claude account auth: `/api/claude/auth/status`, `/api/claude/auth/login/start`, `/api/claude/auth/login/code`, `/api/claude/auth/login/cancel`, `/api/claude/auth/logout`
 - Grok account auth: `/api/grok/auth/status`, `/api/grok/auth/login/start`, `/api/grok/auth/login/cancel`, `/api/grok/auth/logout`
@@ -237,7 +242,7 @@ Common routes:
 - Questions: `/api/relay-question`, `/api/relay-question/:id`, `/api/relay-question/:id/answer`
 - Sharing: `/api/conversation/:id/share`, `/api/conversation/:id/message/:messageId/share-visibility`, `/api/shared/:token`
 - Pinned messages: `/api/conversation/:id/message/:messageId/pin`
-- Session groups: `/api/conversation-groups` (POST: a group by hand), `/api/conversation-groups/:id` (PATCH: the name; DELETE: dissolve), `/api/conversation-groups/:id/archive`, `/api/conversation-groups/:id/stop`, `/api/conversation/:id/group` (PUT: move in; DELETE: move out). The list route carries `groupId`, `groupRole` and the page's `groups`, and never ends a page inside a group (`server/public/app/conversation-group-order.mjs`, shared with the sidebar); a session an agent creates here joins its creator's group at bootstrap (`server/repositories/conversation-group-repository.mjs`). Owner-only: a paired relay's request is refused, and the `remote_relay` tool only reads groups
+- Session groups: `/api/conversation-groups` (POST: a group by hand), `/api/conversation-groups/:id` (PATCH: the name; DELETE: dissolve), `/api/conversation-groups/:id/archive`, `/api/conversation-groups/:id/stop`, `/api/conversation/:id/group` (PUT: move in; DELETE: move out). The list route carries `groupId`, `groupRole` and the page's `groups`, and never ends a page inside a group (`server/public/app/conversation-group-order.mjs`, shared with the sidebar); a session an agent creates here joins its creator's group at bootstrap (`server/repositories/conversation-group-repository.mjs`). Owner-only: a paired relay's request is refused, and the `relay_tool` tool only reads groups
 - Images: `/api/openai/images/generate`, `/api/image-operations/:operationId/execute`, `/api/generated-image/:conversationId/:messageId/:imageId/content`
 - File access: `/api/files/*`, `/api/files-preview/*`, `/api/repo/tree`, `/api/drives/*`
 - Git: `/api/git/status`, `/api/git/diff`, `/api/git/pull`, `/api/git/remote` (the New Chat modal of a Claude Cloud chat)
@@ -475,6 +480,85 @@ rule as for the other worker entries applies: never run the entry bare from an a
 It then checks the context panel and deletes the chat. It costs real money on the DeepSeek account:
 run it only with the account owner's go-ahead.
 
+### Claude API workers
+
+Claude API conversations run `server/claude-api-worker/claude-api-session-worker.mjs`. It is the
+Claude worker (it runs `claude-session-worker-main.mjs` too) with a backend that runs Claude Code on
+the Claude Console API key saved in Settings → Providers → Claude API (`claude-api-backend.mjs`).
+Its log lines read `[claude-api-worker …]`, under `tmux attach` and in
+`worker-<sdk-session-id>.log`. The chat is a Claude chat on another bill: the Claude tab's models,
+efforts, thinking and images, and the host's Claude Code state folder. The full description is in
+[server/README.md](server/README.md#claude-api-provider).
+
+- **What the relay hands it.** `applyClaudeApiProviderEnvironment` sets
+  `COPILOT_WEB_RELAY_WORKER_KIND=claude-api`, `CLAUDE_API_RELAY_MODEL` and `OAR_CLAUDE_API_KEY`.
+  The key is a secret of this kind alone: under tmux it comes through the owner-only secret file,
+  and every other kind is started without it. No worker of any kind is started with the host's
+  `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
+- **What the CLI gets.** The backend builds the CLI's environment from the worker's, without any
+  `ANTHROPIC_*` variable, the host's `CLAUDE_CODE_OAUTH_TOKEN` and the other login variables, the
+  provider switches (Bedrock, Vertex, Foundry and the others), a host's model and effort pins, the
+  relay's settings for its worker (`OAR_*` included) or a host Claude Code session's variables.
+  It then sets `ANTHROPIC_API_KEY` (the key) and `ANTHROPIC_BASE_URL` (`https://api.anthropic.com`).
+  `CLAUDE_CONFIG_DIR` stays as the relay set it, so the chat shares `~/.claude` with Claude chats.
+- **The flag settings.** The spawn's `--settings` (`claudeApiFlagSettings`) carries
+  `disableAllHooks: true`, the base URL, an empty `ANTHROPIC_AUTH_TOKEN` and an empty
+  `apiKeyHelper`, and no key: other users of the host can read the command line. The key and the
+  routing and trust pins (`CLAUDE_CLI_PINNED_ENV`, shared with DeepSeek) go into the same layer over
+  the CLI's stdin (`claudeApiLiveFlagSettings`), before the first message is released. This layer outranks
+  the user's and the chat folder's settings, so their `env` or `apiKeyHelper` cannot swap the key
+  or the endpoint. No hooks and no status line command run.
+- **The key source check.** A turn whose `system/init` names any `apiKeySource` but
+  `ANTHROPIC_API_KEY` is stopped (`claude-api-key-source`). The CLI sends its first request some 50
+  to 90 ms after the init, so at most one model request may already be out on the other credential;
+  the check limits it, it does not prevent it. A subscription turn of a Claude chat gets the reverse
+  check: a key source (`ANTHROPIC_API_KEY`, `apiKeyHelper`, `/login managed key`) stops it
+  (`subscription-key-source`).
+- **Usage.** Both Claude workers post after every turn to `POST /api/claude-api-usage`: per CLI
+  process (`runId`) its counts per model with Claude Code's cost estimate, and the session's totals.
+  The relay books only turns on the key, by the posting worker's kind, per relay-local day
+  (`claude-api-usage-service.mjs`). The Claude API card and the monthly cap read those days.
+- **Left out.** No Claude plan usage, no Claude usage-limit reports and no usage-limit pause. A
+  refused request is explained in the API's terms: `claude-api-credit`, `claude-api-spend-limit`,
+  `claude-api-billing`, `claude-api-key` and `claude-api-rate-limit`. Every failure of a Claude API
+  chat prints as `relay.claude-api-<code>`, never as Claude's `relay.claude-<code>`.
+
+A Claude chat moves between the subscription and the key with
+`POST /api/conversation/:id/billing`; the relay then swaps the worker between turns (see
+[Billing switch](server/README.md#billing-switch)). The same rule as for the other worker entries
+applies: never run the entry bare from an agent's shell (see
+[Claude Cloud workers](#claude-cloud-workers)); `node --check` checks that it parses.
+
+**Proving the spawn.** Two scripts run the bundled CLI against a fake API on the loopback interface,
+with placeholder keys only; they cost nothing:
+- `nice -n 19 node scripts/claude-api-cli-proof.mjs` sets wrong endpoints, keys, key helpers,
+  proxies, TLS trust, Bedrock and Vertex in the user's and the folder's settings, turn by turn, and
+  checks that only the relay's placeholder key reaches the fake API and nothing reaches the wrong
+  listeners, with a control turn that signs in with a stored subscription login. It prints the
+  init's `apiKeySource` and when the live pins land against the first request. `--pins=endpoint`
+  sends only the endpoint, the key and the two blanks, without the routing and trust pins, and is
+  expected to fail;
+- `nice -n 19 node scripts/claude-cli-hooks-proof.mjs` puts hooks and a status line command in the
+  user's, the folder's and a plugin's settings, with `disableAllHooks: false`, and checks that a
+  subscription chat runs them and a DeepSeek and a Claude API chat do not.
+
+On every SDK or CLI bump, run both again, with `scripts/deepseek-cli-proof.mjs`, and check
+`CLAUDE_CLI_PINNED_ENV` against the CLI's variable names.
+
+**Checking a running relay.** `scripts/claude-api-live-check.mjs --relay <url> --cwd <scratch folder>`
+(token in `OAR_RELAY_TOKEN`) runs short turns on `claude-sonnet-5-5` (`--model` for another), on the
+key saved in the relay:
+- a tool turn that writes and reads a file;
+- a follow-up that must name the file (the CLI resumed on the key);
+- the context panel of the chat;
+- the settings route refusing a Claude OAuth token without storing it or quoting it;
+- with `--cap`, a send refused at a lowered monthly cap, and the cap put back;
+- with `--bad-key`, a turn on a key Anthropic refuses, which must end with the Claude API key note.
+  The saved key is not put back: enter it again afterwards, and run this last, on a test relay.
+
+It then deletes the chat. It costs real money on the API key: run it only with the account owner's
+go-ahead.
+
 ### Claude Cloud workers
 
 Claude Cloud conversations run `server/claude-cloud-worker/claude-cloud-session-worker.mjs`, a
@@ -701,10 +785,10 @@ instead of sending it again (see [Claude Cloud workers](#claude-cloud-workers)).
 is quiet while its stream is alive is left running; the worker cannot stop the sandbox, only ask
 it to (`interrupt`).
 
-A question card, a `remote_relay` call and a compaction hold the watchdog whatever the phase. What
+A question card, a `relay_tool` call and a compaction hold the watchdog whatever the phase. What
 bounds a turn that stays quiet and alive is the relay's turn ceiling.
 
-A `remote_relay` call can be quiet for long: `wait_seconds` goes up to the relay's **Longest wait
+A `relay_tool` call can be quiet for long: `wait_seconds` goes up to the relay's **Longest wait
 per tool call** (`remote_relay_max_wait_seconds`, 600 s by default, 120 to 3600 s), and an
 approval card adds the time the user takes. Nothing on the way cuts that short. The worker's
 request to `/api/remote-relays/tool` is a long call without a client-side timeout
@@ -862,7 +946,7 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **7193 pass / 0 fail / 10 skip on Linux (0.9.17, 2026-10-25)** — the count
+Expected: **0 fail** everywhere; **7497 pass / 0 fail / 10 skip on Linux (0.9.18, 2026-10-26)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
 cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **11 skips** that
 are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`) and run on Linux (0.9.17: **7192 pass / 0 fail / 11 skip**).

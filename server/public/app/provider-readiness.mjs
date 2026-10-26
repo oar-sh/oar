@@ -1,8 +1,8 @@
 // Which providers are known to be ready to run a chat, from what the client
 // already loads: the provider settings payloads and the model catalog. No DOM.
 //
-// OpenAI, Claude, Claude Cloud, Cursor, Grok and DeepSeek say so themselves: their
-// settings carry `enabled`. Copilot has no such flag and the relay never asks
+// OpenAI, Claude, Claude API, Claude Cloud, Cursor, Grok and DeepSeek say so
+// themselves: their settings carry `enabled`. Copilot has no such flag and the relay never asks
 // whether the Copilot CLI is signed in, so the best signal is indirect: has a
 // real Copilot model list ever reached the catalog? A fresh database is seeded
 // with a curated list under the source `bootstrap-seed`; a server discovery,
@@ -20,6 +20,7 @@ export const SEED_CATALOG_SOURCE = 'bootstrap-seed';
 const SETTINGS_PROVIDERS = Object.freeze([
   ['openai', 'openai'],
   ['claude', 'claude'],
+  ['claudeApi', 'claude-api'],
   ['claudeCloud', 'claude-cloud'],
   ['cursor', 'cursor'],
   ['grok', 'grok'],
@@ -33,6 +34,7 @@ const REQUIRED_INPUTS = Object.freeze(['openai', 'claude', 'cursor', 'grok', 'ca
  * @param {object} input the settings payloads New Chat loads, plus GET /api/models
  * @param {object|null} [input.openai]
  * @param {object|null} [input.claude]
+ * @param {object|null} [input.claudeApi] null on a relay without Claude API: not offered, not unknown
  * @param {object|null} [input.claudeCloud] null on a relay without Claude Cloud: not offered, not unknown
  * @param {object|null} [input.cursor]
  * @param {object|null} [input.grok]
@@ -68,6 +70,7 @@ export function isSetupRequired(readiness) {
 const inputs = {
   openai: undefined,
   claude: undefined,
+  claudeApi: undefined,
   claudeCloud: undefined,
   cursor: undefined,
   grok: undefined,

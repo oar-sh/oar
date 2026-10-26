@@ -293,3 +293,25 @@ test('a DeepSeek chat has one tier, its 1M window, whatever the merged metadata 
     [{ value: 'default', label: '1.05M' }],
   );
 });
+
+test('a Claude API chat reads its own folded tiers, as a Claude chat does', () => {
+  // Claude API's list (claudeApiContextTiersByModel) can differ from the Claude tab's.
+  const claudeApiTiers = { 'claude-opus-5': [{ value: 'default' }, { value: 'long_context' }] };
+  assert.deepEqual(
+    buildContextTierOptions({
+      modelId: 'claude-opus-5',
+      providerType: 'claude-api',
+      metadata: COPILOT_OPUS_METADATA,
+      claudeTiers: claudeApiTiers,
+    }),
+    [
+      { value: 'default', label: '—' },
+      { value: 'long_context', label: '1M' },
+    ],
+  );
+  // Never Copilot's windows for the same id.
+  assert.notDeepEqual(
+    buildContextTierOptions({ modelId: 'claude-opus-5', providerType: 'claude-api', metadata: COPILOT_OPUS_METADATA, claudeTiers: {} }),
+    buildContextTierOptions({ modelId: 'claude-opus-5', providerType: 'claude-api', metadata: COPILOT_OPUS_METADATA, claudeTiers: claudeApiTiers }),
+  );
+});

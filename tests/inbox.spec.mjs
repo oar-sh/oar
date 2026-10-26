@@ -5,7 +5,7 @@ import { expect, test } from "@playwright/test";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 
 /**
- * Questions that don't block (remote_relay ask) and the Inbox, on two relays
+ * Questions that don't block (relay_tool ask) and the Inbox, on two relays
  * of their own: relay A (where the browser is) and relay B, paired one way
  * (A knows B).
  *

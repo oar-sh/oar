@@ -40,8 +40,10 @@ unlocked that relay yourself; reading and waiting are never limited. When the ag
 conversation has sent 30 prompts to agents on other relays without a message from you, the next
 one asks you first with a question card; **Allow** starts the count again.
 
-**What agents can do.** Every provider gets the same `remote_relay` tool (Claude, DeepSeek, Cursor
-and Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Sessions get it
+**What agents can do.** Every provider gets the same `relay_tool` tool (Claude, Claude API, DeepSeek, Cursor
+and Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Before 0.9.18
+it was called `remote_relay`; OAR's MCP server still runs a call to the old name but lists only the
+new one, and Claude's tool is `mcp__relay__relay_tool`. Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, change their settings, answer questions, stop turns, archive). In the *ask* and *plan* relay
@@ -59,6 +61,19 @@ is started with `provider: "claude-cloud"`, a `repo` (a GitHub URL or `owner/rep
 `example-org/sample-repo`) and an optional `branch` instead of a folder; without a model it gets
 the default model of the other relay's Claude Cloud tab. Claude Cloud must be switched on there.
 A cloud session that exists can be read, prompted, waited for and stopped like any other.
+
+A [Claude API](providers.md#claude-api) session is started with `provider: "claude-api"`; Claude
+API must be switched on there with a saved key. When the month's spend has reached its cap, the
+answer is a 409 `CLAUDE_API_CAP_REACHED` and nothing is created. A `create_session` without a
+provider uses the caller's own provider when the other relay offers it, so a Claude API session
+starts Claude API sessions. For a Claude session, `send` takes `provider` (`claude` or
+`claude-api`) as its billing: the other one [switches the session's billing](providers.md#claude-api)
+together with the message, in one call, so a refused switch sends nothing and a refused message
+switches nothing. The approval card says "Switches billing to API key" (or "to subscription"), and
+the switch has the same checks as the chat's toggle (the key, the cap, the model). `provider` on a
+`send` to any other session is refused, and a relay from before 0.9.18 refuses the switch and sends
+nothing. A `send` without `provider` keeps the session's billing; to a Claude API session at the
+cap it is refused with `CLAUDE_API_CAP_REACHED` and nothing is queued.
 
 Two read actions help an agent plan: `usage` says what each provider's plan has left on a relay
 (Cursor's spend against its limit, Claude's windows and whether a usage limit has paused turns,
@@ -126,7 +141,7 @@ SSH port forward, for example) and private network ranges.
 
 *On oar.sh: [Agent sessions](https://oar.sh/docs/agents-together/agent-sessions/)*
 
-The same `remote_relay` tool can also work on the relay the agent itself runs on. An agent can
+The same `relay_tool` tool can also work on the relay the agent itself runs on. An agent can
 then hand parts of its task to other sessions: it starts them, waits for them and reads their
 replies. Every session it starts is an ordinary conversation in your list. No relay has to be
 paired for this.
@@ -158,7 +173,7 @@ and archive it. Switching the setting off closes this relay to the tool again.
   on this relay.
 
 **What it can start.** A session with any provider that is enabled on this relay (Copilot,
-OpenAI, Claude, Cursor, Grok, DeepSeek or Claude Cloud; not an OpenAI Image chat): in a folder
+OpenAI, Claude, Claude API, Cursor, Grok, DeepSeek or Claude Cloud; not an OpenAI Image chat): in a folder
 (the relay's default folder when the agent names none), or a [Claude Cloud](providers.md#claude-cloud) chat
 with `provider: "claude-cloud"`, `repo` and an optional `branch`. A new session knows nothing of
 the conversation it was started from. Sessions an agent starts use this relay's accounts and
@@ -184,7 +199,7 @@ under **General** (60 minutes by default), which does not know about the wait.
 
 *On oar.sh: [Watching sessions](https://oar.sh/docs/agents-together/watching-sessions/)*
 
-An agent can watch other sessions instead of polling them: with `remote_relay`'s `subscribe` it
+An agent can watch other sessions instead of polling them: with `relay_tool`'s `subscribe` it
 asks to be woken when something happens there. It works for every provider, on this relay (with
 [agent sessions](#agent-sessions) switched on) and on a paired one.
 
@@ -280,7 +295,7 @@ that runs an older OAR answers that it needs an update.
 ## Scheduled prompts
 
 An agent can ask this relay to send it a prompt later, once or again and again, with
-`remote_relay`'s `schedule`: a time (`at`, with a time zone), an interval (`every_minutes`, 5
+`relay_tool`'s `schedule`: a time (`at`, with a time zone), an interval (`every_minutes`, 5
 minutes to 7 days), or both (the first time, then the interval). A nightly review, a sweep every
 half hour or a check in an hour keep going after a restart or an update, which the timers of the
 agent's own CLI do not. A time missed while the relay was down is made up once when it is back,
@@ -308,7 +323,7 @@ them to the new conversation. A conversation holds at most 20. Schedules live on
 ## Questions that don't block
 
 An agent's own question tool (`ask_user`, a card the session waits on) stops its work until you
-answer. With `remote_relay`'s `ask` an agent asks you instead and goes on working on whatever does
+answer. With `relay_tool`'s `ask` an agent asks you instead and goes on working on whatever does
 not depend on the answer: the question shows as a card in its session, and in the **Inbox**, but
 the session does not wait. When you answer or dismiss it, the agent is told at once, as a relay
 event (`question_answered`, with your answer and the option you picked, or that you dismissed it, and the relay you answered on).

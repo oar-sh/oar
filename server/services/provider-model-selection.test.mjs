@@ -63,7 +63,7 @@ test('canonical lookup helpers match case-insensitively', () => {
   assert.equal(isProviderModelAvailable('', ['grok-4.5']), false);
 });
 
-// ─── checkRequestedProviderModel (remote_relay create_session / send) ───────
+// ─── checkRequestedProviderModel (relay_tool create_session / send) ───────
 
 const COPILOT_MODELS = ['gpt-5.4', 'gpt-5.4-mini', 'claude-sonnet-5', 'gpt-5.6-luna'];
 const CLAUDE_MODELS = ['claude-opus-4-7', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
@@ -129,6 +129,9 @@ test('Claude: an alias is the newest of its family by version, never a "[1m]" id
     { status: 'alias', model: 'claude-opus-5[1m]', tierDropped: false },
   );
   assert.deepEqual(checkRequestedProviderModel({ requestedModel: 'opus', provider: 'claude-cloud', models: ['claude-opus-5'] }), { status: 'alias', model: 'claude-opus-5', tierDropped: false });
+  // Claude API runs Claude's models on a key: the same aliases and "[1m]" rule.
+  assert.deepEqual(checkRequestedProviderModel({ requestedModel: 'opus', provider: 'claude-api', models: ['claude-opus-5-5', 'claude-sonnet-5-5'] }), { status: 'alias', model: 'claude-opus-5-5', tierDropped: false });
+  assert.deepEqual(checkRequestedProviderModel({ requestedModel: 'claude-sonnet-5-5[1m]', provider: 'claude-api', models: ['claude-sonnet-5-5'] }), { status: 'known', model: 'claude-sonnet-5-5', tierDropped: true });
   assert.equal(checkRequestedProviderModel({ requestedModel: 'opus', provider: 'cursor', models: ['claude-opus-5'] }).status, 'unknown', 'an alias only for Claude');
 });
 

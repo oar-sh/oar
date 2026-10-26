@@ -732,3 +732,11 @@ test('buildReport lays the imported export over the DeepSeek estimate, reading t
   assert.equal(without.notes.find((note) => note.id === 'deepseek-spend').text, 'Estimated spend on this relay: ¥3.00 since 2026-06-01');
   assert.equal(without.notes.some((note) => note.id === 'deepseek-actual'), false);
 });
+
+test('the Claude API card sits after the Claude cards and before Cursor; without one there is no card', () => {
+  const { service } = makeService();
+  const claudeApiCard = { provider: 'claude-api', label: 'Claude API', status: 'ok', meters: [], details: [], notes: [], links: [] };
+  const ids = service.buildReport({ copilotSummary, claudeCloudConfigured: true, claudeApiCard }).providers.map((card) => card.provider);
+  assert.deepEqual(ids.slice(0, 5), ['github', 'claude', 'claude-cloud', 'claude-api', 'cursor']);
+  assert.equal(service.buildReport({ copilotSummary }).providers.some((card) => card.provider === 'claude-api'), false);
+});

@@ -1,4 +1,4 @@
-// The provider-facing side of the `remote_relay` tool, in one place.
+// The provider-facing side of the `relay_tool` tool, in one place.
 //
 // Every adapter (Claude's in-process MCP server, Cursor's customTools, the
 // Copilot SDK engine's session tools, and the OAR stdio MCP server that Grok
@@ -16,12 +16,14 @@ import {
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_ENDPOINT,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
+  REMOTE_RELAY_LEGACY_TOOL_NAME,
   REMOTE_RELAY_TOOL_NAME,
   summarizeRemoteRelayCall,
   validateRemoteRelayToolInput,
 } from './remote-relay-contract.mjs';
 
 export {
+  REMOTE_RELAY_LEGACY_TOOL_NAME,
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_ENDPOINT,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
@@ -141,7 +143,7 @@ export function remoteRelayCancelledResult() {
 }
 
 /**
- * Executes one `remote_relay` call: validate, then forward
+ * Executes one `relay_tool` call: validate, then forward
  * `{ conversationId, action, args }` to the local relay and hand back its JSON.
  * Never throws — a refusal reads as an answer the model can act on, the same
  * contract as executePreviewTool.
@@ -256,7 +258,7 @@ export function createRemoteRelayToolGate({
 }
 
 /**
- * How many remote_relay calls of this conversation the relay is still working
+ * How many relay_tool calls of this conversation the relay is still working
  * on. 0 on any failure: the caller's watchdog then does what it would have
  * done without the question.
  */
@@ -292,12 +294,27 @@ export function formatRemoteRelayToolResult(result) {
 // ─── Activity lines ──────────────────────────────────────────────────────────
 
 // A provider may report the tool under its bare name or namespaced by the MCP
-// server that carries it (`mcp__relay__remote_relay`, `oar__remote_relay`,
-// `oar/remote_relay`, `oar-remote_relay`); all of them are this tool.
-const REMOTE_RELAY_NAME_PATTERN = new RegExp(`(?:^|__|[^A-Za-z0-9_])${REMOTE_RELAY_TOOL_NAME}$`, 'i');
+// server that carries it (`mcp__relay__relay_tool`, `oar__relay_tool`,
+// `oar/relay_tool`, `oar-relay_tool`); all of them are this tool. So is the
+// name it had before, `remote_relay`, in every spelling: transcripts and
+// sessions from before the rename still render and hold the same way.
+const REMOTE_RELAY_NAME_PATTERN = new RegExp(
+  `(?:^|__|[^A-Za-z0-9_])(?:${REMOTE_RELAY_TOOL_NAME}|${REMOTE_RELAY_LEGACY_TOOL_NAME})$`,
+  'i',
+);
 
 export function isRemoteRelayToolName(name) {
   return REMOTE_RELAY_NAME_PATTERN.test(toText(name));
+}
+
+/**
+ * The tool's listed name for a bare call name that means it: `relay_tool`
+ * itself, or the legacy `remote_relay` a dispatcher still accepts without
+ * listing it. Any other name comes back unchanged.
+ */
+export function canonicalRemoteRelayToolCallName(name) {
+  const text = toText(name);
+  return text === REMOTE_RELAY_LEGACY_TOOL_NAME ? REMOTE_RELAY_TOOL_NAME : text;
 }
 
 /**

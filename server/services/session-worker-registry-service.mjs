@@ -61,6 +61,16 @@ function normalizeStatus(value) {
 }
 
 const STEERING_HOLD_REASONS = new Set(['question', 'compaction', 'adoption', 'delivery', 'tool', 'other']);
+// What keeps a Claude worker's CLI from being released for a billing swap.
+const STEERING_RELEASE_HOLDS = new Set(['question', 'compaction', 'turn', 'background']);
+const WORKER_KIND_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+
+// The kind a worker says it is ("claude", "claude-api", "deepseek", ...):
+// lower case, short, or null when it did not say.
+export function normalizeWorkerKind(value) {
+  const kind = String(value || '').trim().toLowerCase();
+  return WORKER_KIND_PATTERN.test(kind) ? kind : null;
+}
 const STEERING_MESSAGE_ID_MAX_LENGTH = 64;
 const STEERING_CANCELLABLE_IDS_MAX = 50;
 
@@ -122,6 +132,15 @@ export function normalizeWorkerSteeringSnapshot(raw) {
   // Only a snapshot that reports a running CLI carries the key.
   const autoCompactWindow = normalizeSteeringAutoCompactWindow(raw.autoCompactWindow);
   if (autoCompactWindow) snapshot.autoCompactWindow = autoCompactWindow;
+  // Whether the relay may replace the worker now (a Claude billing swap), and
+  // what holds it when not. Only a worker that reports it carries the keys.
+  if (typeof raw.releasable === 'boolean') {
+    snapshot.releasable = raw.releasable;
+    const hold = String(raw.releaseHold || '').trim().toLowerCase();
+    snapshot.releaseHold = !raw.releasable && STEERING_RELEASE_HOLDS.has(hold) ? hold : null;
+    const tasks = Number(raw.backgroundTaskCount);
+    snapshot.backgroundTaskCount = Number.isInteger(tasks) && tasks > 0 ? Math.min(tasks, 999) : 0;
+  }
   return snapshot;
 }
 
@@ -140,6 +159,7 @@ function sanitizeState(raw = null) {
     retryCount: toNonNegativeInt(base.retryCount, 0),
     lastError: String(base.lastError || '').trim() || null,
     steering: normalizeWorkerSteeringSnapshot(base.steering),
+    kind: normalizeWorkerKind(base.kind),
     updatedAt: normalizeTimestamp(base.updatedAt, nowIso),
     createdAt,
   };
@@ -244,7 +264,14 @@ export function createSessionWorkerRegistry() {
     // the old entry into every upsert, so without this a crashed worker's
     // hold outlived it and the composer showed it until a replacement
     // heartbeated — indefinitely, if none ever did.
-    if (existing && isWorkerReplacedOrGone(existing, next)) next.steering = null;
+    // The kind is the same: a process's own word. An upsert that does not
+    // state it keeps the known one, unless the process it described is gone.
+    const statesKind = Object.prototype.hasOwnProperty.call(rawState, 'kind');
+    if (!statesKind) next.kind = existing?.kind || null;
+    if (existing && isWorkerReplacedOrGone(existing, next)) {
+      next.steering = null;
+      if (!statesKind) next.kind = null;
+    }
     clearIndexesForSession(existing);
     bySession.set(state.sdkSessionId, next);
     updateIndexesForSession(next);

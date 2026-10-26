@@ -1,4 +1,4 @@
-// Questions that don't block: remote_relay's `ask` puts a question for the
+// Questions that don't block: relay_tool's `ask` puts a question for the
 // owner into a session (a card there and in the Inbox) and returns at once;
 // the asking session keeps working and is told the answer later, as a relay
 // event (question_answered).
@@ -11,14 +11,20 @@
 // Every text of an ask is written by an agent, possibly on another relay:
 // whoever shows it shows it as plain text.
 //
-// SDK-free and side-effect free: imported by the server, the remote_relay
+// SDK-free and side-effect free: imported by the server, the relay_tool
 // contract and the browser.
 
 // The kind a question card carries in /api/relay-questions and the Inbox:
 // `ask` (this feature), `approval` (a relay's Allow / Deny card on its own
-// agent's call, context.source 'remote_relay'), `ask_user` (every other card a
-// turn waits on).
+// agent's call, context.source REMOTE_RELAY_APPROVAL_SOURCE), `ask_user`
+// (every other card a turn waits on).
 export const RELAY_QUESTION_KINDS = Object.freeze(['ask', 'ask_user', 'approval']);
+
+// The approval card's `context.source`, re-exported by the contract, which
+// imports this module (defined here so neither import goes in a circle).
+// Stored and sent between relays, so it kept the tool's name from before
+// 0.9.18.
+export const REMOTE_RELAY_APPROVAL_SOURCE = 'remote_relay';
 export const RELAY_ASK_KIND = 'ask';
 
 export const RELAY_ASK_URGENCIES = Object.freeze(['normal', 'now']);
@@ -141,5 +147,5 @@ export function relayQuestionKind(question) {
   const kind = toText(question?.kind);
   if (RELAY_QUESTION_KINDS.includes(kind)) return kind;
   const context = question && typeof question.context === 'object' && question.context ? question.context : {};
-  return toText(context.source) === 'remote_relay' ? 'approval' : 'ask_user';
+  return toText(context.source) === REMOTE_RELAY_APPROVAL_SOURCE ? 'approval' : 'ask_user';
 }

@@ -115,23 +115,24 @@ test('a task-shaped tool call opens a subagent run (the category never matches)'
   assert.equal(terminal.payload.status, 'completed');
 });
 
-test('a remote_relay call through the OAR MCP server reads as its action and target', () => {
+test('a relay_tool call through the OAR MCP server reads as its action and target', () => {
   const normalizer = createSdkMessageNormalizer();
   const actions = normalizer.normalizeAcpUpdate({
     sessionUpdate: 'tool_call',
     toolCallId: 'tc-rr-1',
-    title: 'oar/remote_relay',
+    title: 'oar/relay_tool',
     kind: 'other',
     status: 'pending',
     rawInput: { action: 'create_session', relay: 'linux-test', text: 'sidebar polish' },
   });
   assert.equal(
     actions.find((a) => a.channel === 'activity').payload.text,
-    'Tool (remote_relay): create_session → linux-test: “sidebar polish”',
+    'Tool (relay_tool): create_session → linux-test: “sidebar polish”',
   );
   // An explicit name wins over the title; a frame without arguments stays generic.
-  assert.equal(formatToolActivityText('mcp__oar__remote_relay', { action: 'list_relays' }, 'Remote relay'), 'Tool (remote_relay): list_relays');
-  assert.equal(formatToolActivityText('', null, 'remote_relay'), 'Tool (remote_relay)');
+  assert.equal(formatToolActivityText('mcp__oar__relay_tool', { action: 'list_relays' }, 'Remote relay'), 'Tool (relay_tool): list_relays');
+  assert.equal(formatToolActivityText('mcp__oar__remote_relay', { action: 'list_relays' }, 'Remote relay'), 'Tool (relay_tool): list_relays', 'the old name');
+  assert.equal(formatToolActivityText('', null, 'relay_tool'), 'Tool (relay_tool)');
 });
 
 test('formatToolActivityText and classifyGrokError are pure helpers', () => {

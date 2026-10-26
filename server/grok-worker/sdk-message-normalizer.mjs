@@ -64,7 +64,7 @@ export function summarizeToolInput(input) {
 }
 
 export function formatToolActivityText(toolName, input, title = '') {
-  // The OAR MCP server's `remote_relay`, however the agent labels it (bare,
+  // The OAR MCP server's `relay_tool`, however the agent labels it (bare,
   // or namespaced by the server), reads as what it does on which relay.
   if (isRemoteRelayToolName(toolName) || isRemoteRelayToolName(title)) {
     const remoteSummary = remoteRelayActivitySummary(input);

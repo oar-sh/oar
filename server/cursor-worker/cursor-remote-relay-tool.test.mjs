@@ -23,7 +23,7 @@ function recordingApi(reply = { ok: true }) {
 
 test('tool registers under the contract name, description and schema', () => {
   const tool = createRemoteRelayTool({ api: recordingApi().api });
-  assert.equal(tool.name, 'remote_relay');
+  assert.equal(tool.name, 'relay_tool');
   assert.equal(tool.description, REMOTE_RELAY_TOOL_DESCRIPTION);
   assert.deepEqual(tool.inputSchema, REMOTE_RELAY_TOOL_INPUT_SCHEMA);
   assert.notEqual(tool.inputSchema, REMOTE_RELAY_TOOL_INPUT_SCHEMA, 'the SDK gets its own copy of the frozen contract schema');
@@ -164,12 +164,12 @@ function runnerFixture({ summary = { count: 1 }, toolReply = null, gate = null }
 
 const message = { id: 'q-1', conversationId: 'conv-1', relayMode: 'agent', text: 'hello', model: 'cheetah', attachments: [] };
 
-test('the handle carries remote_relay only when the relay reported a paired remote', async () => {
+test('the handle carries relay_tool only when the relay reported a paired remote', async () => {
   const withRemote = runnerFixture({ summary: { count: 2 } });
   await withRemote.runner.handlePendingPayload({ message: { ...message } });
   const tools = withRemote.createCalls[0].customTools;
-  assert.deepEqual(Object.keys(tools).sort(), ['ask_user', 'preview', 'remote_relay']);
-  assert.equal(tools.remote_relay.description, REMOTE_RELAY_TOOL_DESCRIPTION);
+  assert.deepEqual(Object.keys(tools).sort(), ['ask_user', 'preview', 'relay_tool']);
+  assert.equal(tools.relay_tool.description, REMOTE_RELAY_TOOL_DESCRIPTION);
   assert.equal(
     withRemote.calls.filter((call) => call.routePath === '/api/remote-relays/summary').length >= 1,
     true,
@@ -183,10 +183,10 @@ test('the handle carries remote_relay only when the relay reported a paired remo
 
   const pinned = runnerFixture({ summary: { count: 0 }, gate: createRemoteRelayToolGate({ fixed: true }) });
   await pinned.runner.handlePendingPayload({ message: { ...message } });
-  assert.ok(pinned.createCalls[0].customTools.remote_relay);
+  assert.ok(pinned.createCalls[0].customTools.relay_tool);
 });
 
-test('a running remote_relay call holds the stall watchdog like an open ask_user card', async () => {
+test('a running relay_tool call holds the stall watchdog like an open ask_user card', async () => {
   let release = () => {};
   const { runner, createCalls, started, calls } = runnerFixture({
     toolReply: () => new Promise((resolve) => { release = () => resolve({ ok: true, status: 'done' }); }),
@@ -196,7 +196,7 @@ test('a running remote_relay call holds the stall watchdog like an open ask_user
   assert.equal(typeof hasPendingClientWork, 'function');
   assert.equal(hasPendingClientWork(), false);
 
-  const call = createCalls[0].customTools.remote_relay.execute({ action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' });
+  const call = createCalls[0].customTools.relay_tool.execute({ action: 'wait', relay: 'linux-test', session: 's', message_id: 'm' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(hasPendingClientWork(), true, 'held while the relay waits for the remote');
   const toolCall = calls.find((entry) => entry.routePath === REMOTE_RELAY_TOOL_ENDPOINT);
@@ -207,7 +207,7 @@ test('a running remote_relay call holds the stall watchdog like an open ask_user
   assert.equal(hasPendingClientWork(), false, 'released when the call settles');
 });
 
-test('a Stop cancels the pending remote_relay call and releases the hold', async () => {
+test('a Stop cancels the pending relay_tool call and releases the hold', async () => {
   let abortTurn = null;
   let handleOptions = null;
   let toolCall = null;
@@ -248,7 +248,7 @@ test('a Stop cancels the pending remote_relay call and releases the hold', async
         async* [Symbol.asyncIterator]() {
           yield { source: 'delta', update: { type: 'text-delta', text: 'Asking linux-test.' } };
           // The model calls the tool; the run is silent until it answers.
-          toolCall = handleOptions.customTools.remote_relay.execute(
+          toolCall = handleOptions.customTools.relay_tool.execute(
             { action: 'wait', relay: 'linux-test', session: 's', message_id: 'm', wait_seconds: 600 },
             { toolCallId: 'tool-1' },
           );
@@ -277,17 +277,17 @@ test('a Stop cancels the pending remote_relay call and releases the hold', async
 
   // Between turns a call carries no signal: the stopped turn's would cancel it
   // before it started.
-  const later = await handleOptions.customTools.remote_relay.execute({ action: 'list_relays' }, { toolCallId: 'tool-2' });
+  const later = await handleOptions.customTools.relay_tool.execute({ action: 'list_relays' }, { toolCallId: 'tool-2' });
   assert.equal(later.structuredContent.status, 'done');
   assert.equal(toolOptions[1].signal, undefined);
 });
 
-test('a failing remote_relay call releases the hold too', async () => {
+test('a failing relay_tool call releases the hold too', async () => {
   const { runner, createCalls, started } = runnerFixture({
     toolReply: () => { throw new TypeError('fetch failed'); },
   });
   await runner.handlePendingPayload({ message: { ...message } });
-  const result = await createCalls[0].customTools.remote_relay.execute({ action: 'list_relays' });
+  const result = await createCalls[0].customTools.relay_tool.execute({ action: 'list_relays' });
   assert.equal(result.structuredContent.ok, false);
   assert.equal(result.structuredContent.code, 'REMOTE_RELAY_CALL_FAILED');
   assert.equal(started[0].hasPendingClientWork(), false);

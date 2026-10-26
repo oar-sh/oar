@@ -90,7 +90,7 @@ export function resolveProviderModelSelection({
   };
 }
 
-// ─── Checking a model an agent names (remote_relay create_session / send) ───
+// ─── Checking a model an agent names (relay_tool create_session / send) ───
 
 const PROVIDER_LABELS = Object.freeze({
   github: 'Copilot',
@@ -100,8 +100,9 @@ const PROVIDER_LABELS = Object.freeze({
   grok: 'Grok',
   'claude-cloud': 'Claude Cloud',
   deepseek: 'DeepSeek',
+  'claude-api': 'Claude API',
 });
-const CLAUDE_PROVIDERS = new Set(['claude', 'claude-cloud']);
+const CLAUDE_PROVIDERS = new Set(['claude', 'claude-cloud', 'claude-api']);
 const LONG_CONTEXT_SUFFIX = /\[1m\]$/i;
 // A Copilot model with its effort, as the composer sends it ("gpt-5.4-high").
 const EFFORT_VARIANT_SUFFIX = /-(none|minimal|low|medium|high|xhigh|max)$/i;

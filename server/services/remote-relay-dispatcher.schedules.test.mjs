@@ -14,7 +14,7 @@ import { createRemoteRelayCallerContext, formatRemoteRelayApprovalPrompt } from 
 import { createRemoteRelayDispatcher } from './remote-relay-dispatcher.mjs';
 import { createRelayScheduleService } from './relay-schedule-service.mjs';
 
-// remote_relay schedule / list_schedules / unschedule through the dispatcher,
+// relay_tool schedule / list_schedules / unschedule through the dispatcher,
 // on this relay's real schedule service (an in-memory database).
 
 const CALLER = 'conv-fixture-caller';

@@ -134,7 +134,7 @@ export function createGrokTurnRunner({
 } = {}) {
   const terminalTasks = taskPublisher;
   // The OAR MCP server gives Grok the relay's real tools — `preview`, and
-  // `remote_relay` when remotes are paired — bound to this conversation.
+  // `relay_tool` when remotes are paired — bound to this conversation.
   // `OAR_MCP_SERVER=0` is the operator's way back to the preview instruction
   // block, should an agent build turn out to ignore ACP `mcpServers`.
   const oarMcpLaunch = oarMcpServer !== undefined
@@ -238,7 +238,7 @@ export function createGrokTurnRunner({
   }
 
   /**
-   * The inactivity hold. A remote_relay call runs inside the MCP server, which
+   * The inactivity hold. A relay_tool call runs inside the MCP server, which
    * this worker cannot see: Grok just goes quiet for as long as the relay
    * waits on the remote turn. Before the ACP watchdog calls that a stall, the
    * relay is asked whether a call of this conversation is still in flight.
@@ -247,7 +247,7 @@ export function createGrokTurnRunner({
    */
   async function remoteRelayCallInFlight() {
     const inflight = await fetchRemoteRelayInflight({ api, conversationId: sdkSessionId });
-    if (inflight > 0) dbg('remote_relay call in flight; holding the inactivity watchdog', String(inflight));
+    if (inflight > 0) dbg('relay_tool call in flight; holding the inactivity watchdog', String(inflight));
     return inflight > 0;
   }
 
@@ -447,7 +447,7 @@ export function createGrokTurnRunner({
     // absolute cap: "No limit" (0) must not be silently trimmed to the
     // 30-minute default. The inactivity watchdog stays — it detects a dead
     // transport, not a long turn — but asks the relay before it fires while
-    // Grok may be blocked on a remote_relay call.
+    // Grok may be blocked on a relay_tool call.
     const watchdog = {
       ...(turnCeilingMs !== null ? { maxTurnMs: turnCeilingMs > 0 ? turnCeilingMs : 0 } : {}),
       ...(acpMcpServers.length ? { holdStall: remoteRelayCallInFlight } : {}),

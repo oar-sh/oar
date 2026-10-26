@@ -661,7 +661,7 @@ test('OAR_MCP_SERVER=0 turns the wiring off and brings the preview block back', 
   await runner.dispose();
 });
 
-test('the inactivity watchdog asks the relay for an in-flight remote_relay call before it fires', async () => {
+test('the inactivity watchdog asks the relay for an in-flight relay_tool call before it fires', async () => {
   let inflight = 1;
   const calls = [];
   const api = async (method, path, body) => {

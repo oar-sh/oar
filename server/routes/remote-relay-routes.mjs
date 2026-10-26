@@ -48,7 +48,7 @@ export function registerRemoteRelayRoutes(app, deps) {
     });
   });
 
-  // Workers ask at start whether to register the remote_relay tool at all:
+  // Workers ask at start whether to register the relay_tool at all:
   // when a relay is paired (`count`), or when this relay's own sessions are
   // open to its agents (`localEnabled`, the local target).
   app.get('/api/remote-relays/summary', auth, (_req, res) => {
@@ -88,7 +88,7 @@ export function registerRemoteRelayRoutes(app, deps) {
     }
   });
 
-  // POST /api/remote-relays/tool — every provider adapter's remote_relay call.
+  // POST /api/remote-relays/tool — every provider adapter's relay_tool call.
   app.post('/api/remote-relays/tool', auth, async (req, res) => {
     if (!dispatcher) return res.status(503).json({ error: 'Remote relay dispatcher unavailable' });
     // The tool acts for one of this relay's conversations: another relay
@@ -96,7 +96,7 @@ export function registerRemoteRelayRoutes(app, deps) {
     // not host). Its agents reach this relay through the routes it calls.
     if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
       return res.status(403).json({
-        error: 'The remote_relay tool of this relay is for its own sessions; another relay cannot call it.',
+        error: 'The relay_tool of this relay is for its own sessions; another relay cannot call it.',
         code: REMOTE_RELAY_ERROR_CODES.forbidden,
       });
     }

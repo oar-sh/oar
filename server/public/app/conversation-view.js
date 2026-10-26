@@ -81,6 +81,9 @@ import { stripRemoteRelayDisplayArtifacts } from './relay-prompt-sanitizer.mjs';
 import { evaluateUnknownCommandGuard } from './slash-commands.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
 import { relayErrorCtaActions } from './relay-error-ctas.mjs';
+import { switchClaudeBilling } from './claude-billing-toggle-ui.js';
+import { CLAUDE_API_BILLING_URL, CLAUDE_API_LIMITS_URL, focusClaudeApiCapInput } from './claude-api-settings-ui.js';
+import { knownConversationBilling, noteConversationBilling } from './usage-limit-ui.js';
 import { confirmCliInstall } from './cli-install-ui.js';
 import { startGrokSignIn } from './grok-auth-ui.js';
 import { openSettingsModal } from './settings-modal.js';
@@ -3508,8 +3511,9 @@ async function toggleMessageShareVisibility(conversationId, messageId, hiddenFro
 
 // Each CTA lands the user where the state actually lives: the provider panel
 // shows the install log / the device code, so the settings modal is opened
-// first and the action then runs on top of it.
-function runRelayErrorCta(cta) {
+// first and the action then runs on top of it. New Chat runs them too, for a
+// refusal of its own (journal-view.js).
+export function runRelayErrorCta(cta) {
   if (cta === 'install-grok-cli') {
     openSettingsModal('providers', 'grok');
     // The confirm sheet — never a bare curl | bash from a chat bubble.
@@ -3525,6 +3529,15 @@ function runRelayErrorCta(cta) {
   if (cta === 'open-claude-settings') openSettingsModal('providers', 'claude');
   if (cta === 'open-deepseek-settings') openSettingsModal('providers', 'deepseek');
   if (cta === 'open-deepseek-top-up') window.open('https://platform.deepseek.com/top_up', '_blank', 'noopener');
+  if (cta === 'open-claude-api-settings') openSettingsModal('providers', 'claude-api');
+  if (cta === 'open-claude-api-cap') {
+    openSettingsModal('providers', 'claude-api');
+    focusClaudeApiCapInput();
+  }
+  if (cta === 'open-claude-api-billing') window.open(CLAUDE_API_BILLING_URL, '_blank', 'noopener');
+  if (cta === 'open-claude-api-limits') window.open(CLAUDE_API_LIMITS_URL, '_blank', 'noopener');
+  // The chat this note is in, not a chat opened since: the bubble is on screen.
+  if (cta === 'switch-claude-billing-to-subscription' && currentConvId) void switchClaudeBilling(currentConvId, 'claude');
 }
 
 function handleBubbleActionClick(event) {
@@ -4615,6 +4628,10 @@ export async function sendMessage() {
       relayMode: selectedMode,
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,
+      // The billing this page shows for a Claude chat: the relay refuses the
+      // send when the chat has moved to the other one since, so nobody's
+      // turn runs on a bill they did not see.
+      billing: (!isNew && targetConversationId && knownConversationBilling(targetConversationId)) || undefined,
       attachments,
       imageTarget: draftImageEditTarget
         ? {
@@ -4628,7 +4645,16 @@ export async function sendMessage() {
     // A refusal the user can act on (the conversation's model left the
     // catalog) is shown as the relay words it.
     let refusal = '';
-    const r = await sendMessageApi(body, { onRefused: (reason) => { refusal = reason; } });
+    const r = await sendMessageApi(body, {
+      onRefused: (reason, payload) => {
+        refusal = reason;
+        // The chat's billing changed under this page: it learns the new one,
+        // so sending again goes through.
+        if (payload?.code === 'CLAUDE_BILLING_CHANGED' && targetConversationId) {
+          noteConversationBilling(targetConversationId, payload.billing);
+        }
+      },
+    });
     if (!r) {
       // Offline: park the send in the durable outbox instead of bouncing it
       // back into the composer. The client-generated messageId makes a replay

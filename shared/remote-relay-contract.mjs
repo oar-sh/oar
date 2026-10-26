@@ -29,9 +29,20 @@ import {
   normalizeRelayScheduleAt,
   normalizeRelayScheduleTitle,
 } from './relay-schedules.mjs';
-import { RELAY_ASK_LIMITS, RELAY_ASK_URGENCIES, normalizeRelayAskInput } from './relay-asks.mjs';
+import {
+  RELAY_ASK_LIMITS,
+  RELAY_ASK_URGENCIES,
+  REMOTE_RELAY_APPROVAL_SOURCE,
+  normalizeRelayAskInput,
+} from './relay-asks.mjs';
 
-export const REMOTE_RELAY_TOOL_NAME = 'remote_relay';
+// The one name every provider lists the tool under. Up to 0.9.17 it was
+// `remote_relay`; that name is still accepted where a runtime dispatches a
+// call by name without having listed it (the OAR MCP server's tools/call),
+// and recognised in transcripts and holds, but never listed: a second
+// definition would cost every turn its context.
+export const REMOTE_RELAY_TOOL_NAME = 'relay_tool';
+export const REMOTE_RELAY_LEGACY_TOOL_NAME = 'remote_relay';
 
 // Bumped when a relay starts relying on a newer inbound behaviour of its peers.
 // 0 = a relay without this feature (reachable read/prompt only, no pairing).
@@ -154,8 +165,11 @@ export const REMOTE_RELAY_PROMPT_ACTIONS = Object.freeze(['send', 'create_sessio
 export const REMOTE_RELAY_APPROVAL_MODES = Object.freeze(['ask', 'plan']);
 
 export const REMOTE_RELAY_SESSION_SCOPES = Object.freeze(['active', 'recent', 'all']);
-export const REMOTE_RELAY_PROVIDERS = Object.freeze(['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek']);
+export const REMOTE_RELAY_PROVIDERS = Object.freeze(['github', 'openai', 'claude', 'cursor', 'grok', 'claude-cloud', 'deepseek', 'claude-api']);
 export const REMOTE_RELAY_MODES = Object.freeze(['plan', 'ask', 'agent', 'autopilot']);
+// What `send` may name as `provider`: a Claude session's billing, the
+// subscription or the API key. Naming the other one switches the session.
+export const REMOTE_RELAY_SEND_PROVIDERS = Object.freeze(['claude', 'claude-api']);
 export const REMOTE_RELAY_IF_BUSY = Object.freeze(['queue', 'fail']);
 // Reasoning efforts differ per provider and model (none, low, medium, high,
 // xhigh, max, ultracode, ...), so the contract only checks the shape of the
@@ -447,13 +461,15 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     provider: {
       type: 'string',
       enum: [...REMOTE_RELAY_PROVIDERS],
-      description: 'create_session: provider (default: the same provider as this session).',
+      description: 'create_session: provider (default: the same provider as this session). '
+        + 'send to a Claude session: "claude" (the subscription) or "claude-api" (the API key) switches its billing from the next turn, '
+        + 'together with this message; the other billing must be set up there. Omit it to keep the session\'s billing.',
     },
     model: {
       type: 'string',
       description: 'create_session: model id (default: this session\'s model when the remote offers it, else the remote\'s default). '
         + 'send: switch the remote session to this model (default: it keeps its own). update_session: the session\'s model from now on. '
-        + 'Must be an id relay_info lists for the provider (Claude also takes "opus", "sonnet", "haiku"): '
+        + 'Must be an id relay_info lists for the provider (Claude and Claude API also take "opus", "sonnet", "haiku"): '
         + 'an unknown id is refused with the close matches, nothing created or sent.',
     },
     cwd: {
@@ -660,7 +676,7 @@ export const REMOTE_RELAY_ACTION_ARGUMENTS = Object.freeze({
   read_session: Object.freeze(['session', 'last', 'before', 'include_activity', 'max_chars']),
   read_task_output: Object.freeze(['session', 'task_id', 'lines']),
   wait: Object.freeze(['session', 'message_id', 'wait_seconds']),
-  send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy']),
+  send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy', 'provider']),
   create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds']),
   update_session: Object.freeze(['session', ...REMOTE_RELAY_SESSION_SETTINGS]),
   answer_question: Object.freeze(['question_id', 'answer', 'choices']),
@@ -867,6 +883,10 @@ function validateToolInput(input, { maxWaitSeconds, now } = {}) {
       const busyCheck = optionalEnum('if_busy', REMOTE_RELAY_IF_BUSY);
       if (!busyCheck.ok) return busyCheck;
       args.if_busy = args.if_busy || 'queue';
+      const providerCheck = optionalEnum('provider', REMOTE_RELAY_SEND_PROVIDERS);
+      if (!providerCheck.ok) {
+        return invalid('send takes provider "claude" (the subscription) or "claude-api" (the API key), for a Claude session only');
+      }
     } else {
       const providerCheck = optionalEnum('provider', REMOTE_RELAY_PROVIDERS);
       if (!providerCheck.ok) return providerCheck;
@@ -1222,8 +1242,8 @@ export function formatSessionGroupList(groups, max = REMOTE_RELAY_GROUP_LIMITS.r
 // another relay (ask / plan mode) is an ordinary relay question whose
 // `context.source` is this. Only that relay's user may answer it: its question
 // routes hide the card from other relays' agents and refuse their answers, and
-// a dispatcher never offers one to its agent.
-export const REMOTE_RELAY_APPROVAL_SOURCE = 'remote_relay';
+// a dispatcher never offers one to its agent. Defined in relay-asks.mjs.
+export { REMOTE_RELAY_APPROVAL_SOURCE };
 
 /** True for such a card: a formatted question, or a stored request envelope (both carry `context`). */
 export function isRemoteRelayApprovalQuestion(question) {

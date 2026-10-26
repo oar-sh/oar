@@ -11,6 +11,12 @@ export function createSessionRepository(db) {
       : 'rs.model AS runtime_model, NULL AS runtime_provider_type, NULL AS runtime_provider_model';
     // Provenance of conversations another relay's agent created (migration
     // 0005); NULL on a schema that predates it.
+    // The billing a queue row runs on (migration 0031): the Claude API key
+    // removal counts the unfinished rows stamped with the key.
+    const queueHasProvider = db.prepare(`PRAGMA table_info(queue)`).all().some((column) => column.name === 'provider');
+    const claudeApiQueueCountSelect = queueHasProvider
+      ? `(SELECT COUNT(*) FROM queue q WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked') AND LOWER(COALESCE(q.provider, '')) = 'claude-api') AS claude_api_queue_count`
+      : '0 AS claude_api_queue_count';
     const conversationsHaveOrigin = db.prepare(`PRAGMA table_info(conversations)`).all()
       .some((column) => String(column?.name || '').trim() === 'origin_json');
     const conversationOriginSelect = conversationsHaveOrigin ? 'c.origin_json' : 'NULL AS origin_json';
@@ -100,7 +106,8 @@ export function createSessionRepository(db) {
             rs.*,
             c.sdk_session_id AS conversation_sdk_session_id,
             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
-            (SELECT COUNT(*) FROM queue q WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked')) AS active_queue_count
+            (SELECT COUNT(*) FROM queue q WHERE q.conversation_id = c.id AND q.status IN ('pending', 'processing', 'parked')) AS active_queue_count,
+            ${claudeApiQueueCountSelect}
           FROM runtime_sessions rs
           JOIN conversations c ON c.id = rs.conversation_id
           WHERE c.status != 'deleted'

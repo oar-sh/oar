@@ -574,3 +574,42 @@ test('a note with a label and a value is a row of figures; on a card with figure
   assert.match(plain, /data-section-id="by-model">/);
   assert.doesNotMatch(plain, /plan-usage-facts/);
 });
+
+test('the Claude API card renders from the server\'s builder: its tab, the cap bar in dollars, "estimate incomplete"', async () => {
+  const { buildClaudeApiPlanCard } = await import('../../services/plan-usage-claude-api.mjs');
+  const models = [
+    { model: 'claude-sonnet-5-5', hitTokens: 0, missTokens: 1000, outputTokens: 100, costUsd: 4.2, unknownCostTokens: 0 },
+    { model: 'claude-new-model', hitTokens: 0, missTokens: 300, outputTokens: 30, costUsd: 0, unknownCostTokens: 330 },
+  ];
+  const card = buildClaudeApiPlanCard({
+    settings: { configured: true, enabled: true, monthlyCapUsd: 5 },
+    spend: {
+      bounds: { today: '2026-08-08', month: '2026-08', monthStart: '2026-08-01', monthEnd: '2026-08-31', nextMonthStart: '2026-09-01' },
+      today: { models, costUsd: 4.2, unknownCostTokens: 330 },
+      month: { models, costUsd: 4.2, unknownCostTokens: 330 },
+      lastSeenAt: '2026-08-08T11:00:00.000Z',
+    },
+    resetAt: '2026-09-01T00:00:00.000Z',
+    timeZone: 'UTC',
+  });
+  const html = renderPlanUsageHtml({ version: 2, generatedAt: NOW.toISOString(), providers: [card] }, { now: NOW, activeProvider: 'claude-api' });
+  assert.match(html, /data-usage-panel="claude-api"/);
+  assert.match(html, /Claude API/);
+  assert.match(html, /data-meter-id="claude-api-monthly-cap"/);
+  assert.match(html, /\$4\.20/);
+  assert.match(html, /estimate incomplete/);
+  assert.match(html, /no price known/);
+  assert.match(html, /platform\.claude\.com\/settings\/billing/);
+});
+
+test('the DeepSeek budget help text names the steps the bar is drawn with', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /The bar changes colour at 50 % and 75 % of the budget and turns red at 90 %\./);
+  assert.doesNotMatch(html, /amber near the budget and red over it/);
+  // The steps themselves: two changes of colour, then red.
+  assert.equal(utilizationColor(49), '#3fb950');
+  assert.equal(utilizationColor(50), '#d29922');
+  assert.equal(utilizationColor(75), '#e3b341');
+  assert.equal(utilizationColor(90), '#f85149');
+});

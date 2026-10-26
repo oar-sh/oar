@@ -26,12 +26,13 @@ export function isCompactBoundaryActivityEntry(item) {
 
 // The live list of one turn keeps its newest ordinary lines only, but every
 // structured row a line of the transcript is built from: the turn's
-// compaction entries and the session-restart note would otherwise scroll out
-// of a busy turn and take their line with them until the next reload.
+// compaction entries and the session-restart notes (a compaction window, a
+// billing switch) would otherwise scroll out of a busy turn and take their
+// line with them until the next reload.
 export const LIVE_ACTIVITY_CAP = 24;
 function isKeptLiveActivityEntry(item) {
   const kind = normalizeRelayActivityEntry(item)?.metadata?.kind;
-  return kind === 'compact_boundary' || kind === 'compact_window_respawn';
+  return kind === 'compact_boundary' || kind === 'compact_window_respawn' || kind === 'billing_switch_respawn';
 }
 export function capLiveActivityEntries(items, cap = LIVE_ACTIVITY_CAP) {
   const list = Array.isArray(items) ? items : [];

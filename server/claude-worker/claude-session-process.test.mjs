@@ -1889,8 +1889,10 @@ test('steeringState reports the composer-facing snapshot', async () => {
     pendingDeliveredTimeoutMs: 60_000,
   });
 
+  // `releasable`: a billing swap may replace the worker (no CLI here).
   assert.deepEqual(runner.steeringState(), {
     turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: null,
+    releasable: true, releaseHold: null, backgroundTaskCount: 0,
   });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
@@ -1902,6 +1904,7 @@ test('steeringState reports the composer-facing snapshot', async () => {
   const runningWindow = { active: null, backgroundWork: false };
   assert.deepEqual(runner.steeringState(), {
     turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
+    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0,
   });
 
   // Steered entries in flight do not hold steering (unbounded), and the
@@ -1910,6 +1913,7 @@ test('steeringState reports the composer-facing snapshot', async () => {
   await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pending' });
   assert.deepEqual(runner.steeringState(), {
     turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
+    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0,
   });
 
   turn.emit(resultMessage('done', 'native-1'));

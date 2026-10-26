@@ -520,20 +520,21 @@ test('formatToolActivityText degrades without arguments', () => {
   assert.equal(formatToolActivityText('bash', { command: 'x'.repeat(300) }).length, 140);
 });
 
-test('a remote_relay call reads as its action and target', () => {
+test('a relay_tool call reads as its action and target', () => {
   const input = { action: 'send', relay: 'linux-test', session: '0123456789abcdef', text: 'run the tests' };
-  const expected = 'Tool (remote_relay): send → linux-test session 01234567: “run the tests”';
-  assert.equal(formatToolActivityText('remote_relay', input), expected);
-  assert.equal(formatToolActivityText('remote_relay', JSON.stringify(input)), expected, 'string arguments');
-  assert.equal(formatToolActivityText('oar-remote_relay', input), expected, 'an MCP-namespaced name');
-  assert.equal(formatToolActivityText('remote_relay', null), 'Tool (remote_relay)');
+  const expected = 'Tool (relay_tool): send → linux-test session 01234567: “run the tests”';
+  assert.equal(formatToolActivityText('relay_tool', input), expected);
+  assert.equal(formatToolActivityText('relay_tool', JSON.stringify(input)), expected, 'string arguments');
+  assert.equal(formatToolActivityText('oar-relay_tool', input), expected, 'an MCP-namespaced name');
+  assert.equal(formatToolActivityText('oar-remote_relay', input), expected, 'the old name');
+  assert.equal(formatToolActivityText('relay_tool', null), 'Tool (relay_tool)');
 
   const normalizer = createCopilotEventNormalizer();
   const actions = normalizer.normalize({
     type: 'tool.execution_start',
-    data: { toolCallId: 'call-rr-1', toolName: 'remote_relay', arguments: { action: 'list_relays' } },
+    data: { toolCallId: 'call-rr-1', toolName: 'relay_tool', arguments: { action: 'list_relays' } },
   });
-  assert.deepEqual(actions.map((action) => action.payload?.text), ['Tool (remote_relay): list_relays']);
+  assert.deepEqual(actions.map((action) => action.payload?.text), ['Tool (relay_tool): list_relays']);
 });
 
 test('subagent text goes to the lane and never into the main reply', () => {

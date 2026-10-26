@@ -135,7 +135,7 @@ export function isBackgroundLaunch(block, toolUseResult = null) {
 
 export function summarizeToolInput(toolName, input) {
   if (!input || typeof input !== 'object') return '';
-  // `mcp__relay__remote_relay` reads as what it does on which relay
+  // `mcp__relay__relay_tool` reads as what it does on which relay
   // (`send → linux-test session 01234567: “…”`), not as its first argument.
   if (isRemoteRelayToolName(toolName)) {
     const summary = remoteRelayActivitySummary(input);

@@ -45,6 +45,7 @@
 // A provider registers its key by one entry in SAVED_PROVIDER_KEY_SETTINGS.
 
 import { DEEPSEEK_PROVIDER_TYPE } from '../../shared/deepseek-models.mjs';
+import { CLAUDE_API_KEY_SETTING_KEY, CLAUDE_API_PROVIDER_TYPE } from './claude-api-settings-service.mjs';
 import { DEEPSEEK_API_KEY_SETTING_KEY } from './deepseek-settings-service.mjs';
 
 export const REDACTED_SECRET_TEXT = '[redacted]';
@@ -64,6 +65,7 @@ export const WORKER_SESSION_HEADER = 'x-relay-session-id';
 /** The providers whose workers get a key saved in the relay's settings. */
 export const SAVED_PROVIDER_KEY_SETTINGS = Object.freeze([
   Object.freeze({ provider: DEEPSEEK_PROVIDER_TYPE, settingKey: DEEPSEEK_API_KEY_SETTING_KEY }),
+  Object.freeze({ provider: CLAUDE_API_PROVIDER_TYPE, settingKey: CLAUDE_API_KEY_SETTING_KEY }),
 ]);
 
 // JSON bodies are shallow in practice; a deeper one is left as it is below

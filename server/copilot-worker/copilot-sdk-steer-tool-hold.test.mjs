@@ -248,7 +248,17 @@ test('the tool of a background agent does not end the hold of a command of the m
   assert.equal(await first, true);
 });
 
-test('a remote_relay call holds no steer, as before', BOUNDED, async (t) => {
+test('a relay_tool call holds no steer, as before', BOUNDED, async (t) => {
+  const { client, runner, first, readiness } = await openLiveTurn(t);
+  client.session.emit(toolStart('call-1', 'relay_tool'));
+  assert.equal(runner.canAcceptSteering(), true);
+  assert.deepEqual(readiness, [false, true]);
+  client.session.emit(toolComplete('call-1'));
+  client.session.emit(idle);
+  assert.equal(await first, true);
+});
+
+test('a call under the old name, remote_relay, holds no steer either', BOUNDED, async (t) => {
   const { client, runner, first, readiness } = await openLiveTurn(t);
   client.session.emit(toolStart('call-1', 'remote_relay'));
   assert.equal(runner.canAcceptSteering(), true);

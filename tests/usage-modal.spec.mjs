@@ -1,5 +1,9 @@
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
  * Check Usage opens on what it showed last time and reads only the open
@@ -145,4 +149,183 @@ test("Check Usage shows the kept cards at once and reads only the open tab live"
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }
+});
+
+/**
+ * The Claude API card: this month's estimated spend on the key, in the
+ * relay's time zone, with the monthly cap as a bar; tokens without a price
+ * read "estimate incomplete", never $0; at the cap a switch to the key and a
+ * new Claude API chat are refused.
+ *
+ * Its own relay, in a zone far from UTC (UTC+14), so a UTC date would put
+ * the turns on the wrong day: the key, the cap and the booked days are
+ * written into its database, as the settings tab and the booking leave them,
+ * and no request leaves the host (the key is never used: no turn runs).
+ */
+const CLAUDE_API_ZONE = "Pacific/Kiritimati";
+// Invented; not shaped like a Console key.
+const CLAUDE_API_TEST_KEY = "test-claude-api-key-0000000000";
+
+function localDayIn(timeZone, at = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
+}
+
+function previousMonthDay(day) {
+  const year = Number(day.slice(0, 4));
+  const month = Number(day.slice(5, 7));
+  return month === 1 ? `${year - 1}-12-15` : `${year}-${String(month - 1).padStart(2, "0")}-15`;
+}
+
+test.describe("Claude API usage card", () => {
+  let relay = null;
+  const subscriptionChat = `claude-api-usage-sub-${Date.now()}`;
+  const keyChat = `claude-api-usage-key-${Date.now()}`;
+  const headers = () => ({ Authorization: `Bearer ${relay.token}` });
+  const withDb = (fn) => {
+    const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  };
+  const setCap = (value) => withDb((db) => {
+    db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES ('claude_api_monthly_cap_usd', ?, ?)
+      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(String(value), new Date().toISOString());
+  });
+
+  test.beforeAll(async () => {
+    relay = await startRelayServer({ token: randomUUID(), overrides: { TZ: CLAUDE_API_ZONE } });
+    const today = localDayIn(CLAUDE_API_ZONE);
+    const now = new Date().toISOString();
+    withDb((db) => {
+      const setting = db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`);
+      setting.run("claude_api_key", CLAUDE_API_TEST_KEY, now);
+      setting.run("claude_api_enabled", "true", now);
+      setting.run("claude_api_monthly_cap_usd", "1", now);
+      const day = db.prepare(`
+        INSERT INTO claude_api_usage_totals (day, model, hit_tokens, miss_tokens, output_tokens, cost_usd, unknown_cost_tokens, turn_count, first_seen_at, last_seen_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `);
+      day.run(today, "claude-sonnet-5-5", 900_000, 100_000, 20_000, 0.75, 0, now, now, now);
+      day.run(today, "claude-new-model", 0, 400, 40, 0, 440, now, now, now);
+      // Last month's spend is no part of this month's cap.
+      day.run(previousMonthDay(today), "claude-sonnet-5-5", 0, 1_000_000, 0, 9, 0, now, now, now);
+      const conversation = db.prepare(`INSERT INTO conversations (id, title, archived, status, created_at, updated_at) VALUES (?, ?, 0, 'active', ?, ?)`);
+      const runtime = db.prepare(`
+        INSERT INTO runtime_sessions (id, conversation_id, runtime_key, provider_type, provider_model, created_at, last_used_at)
+        VALUES (?, ?, ?, ?, 'claude-sonnet-5-5', ?, ?)
+      `);
+      conversation.run(subscriptionChat, "Claude subscription chat", now, now);
+      runtime.run(`rs-${subscriptionChat}`, subscriptionChat, `rs-${subscriptionChat}`, "claude", now, now);
+      conversation.run(keyChat, "Claude API chat", now, now);
+      runtime.run(`rs-${keyChat}`, keyChat, `rs-${keyChat}`, "claude-api", now, now);
+    });
+  });
+
+  test.afterAll(async () => {
+    if (relay) await relay.stop();
+    relay = null;
+  });
+
+  test("the card shows today and this month in relay time, the cap bar, and what has no price", async ({ page, request }, testInfo) => {
+    setCap(1);
+    const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=claude-api`, { headers: headers() })).json();
+    expect(usage.live).toEqual(["claude-api"]);
+    const card = usage.providers.find((entry) => entry.provider === "claude-api");
+    expect(card).toBeTruthy();
+    expect(card.label).toBe("Claude API");
+    const notes = Object.fromEntries(card.notes.map((note) => [note.id, note]));
+    expect(notes["claude-api-spend-today"].value).toBe("$0.75 (estimate incomplete)");
+    expect(notes["claude-api-spend-month"].value).toBe("$0.75 (estimate incomplete)");
+    expect(notes["claude-api-spend-month"].text).toMatch(/440 tokens had no known price/);
+    expect(notes["claude-api-estimate"].text).toContain(CLAUDE_API_ZONE);
+    const meter = card.meters.find((entry) => entry.id === "claude-api-monthly-cap");
+    expect(meter).toMatchObject({ unit: "usd", used: 0.75, allowance: 1, remaining: 0.25, estimated: true });
+    // The cap starts over at the zone's own midnight on the 1st.
+    expect(meter.resetAt).toMatch(/T10:00:00\.000Z$/);
+    expect(card.links.map((link) => link.url)).toContain("https://platform.claude.com/settings/billing");
+    expect(JSON.stringify(card)).not.toMatch(/\d+ turns?\b/);
+
+    // Opened from a chat on the key, Check Usage lands on the Claude API tab.
+    await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
+    await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
+    await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
+    await page.evaluate(() => window.showUsage());
+    const panel = page.locator('[data-usage-panel="claude-api"]');
+    await expect(panel).toBeVisible();
+    await expect(page.locator('[data-usage-tab="claude-api"]')).toHaveText("Claude API");
+    await expect(panel.locator('[data-meter-id="claude-api-monthly-cap"]')).toBeVisible();
+    await expect(panel).toContainText("estimate incomplete");
+    await expect(panel).toContainText("no price known");
+    await expect(panel).not.toContainText("$9.");
+
+    // For the rendered check: phone widths, both themes. The screenshots go
+    // to the test's output folder, or to OAR_E2E_SCREENSHOT_DIR when set.
+    const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim() || testInfo.outputPath();
+    for (const viewport of [{ name: "phone-390", width: 390, height: 844 }, { name: "phone-320", width: 320, height: 640 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      for (const theme of ["dark", "light"]) {
+        await page.evaluate((value) => {
+          if (value === "light") document.documentElement.setAttribute("data-theme", "light");
+          else document.documentElement.removeAttribute("data-theme");
+        }, theme);
+        const overflow = await panel.evaluate((node) => node.scrollWidth - node.clientWidth);
+        expect(overflow, `${viewport.name} ${theme}: the card is wider than its box`).toBeLessThanOrEqual(0);
+        await page.screenshot({ path: path.join(shotDir, `claude-api-card-${viewport.name}-${theme}.png`) });
+      }
+    }
+    await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
+  });
+
+  test("at the cap: the card says so, a switch to the key and a new Claude API chat are refused", async ({ page, request }, testInfo) => {
+    setCap(0.5);
+    const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=claude-api`, { headers: headers() })).json();
+    const card = usage.providers.find((entry) => entry.provider === "claude-api");
+    expect(card.message).toMatch(/reached the cap: new Claude API turns, agents' new Claude API sessions and switches to the API key are refused/);
+    expect(card.meters.find((entry) => entry.id === "claude-api-monthly-cap").utilization).toBe(100);
+
+    const switched = await request.post(`${relay.baseUrl}/api/conversation/${subscriptionChat}/billing`, {
+      headers: headers(),
+      data: { to: "claude-api" },
+    });
+    expect(switched.status()).toBe(409);
+    const switchBody = await switched.json();
+    expect(switchBody.code).toBe("CLAUDE_API_CAP_REACHED");
+    expect(switchBody.error).toMatch(/\$0\.75, has reached the monthly cap of \$0\.50/);
+
+    const created = await request.post(`${relay.baseUrl}/api/conversation/bootstrap`, {
+      headers: headers(),
+      data: { providerType: "claude-api", title: "over the cap" },
+    });
+    expect(created.status()).toBe(409);
+    expect((await created.json()).code).toBe("CLAUDE_API_CAP_REACHED");
+
+    // The page shows the reached cap.
+    await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
+    await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
+    await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
+    await page.evaluate(() => window.showUsage());
+    const panel = page.locator('[data-usage-panel="claude-api"]');
+    await expect(panel).toContainText("reached the cap");
+    const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim() || testInfo.outputPath();
+    for (const viewport of [{ name: "phone-390", width: 390, height: 844 }, { name: "phone-320", width: 320, height: 640 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      for (const theme of ["dark", "light"]) {
+        await page.evaluate((value) => {
+          if (value === "light") document.documentElement.setAttribute("data-theme", "light");
+          else document.documentElement.removeAttribute("data-theme");
+        }, theme);
+        await page.screenshot({ path: path.join(shotDir, `claude-api-card-at-cap-${viewport.name}-${theme}.png`) });
+      }
+    }
+    await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
+  });
 });

@@ -36,7 +36,7 @@
 //
 // --pins=all (the default) runs the backend as it is; --pins=endpoint pins
 // only the endpoint and the key (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
-// ANTHROPIC_API_KEY, apiKeyHelper), as before DEEPSEEK_CLI_PINNED_ENV;
+// ANTHROPIC_API_KEY, apiKeyHelper), as before CLAUDE_CLI_PINNED_ENV;
 // --pins=none sends no live flag settings at all. The last two show what each
 // trap catches without the pins, and are expected to fail.
 //

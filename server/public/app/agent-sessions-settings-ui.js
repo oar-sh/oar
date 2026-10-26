@@ -1,5 +1,5 @@
 // Settings → Relays → Agent sessions: the switch that lets agents start and use
-// sessions on this relay through the remote_relay tool, and the slider for the
+// sessions on this relay through the relay_tool, and the slider for the
 // longest wait of one tool call. The decisions live in
 // agent-sessions-settings.mjs; this file only moves them into the markup in
 // index.html. The static controls use inline handlers that bootstrap.js

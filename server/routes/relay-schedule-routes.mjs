@@ -2,7 +2,7 @@
 
 // Relay schedules, for the browser: the active schedules (the "scheduled"
 // marker and the list in the header) and Cancel. Agents use the
-// remote_relay tool instead; a request from another relay's agent is
+// relay_tool instead; a request from another relay's agent is
 // refused here, so only this relay's user cancels a schedule from outside
 // its conversation.
 

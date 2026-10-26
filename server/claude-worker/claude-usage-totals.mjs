@@ -106,3 +106,56 @@ export function claudeToolRequests(serverToolUse, { modelKey = (value) => String
   }
   return [...requests.values()].filter((entry) => entry.searchRequests + entry.fetchRequests > 0);
 }
+
+function costOf(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+/**
+ * The CLI's totals per model with Claude Code's own cost estimate, for the
+ * Claude API booking (claude-api-usage-service.mjs): `[{ model, hitTokens,
+ * missTokens, outputTokens, costUsd, costUnknown }]`. From `modelUsage` (the
+ * session's running totals, sub-agents and helper calls included; `costUSD`
+ * per model, `costBasis: 'unknown'` for a model the CLI has no price for), or
+ * from `usage` alone under the turn's model (pass `modelUsage` as null): the
+ * turn's main agent loop, which carries no cost. Model ids keep Claude's
+ * `[1m]` tier; the relay books them under the base id.
+ */
+export function claudeBillingTotals(modelUsage, { usage = null, model = '' } = {}) {
+  const totals = new Map();
+  const add = (name, hit, miss, output, costUsd, costUnknown) => {
+    const key = String(name ?? '').trim().toLowerCase();
+    if (!key) return;
+    const current = totals.get(key) || { model: key, hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0, costUnknown: false };
+    current.hitTokens += hit;
+    current.missTokens += miss;
+    current.outputTokens += output;
+    current.costUsd += costUsd;
+    current.costUnknown = current.costUnknown || costUnknown;
+    totals.set(key, current);
+  };
+  if (modelUsage && typeof modelUsage === 'object' && !Array.isArray(modelUsage)) {
+    for (const [name, entry] of Object.entries(modelUsage)) {
+      if (!entry || typeof entry !== 'object') continue;
+      add(
+        name,
+        count(entry.cacheReadInputTokens),
+        count(entry.inputTokens) + count(entry.cacheCreationInputTokens),
+        count(entry.outputTokens),
+        costOf(entry.costUSD),
+        entry.costBasis === 'unknown',
+      );
+    }
+  } else if (usage && typeof usage === 'object') {
+    add(
+      model,
+      count(usage.cache_read_input_tokens),
+      count(usage.input_tokens) + count(usage.cache_creation_input_tokens),
+      count(usage.output_tokens),
+      0,
+      false,
+    );
+  }
+  return [...totals.values()].filter((entry) => entry.hitTokens + entry.missTokens + entry.outputTokens > 0 || entry.costUsd > 0);
+}

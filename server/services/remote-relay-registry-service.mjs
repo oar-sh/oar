@@ -27,7 +27,7 @@ import { remoteRelayAliases } from '../../shared/remote-relay-mentions.mjs';
 //   remote_relay_inbound_enabled accept prompts from other relays' agents
 //   agent_sessions_enabled       this relay's own agents may start and use
 //                                sessions on it (the local target; off by default)
-//   remote_relay_max_wait_seconds the longest wait of one remote_relay call
+//   remote_relay_max_wait_seconds the longest wait of one relay_tool call
 //
 // Tokens never leave through listPublic(), the socket event or any route; only
 // the outbound client reads them (list()/get()/resolve() are server-internal).

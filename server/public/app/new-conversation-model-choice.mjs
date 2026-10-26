@@ -25,6 +25,27 @@ export function buildNewConversationModelChoices(options = []) {
   return choices;
 }
 
+/**
+ * The model New Chat starts on, from the values its list offers: the
+ * composer's last model when the list has it, else the provider's own
+ * default (Claude API's settings model; the list is sorted by name, so its
+ * first entry is no default), else Auto when allowed, else ''. '' leaves the
+ * list's first entry.
+ */
+export function preselectNewConversationModel(values = [], {
+  storedModel = '',
+  providerDefault = '',
+  allowAuto = true,
+} = {}) {
+  const offered = new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean));
+  const stored = String(storedModel || '').trim();
+  if (stored && offered.has(stored)) return stored;
+  const fallback = String(providerDefault || '').trim();
+  if (fallback && offered.has(fallback)) return fallback;
+  if (allowAuto && offered.has('auto')) return 'auto';
+  return '';
+}
+
 function normalizeProviderKey(provider = '') {
   const key = String(provider || '').trim().toLowerCase();
   if (key === 'openai-byok') return 'openai';

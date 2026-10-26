@@ -15,6 +15,7 @@ import {
   REMOTE_RELAY_TOOL_DESCRIPTION,
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
   REMOTE_RELAY_TOOL_NAME,
+  REMOTE_RELAY_LEGACY_TOOL_NAME,
   REMOTE_RELAY_APPROVAL_SOURCE,
   AGENT_SESSIONS_SOCKET_EVENT,
   checkRemoteRelayUrlPolicy,
@@ -38,8 +39,10 @@ import {
 } from './remote-relay-contract.mjs';
 import { RELAY_EVENT_LIMITS } from './relay-events.mjs';
 
-test('the tool is named remote_relay and its schema lists every action', () => {
-  assert.equal(REMOTE_RELAY_TOOL_NAME, 'remote_relay');
+test('the tool is named relay_tool and its schema lists every action', () => {
+  assert.equal(REMOTE_RELAY_TOOL_NAME, 'relay_tool');
+  assert.equal(REMOTE_RELAY_LEGACY_TOOL_NAME, 'remote_relay');
+  assert.ok(!REMOTE_RELAY_TOOL_DESCRIPTION.includes(REMOTE_RELAY_LEGACY_TOOL_NAME), 'the description names only the new tool');
   assert.deepEqual(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.enum, [...REMOTE_RELAY_ACTIONS]);
   assert.deepEqual(REMOTE_RELAY_TOOL_INPUT_SCHEMA.required, ['action']);
   for (const action of REMOTE_RELAY_ACTIONS) {
@@ -320,6 +323,10 @@ test('write actions are the ones that change the remote', () => {
 
 test('an approval card is recognised by its context source, formatted or stored', () => {
   assert.equal(REMOTE_RELAY_APPROVAL_SOURCE, 'remote_relay');
+  // Stored, and sent between relays: the source did not follow the tool's
+  // rename, so a card stored (or sent by a relay) before it still counts.
+  assert.equal(REMOTE_RELAY_APPROVAL_SOURCE, REMOTE_RELAY_LEGACY_TOOL_NAME);
+  assert.notEqual(REMOTE_RELAY_APPROVAL_SOURCE, REMOTE_RELAY_TOOL_NAME);
   assert.equal(isRemoteRelayApprovalQuestion({ id: 'question-1', context: { source: 'remote_relay', header: 'Remote relay' } }), true);
   assert.equal(isRemoteRelayApprovalQuestion({ request: null, context: { source: ' remote_relay ' }, allowFreeform: false }), true);
   assert.equal(isRemoteRelayApprovalQuestion({ id: 'question-2', context: { source: 'ask_user' } }), false);

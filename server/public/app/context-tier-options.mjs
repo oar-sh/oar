@@ -46,7 +46,9 @@ function claudeTiersForModel(modelId, claudeTiers) {
  * windows on a Claude conversation. For the Claude provider the offered tiers
  * are exactly the enabled catalog ids the server folded into
  * claudeContextTiersByModel: base id → default, "[1m]" id → long_context, and a
- * model may legitimately have only one of the two.
+ * model may legitimately have only one of the two. Claude API (`claude-api`)
+ * serves the same ids on an API key, with its own folded list
+ * (claudeApiContextTiersByModel), which the caller passes as `claudeTiers`.
  */
 export function buildContextTierOptions({
   modelId = '',
@@ -63,7 +65,9 @@ export function buildContextTierOptions({
   if (provider === 'claude-cloud') return [{ value: 'default', label: UNKNOWN_WINDOW_LABEL }];
   // DeepSeek's models have one window, 1M: no tier to choose.
   if (provider === 'deepseek') return [{ value: 'default', label: tokenLabel(DEEPSEEK_CONTEXT_WINDOW_TOKENS) }];
-  const claudeTierList = provider === 'claude' ? claudeTiersForModel(modelId, claudeTiers) : null;
+  const claudeTierList = provider === 'claude' || provider === 'claude-api'
+    ? claudeTiersForModel(modelId, claudeTiers)
+    : null;
   if (claudeTierList) {
     return claudeTierList
       .map((tier) => String(tier?.value || '').trim().toLowerCase())

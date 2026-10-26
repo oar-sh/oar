@@ -33,6 +33,10 @@ export function createHeartbeatController({
   // Optional: called after every beat the relay answered, for work that
   // waits for a reachable relay (posts kept after a failure).
   onAnswered = () => {},
+  // Optional: the kind of worker this is ("claude", "claude-api", ...). The
+  // relay hands a Claude chat's row only to a worker of the row's billing,
+  // and knows a worker's kind from what it says here and in its hello.
+  workerKind = null,
   // requestPulse's window: one turn transition can flip the steering
   // snapshot several times in quick succession, and each flip only needs to
   // reach the relay once.
@@ -66,6 +70,7 @@ export function createHeartbeatController({
         ...(steering && typeof steering === "object" ? { steering } : {}),
         ...(settleFailed.length ? { settleFailed } : {}),
         ...(Array.isArray(backgroundTaskIds) ? { backgroundTasks: backgroundTaskDigest(backgroundTaskIds) } : {}),
+        ...(workerKind ? { workerKind: String(workerKind) } : {}),
       };
       const response = await api("POST", "/api/heartbeat", body);
       // Failed by the relay, or skipped because this worker has no claim on

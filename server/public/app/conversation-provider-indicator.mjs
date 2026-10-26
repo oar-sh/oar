@@ -27,6 +27,12 @@ export function isConversationUsingDeepSeekProvider(conversation = null) {
   return resolveConversationProviderType(conversation) === 'deepseek';
 }
 
+// A Claude chat on the saved Claude Console key: the same Claude worker as
+// `claude`, on another bill. A chat can switch between the two.
+export function isConversationUsingClaudeApiProvider(conversation = null) {
+  return resolveConversationProviderType(conversation) === 'claude-api';
+}
+
 // Its own provider, never a flavour of `claude`: the session runs in a sandbox
 // at Anthropic, so nothing that is true of a local Claude worker (modes,
 // effort, steering, a working directory) may be assumed for it.
@@ -40,6 +46,7 @@ const CLAUDE_CLOUD_MARKER = '☁';
 const PROVIDER_NAMES = Object.freeze({
   openai: 'OpenAI',
   claude: 'Claude',
+  'claude-api': 'Claude API',
   'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
@@ -79,6 +86,9 @@ const SESSION_LOCK_LABELS = {
   openai: 'OpenAI',
   'openai-image': 'OpenAI Image',
   claude: 'Claude SDK',
+  // The same Claude SDK models as `claude`, named for the bill, as the pill
+  // and New Chat name it.
+  'claude-api': 'Claude API',
   cursor: 'Cursor SDK',
   grok: 'Grok',
   deepseek: 'DeepSeek',
@@ -99,6 +109,7 @@ export function sessionLockProviderKey({ providerType = '', model = '' } = {}) {
   }
   if (normalized === 'openai-image' || normalized === 'openai-image-byok') return 'openai-image';
   if (normalized === 'claude' || normalized === 'claude-agent-sdk' || normalized === 'anthropic') return 'claude';
+  if (normalized === 'claude-api') return 'claude-api';
   if (normalized === 'claude-cloud') return 'claude-cloud';
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok' || normalized === 'xai' || normalized === 'xai-grok') return 'grok';

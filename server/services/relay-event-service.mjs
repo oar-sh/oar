@@ -107,6 +107,7 @@ import {
   relayEventQuietWindowEnd,
   relayEventTypesTake,
 } from '../../shared/relay-events.mjs';
+import { REMOTE_RELAY_APPROVAL_SOURCE } from '../../shared/relay-asks.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
 export const RELAY_EVENT_SELF_RELAY_ID = 'self';
@@ -2307,8 +2308,8 @@ export function createRelayEventService({
       prompt: String(question.prompt || question.question || '').slice(0, 2000),
       options,
       questionId: toText(question.id),
-      ...(toText(context?.source) === 'remote_relay' ? { approvalCard: true } : {}),
-      // A question that does not block (remote_relay ask).
+      ...(toText(context?.source) === REMOTE_RELAY_APPROVAL_SOURCE ? { approvalCard: true } : {}),
+      // A question that does not block (relay_tool ask).
       ...(toText(question.kind) === 'ask' ? { kind: 'ask' } : {}),
     });
   }

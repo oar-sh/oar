@@ -290,7 +290,7 @@ test('thought text is capped at 16KiB per thought', () => {
   assert.equal(second[0].payload.text.length, 16 * 1024);
 });
 
-test('a remote_relay custom-tool call reads as its action and target', () => {
+test('a relay_tool custom-tool call reads as its action and target', () => {
   const normalizer = createSdkMessageNormalizer();
   // The SDK reports a custom tool as its generic MCP call.
   const actions = normalizer.normalize(stream({
@@ -300,16 +300,22 @@ test('a remote_relay custom-tool call reads as its action and target', () => {
     status: 'running',
     args: {
       providerIdentifier: 'custom-user-tools',
-      toolName: 'remote_relay',
+      toolName: 'relay_tool',
       args: { action: 'send', relay: 'linux-test', session: '0123456789abcdef', text: 'run the tests' },
     },
   }));
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].payload.text, 'Tool (remote_relay): send → linux-test session 01234567: “run the tests”');
+  assert.equal(actions[0].payload.text, 'Tool (relay_tool): send → linux-test session 01234567: “run the tests”');
 
   // Bare name, arguments not streamed yet, and an unrelated MCP tool.
-  assert.equal(formatToolActivityText('remote_relay', { action: 'list_relays' }), 'Tool (remote_relay): list_relays');
-  assert.equal(formatToolActivityText('mcp', { toolName: 'remote_relay' }), 'Tool (remote_relay)');
+  assert.equal(formatToolActivityText('relay_tool', { action: 'list_relays' }), 'Tool (relay_tool): list_relays');
+  assert.equal(formatToolActivityText('remote_relay', { action: 'list_relays' }), 'Tool (relay_tool): list_relays', 'the old name');
+  assert.equal(formatToolActivityText('mcp', { toolName: 'relay_tool' }), 'Tool (relay_tool)');
+  assert.equal(
+    formatToolActivityText('mcp', { providerIdentifier: 'custom-user-tools', toolName: 'remote_relay', args: { action: 'list_relays' } }),
+    'Tool (relay_tool): list_relays',
+    'the old name inside the generic MCP call',
+  );
   assert.equal(
     formatToolActivityText('mcp', { providerIdentifier: 'custom-user-tools', toolName: 'preview', args: { action: 'list' } }),
     'Tool (mcp): {"providerIdentifier":"custom-user-tools","toolName":"preview","args":{"action":"list"}}',

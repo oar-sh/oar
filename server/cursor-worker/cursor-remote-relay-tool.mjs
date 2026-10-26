@@ -1,7 +1,7 @@
 /**
- * The relay's `remote_relay` custom tool for the Cursor worker. SDK-free: the
+ * The relay's `relay_tool` custom tool for the Cursor worker. SDK-free: the
  * turn runner passes the returned `{ description, inputSchema, execute }` into
- * `customTools.remote_relay`, and every call goes through the shared tool core
+ * `customTools.relay_tool`, and every call goes through the shared tool core
  * to the local relay endpoint.
  *
  * A call can legitimately run for many minutes (a remote turn plus an approval
@@ -46,7 +46,7 @@ export function createRemoteRelayTool({
     } catch (error) {
       // A tool exception must never kill the run.
       const message = error?.message || String(error);
-      dbg('remote_relay tool failed', message);
+      dbg('relay_tool failed', message);
       const result = { ok: false, code: REMOTE_RELAY_CALL_FAILED, error: message };
       return {
         structuredContent: result,

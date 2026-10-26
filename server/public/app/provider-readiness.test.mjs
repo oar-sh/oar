@@ -25,6 +25,7 @@ test('each settings provider counts as ready when its payload says enabled', () 
   const cases = [
     ['openai', 'openai'],
     ['claude', 'claude'],
+    ['claudeApi', 'claude-api'],
     ['claudeCloud', 'claude-cloud'],
     ['cursor', 'cursor'],
     ['grok', 'grok'],

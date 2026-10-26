@@ -164,7 +164,7 @@ test('the legacy answer never asks for the account usage', async () => {
 test('every provider is live when nothing is asked for, and the answer says so', async () => {
   const { app } = setup({ claudeAccountUsageService: { getAccountUsage: async () => ACCOUNT } });
   const res = await getUsage(app);
-  assert.deepEqual(res.body.live, ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek']);
+  assert.deepEqual(res.body.live, ['github', 'claude', 'claude-cloud', 'cursor', 'grok', 'deepseek', 'claude-api']);
   assert.equal(typeof res.body.fetchedAt.github, 'string');
   assert.equal(res.body.fetchedAt.claude, ACCOUNT.fetchedAt);
   assert.equal(res.body.providers[0].capturedAt, res.body.fetchedAt.github);
@@ -221,7 +221,7 @@ test('asked for one provider, the others come from the last live answer without 
 
   // Unknown ids are ignored; `all` means everything live.
   const fourth = await getUsage(app, { providers: 'all' });
-  assert.equal(fourth.body.live.length, 6);
+  assert.equal(fourth.body.live.length, 7);
   assert.deepEqual([quotaReads, billingReads, grokReads], [2, 2, 3]);
 });
 

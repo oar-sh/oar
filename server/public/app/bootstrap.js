@@ -80,6 +80,7 @@ import {
   updateCursorSettings,
   updateGrokSettings,
   updateDeepSeekSettings,
+  updateClaudeApiSettings,
   loadConversation,
   refreshConversationHistory,
   updateConversationTitle,
@@ -181,6 +182,7 @@ import {
   composerPlaceholderFor,
   contextWindowSuffix,
   humanizeModelLabel,
+  distinctModelLabels,
   modelMetadataFor,
   modelSelectorOptionsEqual,
   splitModelVariantId,
@@ -330,6 +332,13 @@ import {
   importDeepSeekUsageExport,
   applyDeepSeekSettingsState,
   refreshDeepSeekSettingsState,
+  saveClaudeApiSettings,
+  removeClaudeApiSettings,
+  toggleClaudeApiProvider,
+  refreshClaudeApiModels,
+  openClaudeTabFromClaudeApi,
+  applyClaudeApiSettingsState,
+  refreshClaudeApiSettingsState,
   saveCursorSettings,
   removeCursorSettings,
   saveCursorAllowanceSettings,
@@ -373,6 +382,7 @@ import {
 } from './action-confirmations.js';
 import { applyPendingActionsFromStatus, initHostSuspendUi } from './host-suspend-ui.js';
 import { applyUsageLimitFromStatus, initUsageLimitUi } from './usage-limit-ui.js';
+import { initClaudeBillingToggle, renderClaudeBillingToggle } from './claude-billing-toggle-ui.js';
 import {
   startClaudeRelogin,
   submitClaudeLoginCodeFromInput,
@@ -449,6 +459,7 @@ const PROVIDER_LABELS = {
   openai: 'OpenAI',
   'openai-byok': 'OpenAI (BYOK)',
   claude: 'Claude SDK',
+  'claude-api': 'Claude API',
   'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor SDK',
   grok: 'Grok',
@@ -522,6 +533,7 @@ let modelCatalogState = {
   reasoningEfforts: [],
   modelMetadataByModel: {},
   claudeContextTiersByModel: {},
+  claudeApiContextTiersByModel: {},
   stale: true,
   metadataValid: false,
   reasoningMetadataValid: false,
@@ -1444,6 +1456,8 @@ function syncSessionLockNote({ pinnedModel = '' } = {}) {
   } else {
     delete note.dataset.provider;
   }
+  // The billing toggle sits under the note and follows the same chat.
+  renderClaudeBillingToggle();
 }
 
 function applyModelMetadataHardFail(message = '') {
@@ -1510,6 +1524,7 @@ function normalizeModelSelectorProviderType(providerType = '') {
   const normalized = String(providerType || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok') return 'openai';
   if (normalized === 'claude') return 'claude';
+  if (normalized === 'claude-api') return 'claude-api';
   if (normalized === CLAUDE_CLOUD_PROVIDER) return CLAUDE_CLOUD_PROVIDER;
   if (normalized === 'cursor') return 'cursor';
   if (normalized === 'grok') return 'grok';
@@ -1542,6 +1557,9 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
   const hasCursor = providers.includes('cursor');
   const hasGrok = providers.includes('grok');
   const hasDeepSeek = providers.includes('deepseek');
+  // Claude API rows are the Claude provider's ids on an API key: as
+  // exclusive as the other runtimes' rows.
+  const hasClaudeApi = providers.includes('claude-api');
   // Only present if a relay tags catalog rows for Claude Cloud; such a row is
   // then as exclusive as the other runtimes' rows.
   const hasClaudeCloud = providers.includes(CLAUDE_CLOUD_PROVIDER);
@@ -1551,15 +1569,17 @@ function modelVisibleForActiveProvider(modelId, activeProviderType, providersByM
     && provider !== 'cursor'
     && provider !== 'grok'
     && provider !== 'deepseek'
+    && provider !== 'claude-api'
     && provider !== CLAUDE_CLOUD_PROVIDER
   ));
   const activeProvider = normalizeModelSelectorProviderType(activeProviderType);
   if (activeProvider === 'openai') return hasOpenAIByok;
   if (activeProvider === 'claude') return hasClaude;
+  if (activeProvider === 'claude-api') return hasClaudeApi;
   if (activeProvider === 'cursor') return hasCursor;
   if (activeProvider === 'grok') return hasGrok;
   if (activeProvider === 'deepseek') return hasDeepSeek;
-  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok || hasDeepSeek || hasClaudeCloud) && !hasNonExclusiveProvider);
+  return !((hasOpenAIByok || hasClaude || hasCursor || hasGrok || hasDeepSeek || hasClaudeApi || hasClaudeCloud) && !hasNonExclusiveProvider);
 }
 
 // A Claude Cloud conversation does not pick from the shared catalog: its
@@ -1595,10 +1615,16 @@ function buildModelSelectorOptions(
   if (normalizeModelSelectorProviderType(activeProviderType) === CLAUDE_CLOUD_PROVIDER) {
     return buildClaudeCloudModelSelectorOptions(models, providersByModel, metadataByModel);
   }
-  const normalizedOptions = buildCatalogModelOptions(models.length ? models : [FALLBACK_MODEL], {
+  // Only this provider's models are labelled: two ids that read the same
+  // fall back to their raw ids, and an id another provider serves
+  // ("claude-haiku-4-5" beside the key's "claude-haiku-4-5-20251001") must
+  // not do that to a list it is not in.
+  const visibleModels = (models.length ? models : [FALLBACK_MODEL])
+    .filter((modelId) => modelVisibleForActiveProvider(modelId, activeProviderType, providersByModel));
+  const normalizedOptions = buildCatalogModelOptions(visibleModels, {
     autoValue: AUTO_MODEL_OPTION,
     metadataByModel,
-    annotateContextWindow: normalizeModelSelectorProviderType(activeProviderType) !== 'claude',
+    annotateContextWindow: !['claude', 'claude-api'].includes(normalizeModelSelectorProviderType(activeProviderType)),
   });
   return normalizedOptions.filter((option) => modelVisibleForActiveProvider(
     option.value,
@@ -1804,6 +1830,12 @@ function updateModelCatalogState(payload) {
         Array.isArray(tiers) ? tiers : [],
       ]))
       : {},
+    claudeApiContextTiersByModel: payload?.claudeApiContextTiersByModel && typeof payload.claudeApiContextTiersByModel === 'object'
+      ? Object.fromEntries(Object.entries(payload.claudeApiContextTiersByModel).map(([modelId, tiers]) => [
+        String(modelId || '').trim().toLowerCase(),
+        Array.isArray(tiers) ? tiers : [],
+      ]))
+      : {},
     stale: !!payload?.stale,
     metadataValid: payload?.metadataValid === true,
     reasoningMetadataValid: payload?.reasoningMetadataValid === true,
@@ -1935,7 +1967,9 @@ function updateContextTierSelector(modelId) {
     modelId,
     providerType: activeComposerProviderType(),
     metadata: modelMetadataFor(modelId, modelCatalogState.modelMetadataByModel) || {},
-    claudeTiers: modelCatalogState.claudeContextTiersByModel,
+    claudeTiers: activeComposerProviderType() === 'claude-api'
+      ? modelCatalogState.claudeApiContextTiersByModel
+      : modelCatalogState.claudeContextTiersByModel,
   });
   const current = select.value;
   select.innerHTML = '';
@@ -1957,8 +1991,9 @@ function updateModelPricingDetails(modelId, tier) {
   if (!details || !summary || !grid) return;
   const metadata = modelCatalogState.modelMetadataByModel?.[modelId] || {};
   // The catalog's prices are Copilot credits; a cloud session is billed to the
-  // Claude account, so they would be the wrong numbers for it.
-  const pricing = activeComposerProviderType() === CLAUDE_CLOUD_PROVIDER
+  // Claude account and a Claude API chat to the Console in dollars, so they
+  // would be the wrong numbers for them.
+  const pricing = activeComposerProviderType() === CLAUDE_CLOUD_PROVIDER || activeComposerProviderType() === 'claude-api'
     ? null
     : metadata?.pricing?.[tier === 'long_context' ? 'longContext' : 'default'];
   if (!pricing || typeof pricing !== 'object') {
@@ -2000,6 +2035,7 @@ const RELAY_MODES_BY_PROVIDER = {
   github: ['agent', 'ask', 'plan', 'autopilot'],
   openai: ['agent', 'ask', 'plan', 'autopilot'],
   claude: ['agent', 'ask', 'plan', 'autopilot'],
+  'claude-api': ['agent', 'ask', 'plan', 'autopilot'],
   cursor: ['agent', 'ask', 'plan', 'autopilot'],
   grok: ['agent', 'ask', 'plan', 'autopilot'],
   deepseek: ['agent', 'ask', 'plan', 'autopilot'],
@@ -2066,7 +2102,7 @@ async function persistCurrentConversationPreferences() {
   const contextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim().toLowerCase();
   const preferredModelWithTier = model
     && contextTier === 'long_context'
-    && activeComposerProviderType() === 'claude'
+    && (activeComposerProviderType() === 'claude' || activeComposerProviderType() === 'claude-api')
     && !CLAUDE_LONG_CONTEXT_PATTERN.test(model)
     ? `${model}[1m]`
     : model;
@@ -2356,6 +2392,13 @@ function reportOpenAIModelDiscoveryFailure(payload) {
       8000,
     );
   }
+  const claudeApiDiscovery = payload?.claudeApiModelDiscovery;
+  if (claudeApiDiscovery && claudeApiDiscovery.ok === false && !claudeApiDiscovery.skipped) {
+    showTransientRelayNotice(
+      `Claude API model discovery failed. Cached Claude API models were kept: ${claudeApiDiscovery.error || 'unknown error'}`,
+      8000,
+    );
+  }
 }
 
 async function retryModelMetadataRefresh() {
@@ -2504,6 +2547,17 @@ function applyModelVariantCatalogState(payload) {
           : [],
       }
       : null,
+    claudeApiModels: payload?.claudeApiModels && typeof payload.claudeApiModels === 'object'
+      ? {
+        defaultModel: String(payload.claudeApiModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.claudeApiModels.availableModels)
+          ? payload.claudeApiModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.claudeApiModels.enabledModels)
+          ? payload.claudeApiModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+      }
+      : null,
   };
 }
 
@@ -2572,6 +2626,11 @@ function renderModelVariantCatalogBody() {
       return entryProvider === 'claude';
     }
     if (entryProvider === 'claude') return false;
+    // Claude API lists the same Claude ids as the Claude SDK tab, its own rows.
+    if (activeTab === 'claude-api') {
+      return entryProvider === 'claude-api';
+    }
+    if (entryProvider === 'claude-api') return false;
     if (activeTab === 'cursor') {
       return entryProvider === 'cursor';
     }
@@ -2596,6 +2655,7 @@ function renderModelVariantCatalogBody() {
         && provider !== 'cursor'
         && provider !== 'grok'
         && provider !== 'deepseek'
+        && provider !== 'claude-api'
         && provider !== CLAUDE_CLOUD_PROVIDER
       ));
     }
@@ -2729,6 +2789,31 @@ function renderModelVariantCatalogBody() {
     }
     grouped.set('deepseek', providerRows);
   }
+  const claudeApiCatalog = modelVariantCatalogState.claudeApiModels;
+  if (claudeApiCatalog?.availableModels?.length) {
+    const claudeApiEnabledSet = new Set(claudeApiCatalog.enabledModels || []);
+    const claudeApiDefaultModel = String(claudeApiCatalog.defaultModel || '').trim();
+    // Named by model; two snapshots that would read the same keep their ids.
+    const claudeApiLabels = distinctModelLabels(claudeApiCatalog.availableModels);
+    const providerRows = [];
+    for (const [index, claudeApiModelId] of claudeApiCatalog.availableModels.entries()) {
+      const isDefaultModel = claudeApiModelId === claudeApiDefaultModel;
+      providerRows.push({
+        variantId: `${claudeApiModelId}--provider-claude-api`,
+        baseModelId: claudeApiModelId,
+        provider: 'claude-api',
+        label: claudeApiLabels.get(claudeApiModelId) || claudeApiModelId,
+        releaseStatus: null,
+        reasoningEffort: null,
+        // The default model always stays enabled, as for the other providers.
+        selectable: !isDefaultModel,
+        enabled: claudeApiEnabledSet.has(claudeApiModelId) || isDefaultModel,
+        claudeApiModelId,
+        sortOrder: index,
+      });
+    }
+    grouped.set('claude-api', providerRows);
+  }
   const selected = new Set(modelVariantCatalogState.enabledVariantIds);
   const selectedOrder = new Map(
     modelVariantCatalogState.enabledVariantIds.map((variantId, index) => [variantId, index]),
@@ -2765,24 +2850,28 @@ function renderModelVariantCatalogBody() {
   const hasCursorTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'cursor'));
   const hasGrokTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'grok'));
   const hasDeepSeekTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'deepseek'));
+  const hasClaudeApiTab = providerOrder.some((providerKey) => providerBelongsToTab(providerKey, 'claude-api'));
   if (modelVariantCatalogProviderTab === 'openai' && !hasOpenAITab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'anthropic' && !hasAnthropicTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'cursor' && !hasCursorTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'grok' && !hasGrokTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'deepseek' && !hasDeepSeekTab) modelVariantCatalogProviderTab = 'copilot';
+  if (modelVariantCatalogProviderTab === 'claude-api' && !hasClaudeApiTab) modelVariantCatalogProviderTab = 'copilot';
   if (modelVariantCatalogProviderTab === 'copilot' && !hasCopilotTab) {
     if (hasOpenAITab) modelVariantCatalogProviderTab = 'openai';
     else if (hasAnthropicTab) modelVariantCatalogProviderTab = 'anthropic';
     else if (hasCursorTab) modelVariantCatalogProviderTab = 'cursor';
     else if (hasGrokTab) modelVariantCatalogProviderTab = 'grok';
     else if (hasDeepSeekTab) modelVariantCatalogProviderTab = 'deepseek';
+    else if (hasClaudeApiTab) modelVariantCatalogProviderTab = 'claude-api';
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
-    <div class="summary-tab-strip" style="display:flex;gap:8px;align-items:center;">
+    <div class="summary-tab-strip" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'claude-api' ? ' active' : ''}" data-model-provider-tab="claude-api" ${hasClaudeApiTab ? '' : 'disabled'}>Claude API</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'cursor' ? ' active' : ''}" data-model-provider-tab="cursor" ${hasCursorTab ? '' : 'disabled'}>Cursor SDK</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'grok' ? ' active' : ''}" data-model-provider-tab="grok" ${hasGrokTab ? '' : 'disabled'}>Grok</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'deepseek' ? ' active' : ''}" data-model-provider-tab="deepseek" ${hasDeepSeekTab ? '' : 'disabled'}>DeepSeek</button>
@@ -2840,7 +2929,8 @@ function renderModelVariantCatalogBody() {
         const selectable = row.selectable !== false;
         // SDK-provider rows (Claude/Cursor/Grok/DeepSeek) carry their own enabled
         // flag; only Copilot variant rows read the enabledVariantIds selection.
-        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || row.grokModelId || row.deepseekModelId || '';
+        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || row.grokModelId || row.deepseekModelId
+          || row.claudeApiModelId || '';
         const checked = sdkProviderModelId
           ? row.enabled === true
           : (selectable && selected.has(row.variantId));
@@ -2862,12 +2952,14 @@ function renderModelVariantCatalogBody() {
             ? ` data-cursor-model="${escHtml(row.cursorModelId)}"`
             : (row.grokModelId
               ? ` data-grok-model="${escHtml(row.grokModelId)}"`
-              : (row.deepseekModelId ? ` data-deepseek-model="${escHtml(row.deepseekModelId)}"` : '')));
+              : (row.deepseekModelId
+                ? ` data-deepseek-model="${escHtml(row.deepseekModelId)}"`
+                : (row.claudeApiModelId ? ` data-claude-api-model="${escHtml(row.claudeApiModelId)}"` : ''))));
         return `
           <label class="model-variant-row">
             <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${sdkModelAttr} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
             <span class="model-variant-row-copy">
-              <span class="model-variant-row-title">${escHtml(row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
+              <span class="model-variant-row-title"${row.claudeApiModelId ? ` title="${escHtml(row.claudeApiModelId)}"` : ''}>${escHtml(row.claudeApiModelId ? row.label : row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
             </span>
           </label>
         `;
@@ -2993,12 +3085,17 @@ async function saveSelectedModelsFromModal() {
     .filter((input) => input.checked)
     .map((input) => String(input.getAttribute('data-deepseek-model') || '').trim())
     .filter(Boolean);
+  const claudeApiCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-claude-api-model]'));
+  const selectedClaudeApiModels = claudeApiCheckboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.getAttribute('data-claude-api-model') || '').trim())
+    .filter(Boolean);
   // Only the active provider tab's rows are in the DOM, but the PATCH
   // replaces the WHOLE enabled set — so the save must only change rows the
   // user could actually see. Off-screen variants keep their stored state,
   // otherwise saving from e.g. the OpenAI tab silently disables every
   // Copilot-only vendor group (Anthropic, Google, …).
-  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model]):not([data-deepseek-model])'));
+  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model]):not([data-deepseek-model]):not([data-claude-api-model])'));
   const renderedVariantIds = new Set(renderedVariantCheckboxes
     .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
     .filter(Boolean));
@@ -3044,7 +3141,13 @@ async function saveSelectedModelsFromModal() {
       if (!savedDeepSeek) throw new Error('Failed to save DeepSeek model selection');
       applyDeepSeekSettingsState(savedDeepSeek);
     }
-    if (claudeCheckboxes.length || cursorCheckboxes.length || grokCheckboxes.length || deepseekCheckboxes.length) {
+    if (claudeApiCheckboxes.length) {
+      const savedClaudeApi = await updateClaudeApiSettings({ enabledModels: selectedClaudeApiModels });
+      if (!savedClaudeApi) throw new Error('Failed to save Claude API model selection');
+      applyClaudeApiSettingsState(savedClaudeApi);
+    }
+    if (claudeCheckboxes.length || cursorCheckboxes.length || grokCheckboxes.length || deepseekCheckboxes.length
+      || claudeApiCheckboxes.length) {
       const refreshedCatalog = await loadModelVariantCatalog();
       if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
     }
@@ -3551,13 +3654,15 @@ async function loadContextSummaryAndRender(convId) {
   const refreshLookupId = sessionId || trimmedConvId || null;
   const providerLabel = payload.providerType === 'claude'
     ? 'Claude'
-    : (payload.providerType === CLAUDE_CLOUD_PROVIDER
-      ? 'Claude Cloud'
-      : (payload.providerType === 'cursor'
-        ? 'Cursor'
-        : (payload.providerType === 'grok'
-          ? 'Grok'
-          : (payload.providerType === 'deepseek' ? 'DeepSeek' : 'Copilot'))));
+    : (payload.providerType === 'claude-api'
+      ? 'Claude API'
+      : (payload.providerType === CLAUDE_CLOUD_PROVIDER
+        ? 'Claude Cloud'
+        : (payload.providerType === 'cursor'
+          ? 'Cursor'
+          : (payload.providerType === 'grok'
+            ? 'Grok'
+            : (payload.providerType === 'deepseek' ? 'DeepSeek' : 'Copilot')))));
   const subtitle = sessionId
     ? `${providerLabel} session ${sessionId.slice(0, 8)}`
     : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
@@ -3566,9 +3671,10 @@ async function loadContextSummaryAndRender(convId) {
   // (older relays send neither, and the notes fall back to draft vs stored).
   const sessionField = (key) => payload[key] ?? payload.contextUsage?.[key] ?? null;
   const modelContextLimit = sessionField('modelContextLimit');
-  // A DeepSeek chat runs the same Claude Code runner, so it has the same
-  // compaction window to show and to steer.
-  const runsClaudeCode = payload.providerType === 'claude' || payload.providerType === 'deepseek';
+  // A DeepSeek or Claude API chat runs the same Claude Code runner, so it has
+  // the same compaction window to show and to steer.
+  const runsClaudeCode = payload.providerType === 'claude' || payload.providerType === 'deepseek'
+    || payload.providerType === 'claude-api';
   const usageHtml = renderContextUsageHtml(payload.contextUsage, {
     compactionWindow: runsClaudeCode,
     modelContextLimit,
@@ -3614,15 +3720,17 @@ async function loadContextSummaryAndRender(convId) {
       usedTokens: autoCompactControlSession.usedTokens,
     })
     : '';
-  const thinkingHtml = payload.providerType === 'claude'
+  const thinkingHtml = payload.providerType === 'claude' || payload.providerType === 'claude-api'
     ? renderThinkingControlHtml({
       thinkingEnabled: payload.thinkingEnabled !== false,
       thinkingDisplay: payload.thinkingDisplay ?? null,
     })
     : '';
-  // What this folder's commits say, with the folder override: Claude, and a
-  // Claude Cloud chat that was started from a folder (no path, no row).
-  const attributionHtml = payload.providerType === 'claude' || payload.providerType === 'claude-cloud'
+  // What this folder's commits say, with the folder override: Claude (on
+  // either billing), and a Claude Cloud chat that was started from a folder
+  // (no path, no row).
+  const attributionHtml = payload.providerType === 'claude' || payload.providerType === 'claude-api'
+    || payload.providerType === 'claude-cloud'
     ? renderAttributionControlHtml(payload.attribution || null)
     : '';
   thinkingControlStored = {
@@ -4652,6 +4760,7 @@ initSocketHandlers({
   applyGrokSettingsState,
   applyCursorSettingsState,
   applyDeepSeekSettingsState,
+  applyClaudeApiSettingsState,
 });
 
 initCwdPicker({
@@ -4736,6 +4845,15 @@ async function initApp() {
     syncWindowRetentionSlider();
     initHostSuspendUi();
     initUsageLimitUi();
+    // After a switch the chat's provider changed: its model list, lock note
+    // and list pill follow.
+    initClaudeBillingToggle({
+      isSharedReaderMode,
+      onConversationProviderChanged: (conversationId) => {
+        if (conversationId === currentConvId) syncAutoModelAvailability();
+        renderConvList();
+      },
+    });
   }
   setupViewportTracking();
   bindChatSelectionGuard();
@@ -5036,12 +5154,15 @@ async function initApp() {
   const claudeSettings = await refreshClaudeSettingsState();
   // null on a relay without DeepSeek: not offered, as for Claude Cloud.
   const deepseekSettings = await refreshDeepSeekSettingsState();
+  // The same for Claude API; its state also decides the composer's billing toggle.
+  const claudeApiSettings = await refreshClaudeApiSettingsState();
   updateProviderReadinessInputs({
     openai: openAISettings || null,
     cursor: cursorSettings || null,
     grok: grokSettings || null,
     claude: claudeSettings || null,
     deepseek: deepseekSettings || null,
+    claudeApi: claudeApiSettings || null,
   });
   // Not awaited: only a Claude Cloud conversation needs it (its model list),
   // and the subscription below rebuilds that list when the answer arrives. A
@@ -5221,6 +5342,11 @@ window.saveDeepSeekSettings = saveDeepSeekSettings;
 window.removeDeepSeekSettings = removeDeepSeekSettings;
 window.toggleDeepSeekProvider = toggleDeepSeekProvider;
 window.importDeepSeekUsageExport = importDeepSeekUsageExport;
+window.saveClaudeApiSettings = saveClaudeApiSettings;
+window.removeClaudeApiSettings = removeClaudeApiSettings;
+window.toggleClaudeApiProvider = toggleClaudeApiProvider;
+window.refreshClaudeApiModels = refreshClaudeApiModels;
+window.openClaudeTabFromClaudeApi = openClaudeTabFromClaudeApi;
 window.toggleGrokProvider = toggleGrokProvider;
 window.saveClaudeCloudSettings = saveClaudeCloudSettings;
 window.toggleClaudeCloudProvider = toggleClaudeCloudProvider;

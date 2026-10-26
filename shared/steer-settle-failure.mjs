@@ -86,6 +86,7 @@ export function steerAgentLabelForProvider(providerType) {
     case 'grok': return 'Grok';
     case 'claude-cloud': return 'Claude Cloud';
     case 'deepseek': return 'DeepSeek';
+    case 'claude-api': return 'Claude API';
     default: return DEFAULT_STEER_AGENT_LABEL;
   }
 }

@@ -52,7 +52,7 @@ function wrongTypeFor(property) {
 
 test('the definition carries the contract name/description and the shape as a loose object', () => {
   const definition = createRemoteRelayToolDefinition({ api: recordingApi().api });
-  assert.equal(definition.name, 'remote_relay');
+  assert.equal(definition.name, 'relay_tool');
   assert.equal(definition.description, REMOTE_RELAY_TOOL_DESCRIPTION);
   assert.equal(definition.inputSchema, REMOTE_RELAY_TOOL_ZOD_SCHEMA);
   assert.deepEqual(Object.keys(definition.inputSchema.shape), Object.keys(REMOTE_RELAY_TOOL_ZOD_SHAPE));
@@ -96,15 +96,15 @@ test('through the SDK\'s MCP server: every field is advertised, and unknown keys
   const mcp = await connectRelayMcpServer(createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' }));
   try {
     const listed = await mcp.request('tools/list', {});
+    assert.deepEqual(listed.result.tools.map((listedTool) => listedTool.name), ['relay_tool'], 'the old name is not listed');
     const [tool] = listed.result.tools;
-    assert.equal(tool.name, 'remote_relay');
     assert.deepEqual(Object.keys(tool.inputSchema.properties), Object.keys(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties));
     assert.deepEqual(tool.inputSchema.required, ['action']);
     assert.equal(tool.inputSchema.properties.group.description, REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.group.description);
     assert.equal(tool.inputSchema.additionalProperties === false, false, 'unknown keys are not refused by the schema');
 
     const call = async (args) => {
-      const answer = await mcp.request('tools/call', { name: 'remote_relay', arguments: args });
+      const answer = await mcp.request('tools/call', { name: 'relay_tool', arguments: args });
       assert.ok(answer.result, JSON.stringify(answer));
       return JSON.parse(answer.result.content[0].text);
     };
@@ -120,8 +120,12 @@ test('through the SDK\'s MCP server: every field is advertised, and unknown keys
     assert.deepEqual(stopped.ignored, ['group_id']);
     assert.deepEqual(stub.calls[0].body.args, { relay: 'this', session: 's-1' });
     // The schema still checks the types it declares.
-    const typed = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'stop', relay: 7 } });
+    const typed = await mcp.request('tools/call', { name: 'relay_tool', arguments: { action: 'stop', relay: 7 } });
     assert.equal(typed.result?.isError === true || !!typed.error, true, JSON.stringify(typed));
+    assert.equal(stub.calls.length, 1);
+    // The old name is no second tool here: the CLI calls only what it listed.
+    const legacy = await mcp.request('tools/call', { name: 'remote_relay', arguments: { action: 'list_relays' } });
+    assert.equal(legacy.result?.isError === true || !!legacy.error, true, JSON.stringify(legacy));
     assert.equal(stub.calls.length, 1);
   } finally {
     await mcp.close();

@@ -126,7 +126,7 @@ export function createCursorTurnRunner({
   // The error an agent started in `cwd` fails with up front, or null
   // (shared/worker-runtime/working-directory.mjs).
   checkWorkingDirectoryImpl = missingWorkingDirectoryError,
-  // Whether agent handles carry the relay's `remote_relay` tool
+  // Whether agent handles carry the relay's `relay_tool` tool
   // (shared/remote-relay-tool-core.mjs). Default: ask the relay.
   remoteRelayToolGate = null,
   dbg = () => {},
@@ -149,7 +149,7 @@ export function createCursorTurnRunner({
   // Open ask_user round-trips: the merged-stream stall watchdog defers while
   // a human is thinking about a question card.
   let pendingAskUserCalls = 0;
-  // Running remote_relay calls, same family: the relay may be waiting up to
+  // Running relay_tool calls, same family: the relay may be waiting up to
   // 600 s for a remote turn (plus an approval card) with no SDK traffic.
   let pendingRemoteRelayCalls = 0;
   // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
@@ -178,7 +178,7 @@ export function createCursorTurnRunner({
   // plain refusal the model can relay instead of a failed turn.
   const previewTool = createPreviewTool({
     api,
-    // Between turns, the worker's own session (as remote_relay below): list
+    // Between turns, the worker's own session (as relay_tool below): list
     // and close are scoped to a conversation and refused without one.
     getConversationId: () => activeMessage?.conversationId || sdkSessionId || '',
     dbg,
@@ -202,7 +202,7 @@ export function createCursorTurnRunner({
       execute: previewTool.execute,
     },
   };
-  // `remote_relay` joins the set only while this relay has paired remotes.
+  // `relay_tool` joins the set only while this relay has paired remotes.
   // Asked once when the worker starts; the first handle waits for the answer
   // (it is created asynchronously anyway), and every handle creation refreshes
   // it so a later rebuild picks up a remote paired in the meantime.
