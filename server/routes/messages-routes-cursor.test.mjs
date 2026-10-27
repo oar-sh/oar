@@ -331,10 +331,48 @@ test('buildDequeuedRelayMessage yields a null cursorAgentId when the column is e
   assert.equal(message.cursorAgentId, null);
 });
 
-test('a cursor-only model on an existing github conversation requires a new Cursor conversation', async () => {
+// Copilot's catalog in these tests: its own dotted Claude id, not the Claude form.
+const COPILOT_MODELS = ['claude-opus-5.5', 'gpt-5.4-mini'];
+function copilotCatalog() {
+  return (model) => {
+    const requested = String(model || '').trim().toLowerCase();
+    if (COPILOT_MODELS.includes(requested)) {
+      return { ok: true, model: requested, modelVariantId: requested, reasoningEffort: null, warning: null };
+    }
+    return { ok: false, error: 'Unsupported model', available: [...COPILOT_MODELS] };
+  };
+}
+
+// A Copilot conversation is never moved by a model id: an id only another
+// provider lists is a model Copilot lacks, named with its close match.
+test('a Claude-form id Cursor, Grok and DeepSeek list is refused on a github conversation as unknown to Copilot, not routed', async () => {
   const db = makeDb();
   insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
   const deps = baseRouteDeps(makeStmts(db), {
+    resolveRequestedModel: copilotCatalog(),
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'claude-opus-5-5'] }),
+    getGrokProviderSettings: () => ({ enabled: true, model: 'grok-4.5', models: ['grok-4.5', 'claude-opus-5-5'] }),
+    getDeepSeekProviderSettings: () => ({ enabled: true, model: 'deepseek-flash', models: ['deepseek-flash', 'claude-opus-5-5'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'claude-opus-5-5',
+    relayMode: 'default',
+  });
+  assert.equal(status, 400);
+  assert.equal(body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.equal(body.error, 'Unknown model \'claude-opus-5-5\' for Copilot; did you mean \'claude-opus-5.5\'? Valid ids: claude-opus-5.5, gpt-5.4-mini.');
+  assert.deepEqual(body.supportedModels, COPILOT_MODELS);
+  assert.deepEqual(body.suggestedModels, ['claude-opus-5.5']);
+});
+
+test('a cursor-only model on an existing github conversation is refused as unknown to Copilot', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    resolveRequestedModel: copilotCatalog(),
     getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'cursor-fast'] }),
   });
   const { status, body } = await invokePost('/api/message', deps, {
@@ -344,9 +382,71 @@ test('a cursor-only model on an existing github conversation requires a new Curs
     model: 'composer-1',
     relayMode: 'default',
   });
+  assert.equal(status, 400);
+  assert.equal(body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.match(body.error, /^Unknown model 'composer-1' for Copilot/);
+});
+
+test('a DeepSeek id on a github conversation is not routed to DeepSeek by its name', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    resolveRequestedModel: copilotCatalog(),
+    getDeepSeekProviderSettings: () => ({ enabled: true, model: 'deepseek-flash', models: ['deepseek-flash'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'deepseek-flash',
+    relayMode: 'default',
+  });
+  assert.equal(status, 400);
+  assert.equal(body.code, 'COPILOT_MODEL_UNAVAILABLE');
+});
+
+test('the dotted Copilot id passes every guard on a github conversation', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps({
+    ...makeStmts(db),
+    getConvAnyStatus: { get: () => null },
+  }, {
+    resolveRequestedModel: copilotCatalog(),
+    resolveRequestedReasoningEffort: () => ({ ok: true, effort: 'high', supported: ['high'] }),
+    getCursorProviderSettings: () => ({ enabled: true, model: 'composer-1', models: ['composer-1', 'claude-opus-5-5'] }),
+    maybeApplyWorkspaceRootFromMessage: () => ({ attempted: false, changed: false }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'claude-opus-5.5',
+    relayMode: 'agent',
+  });
+  // Guard path only: the conversation row is intentionally missing, so the
+  // send stops at the session binding, after the model was resolved.
+  assert.equal(status, 404, JSON.stringify(body));
+  assert.equal(body.error, 'Conversation not found');
+});
+
+test('an explicit grok providerType on an existing github conversation requires a new Grok conversation', async () => {
+  const db = makeDb();
+  insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
+  const deps = baseRouteDeps(makeStmts(db), {
+    resolveRequestedModel: copilotCatalog(),
+    getGrokProviderSettings: () => ({ enabled: true, model: 'grok-4.5', models: ['grok-4.5'] }),
+  });
+  const { status, body } = await invokePost('/api/message', deps, {
+    clientId: 'client-1',
+    conversationId: 'conv-gh',
+    text: 'hello there',
+    model: 'grok-4.5',
+    providerType: 'grok',
+    relayMode: 'default',
+  });
   assert.equal(status, 409);
-  assert.equal(body.code, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
-  assert.equal(body.error, 'Cursor model selection requires creating a new Cursor conversation');
+  assert.equal(body.code, 'GROK_MODEL_REQUIRES_NEW_CONVERSATION');
 });
 
 test('an explicit cursor providerType on an existing github conversation requires a new Cursor conversation', async () => {

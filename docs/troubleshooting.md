@@ -46,3 +46,18 @@ Symptoms and what to check. This is the detail behind the [README](../README.md#
 | The Cloudflare tunnel stays off and the status dot's tooltip says `cloudflared is not installed` | OAR runs the `cloudflared` on the relay host and ships none. Install it (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)); the tunnel starts within a minute |
 | `npm install -g @oar-sh/oar` fails with node-gyp or prebuild errors | `better-sqlite3` has no prebuilt binary for your platform; install a C/C++ build toolchain and Python, then retry |
 | No usage line under a reply        | Expected for OpenAI, Claude, Claude API, Claude Cloud, Cursor, Grok, and DeepSeek turns; only Copilot turns record plan usage |
+| The relay stopped with *JavaScript heap out of memory* in its log | See [The relay ran out of memory](#the-relay-ran-out-of-memory) below |
+
+## The relay ran out of memory
+
+The relay runtime starts with a fixed heap limit. By default it is 60 % of the host's RAM, in 64 MB steps, with a minimum of 2048 MB and a maximum of 8192 MB, and never below Node's own default. On a 4 GB host that is about 2.3 GB. Every start logs the limit and where it came from, such as `[relay] heap limit 2368 MB (default: 60% of 3.9 GB RAM)`. Every 10 minutes the status log gets a line such as `[relay] memory rss=812 heapUsed=640 heapLimit=2560`. One extra `[relay] memory high: …` line is logged when the used heap passes 80 % of the limit.
+
+To set the limit yourself, put `heapLimitMb` (whole MB, at least 512) in `config.json` and restart the relay. Every launcher reads it: `oar start`, the systemd service, Windows autostart and the CLI extension. A `--max-old-space-size` in `NODE_OPTIONS`, or on the `node` command line that starts `server.js`, wins over `heapLimitMb` and is not added twice. Unlike `heapLimitMb`, `NODE_OPTIONS` set in a shell is lost when something else relaunches the relay.
+
+When the heap nears its limit, Node writes one heap snapshot (`Heap.<date>.<pid>.….heapsnapshot`) to the `diagnostics` folder in the relay's data directory: `~/.oar/data/diagnostics`, `%APPDATA%\oar\data\diagnostics` on Windows, or `server/data/diagnostics` in a checkout. The relay creates that folder and logs its path at start. On Linux and macOS it makes the folder owner-only (0700); on Windows the folder keeps the permissions of the data folder it sits in. A `--diagnostic-dir` you set yourself is used as it is.
+
+- **Disk:** a snapshot is about as large as the heap in use, so up to the heap limit. The data directory also holds the database, so when its drive has less than twice the heap limit free, the relay starts without a snapshot and logs why.
+- **Memory:** Node can need up to about twice the heap in use to write the snapshot, and the relay stops responding while it writes. On a small host, writing it can fail or get the process killed. In that case the relay ends as it would have without the snapshot.
+- **What to do with one:** copy it off the host, open it in Chrome DevTools (**Memory** tab → **Load**), and sort by *Retained size* to see what holds the memory. Comparing it with a snapshot from an earlier, healthy run shows what grew. A snapshot holds everything that was in memory, including the auth token and provider API keys, so never share one as it is. Delete it once it has been read: the relay never deletes snapshots, and the start line counts how many are there.
+
+After a runtime crashes, including one that ran out of memory, the relay's own supervisor relaunches it up to 2 times; the 3rd crash in a row stops the relay with exit code 1. Under the systemd service, `Restart=on-failure` then starts it again. A run of 10 minutes or more resets the count.

@@ -946,10 +946,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **7497 pass / 0 fail / 10 skip on Linux (0.9.18, 2026-10-26)** — the count
+Expected: **0 fail** everywhere; **7535 pass / 0 fail / 10 skip on Linux (0.9.19, 2026-10-27)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
-cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **11 skips** that
-are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`) and run on Linux (0.9.17: **7192 pass / 0 fail / 11 skip**).
+cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **12 skips** that
+are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`) and run on Linux (0.9.19: **7533 pass / 0 fail / 12 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

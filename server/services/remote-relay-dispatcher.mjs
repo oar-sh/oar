@@ -2386,10 +2386,29 @@ export function createRemoteRelayDispatcher({
       // From here the new session's queued turn counts toward the cap itself.
       ctx.onPromptQueued?.();
     } catch (error) {
-      if (!choice.effort || !isEffortRejection(error)) throw error;
       // The session exists by now: say so, or the agent starts a second one.
+      const remoteCode = toText(error?.remoteBody?.code);
+      if (!choice.effort || !isEffortRejection(error)) {
+        // The remote's own 4xx is passed on, anything else is a 502, as
+        // mapRemoteError answers them.
+        const code = toText(error?.code);
+        const remoteStatus = Number(error?.status) || 0;
+        const status = error instanceof DispatchFailure
+          ? error.status
+          : (code.startsWith(REMOTE_RELAY_ERROR_CODES.httpPrefix) && remoteStatus >= 400 && remoteStatus < 500 ? remoteStatus : 502);
+        const supportedModels = Array.isArray(error?.remoteBody?.supportedModels) ? error.remoteBody.supportedModels.slice(0, 50) : null;
+        throw new DispatchFailure(status, code || `${REMOTE_RELAY_ERROR_CODES.httpPrefix}${status}`,
+          `${toText(error?.message).replace(/[.\s]+$/, '') || `Relay "${ctx.relay.name}" refused the first prompt`}. The session ${session} was created, but the prompt was not queued.`,
+          {
+            ...(isPlainObject(error?.extra) ? error.extra : {}),
+            session,
+            ...(remoteCode ? { remoteCode } : {}),
+            ...(supportedModels ? { supportedModels } : {}),
+            openUrl: remoteConversationUrl(ctx.relay.url, session) || null,
+            note: 'Use send with this session (update_session to change its model); do not create another session.',
+          });
+      }
       const supported = supportedEffortsOf(error);
-      const remoteCode = toText(error.remoteBody?.code);
       throw new DispatchFailure(400, toText(error.code) || `${REMOTE_RELAY_ERROR_CODES.httpPrefix}400`,
         `${toText(error.message) || `Relay "${ctx.relay.name}" refused effort "${choice.effort}"`}. The session was created, but the prompt was not queued.`,
         {
@@ -3966,7 +3985,13 @@ export function createRemoteRelayDispatcher({
     // wait_seconds is cut to this relay's "longest wait" setting, for every
     // target: the waiting is done here, by polling the target.
     const { maxWaitSeconds } = agentSessions();
-    const validation = validateRemoteRelayToolInput({ ...(isPlainObject(args) ? args : {}), action }, { maxWaitSeconds });
+    // The server must always pass the provider lists: without them the
+    // contract checks a provider's shape only (the worker's path).
+    const validation = validateRemoteRelayToolInput({ ...(isPlainObject(args) ? args : {}), action }, {
+      maxWaitSeconds,
+      providers: REMOTE_RELAY_PROVIDERS,
+      sendProviders: REMOTE_RELAY_SEND_PROVIDERS,
+    });
     const result = await runValidated({ conversationId, req, signal }, validation);
     // The arguments the action does not take, named on the answer (a call
     // that came through a worker's tool had them named there already).

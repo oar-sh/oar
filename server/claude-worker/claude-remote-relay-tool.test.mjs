@@ -235,6 +235,26 @@ test('the zod mirror takes an effort as free text and the handler passes it on',
   assert.equal(stub.calls.length, 1, 'a malformed effort never reaches the relay');
 });
 
+test('a worker older than the relay forwards provider ids it has never heard of', async () => {
+  // The provider field holds no list: an id added by a later relay (here
+  // deepseek and claude-api stand for those, with one no relay has yet)
+  // passes the SDK's parse and the contract's shape check unchanged.
+  const ids = ['deepseek', 'claude-api', 'some-later-provider'];
+  for (const provider of ids) assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.provider.safeParse(provider).success, true, provider);
+  const stub = recordingApi({ ok: true, status: 'queued' });
+  const mcp = await connectRelayMcpServer(createRemoteRelayToolDefinition({ api: stub.api, getConversationId: () => 'conv-1' }));
+  try {
+    for (const provider of ids) {
+      const answer = await mcp.request('tools/call', { name: 'relay_tool', arguments: { action: 'create_session', relay: 'this', text: 'go', provider } });
+      assert.equal(JSON.parse(answer.result.content[0].text).ok, true, provider);
+    }
+    await mcp.request('tools/call', { name: 'relay_tool', arguments: { action: 'send', relay: 'this', session: 's-1', text: 'go', provider: 'claude-api' } });
+  } finally {
+    await mcp.close();
+  }
+  assert.deepEqual(stub.calls.map((call) => call.body.args.provider), [...ids, 'claude-api']);
+});
+
 test('the zod mirror takes repo and branch, and the handler sends a cloud create to this relay with them', async () => {
   for (const field of ['repo', 'branch']) {
     assert.ok(REMOTE_RELAY_TOOL_ZOD_SHAPE[field], `${field} is part of the shape`);

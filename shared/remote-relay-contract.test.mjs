@@ -9,6 +9,7 @@ import {
   REMOTE_RELAY_LIMITS,
   REMOTE_RELAY_NO_GROUP,
   REMOTE_RELAY_PROVIDERS,
+  REMOTE_RELAY_SEND_PROVIDERS,
   REMOTE_RELAY_SESSION_SETTINGS,
   REMOTE_RELAY_SCHEDULE_ACTIONS,
   REMOTE_RELAY_SETTING_KEYS,
@@ -31,6 +32,7 @@ import {
   normalizeRemoteRelayRepo,
   remoteConversationUrl,
   remoteRelayActionPermission,
+  remoteRelayProviderDescription,
   remoteRelayPermissionAllows,
   stripRemotePromptHeader,
   summarizeRemoteRelayCall,
@@ -146,7 +148,7 @@ test('the longest-wait setting has a range, a step and a default', () => {
 
 test('create_session takes repo and branch with provider claude-cloud, and with no other', () => {
   assert.ok(REMOTE_RELAY_PROVIDERS.includes('claude-cloud'));
-  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.provider.enum.includes('claude-cloud'));
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.provider.description, /claude-cloud/);
   assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.repo);
   assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.branch);
   const create = (extra) => validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'fix the banner', ...extra });
@@ -227,8 +229,38 @@ test('create_session accepts provider, model, cwd, mode and title', () => {
     cwd: '/work/demo',
     title: 'report builder',
   });
-  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'r', text: 'x', provider: 'nope' }).ok, false);
   assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'r', text: 'x', mode: 'yolo' }).ok, false);
+});
+
+test('provider is a plain string: the shape without lists, the relay\'s lists when it passes them', () => {
+  const property = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.provider;
+  assert.equal(property.type, 'string');
+  assert.equal(property.enum, undefined, 'a worker outlives relay updates');
+  for (const provider of [...REMOTE_RELAY_PROVIDERS, ...REMOTE_RELAY_SEND_PROVIDERS]) assert.ok(property.description.includes(provider), provider);
+  assert.match(property.description, /relay_info lists what the target relay offers/);
+  assert.equal(property.description, remoteRelayProviderDescription(REMOTE_RELAY_PROVIDERS, REMOTE_RELAY_SEND_PROVIDERS));
+  assert.doesNotMatch(remoteRelayProviderDescription(['github', 'claude']), /deepseek/);
+
+  const create = { action: 'create_session', relay: 'r', text: 'x' };
+  const send = { action: 'send', relay: 'r', session: 's', text: 'x' };
+  // The worker's path: any id-shaped value goes on, the relay judges it.
+  for (const provider of ['deepseek', 'claude-api', 'nope', 'Some-Later-Provider']) {
+    assert.equal(validateRemoteRelayToolInput({ ...create, provider }).args.provider, provider.toLowerCase());
+  }
+  assert.equal(validateRemoteRelayToolInput({ ...send, provider: 'openai' }).args.provider, 'openai');
+  for (const provider of ['open ai!', 'x'.repeat(33), '-claude']) {
+    assert.match(validateRemoteRelayToolInput({ ...create, provider }).error, /provider must be a provider id/);
+  }
+
+  // The relay's path.
+  const lists = { providers: REMOTE_RELAY_PROVIDERS, sendProviders: REMOTE_RELAY_SEND_PROVIDERS };
+  assert.equal(validateRemoteRelayToolInput({ ...create, provider: 'DeepSeek' }, lists).args.provider, 'deepseek');
+  const nope = validateRemoteRelayToolInput({ ...create, provider: 'nope' }, lists);
+  assert.equal(nope.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+  assert.equal(nope.error, `provider "nope" is not a provider here; this relay offers: ${REMOTE_RELAY_PROVIDERS.join(', ')}`);
+  assert.equal(validateRemoteRelayToolInput({ ...send, provider: 'claude-api' }, lists).args.provider, 'claude-api');
+  assert.equal(validateRemoteRelayToolInput({ ...send, provider: 'openai' }, lists).error,
+    'provider "openai" can\'t be used with send; send takes one of: claude, claude-api (the Claude session\'s subscription or API key)');
 });
 
 test('send and create_session take an effort: any short lowercase token, no fixed list', () => {

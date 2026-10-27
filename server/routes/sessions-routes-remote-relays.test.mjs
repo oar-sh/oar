@@ -355,6 +355,41 @@ test('an agent\'s bootstrap with a Copilot model the catalogue lacks is refused;
   assert.equal(human.body.selectedModel, 'gpt-5.4-mini');
 });
 
+// Claude and Cursor both list the Claude-form id; Copilot lists its dotted id.
+// Neither "requires the X provider" answer fits an id two providers list, and
+// it is not Copilot's: refused before a Copilot session with it exists.
+test('an agent\'s Copilot bootstrap with a Claude-form id that Claude and Cursor list is refused with Copilot\'s id', async () => {
+  const fx = setup({
+    modelCatalog: {
+      models: ['gpt-5.4-mini', 'claude-opus-5.5'],
+      currentModel: 'gpt-5.4-mini',
+      defaultModel: 'gpt-5.4-mini',
+      reasoningByModel: {},
+      providersByModel: { 'gpt-5.4-mini': ['github-copilot'], 'claude-opus-5.5': ['github-copilot'] },
+    },
+    extraDeps: () => ({
+      getClaudeProviderSettings: () => ({ enabled: true, model: 'claude-opus-5-5', models: ['claude-opus-5-5'] }),
+      getCursorProviderSettings: () => ({ enabled: true, configured: true, model: 'composer-1', models: ['composer-1', 'claude-opus-5-5'] }),
+    }),
+  });
+  // The catalogue does not count the id as Copilot's because a later layer
+  // (Cursor) found it in the list an earlier one (Claude) had extended.
+  const catalog = await fx.call('GET /api/models');
+  assert.deepEqual(catalog.body.providersByModel['claude-opus-5-5'], ['claude', 'cursor']);
+  assert.ok(catalog.body.providersByModel['claude-opus-5.5'].includes('github-copilot'));
+
+  const refused = await fx.bootstrap({ origin: ORIGIN, model: 'claude-opus-5-5', providerType: 'github' }, agentHeaders);
+  assert.equal(refused.status, 400, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.match(refused.body.error, /^Unknown model 'claude-opus-5-5' for Copilot; did you mean 'claude-opus-5\.5'\?/);
+  assert.deepEqual(refused.body.suggestedModels, ['claude-opus-5.5']);
+  assert.equal(fx.db.prepare(`SELECT COUNT(*) AS n FROM conversations`).get().n, 0, 'nothing is created');
+
+  const listed = await fx.bootstrap({ origin: ORIGIN, model: 'claude-opus-5.5', providerType: 'github' }, agentHeaders);
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.equal(listed.body.selectedModel, 'claude-opus-5.5');
+});
+
 test('before Copilot discovery ("auto" only) an agent\'s model is not refused; another provider\'s model is answered as such', async () => {
   const early = setup({ modelCatalog: { models: ['auto'], currentModel: 'auto', defaultModel: 'auto', providersByModel: {} } });
   const unchecked = await early.bootstrap({ origin: ORIGIN, model: 'gpt-5.4' }, agentHeaders);

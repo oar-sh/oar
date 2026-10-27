@@ -3,6 +3,48 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.19] — 2026-10-27
+
+Highlights: a relay that runs out of memory is restarted instead of staying
+down. Its runtime starts with a heap limit, set with `heapLimitMb` in
+`config.json`, and writes one heap snapshot when it nears that limit; a
+snapshot holds the relay's auth token and API keys, so never share one as it
+is. Agent sessions can use the providers a relay update added without a
+restart of their own, and Copilot refuses another provider's model id before
+it creates anything.
+
+### Fixed
+
+- **A relay that runs out of memory is restarted.** A relay runtime that ran
+  out of memory ended the relay for good. Its supervisor took the
+  out-of-memory abort for a clean stop and exited 0, which systemd does not
+  restart. The runtime is now relaunched like any crash. It starts with a heap
+  limit (60 % of RAM, 2048–8192 MB, set with `heapLimitMb` in `config.json`)
+  and writes one heap snapshot to `diagnostics` in the data directory when it
+  nears that limit. A heap snapshot holds the relay's auth token and API keys:
+  never share one as it is. The status log shows its memory every 10 minutes
+  and when the heap passes 80 % of the limit.
+- **`relay_tool` takes any provider id.** Agent sessions started before a
+  relay update refused the providers the update added (such as `deepseek` and
+  `claude-api`) in `relay_tool`'s `create_session` and `send`. The tool now
+  takes any provider id; the relay checks it against its current list and
+  names that list when it refuses one.
+- **Copilot refuses another provider's model id before creating anything.** A
+  Copilot session given another provider's model id (such as `claude-opus-5-5`
+  for Copilot's `claude-opus-5.5`) was created and then refused with
+  `CURSOR_MODEL_REQUIRES_NEW_CONVERSATION`. Copilot now refuses such an id
+  with `COPILOT_MODEL_UNAVAILABLE` and the close match before anything is
+  created, and a first prompt refused after `create_session` made the session
+  names that session.
+
+### Upgrade notes
+
+- **Agent sessions started before 0.9.19 keep their provider list:** their
+  workers keep running through the update, with the `relay_tool` they
+  started with. That list is the one 0.9.19 has, so nothing changes now; it
+  lacks the providers a later update adds until the session's worker
+  restarts, for example after **☠️ Kill session** in the `⋯` menu.
+
 ## [0.9.18] — 2026-10-26
 
 Highlights: Claude chats can run on a Claude Console API key. Claude API is

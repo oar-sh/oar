@@ -5,6 +5,8 @@ import {
   REMOTE_PROMPT_HEADER_PATTERN,
   REMOTE_RELAY_ERROR_CODES as CODES,
   REMOTE_RELAY_LIMITS,
+  REMOTE_RELAY_PROVIDERS,
+  validateRemoteRelayToolInput,
 } from '../../shared/remote-relay-contract.mjs';
 import { executeRemoteRelayTool } from '../../shared/remote-relay-tool-core.mjs';
 import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
@@ -1969,6 +1971,38 @@ test('an explicit effort refused after the session was created names that sessio
   assert.deepEqual(effortsSent(remote), { bootstrap: ['high'], message: ['high'] });
 });
 
+test('any first prompt refused after the session was created names that session', async () => {
+  const { run, remote } = setup();
+  const original = remote.request;
+  remote.request = async (relay, method, path, options = {}) => {
+    if (method === 'POST' && path === '/api/message') {
+      throw remoteError(`${CODES.httpPrefix}409`, 'This conversation cannot switch to that model.', 409,
+        { error: 'This conversation cannot switch to that model.', code: 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION' });
+    }
+    return original(relay, method, path, options);
+  };
+  const result = await run('create_session', { ...CREATE, provider: 'github', model: 'gpt-5.6-luna' });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, `${CODES.httpPrefix}409`);
+  assert.equal(result.body.remoteCode, 'CURSOR_MODEL_REQUIRES_NEW_CONVERSATION');
+  assert.equal(result.body.session, 'conv-new-1');
+  assert.equal(result.body.openUrl, 'https://relay-b.example.test/?conv=conv-new-1');
+  assert.match(result.body.error, /^This conversation cannot switch to that model\. The session conv-new-1 was created, but the prompt was not queued\.$/);
+  assert.match(result.body.note, /do not create another session/);
+
+  // A failure without an HTTP status is still the remote's, and still names the session.
+  const { run: runDown, remote: down } = setup();
+  const passOn = down.request;
+  down.request = async (relay, method, path, options = {}) => {
+    if (method === 'POST' && path === '/api/message') throw new Error('socket hang up');
+    return passOn(relay, method, path, options);
+  };
+  const lost = await runDown('create_session', CREATE);
+  assert.equal(lost.status, 502);
+  assert.equal(lost.body.session, 'conv-new-1');
+  assert.match(lost.body.error, /^socket hang up\. The session conv-new-1 was created/);
+});
+
 test('an effort the remote replaces without refusing is reported as the one the turn runs with', async () => {
   const { run, remote } = setup();
   remote.efforts = { supported: ['none', 'low', 'medium', 'high'], strictBootstrap: false, strictMessage: false };
@@ -2143,6 +2177,37 @@ test('relay_info lists Claude API with its models while the remote has it switch
   remote.settings['claude-api'] = { ...remote.settings['claude-api'], enabled: false };
   const off = await run('relay_info', { relay: 'linux-test' });
   assert.equal(off.body.providers.find((entry) => entry.provider === 'claude-api').configured, false);
+});
+
+test('create_session takes deepseek and claude-api, as forwarded by a worker that checks the shape only', async () => {
+  for (const [provider, model] of [['deepseek', 'deepseek-flash'], ['claude-api', 'claude-sonnet-5-5']]) {
+    const { run, remote } = setup();
+    remote.settings[provider] = { configured: true, enabled: true, model, models: [model] };
+    // What the worker's validator hands on, without any provider list.
+    const forwarded = validateRemoteRelayToolInput({ action: 'create_session', ...CREATE_ARGS, provider });
+    assert.equal(forwarded.args.provider, provider);
+    const result = await run('create_session', forwarded.args);
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(result.body.provider, provider);
+    assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap')[0].body.providerType, provider);
+  }
+});
+
+test('the relay refuses a provider it does not know and names the ones it has', async () => {
+  const { run, remote, approvals } = setup();
+  const result = await run('create_session', { ...CREATE_ARGS, provider: 'nope' });
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, CODES.invalidInput);
+  assert.equal(result.body.error, `provider "nope" is not a provider here; this relay offers: ${REMOTE_RELAY_PROVIDERS.join(', ')}`);
+  for (const provider of REMOTE_RELAY_PROVIDERS) assert.ok(result.body.error.includes(provider), provider);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(approvals.length, 0);
+
+  withSession(remote);
+  const send = await run('send', { ...SEND_ARGS, provider: 'openai' });
+  assert.equal(send.status, 400);
+  assert.equal(send.body.error, 'provider "openai" can\'t be used with send; send takes one of: claude, claude-api (the Claude session\'s subscription or API key)');
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
 });
 
 test('relay_info lists Claude Cloud when the remote has it switched on, without efforts', async () => {
@@ -4409,7 +4474,7 @@ test('provider on a session that is no Claude one, or another provider: refused 
   assert.equal(onCursor.body.code, 'REMOTE_RELAY_INVALID_INPUT');
   const other = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, provider: 'deepseek', wait_seconds: 0 });
   assert.equal(other.status, 400);
-  assert.match(other.body.error, /send takes provider "claude"/);
+  assert.equal(other.body.error, 'provider "deepseek" can\'t be used with send; send takes one of: claude, claude-api (the Claude session\'s subscription or API key)');
   assert.equal(conv.messages.length, 2);
   assert.equal(remote.callsTo('POST', '/api/message').length, 0);
 });

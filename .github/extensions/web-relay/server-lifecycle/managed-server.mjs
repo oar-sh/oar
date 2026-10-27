@@ -1,3 +1,5 @@
+import { relayRuntimeNodeFlags, relayRuntimeNodeFlagsOrNone } from "../../../../server/relay-heap-guard.mjs";
+
 export function createManagedServerLifecycle({
   api,
   dbg,
@@ -16,6 +18,8 @@ export function createManagedServerLifecycle({
   relayPort = 3333,
   nodeBin,
   serverStartTimeoutMs,
+  // The heap limit and heap snapshot flags every relay runtime starts with.
+  nodeFlags = relayRuntimeNodeFlags,
 }) {
   let managedServerProc = null;
   let managedServerStdoutFd = null;
@@ -301,7 +305,15 @@ export function createManagedServerLifecycle({
         if (startupWorkspaceRoot) {
           serverEnv.COPILOT_WORKSPACE_ROOT = startupWorkspaceRoot;
         }
-        managedServerProc = spawn(nodeBin, serverArgs, {
+        // The runtime runs in this process (--supervised): its Node flags go here.
+        const { flags } = relayRuntimeNodeFlagsOrNone(nodeFlags, {
+          env: serverEnv,
+          execArgv: [],
+          serverDir,
+          fsImpl: fs,
+          logger: { log: (line) => dbg(line) },
+        });
+        managedServerProc = spawn(nodeBin, [...flags, ...serverArgs], {
           cwd: serverDir,
           env: serverEnv,
           stdio: ["ignore", managedServerStdoutFd, managedServerStderrFd],

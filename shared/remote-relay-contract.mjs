@@ -175,6 +175,17 @@ export const REMOTE_RELAY_IF_BUSY = Object.freeze(['queue', 'fail']);
 // xhigh, max, ultracode, ...), so the contract only checks the shape of the
 // value: the remote relay decides whether its model takes it.
 export const REMOTE_RELAY_EFFORT_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+// A worker can outlive a relay update, so its tool checks a provider's shape
+// only; the relay checks it against the list it has now.
+export const REMOTE_RELAY_PROVIDER_ID_PATTERN = REMOTE_RELAY_EFFORT_PATTERN;
+
+/** The provider field's description, with the lists a relay has. */
+export function remoteRelayProviderDescription(providers = REMOTE_RELAY_PROVIDERS, sendProviders = REMOTE_RELAY_SEND_PROVIDERS) {
+  return `create_session: provider, one of: ${providers.join(', ')} (relay_info lists what the target relay offers; `
+    + 'default: the same provider as this session). '
+    + `send to a Claude session: one of ${sendProviders.join(', ')} (the subscription or the API key) switches its billing from the next turn, `
+    + 'together with this message; the other billing must be set up there. Omit it to keep the session\'s billing.';
+}
 
 export const REMOTE_RELAY_RESULT_STATUSES = Object.freeze([
   'queued',
@@ -460,10 +471,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     },
     provider: {
       type: 'string',
-      enum: [...REMOTE_RELAY_PROVIDERS],
-      description: 'create_session: provider (default: the same provider as this session). '
-        + 'send to a Claude session: "claude" (the subscription) or "claude-api" (the API key) switches its billing from the next turn, '
-        + 'together with this message; the other billing must be set up there. Omit it to keep the session\'s billing.',
+      description: remoteRelayProviderDescription(),
     },
     model: {
       type: 'string',
@@ -759,6 +767,10 @@ export function normalizeRemoteRelayRepo(value) {
  * does not know the setting) wait_seconds is clamped to the ceiling only.
  * `waitLimitedFrom` is set on the result when the relay's setting cut the wait.
  *
+ * `providers` / `sendProviders` are the relay's own lists. Without them (an
+ * adapter in a worker, which may be older than the relay) `provider` is
+ * checked for its shape only; the relay passes them and refuses an unknown one.
+ *
  * An argument the action does not take is never dropped in silence:
  * create_session and update_session refuse it (nothing is created or
  * changed), every other action lists it in `ignored` on the result, which the
@@ -777,7 +789,7 @@ export function validateRemoteRelayToolInput(input = {}, options = {}) {
   return notTaken.length ? { ...result, ignored: notTaken } : result;
 }
 
-function validateToolInput(input, { maxWaitSeconds, now } = {}) {
+function validateToolInput(input, { maxWaitSeconds, now, providers, sendProviders } = {}) {
   const action = toText(input?.action).toLowerCase();
   if (!REMOTE_RELAY_ACTIONS.includes(action)) {
     return invalid(`action must be one of: ${REMOTE_RELAY_ACTIONS.join(', ')}`);
@@ -821,6 +833,16 @@ function validateToolInput(input, { maxWaitSeconds, now } = {}) {
     if (!value) return { ok: true };
     if (!allowed.includes(value)) return invalid(`${key} must be one of: ${allowed.join(', ')}`);
     args[key] = value;
+    return { ok: true };
+  };
+  const optionalProvider = (allowed, refusal) => {
+    const value = toText(input?.provider).toLowerCase();
+    if (!value) return { ok: true };
+    if (!REMOTE_RELAY_PROVIDER_ID_PATTERN.test(value)) {
+      return invalid('provider must be a provider id such as claude or openai (letters, digits and dashes, at most 32 characters)');
+    }
+    if (Array.isArray(allowed) && !allowed.includes(value)) return invalid(refusal(value, allowed.join(', ')));
+    args.provider = value;
     return { ok: true };
   };
   const optionalText = (key, max = 500) => {
@@ -883,12 +905,12 @@ function validateToolInput(input, { maxWaitSeconds, now } = {}) {
       const busyCheck = optionalEnum('if_busy', REMOTE_RELAY_IF_BUSY);
       if (!busyCheck.ok) return busyCheck;
       args.if_busy = args.if_busy || 'queue';
-      const providerCheck = optionalEnum('provider', REMOTE_RELAY_SEND_PROVIDERS);
-      if (!providerCheck.ok) {
-        return invalid('send takes provider "claude" (the subscription) or "claude-api" (the API key), for a Claude session only');
-      }
+      const providerCheck = optionalProvider(sendProviders, (value, list) =>
+        `provider "${value}" can't be used with send; send takes one of: ${list} (the Claude session's subscription or API key)`);
+      if (!providerCheck.ok) return providerCheck;
     } else {
-      const providerCheck = optionalEnum('provider', REMOTE_RELAY_PROVIDERS);
+      const providerCheck = optionalProvider(providers, (value, list) =>
+        `provider "${value}" is not a provider here; this relay offers: ${list}`);
       if (!providerCheck.ok) return providerCheck;
       optionalText('cwd', 1000);
       optionalText('title', 200);

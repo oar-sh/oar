@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import { RELAY_RESTART_EXIT_CODE, RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
+import { relayRuntimeNodeFlags, relayRuntimeNodeFlagsOrNone } from './relay-heap-guard.mjs';
 
 // Role selection travels on argv, never in the environment. The runtime's env is
 // inherited by tmux worker sessions and by the Copilot CLI it launches, and the
@@ -34,8 +35,11 @@ export function spawnRelayRuntime({
   detached = false,
   windowsHide = true,
   logger = console,
+  // The heap limit and heap snapshot flags (relay-heap-guard.mjs).
+  nodeFlags = relayRuntimeNodeFlags,
 } = {}) {
-  const child = spawnImpl(process.execPath, [...execArgv, scriptPath, RELAY_RUNTIME_FLAG, ...args], {
+  const { flags } = relayRuntimeNodeFlagsOrNone(nodeFlags, { env, execArgv, serverDir: path.dirname(String(scriptPath || '')), logger });
+  const child = spawnImpl(process.execPath, [...flags, ...execArgv, scriptPath, RELAY_RUNTIME_FLAG, ...args], {
     cwd,
     env,
     detached,
@@ -84,8 +88,14 @@ export async function runDirectRelaySupervisor({
   exitImpl = (code) => process.exit(code),
   logger = console,
   installSignalHandlers = true,
+  signals = process,
+  nodeFlags = relayRuntimeNodeFlags,
   restartDelayMs = 500,
   maxCrashRestarts = 3,
+  // A runtime that ran this long before it crashed starts the count afresh:
+  // crashes days apart are not a crash loop.
+  crashCountResetMs = 10 * 60 * 1000,
+  now = Date.now,
 } = {}) {
   let runtimeProc = null;
   let shuttingDown = false;
@@ -102,13 +112,20 @@ export async function runDirectRelaySupervisor({
   const handleSigTerm = () => requestShutdown('SIGTERM', 0);
 
   if (installSignalHandlers) {
-    process.on('SIGINT', handleSigInt);
-    process.on('SIGTERM', handleSigTerm);
+    signals.on('SIGINT', handleSigInt);
+    signals.on('SIGTERM', handleSigTerm);
   }
 
   try {
     let crashCount = 0;
     while (true) {
+      // A Ctrl-C reaches the runtime (same process group) before this
+      // supervisor's handler can run: the runtime's signal exit looks like a
+      // crash, and the shutdown arrives during the delay. Never relaunch then.
+      if (shuttingDown) {
+        return await exitImpl(shutdownExitCode);
+      }
+      const startedAt = now();
       runtimeProc = spawnRelayRuntime({
         env,
         cwd,
@@ -119,6 +136,7 @@ export async function runDirectRelaySupervisor({
         stdio,
         detached: false,
         logger,
+        nodeFlags,
       });
       if (runtimeProc.stdout?.on) {
         runtimeProc.stdout.on('data', (chunk) => process.stdout.write(chunk));
@@ -139,7 +157,13 @@ export async function runDirectRelaySupervisor({
         return await exitImpl(1);
       }
 
-      const exitCode = Number.isInteger(Number(result.code)) ? Number(result.code) : null;
+      // A runtime killed by a signal (an out-of-memory abort is SIGABRT, the
+      // kernel's OOM killer SIGKILL) exits with code null: a crash. Number(null)
+      // is 0, which once ended the supervisor as if the runtime stopped cleanly.
+      const exitCode = result.code !== null && result.code !== undefined && Number.isInteger(Number(result.code))
+        ? Number(result.code)
+        : null;
+      const signal = exitCode === null ? (result.signal || null) : null;
       if (exitCode === RELAY_RESTART_EXIT_CODE) {
         logger?.log?.(`[relay] runtime requested restart; relaunching ${path.basename(String(scriptPath || ''))}...`);
         crashCount = 0;
@@ -156,8 +180,10 @@ export async function runDirectRelaySupervisor({
         return await exitImpl(RELAY_STOP_EXIT_CODE);
       }
 
+      if (now() - startedAt >= crashCountResetMs) crashCount = 0;
       const attempt = crashCount + 1;
-      logger?.error?.(`[relay] runtime crashed with exit code ${exitCode ?? 'null'} (crash ${attempt}/${maxCrashRestarts}).`);
+      const how = signal ? `signal ${signal}` : `exit code ${exitCode ?? 'null'}`;
+      logger?.error?.(`[relay] runtime crashed with ${how} (crash ${attempt}/${maxCrashRestarts}).`);
       if (attempt >= maxCrashRestarts) {
         logger?.error?.('[relay] crash limit reached; supervisor stopping.');
         return await exitImpl(1);
@@ -168,8 +194,8 @@ export async function runDirectRelaySupervisor({
 
   } finally {
     if (installSignalHandlers) {
-      process.off('SIGINT', handleSigInt);
-      process.off('SIGTERM', handleSigTerm);
+      signals.off('SIGINT', handleSigInt);
+      signals.off('SIGTERM', handleSigTerm);
     }
   }
 }

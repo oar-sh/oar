@@ -1,12 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 
 import { createManagedServerLifecycle } from "./managed-server.mjs";
 
 // Starts the managed relay against fakes: the first status probe finds no
 // relay, the next one finds it ready. Returns the environment it was given.
-async function startWith({ relayEnv, processEnv = {} }) {
+async function startWith(options) {
+  return (await spawnWith(options)).options.env;
+}
+
+// The same, returning the spawn: its command, args and options.
+async function spawnWith({ relayEnv, processEnv = {}, fs = { mkdirSync() {}, openSync: () => 99, closeSync() {}, statSync: () => ({ size: 0 }) } }) {
   const saved = {};
   for (const [key, value] of Object.entries(processEnv)) {
     saved[key] = process.env[key];
@@ -22,7 +28,7 @@ async function startWith({ relayEnv, processEnv = {} }) {
         return { ok: true };
       },
       dbg: () => {},
-      fs: { mkdirSync() {}, openSync: () => 99, closeSync() {}, statSync: () => ({ size: 0 }) },
+      fs,
       spawn: (command, args, options) => {
         const child = Object.assign(new EventEmitter(), { exitCode: null, pid: 4242 });
         spawned.push({ command, args, options });
@@ -41,7 +47,7 @@ async function startWith({ relayEnv, processEnv = {} }) {
     });
     assert.equal(await lifecycle.ensureManagedServer(), true);
     assert.equal(spawned.length, 1);
-    return spawned[0].options.env;
+    return spawned[0];
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
@@ -105,6 +111,21 @@ test("a managed relay that stops on purpose (exit 78) is not retried; a crash is
     assert.ok(!logs.some((line) => line.includes("restart scheduled")) || retried, `exit ${code}: nothing scheduled`);
     await lifecycle.stopManagedServer();
   }
+});
+
+test("the managed relay's runtime gets the heap limit and a snapshot in the data dir's diagnostics", async () => {
+  const made = [];
+  const { args } = await spawnWith({
+    relayEnv: PINS,
+    processEnv: { COPILOT_WEB_RELAY_CONFIG: "", COPILOT_WEB_RELAY_DATA_DIR: "", COPILOT_WEB_RELAY_LOG_DIR: "", COPILOT_WEB_RELAY_ROOT: "", NODE_OPTIONS: "" },
+    fs: { mkdirSync(dir, options) { made.push({ dir, options }); }, openSync: () => 99, closeSync() {}, statSync: () => ({ size: 0 }) },
+  });
+  const diagnostics = path.join(path.resolve(PINS.COPILOT_WEB_RELAY_DATA_DIR), "diagnostics");
+  const serverAt = args.indexOf("server.js");
+  assert.equal(serverAt, 3, args.join(" "));
+  assert.match(args[0], /^--max-old-space-size=\d+$/);
+  assert.deepEqual(args.slice(1, 3), ["--heapsnapshot-near-heap-limit=1", `--diagnostic-dir=${diagnostics}`]);
+  assert.deepEqual(made.at(-1), { dir: diagnostics, options: { recursive: true, mode: 0o700 } });
 });
 
 test("a checkout's managed relay is started without pins", async () => {

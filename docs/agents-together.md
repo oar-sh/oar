@@ -49,7 +49,9 @@ relay, **Agents may** limits it to *read only*, *read and prompt* (existing sess
 (also create sessions, change their settings, answer questions, stop turns, archive). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
-session it works in, as far as the other relay offers it. A `send` that names no model or effort
+session it works in, as far as the other relay offers it. The providers to choose from are the
+other relay's, as `relay_info` lists them; an unknown one is refused with that list. A session
+started before a relay update can use the providers the update added, without a restart. A `send` that names no model or effort
 keeps the ones the session there uses. A model in `create_session` or `send` that the provider
 does not list there (the list New Chat offers) is refused before anything is created or sent,
 with the close matches ("Unknown model 'gpt-5-4' for Copilot on relay …; did you mean 'gpt-5.4'?"); for

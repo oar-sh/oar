@@ -501,15 +501,34 @@ export function parseGrokSettingsUpdateRequest(body = {}) {
   };
 }
 
+/**
+ * The lower-cased ids Copilot itself lists in `modelState`: those an earlier
+ * provider layer did not add. A layer tags every id it adds, so an id with
+ * tags but none of them Copilot's is another provider's ("claude-opus-5-5"
+ * from the Claude layer), not one Copilot serves too.
+ */
+function copilotListedModelIds(modelState = {}) {
+  const providersByModel = modelState?.providersByModel && typeof modelState.providersByModel === 'object'
+    ? modelState.providersByModel
+    : {};
+  return new Set(
+    (Array.isArray(modelState?.models) ? modelState.models : [])
+      .filter((value) => {
+        const id = String(value || '').trim();
+        const providers = providersByModel[id] || providersByModel[id.toLowerCase()];
+        return !Array.isArray(providers) || providers.length === 0
+          || providers.some((provider) => String(provider || '').trim().toLowerCase() === 'github-copilot');
+      })
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value && value.toLowerCase() !== 'auto'),
+  );
+}
+
 export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
   const configured = claudeSettings?.enabled === true;
   const model = String(claudeSettings?.model || '').trim();
   if (!configured || !model) return { ...modelState };
-  const baseModels = new Set(
-    (Array.isArray(modelState?.models) ? modelState.models : [])
-      .map((value) => String(value || '').trim().toLowerCase())
-      .filter((value) => value && value.toLowerCase() !== 'auto'),
-  );
+  const baseModels = copilotListedModelIds(modelState);
   const claudeModels = Array.isArray(claudeSettings?.models)
     ? claudeSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
@@ -605,11 +624,7 @@ export function buildModelCatalogWithOpenAIProvider(modelState = {}, openAISetti
   const configured = openAISettings?.enabled === true;
   const model = String(openAISettings?.model || '').trim();
   if (!configured || !model) return { ...modelState };
-  const baseModels = new Set(
-    (Array.isArray(modelState?.models) ? modelState.models : [])
-      .map((value) => String(value || '').trim().toLowerCase())
-      .filter((value) => value && value.toLowerCase() !== 'auto'),
-  );
+  const baseModels = copilotListedModelIds(modelState);
   const openAIModels = Array.isArray(openAISettings?.models)
     ? openAISettings.models.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
@@ -659,11 +674,7 @@ export function buildModelCatalogWithCursorProvider(modelState = {}, cursorSetti
   const configured = cursorSettings?.enabled === true;
   const model = String(cursorSettings?.model || '').trim();
   if (!configured || !model) return { ...modelState };
-  const baseModels = new Set(
-    (Array.isArray(modelState?.models) ? modelState.models : [])
-      .map((value) => String(value || '').trim().toLowerCase())
-      .filter((value) => value && value.toLowerCase() !== 'auto'),
-  );
+  const baseModels = copilotListedModelIds(modelState);
   const cursorModelList = Array.isArray(cursorSettings?.models)
     ? cursorSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
@@ -748,11 +759,7 @@ export function buildModelCatalogWithGrokProvider(modelState = {}, grokSettings 
   const configured = grokSettings?.enabled === true;
   const model = String(grokSettings?.model || '').trim();
   if (!configured || !model) return { ...modelState };
-  const baseModels = new Set(
-    (Array.isArray(modelState?.models) ? modelState.models : [])
-      .map((value) => String(value || '').trim().toLowerCase())
-      .filter((value) => value && value.toLowerCase() !== 'auto'),
-  );
+  const baseModels = copilotListedModelIds(modelState);
   const grokModelList = Array.isArray(grokSettings?.models)
     ? grokSettings.models.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
@@ -6600,6 +6607,7 @@ export function registerSessionsRoutes(app, deps) {
     // lookup below knows exact base ids only and would fall back too.
     let copilotBoundModel = '';
     let copilotVariantEffort = '';
+    let copilotRefusal = null;
     if (
       remoteRequest.remote
       && !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider && !useGrokProvider
@@ -6625,20 +6633,23 @@ export function registerSessionsRoutes(app, deps) {
         effortsFor: (base) => reasoningByModel[base] || reasoningByModel[String(base).toLowerCase()] || null,
       });
       // Another provider's model is answered by the checks below ("requires
-      // the Claude provider"), not as an unknown one.
+      // the Claude provider"), not as an unknown one. One that several other
+      // providers list ("claude-opus-5-5": Claude and Cursor) passes those
+      // checks and is refused as unknown after them.
       const otherProviders = mergedModels.some((modelId) => String(modelId || '').trim().toLowerCase() === requestedBootstrapModel.toLowerCase());
       if (copilotCheck.status === 'known' && copilotCheck.model && !isAutoModelId(copilotCheck.model)) {
         copilotBoundModel = copilotCheck.base || copilotCheck.model;
         copilotVariantEffort = copilotCheck.effort || '';
       }
-      if (copilotCheck.status === 'unknown' && !otherProviders) {
-        return res.status(400).json({
+      if (copilotCheck.status === 'unknown') {
+        copilotRefusal = {
           ok: false,
           error: unknownProviderModelText({ model: copilotCheck.model, provider: 'github', suggestions: copilotCheck.suggestions, models: copilotCheck.models }),
           code: 'COPILOT_MODEL_UNAVAILABLE',
           supportedModels: copilotCheck.models,
           ...(copilotCheck.suggestions.length ? { suggestedModels: copilotCheck.suggestions } : {}),
-        });
+        };
+        if (!otherProviders) return res.status(400).json(copilotRefusal);
       }
     }
     if (useOpenAIProvider && openAISettings?.configured !== true) {
@@ -6798,6 +6809,9 @@ export function registerSessionsRoutes(app, deps) {
         });
       }
     }
+    // No single other provider claims it: a Copilot session with a model
+    // Copilot does not list would be refused at its first send.
+    if (copilotRefusal) return res.status(400).json(copilotRefusal);
 
     const bootstrapProviderType = useClaudeCloudProvider
       ? 'claude-cloud'

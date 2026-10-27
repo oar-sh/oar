@@ -11,7 +11,6 @@ import {
   REMOTE_RELAY_ACTIONS,
   REMOTE_RELAY_IF_BUSY,
   REMOTE_RELAY_MODES,
-  REMOTE_RELAY_PROVIDERS,
   REMOTE_RELAY_SESSION_SCOPES,
   REMOTE_RELAY_THINKING_DISPLAYS,
 } from '../../shared/remote-relay-contract.mjs';
@@ -61,7 +60,8 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   before: text('before'),
   include_activity: z.boolean().optional().describe(FIELDS.include_activity.description),
   max_chars: number('max_chars'),
-  provider: choice('provider', REMOTE_RELAY_PROVIDERS),
+  // Free text: the worker outlives relay updates, the relay checks the id.
+  provider: text('provider'),
   model: text('model'),
   cwd: text('cwd'),
   repo: text('repo'),

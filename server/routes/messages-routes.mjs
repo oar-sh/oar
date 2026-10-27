@@ -56,7 +56,11 @@ import { readBefore, readTail, shapeSnapshot, taskOutputSource } from '../servic
 import { taskKindOf } from '../services/session-activity-tracker.mjs';
 import { ANSWERED_ELSEWHERE_KIND, STEER_FOLDED_TEXT } from '../../shared/steer-settle-markers.mjs';
 import { isLiveResend } from '../services/steer-resend.mjs';
-import { resolveProviderModelSelection } from '../services/provider-model-selection.mjs';
+import {
+  checkRequestedProviderModel,
+  resolveProviderModelSelection,
+  unknownProviderModelText,
+} from '../services/provider-model-selection.mjs';
 import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
 import {
@@ -5019,6 +5023,13 @@ export function registerMessagesRoutes(app, deps) {
         code: 'OPENAI_MODEL_REQUIRES_NEW_CONVERSATION',
       });
     }
+    // A Copilot conversation is bound too, for the model-id guards below only:
+    // Copilot resells Claude and GPT models under ids of its own
+    // ("claude-opus-5.5"), so a Claude-form id another provider lists
+    // ("claude-opus-5-5") is a model Copilot lacks, answered by the Copilot
+    // check further down, never a switch to Cursor, Grok or DeepSeek. (It is
+    // not in runtimeBoundToExplicitProvider: that one also picks the catalog.)
+    const runtimeBoundForModelGuards = runtimeBoundToExplicitProvider || runtimeProviderType === 'github';
     // Cursor conversations are bootstrap-created only, so an existing
     // github/openai/claude conversation cannot cross to the Cursor provider
     // mid-conversation. Cursor settings are read lazily so the hot path stays
@@ -5028,7 +5039,7 @@ export function registerMessagesRoutes(app, deps) {
       let requestTargetsCursor = requestedProviderType === 'cursor';
       if (
         !requestTargetsCursor
-        && !runtimeBoundToExplicitProvider
+        && !runtimeBoundForModelGuards
         && requestedOpenAIModel
         && !requestedModelAvailableInGitHub
       ) {
@@ -5053,7 +5064,7 @@ export function registerMessagesRoutes(app, deps) {
       let requestTargetsGrok = requestedProviderType === 'grok';
       if (
         !requestTargetsGrok
-        && !runtimeBoundToExplicitProvider
+        && !runtimeBoundForModelGuards
         && requestedOpenAIModel
         && !requestedModelAvailableInGitHub
       ) {
@@ -5079,7 +5090,7 @@ export function registerMessagesRoutes(app, deps) {
       let requestTargetsDeepSeek = requestedProviderType === 'deepseek';
       if (
         !requestTargetsDeepSeek
-        && !runtimeBoundToExplicitProvider
+        && !runtimeBoundForModelGuards
         && requestedOpenAIModel
         && !requestedModelAvailableInGitHub
       ) {
@@ -5397,6 +5408,24 @@ export function registerMessagesRoutes(app, deps) {
                     error: deepseekModel ? null : 'DeepSeek model is not configured',
                   }
                 : githubModelResolution)))));
+    // A model Copilot does not list is named with its close matches, as the
+    // bootstrap names it: "claude-opus-5-5" (the Claude form) gets "did you
+    // mean 'claude-opus-5.5'?". Refused before anything is stored.
+    if (!modelResolution.ok && modelResolution === githubModelResolution && explicitModelGiven) {
+      const copilotCheck = checkRequestedProviderModel({
+        requestedModel: requestedOpenAIModel,
+        provider: 'github',
+        models: Array.isArray(githubModelResolution.available) ? githubModelResolution.available : [],
+      });
+      if (copilotCheck.status === 'unknown') {
+        return res.status(400).json({
+          error: unknownProviderModelText({ model: copilotCheck.model, provider: 'github', suggestions: copilotCheck.suggestions, models: copilotCheck.models }),
+          code: 'COPILOT_MODEL_UNAVAILABLE',
+          supportedModels: copilotCheck.models,
+          ...(copilotCheck.suggestions.length ? { suggestedModels: copilotCheck.suggestions } : {}),
+        });
+      }
+    }
     if (!modelResolution.ok) return res.status(400).json({ error: modelResolution.error, supportedModels: modelResolution.available || [] });
     const requestedModel = String(modelResolution.model || '').trim();
     const requestedAutoModel = requestedModel.toLowerCase() === AUTO_MODEL_SENTINEL;

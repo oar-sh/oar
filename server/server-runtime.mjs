@@ -141,6 +141,7 @@ import { createClaudeSessionRootResolver } from './services/claude-session-root-
 import { createCursorSessionRootResolver } from './services/cursor-session-root-service.mjs';
 import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
+import { startRelayMemoryLog } from './relay-heap-guard.mjs';
 import { adoptEarlierDatabase, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
 import { ensureDataDirs, resolveDataDir, resolveUploadDir, resolveUploadReadDirs, uploadPathInDirs } from './services/data-dir-resolution.mjs';
 import { mergeStrayMigratedUploads } from './services/oar-state-migration-service.mjs';
@@ -1949,6 +1950,8 @@ const runtimeTimers = {
   sharedViewerPrune: null,
   restoredTaskSettle: null,
   claudeApiCapClock: null,
+  memoryLog: null,
+  memoryWatch: null,
 };
 
 function normalizeRemotePath(value) {
@@ -7856,6 +7859,13 @@ runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
 runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
 if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
+// Memory in the status log: now, every 10 minutes, and once per crossing of
+// 80 % of the heap limit (relay-heap-guard.mjs).
+{
+  const memoryTimers = startRelayMemoryLog({ logger: console });
+  runtimeTimers.memoryLog = memoryTimers.log;
+  runtimeTimers.memoryWatch = memoryTimers.check;
+}
 const sweptUploads = sweepUnreferencedUploadBlobs();
 if (sweptUploads > 0) {
   console.log(`${runtimeLogPrefix()}Reclaimed ${sweptUploads} unreferenced upload(s)`);

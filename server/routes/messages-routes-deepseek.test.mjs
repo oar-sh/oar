@@ -95,19 +95,25 @@ function deepseekDeps(db, overrides = {}) {
   });
 }
 
-test('a DeepSeek model on an existing github conversation requires a new DeepSeek conversation', async () => {
+// A github conversation is never moved by a model id: a DeepSeek id is a model
+// Copilot lacks.
+test('a DeepSeek model on an existing github conversation is refused as unknown to Copilot', async () => {
   const db = makeDb();
   insertRuntimeSession(db, { conversationId: 'conv-gh', providerType: 'github' });
-  const { status, body } = await invokePost('/api/message', deepseekDeps(db), {
+  const copilotModels = ['gpt-5.4-mini', 'claude-opus-5.5'];
+  const { status, body } = await invokePost('/api/message', deepseekDeps(db, {
+    resolveRequestedModel: () => ({ ok: false, error: 'Unsupported model', available: [...copilotModels] }),
+  }), {
     clientId: 'client-1',
     conversationId: 'conv-gh',
     text: 'hello there',
     model: 'deepseek-flash',
     relayMode: 'default',
   });
-  assert.equal(status, 409);
-  assert.equal(body.code, 'DEEPSEEK_MODEL_REQUIRES_NEW_CONVERSATION');
-  assert.equal(body.error, 'DeepSeek model selection requires creating a new DeepSeek conversation');
+  assert.equal(status, 400);
+  assert.equal(body.code, 'COPILOT_MODEL_UNAVAILABLE');
+  assert.match(body.error, /^Unknown model 'deepseek-flash' for Copilot/);
+  assert.deepEqual(body.supportedModels, copilotModels);
 });
 
 test('an explicit deepseek providerType cannot cross into another provider\'s session', async () => {
