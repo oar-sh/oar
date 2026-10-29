@@ -39,6 +39,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { resumeRelayMode } from '../../shared/plan-only.mjs';
+import { readPlanOnly } from './conversation-preferences-service.mjs';
 
 export const RESTART_RESUME_SETTING_KEY = 'restart_resume_notes';
 export const RESTART_RESUME_KIND = 'relay-restart-resume';
@@ -91,7 +93,7 @@ export function createRestartResumeService({
   if (!db || !stmts) throw new Error('createRestartResumeService requires db and stmts');
   const listProcessing = db.prepare(`
     SELECT id, conversation_id, model, model_variant_id, reasoning_effort, context_tier, relay_mode,
-           owner_sdk_session_id, runtime_session_id
+           owner_sdk_session_id, runtime_session_id, text
     FROM queue WHERE status = 'processing'
   `);
   const statusOf = db.prepare(`SELECT status FROM queue WHERE id = ?`);
@@ -212,7 +214,8 @@ export function createRestartResumeService({
     // The model and mode the interrupted turn ran with.
     const model = text(cutRow?.model) || text(latestModel) || text(runtimeSession?.provider_model) || text(runtimeSession?.model) || null;
     const modelVariant = text(cutRow?.model_variant_id) || model;
-    const relayMode = text(cutRow?.relay_mode) || 'agent';
+    // On a plan-only session only the "Approve plan" turn goes on in agent mode.
+    const relayMode = resumeRelayMode({ relayMode: cutRow?.relay_mode, text: cutRow?.text, planOnly: readPlanOnly(conversation) });
     const owner = text(cutRow?.owner_sdk_session_id) || text(runtimeSession?.sdk_session_id) || null;
     const write = db.transaction(() => {
       stmts.insertMsg.run(

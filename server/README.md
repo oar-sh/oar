@@ -84,7 +84,10 @@ Mode summary — one entry point, role chosen by argv:
 
 - `node server/server.js` (= `npm start`): the process stays attached as a supervisor and runs
   `server-runtime.mjs` in a worker child it marks with `--relay-runtime`. Exit 75 relaunches the
-  worker; other non-zero exits are retried 3 times before the supervisor gives up.
+  worker; other non-zero exits are retried 3 times before the supervisor gives up. As the main
+  process of a systemd user service (`oar service install`), the supervisor hands exit 75 to
+  systemd instead, which restarts the whole service from the code on disk; it relaunches the
+  worker itself when that cannot be done within 30 s.
 - `node server/server.js --supervised`: runs the server in this process and exits 75 instead of
   restarting itself, leaving that to whoever spawned it. This is what the CLI extension passes.
 - `node server/relay.mjs`: the standalone Copilot relay, started by hand after the server is up.
@@ -385,7 +388,7 @@ provider, and other providers' bindings are never touched.
 
 | Relay mode  | Claude mapping                                                              |
 | ----------- | --------------------------------------------------------------------------- |
-| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board, then the tool call is **denied** so the turn ends for review instead of rolling straight into implementation — the board's choice starts the next turn in the chosen mode |
+| `plan`      | SDK `permissionMode: 'plan'`; `ExitPlanMode` publishes a **plan_ready** board, then the tool call is **denied** so the turn ends for review instead of rolling straight into implementation — the board's choice queues the next turn (see [Relay Mode Selection](#relay-mode-selection)): **Approve plan** one agent-mode turn while the saved mode stays plan, **Implement in autopilot** autopilot, **Stop here and prompt myself** agent, **Stop here** nothing |
 | `ask`       | System prompt appended to prefer `AskUserQuestion` before implementing        |
 | `agent`     | Default permission mode, unmodified preset prompt                            |
 | `autopilot` | System prompt appended to keep moving unless input is truly blocking          |
@@ -601,7 +604,8 @@ stay, and the age is the entry's `updated_at`; runs still `running` (or `pending
 never touched, nor are the lane rows. `services/subagent-record-retention.mjs` sweeps 30 s after
 start, once a day and 5 s after the setting changes, 2000 rows per transaction with the event loop
 free in between, through a partial index over the unstripped tool entries, and logs one
-`SUBAGENT RETENTION …` line. No VACUUM: SQLite reuses the freed pages.
+`SUBAGENT RETENTION …` line. No VACUUM: SQLite reuses the freed pages. (The relay's database
+backups are not VACUUM copies either: an online `backup()`, see [DEVELOPING.md](../DEVELOPING.md#the-database-file-and-its-backups).)
 
 ### Context usage
 
@@ -932,8 +936,9 @@ into `claude_api_usage_totals`. Checkpoints older than 60 days are pruned hourly
 session's newest run.
 
 `GET /api/usage` adds a Claude API card while a key is saved or the provider is on
-(`services/plan-usage-claude-api.mjs`): today and this month in relay-local days, spend and tokens
-per model, and the cap. Tokens Claude Code could not price are not $0: the card marks the estimate
+(`services/plan-usage-claude-api.mjs`): today and this month in relay-local days, spend per model,
+and the cap; its tokens are in the Tokens sections every card gets (see [Token
+usage](#token-usage-all-providers)). Tokens Claude Code could not price are not $0: the card marks the estimate
 incomplete, and the cap counts only priced spend. The cap is reached when this month's estimate is
 at or above `claude_api_monthly_cap_usd`; while a cap is set, a spend that cannot be read counts as
 reached. While it is reached, these are refused with `CLAUDE_API_CAP_REACHED`: the claim of a row on
@@ -1033,7 +1038,7 @@ Per-turn behavior:
 
 | Relay mode  | Cursor mapping                                                               |
 | ----------- | ---------------------------------------------------------------------------- |
-| `plan`      | SDK native plan mode; a plan-shaped final message publishes a **plan_ready** board |
+| `plan`      | SDK native plan mode; a plan-shaped final message publishes a **plan_ready** board, with the same buttons and follow-ups as Claude's |
 | `ask` / `autopilot` | The SDK's send options carry no per-turn instruction channel, so a `[Relay mode: …]` nudge is prepended to the user message — injected only when the mode changes, and a change away from a nudged mode sends an explicit cancellation |
 | `agent`     | Default behavior, no injection                                                |
 
@@ -1050,6 +1055,55 @@ Per-turn behavior:
   it has none in the data dir, or when its `agent.db` there changed last. The explorer's Session root resolves to it via `resolveCursorSessionRoot`.
 - Cursor turns are skipped by `fetchUsageSummary` like OpenAI and Claude turns — no Copilot usage
   line is attached.
+
+## Token usage (all providers)
+
+Every worker posts a turn's tokens to `POST /api/turn-token-usage` after the turn, beside whatever
+its provider's card gets: fresh input, output, cache writes and cache reads apart, reasoning where
+the provider reports it (stored, not shown), and the cost where one is known
+(`services/token-usage-service.mjs`, migration 0036).
+
+- `turn_token_usage`: one row per turn (`turn_id`, the queue row's id), run (`run_id`: the Claude
+  process's id, the row's attempt id, or the worker's own per-process id) and model, with
+  `conversation_id`, `provider`, `billing`, `native_session_id`, `at`, `day` and the counts. Kept with
+  the chat and deleted with it, by every hard delete (the conversation route, the startup delete
+  retry, the cache rebuild for the chats it removes). Nothing reads it yet besides `readTurn` and
+  `readConversation`, for a later display in the chat.
+- `token_usage_days`: the sums per day, provider, billing, model and source (`turns`, or `backfill`
+  for the days copied by 0036). They outlive the chats.
+- A count only rises: a later report of the same turn, run and model keeps the larger value per
+  field (a field it leaves out keeps the earlier one), and only the rise goes into the day. A field
+  stays NULL until a turn reports it.
+- The day is the relay's local date of the turn's first report: the worker's `at`, or the relay's
+  clock when that is missing or more than a day off. A later report of the same turn books into that
+  day.
+- A Claude cloud report carries the session's running totals; the turn is what they add to the
+  session's other booked turns for that model, floored at 0.
+
+What each worker reports:
+
+| Worker | Per turn | Cache split | Cost |
+| ------ | -------- | ----------- | ---- |
+| Claude, Claude API, DeepSeek | the growth of the CLI's `modelUsage` per process and session, measured like the existing bookings (`claude-turn-publisher.mjs`, `turnCounts`); a resumed process's first result counts the turn's main loop only | `cacheCreationInputTokens` and `cacheReadInputTokens` apart; the older bookings still fold writes into misses | Claude Code's `costUSD`; DeepSeek's from `shared/deepseek-pricing.mjs`, sub-agents under the model that served them |
+| Claude cloud | the session totals of the result's `modelUsage` | from `modelUsage`; the session read's cache figures stand in only when the session ran one model | `costUSD` |
+| Copilot (plan and own key) | `assistant.usage` per model, a sub-agent's model apart; a compaction's own call from `session.compaction_complete` | as reported; a field no call carried is NULL. Fresh input is the prompt count less cache reads and writes (inferred from the runtime's OpenAI-style counts; `OAR_DEBUG_TOKEN_USAGE=1` logs each call's raw counts) | none |
+| Cursor | the SDK's turn usage under the turn's model | as reported | none |
+| Grok | per model where the agent breaks it down | as reported | the agent's `costUsd` |
+
+`GET /api/usage` appends two sections per billing group to every card it answers with
+(`services/plan-usage-tokens.mjs`): `<provider>-token-usage` (today, this month, all time) and
+`<provider>-token-usage-by-model` (this month), with `-byok-<type>` after for an own key's group on
+the Copilot card. Months are calendar months in relay local time, as on the Claude API card.
+Both sections come with `open: true`. The by-model rows name models as the tab does elsewhere and
+are sorted by that name; ids with one name (a dated and an undated Claude id) are one row with
+their tokens added up (a field neither reported stays null) and the ids in the row's `title`
+(`Model ids: <id>, <id>`), which the view shows as the row's tooltip. A detail row's `title` is
+optional and set only there.
+
+Known gaps: a 0.9.19 worker posts nothing, so its turns are missing until the workers restart on
+0.9.20; a Copilot compaction that completes between turns is not counted; the backfilled days have
+cache writes inside input, and DeepSeek's are UTC days, so near a month's end up to a day of
+DeepSeek's share can land in the next month.
 
 ## Turn recovery and the max turn duration
 
@@ -1139,7 +1193,16 @@ card is marked as one only the user can answer), `error` (`turn_failed`, `usage_
 `task_failed` (background sub-agents and shell tasks: kind, status, exit code where known; a
 non-zero exit is `task_failed`), `stalled` (no activity for `stalled_minutes`, default 15, while a
 turn or task runs and no question waits for an answer), `all_idle`
-(nothing runs in the watched set any more). `task_started` only when named in `events`.
+(nothing runs in the watched set any more), `board_settled` (a plan card was settled, with any
+button, "Stop here" included; not urgent; detail `boardId`, `boardType`, `action`, `actionLabel`,
+`title`, `queuedMessageId`, null for `exit_only`). `task_started` only when named in `events`.
+The `board_settled` line has exactly this form, which watchers match on:
+
+```
+[relay event] session "<session title>" (<session id>): board_settled "<card title>" → "<label>" (action <action id>, board_id <board id>, queued message <message id>)
+```
+
+For "Stop here" the parenthesis ends `…, nothing queued)`.
 `subagent_finished` is no event of its own but a narrower `task_finished` a subscription can name
 (`RELAY_EVENT_SUBSCRIBABLE_TYPES`): the end of a task that is not a shell command, delivered as a
 `task_finished` line. The default (`events` left out) is every type but `task_started` and
@@ -1149,12 +1212,15 @@ minute or so, and each was a wake-up, a model turn on the watcher's whole contex
 whose stored list is exactly the old default (every type but `task_started`, in any order) named no
 events and is read as the new default (`effectiveRelayEventTypes`, at read time, the row is never
 rewritten, so an older relay reading the same database sees what it stored); any other list,
-including the old default plus more, is the watcher's choice and stays. A subscribe that names
+including the old default plus more, is the watcher's choice and stays. The same holds for a list
+stored as the 0.9.19 default (the default before `board_settled`): it is read as the new default and
+gets `board_settled`. So does a subscribe that names exactly those seven types (`question_asked`,
+`error`, `turn_end`, `subagent_finished`, `task_failed`, `stalled`, `all_idle`). A subscribe that names
 exactly the old default list stores `subagent_finished` with it, so it is never read as the default. A mirror shows the paired
 relay's list as that relay returned it. With
 `heartbeat_minutes` a `heartbeat` event comes at that interval while the watched set has work
-running, none while it is idle. `match` (a case-insensitive regular expression) filters `turn_end`
-and task events by their text; other events pass. `once` ends a subscription after its first event,
+running, none while it is idle. `match` (a case-insensitive regular expression) filters `turn_end`,
+task events and `board_settled` (its action id, label and card title) by their text; other events pass. `once` ends a subscription after its first event,
 with `match` after the first one that matches (a heartbeat never ends it). An event is
 `{ v, relay: { id, name }, session: { id, title }, type, at, detail }`; `relay.id` is `self` for this
 relay's sessions, the paired relay's registry id for its sessions (then `replayed: true` marks one it
@@ -1535,6 +1601,68 @@ permission cards) has none and is answered with its choices.
 - Read-only inspection is allowed when it materially improves plan quality (for example `glob`, `rg`, `view`).
 - Do not edit repository files or run mutating commands unless implementation is explicitly requested.
 
+A message whose mode is on the other side of plan mode from the conversation's running turn (plan
+vs. agent, ask or autopilot) is not steered into that turn: it waits and runs as its own turn when
+the running one ends. Same-side messages steer as before. The composer then reads "Queue", with the
+title "Queued behind the running turn: plan mode and the writing modes do not steer into each other".
+
+**The plan card** ("Plan ready for review", a `plan_ready` board) offers, for every provider and in
+this order: "Approve plan" (`approve_only`), "Implement in autopilot" (`autopilot`), "Stop here and
+prompt myself" (`interactive`) and "Stop here" (`exit_only`). The Copilot CLI (extension mode) may
+bring its own list (for example "Implement with autopilot fleet", `autopilot_fleet`); "Approve plan"
+is added first to it. Cards pending from before the upgrade get "Approve plan" too. What each queues:
+
+- `approve_only` marks the plan approved and queues "Plan approved by the user. Do not implement.
+  Finish only the plan-only steps you were given, then stop." That one turn runs in agent mode
+  (plan mode blocks writes, and the plan document may need committing); the session's saved mode
+  stays plan, so the next message plans again.
+- `autopilot` queues "Please implement the approved plan now." and moves the session to autopilot;
+  `autopilot_fleet` queues "Please implement the approved plan using autopilot_fleet where useful."
+  (autopilot).
+- `interactive` queues "I approved the plan. Let's proceed interactively with implementation." and
+  moves the session to agent.
+- `exit_only` queues nothing.
+
+No follow-up carries the plan summary. A click while the plan turn still runs is not steered into
+it: the follow-up waits and runs as its own turn. Settling a card sends `board_settled` to the
+session's subscribers (see the event types above).
+
+**Plan-only sessions** (`conversations.plan_only`, migration 0035) lock a session in plan mode
+against agents. The lock is set only when asked: relay_tool `create_session` with `planOnly: true`,
+`update_session` with `planOnly: true` (with `mode: "plan"` unless the session is in plan already),
+or the owner's toggle "Plan only: agents can't take this session out of plan mode" in the Context
+usage modal, shown for every session. Plan mode alone never sets it.
+
+- While it is set, an agent's `send` or `update_session` that names a mode other than plan is
+  refused with HTTP 409, code `plan_only`: "This session is plan-only; agents can't change its mode.
+  Clear planOnly first, or ask the user." A `send` without a mode runs in the session's saved mode. An agent's PATCH of
+  the preferences route is refused too (409 for a mode change, 403 for any planOnly change): agents
+  use `update_session`.
+- `create_session` with `planOnly: true` and no mode starts in plan; with another mode named it is
+  refused before anything is created. A target relay too old for planOnly creates the session
+  without the lock, and the result says so (`planOnlyWarning`).
+- An agent clears it only with `planOnly: false` in the same `update_session` that names a mode
+  other than plan (`{planOnly: false, mode: "agent"}`). Alone, or with `mode: "plan"`, it is ignored,
+  not refused, and on a plan-only session the answer notes "planOnly unchanged: clear it in the same call as the new mode."
+  The owner's toggle clears it any time, and the owner can always change the mode in the UI; the
+  mode select shows "Plan 🔒" with a dashed accent border and a title on a plan-only session.
+- The plan card recommends "Approve plan" and asks before "Implement in autopilot", "Implement with
+  autopilot fleet" and "Stop here and prompt myself":
+  `This session is plan-only. <label> leaves plan mode. Go on?`. "Approve plan" and "Stop here"
+  never ask.
+- `list_sessions` and `read_session` show `planOnly: true`. A compaction keeps the lock and the
+  saved mode. A turn cut by a usage limit or a restart goes on in plan, except the "Approve plan"
+  turn itself.
+- The conversation's own agent counts as a plan-mode caller (its saved mode), also during the one
+  "Approve plan" agent turn: its `create_session` defaults to plan and its writes show the approval
+  card.
+
+**relay_tool `send` without a mode** leaves the target session in its own mode (before 0.9.20 it got
+the caller's mode); a mode is set only when the sender names one. `create_session` without a mode
+still takes the calling session's mode. The approval card shows a mode for a `send` only when one was
+named. A 0.9.19 relay still sends its caller's mode, so a `send` from a non-plan 0.9.19 caller to a
+plan-only session on 0.9.20 is refused.
+
 ## Conversation titles
 
 The active conversation header includes a `✍️` button for renaming the conversation inline.
@@ -1914,6 +2042,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
 | POST | `/api/claude-api-usage` | (Claude and Claude API workers) Report, after every turn, what the turn's Claude Code process ran: `{ conversationId, claudeNativeSessionId, runId, at, turnId?, firstResultOfRun?, resumedSessionId?, billing, runCounts: [{ model, hitTokens, missTokens, outputTokens, costUsd, costUnknown? }], sessionTotals: [ … ] }` → `{ ok, billing, basis, models }`. The billing is the posting worker's registered kind (the body's only without one); only `claude-api` reports book spend, a subscription report keeps the session's mark. See [Usage and the monthly cap](#usage-and-the-monthly-cap). `400` on a malformed body, `404` without a runtime session, `409` for a conversation that is not a Claude one, `501` without the usage service |
 | POST | `/api/deepseek-plan-usage` | (DeepSeek worker) Report, after a turn, the CLI's running token totals per model for its Claude Code session: `{ conversationId, sdkSessionId?, claudeNativeSessionId, runId?, at?, totals: [{ model, hitTokens, missTokens, outputTokens }], requests?: [{ model, searchRequests, fetchRequests }] }` (cache hits, cache misses, output; the web searches and fetches). `runId` names the worker's Claude Code process. A Claude model name (`claude-opus-5-5`, from a Claude Code spawned without the alias pins) is booked under the DeepSeek model that served it (`claude-opus*` → `deepseek-v4-pro`, `claude-sonnet*` / `claude-haiku*` → `deepseek-flash`), entries of one model summed. With a run id the totals are that process's own, counted from zero by the worker (the CLI's `modelUsage` is the session's running total, which a resumed CLI continues from its transcript; the worker reports what it grows by per result, and for the first result of a process resumed on its session the turn's own `usage`, so a CLI that died before writing its cost state and restored an older snapshot books nothing of the history again). The relay keeps the totals last reported per (conversation, session, model), with the run id, in `deepseek_usage_checkpoints` and books, under the checkpoint's run id, only the increase, field by field, into `deepseek_usage_totals` with the estimate in USD and CNY at DeepSeek's price for `at` (peak or off-peak; the relay's time when it is missing or more than five minutes ahead). A total below its checkpoint under the checkpoint's run id is a stale report (retried, or delivered after a later one): nothing is booked and the checkpoint keeps its high-water mark. Under another run id the report is a new process, booked in full, from which the checkpoint starts over. Known limits: a late report of an earlier process after a newer one started is booked in full, and the newer run's next report is also booked in full (the checkpoint had moved back to the earlier run, so the relay cannot tell either from a new process); the first result of a process resumed on its session reports the main loop's `usage` under the turn's model, so what sub-agents spent in that one turn is left out. Without a run id (an older worker) the totals are the CLI's session totals: the increase is booked, and a drop is a CLI counting from zero again on the same session, booked in full. A new session starts from zero. With a run id the requests are the process's running counts, booked like the tokens under a run id of their own (`request_run_id`; a repeated post adds nothing, an entry with counts only leaves the token checkpoint's run alone); without one they are the turn's counts, booked as they come. Requests are counted from the first turn and priced at $0.75 / ¥5 per 1,000 from 2026-10-31 16:00 UTC (no peak price); the same sums go into `deepseek_usage_days` per UTC day in the same transaction. A repeated report answers `200` with nothing booked. `400` on a malformed body, `404` without a runtime session, `409` for a conversation not bound to DeepSeek |
+| POST | `/api/turn-token-usage` | (every worker) Report a turn's tokens: `{ conversationId, turnId, runId?, provider?, billing?, nativeSessionId?, responseMessageId?, at?, models: [{ model, inputTokens?, outputTokens?, cacheWriteTokens?, cacheReadTokens?, reasoningTokens?, costUsd?, costSource?, costUnknown? }] }`, or `sessionTotals` in place of `models` (Claude cloud: the session's running totals; needs `nativeSessionId`). `turnId` is the queue row's id; `runId` the worker process or attempt. `inputTokens` is fresh input, without cache reads and writes. A missing, negative, non-finite or unsafely large count is unknown (NULL), and 0 means reported zero; a cost above $1e9 is unknown; at most 32 models. The relay books the turn's rise per field over what the same turn, run and model already booked (see [Token usage](#token-usage-all-providers)), so a retried or reordered report books nothing twice. The provider is the chat's: a Claude chat's posting worker's registered kind, else the chat's binding, and the body's `provider` only for a chat without a binding (a cache rebuild); a chat on the user's own OpenAI key books as `github` with billing `byok-openai`, and a Copilot chat's `billing` may name `byok-<type>`. Answers `{ ok, provider, billing, models }`. `400` on a malformed body, `404` for a conversation that does not exist or is deleted (an archived one books), `409` for a chat that keeps no token usage, `501` without the tables |
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run. A new run needs the spawning turn's `messageId`; an update to a known run may omit it (a background agent's end arrives between turns). Optional header fields: `subagentType`, `model`, `modelInherited`, `taskId`, `background`, `timelineOwner`; a post without `status` leaves the run's state alone. Emits `subagent_status` with the whole header |
 | POST | `/api/subagent-timeline` | (Worker) `{ conversationId, subagentRunId, taskId?, entries: [{ key, kind, text, done?, toolName?, toolUseId?, metadata? }], header? }` → `{ ok, stored, truncated }`. Kinds: `thought`, `tool_call`, `tool_result`, `text`, `child`, `note`. Fenced by the run row, not by an open turn; an unknown run whose `header.parentSubagentId` is known is created under the parent's turn, an unknown run whose `taskId` (or `header.taskId`) a run of the conversation carries is written to that run (a resumed agent; when the post sets that finished run `running` again, the relay adds a note where it resumed), anything else is `404 unknown_run`. `header.status: 'running'` clears the run's end time. Sends `subagent_timeline` `{ conversationId, messageId, subagentRunId, entries, truncated }`, volatile, only to the pages watching the run (`subagent_viewer_watch`) |
 | GET | `/api/conversation/:conversationId/subagent/:subagentRunId` | One run's record for the viewer: `?after=<seq>&limit=<n>` (default 500, max 2000) → `{ run, entries, children, nextAfter, complete }`. `entries` are those after `after` plus any still open; `run.legacy` marks a record rebuilt from the lane rows |
@@ -1993,7 +2122,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `waitingFor`: `[{ conversationId, title, turns }]`, the sessions with a processing turn
   - `held`: `{ count, conversations: [{ conversationId, title, count }] }`, pending and parked messages
   - `backgroundTasks`: `[{ conversationId, title, count, detail, survives, why }]`, sessions with running background work of a live worker (the task panel's sets and running sub-agent runs, through `background-work-view.mjs`), then sessions with console tasks held since the last restart (`background-task-store.mjs` `listRestored`), which no worker has confirmed yet: `survives: null`
-  - `survival`: `{ action, workersSurvive, summary }`. Workers are separate processes (tmux, detached, a console window) and outlive a restart, which the relay's supervisor or the CLI extension takes; they outlive a shutdown too, except under a systemd service (detected from `INVOCATION_ID` and a `.service` cgroup), whose stop may take the workers with it (`survives: false`, shown as "may stop"; a worker in a tmux session the service did not start survives, which the relay cannot tell). A Claude Cloud session runs at Anthropic and always survives
+  - `survival`: `{ action, workersSurvive, summary }`. Workers are separate processes (tmux, detached, a console window) and outlive a restart, which the relay's supervisor or the CLI extension takes, and a shutdown. Under a systemd user service (detected from `INVOCATION_ID` and a `.service` cgroup) a restart is handed to systemd and restarts the whole service; the relay starts its workers in scopes of their own (`systemd-run --user --scope`), so they survive that and a stop, and the summary adds that a worker on a tmux server or in a process started before 0.9.20 may stop once. Where the relay does not start them in scopes (systemd-run missing or without a bus, a system service, a relay that is not the unit's own) they may stop with the service (`survives: false`, shown as "may stop"). A Claude Cloud session runs at Anthropic and always survives
   - while queued also `holdsNewTurns`, `maxWaitMs`, `waitingSince` (start of the current period), `deadlineAt` (`null` without a limit), `question`, `keptWaiting`
 - Ownership after an intentional restart follows the argv role, so exactly one supervisor acts on exit 75:
   - `server.js --supervised` exits 75 and relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
@@ -2574,7 +2703,8 @@ column) and, among them, the functions of `server/migrations/0002-…` to `0022-
 schema itself and does nothing when its change is already there, so all of them run on every boot.
 From 0004 on a failure is logged (`migration 00NN failed; retrying on next boot`) and the boot goes
 on. Every file can also be run by hand against a database: `node server/migrations/<file>.mjs
-[path/to/copilot.db]`. `0001-add-structured-answer.mjs` (the `structured_answer` and
+[path/to/oar.db]`; without a path it takes the database in `server/data` (`oar.db`, else the name of
+installs from before 0.9.20) and never creates one (`cliDbPath`). `0001-add-structured-answer.mjs` (the `structured_answer` and
 `request_schema` columns of `relay_questions`, see [Structured Answers and Multi-Field
 Elicitation](#structured-answers-and-multi-field-elicitation)) is only such a script: the boot adds
 those columns with its own guarded `ALTER TABLE`.
@@ -2633,6 +2763,9 @@ allowed): the owner's "Agents in this conversation may start sessions" for a ses
 started, which lifts the relay_tool's one-level rule for it. Only the preferences route
 writes it, and only for the owner (a request of an agent or a paired relay is refused). Without the
 column the switch cannot be turned on and the rule holds everywhere; an older build ignores it.
+
+`0035-conversation-plan-only.mjs` adds `conversations.plan_only` (NULL or 0 = not plan-only): the
+lock of a [plan-only session](#relay-mode-selection), which agents can't take out of plan mode.
 
 `0021-conversation-group-agent-marks.mjs` adds two columns to `conversation_groups` for what an
 agent's update_session may do to a group: `agent_made` (1 for a group it made by name, which goes
@@ -2747,6 +2880,18 @@ and `model`, lower case without `[1m]`, as the key, then `hit_tokens`, `miss_tok
 the saved Claude API key ran, which the Claude API card and the monthly cap read. Subscription
 turns are never booked here. Additive and idempotent, handled like 0033. An older build ignores the
 table.
+`0036-token-usage.mjs` adds `turn_token_usage` and `token_usage_days` (see [Token
+usage](#token-usage-all-providers)) and, in the same transaction, copies the days the relay already
+has: `claude_api_usage_totals` (relay-local days) as provider `claude-api` and `deepseek_usage_days`
+(UTC days, kept as they are) as `deepseek`, both with `source = 'backfill'`, `miss_tokens` as
+`input_tokens` (cache writes included), `hit_tokens` as `cache_read_tokens`, `cache_write_tokens`
+NULL, the dollar cost (DeepSeek's token estimate, not its tools), the unpriced tokens and the turns.
+Model ids are normalised (lower case, no `[1m]`) and rows that meet are summed; DeepSeek's days keep
+no seen times, so the day's bounds stand in. Both tables existing means it ran: the copy is a
+snapshot of the first 0.9.20 boot and never runs again. A missing source table (its migration failed
+on this boot) throws, so nothing is created; the failure is logged (`[token-usage] migration 0036
+failed; retrying on next boot`) and the next boot runs it again, and the token usage service retries
+it too. An older build ignores both tables; turns that run on it are not counted.
 
 `0007-claude-cloud.mjs` adds the storage of [Claude Cloud](#claude-cloud-provider) conversations.
 It is additive and idempotent, runs on every boot, and a failure is logged and retried on the next
@@ -2789,7 +2934,11 @@ working with the corresponding feature inert rather than crashing at startup.
 | `server.js` | Main server |
 | `public/index.html` | Web chat UI |
 | `config.json` | Auth token and settings (gitignored) |
-| `data/copilot.db` | Persisted conversations, settings, and queue storage (gitignored) |
+| `data/oar.db` | Persisted conversations, settings, and queue storage (gitignored); `data/copilot.db` on installs from before 0.9.20 (`services/database-file.mjs` resolves which) |
+| `data/db-backups.json` | The database backups this relay wrote (`services/db-backup-service.mjs`): only those are ever rotated; a `.partial` of a writer that died is named there with its pid |
+| `data/db-backup-progress.json` | While a backup is written, with the writer's pid and identity: `oar start` says "backing up", `oar backup` refuses, a start waits; one a killed writer left is removed at the next start |
+| `data/db-backup-wait.json` | While a start waits for an `oar backup` of the same database (and during its own copy beside it), with the relay's pid: `oar start` leaves the relay running |
+| `backups/` | A checkout's database backups, `oar-<version>-<time>-<reason>.db` (gitignored, not packed; a global install keeps them in the state root's `backups/`) |
 | `relay-tools.md` | Markdown tool guidance loaded by the relay extension |
 | `claude-worker/` | Claude Agent SDK session worker (turn runner, ask-user bridge, attachments, SDK message normalizer) |
 | `claude-cloud-worker/` | Claude Cloud session worker (turn runner over the cloud session's event stream, event normalizer) |

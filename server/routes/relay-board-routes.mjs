@@ -1,7 +1,14 @@
 'use strict';
 
-import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { persistConversationPreferences, readPlanOnly } from '../services/conversation-preferences-service.mjs';
 import { fallbackReasoningEffort } from '../services/conversation-model-fallback.mjs';
+import {
+  PLAN_BOARD_APPROVE_ONLY,
+  isPendingPlanBoard,
+  planBoardActionLabel,
+  planBoardFollowupMode,
+  planBoardFollowupText,
+} from '../../shared/plan-board-actions.mjs';
 
 function normalizeId(value) {
   const text = String(value || '').trim();
@@ -20,34 +27,6 @@ function normalizeBoardType(value) {
   return text.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'generic';
 }
 
-function labelForAction(actionId) {
-  const id = String(actionId || '').trim().toLowerCase();
-  if (id === 'autopilot') return 'Implement in autopilot';
-  if (id === 'autopilot_fleet') return 'Implement with autopilot fleet';
-  if (id === 'interactive') return 'Stop here and prompt myself';
-  if (id === 'exit_only') return 'Stop here';
-  return id.replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase()) || 'Select';
-}
-
-function defaultPromptForAction(actionId, board = null) {
-  const summary = String(board?.body || '').trim();
-  if (actionId === 'autopilot') {
-    return `Please implement the approved plan now.\n\nPlan summary:\n${summary}`;
-  }
-  if (actionId === 'autopilot_fleet') {
-    return `Please implement the approved plan using autopilot_fleet where useful.\n\nPlan summary:\n${summary}`;
-  }
-  if (actionId === 'interactive') {
-    return `I approved the plan. Let's proceed interactively with implementation.\n\nPlan summary:\n${summary}`;
-  }
-  return '';
-}
-
-function modeForAction(actionId, fallbackMode) {
-  if (actionId === 'autopilot' || actionId === 'autopilot_fleet') return 'autopilot';
-  if (actionId === 'interactive') return 'agent';
-  return fallbackMode;
-}
 
 function normalizeBoardActions(rawActions) {
   const input = Array.isArray(rawActions) ? rawActions : [];
@@ -61,7 +40,7 @@ function normalizeBoardActions(rawActions) {
     const id = String(item.id || item.actionId || item.value || '').trim().toLowerCase();
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    const label = String(item.label || item.title || labelForAction(id)).trim().slice(0, 120) || labelForAction(id);
+    const label = String(item.label || item.title || planBoardActionLabel(id)).trim().slice(0, 120) || planBoardActionLabel(id);
     const mode = normalizeId(item.mode);
     const prompt = normalizeBoardText(item.prompt || '', '');
     normalized.push({
@@ -99,6 +78,7 @@ export function registerRelayBoardRoutes(app, deps) {
     DEFAULT_MODEL,
     formatRelayBoardRow,
     pushDispatchService,
+    relayEventService,
   } = deps;
 
   /**
@@ -201,7 +181,12 @@ export function registerRelayBoardRoutes(app, deps) {
     const boardId = uuidv4();
     const relayMode = normalizeRelayMode(mode || q.relay_mode) || DEFAULT_RELAY_MODE;
     const normalizedActions = normalizeBoardActions(actions);
-    const normalizedRecommended = normalizeId(recommendedAction);
+    // A plan-only session's plan card recommends "Approve plan", whatever the
+    // worker or the Copilot CLI recommended.
+    const boardConversationId = normalizeId(conversationId) || q.conversation_id;
+    const planOnly = normalizedBoardType === 'plan_ready'
+      && readPlanOnly(stmts.getConvAnyStatus?.get?.(boardConversationId));
+    const normalizedRecommended = planOnly ? PLAN_BOARD_APPROVE_ONLY : normalizeId(recommendedAction);
     const boardContext = parseContext(context);
 
     stmts.insertBoard.run(
@@ -240,23 +225,43 @@ export function registerRelayBoardRoutes(app, deps) {
     }
 
     const board = formatRelayBoardRow(row);
+    const conversationRow = stmts.getConvAnyStatus?.get?.(String(board?.conversationId || '').trim()) || null;
+    if (conversationRow && String(conversationRow.status || '').trim() === 'deleted') {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
     const actions = Array.isArray(board?.actions) ? board.actions : [];
-    const selected = actions.find((item) => String(item?.id || '').trim().toLowerCase() === actionId.toLowerCase());
+    const chosen = actionId.toLowerCase();
+    // "Approve plan" is taken on any pending plan card, also one stored
+    // before the button existed.
+    const selected = actions.find((item) => String(item?.id || '').trim().toLowerCase() === chosen)
+      || (chosen === PLAN_BOARD_APPROVE_ONLY && isPendingPlanBoard(board)
+        ? { id: PLAN_BOARD_APPROVE_ONLY, label: planBoardActionLabel(PLAN_BOARD_APPROVE_ONLY), mode: planBoardFollowupMode(PLAN_BOARD_APPROVE_ONLY) }
+        : null);
     if (!selected) return res.status(400).json({ error: 'Unknown board action' });
 
     const now = new Date().toISOString();
-    const shouldDismiss = actionId.toLowerCase() === 'exit_only';
-    if (shouldDismiss) {
-      stmts.dismissBoard.run(actionId, now, now, boardId);
-    } else {
-      stmts.markBoardAction.run(actionId, now, now, boardId);
+    const shouldDismiss = chosen === 'exit_only';
+    const approveOnly = chosen === PLAN_BOARD_APPROVE_ONLY;
+    // Only a pending card is settled: a second press (here or in the Inbox)
+    // finds it settled already and queues nothing.
+    const settledRow = shouldDismiss
+      ? stmts.dismissBoard.run(chosen, now, now, boardId)
+      : stmts.markBoardAction.run(chosen, now, now, boardId);
+    if (Number(settledRow?.changes) !== 1) {
+      const current = stmts.getBoard.get(boardId);
+      return res.status(409).json({ error: `Board already ${current?.status || 'settled'}`, board: formatRelayBoardRow(current) });
     }
 
     let queuedMessageId = null;
     if (!shouldDismiss) {
-      const followupPrompt = normalizeBoardText(selected.prompt || defaultPromptForAction(actionId.toLowerCase(), board), '');
+      // approve_only says exactly its line; the others may carry their own.
+      const followupPrompt = normalizeBoardText(approveOnly ? planBoardFollowupText(chosen) : (selected.prompt || planBoardFollowupText(chosen)), '');
       if (followupPrompt) {
-        const relayMode = normalizeRelayMode(selected.mode || modeForAction(actionId.toLowerCase(), board.mode)) || DEFAULT_RELAY_MODE;
+        // approve_only runs this one turn in agent mode (plan mode blocks
+        // the writes its plan-only steps need); the session stays in plan.
+        const relayMode = normalizeRelayMode(approveOnly
+          ? planBoardFollowupMode(chosen)
+          : (selected.mode || planBoardFollowupMode(chosen) || board.mode)) || DEFAULT_RELAY_MODE;
         const convId = String(board?.conversationId || '').trim();
         const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(convId) || null;
         const latestModel = stmts.getLatestConversationModel?.get?.(convId)?.model || null;
@@ -323,11 +328,21 @@ export function registerRelayBoardRoutes(app, deps) {
             timestamp: now,
           },
         });
-        followChosenMode(convId, relayMode, now);
+        if (!approveOnly) followChosenMode(convId, relayMode, now);
       }
     }
 
     const updated = formatRelayBoardRow(stmts.getBoard.get(boardId));
+    try {
+      relayEventService?.noteBoardSettled?.(String(updated?.conversationId || board?.conversationId || ''), {
+        boardId,
+        boardType: updated?.boardType || board?.boardType || null,
+        action: chosen,
+        actionLabel: String(selected.label || '').trim() || planBoardActionLabel(chosen),
+        title: updated?.title || board?.title || '',
+        queuedMessageId,
+      });
+    } catch {}
     io.emit('relay_board_updated', { board: updated });
     io.emit('relay_board_changed', { conversationId: updated?.conversationId || null, boardId });
     return res.json({

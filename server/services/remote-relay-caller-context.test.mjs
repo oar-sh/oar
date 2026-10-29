@@ -9,6 +9,7 @@ import { createMessageRepository } from '../repositories/message-repository.mjs'
 import { createRemoteRelayRepository } from '../repositories/remote-relay-repository.mjs';
 import {
   createRemoteRelayCallerContext,
+  formatApprovalSummary,
   formatRemoteRelayApprovalPrompt,
 } from './remote-relay-caller-context.mjs';
 
@@ -104,6 +105,7 @@ test('the caller context comes from the live turn, the runtime binding and the c
     model: 'claude-sonnet-5[1m]',
     effort: '',
     mode: 'plan',
+    planOnly: false,
     processingRowId: 'q-1',
     attemptId: 'attempt-q-1',
     userMessageId: 'q-1',
@@ -111,6 +113,34 @@ test('the caller context comes from the live turn, the runtime binding and the c
     originRelayIds: [],
     origin: null,
   });
+});
+
+test('a plan-only caller\'s mode is its saved one, not its live turn\'s (the "Approve plan" agent turn)', () => {
+  const { db, context } = setup();
+  seedConversation(db, { preferredMode: 'plan' });
+  db.prepare(`UPDATE conversations SET plan_only = 1 WHERE id = 'c-1'`).run();
+  seedTurn(db, { id: 'q-1', mode: 'agent' });
+  const caller = context.getCallerContext('c-1');
+  assert.equal(caller.mode, 'plan');
+  assert.equal(caller.planOnly, true);
+  // So create_session's default and the approval card see a plan caller.
+  assert.match(formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'create_session', args: { text: 'x' }, caller }), /Mode: plan/);
+
+  const free = setup();
+  seedConversation(free.db, { preferredMode: 'plan' });
+  seedTurn(free.db, { id: 'q-1', mode: 'agent' });
+  assert.equal(free.context.getCallerContext('c-1').mode, 'agent', 'any other caller: the live turn decides');
+});
+
+test('the cards name planOnly: the settings change and a plan-only create_session', () => {
+  assert.match(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'update_session', args: { session: 'conv-remote-1', planOnly: false, mode: 'agent' }, sessionSettings: { session: 'conv-remote-1', title: 'Plan lane' } }),
+    /Mode: agent · planOnly: false/,
+  );
+  assert.match(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'create_session', args: { text: 'x', planOnly: true }, caller: { mode: 'agent' } }),
+    /Mode: plan · Plan only · Provider: /,
+  );
 });
 
 test('the effort is the live turn\'s, else the one the conversation prefers', () => {
@@ -274,7 +304,8 @@ test('approval puts an Allow / Deny card on the calling turn and resolves on All
   assert.equal(row.attempt_id, 'attempt-q-1');
   assert.equal(row.owner_worker_id, null);
   assert.deepEqual(JSON.parse(row.choices), ['Allow', 'Deny']);
-  assert.equal(row.prompt, 'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\nMode: plan\n\n“Rebuild the sidebar polish widgets”');
+  // No mode named: the target keeps its own, so the card names none.
+  assert.equal(row.prompt, 'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\n“Rebuild the sidebar polish widgets”');
   const envelope = JSON.parse(row.request);
   assert.equal(envelope.allowFreeform, false);
   assert.equal(envelope.context.header, 'Remote relay');
@@ -476,7 +507,7 @@ test('the card says how the remote turn would run: mode, provider, model and fol
   // A send that names a Claude billing says what it does to the bill.
   assert.equal(
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { session: 'conv-remote-1', text: 'Go on', provider: 'claude-api' }, caller }),
-    'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\nMode: plan · Switches billing to API key\n\n“Go on”',
+    'Allow the agent to send a prompt on relay "linux-test" (session conv-rem)?\n\nSwitches billing to API key\n\n“Go on”',
   );
   assert.match(
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'send', args: { session: 'conv-remote-1', text: 'Go on', provider: 'claude' }, caller }),
@@ -547,8 +578,14 @@ test('the card names the folder of a local session, or the default one', () => {
 
 test('the other cards of the local target say "this relay", not a relay name', () => {
   assert.equal(
-    formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'send', args: { session: 'abcdef123456', text: 'Run it' }, caller: { mode: 'ask' } }),
+    formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'send', args: { session: 'abcdef123456', text: 'Run it', mode: 'ask' }, caller: { mode: 'ask' } }),
     'Allow the agent to send a prompt on this relay (session abcdef12)?\n\nMode: ask\n\n“Run it”',
+  );
+  // A send that names no mode leaves the target's own: the card names none,
+  // whatever mode the caller runs in. A new session still takes the caller's.
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'send', args: { session: 'abcdef123456', text: 'Run it' }, caller: { mode: 'ask' } }),
+    'Allow the agent to send a prompt on this relay (session abcdef12)?\n\n“Run it”',
   );
   assert.equal(
     formatRemoteRelayApprovalPrompt({ relay: SELF, action: 'stop', args: {}, agentPrompts: 30 }),
@@ -640,4 +677,68 @@ test('the once-per-conversation local card names the group', async () => {
     'This agent wants to start sessions on this relay (claude, the default folder). Sessions it starts use this relay\'s accounts.'
       + '\n\nMode: agent · Provider: claude · Group: Docs batch (grp_docs)\n\n“Check the docs”',
   );
+});
+
+// ─── The summary another relay's Inbox shows ───────────────────────
+
+test('the approval summary names the kind, the requesting session and the reason, never the words it would send', () => {
+  const caller = { conversationId: 'c-lead-123456', title: 'Lead', provider: 'claude', mode: 'ask' };
+  const secret = 'SECRET-PROMPT-TEXT';
+  const relay = { name: 'relay-c' };
+  const cases = [
+    [{ relay, action: 'create_session', args: { text: secret, title: 'Docs pass', model: 'claude-sonnet-5', cwd: '/home/dev/app' }, caller },
+      'create_session', 'New session requested by \'Lead\': Docs pass, claude-sonnet-5'],
+    [{ relay, action: 'create_session', args: { text: secret }, caller: { conversationId: 'c-lead-123456' } },
+      'create_session', 'New session requested by \'c-lead-1\''],
+    [{ relay, action: 'send', args: { session: 'conv-1', text: secret }, caller, agentPrompts: 30 },
+      'loop_guard', 'Loop guard: 30 prompts by \'Lead\''],
+    [{ relay, action: 'send', args: { session: 'conv-1', text: secret }, caller },
+      'write', 'Send a prompt on relay "relay-c" requested by \'Lead\''],
+    [{ relay, action: 'answer_question', args: { answer: secret, choices: [secret] }, caller },
+      'write', 'Answer a question on relay "relay-c" requested by \'Lead\''],
+    [{ relay, action: 'ask', args: { question: secret, options: [secret] }, caller },
+      'write', 'Ask you a question on behalf of another session on relay "relay-c" requested by \'Lead\''],
+    [{ relay: { local: true }, action: 'schedule', args: { text: secret, title: 'Nightly' }, caller },
+      'write', 'Schedule a prompt on this relay requested by \'Lead\''],
+    [{ relay, action: 'update_session', args: { session: 'conv-77777777', model: 'claude-opus-5' }, caller, sessionSettings: { session: 'conv-77777777', title: 'Worker' } },
+      'session_settings', 'Change settings of \'Worker\' requested by \'Lead\''],
+    [{ relay, action: 'subscribe', caller, watch: { kind: 'subscribe', sessions: [{ id: 's1' }, { id: 's2' }, { id: 's3' }] } },
+      'watch', 'Watch 3 sessions requested by \'Lead\''],
+    [{ relay, action: 'subscribe', caller, watch: { kind: 'subscribe', all: true } },
+      'watch', 'Watch ALL sessions requested by \'Lead\''],
+    [{ relay, action: 'transfer_subscriptions', caller, watch: { kind: 'transfer', count: 1, from: { id: 'c-old' } } },
+      'watch', 'Take over 1 event subscription requested by \'Lead\''],
+    [{ relay: { local: true }, action: 'create_session', args: { text: secret, cwd: '/home/dev/app' }, caller, localSessions: true },
+      'local_sessions', 'Start sessions on this relay requested by \'Lead\''],
+  ];
+  for (const [input, variant, summary] of cases) {
+    const result = formatApprovalSummary(input);
+    assert.deepEqual(result, { variant, summary });
+    assert.ok(!result.summary.includes(secret), `no prompt, answer or question text: ${result.summary}`);
+    assert.ok(!result.summary.includes('/home/dev'), 'no folder');
+  }
+  const long = formatApprovalSummary({ relay, action: 'create_session', args: { title: 'T'.repeat(200), model: 'M'.repeat(200) }, caller: { title: 'L'.repeat(200) } });
+  assert.ok(long.summary.length <= 160);
+});
+
+test('the approval card carries its variant and summary in its context', async () => {
+  let harness;
+  harness = setup({
+    onSleep: () => {
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Deny' WHERE id = 'question-1'`).run();
+    },
+  });
+  const { db, context } = harness;
+  seedConversation(db);
+  seedTurn(db, { id: 'q-1' });
+  await context.requestApproval({
+    conversationId: 'c-1',
+    callerContext: context.getCallerContext('c-1'),
+    relay: RELAY,
+    action: 'create_session',
+    args: { text: 'Rebuild the sidebar polish widgets', title: 'Sidebar', model: 'claude-sonnet-5' },
+  });
+  const envelope = JSON.parse(questionRow(db, 'question-1').request);
+  assert.equal(envelope.context.variant, 'create_session');
+  assert.equal(envelope.context.summary, 'New session requested by \'report builder\': Sidebar, claude-sonnet-5');
 });

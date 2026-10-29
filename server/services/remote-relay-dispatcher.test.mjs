@@ -9,6 +9,7 @@ import {
   validateRemoteRelayToolInput,
 } from '../../shared/remote-relay-contract.mjs';
 import { executeRemoteRelayTool } from '../../shared/remote-relay-tool-core.mjs';
+import { formatTokenSplit } from './plan-usage-tokens.mjs';
 import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
 import {
   REMOTE_RELAY_INTERNAL_ERROR_CODE,
@@ -340,6 +341,7 @@ function createFakeRemote() {
             currentWorkspaceRootPath: conv.cwd,
             ...(conv.origin ? { origin: conv.origin } : {}),
             ...(conv.mayCreateSessions ? { mayCreateSessions: true } : {}),
+            ...(conv.planOnly !== undefined ? { planOnly: conv.planOnly === true } : {}),
             ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
             ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
             ...(conv.groupId ? { groupId: conv.groupId, groupRole: conv.groupRole || 'member' } : {}),
@@ -391,6 +393,7 @@ function createFakeRemote() {
             ...(conv.reportActiveTurn ? { activeTurn: conv.activeTurn } : {}),
             ...(conv.origin ? { origin: conv.origin } : {}),
             ...(conv.mayCreateSessions ? { mayCreateSessions: true } : {}),
+            ...(conv.planOnly !== undefined ? { planOnly: conv.planOnly === true } : {}),
             backgroundTasks: conv.backgroundTasks || [],
             ...(conv.sessionState ? { sessionState: conv.sessionState } : {}),
             ...(conv.sessionTasks ? { sessionTasks: conv.sessionTasks } : {}),
@@ -448,10 +451,13 @@ function createFakeRemote() {
           mode: body.relayMode,
           effort,
           origin: body.origin,
+          // A relay that predates planOnly ignores it and does not echo it.
+          ...(remote.bootstrapIgnoresPlanOnly ? {} : { planOnly: body.planOnly === true }),
         });
         return {
           ok: true,
           conversationId: id,
+          ...(remote.bootstrapIgnoresPlanOnly ? {} : { planOnly: body.planOnly === true }),
           // A relay that predates the model checks swaps an unknown Copilot id.
           selectedModel: remote.bootstrapBinds || body.model,
           selectedProviderType: body.providerType,
@@ -1027,7 +1033,9 @@ test('send queues a prompt with the header and origin, then returns the reply', 
     hops: 1,
   });
   assert.equal(post.model, 'claude-sonnet-5', 'the session keeps the model it already uses');
-  assert.equal(post.relayMode, 'autopilot', 'the caller\'s mode by default');
+  // The caller runs in autopilot; a send that names no mode leaves the
+  // target in its own (decision 5): no relayMode goes out.
+  assert.equal(Object.prototype.hasOwnProperty.call(post, 'relayMode'), false, 'no mode named, none sent');
 });
 
 test('send with wait_seconds 0 only queues; a duplicate is reported as such', async () => {
@@ -3652,6 +3660,45 @@ test('usage reports each provider plan and the usage-limit state, with nothing p
   }
 });
 
+test('usage: a tab\'s Tokens sections reach the agent whole, own-key group included, worst-case values unclipped', async () => {
+  const { run, remote } = setup();
+  const worst = formatTokenSplit({ inputTokens: 999_900_000_000, outputTokens: 999_900_000_000, cacheWriteTokens: 999_900_000_000, cacheReadTokens: 999_900_000_000 });
+  const tokenSection = (id, label) => ({
+    id,
+    label,
+    rows: [{ label: 'Today', value: worst }, { label: 'This month', value: worst }, { label: 'All time', value: 'in 1.2M · out 340k · cache w — · cache r 45.3M' }],
+    note: 'OpenAI does not report cache writes. Counting since Oct 1, 2026.',
+  });
+  const own = (id) => ({ id, label: id, rows: [{ label: 'Row', value: 'value' }] });
+  withUsageRoutes(remote, {
+    usage: {
+      providers: [{
+        provider: 'github',
+        label: 'Copilot',
+        status: 'ok',
+        meters: [],
+        // The Copilot tab's own four sections, then two Tokens groups: eight.
+        details: [
+          own('a'), own('b'), own('c'), own('d'),
+          tokenSection('github-token-usage', 'Tokens'),
+          tokenSection('github-token-usage-by-model', 'Tokens by model, this month'),
+          tokenSection('github-token-usage-byok-openai', 'Tokens — own OpenAI key'),
+          tokenSection('github-token-usage-by-model-byok-openai', 'Tokens by model, this month — own OpenAI key'),
+        ],
+      }],
+    },
+  });
+  const result = await run('usage', { relay: 'spare-test' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const [copilot] = result.body.providers;
+  assert.equal(copilot.details.length, 8);
+  const byok = copilot.details[6];
+  assert.equal(byok.label, 'Tokens — own OpenAI key');
+  assert.equal(byok.rows[0].value, worst);
+  assert.ok(worst.length < 120);
+  assert.equal(byok.rows[2].value, 'in 1.2M · out 340k · cache w — · cache r 45.3M');
+});
+
 test('usage needs read permission only, and works on this relay too', async () => {
   // spare-test is a "read" relay: enough.
   const { run, remote, local } = setupLocal({ unlocked: ['rr_spare'] });
@@ -4501,4 +4548,93 @@ test('the approval card names a billing switch only when the send makes one', as
     assert.equal(approvals.length, 1, current);
     assert.equal(approvals[0].args.provider, expected, current);
   }
+});
+
+// ─── Plan-only ─────────────────────────────────────────────────────
+
+test('create_session planOnly: no mode named starts in plan, whatever the caller runs in', async () => {
+  const { run, remote, approvals } = setup({ caller: { mode: 'agent' } });
+  const result = await run('create_session', { relay: 'linux-test', text: 'Plan the export', planOnly: true, wait_seconds: 0 });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.mode, 'plan');
+  assert.equal(result.body.planOnly, true);
+  assert.equal(result.body.planOnlyWarning, undefined);
+  const bootstrap = remote.callsTo('POST', '/api/conversation/bootstrap')[0].body;
+  assert.equal(bootstrap.planOnly, true);
+  assert.equal(bootstrap.relayMode, 'plan');
+  assert.equal(remote.callsTo('POST', '/api/message')[0].body.relayMode, 'plan');
+  assert.deepEqual(approvals, []);
+});
+
+test('create_session planOnly with another mode named is refused before anything is created', async () => {
+  const { run, remote } = setup();
+  const result = await run('create_session', { relay: 'linux-test', text: 'Plan the export', planOnly: true, mode: 'agent' });
+  assert.equal(result.status, 400);
+  assert.match(result.body.error, /planOnly keeps a session in plan mode; it cannot start in agent mode/);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  // Without planOnly the caller's mode is still the default (decision B).
+  const plain = setup({ caller: { mode: 'autopilot' } });
+  await plain.run('create_session', { relay: 'linux-test', text: 'Build it', wait_seconds: 0 });
+  assert.equal(plain.remote.callsTo('POST', '/api/conversation/bootstrap')[0].body.relayMode, 'autopilot');
+  assert.equal(plain.remote.callsTo('POST', '/api/conversation/bootstrap')[0].body.planOnly, undefined);
+});
+
+test('create_session planOnly on a relay too old for it says the lock is missing', async () => {
+  const { run, remote } = setup();
+  remote.bootstrapIgnoresPlanOnly = true;
+  const result = await run('create_session', { relay: 'linux-test', text: 'Plan the export', planOnly: true, wait_seconds: 0 });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.planOnly, false);
+  assert.match(result.body.planOnlyWarning, /WITHOUT the plan-only lock/);
+  assert.match(result.body.summary, /no plan-only lock: target too old/);
+  assert.match(result.body.note, /WITHOUT the plan-only lock/);
+});
+
+test('list_sessions and read_session show planOnly like mayCreateSessions', async () => {
+  const { run, remote } = setup();
+  withSession(remote, { planOnly: true });
+  remote.addConversation({ id: 'conv-2', title: 'free', planOnly: false });
+  const list = await run('list_sessions', { relay: 'linux-test' });
+  assert.equal(list.status, 200, JSON.stringify(list.body));
+  assert.equal(list.body.sessions.find((entry) => entry.id === 'conv-1').planOnly, true);
+  assert.equal(list.body.sessions.find((entry) => entry.id === 'conv-2').planOnly, undefined);
+  const read = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
+  assert.equal(read.body.session.planOnly, true);
+});
+
+test('a plan-only target\'s refusal of a send reads as a clear error', async () => {
+  const { run, remote } = setup();
+  withSession(remote, { planOnly: true, mode: 'plan' });
+  remote.fail('POST', '/api/message', remoteError(`${CODES.httpPrefix}409`, 'Relay "linux-test" answered HTTP 409', 409, {
+    ok: false, code: 'plan_only', error: 'This session is plan-only; agents can\'t change its mode. Clear planOnly first, or ask the user.',
+  }));
+  const result = await run('send', { relay: 'linux-test', session: 'conv-1', text: 'implement', mode: 'agent' });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, 'plan_only');
+  assert.match(result.body.error, /Session conv-1 on relay "linux-test" is plan-only: agents can't switch it to another mode/);
+  assert.match(result.body.error, /Nothing was sent\./);
+});
+
+test('a plan-only target\'s refusal of update_session reads as a clear error, before any card', async () => {
+  const { run, remote, approvals } = setup({ caller: { mode: 'plan' } });
+  withSession(remote, { planOnly: true, mode: 'plan' });
+  remote.fail('PATCH', '/api/conversation/conv-1/settings', remoteError(`${CODES.httpPrefix}409`, 'Relay "linux-test" answered HTTP 409', 409, {
+    ok: false, code: 'plan_only', error: 'This session is plan-only; agents can\'t change its mode. Clear planOnly first, or ask the user. Nothing was changed.',
+  }));
+  const result = await run('update_session', { relay: 'linux-test', session: 'conv-1', mode: 'agent' });
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, 'plan_only');
+  assert.match(result.body.error, /plan-only/);
+  assert.match(result.body.note, /planOnly: false with the mode/);
+  assert.deepEqual(approvals, [], 'refused by the dry run, no Allow card');
+  assert.equal(remote.callsTo('PATCH', '/api/conversation/conv-1/settings').length, 1, 'the dry run only');
+});
+
+test('update_session passes planOnly on as a setting', async () => {
+  const { run, remote } = setup();
+  withSession(remote);
+  await run('update_session', { relay: 'linux-test', session: 'conv-1', planOnly: false, mode: 'agent' });
+  const calls = remote.callsTo('PATCH', '/api/conversation/conv-1/settings');
+  assert.ok(calls.length >= 1);
+  assert.deepEqual(calls[0].body.settings, { mode: 'agent', planOnly: false });
 });

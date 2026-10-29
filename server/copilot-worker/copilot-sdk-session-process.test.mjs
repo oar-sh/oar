@@ -2211,6 +2211,75 @@ test('a BYOK turn posts no copilot usage', async () => {
   assert.equal(stub.bodiesFor('/api/copilot-plan-usage').length, 0);
 });
 
+test('a hosted turn books its tokens per model, under the plan', async () => {
+  const { stub, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.whenTokensPosted();
+  const [post] = stub.bodiesFor('/api/turn-token-usage');
+  assert.equal(post.conversationId, 'conv-1');
+  assert.equal(post.turnId, 'q-1');
+  assert.equal(post.provider, 'github');
+  assert.equal(post.billing, '');
+  assert.match(post.runId, /^[0-9a-f-]{36}$/);
+  // The recorded turn's calls report every field, as 0.
+  assert.deepEqual(post.models, [{
+    model: 'spike-model', inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, reasoningTokens: 0,
+  }]);
+  assert.equal('costUsd' in post.models[0], false);
+});
+
+test('a BYOK turn books its tokens under its own key, and still posts no copilot usage', async () => {
+  const { stub, runner } = setup({
+    env: {
+      COPILOT_PROVIDER_TYPE: 'openai',
+      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_MODEL: 'gpt-5.4-mini',
+    },
+  });
+  await runner.handlePendingPayload({ message: baseMessage });
+  await runner.whenTokensPosted();
+  assert.equal(stub.bodiesFor('/api/copilot-plan-usage').length, 0);
+  const [post] = stub.bodiesFor('/api/turn-token-usage');
+  assert.equal(post.billing, 'byok-openai');
+  assert.equal(post.provider, 'github');
+  assert.equal(post.turnId, 'q-1');
+});
+
+test('OAR_DEBUG_TOKEN_USAGE=1 logs the raw token counts of each model call; unset, nothing', async () => {
+  const logged = [];
+  const on = setup({ env: { OAR_DEBUG_TOKEN_USAGE: '1' }, dbg: (...parts) => logged.push(parts) });
+  await on.runner.handlePendingPayload({ message: baseMessage });
+  const lines = logged.filter((parts) => parts[0] === 'token usage');
+  assert.ok(lines.length >= 1);
+  assert.deepEqual(Object.keys(JSON.parse(lines[0][1])), ['model', 'interactionType', 'inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens']);
+  const quiet = [];
+  const off = setup({ env: {}, dbg: (...parts) => quiet.push(parts) });
+  await off.runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(quiet.some((parts) => parts[0] === 'token usage'), false);
+});
+
+test('two attempts of one row in one process are two runs: the row\'s attempt id names the run', async () => {
+  const { stub, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-1' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-2' } });
+  await runner.whenTokensPosted();
+  const posts = stub.bodiesFor('/api/turn-token-usage');
+  assert.deepEqual(posts.map((post) => [post.turnId, post.runId]), [['q-1', 'attempt-1'], ['q-1', 'attempt-2']]);
+});
+
+test('the worker names one run for its whole life; a second worker names another', async () => {
+  const first = setup({ env: {} });
+  await first.runner.handlePendingPayload({ message: baseMessage });
+  await first.runner.whenTokensPosted();
+  const second = setup({ env: {} });
+  await second.runner.handlePendingPayload({ message: baseMessage });
+  await second.runner.whenTokensPosted();
+  const [a] = first.stub.bodiesFor('/api/turn-token-usage');
+  const [b] = second.stub.bodiesFor('/api/turn-token-usage');
+  assert.equal(a.turnId, b.turnId);
+  assert.notEqual(a.runId, b.runId);
+});
+
 test('a hosted session carries no BYOK provider block', async () => {
   const { client, runner } = setup({ env: {} });
   await runner.handlePendingPayload({ message: baseMessage });

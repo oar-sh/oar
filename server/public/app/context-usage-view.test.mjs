@@ -8,6 +8,7 @@ import {
   renderAutoCompactControlHtml,
   renderAutoCompactNotesHtml,
   renderAgentSessionsControlHtml,
+  renderPlanOnlyControlHtml,
   renderThinkingControlHtml,
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
@@ -360,4 +361,12 @@ test('the owner\'s "may start sessions" switch: checked as stored, bound to its 
   assert.match(off, /Agents in this conversation may start sessions \(even though an agent started it\)/);
   assert.match(renderAgentSessionsControlHtml({ conversationId: 'conv-1', mayCreateSessions: true }), /data-conversation-id="conv-1" checked>/);
   assert.doesNotMatch(renderAgentSessionsControlHtml({ conversationId: '"><b>', mayCreateSessions: true }), /"><b>/);
+});
+
+test('the plan-only switch, for any session: checked as stored, named for its conversation', () => {
+  const off = renderPlanOnlyControlHtml({ conversationId: 'conv-1' });
+  assert.match(off, /id="ctx-plan-only" data-conversation-id="conv-1">/);
+  assert.match(off, /Plan only: agents can't take this session out of plan mode/);
+  assert.match(renderPlanOnlyControlHtml({ conversationId: 'conv-1', planOnly: true }), /data-conversation-id="conv-1" checked>/);
+  assert.match(renderPlanOnlyControlHtml({ conversationId: '"><x' }), /data-conversation-id="&quot;&gt;&lt;x"/);
 });

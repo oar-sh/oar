@@ -24,7 +24,7 @@ function startRelay(state = null) {
       fs.mkdirSync(path.join(stateRoot, "install", "data"), { recursive: true });
       fs.writeFileSync(
         path.join(stateRoot, "config.json"),
-        `${JSON.stringify({ dataDir: path.join(stateRoot, "install", "data"), localhostOnly: true }, null, 2)}\n`,
+        `${JSON.stringify({ dataDir: path.join(stateRoot, "install", "data"), localhostOnly: true, dbBackups: { dir: path.join(stateRoot, "db-backups") } }, null, 2)}\n`,
         { mode: 0o600 },
       );
       return { COPILOT_WEB_RELAY_DATA_DIR: "" };

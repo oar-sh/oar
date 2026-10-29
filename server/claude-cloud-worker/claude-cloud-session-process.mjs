@@ -18,6 +18,7 @@ import {
 } from '../claude-worker/claude-turn-publisher.mjs';
 import { summarizeToolInput } from '../claude-worker/sdk-message-normalizer.mjs';
 import {
+  cloudSessionTokenTotals,
   createClaudeCloudEventNormalizer,
   readCloudResult,
   readCloudSessionUsage,
@@ -1180,6 +1181,32 @@ export function createClaudeCloudSessionRunner({
     state.contextUsage = usage.contextUsage;
     await publisher.publishContextUsage({ message, state, model, sdkSessionId });
     await publisher.publishPlanUsage({ message, state, sdkSessionId });
+    await publishTurnTokens(message, state, usage.tokens);
+  }
+
+  // A worker process names its run once: a turn requeued onto a restarted
+  // worker is another run of it (POST /api/turn-token-usage).
+  const tokenRunId = crypto.randomUUID();
+
+  /**
+   * The session's running token totals per model (the result's
+   * `modelUsage`), under the turn: the relay books what they grew by since
+   * the session's other turns. Advisory; nothing without `modelUsage`.
+   */
+  async function publishTurnTokens(message, state, sessionTokens) {
+    const sessionTotals = cloudSessionTokenTotals(state.result?.modelUsage, sessionTokens);
+    if (!sessionTotals.length || !session.id) return;
+    await api('POST', '/api/turn-token-usage', {
+      conversationId: message.conversationId,
+      turnId: String(message.id || ''),
+      runId: tokenRunId,
+      provider: 'claude-cloud',
+      nativeSessionId: session.id,
+      at: new Date().toISOString(),
+      sessionTotals,
+    }).catch((error) => {
+      dbg('turn token publish failed', error?.message || String(error));
+    });
   }
 
   async function finishTurn(t, outcome) {

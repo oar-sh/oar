@@ -339,6 +339,25 @@ test('on Linux autostart is the systemd service; on macOS and in a checkout it i
   assert.deepEqual(await runAutostart(install.options({ argv: ['boot'] })), { code: 1, reason: 'git-checkout' });
 });
 
+test('on Linux a checkout\'s autostart is its service, --replace included', async (t) => {
+  const install = makeInstall(t);
+  fs.mkdirSync(path.join(install.packageRoot, '.git'));
+  const unitPath = path.join(install.env.HOME, '.config', 'systemd', 'user', 'oar.service');
+  fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+  fs.writeFileSync(unitPath, '[Service]\nExecStart=/usr/bin/node /srv/oar/server/server.js\n');
+  const calls = [];
+  const spawnSyncImpl = (command, args) => { calls.push([command, ...args].join(' ')); return { status: 0 }; };
+  // The config a checkout has: server/config.json.
+  fs.mkdirSync(path.join(install.packageRoot, 'server'), { recursive: true });
+  fs.writeFileSync(path.join(install.packageRoot, 'server', 'config.json'), JSON.stringify({ authToken: 't', port: 4100 }));
+  const options = (argv) => install.options({ argv, platform: 'linux', spawnSyncImpl, fetchImpl: async () => { throw new Error('ECONNREFUSED'); }, readyWaitMs: 10 });
+  assert.deepEqual(await runAutostart(options(['boot'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(unitPath, 'utf8'), '[Service]\nExecStart=/usr/bin/node /srv/oar/server/server.js\n');
+  await runAutostart(options(['boot', '--replace']));
+  assert.ok(fs.existsSync(`${unitPath}.bak`));
+  assert.match(fs.readFileSync(unitPath, 'utf8'), /^WorkingDirectory=/m);
+});
+
 test('the command line takes autostart, uninstall and setup --autostart', async () => {
   const calls = [];
   const commands = Object.fromEntries(['autostart', 'uninstall', 'setup'].map((name) => [name, async ({ argv }) => { calls.push([name, argv]); return { code: 0 }; }]));
@@ -403,7 +422,7 @@ test('uninstall stops the relay, removes the generated entries, keeps hand-made 
   const handMade = { path: path.join(install.startup, 'copilot-remote-web-relay.cmd'), generated: false, otherInstall: null };
   windowsDoubles(install, { signin: [generatedSignin(install), handMade], boot: BOOT_READY(install) });
   fs.mkdirSync(path.join(install.stateRoot, 'data'));
-  fs.writeFileSync(path.join(install.stateRoot, 'data', 'copilot.db'), 'db');
+  fs.writeFileSync(path.join(install.stateRoot, 'data', 'oar.db'), 'db');
   const relay = fakeRelay();
   const result = await runUninstall(install.options({ argv: [], fetchImpl: relay.fetch }));
   assert.deepEqual(result, { code: 0, reason: 'uninstalled' });
@@ -411,7 +430,7 @@ test('uninstall stops the relay, removes the generated entries, keeps hand-made 
   assert.deepEqual(install.calls, ['elevate:disable', 'signin:false']);
   assert.deepEqual(install.signin.listEntries(), [handMade]);
   assert.match(install.output(), /Left as it is: .*copilot-remote-web-relay\.cmd \(hand-made\)/);
-  assert.equal(fs.readFileSync(path.join(install.stateRoot, 'data', 'copilot.db'), 'utf8'), 'db', 'the data stays');
+  assert.equal(fs.readFileSync(path.join(install.stateRoot, 'data', 'oar.db'), 'utf8'), 'db', 'the data stays');
   assert.match(install.output(), new RegExp(`Your data stays in ${install.stateRoot.replace(/[\\.]/g, '\\$&')}`));
 
   assert.equal(install.spawned.length, 1);
@@ -552,21 +571,29 @@ test('uninstall --purge with yes to each deletes those too, and refuses a state 
   assert.ok(fs.existsSync(home.env.HOME));
 });
 
-test('uninstall on Linux removes the unit oar service wrote and keeps a hand-made one', async (t) => {
-  const { buildSystemdUnit } = await import('./services/oar-cli-helpers.mjs');
-  for (const handMade of [false, true]) {
+test('uninstall on Linux removes the unit oar service wrote (this version or 0.9.19) and keeps any other', async (t) => {
+  const { buildSystemdUnit, buildSystemdUnit0919 } = await import('./services/oar-cli-helpers.mjs');
+  for (const kind of ['generated', 'generated-earlier', 'hand-made', 'other-install']) {
+    const handMade = ['hand-made', 'other-install'].includes(kind);
     const install = makeInstall(t);
     const unitPath = path.join(install.env.HOME, '.config', 'systemd', 'user', 'oar.service');
     fs.mkdirSync(path.dirname(unitPath), { recursive: true });
-    const unit = buildSystemdUnit({
+    const args = {
       nodeBin: '/opt/node/bin/node',
       packageRoot: install.packageRoot,
       configPath: path.join(install.stateRoot, 'config.json'),
       dataDir: path.join(install.stateRoot, 'data'),
       logDir: path.join(install.stateRoot, 'logs'),
       pathEnv: '/usr/bin',
-    });
-    fs.writeFileSync(unitPath, handMade ? unit.replace('RestartSec=5', 'RestartSec=30') : unit);
+      systemdVersion: 257,
+    };
+    const unit = {
+      generated: () => buildSystemdUnit(args),
+      'generated-earlier': () => buildSystemdUnit0919(args),
+      'hand-made': () => buildSystemdUnit0919(args).replace('RestartSec=5', 'RestartSec=30'),
+      'other-install': () => buildSystemdUnit({ ...args, packageRoot: path.join(install.root, 'other') }),
+    }[kind]();
+    fs.writeFileSync(unitPath, unit);
     const systemctl = [];
     const result = await runUninstall(install.options({
       argv: [], platform: 'linux', spawnSyncImpl: (command, args) => { systemctl.push([command, ...args].join(' ')); return { status: 0 }; },
@@ -740,4 +767,38 @@ test('a declined prompt stops uninstall before anything else goes: the launcher 
   assert.equal(fs.readFileSync(wrapper, 'utf8'), source);
   assert.deepEqual(install.signin.listEntries(), [generatedSignin(install)]);
   assert.deepEqual(install.spawned, [], 'npm is not started');
+});
+test('uninstall --purge knows an OAR folder by either database name, oar.db or copilot.db', async (t) => {
+  // A state root without config.json, its database oar.db: still OAR's.
+  const bare = makeInstall(t);
+  windowsDoubles(bare);
+  fs.mkdirSync(path.join(bare.stateRoot, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(bare.stateRoot, 'data', 'oar.db'), 'db');
+  assert.deepEqual(await runUninstall(bare.options({ argv: ['--purge'], prompter: scripted(['delete']) })), { code: 0, reason: 'uninstalled' });
+  assert.equal(fs.existsSync(bare.stateRoot), false);
+  assert.match(bare.output(), /the database with every conversation, its backups, the uploads and the logs/, 'the prompt names the backups');
+
+  // A data folder outside holding oar.db is asked about as a data folder.
+  const install = makeInstall(t);
+  windowsDoubles(install);
+  const elsewhere = path.join(install.root, 'my-data');
+  fs.mkdirSync(elsewhere);
+  fs.writeFileSync(path.join(elsewhere, 'oar.db'), 'db');
+  fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dataDir: elsewhere }));
+  const prompter = scripted(['delete', true]);
+  await runUninstall(install.options({ argv: ['--purge'], prompter }));
+  assert.match(prompter.asked[1], /my-data \(a data folder outside the state root\)/);
+  assert.equal(fs.existsSync(elsewhere), false);
+});
+
+test('uninstall --purge names backups kept outside the state root as not deleted', async (t) => {
+  const install = makeInstall(t);
+  windowsDoubles(install);
+  const outside = path.join(install.root, 'my-backups');
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'oar-0.9.20-20261103-091500-manual.db'), 'kept');
+  fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dbBackups: { dir: outside } }));
+  await runUninstall(install.options({ argv: ['--purge'], prompter: scripted(['delete']) }));
+  assert.match(install.output(), new RegExp(`Not deleted: the database backups in ${outside.replace(/[\\.]/g, '\\$&')} \\(dbBackups\\.dir in the config\\)`));
+  assert.ok(fs.existsSync(path.join(outside, 'oar-0.9.20-20261103-091500-manual.db')));
 });

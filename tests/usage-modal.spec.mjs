@@ -182,7 +182,7 @@ test.describe("Claude API usage card", () => {
   const keyChat = `claude-api-usage-key-${Date.now()}`;
   const headers = () => ({ Authorization: `Bearer ${relay.token}` });
   const withDb = (fn) => {
-    const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+    const db = new DatabaseSync(path.join(relay.dataDir, "oar.db"));
     try {
       return fn(db);
     } finally {
@@ -326,6 +326,176 @@ test.describe("Claude API usage card", () => {
         await page.screenshot({ path: path.join(shotDir, `claude-api-card-at-cap-${viewport.name}-${theme}.png`) });
       }
     }
+    await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
+  });
+
+  // The token booking: the card's own tokens-by-model section is
+  // replaced by the Tokens sections every tab gets, cache writes apart, and
+  // the days copied at the upgrade say their input includes cache writes.
+  // A chat on the user's own OpenAI key books under the Copilot tab, as a
+  // group of its own. Counts are made up; no turn runs.
+  test("the Tokens sections: periods and models with cache writes apart, the copied days' note, an own key's group", async ({ page, request }) => {
+    const byokChat = `token-usage-byok-${Date.now()}`;
+    const today = localDayIn(CLAUDE_API_ZONE);
+    withDb((db) => {
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO token_usage_days (day, provider, billing, model, source, input_tokens, output_tokens, cache_read_tokens, cost_usd, turn_count, first_seen_at, last_seen_at, updated_at)
+        VALUES (?, 'claude-api', '', 'claude-sonnet-5-5', 'backfill', 100000, 20000, 900000, 0.75, 1, ?, ?, ?)
+      `).run(previousMonthDay(today), now, now, now);
+      db.prepare(`INSERT INTO conversations (id, title, archived, status, created_at, updated_at) VALUES (?, ?, 0, 'active', ?, ?)`).run(byokChat, "Own key chat", now, now);
+      db.prepare(`
+        INSERT INTO runtime_sessions (id, conversation_id, runtime_key, provider_type, provider_model, created_at, last_used_at)
+        VALUES (?, ?, ?, 'openai', 'gpt-5.4-mini', ?, ?)
+      `).run(`rs-${byokChat}`, byokChat, `rs-${byokChat}`, now, now);
+    });
+    const post = async (data) => {
+      const answer = await request.post(`${relay.baseUrl}/api/turn-token-usage`, { headers: headers(), data });
+      expect(answer.status(), JSON.stringify(await answer.json())).toBe(200);
+      return answer.json();
+    };
+    const booked = await post({
+      conversationId: keyChat,
+      turnId: `turn-${Date.now()}`,
+      runId: "run-1",
+      models: [{ model: "claude-sonnet-5-5", inputTokens: 1_200, outputTokens: 300, cacheWriteTokens: 4_000, cacheReadTokens: 45_000, costUsd: 0.05, costSource: "claude-code" }],
+    });
+    expect(booked.provider).toBe("claude-api");
+    const own = await post({
+      conversationId: byokChat,
+      turnId: `turn-byok-${Date.now()}`,
+      runId: "run-1",
+      models: [{ model: "gpt-5.4-mini", inputTokens: 800, outputTokens: 90, cacheReadTokens: 2_000 }],
+    });
+    expect(own).toMatchObject({ provider: "github", billing: "byok-openai" });
+
+    const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=claude-api`, { headers: headers() })).json();
+    const card = usage.providers.find((entry) => entry.provider === "claude-api");
+    const ids = card.details.map((section) => section.id);
+    expect(ids).not.toContain("claude-api-tokens-by-model");
+    expect(ids).toEqual(expect.arrayContaining(["claude-api-token-usage", "claude-api-token-usage-by-model"]));
+    const tokens = card.details.find((section) => section.id === "claude-api-token-usage");
+    expect(tokens.rows.map((row) => row.label)).toEqual(["Today", "This month", "All time"]);
+    expect(tokens.rows[0].value).toBe("in 1.2k · out 300 · cache w 4k · cache r 45k");
+    expect(tokens.rows[2].value).toBe("in 101.2k · out 20.3k · cache w 4k · cache r 945k");
+    expect(tokens.note).toMatch(/input includes cache writes\./);
+    // Named as the tab's spend rows name it, not by the raw id.
+    const byModel = card.details.find((section) => section.id === "claude-api-token-usage-by-model");
+    expect(byModel.rows.map((row) => row.label)).toEqual(["Claude Sonnet 5.5"]);
+    const copilot = usage.providers.find((entry) => entry.provider === "github");
+    const byok = copilot.details.find((section) => section.id === "github-token-usage-byok-openai");
+    expect(byok.label).toBe("Tokens — own OpenAI key");
+    expect(byok.rows[0].value).toBe("in 800 · out 90 · cache w — · cache r 2k");
+    expect(byok.note).toMatch(/OpenAI does not report cache writes\./);
+
+    await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
+    await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
+    await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
+    await page.evaluate(() => window.showUsage());
+    const panel = page.locator('[data-usage-panel="claude-api"]');
+    await expect(panel.locator('[data-section-id="claude-api-token-usage"]')).toBeVisible();
+    await expect(panel.locator('[data-section-id="claude-api-token-usage"] summary')).toHaveText("Tokens");
+    await expect(panel.locator('[data-section-id="claude-api-tokens-by-model"]')).toHaveCount(0);
+  });
+
+  // The Claude tab's Tokens sections open expanded, and a dated and an
+  // undated id of one model are one row with the ids in its title. Counts
+  // are made up; no turn runs. Frames for the rendered check: 1280 and 390
+  // px, both themes, and the merged row's tooltip.
+  test("the Claude tab's Tokens sections open expanded; ids with one name are one row, the ids in its tooltip", async ({ page, request }, testInfo) => {
+    const answer = await request.post(`${relay.baseUrl}/api/turn-token-usage`, {
+      headers: headers(),
+      data: {
+        conversationId: subscriptionChat,
+        turnId: `turn-claude-${Date.now()}`,
+        runId: "run-1",
+        models: [
+          { model: "claude-opus-5-5", inputTokens: 12_400, outputTokens: 3_100, cacheWriteTokens: 18_000, cacheReadTokens: 410_000 },
+          { model: "claude-opus-5-5-20260601", inputTokens: 2_600, outputTokens: 900, cacheWriteTokens: 2_000, cacheReadTokens: 90_000 },
+          { model: "claude-haiku-4-5", inputTokens: 800, outputTokens: 120, cacheWriteTokens: 0, cacheReadTokens: 6_000 },
+        ],
+      },
+    });
+    expect(answer.status(), JSON.stringify(await answer.json())).toBe(200);
+    const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=claude`, { headers: headers() })).json();
+    const card = usage.providers.find((entry) => entry.provider === "claude");
+    const byModel = card.details.find((section) => section.id === "claude-token-usage-by-model");
+    expect(byModel.open).toBe(true);
+    expect(card.details.find((section) => section.id === "claude-token-usage").open).toBe(true);
+    expect(byModel.rows.map((row) => [row.label, row.value, row.title || null])).toEqual([
+      ["Claude Haiku 4.5", "in 800 · out 120 · cache w 0 · cache r 6k", null],
+      ["Claude Opus 5.5", "in 15k · out 4k · cache w 20k · cache r 500k", "Model ids: claude-opus-5-5, claude-opus-5-5-20260601"],
+    ]);
+
+    await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
+    await page.waitForLoadState("networkidle");
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
+    await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
+    await page.evaluate(async (id) => { await window.openConversation(id); }, subscriptionChat);
+    await page.evaluate(() => window.showUsage());
+    const panel = page.locator('[data-usage-panel="claude"]');
+    await expect(panel).toBeVisible();
+    const tokens = panel.locator('[data-section-id="claude-token-usage"]');
+    const models = panel.locator('[data-section-id="claude-token-usage-by-model"]');
+    // Open without a click.
+    await expect(tokens).toHaveAttribute("open", "");
+    await expect(models).toHaveAttribute("open", "");
+    await expect(tokens.locator("table")).toBeVisible();
+    const merged = models.locator("tr", { hasText: "Claude Opus 5.5" });
+    await expect(merged).toHaveAttribute("title", "Model ids: claude-opus-5-5, claude-opus-5-5-20260601");
+    await expect(models.locator("tr")).toHaveCount(2);
+
+    const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim() || testInfo.outputPath();
+    // The chat header names the test relay's working folder, a path of the
+    // host running the suite: hidden in every frame (a mask would paint over
+    // the modal too).
+    await page.addStyleTag({ content: "#chat-title-cwd { visibility: hidden !important; }" });
+    const shot = (name) => page.screenshot({ path: path.join(shotDir, name) });
+    const setTheme = (theme) => page.evaluate((value) => {
+      if (value === "light") document.documentElement.setAttribute("data-theme", "light");
+      else document.documentElement.removeAttribute("data-theme");
+    }, theme);
+    for (const viewport of [{ name: "1280", width: 1280, height: 900 }, { name: "phone-390", width: 390, height: 844 }]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      for (const theme of ["dark", "light"]) {
+        await setTheme(theme);
+        const overflow = await panel.evaluate((node) => node.scrollWidth - node.clientWidth);
+        expect(overflow, `${viewport.name} ${theme}: the card is wider than its box`).toBeLessThanOrEqual(0);
+        await tokens.scrollIntoViewIfNeeded();
+        await shot(`claude-tokens-${viewport.name}-${theme}.png`);
+      }
+    }
+
+    // The tooltip: a headless screenshot never shows the browser's own, so
+    // the frame draws a stand-in from the row's title where the pointer is.
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await setTheme("dark");
+    // Back from the phone width the sidebar (a drawer there) slides back in:
+    // a frame taken during that shows it shifted and clipped. Wait until
+    // nothing moves, and nothing is scrolled sideways.
+    await page.waitForFunction(() => document.getAnimations().every((animation) => animation.playState !== "running"));
+    await page.evaluate(() => window.scrollTo(0, window.scrollY));
+    expect(await page.locator("#sidebar").evaluate((node) => Math.round(node.getBoundingClientRect().left))).toBe(0);
+    await merged.scrollIntoViewIfNeeded();
+    await merged.hover();
+    const box = await merged.locator("td").first().boundingBox();
+    await page.evaluate(({ x, y, text }) => {
+      const tip = document.createElement("div");
+      tip.id = "e2e-tooltip-stand-in";
+      tip.textContent = text;
+      Object.assign(tip.style, {
+        position: "fixed", left: `${x}px`, top: `${y}px`, zIndex: "2147483647", padding: "3px 7px",
+        background: "#f7f7f7", color: "#111", border: "1px solid #767676", font: "12px system-ui, sans-serif",
+        boxShadow: "1px 2px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap", pointerEvents: "none",
+      });
+      document.body.appendChild(tip);
+    }, { x: box.x + 24, y: box.y + box.height + 4, text: await merged.getAttribute("title") });
+    await shot("claude-tokens-merged-row-tooltip-1280-dark.png");
+    await page.evaluate(() => document.getElementById("e2e-tooltip-stand-in")?.remove());
     await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
   });
 });

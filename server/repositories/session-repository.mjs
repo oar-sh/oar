@@ -45,6 +45,10 @@ export function createSessionRepository(db) {
     const conversationsHaveMayCreateSessions = db.prepare(`PRAGMA table_info(conversations)`).all()
       .some((column) => String(column?.name || '').trim() === 'may_create_sessions');
     const conversationMayCreateSelect = conversationsHaveMayCreateSessions ? 'c.may_create_sessions' : 'NULL AS may_create_sessions';
+    // Plan-only (migration 0035), the same way.
+    const conversationsHavePlanOnly = db.prepare(`PRAGMA table_info(conversations)`).all()
+      .some((column) => String(column?.name || '').trim() === 'plan_only');
+    const conversationPlanOnlySelect = conversationsHavePlanOnly ? 'c.plan_only' : 'NULL AS plan_only';
     return {
         // conversations
         getConv:        db.prepare(`SELECT * FROM conversations WHERE id = ? AND status != 'deleted'`),
@@ -53,7 +57,8 @@ export function createSessionRepository(db) {
         listConvIdsMissingRuntimeSession: db.prepare(`SELECT c.id AS id FROM conversations c LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE rs.id IS NULL AND c.status != 'deleted'`),
         runtimeSessionsSupportProviders,
         conversationsHaveMayCreateSessions,
-        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, ${conversationCloudSelect}, ${conversationGroupSelect}, ${conversationMayCreateSelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = ?) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
+        conversationsHavePlanOnly,
+        listConvs:      db.prepare(`SELECT c.id, c.title, c.title_source, c.archived, c.compacted_into, c.compacted_from, c.sdk_session_id, c.preferred_relay_mode, c.preferred_model, c.preferred_reasoning_effort, c.configured_workspace_root_path, c.runtime_workspace_root_path, c.draft_text, c.draft_updated_at, c.draft_updated_by_client_id, c.draft_attachments, ${conversationOriginSelect}, ${conversationCloudSelect}, ${conversationGroupSelect}, ${conversationMayCreateSelect}, ${conversationPlanOnlySelect}, c.created_at, c.updated_at, rs.id AS runtime_session_id, rs.strategy AS runtime_strategy, rs.status AS runtime_status, rs.last_used_at AS runtime_last_used_at, ${runtimeProviderSelect}, COUNT(m.id) as message_count FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id LEFT JOIN runtime_sessions rs ON rs.conversation_id = c.id WHERE c.status != 'deleted' AND (? = 1 OR c.archived = ?) GROUP BY c.id ORDER BY CASE WHEN c.sdk_session_id IS NULL OR c.sdk_session_id = '' THEN 1 ELSE 0 END ASC, c.updated_at DESC`),
         insertConv:     db.prepare(`INSERT OR IGNORE INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`),
         updateConvTime: db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`),
         updateConvTitle: db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`),

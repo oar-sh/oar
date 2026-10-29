@@ -172,7 +172,7 @@ test('the card reads only the saved key\'s rows, and nothing without a saved key
 
 test('the CLI\'s import reads the files and the saved key from the database', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-deepseek-import-'));
-  const dbPath = path.join(dir, 'copilot.db');
+  const dbPath = path.join(dir, 'oar.db');
   const setup = new Database(dbPath);
   setup.exec('CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)');
   setup.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)').run('deepseek_api_key', KEY_A, 'now');

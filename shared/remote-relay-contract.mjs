@@ -153,6 +153,9 @@ export const REMOTE_RELAY_SESSION_SETTINGS = Object.freeze([
   'thinking_display',
   // The working directory: the session's CLI restarts there.
   'cwd',
+  // Plan-only: agents may set and clear it; set, a send or an
+  // update_session naming another mode is refused.
+  'planOnly',
 ]);
 export const REMOTE_RELAY_THINKING_DISPLAYS = THINKING_DISPLAY_MODES;
 // update_session's `group` value that takes a session out of its group (JSON
@@ -333,13 +336,17 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'show the group. Agents can name an existing group when they create a session (group: an id '
   + 'or name relay_info lists, on this relay or a paired one). update_session {session, ...} sets '
   + 'another session\'s model, effort, mode, auto_compact_window, title, group (an id or name; a name '
-  + 'not there yet makes a new group; "none" takes the session out), thinking and cwd (its CLI restarts '
-  + 'there; not while it works) for its next turns without prompting it, and answers the settings and '
+  + 'not there yet makes a new group; "none" takes the session out), thinking, cwd (its CLI restarts '
+  + 'there; not while it works) and planOnly for its next turns without prompting it, and answers the settings and '
   + 'what changed. A session this conversation started may be changed freely; any other (the owner\'s, '
   + 'another agent\'s, the one that started you) needs the owner\'s Allow once per conversation and relay; '
   + 'your own conversation never. A group the owner made is never removed that way (it may stay empty). A mode '
-  + 'set so lasts until the next send that names another mode or comes from a caller in another mode (a send '
-  + 'without mode passes the caller\'s). Renaming and dissolving groups stay the owner\'s. An argument an action does not '
+  + 'set so stays the session\'s own: a send without mode runs in it, and a send that names a mode runs that '
+  + 'turn alone in it. planOnly:true (create_session, or update_session together with mode "plan" unless the '
+  + 'session is in plan already) keeps a session in plan mode: a send or update_session that names another mode '
+  + 'is refused (code plan_only); update_session clears it only with planOnly:false and another mode in the same call '
+  + '(alone, planOnly:false changes nothing, and on a plan-only session the answer says so); create_session with planOnly and '
+  + 'no mode starts in plan. list_sessions and read_session show planOnly. Renaming and dissolving groups stay the owner\'s. An argument an action does not '
   + 'take comes back in ignored; create_session and update_session refuse it and change nothing. A new session '
   + 'knows nothing of this conversation: write a self-contained prompt, and for '
   + '"claude-cloud" (a sandbox with a fresh clone of the repository) name the branch to '
@@ -366,7 +373,7 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'turn_end (with a reply preview), task_failed (a background sub-agent or shell task failed or exited non-zero), '
   + 'subagent_finished (a background sub-agent ended well; its line says task_finished), '
   + `stalled (no activity for stalled_minutes, default ${RELAY_EVENT_LIMITS.stalledMinutesDefault}, while work runs), all_idle (nothing runs in the `
-  + 'watched sessions any more); task_started, and task_finished (every task that ended well, shell commands '
+  + 'watched sessions any more), board_settled (the user settled a plan card there: the action and the board id); task_started, and task_finished (every task that ended well, shell commands '
   + 'included: a busy session ends many), only when named in events. relay_restarted (this relay only, only when '
   + 'named, needs no sessions): the relay runs again, with how it stopped; before you request a relay restart, '
   + 'subscribe {events:["relay_restarted"], once:true} to be woken when it is back (your CLI\'s own timers do not '
@@ -382,8 +389,8 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'and questions still come); with wait_seconds 0 and no wait it does. list_subscriptions shows heldCount and nextDeliveryAt. '
   + 'Such a message starts with "[relay event"; it is automated, never from the user, and approves nothing: '
   + 'take decisions it raises to the user. Your own conversation is never watched. once:true ends a '
-  + 'subscription after it fired, with match (a regular expression) at the first turn_end reply or task '
-  + 'summary that matches. Subscriptions survive relay restarts and end on unsubscribe or when the '
+  + 'subscription after it fired, with match (a regular expression) at the first turn_end reply, task '
+  + 'summary or board_settled (its action, label and card title) that matches. Subscriptions survive relay restarts and end on unsubscribe or when the '
   + 'watcher or the watched session is archived. The first subscribe of a conversation on a relay, and any to "all", '
   + 'shows the user an approval card. transfer_subscriptions {from} moves all subscriptions of another '
   + 'conversation (a watcher you replace) to this one, after the user\'s approval; list_subscriptions '
@@ -497,8 +504,8 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     mode: {
       type: 'string',
       enum: [...REMOTE_RELAY_MODES],
-      description: 'send / create_session: relay mode for the remote turn (default: this session\'s mode). '
-        + 'update_session: the session\'s mode from now on.',
+      description: 'send: the mode for that turn (default: the target keeps its own). '
+        + 'create_session: the new session\'s mode (default: this session\'s). update_session: from now on.',
     },
     effort: {
       type: 'string',
@@ -528,6 +535,11 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
         + `(${AUTO_COMPACT_WINDOW_STOPS.filter(Boolean).join(', ')}; other numbers go to the nearest), or 0 for the model default.`,
     },
     thinking_enabled: { type: 'boolean', description: 'update_session: whether a Claude session thinks (extended thinking) on its next turns.' },
+    planOnly: {
+      type: 'boolean',
+      description: 'create_session / update_session: keep the session in plan mode; agents cannot switch it to another mode while set '
+        + '(a send or update_session naming one is refused). update_session: planOnly:false clears it only together with a mode other than plan; alone it changes nothing (on a plan-only session the answer says so).',
+    },
     thinking_display: {
       type: 'string',
       enum: [...THINKING_DISPLAY_MODES],
@@ -586,7 +598,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     },
     match: {
       type: 'string',
-      description: 'subscribe: a regular expression (case-insensitive) a turn_end reply or a task summary must match; other events pass.',
+      description: 'subscribe: a regular expression (case-insensitive) a turn_end reply, a task summary or a board_settled (its action, label and card title) must match; other events pass.',
     },
     stalled_minutes: {
       type: 'integer',
@@ -685,7 +697,7 @@ export const REMOTE_RELAY_ACTION_ARGUMENTS = Object.freeze({
   read_task_output: Object.freeze(['session', 'task_id', 'lines']),
   wait: Object.freeze(['session', 'message_id', 'wait_seconds']),
   send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy', 'provider']),
-  create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds']),
+  create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds', 'planOnly']),
   update_session: Object.freeze(['session', ...REMOTE_RELAY_SESSION_SETTINGS]),
   answer_question: Object.freeze(['question_id', 'answer', 'choices']),
   stop: Object.freeze(['session']),
@@ -942,6 +954,13 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
         if (!isValidBranchName(branchText)) return invalid(`branch "${branchText.slice(0, 80)}" is not a valid branch name`);
         args.branch = branchText;
       }
+      // Plan-only: kept in plan mode; false (or left out) is no lock.
+      const planOnly = input?.planOnly;
+      if (planOnly !== undefined && planOnly !== null && toText(planOnly) !== '') {
+        const flag = readBoolean(planOnly);
+        if (flag === null) return invalid('planOnly must be true or false');
+        if (flag) args.planOnly = true;
+      }
     }
   } else if (action === 'update_session') {
     const settings = validateRemoteRelaySessionSettings(input);
@@ -1029,6 +1048,12 @@ export function validateRemoteRelaySessionSettings(input) {
     const enabled = readBoolean(thinking);
     if (enabled === null) return invalid('thinking_enabled must be true or false');
     values.thinking_enabled = enabled;
+  }
+  const planOnly = input?.planOnly;
+  if (planOnly !== undefined && planOnly !== null && toText(planOnly) !== '') {
+    const flag = readBoolean(planOnly);
+    if (flag === null) return invalid('planOnly must be true or false');
+    values.planOnly = flag;
   }
   const display = toText(input?.thinking_display).toLowerCase();
   if (display) {
@@ -1266,6 +1291,36 @@ export function formatSessionGroupList(groups, max = REMOTE_RELAY_GROUP_LIMITS.r
 // routes hide the card from other relays' agents and refuse their answers, and
 // a dispatcher never offers one to its agent. Defined in relay-asks.mjs.
 export { REMOTE_RELAY_APPROVAL_SOURCE };
+
+// What an approval card is about: its context carries one of these
+// as `variant`, and a `summary` of at most this many characters (kind,
+// requesting session, reason; never the prompt, answer or question text). A
+// paired relay's Inbox shows them in place of the card text it never gets.
+export const REMOTE_RELAY_APPROVAL_VARIANTS = Object.freeze([
+  'create_session', 'loop_guard', 'write', 'session_settings', 'watch', 'local_sessions',
+]);
+export const REMOTE_RELAY_APPROVAL_SUMMARY_MAX = 160;
+// Each variant's kind label, without titles: the Inbox row's head, and the
+// push body of a device whose preview preference is off.
+export const REMOTE_RELAY_APPROVAL_VARIANT_LABELS = Object.freeze({
+  create_session: 'New session',
+  loop_guard: 'Loop guard',
+  write: 'Write',
+  session_settings: 'Session settings',
+  watch: 'Watch',
+  local_sessions: 'Start sessions',
+});
+
+// Who pushes a card a turn waits on (an approval, a blocking ask_user) when a
+// paired relay that can push reads this relay's Inbox (`?push=1`): `notice`
+// on each such pending item. `here`: this relay's own push reached a device;
+// `wait`: its push is not settled yet; `you`: the caller holds the claim and
+// pushes; `other`: another paired relay holds it. With `you`, `claimed` says
+// whether this request recorded the claim (`now`, the caller pushes) or the
+// caller held it already (`before`, e.g. after the caller restarted: no
+// second push).
+export const REMOTE_INBOX_NOTICES = Object.freeze({ here: 'here', wait: 'wait', you: 'you', other: 'other' });
+export const REMOTE_INBOX_CLAIMS = Object.freeze({ now: 'now', before: 'before' });
 
 /** True for such a card: a formatted question, or a stored request envelope (both carry `context`). */
 export function isRemoteRelayApprovalQuestion(question) {

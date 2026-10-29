@@ -191,8 +191,10 @@ function setup(state = {}) {
       gracefulTimeoutMs: 5,
       escalationTimeoutMs: 5,
       pollIntervalMs: 1,
+      ...(state.stopOverrides || {}),
     },
     sdkSessionImportService: state.sdkSessionImportService || null,
+    tokenUsageService: state.tokenUsageService ? { forgetConversation: (id) => events.push(`token-usage-forgotten:${id}`) } : null,
     claudeCloudSessionService: state.claudeCloudSessionService || null,
     resolveClaudeSessionRoot: state.resolveClaudeSessionRoot || null,
     resolveDeepSeekSessionRoot: state.resolveDeepSeekSessionRoot || null,
@@ -393,6 +395,16 @@ test('an idle worker is stopped before the conversation is deleted', async () =>
   assert.ok(events.includes('tombstone:sdk-1') && events.includes('emit:conversation_deleted:conv-1'));
 });
 
+test('a deleted conversation\'s turn tokens go with its rows; the day sums are not touched', async () => {
+  const { del, events } = setup({ runtimeSession: { provider_type: 'cursor' }, tokenUsageService: true });
+  const response = await del();
+  assert.equal(response.statusCode, 200);
+  const order = (prefix) => events.findIndex((event) => event.startsWith(prefix));
+  assert.ok(order('token-usage-forgotten:conv-1') >= 0, events.join(' | '));
+  assert.ok(order('token-usage-forgotten:conv-1') < order('sql:DELETE FROM conversations'));
+  assert.ok(!events.some((event) => event.includes('token_usage_days')));
+});
+
 test('a second delete of the same conversation waits for the first and finds it gone', async () => {
   let releaseStop;
   const stopGate = new Promise((resolve) => { releaseStop = resolve; });
@@ -428,6 +440,50 @@ test('a worker that survives the stop leaves the conversation intact', async () 
   assert.deepEqual(deletedRows(events), []);
   assert.ok(!events.some((event) => event.startsWith('tombstone:') || event.includes("status = 'deleted'")));
   assert.ok(!events.includes('emit:conversation_deleted:conv-1'));
+});
+
+// The registry still holds a worker whose process is gone (it crashed or was
+// ended outside the relay). On Windows the stop of its pid was a PowerShell
+// call of its own, which could fail or time out: the archive answered 409
+// worker-stop-failed until a later try got through. A gone process is
+// stopped already.
+test('archiving a conversation whose worker is gone archives it, with no stop call', async () => {
+  const stopCalls = [];
+  const { archive, events } = setup({
+    worker: { status: 'ready', pid: 4242 },
+    processPids: [],
+    alivePids: [],
+    stopOverrides: {
+      platform: 'win32',
+      processInspector: {
+        findWindowsProcessTreeForSessionAsync: async () => [],
+        stopWindowsPidsAsync: async (pids) => { stopCalls.push([...pids]); throw new Error('Get-CimInstance timed out'); },
+      },
+    },
+  });
+  const response = await archive();
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(response.body.ok, true);
+  assert.deepEqual(stopCalls, []);
+  assert.ok(events.includes('registry-removed:sdk-1'));
+  assert.ok(events.includes('emit:conversation_archived:conv-1'));
+});
+
+test('a worker that survives the stop is not archived, and the reason is logged', async (t) => {
+  const warnings = [];
+  t.mock.method(console, 'warn', (line) => warnings.push(String(line)));
+  const { archive, events } = setup({
+    worker: { status: 'ready', pid: 4242 },
+    processPids: [4242],
+    alivePids: [4242],
+    survivors: true,
+  });
+  const response = await archive();
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.error, 'worker-stop-failed');
+  assert.deepEqual(response.body.remainingPids, [4242]);
+  assert.ok(!events.includes('emit:conversation_archived:conv-1'));
+  assert.ok(warnings.some((line) => /^\[archive\] Not archived conv-1: its worker did not stop \(worker-stop-timeout:4242; remaining pids 4242\)\.$/.test(line)), warnings.join('\n'));
 });
 
 // A Claude API conversation is a Claude one on an API key: its CLI state is

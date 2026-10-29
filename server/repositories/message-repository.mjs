@@ -5,6 +5,33 @@ import { createMessagePinStatements } from './message-pin-statements.mjs';
 import { createConversationHistoryPageStatements } from '../services/conversation-history-page.mjs';
 import { sessionWorkerProviderSqlList } from '../../shared/provider-routing.mjs';
 
+/**
+ * The claim's plan-boundary hold, part of every findPending*
+ * statement: a pending row waits while its conversation has a live turn on
+ * the other side of plan mode, because handing it to the worker would steer
+ * it into that turn and switch what the turn may do. The conversation's later
+ * rows wait behind it whatever their mode, so one conversation keeps its
+ * order, while the claim goes on to other conversations' rows.
+ * `PLAN_BOUNDARY_HOLD_MARK` lets a test find any claim without it.
+ */
+export const PLAN_BOUNDARY_HOLD_MARK = '/* plan-boundary-hold */';
+
+export function planBoundaryHoldSql(alias) {
+  return `${PLAN_BOUNDARY_HOLD_MARK} NOT EXISTS (
+    SELECT 1
+    FROM queue held
+    JOIN queue live
+      ON live.conversation_id = held.conversation_id
+     AND live.status = 'processing'
+     AND live.id != held.id
+    WHERE held.conversation_id = ${alias}.conversation_id
+      AND held.status = 'pending'
+      AND COALESCE(held.kind, '') != 'continuation'
+      AND (held.timestamp < ${alias}.timestamp OR (held.timestamp = ${alias}.timestamp AND held.rowid <= ${alias}.rowid))
+      AND (LOWER(TRIM(COALESCE(live.relay_mode, ''))) = 'plan') != (LOWER(TRIM(COALESCE(held.relay_mode, ''))) = 'plan')
+  )`;
+}
+
 export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
     const messagePins = createMessagePinStatements(db);
@@ -187,7 +214,7 @@ export function createMessageRepository(db) {
         // steer-recovered row waited 5 minutes while newer messages jumped
         // it). Head-of-line protection is the WHERE clause's next_attempt_at
         // backoff plus MAX_REQUEUE_RETRIES, which fails a row for good.
-        findPending:    db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND COALESCE(kind, '') != 'continuation' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY timestamp ASC, rowid ASC LIMIT 1`),
+        findPending:    db.prepare(`SELECT q.* FROM queue q WHERE q.status = 'pending' AND COALESCE(q.kind, '') != 'continuation' AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?) AND ${planBoundaryHoldSql('q')} ORDER BY q.timestamp ASC, q.rowid ASC LIMIT 1`),
         // Global fallback for requesters without a session identity (the legacy
         // Copilot relay CLI). Conversations bound to a session-worker provider
         // (claude/cursor/grok) are excluded outright: handing one of their turns
@@ -218,6 +245,7 @@ export function createMessageRepository(db) {
               NULLIF(rsc.provider_type, ''),
               'github'
             )) NOT IN (${sessionWorkerProviderSqlList()})
+            AND ${planBoundaryHoldSql('q')}
           ORDER BY
             q.timestamp ASC,
             q.rowid ASC
@@ -254,6 +282,7 @@ export function createMessageRepository(db) {
                 NULLIF(c.sdk_session_id, '')
               ) = ?
             )
+            AND ${planBoundaryHoldSql('q')}
           ORDER BY
             CASE
               WHEN COALESCE(
@@ -282,6 +311,7 @@ export function createMessageRepository(db) {
               NULLIF(rs.sdk_session_id, ''),
               NULLIF(c.sdk_session_id, '')
             ) = ?
+            AND ${planBoundaryHoldSql('q')}
           ORDER BY
             q.timestamp ASC,
             q.rowid ASC

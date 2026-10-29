@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import {
   CLAUDE_LIVE_FLAG_SETTINGS_CODE,
   CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE,
@@ -6,17 +7,12 @@ import {
   claudeFailureGuidance,
 } from './claude-turn-failure.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
 import { buildUsageLimitFailure } from '../../shared/claude-usage-limit.mjs';
 import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
-import { claudeBillingTotals, claudeSearchTotals, claudeToolRequests, claudeUsageTotals } from './claude-usage-totals.mjs';
-
-const PLAN_BOARD_ACTIONS = [
-  { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
-  { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
-  { id: 'exit_only', label: 'Stop here', mode: 'agent' },
-];
+import { claudeBillingTotals, claudeSearchTotals, claudeTokenTotals, claudeToolRequests, claudeUsageTotals } from './claude-usage-totals.mjs';
 
 /**
  * The attempt-fencing echo for a row's write bodies. Every publish that names
@@ -96,6 +92,13 @@ export function createClaudeTurnPublisher({
   // `billingKind` is the worker's kind.
   billingUsageRoute = null,
   billingKind = null,
+  // The token booking (POST /api/turn-token-usage): the provider a
+  // turn's tokens are reported under (the worker's kind: 'claude',
+  // 'claude-api', 'deepseek'), null for none. `turnTokenCost(entry, at)`
+  // prices a model's share of a turn where Claude Code's own estimate does
+  // not fit (DeepSeek: `{ costUsd, costSource }`, costUsd null when unknown).
+  turnTokenProvider = null,
+  turnTokenCost = null,
 } = {}) {
   /** `{ code, stableCode }` of a failure code, in the backend's namespace. */
   function failureCodes(code) {
@@ -230,6 +233,9 @@ export function createClaudeTurnPublisher({
    * Advisory: a failure here must not disturb the turn's response.
    */
   async function publishPlanUsage({ message, state, sdkSessionId, runId = '', resumedSessionId = '' }) {
+    // Fire-and-forget: the token post never holds the reply (the counting
+    // itself runs at once, before the next result can arrive).
+    if (turnTokenProvider) void publishTurnTokens({ message, state, runId, resumedSessionId });
     if (billingUsageRoute) await publishBillingUsage({ message, state, sdkSessionId, runId, resumedSessionId });
     if (usageRoute) {
       await publishBackendUsage({ message, state, sdkSessionId, runId, resumedSessionId });
@@ -251,6 +257,20 @@ export function createClaudeTurnPublisher({
       dbg('plan usage publish failed', error?.message || String(error));
     });
   }
+
+  // Three trackers below measure a turn from the CLI's results, one per
+  // booking, and mirror each other's rules: `run` / runningCounts (DeepSeek's
+  // card), `billingRun` / billingCounts (the Claude API booking) and
+  // `tokenRun` / turnCounts (the token booking). Each keys on the
+  // process (`runId`) and the CLI session id, so a `/clear` starts over;
+  // takes a fresh process's `modelUsage` growth over the last result's, but
+  // a resumed process's first result (and a result without `modelUsage`) as
+  // its turn `usage` alone, the main loop, and a result without `modelUsage`
+  // raises the baseline by that `usage`, so the next result's growth does
+  // not count it again; lets the baseline only rise, so a late result of an
+  // older turn books nothing twice; and counts a turn state once. They differ only in what they keep: hits and misses (cache
+  // writes inside) for the first two, the four token kinds apart for the
+  // third. A change to one rule belongs in all three.
 
   // The CLI process's own token totals and web search and fetch counts per
   // model, counted from zero for each process (`runId`) and CLI session id
@@ -475,7 +495,10 @@ export function createClaudeTurnPublisher({
         }));
       }
       // The baseline only rises: a late result of an older turn below it
-      // must not make the next one count twice.
+      // must not make the next one count twice. A result without
+      // `modelUsage` grew the CLI's running totals by its `usage`, as `run`
+      // has it: the baseline grows by it too, so the next result's growth
+      // does not book that turn again.
       if (hasModelUsage) {
         for (const entry of session) {
           const last = billingRun.lastSession.get(entry.model) || { hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0 };
@@ -486,6 +509,16 @@ export function createClaudeTurnPublisher({
             costUsd: Math.max(last.costUsd, entry.costUsd),
           });
         }
+      } else {
+        for (const entry of claudeBillingTotals(null, { usage: result.usage, model })) {
+          const last = billingRun.lastSession.get(entry.model) || { hitTokens: 0, missTokens: 0, outputTokens: 0, costUsd: 0 };
+          billingRun.lastSession.set(entry.model, {
+            hitTokens: last.hitTokens + entry.hitTokens,
+            missTokens: last.missTokens + entry.missTokens,
+            outputTokens: last.outputTokens + entry.outputTokens,
+            costUsd: last.costUsd,
+          });
+        }
       }
       billingRun.results += 1;
     }
@@ -494,6 +527,128 @@ export function createClaudeTurnPublisher({
       runCounts: [...billingRun.totals.values()].map((entry) => ({ ...entry })),
       sessionTotals: session,
     };
+  }
+
+  // The token booking's counts, measured like billingRun above,
+  // with the four token kinds apart, then summed per turn: a turn's results
+  // (a stopped turn's, the steered rows it folded in) post the turn's total
+  // so far under its id, which the relay keeps the larger of. A worker
+  // without a process id names one for its own life, so a requeued turn on
+  // a restarted worker is a second run, not the same row.
+  const tokenRun = { key: '', results: 0, lastSession: new Map() };
+  const tokenStates = new WeakSet();
+  const turnTokens = new Map();
+  const ownRunId = randomUUID();
+  const TOKEN_FIELDS = ['inputTokens', 'cacheWriteTokens', 'cacheReadTokens', 'outputTokens'];
+  const TURN_TOKENS_KEPT = 20;
+
+  function turnCounts(state, result, { turnId, runId, sessionId, resumedSessionId, modelKey }) {
+    const model = result.model || state.responseModel;
+    const key = `${runId}\n${sessionId}`;
+    if (tokenRun.key !== key) {
+      tokenRun.key = key;
+      tokenRun.results = 0;
+      tokenRun.lastSession = new Map();
+    }
+    // Per run and turn: a turn re-run by a new CLI process (after a crash)
+    // is a second row at the relay, holding that run's tokens only.
+    const turnKey = `${runId}\n${turnId}`;
+    let turn = turnTokens.get(turnKey);
+    if (!turn) {
+      turn = new Map();
+      turnTokens.set(turnKey, turn);
+      while (turnTokens.size > TURN_TOKENS_KEPT) turnTokens.delete(turnTokens.keys().next().value);
+    }
+    if (!tokenStates.has(state)) {
+      tokenStates.add(state);
+      const at = new Date().toISOString();
+      const hasModelUsage = Boolean(result.modelUsage) && typeof result.modelUsage === 'object' && !Array.isArray(result.modelUsage);
+      const resumed = tokenRun.results === 0 && Boolean(resumedSessionId) && sessionId === resumedSessionId;
+      const session = hasModelUsage ? claudeTokenTotals(result.modelUsage, modelKey) : [];
+      const grown = !hasModelUsage || resumed
+        ? claudeTokenTotals(null, { usage: result.usage, model, ...modelKey })
+        : session.map((entry) => {
+          const last = tokenRun.lastSession.get(entry.model);
+          const delta = { model: entry.model, costUnknown: entry.costUnknown };
+          for (const field of TOKEN_FIELDS) delta[field] = Math.max(0, entry[field] - (last?.[field] || 0));
+          delta.costUsd = entry.costUsd === null ? null : Math.max(0, entry.costUsd - (last?.costUsd || 0));
+          return delta;
+        });
+      for (const entry of grown) {
+        const priced = typeof turnTokenCost === 'function' ? turnTokenCost(entry, at) : null;
+        const costUsd = priced ? priced.costUsd : entry.costUsd;
+        const costSource = priced ? priced.costSource : (entry.costUsd === null ? null : 'claude-code');
+        const current = turn.get(entry.model) || {
+          model: entry.model, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costUsd: null, costSource: null, costUnknown: false,
+        };
+        for (const field of TOKEN_FIELDS) current[field] += entry[field];
+        if (costUsd !== null && costUsd !== undefined) current.costUsd = (current.costUsd ?? 0) + costUsd;
+        current.costSource = current.costSource || costSource;
+        // A backend's own price wins over Claude Code's word on it (DeepSeek's
+        // models are unknown to Claude Code's table, yet OAR prices them).
+        const unknown = priced ? priced.costUsd === null || priced.costUsd === undefined : (entry.costUnknown || costUsd === null || costUsd === undefined);
+        current.costUnknown = current.costUnknown || unknown;
+        turn.set(entry.model, current);
+      }
+      // The baseline only rises: a late result of an older turn below it
+      // must not make the next one count twice. A result without
+      // `modelUsage` grew the CLI's running totals by its `usage`, as `run`
+      // has it: the baseline grows by it too.
+      for (const entry of session) {
+        const last = tokenRun.lastSession.get(entry.model) || {};
+        const next = { costUsd: Math.max(last.costUsd || 0, entry.costUsd || 0) };
+        for (const field of TOKEN_FIELDS) next[field] = Math.max(last[field] || 0, entry[field]);
+        tokenRun.lastSession.set(entry.model, next);
+      }
+      if (!hasModelUsage) {
+        for (const entry of grown) {
+          const last = tokenRun.lastSession.get(entry.model) || {};
+          const next = { costUsd: last.costUsd || 0 };
+          for (const field of TOKEN_FIELDS) next[field] = (last[field] || 0) + entry[field];
+          tokenRun.lastSession.set(entry.model, next);
+        }
+      }
+      tokenRun.results += 1;
+    }
+    return [...turn.values()]
+      .filter((entry) => TOKEN_FIELDS.some((field) => entry[field] > 0) || entry.costUsd > 0)
+      .map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * Ship the turn's tokens per model to the token booking: the
+   * turn's total so far, under the turn's id and the process's run id.
+   * Reasoning is not reported apart by Claude, so it is left out (NULL).
+   * Advisory and fire-and-forget: it never throws and nothing waits on it.
+   */
+  async function publishTurnTokens({ message, state, runId = '', resumedSessionId = '' }) {
+    try {
+      const result = state.result;
+      const turnId = String(message?.id || '').trim();
+      if (!turnId || !result) return;
+      const sessionId = String(result.sessionId || '').trim();
+      const modelKey = typeof usageModelKey === 'function' ? { modelKey: usageModelKey } : {};
+      const run = String(runId || '') || ownRunId;
+      const models = turnCounts(state, result, {
+        turnId,
+        runId: run,
+        sessionId,
+        resumedSessionId: String(resumedSessionId || '').trim(),
+        modelKey,
+      });
+      if (!models.length) return;
+      await api('POST', '/api/turn-token-usage', {
+        conversationId: message.conversationId,
+        turnId,
+        runId: run,
+        provider: turnTokenProvider,
+        ...(sessionId ? { nativeSessionId: sessionId } : {}),
+        at: new Date().toISOString(),
+        models,
+      });
+    } catch (error) {
+      dbg('turn token publish failed', error?.message || String(error));
+    }
   }
 
   /**

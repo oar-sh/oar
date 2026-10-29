@@ -33,6 +33,9 @@ export const RELAY_EVENT_TYPES = Object.freeze([
   'task_failed',
   'stalled',
   'all_idle',
+  // The user settled a plan card (board) of the session: its action, and the
+  // message it queued (none for exit_only).
+  'board_settled',
 ]);
 
 // Not one a subscription names in `events`: `heartbeat_minutes` turns it on.
@@ -97,6 +100,26 @@ export const RELAY_EVENT_LEGACY_DEFAULT_TYPES = Object.freeze([
   'all_idle',
 ]);
 
+// The default from subagent_finished until board_settled (0.9.19): a
+// subscription made without events then stored exactly this list, and takes
+// today's default as well. Unlike the older one, a watcher who names exactly
+// this list now gets it read as the default too (board_settled added): there
+// is no type to add beside it that changes nothing.
+export const RELAY_EVENT_PRE_BOARD_DEFAULT_TYPES = Object.freeze([
+  'question_asked',
+  'error',
+  'turn_end',
+  'subagent_finished',
+  'task_failed',
+  'stalled',
+  'all_idle',
+]);
+
+function sameTypeSet(types, reference) {
+  const unique = new Set((Array.isArray(types) ? types : []).map(toText).filter(Boolean));
+  return unique.size === reference.length && reference.every((type) => unique.has(type));
+}
+
 /**
  * The events a stored subscription takes. A list that is exactly the old
  * default (any order, no more, no less) was the default, not a choice, and
@@ -106,14 +129,14 @@ export const RELAY_EVENT_LEGACY_DEFAULT_TYPES = Object.freeze([
  */
 export function effectiveRelayEventTypes(types) {
   const list = Array.isArray(types) ? types.map(toText).filter(Boolean) : [];
-  return isLegacyDefaultRelayEventTypes(list) ? [...RELAY_EVENT_DEFAULT_TYPES] : list;
+  return isLegacyDefaultRelayEventTypes(list) || sameTypeSet(list, RELAY_EVENT_PRE_BOARD_DEFAULT_TYPES)
+    ? [...RELAY_EVENT_DEFAULT_TYPES]
+    : list;
 }
 
 /** Whether a list is exactly the old default as a set (any order, repeats ignored). */
 export function isLegacyDefaultRelayEventTypes(types) {
-  const unique = new Set((Array.isArray(types) ? types : []).map(toText).filter(Boolean));
-  return unique.size === RELAY_EVENT_LEGACY_DEFAULT_TYPES.length
-    && RELAY_EVENT_LEGACY_DEFAULT_TYPES.every((type) => unique.has(type));
+  return sameTypeSet(types, RELAY_EVENT_LEGACY_DEFAULT_TYPES);
 }
 
 /**
@@ -403,6 +426,9 @@ export function relayEventMatchText(event) {
   if (event?.type === 'task_finished' || event?.type === 'task_failed') {
     return [detail.description, detail.summary].map(toText).filter(Boolean).join('\n');
   }
+  if (event?.type === 'board_settled') {
+    return [detail.action, detail.actionLabel, detail.title].map(toText).filter(Boolean).join('\n');
+  }
   return null;
 }
 
@@ -575,6 +601,14 @@ export function formatRelayEventLine(event) {
       const minutes = Number(detail.quietMinutes);
       const what = oneLine(detail.what, 80) || 'work';
       return `${head}: no activity for ${Number.isFinite(minutes) ? minutes : '?'} min while ${what} is still running`;
+    }
+    case 'board_settled': {
+      const action = oneLine(detail.action, 80);
+      const label = oneLine(detail.actionLabel, 120) || action || 'settled';
+      const ids = [action ? `action ${action}` : '', oneLine(detail.boardId, 80) ? `board_id ${oneLine(detail.boardId, 80)}` : ''].filter(Boolean);
+      // exit_only queues nothing: the session stops there.
+      ids.push(oneLine(detail.queuedMessageId, 80) ? `queued message ${oneLine(detail.queuedMessageId, 80)}` : 'nothing queued');
+      return `${head} ${quote(detail.title || 'plan card', 200)} → ${quote(label, 120)} (${ids.join(', ')})`;
     }
     default:
       return head;

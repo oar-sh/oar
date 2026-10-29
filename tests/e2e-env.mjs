@@ -1,8 +1,10 @@
 import path from "path";
 
+import { resolveDatabaseFile } from "../server/services/database-file.mjs";
+
 // Single source of truth for how e2e specs reach the relay under test.
 // Everything comes from env vars set by tests/run-e2e.mjs. There are
-// deliberately NO fallbacks to server/config.json, server/data/copilot.db,
+// deliberately NO fallbacks to server/config.json, server/data/<database>,
 // or http://127.0.0.1:3333 — those belong to the live relay, and specs
 // must never read from or write to it.
 
@@ -51,5 +53,6 @@ export function relayGrokLoginDeniedFile() {
 }
 
 export function relayDbPath() {
-  return path.join(relayDataDir(), "copilot.db");
+  // The file the test relay runs on: oar.db in its fresh data dir.
+  return resolveDatabaseFile(relayDataDir()).path;
 }

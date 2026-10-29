@@ -937,6 +937,10 @@
     gap: 6px;
   }
   .inbox-choice.recommended { border-color: var(--accent); }
+  /* A plan card in the Inbox: the plan folded, its own buttons. */
+  .inbox-choice.inbox-plan-action-recommended { border-color: var(--accent); }
+  .inbox-plan-body summary { cursor: pointer; color: var(--muted); font-size: var(--fs-meta-sm); }
+  .inbox-plan-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; margin-top: 4px; }
   .inbox-recommended-tag { color: var(--accent); font-size: var(--fs-meta-xs); }
   .inbox-answer { border-color: var(--accent); color: var(--accent); }
   .inbox-dismiss { color: var(--muted); }
@@ -3193,6 +3197,10 @@
   .about-usage-provider { font-size: 0.82rem; font-weight: 600; margin-top: 8px; }
   .about-usage-provider:first-child { margin-top: 0; }
   .about-state { font-weight: 600; }
+  /* A path (the database file, the backup folder) wraps anywhere rather than
+     pushing the card wider than a phone's screen. */
+  .about-section .plan-usage-detail-value { white-space: normal; overflow-wrap: anywhere; }
+  .about-section .plan-usage-detail-hint { overflow-wrap: anywhere; }
   .about-state[data-state="online"] { color: var(--success); }
   .about-state[data-state="offline"] { color: var(--warn); }
   .about-state[data-state="idle"] { color: var(--muted); }
@@ -4417,6 +4425,12 @@
     min-width: 84px; width: 84px; outline: none;
   }
   #mode-select:focus { border-color: var(--accent); }
+  /* A plan-only session: agents can't take it out of plan mode. */
+  #mode-select[data-plan-only="true"] { border-style: dashed; border-color: var(--accent); }
+  /* Room for "Plan 🔒" beside the arrow; the phone layouts size the select themselves. */
+  @media (min-width: 681px) {
+    #mode-select[data-plan-only="true"] { min-width: 104px; width: 104px; }
+  }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   #send-btn:not(:disabled):hover { opacity: 0.85; }
 

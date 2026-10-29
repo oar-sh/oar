@@ -367,6 +367,22 @@ export function renderAgentSessionsControlHtml({ conversationId = '', mayCreateS
   `;
 }
 
+/**
+ * The owner's plan-only switch, for every session: agents cannot take it out
+ * of plan mode while it is on (the owner still changes the mode freely).
+ */
+export function renderPlanOnlyControlHtml({ conversationId = '', planOnly = false } = {}) {
+  return `
+    <div class="ctx-agent-sessions ctx-plan-only">
+      <label class="ctx-agent-sessions-row">
+        <input type="checkbox" id="ctx-plan-only" data-conversation-id="${escapeHtml(conversationId)}"${planOnly === true ? ' checked' : ''}>
+        <span>Plan only: agents can't take this session out of plan mode</span>
+      </label>
+      <div class="ctx-thinking-note">While this is on, an agent's message or settings change that names another mode is refused; you can still change the mode yourself. "Approve plan" runs one turn with write access and the session plans again after it. Agents may switch it off.</div>
+    </div>
+  `;
+}
+
 // A model limit is a round figure: 1M rather than 1.0M.
 function formatModelLimit(value) {
   const n = toNullableNumber(value);

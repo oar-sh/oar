@@ -1225,6 +1225,9 @@ test.describe("the send setting", () => {
     await page.reload();
     await page.waitForLoadState("networkidle");
     expect(await page.evaluate((key) => localStorage.getItem(key), SEND_SETTING_KEY)).toBe("0");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.openSettingsModal === "function");
     await page.evaluate(() => window.openSettingsModal("general"));
     await expect(toggle).not.toBeChecked();
 
@@ -1233,6 +1236,9 @@ test.describe("the send setting", () => {
     await page.reload();
     await page.waitForLoadState("networkidle");
     expect(await page.evaluate((key) => localStorage.getItem(key), SEND_SETTING_KEY)).toBe("1");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.openSettingsModal === "function");
     await page.evaluate(() => window.openSettingsModal("general"));
     await expect(toggle).toBeChecked();
   });

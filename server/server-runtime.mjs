@@ -28,6 +28,8 @@ import { createDetachedWorkerWatch } from './services/detached-worker-watch-serv
 import { applyCdnNoStoreHeaders } from './services/file-serving.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
+import { PLAN_BOARD_APPROVE_ONLY, planBoardShownActions } from '../shared/plan-board-actions.mjs';
+import { carryPlanOnlyToCompacted, readPlanOnly } from './services/conversation-preferences-service.mjs';
 import { sanitizeRelayQuestionContext as sanitizeRelayQuestionContextWith } from './services/relay-question-context.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
@@ -74,6 +76,7 @@ import { createClaudeApiSettingsService } from './services/claude-api-settings-s
 import { createClaudeBillingSwitchService, normalizeClaudeBilling } from './services/claude-billing-switch-service.mjs';
 import { createClaudeBillingSwapService } from './services/claude-billing-swap-service.mjs';
 import { createClaudeApiUsageService } from './services/claude-api-usage-service.mjs';
+import { createTokenUsageService } from './services/token-usage-service.mjs';
 import { createClaudeApiCapWatch, createClaudeApiPlanUsage, createClaudeApiStopNoteLedger } from './services/plan-usage-claude-api.mjs';
 import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, DEFAULT_DEEPSEEK_MODEL, deepseekModelLabel } from '../shared/deepseek-models.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
@@ -101,6 +104,7 @@ import { createRelayEventService } from './services/relay-event-service.mjs';
 import { createRelayScheduleService } from './services/relay-schedule-service.mjs';
 import { createRelayAskService } from './services/relay-ask-service.mjs';
 import { createRelayAskLinkService } from './services/relay-ask-link-service.mjs';
+import { createRemoteInboxWatchService } from './services/remote-inbox-watch-service.mjs';
 import { createRelayEventLinkService } from './services/relay-event-link-service.mjs';
 import { buildClaudeAttributionSettings, normalizeClaudeAttributionMode, resolveClaudeAttributionMode, DEFAULT_CLAUDE_ATTRIBUTION_MODE } from '../shared/claude-attribution.mjs';
 import {
@@ -142,7 +146,10 @@ import { createCursorSessionRootResolver } from './services/cursor-session-root-
 import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { startRelayMemoryLog } from './relay-heap-guard.mjs';
-import { adoptEarlierDatabase, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
+import { TAKEOVER_PROGRESS_FILE, adoptEarlierDatabase, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
+import { checkDatabaseFile, resolveDatabaseFile, settleDatabaseFile } from './services/database-file.mjs';
+import { describeBackups, describeNextBackup, maybeBackupBeforeStart, writeDbLastRun } from './services/db-backup-service.mjs';
+import { resolveStateLayout } from './services/oar-state-layout.mjs';
 import { ensureDataDirs, resolveDataDir, resolveUploadDir, resolveUploadReadDirs, uploadPathInDirs } from './services/data-dir-resolution.mjs';
 import { mergeStrayMigratedUploads } from './services/oar-state-migration-service.mjs';
 import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
@@ -219,7 +226,8 @@ import {
   resolveRelayRestartMaxWaitOverrideMs,
   RELAY_RESTART_MAX_WAIT_SETTING_KEY,
 } from './services/relay-restart-queue.mjs';
-import { createRestartPictureCollector } from './services/relay-restart-picture.mjs';
+import { createRestartPictureCollector, detectRelayHosting } from './services/relay-restart-picture.mjs';
+import { createWorkerScope } from './services/worker-scope.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
 import { createStaleTurnRecovery } from './services/stale-turn-recovery.mjs';
 import {
@@ -320,7 +328,9 @@ const CONFIG_PATH    = process.env.COPILOT_WEB_RELAY_CONFIG
 // for why the config can carry it (a dev checkout pointing at a release
 // install's data).
 const DATA_DIR = resolveDataDir({ env: process.env, configPath: CONFIG_PATH, serverDir: __dirname });
-const DB_PATH        = path.join(DATA_DIR, 'copilot.db');
+// DB_PATH (oar.db, or the name of installs from before 0.9.20) is
+// resolved under the lock, once an earlier database may have been brought
+// over: see resolveDatabaseFile below.
 const RELAY_LOCK_PATH = path.join(DATA_DIR, 'relay-server.lock');
 // Uploads follow the data dir whenever the env var or config.json chose it.
 const UPLOAD_DIR     = resolveUploadDir({ dataDir: DATA_DIR, env: process.env, serverDir: __dirname });
@@ -1441,7 +1451,16 @@ async function refreshGrokProviderModels() {
   }
 }
 
-const DEFAULT_CONFIG = { authToken: '', port: 3333, pollIntervalMs: 3000, conversationSessionMode: 'isolated', localhostOnly: true };
+const DEFAULT_CONFIG = {
+  authToken: '',
+  port: 3333,
+  pollIntervalMs: 3000,
+  conversationSessionMode: 'isolated',
+  localhostOnly: true,
+  // A copy of the database at the first start of each new version, the last
+  // `keep` kept (db-backup-service.mjs); `dir` (absolute) moves the folder.
+  dbBackups: { enabled: true, keep: 2 },
+};
 // How long a turn may go without any sign of life from its worker before the
 // relay assumes the worker died. This is an inactivity window, not a cap on turn
 // length — see recoverStaleMessages.
@@ -1868,8 +1887,28 @@ try {
   console.error(`[server] ${error?.message || String(error)}`);
   process.exit(error?.code === 'ERELAYLOCKED' ? RELAY_STOP_EXIT_CODE : 1);
 }
-// Before the database opens, under the lock (adoptEarlierDatabase); the
-// result also feeds lostPackageDatabaseWarning.
+// Before the database opens, under the lock: both names there are settled
+// first (the earlier name's database, not newer, is set aside, else the
+// relay stops), then adoptEarlierDatabase, whose result also feeds
+// lostPackageDatabaseWarning.
+{
+  let settled;
+  try {
+    settled = settleDatabaseFile({
+      dataDir: DATA_DIR,
+      Database,
+      progressFile: path.join(DATA_DIR, TAKEOVER_PROGRESS_FILE),
+      logger: console,
+    });
+  } catch (error) {
+    settled = { status: 'refused', error: `[data] Not starting: the database files in ${DATA_DIR} could not be looked at (${error?.message || error}).` };
+  }
+  if (settled.status === 'refused') {
+    console.error(settled.error);
+    try { relaySingletonGuard.release(); } catch {}
+    process.exit(RELAY_STOP_EXIT_CODE);
+  }
+}
 let earlierDatabase;
 {
   try {
@@ -1888,6 +1927,21 @@ let earlierDatabase;
   }
   if (earlierDatabase.status === 'refused') {
     console.error(earlierDatabase.error);
+    try { relaySingletonGuard.release(); } catch {}
+    process.exit(RELAY_STOP_EXIT_CODE);
+  }
+}
+// Resolved after the adoption, which may have placed the database: `created`
+// only when neither name is there now.
+const databaseFile = resolveDatabaseFile(DATA_DIR);
+const DB_PATH = databaseFile.path;
+{
+  // A dangling link, or an oar.db-wal/-shm without oar.db (a later rename to
+  // oar.db would take its pages in), stops the start; other strays are said.
+  const check = checkDatabaseFile(databaseFile);
+  for (const warning of check.warnings) console.warn(warning);
+  if (check.refusal) {
+    console.error(check.refusal);
     try { relaySingletonGuard.release(); } catch {}
     process.exit(RELAY_STOP_EXIT_CODE);
   }
@@ -2737,7 +2791,7 @@ const configuredConversationSessionMode =
 updateModelCatalog({ models: [DEFAULT_MODEL], currentModel: DEFAULT_MODEL, defaultModel: DEFAULT_MODEL, source: 'bootstrap' });
 
 // ─── SQLite Setup ─────────────────────────────────────────────────────────────
-const databaseCreatedAtStart = !fs.existsSync(DB_PATH);
+const databaseCreatedAtStart = databaseFile.created;
 const db = new Database(DB_PATH);
 if (process.platform !== 'win32') {
   fs.chmodSync(DB_PATH, 0o600);
@@ -2750,11 +2804,39 @@ if (process.platform !== 'win32') {
   }
 }
 
+// Where the state root keeps backups (npm), or a checkout (server/backups).
+const STATE_LAYOUT = resolveStateLayout({ packageRoot: REPO_ROOT });
+// A copy of the database before this version's migrations, when another
+// version (on a checkout: another commit) ran on it last; before applySchema
+// and before reconcileUpdateAttempt, which removes the in-app update's
+// record that names the version before. Never stops the start.
+let dbBackupAtStart = null;
+try {
+  dbBackupAtStart = await maybeBackupBeforeStart({
+    db,
+    Database,
+    dbPath: DB_PATH,
+    dataDir: DATA_DIR,
+    databaseCreated: databaseCreatedAtStart,
+    layout: STATE_LAYOUT,
+    serverDir: __dirname,
+    config,
+    runningVersion: RUNNING_VERSION,
+    runningCommit: BUILD_COMMIT,
+    logger: console,
+  });
+} catch (error) {
+  console.warn(`[backup] failed: ${error?.message || error}; this start goes on without a backup of the version before.`);
+}
+
 // Base DDL plus the column-backfill/upgrade migrations, extracted verbatim to
 // db-schema.mjs so tests can build the exact production schema. Runs the
 // CREATE TABLE IF NOT EXISTS block, the FTS setup, and every ALTER TABLE
 // upgrade in the original order.
 applySchema(db);
+// A database that had no app_settings table before applySchema (a new one):
+// the version that runs on it now.
+if (dbBackupAtStart?.deferredLastRun) writeDbLastRun(db, dbBackupAtStart.deferredLastRun);
 
 // ─── Prepared Statements ──────────────────────────────────────────────────────
 // Owns its own schema (plan-usage tables) and the derived Cursor spend
@@ -3245,11 +3327,16 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   if (!copilotSdkEngine) return openAiEnv;
   return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model });
 }
+// Under a systemd user service, session workers start in scopes of their
+// own (worker-scope.mjs); asked once, at the first worker start.
+const workerScope = createWorkerScope({ hosting: detectRelayHosting(), log: (message) => console.log(`${runtimeLogPrefix()}${message}`) });
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
   env: sessionWorkerLaunchEnv,
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
+  workerScope,
 });
+
 async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true } = {}) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
@@ -3281,6 +3368,7 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const workerLaunchEnv = buildSessionWorkerLaunchEnvForSession(normalizedTargetSessionId);
   const launched = await launchSessionCli({
+    workerScope,
     targetSessionId: normalizedTargetSessionId,
     cwd: resolvedWorkspaceRoot,
     env: workerLaunchEnv,
@@ -3359,6 +3447,7 @@ const updateCheckService = updateCheckKilled ? null : createUpdateCheckService({
 });
 const updateInstallService = createUpdateInstallService({
   runningVersion: RUNNING_VERSION,
+  describeNextBackup: () => describeNextBackup({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, dbPath: DB_PATH, config }),
   installMethod: INSTALL_METHOD,
   packageRoot: PACKAGE_ROOT,
   readSetting: readAppSettingValue,
@@ -3676,6 +3765,7 @@ function collectRestartPicture({ action = 'restart' } = {}) {
     restartPictureCollector = createRestartPictureCollector({
       db,
       backgroundWorkView,
+      workerScopes: () => workerScope.inUse(),
       listHeldTasks: () => backgroundTaskStore.listRestored().map(({ key, task }) => ({
         conversationId: resolveConversationRecord({ conversationId: key, sdkSessionId: key })?.id || key,
         description: task?.description || task?.taskType || '',
@@ -4055,19 +4145,28 @@ function parseBoardContext(rawContext) {
 
 function formatRelayBoardRow(row) {
   if (!row) return null;
+  const boardType = String(row.board_type || '').trim().toLowerCase() || 'generic';
+  const status = String(row.status || 'pending').trim().toLowerCase() || 'pending';
+  const planOnly = readPlanOnly(stmts.getConvAnyStatus.get(row.conversation_id));
   return {
     id: row.id,
     queueId: row.queue_id,
     conversationId: row.conversation_id,
     messageId: row.message_id,
-    boardType: String(row.board_type || '').trim().toLowerCase() || 'generic',
+    boardType,
     mode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
     title: String(row.title || '').trim(),
     body: String(row.body || '').trim(),
-    actions: parseBoardActions(row.actions_json),
-    recommendedAction: String(row.recommended_action || '').trim() || null,
+    // A pending plan card stored before "Approve plan" existed shows it too.
+    actions: planBoardShownActions({ boardType, status }, parseBoardActions(row.actions_json)),
+    // On a plan-only session a pending plan card recommends "Approve plan".
+    recommendedAction: (planOnly && status === 'pending' && boardType === 'plan_ready')
+      ? PLAN_BOARD_APPROVE_ONLY
+      : (String(row.recommended_action || '').trim() || null),
+    // The UI asks before an action that leaves plan mode on such a session.
+    planOnly,
     context: parseBoardContext(row.context_json),
-    status: String(row.status || 'pending').trim().toLowerCase() || 'pending',
+    status,
     selectedAction: String(row.selected_action || '').trim() || null,
     actedAt: row.acted_at || null,
     createdAt: row.created_at,
@@ -5249,6 +5348,8 @@ function createCompactedConversation(sourceConversationId) {
     // The new conversation stays in the old one's session group, and heads
     // it if the old one did; the archived source stays a member.
     conversationGroups.carryToCompacted(sourceConversationId, targetConversationId, now);
+    // A plan-only conversation's lock goes along, with its saved mode.
+    carryPlanOnlyToCompacted({ db, stmts, source, targetConversationId, updatedAt: now });
     // A Claude chat keeps its billing (the subscription or the API key, a
     // pending swap's included): the new chat's first worker launches on it,
     // and it is never guessed again from a Claude model id. Other providers
@@ -5550,6 +5651,9 @@ const usageLimitPauseService = createUsageLimitPauseService({
 // workers' reports (services/claude-api-usage-service.mjs); the Claude API
 // card and its cap read it.
 const claudeApiUsageService = createClaudeApiUsageService({ db, logger: console });
+// Tokens per turn and per day for every provider, booked from the
+// workers' reports; the Tokens sections in Check Usage and About read it.
+const tokenUsageService = createTokenUsageService({ db, logger: console });
 // This month's spend on the key against the cap, and the Check Usage card
 // (services/plan-usage-claude-api.mjs), over the same local days.
 const claudeApiPlanUsage = createClaudeApiPlanUsage({
@@ -7362,6 +7466,16 @@ const relayAskLinkService = createRelayAskLinkService({
   client: remoteRelayClient,
   logger: console,
 });
+// Paired relays' cards a turn waits on: the badge here stays current, and
+// one relay pushes a card its own relay reached no device for.
+const remoteInboxWatchService = createRemoteInboxWatchService({
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
+  push: pushDispatchService,
+  hasSockets: () => io.of('/').sockets.size > 0,
+  emit: (event) => io.emit(event),
+  logger: console,
+});
 const remoteRelayPairing = createRemoteRelayPairing({
   registry: remoteRelayRegistry,
   client: remoteRelayClient,
@@ -7647,6 +7761,7 @@ const sharedRouteDeps = {
   usageLimitPauseService,
   claudeBillingSwitchService,
   claudeApiUsageService,
+  tokenUsageService,
   claudeApiClaimCheck,
   onClaudeBillingFence: handleClaudeBillingFence,
   claudeApiPlanUsage,
@@ -7719,11 +7834,13 @@ registerRelayAskRoutes(app, {
   db,
   stmts,
   formatQuestionRow,
+  formatRelayBoardRow,
   relayAskService,
   relayAskLinkService,
   remoteRelayInbound,
   remoteRelayRegistry,
   remoteRelayClient,
+  questionNotice: (questionId) => pushDispatchService.questionNotice(questionId),
 });
 registerRelayRestartRoutes(app, {
   auth,
@@ -7758,6 +7875,7 @@ registerAboutRoutes(app, {
     isRelayCliOnline: () => runtimeState.cliOnline === true,
     listWorkers: () => sessionWorkerRegistry.listWorkers(),
     getUpdateState: () => buildUpdateStatePayload(),
+    describeBackups: () => describeBackups({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, config, sizes: false }),
   }),
 });
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
@@ -8109,6 +8227,8 @@ relayEventLinkService.start();
 relayScheduleService.start();
 // Asks on paired relays still open there: look for their answers again.
 relayAskLinkService.start();
+// Paired relays' Inboxes, every ~20 s.
+remoteInboxWatchService.start();
 runtimeTimers.pendingWorkerPrime = setInterval(() => {
   void primePendingSessionWorkers('maintenance');
   detachedWorkerWatch.sweep().catch((error) => {
@@ -8431,6 +8551,7 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   try { relayEventLinkService.stop(); } catch {}
   try { relayScheduleService.stop(); } catch {}
   try { relayAskLinkService.stop(); } catch {}
+  try { remoteInboxWatchService.stop(); } catch {}
   tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();

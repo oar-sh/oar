@@ -35,6 +35,9 @@ export const RELAY_ASK_CLOSED_STATUSES = Object.freeze(['answered', 'dismissed']
 // Socket event the relay sends on every change of an ask (`{ ask }`) and
 // of the Inbox's count (`{ pending }`).
 export const RELAY_ASK_SOCKET_EVENT = 'relay_ask_updated';
+// Socket event (no payload) the relay sends when the pending items of its
+// paired relays' Inboxes changed (remote-inbox-watch-service.mjs).
+export const INBOX_REMOTE_CHANGED_EVENT = 'inbox_remote_changed';
 
 export const RELAY_ASK_LIMITS = Object.freeze({
   questionMax: 500,

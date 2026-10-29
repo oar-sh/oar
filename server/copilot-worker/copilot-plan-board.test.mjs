@@ -7,6 +7,7 @@ import {
   planTextFromExitRequest,
   shouldPostPlanBoard,
 } from './copilot-plan-board.mjs';
+import { PLAN_BOARD_ACTIONS as SHARED_PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 
 const message = { id: 'q-1', conversationId: 'conv-1', relayMode: 'plan' };
 
@@ -25,12 +26,19 @@ test('the board payload matches the contract every other worker posts', () => {
   assert.equal(payload.conversationId, 'conv-1');
   assert.equal(payload.mode, 'plan');
   assert.deepEqual(payload.actions, [
+    { id: 'approve_only', label: 'Approve plan', mode: 'agent' },
     { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
     { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
     { id: 'exit_only', label: 'Stop here', mode: 'agent' },
   ]);
   assert.equal(payload.context.source, 'plan-mode-fallback');
   assert.equal(payload.context.queueMessageId, 'q-1');
+});
+
+test('the worker posts the shared list, not a copy of its own', () => {
+  const payload = buildCopilotPlanReadyBoardPayload({ message, planText: '- a\n- b' });
+  assert.equal(payload.actions, SHARED_PLAN_BOARD_ACTIONS);
+  assert.equal(PLAN_BOARD_ACTIONS, SHARED_PLAN_BOARD_ACTIONS);
 });
 
 test('the autopilot handoff action is present, since that is the point of the board', () => {

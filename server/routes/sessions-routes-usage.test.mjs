@@ -7,6 +7,8 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createPlanUsageService } from '../services/plan-usage-service.mjs';
+import { createTokenUsageService } from '../services/token-usage-service.mjs';
+import { normalizeTurnTokenUsageReport } from '../../shared/turn-token-usage.mjs';
 
 // GET /api/usage with the Claude account's live usage: read best-effort beside
 // the other providers' fetches, never a reason for the modal to fail or wait.
@@ -52,7 +54,7 @@ async function getUsage(app, query = {}) {
   return res;
 }
 
-function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage, deepseekEnabled = false, deepseekBalanceService, deepseekUsageImportService } = {}) {
+function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage, deepseekEnabled = false, deepseekBalanceService, deepseekUsageImportService, withTokens = false } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   // Only the runtime session rows matter here, so they go in without their conversations.
@@ -65,6 +67,7 @@ function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [],
     insert.run(`rs-${conversationId}`, conversationId, `rs-${conversationId}`, providerType, costUsd, NOW, NOW);
   }
   const planUsageService = createPlanUsageService({ db, now: () => new Date(NOW) });
+  const tokenUsageService = withTokens ? createTokenUsageService({ db, now: () => Date.parse(NOW), timeZone: 'UTC', logger: { warn() {} } }) : null;
   const app = createMockApp();
   registerSessionsRoutes(app, {
     auth: (_req, _res, next) => next(),
@@ -84,8 +87,9 @@ function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [],
     deepseekSettingsService: { getSettings: () => ({ configured: deepseekEnabled, enabled: deepseekEnabled }) },
     ...(deepseekBalanceService === undefined ? {} : { deepseekBalanceService }),
     ...(deepseekUsageImportService === undefined ? {} : { deepseekUsageImportService }),
+    ...(tokenUsageService ? { tokenUsageService } : {}),
   });
-  return { app, planUsageService };
+  return { app, planUsageService, tokenUsageService };
 }
 
 test('the report carries the live Claude card and the Claude Cloud card after it', async () => {
@@ -361,4 +365,60 @@ test('an imported DeepSeek export shows on the card; one that cannot be read lea
   // The 3rd is a Saturday: off-peak, $0.75.
   assert.match(plain.notes.find((note) => note.id === 'deepseek-spend').text, /\$2\.25 since 2026-10-02/);
   assert.equal(plain.notes.some((note) => note.id === 'deepseek-actual'), false);
+});
+
+test('every tab with booked turns gets its Tokens sections; Copilot\'s own key is a group of its own', async () => {
+  const { app, tokenUsageService } = setup({ withTokens: true, grokEnabled: true, deepseekEnabled: true });
+  let turn = 0;
+  const book = (provider, model, fields, billing = '') => {
+    turn += 1;
+    const { report } = normalizeTurnTokenUsageReport({ conversationId: 'conv-1', turnId: `t-${turn}`, models: [{ model, ...fields }] });
+    tokenUsageService.recordTurn({ conversationId: 'conv-1', provider, billing, report });
+  };
+  const all = { inputTokens: 1_200, outputTokens: 300, cacheWriteTokens: 400, cacheReadTokens: 9_000 };
+  book('github', 'gpt-5.5', all);
+  book('github', 'gpt-5.5', { inputTokens: 50, outputTokens: 5, cacheReadTokens: 10 }, 'byok-openai');
+  book('claude', 'claude-opus-5-5', all);
+  book('claude', 'claude-opus-5-5-20260601', { inputTokens: 100, outputTokens: 10, cacheWriteTokens: 0, cacheReadTokens: 0 });
+  book('claude-cloud', 'claude-opus-5-5', all);
+  book('cursor', 'composer-2', all);
+  book('grok', 'grok-5', all);
+  book('deepseek', 'deepseek-flash', all);
+  const res = await getUsage(app);
+  assert.equal(res.statusCode, 200);
+  const sectionIds = (provider) => (res.body.providers.find((card) => card.provider === provider)?.details || [])
+    .map((section) => section.id)
+    .filter((id) => id.includes('-token-usage'));
+  assert.deepEqual(sectionIds('github'), ['github-token-usage', 'github-token-usage-by-model', 'github-token-usage-byok-openai', 'github-token-usage-by-model-byok-openai']);
+  for (const provider of ['claude', 'claude-cloud', 'cursor', 'grok', 'deepseek']) {
+    assert.ok(sectionIds(provider).includes(`${provider}-token-usage`), `${provider}: ${sectionIds(provider).join(', ')}`);
+  }
+  const byok = res.body.providers.find((card) => card.provider === 'github').details.find((section) => section.id === 'github-token-usage-byok-openai');
+  assert.equal(byok.label, 'Tokens — own OpenAI key');
+  assert.equal(byok.rows[0].value, 'in 50 · out 5 · cache w — · cache r 10');
+  assert.match(byok.note, /OpenAI does not report cache writes/);
+  // DeepSeek keeps its own section beside the new ones.
+  const deepseek = res.body.providers.find((card) => card.provider === 'deepseek');
+  assert.ok(deepseek.details.length >= 2);
+  // Models are named as the tab names them elsewhere; an id without a label stays as it is.
+  const byModelLabels = (provider) => res.body.providers.find((card) => card.provider === provider)
+    .details.find((section) => section.id === `${provider}-token-usage-by-model`).rows.map((row) => row.label);
+  assert.deepEqual(byModelLabels('deepseek'), ['DeepSeek Flash']);
+  assert.deepEqual(byModelLabels('claude'), ['Claude Opus 5.5']);
+  assert.deepEqual(byModelLabels('cursor'), ['composer-2']);
+  // A dated and an undated id with one name are one row, the ids in its title; the sections open.
+  const claudeByModel = res.body.providers.find((card) => card.provider === 'claude').details.find((section) => section.id === 'claude-token-usage-by-model');
+  assert.deepEqual(claudeByModel.rows, [{
+    label: 'Claude Opus 5.5',
+    value: 'in 1.3k · out 310 · cache w 400 · cache r 9k',
+    hint: 'today 11k · all time 11k',
+    title: 'Model ids: claude-opus-5-5, claude-opus-5-5-20260601',
+  }]);
+  assert.equal(claudeByModel.open, true);
+});
+
+test('without the token booking no tab gets Tokens sections', async () => {
+  const { app } = setup();
+  const res = await getUsage(app);
+  assert.equal(res.body.providers.some((card) => (card.details || []).some((section) => section.id.includes('-token-usage'))), false);
 });

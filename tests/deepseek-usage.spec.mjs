@@ -109,7 +109,7 @@ async function startDeepSeekRelay(conversationId) {
     balance_infos: [{ currency: "CNY", total_balance: "110.00", granted_balance: "10.00", topped_up_balance: "100.00" }],
   };
   const relay = await startRelayServer({ token: randomUUID() });
-  const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+  const db = new DatabaseSync(path.join(relay.dataDir, "oar.db"));
   try {
     const now = new Date().toISOString();
     db.prepare(`
@@ -185,10 +185,29 @@ test.describe("DeepSeek usage card", () => {
     });
     expect(wrong.status()).toBe(404);
 
+    // The token booking: the turn's tokens, cache writes apart.
+    const tokens = await request.post(`${relay.baseUrl}/api/turn-token-usage`, {
+      headers: headers(),
+      data: {
+        conversationId,
+        turnId: "deepseek-turn-1",
+        runId: "run-1",
+        models: [{ model: "deepseek-flash", inputTokens: 1_000_000, outputTokens: 1_000_000, cacheWriteTokens: 0, cacheReadTokens: 1_000_000 }],
+      },
+    });
+    expect(tokens.status()).toBe(200);
+
     const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=deepseek`, { headers: headers() })).json();
     expect(usage.live).toEqual(["deepseek"]);
     const card = usage.providers.find((entry) => entry.provider === "deepseek");
     expect(card.status).toBe("ok");
+    // The tab's own tokens section (with the imported actuals) stays beside the new ones.
+    const sectionIds = card.details.map((section) => section.id);
+    expect(sectionIds).toEqual(expect.arrayContaining(["deepseek-tokens-by-model", "deepseek-token-usage", "deepseek-token-usage-by-model"]));
+    expect(card.details.find((section) => section.id === "deepseek-token-usage").rows[2].value).toBe("in 1M · out 1M · cache w 0 · cache r 1M");
+    // The card's own section keeps its id under its new title; the new one names models as the card does.
+    expect(card.details.find((section) => section.id === "deepseek-tokens-by-model").label).toBe("Priced tokens by model");
+    expect(card.details.find((section) => section.id === "deepseek-token-usage-by-model").rows.map((row) => row.label)).toEqual(["DeepSeek Flash"]);
     const notes = Object.fromEntries(card.notes.map((note) => [note.id, note.text]));
     expect(notes["deepseek-balance-cny"]).toBe("Balance (CNY): ¥110.00 (topped up ¥100.00, granted ¥10.00)");
     // Peak flash: ¥0.04 + ¥2 + ¥8 per 1M.
@@ -476,7 +495,7 @@ test.describe("DeepSeek usage card", () => {
     // starting balance was set, and had read the balance before the rise
     // after it was set too: the top-up replaces it.
     const roseAt = new Date(Date.parse(startingBalanceSetAt) + 1).toISOString();
-    const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+    const db = new DatabaseSync(path.join(relay.dataDir, "oar.db"));
     try {
       db.prepare(`
         INSERT INTO deepseek_balance_reference (currency, reference_total, last_total, reference_at, updated_at, rose_at, last_read_at, rose_from_at)
@@ -609,7 +628,7 @@ test.describe("DeepSeek usage card", () => {
     // With the tab open, the relay notes a top-up after the setting, from a
     // read after it (as a poll of the usage card would).
     const roseAt = new Date().toISOString();
-    const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+    const db = new DatabaseSync(path.join(relay.dataDir, "oar.db"));
     try {
       db.prepare(`
         INSERT INTO deepseek_balance_reference (currency, reference_total, last_total, reference_at, updated_at, rose_at, last_read_at, rose_from_at)

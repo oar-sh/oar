@@ -24,6 +24,7 @@ function createSdkDeleteSessionCaller(sdkClient) {
 }
 
 import { cleanupGeneratedImagesForConversation } from './generated-image-cleanup-service.mjs';
+import { forgetTurnTokenRows } from './token-usage-service.mjs';
 
 export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateRoot = null, conversationGroups = null } = {}) {
   const callDeleteSession = createSdkDeleteSessionCaller(sdkClient);
@@ -55,6 +56,8 @@ export function createDeleteArchiveService(db, sdkClient, { resolveSessionStateR
       db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(conversationId);
       db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(conversationId);
+      // Its turns' tokens go too; the day sums stay.
+      forgetTurnTokenRows(db, [conversationId]);
       db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
     }),
   };

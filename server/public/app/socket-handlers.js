@@ -40,7 +40,7 @@ import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } fro
 import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
 import { applyRelaySchedules, loadRelaySchedules } from './relay-schedules-ui.js';
 import { noteInboxQuestionsChanged, noteRelayAskUpdated, refreshInbox } from './inbox-ui.js';
-import { RELAY_ASK_SOCKET_EVENT } from './inbox-view.mjs';
+import { INBOX_REMOTE_CHANGED_EVENT, RELAY_ASK_SOCKET_EVENT } from './inbox-view.mjs';
 import {
   upsertRelayQuestion,
   loadRelayQuestions,
@@ -104,6 +104,7 @@ import { stripRelayPromptContext } from './relay-prompt-sanitizer.mjs';
 import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 import { mergeRelayThoughts } from './relay-thoughts.mjs';
 import { conversationPayloadCache } from './conversation-payload-cache.mjs';
+import { planOnlyAfterBroadcast } from './plan-board-shared.mjs';
 
 // A live row of the conversation on screen joins its kept window, so a
 // switch away and back still shows it. Rows of other conversations do not:
@@ -664,12 +665,16 @@ export async function connectSocket(overrideDeps) {
     loadRelayQuestions(currentConvId);
     noteInboxQuestionsChanged();
   });
+  // A paired relay's pending cards changed (this relay checks them every ~20 s).
+  socket.on(INBOX_REMOTE_CHANGED_EVENT, () => noteInboxQuestionsChanged());
   // Questions that don't block: one ask, after every change of it.
   socket.on(RELAY_ASK_SOCKET_EVENT, (payload) => noteRelayAskUpdated(payload));
   socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_changed', () => {
     loadRelayBoards();
+    // Plan cards are in the Inbox too.
+    noteInboxQuestionsChanged();
   });
   // Relay event subscriptions: the whole active list, after every change.
   socket.on('relay_event_subscriptions', ({ subscriptions }) => {
@@ -846,7 +851,7 @@ export async function connectSocket(overrideDeps) {
     applyConversationTitleUpdate(conversationId, title, updatedAt);
     syncChatTitleControls();
   });
-  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, thinkingEnabled, thinkingDisplay, mayCreateSessions, senderClientId }) => {
+  socket.on('conversation_preferences_updated', ({ conversationId, preferredRelayMode, preferredModel, preferredReasoningEffort, autoCompactWindow, thinkingEnabled, thinkingDisplay, mayCreateSessions, planOnly, senderClientId }) => {
     if (senderClientId && senderClientId === CLIENT_ID) return;
     const id = String(conversationId || '').trim();
     if (!id || !conversations[id]) return;
@@ -872,6 +877,9 @@ export async function connectSocket(overrideDeps) {
       mayCreateSessions: typeof mayCreateSessions === 'boolean'
         ? mayCreateSessions
         : conversations[id].mayCreateSessions === true,
+      // Plan-only: a broadcast without it (an older relay, a board's mode
+      // follow-up) keeps the known value.
+      planOnly: planOnlyAfterBroadcast(planOnly, conversations[id].planOnly),
     };
     if (String(currentConvId || '').trim() === id) {
       applyConversationPreferencesForConversation(id, {

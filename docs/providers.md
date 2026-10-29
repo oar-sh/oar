@@ -47,6 +47,8 @@ Save your key in **⚙️ Settings → Providers → OpenAI**, together with the
 - **OpenAI (BYOK)** conversations run the Copilot runtime against that endpoint with your key, on whichever Copilot engine is selected.
 - **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it. The relay calls the OpenAI Images API itself (`/images/generations`, or `/images/edits` with an attached or generated image) on both Copilot engines; these turns never go to the Copilot runtime.
 
+Turns on your own key are counted in **Check Usage** on the Copilot tab, as **Tokens — own OpenAI key**, apart from the Copilot plan's figures and without a cost. OpenAI reports no cache writes, so that column reads "—".
+
 ## Claude (Agent SDK)
 
 *On oar.sh: [Claude](https://oar.sh/docs/providers/claude/)*
@@ -114,7 +116,7 @@ The turns are billed to the Console organisation the key belongs to. A Claude AP
 
 **Monthly cap.** An optional cap in US dollars on the tab. Once this month's estimated spend (the relay's calendar month, in its time zone) reaches it, new turns on the key, switches to the key and new Claude API chats are refused, until the 1st or until you raise it. A running turn finishes. A turn's cost is booked when it ends, so turns already running can take the month past the cap. The cap counts only the priced part of the estimate, and while a cap is set, a spend that cannot be read counts as reached. Spend limits set in the Console apply on top.
 
-**Spend.** The **Claude API** card in **Check Usage** shows what this relay's turns on the key are estimated to have cost today and this month, by model (see [Usage and context](web-ui.md#usage-and-context)). The figures are Claude Code's own estimate from its price table; the Console's [billing page](https://platform.claude.com/settings/billing) has the real ones and the balance.
+**Spend.** The **Claude API** card in **Check Usage** shows what this relay's turns on the key are estimated to have cost today and this month, by model, and their tokens with cache writes and cache reads apart (see [Usage and context](web-ui.md#usage-and-context)). The figures are Claude Code's own estimate from its price table; the Console's [billing page](https://platform.claude.com/settings/billing) has the real ones and the balance.
 
 **Subscriber API credit.** A Max or Team plan comes with monthly API credit for a Console organisation linked to the plan; a key from that organisation spends it first. OAR counts those turns in its estimate like any other, but it cannot see which pool paid, the credit or what you bought, nor how much of either is left.
 

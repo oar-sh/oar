@@ -6,6 +6,7 @@ import nodePathModule from 'node:path';
 
 import { createClaudeSessionRunner } from './claude-session-process.mjs';
 import { buildClaudePlanReadyBoardPayload } from './claude-turn-publisher.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { SLASH_COMMAND_GUARD } from '../../shared/slash-command-guard.mjs';
 import { ANSWERED_ELSEWHERE_KIND, DELIVERY_ANSWERED_ELSEWHERE_TEXT } from '../../shared/steer-settle-markers.mjs';
@@ -452,6 +453,9 @@ test('ExitPlanMode board falls back to the plan file when input.plan is empty', 
   assert.ok(board, 'plan board must be posted');
   assert.match(board.body.body, /1\. first/);
   assert.equal(board.body.boardType, 'plan_ready');
+  // The one shared list, "Approve plan" first.
+  assert.deepEqual(JSON.parse(JSON.stringify(board.body.actions)), JSON.parse(JSON.stringify(PLAN_BOARD_ACTIONS)));
+  assert.equal(board.body.actions[0].id, 'approve_only');
 });
 
 test('plan board payload requires plan text', () => {

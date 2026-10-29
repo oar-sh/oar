@@ -40,6 +40,8 @@ import { migrateQueueProvider } from './migrations/0031-queue-provider.mjs';
 import { migrateRuntimeSessionBillingSwitch } from './migrations/0032-runtime-session-billing-switch.mjs';
 import { migrateClaudeApiUsageCheckpoints } from './migrations/0033-claude-api-usage-checkpoints.mjs';
 import { migrateClaudeApiUsageTotals } from './migrations/0034-claude-api-usage-totals.mjs';
+import { migrateConversationPlanOnly } from './migrations/0035-conversation-plan-only.mjs';
+import { migrateTokenUsage } from './migrations/0036-token-usage.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1057,6 +1059,22 @@ try {
   migrateClaudeApiUsageTotals(db);
 } catch (error) {
   console.warn(`[claude-api-usage] migration 0034 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// A plan-only conversation, handled like 0020.
+try {
+  migrateConversationPlanOnly(db);
+} catch (error) {
+  console.warn(`[plan-only] migration 0035 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Tokens per turn and per day for every provider, with a one-time
+// copy of the Claude API and DeepSeek days. After 0025 and 0034: a missing
+// source throws here, so it is logged and retried next boot like 0034.
+try {
+  migrateTokenUsage(db);
+} catch (error) {
+  console.warn(`[token-usage] migration 0036 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

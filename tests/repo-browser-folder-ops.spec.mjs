@@ -122,6 +122,9 @@ test.describe("Repo browser folder operations", () => {
     await installStubs(page, tree, log);
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.openRepoBrowser === "function");
     await page.evaluate(() => window.openRepoBrowser());
     await expect(page.locator("#repo-browser-modal")).toHaveClass(/visible/);
   });

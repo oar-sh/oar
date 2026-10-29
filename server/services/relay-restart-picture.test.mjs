@@ -19,14 +19,116 @@ test('hosting: systemd needs the invocation id and a service cgroup, on Linux on
   assert.equal(detectRelayHosting({ env: {}, argv: ['node', 'server.js', '--supervised'], platform: 'linux' }).supervised, true);
 });
 
-test('survival: workers outlive a restart everywhere, and a shutdown except under systemd', () => {
+// The user manager's cgroup segment, built so no line reads as an email address.
+const USER_MANAGER = ['user', '1000.service'].join('@');
+
+test('hosting: the unit, and whether a user manager runs it', () => {
+  const detect = (cgroup) => {
+    const { systemd, unit, userManager } = detectRelayHosting({ env: { INVOCATION_ID: 'abc' }, argv: [], platform: 'linux', readCgroup: () => cgroup });
+    return { systemd, unit, userManager };
+  };
+  assert.deepEqual(detect(`0::/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/oar.service\n`), { systemd: true, unit: 'oar.service', userManager: true });
+  assert.deepEqual(detect(`0::/user.slice/user-1000.slice/${USER_MANAGER}/oar-relay.service\n`), { systemd: true, unit: 'oar-relay.service', userManager: true });
+  assert.deepEqual(detect('0::/system.slice/oar.service\n'), { systemd: true, unit: 'oar.service', userManager: false });
+  // A worker in a scope of its own, a tmux pane, a login shell: not the service.
+  for (const cgroup of [
+    `0::/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/run-r3f2a.scope\n`,
+    `0::/user.slice/user-1000.slice/${USER_MANAGER}/tmux-spawn-4c91.scope\n`,
+    '0::/user.slice/user-1000.slice/session-3.scope\n',
+    '',
+  ]) {
+    assert.deepEqual(detect(cgroup), { systemd: false, unit: '', userManager: false }, cgroup);
+  }
+  // cgroup v1 (hybrid): controller lines stop at the user manager; the
+  // unified and name=systemd lines name the unit.
+  assert.deepEqual(detect([
+    `10:memory:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `7:pids:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `1:name=systemd:/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/oar.service`,
+    `0::/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/oar.service`,
+  ].join('\n')), { systemd: true, unit: 'oar.service', userManager: true });
+  // v1 without the unified line: name=systemd alone.
+  assert.deepEqual(detect([
+    '12:cpu,cpuacct:/user.slice',
+    `1:name=systemd:/user.slice/user-1000.slice/${USER_MANAGER}/oar.service`,
+  ].join('\n')), { systemd: true, unit: 'oar.service', userManager: true });
+  // A scoped worker on a hybrid host: the memory line still ends in the
+  // user manager, but the worker is not the service.
+  assert.deepEqual(detect([
+    `10:memory:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `7:pids:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `1:name=systemd:/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/run-r3f2a.scope`,
+    `0::/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/run-r3f2a.scope`,
+  ].join('\n')), { systemd: false, unit: '', userManager: false });
+  // Only controller lines: nothing to tell from.
+  assert.deepEqual(detect(`10:memory:/user.slice/user-1000.slice/${USER_MANAGER}\n`), { systemd: false, unit: '', userManager: false });
+});
+
+test('hosting: the unified line counts only when it names a service (v2, hybrid with a bare 0::/, v1)', () => {
+  const detect = (cgroup) => {
+    const { systemd, unit, userManager } = detectRelayHosting({ env: { INVOCATION_ID: 'abc' }, argv: [], platform: 'linux', readCgroup: () => cgroup });
+    return { systemd, unit, userManager };
+  };
+  const service = { systemd: true, unit: 'oar.service', userManager: true };
+  const none = { systemd: false, unit: '', userManager: false };
+  // cgroup v2: the unified line only.
+  assert.deepEqual(detect(`0::/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/oar.service\n`), service);
+  // Hybrid: the unified hierarchy mounted but unused, a bare `0::/`; the
+  // name=systemd line names the unit.
+  const hybrid = (named) => [
+    '12:cpu,cpuacct:/user.slice',
+    `10:memory:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `1:name=systemd:/user.slice/user-1000.slice/${USER_MANAGER}/${named}`,
+    '0::/',
+    '',
+  ].join('\n');
+  assert.deepEqual(detect(hybrid('app.slice/oar.service')), service);
+  assert.deepEqual(detect(hybrid('app.slice/run-r3f2a.scope')), none, 'a scoped worker is still not the service');
+  // cgroup v1: no unified line at all.
+  assert.deepEqual(detect([
+    '12:cpu,cpuacct:/user.slice',
+    `10:memory:/user.slice/user-1000.slice/${USER_MANAGER}`,
+    `1:name=systemd:/user.slice/user-1000.slice/${USER_MANAGER}/app.slice/oar.service`,
+    '',
+  ].join('\n')), service);
+});
+
+test('survival: workers outlive a restart and a shutdown, under systemd in scopes of their own', () => {
   assert.equal(describeRestartSurvival({ action: 'restart', hosting: { systemd: true } }).workersSurvive, true);
   assert.equal(describeRestartSurvival({ action: 'restart', hosting: {} }).workersSurvive, true);
   assert.equal(describeRestartSurvival({ action: 'shutdown', hosting: {} }).workersSurvive, true);
-  const stop = describeRestartSurvival({ action: 'shutdown', hosting: { systemd: true } });
-  assert.equal(stop.workersSurvive, false);
+  const stop = describeRestartSurvival({ action: 'shutdown', hosting: { systemd: true, userManager: true, workerScopes: true } });
+  assert.equal(stop.workersSurvive, true);
   assert.match(stop.summary, /systemd/);
-  assert.match(stop.summary, /may stop/);
+  assert.match(stop.summary, /scopes of their own and keep running/);
+  assert.match(stop.summary, /A worker on a tmux server or in a process started before OAR 0\.9\.20, inside the service, may stop once/);
+  // A user service restarts as a whole: the same rule.
+  const restart = describeRestartSurvival({ action: 'restart', hosting: { systemd: true, userManager: true, workerScopes: true } });
+  assert.equal(restart.workersSurvive, true);
+  assert.match(restart.summary, /a restart restarts the service/);
+  // A system service only relaunches the runtime on a restart.
+  assert.doesNotMatch(describeRestartSurvival({ action: 'restart', hosting: { systemd: true, userManager: false, workerScopes: false } }).summary, /systemd/);
+});
+
+test('survival: under systemd, workers that could not get scopes of their own may stop', () => {
+  for (const action of ['shutdown', 'restart']) {
+    for (const workerScopes of [false, undefined]) {
+      const survival = describeRestartSurvival({ action, hosting: { systemd: true, userManager: true, workerScopes } });
+      assert.equal(survival.workersSurvive, false, `${action} ${workerScopes}`);
+      assert.match(survival.summary, /could not start its session workers outside it/);
+    }
+  }
+  // A system service: no scopes, a shutdown may take the workers.
+  assert.equal(describeRestartSurvival({ action: 'shutdown', hosting: { systemd: true, userManager: false, workerScopes: false } }).workersSurvive, false);
+  const collect = createRestartPictureCollector({
+    db: null,
+    hosting: { systemd: true, userManager: true, unit: 'oar.service' },
+    workerScopes: () => false,
+    backgroundWorkView: { backgroundBlockers: () => [{ kind: 'background', conversationId: 'c1', title: 'export' }] },
+  });
+  const picture = collect({ action: 'shutdown' });
+  assert.equal(picture.survival.workersSurvive, false);
+  assert.equal(picture.backgroundTasks[0].survives, false);
 });
 
 const QUEUE_ROWS = [
@@ -61,12 +163,17 @@ test('the picture: processing sessions wait, pending and parked are held, backgr
   assert.equal(picture.survival.workersSurvive, true);
 });
 
-test('a shutdown under systemd stops the local workers\' tasks; a cloud session\'s survive', () => {
+test('a shutdown under systemd keeps the tasks of scoped workers', () => {
+  const picture = buildRestartPicture({ action: 'shutdown', backgroundBlockers: BLOCKERS, hosting: { systemd: true, workerScopes: true } });
+  assert.ok(picture.backgroundTasks.every((task) => task.survives === true));
+});
+
+test('a shutdown under systemd stops the tasks of workers without a scope; a cloud session\'s survive', () => {
   const picture = buildRestartPicture({
     action: 'shutdown',
     queueRows: [],
     backgroundBlockers: BLOCKERS,
-    hosting: { systemd: true },
+    hosting: { systemd: true, workerScopes: false },
     providerOf: (id) => (id === 'c5' ? 'claude-cloud' : 'claude'),
   });
   const byId = Object.fromEntries(picture.backgroundTasks.map((task) => [task.conversationId, task]));

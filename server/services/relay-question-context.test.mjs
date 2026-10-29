@@ -51,3 +51,14 @@ test('an unknown relay mode falls back to the default', () => {
   assert.equal(sanitizeRelayQuestionContext({ relayMode: 'bogus' }, { normalizeRelayMode, defaultRelayMode: 'agent' }).relayMode, 'agent');
   assert.equal(sanitizeRelayQuestionContext({ relayMode: 'plan' }, { normalizeRelayMode }).relayMode, 'plan');
 });
+
+test('an approval card\'s variant (a listed one only) and its bounded summary survive', () => {
+  const context = sanitizeRelayQuestionContext({ source: 'remote_relay', variant: 'loop_guard', summary: `  Loop guard:\n 30 prompts by 'Lead' ${'x'.repeat(300)}` });
+  assert.equal(context.variant, 'loop_guard');
+  assert.equal(context.summary.length, 160);
+  assert.ok(context.summary.startsWith('Loop guard: 30 prompts by \'Lead\' x'));
+  const dropped = sanitizeRelayQuestionContext({ source: 's', variant: 'delete_everything', summary: '   ' });
+  assert.equal('variant' in dropped, false);
+  assert.equal('summary' in dropped, false);
+  assert.equal('variant' in sanitizeRelayQuestionContext({ source: 's', variant: ['write'] }), false);
+});

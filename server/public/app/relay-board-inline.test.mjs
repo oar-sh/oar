@@ -28,6 +28,9 @@ test('the outcome names the action as its button did', () => {
   assert.equal(boardOutcomeLine({ status: 'acted', selectedAction: 'autopilot', actions }), 'Chosen: Implement in autopilot');
   assert.equal(boardOutcomeLine({ status: 'dismissed', selectedAction: 'exit_only', actions }), 'Chosen: Exit plan mode');
   assert.equal(chosenActionLabel({ selectedAction: 'keep_planning', actions }), 'keep planning');
+  // A card stored before "Approve plan" existed does not list it; the label
+  // still reads as the button did.
+  assert.equal(boardOutcomeLine({ status: 'acted', selectedAction: 'approve_only', actions }), 'Chosen: Approve plan');
   assert.equal(boardOutcomeLine({ status: 'dismissed', actions }), 'Dismissed');
 });
 

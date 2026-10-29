@@ -37,6 +37,10 @@ test('the browser copy matches shared/relay-events.mjs', () => {
       { ...event('turn_end', { preview: 'held' }), held: { reason: 'quiet', from: '23:00', to: '06:00', tz: 'Europe/Berlin' } },
       { ...event('task_failed', { kind: 'shell', description: 'npm test', exitCode: 1 }), held: { reason: 'digest', minutes: 30, subscriptionId: 'sub_fixture' } },
     ]),
+    shared.buildRelayEventMessageText([
+      event('question_answered', { questionId: 'ask_fixture01', prompt: 'Which?', answer: 'A' }),
+      event('board_settled', { boardId: 'brd_fixture01', action: 'exit_only', actionLabel: 'Stop here', title: 'Plan B' }),
+    ]),
     'a stray text',
   ];
   for (const text of samples) assert.deepEqual(parseRelayEventMessageText(text), shared.parseRelayEventMessageText(text));
@@ -69,6 +73,19 @@ test('a replayed row carries its tag and keeps the paired relay\'s name on each 
   assert.match(html, /<span class="relay-event-text">3 events · link lost, reply, link back<\/span>/);
   assert.match(html, /<li class="relay-event-line relay-event-turn-end">lab-relay · session/);
   assert.doesNotMatch(html, /Replayed: 1 event/, 'the replay header is the tag, not a line');
+});
+
+test('question_answered and board_settled rows are known types with their labels', () => {
+  const text = shared.buildRelayEventMessageText([
+    event('question_answered', { questionId: 'ask_fixture01', prompt: 'Which?', answer: 'A' }),
+    event('board_settled', { boardId: 'brd_fixture01', action: 'approve', actionLabel: 'Approve plan', title: 'Plan A', queuedMessageId: 'msg-fixture-1' }),
+  ]);
+  const parsed = parseRelayEventMessageText(text);
+  assert.deepEqual(parsed.types, ['question_answered', 'board_settled']);
+  assert.equal(relayEventSummaryText(parsed), '2 events · answer, plan card settled');
+  const html = renderRelayEventRowHtml({ role: 'user', kind: RELAY_EVENT_MESSAGE_KIND, text });
+  assert.match(html, /relay-event-line relay-event-question-answered/);
+  assert.match(html, /relay-event-line relay-event-board-settled/);
 });
 
 const SUBS = [

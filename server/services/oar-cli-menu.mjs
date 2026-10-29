@@ -76,6 +76,7 @@ const SERVICE_TEXT = {
   active: 'installed, running',
   installed: 'installed',
   none: 'not installed',
+  other: 'another OAR install\'s',
   unavailable: 'not available here',
 };
 

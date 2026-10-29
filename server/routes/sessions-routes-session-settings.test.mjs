@@ -715,3 +715,145 @@ test('a group name that became ambiguous before the write is refused, not create
   assert.match(result.body.error, /names several session groups.*These settings were changed before: cwd\./);
   assert.equal(fx.conversationGroups.listGroups().filter((group) => /twin batch/i.test(group.name)).length, 2, 'no third group');
 });
+
+// ─── Plan-only ─────────────────────────────────────────────────────
+
+test('a session starts plan-only through create_session\'s bootstrap: in plan, refused with another mode', async () => {
+  const fx = setup();
+  const lead = await fx.owned();
+  const id = await fx.bootstrap({ title: 'Plan lane', relayMode: undefined, planOnly: true, origin: LOCAL_ORIGIN(lead) }, loopbackHeaders, true);
+  assert.equal(fx.row(id).plan_only, 1);
+  assert.equal(fx.row(id).preferred_relay_mode, 'plan', 'no mode named: plan');
+  const named = await fx.bootstrap({ title: 'Plan lane 2', relayMode: 'plan', planOnly: true });
+  assert.equal(fx.row(named).plan_only, 1);
+  const refused = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Bad', relayMode: 'agent', planOnly: true } });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, 'PLAN_ONLY_MODE');
+  const typed = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Bad', planOnly: 'yes' } });
+  assert.equal(typed.status, 400);
+  // Plan mode alone never sets it.
+  const plain = await fx.bootstrap({ title: 'Plain plan', relayMode: 'plan' });
+  assert.equal(fx.row(plain).plan_only, null);
+  // The list and the detail show it.
+  const list = await fx.call('GET /api/conversations', { query: {} });
+  assert.equal(list.body.conversations.find((entry) => entry.id === id).planOnly, true);
+  assert.equal(list.body.conversations.find((entry) => entry.id === plain).planOnly, false);
+  const detail = await fx.call('GET /api/conversation/:id', { params: { id }, query: {} });
+  assert.equal(detail.body.planOnly, true);
+});
+
+test('update_session cannot switch a plan-only session out of plan; the dry run refuses first', async () => {
+  const fx = setup();
+  const { child } = await fx.agentMade();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(child);
+  for (const mode of ['agent', 'ask', 'autopilot']) {
+    const refused = await fx.asLocalAgent(child, { settings: { mode, title: 'Renamed' } });
+    assert.equal(refused.status, 409, mode);
+    assert.equal(refused.body.code, 'plan_only');
+    assert.match(refused.body.error, /plan-only; agents can't change its mode/);
+  }
+  const dry = await fx.asLocalAgent(child, { settings: { mode: 'agent' }, dry_run: true });
+  assert.equal(dry.status, 409);
+  const paired = await fx.asPairedAgent(child, { settings: { mode: 'agent' }, owner_approved: true });
+  assert.equal(paired.status, 409);
+  assert.equal(fx.row(child).preferred_relay_mode, 'plan');
+  assert.equal(fx.row(child).title, 'Agent chat', 'nothing in the call was applied');
+  // plan itself is fine, and so is a call that names no mode.
+  assert.equal((await fx.asLocalAgent(child, { settings: { mode: 'plan', title: 'Plan lane' } })).status, 200);
+  assert.equal(fx.row(child).title, 'Plan lane');
+  // planOnly:true with another mode in the same call: still plan-only after it.
+  const both = await fx.asLocalAgent(child, { settings: { planOnly: true, mode: 'agent' } });
+  assert.equal(both.status, 409);
+});
+
+test('planOnly:false and a mode in one call frees the session; agents may set it again with plan', async () => {
+  const fx = setup();
+  const { child } = await fx.agentMade();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(child);
+  const freed = await fx.asLocalAgent(child, { settings: { planOnly: false, mode: 'agent' } });
+  assert.equal(freed.status, 200, JSON.stringify(freed.body));
+  assert.deepEqual(freed.body.changed, ['mode', 'planOnly']);
+  assert.equal(freed.body.settings.planOnly, false);
+  assert.equal(fx.row(child).plan_only, 0);
+  assert.equal(fx.row(child).preferred_relay_mode, 'agent');
+  assert.equal(fx.events('conversation_preferences_updated').at(-1).planOnly, false);
+  // Set again: an agent-mode session needs mode plan in the same call.
+  const alone = await fx.asLocalAgent(child, { settings: { planOnly: true } });
+  assert.equal(alone.status, 400);
+  assert.match(alone.body.error, /add mode: "plan" in the same call/);
+  const dry = await fx.asLocalAgent(child, { settings: { planOnly: true }, dry_run: true });
+  assert.equal(dry.status, 400);
+  assert.equal(fx.row(child).plan_only, 0);
+  const locked = await fx.asLocalAgent(child, { settings: { planOnly: true, mode: 'plan' } });
+  assert.equal(locked.status, 200, JSON.stringify(locked.body));
+  assert.equal(fx.row(child).plan_only, 1);
+  assert.equal(fx.row(child).preferred_relay_mode, 'plan');
+  assert.equal(fx.events('conversation_preferences_updated').at(-1).planOnly, true);
+  // A session in plan already takes planOnly alone.
+  await fx.asLocalAgent(child, { settings: { planOnly: false, mode: 'agent' } });
+  await fx.asLocalAgent(child, { settings: { mode: 'plan' } });
+  assert.equal((await fx.asLocalAgent(child, { settings: { planOnly: true } })).status, 200);
+  assert.equal(fx.row(child).plan_only, 1);
+  const typed = await fx.asLocalAgent(child, { settings: { planOnly: 'maybe' } });
+  assert.equal(typed.status, 400);
+});
+
+test('the owner changes a plan-only session\'s mode and the flag; agents get neither through the preferences route', async () => {
+  const fx = setup();
+  const { child } = await fx.agentMade();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(child);
+  // The owner's composer: the mode changes, the flag stays.
+  const owner = await fx.call(PREFERENCES, { params: { id: child }, body: { clientId: 'client-a', preferredRelayMode: 'agent', preferredModel: 'gpt-5.4-mini' } });
+  assert.equal(owner.status, 200, JSON.stringify(owner.body));
+  assert.equal(fx.row(child).preferred_relay_mode, 'agent');
+  assert.equal(fx.row(child).plan_only, 1);
+  assert.equal(owner.body.planOnly, true);
+  // An agent through the same route: no mode other than plan, no flag at all.
+  fx.db.prepare(`UPDATE conversations SET preferred_relay_mode = 'plan' WHERE id = ?`).run(child);
+  for (const headers of [agentHeaders, loopbackHeaders]) {
+    const loopback = headers === loopbackHeaders;
+    const mode = await fx.call(PREFERENCES, { params: { id: child }, body: { preferredRelayMode: 'agent' }, headers, loopback });
+    assert.equal(mode.status, 409);
+    assert.equal(mode.body.code, 'plan_only');
+    const flag = await fx.call(PREFERENCES, { params: { id: child }, body: { planOnly: false }, headers, loopback });
+    assert.equal(flag.status, 403);
+  }
+  assert.equal(fx.row(child).preferred_relay_mode, 'plan');
+  assert.equal(fx.row(child).plan_only, 1);
+  // The owner's toggle, off and on; another write leaves it alone.
+  const off = await fx.call(PREFERENCES, { params: { id: child }, body: { clientId: 'client-a', planOnly: false } });
+  assert.equal(off.body.planOnly, false);
+  assert.equal(fx.events('conversation_preferences_updated').at(-1).planOnly, false);
+  const on = await fx.call(PREFERENCES, { params: { id: child }, body: { planOnly: true } });
+  assert.equal(on.body.planOnly, true);
+  await fx.call(PREFERENCES, { params: { id: child }, body: { thinkingEnabled: false } });
+  assert.equal(fx.row(child).plan_only, 1);
+  assert.equal((await fx.call(PREFERENCES, { params: { id: child }, body: { planOnly: 'yes' } })).status, 400);
+});
+test('planOnly:false counts only with a new mode: alone or with plan it is passed over, and the answer says so', async () => {
+  const fx = setup();
+  const { child } = await fx.agentMade();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(child);
+  for (const settings of [{ planOnly: false }, { planOnly: false, mode: 'plan' }]) {
+    const passed = await fx.asLocalAgent(child, { settings });
+    assert.equal(passed.status, 200, JSON.stringify(passed.body));
+    assert.deepEqual(passed.body.changed, []);
+    assert.ok(passed.body.notes.includes('planOnly unchanged: clear it in the same call as the new mode.'), JSON.stringify(settings));
+    assert.equal(fx.row(child).plan_only, 1);
+  }
+  // A caller that sends every property, false for the empty ones: its title still changes, the lock stays.
+  const filled = await fx.asLocalAgent(child, { settings: { title: 'Plan lane', planOnly: false, thinking_enabled: false } });
+  assert.equal(filled.status, 200, JSON.stringify(filled.body));
+  assert.ok(filled.body.changed.includes('title'));
+  assert.ok(!filled.body.changed.includes('planOnly'));
+  assert.equal(fx.row(child).plan_only, 1);
+  assert.equal(fx.row(child).title, 'Plan lane');
+  // The dry run says the same.
+  const dry = await fx.asLocalAgent(child, { settings: { planOnly: false }, dry_run: true });
+  assert.deepEqual(dry.body.changed, []);
+  assert.ok(dry.body.notes.includes('planOnly unchanged: clear it in the same call as the new mode.'));
+  // A session that is not plan-only: nothing to say.
+  fx.db.prepare(`UPDATE conversations SET plan_only = NULL WHERE id = ?`).run(child);
+  const free = await fx.asLocalAgent(child, { settings: { planOnly: false, title: 'Free' } });
+  assert.equal(free.body.notes, undefined);
+});

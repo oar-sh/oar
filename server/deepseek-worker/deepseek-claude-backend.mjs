@@ -35,6 +35,7 @@
 // (api-docs.deepseek.com, quick_start/agent_integrations/claude_code).
 
 import { deepseekAnthropicBaseUrl } from '../../shared/deepseek-api.mjs';
+import { estimateCost } from '../../shared/deepseek-pricing.mjs';
 import { isHostClaudeSessionVariable } from '../../shared/host-claude-session-env.mjs';
 import { CLAUDE_CLI_KEY_CHAT_SETTINGS, claudeCliPinnedEnv } from '../claude-worker/claude-cli-pinned-env.mjs';
 import {
@@ -262,6 +263,19 @@ export function createDeepSeekClaudeBackend({ env = process.env } = {}) {
     // relay's model ids (relayModel); the relay books what each report adds.
     // Claude Code's `total_cost_usd` is at Claude's prices and is not sent.
     usageRoute: '/api/deepseek-plan-usage',
+    // A turn's tokens (POST /api/turn-token-usage) are priced at DeepSeek's
+    // own rates for the time, as the card's estimate is: cache writes and
+    // fresh input are both misses. Null for a model the table has no price for.
+    turnTokenCost: (entry, at) => {
+      const costUsd = estimateCost({
+        model: entry.model,
+        at,
+        hitTokens: entry.cacheReadTokens,
+        missTokens: entry.inputTokens + entry.cacheWriteTokens,
+        outputTokens: entry.outputTokens,
+      });
+      return { costUsd, costSource: costUsd === null ? null : 'oar-deepseek-table' };
+    },
 
     // A Claude id is not a model of DeepSeek's to request, only one it may
     // have served (relayModel).

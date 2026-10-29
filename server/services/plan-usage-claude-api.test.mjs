@@ -275,9 +275,14 @@ test('the card: no card without a key and off; switched off keeps the month\'s f
   // Console billing once, in the card's links: the estimate note has none.
   assert.equal(noteOf(card, 'claude-api-estimate').link ?? null, null);
   assert.equal(card.links.filter((link) => link.label === 'Console billing').length, 1);
-  const tokens = card.details.find((section) => section.id === 'claude-api-tokens-by-model');
-  assert.equal(tokens.rows[0].label, 'Claude Sonnet 5.5 (Console)');
-  assert.equal(tokens.rows[0].value, 'cache read 0 · other input 1.5M · output 20.0k');
+  // The card's own tokens-by-model section is gone: the Tokens sections every
+  // tab gets replace it (plan-usage-tokens.mjs), with cache writes apart.
+  assert.equal(card.details.some((section) => section.id === 'claude-api-tokens-by-model'), false);
+  // The names it gave its models, for the Tokens sections: the Console's, else Claude's label, else the id.
+  assert.equal(app.planUsage.modelLabel(SONNET), 'Claude Sonnet 5.5 (Console)');
+  assert.equal(app.planUsage.modelLabel('claude-opus-5-5'), 'Claude Opus 5.5');
+  assert.equal(app.planUsage.modelLabel('claude-new-model'), 'claude-new-model');
+  assert.ok(card.details.some((section) => section.id === 'claude-api-spend-by-model'));
   const empty = setup().planUsage.buildCard();
   assert.match(empty.message, /No turns on the Claude API key this month yet/);
   assert.equal(noteOf(empty, 'claude-api-spend-month').value, '$0.00');

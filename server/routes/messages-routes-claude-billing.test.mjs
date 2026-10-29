@@ -731,3 +731,22 @@ test('the way out a Claude API note names follows the refusal: the cap, switched
   assert.equal(claudeApiRemedyText({ code: 'CLAUDE_API_NOT_CONFIGURED', switchedOff: true }), 'Switch this chat to the subscription, or switch Claude API on in Settings → Providers → Claude API');
   assert.equal(claudeApiRemedyText({ code: 'CLAUDE_API_NOT_CONFIGURED' }), 'Switch this chat to the subscription, or set Claude API up in Settings → Providers → Claude API');
 });
+
+test('a plan-only chat: an agent\'s billing switch with a message that names another mode is refused before the switch', async () => {
+  const app = boot({ provider: 'claude' });
+  app.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(CONV);
+  const refused = await app.post('/api/conversation/:id/billing', {
+    to: 'claude-api', by: 'agent', message: { clientId: 'agent-1', text: 'implement on the key', model: MODEL, relayMode: 'agent' },
+  }, { params: { id: CONV }, headers: AGENT_HEADERS });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.code, 'plan_only');
+  assert.equal(app.runtime().provider_type, 'claude', 'the billing is as it was');
+  assert.deepEqual(app.queueRows(), []);
+  // A message that stays in plan switches and queues as before.
+  const planned = await app.post('/api/conversation/:id/billing', {
+    to: 'claude-api', by: 'agent', message: { clientId: 'agent-1', text: 'plan on the key', model: MODEL },
+  }, { params: { id: CONV }, headers: AGENT_HEADERS });
+  assert.equal(planned.status, 200, JSON.stringify(planned.body));
+  assert.equal(app.runtime().provider_type, 'claude-api');
+  assert.deepEqual(app.queueRows().map((row) => row.provider), ['claude-api']);
+});

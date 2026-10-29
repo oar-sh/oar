@@ -779,3 +779,97 @@ test('tool-call summary and a following session.task_complete event agree idempo
   ]);
   assert.equal(terminal(actions).text, 'same summary');
 });
+
+// The token booking's view of a turn (POST /api/turn-token-usage): per model,
+// the four token kinds apart, and a field no call carried stays null.
+// Counts are made up; the runtime's prompt count includes the cached tokens.
+function tokenTurn(extra = []) {
+  return [
+    { type: 'assistant.turn_start', data: { interactionId: 'i-1' } },
+    { type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 1_000, cacheReadTokens: 600, cacheWriteTokens: 100, outputTokens: 50, reasoningTokens: 20, interactionType: 'conversation-agent' } },
+    { type: 'subagent.started', agentId: 'agent-7', data: { toolCallId: 'call-7', name: 'researcher' } },
+    { type: 'assistant.usage', agentId: 'agent-7', data: { model: 'claude-haiku-5-5', inputTokens: 300, outputTokens: 30, interactionType: 'conversation-subagent' } },
+    { type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 900, cacheReadTokens: 850, cacheWriteTokens: 0, outputTokens: 40, reasoningTokens: 0 } },
+    ...extra,
+    { type: 'assistant.idle', data: {} },
+  ];
+}
+const tokensOf = (actions) => terminal(actions).usage.models;
+
+test('tokens: one entry per model; a sub-agent\'s model is its own, not the turn\'s', () => {
+  const { actions } = run(tokenTurn());
+  assert.deepEqual(tokensOf(actions), [
+    // Fresh input is the prompt count less the cache reads and writes, per call.
+    { model: 'gpt-5.5', inputTokens: 350, outputTokens: 90, cacheReadTokens: 1_450, cacheWriteTokens: 100, reasoningTokens: 20 },
+    // The sub-agent's calls carry no cache fields: they stay unknown, not 0.
+    { model: 'claude-haiku-5-5', inputTokens: 300, outputTokens: 30, cacheReadTokens: null, cacheWriteTokens: null, reasoningTokens: null },
+  ]);
+  // The turn's reported model is still the main thread's.
+  assert.equal(terminal(actions).usage.model, 'gpt-5.5');
+});
+
+test('tokens: a prompt count below its cache figures floors fresh input at 0, never negative', () => {
+  const { actions } = run([
+    { type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 100, cacheReadTokens: 400, outputTokens: 1 } },
+    { type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 50, cacheReadTokens: 40, cacheWriteTokens: 30, outputTokens: 1 } },
+    { type: 'assistant.idle', data: {} },
+  ]);
+  // Per call: max(0, 100 - 400) + max(0, 50 - 40 - 30), not -290 + -20.
+  assert.equal(tokensOf(actions)[0].inputTokens, 0);
+  assert.equal(tokensOf(actions)[0].cacheReadTokens, 440);
+  assert.equal(tokensOf(actions)[0].cacheWriteTokens, 30);
+});
+
+test('tokens: OAR_DEBUG_TOKEN_USAGE\'s hook gets the raw counts of every call, no ids', () => {
+  const seen = [];
+  const normalizer = createCopilotEventNormalizer({ debugTokenUsage: (fields) => seen.push(fields) });
+  normalizer.normalize({ type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 1_200, cacheReadTokens: 1_000, outputTokens: 9, apiCallId: 'chatcmpl-example', providerCallId: 'p-1' } });
+  assert.deepEqual(seen, [{
+    model: 'gpt-5.5', interactionType: null, inputTokens: 1_200, cacheReadTokens: 1_000, cacheWriteTokens: null, outputTokens: 9, reasoningTokens: null,
+  }]);
+});
+
+test('tokens: a compaction\'s own call is booked from compaction_complete', () => {
+  const { actions } = run(tokenTurn([
+    { type: 'session.compaction_start', data: {} },
+    { type: 'session.compaction_complete', data: { success: true, compactionTokensUsed: { model: 'gpt-5.5-mini', inputTokens: 5_000, cacheReadTokens: 4_000, cacheWriteTokens: 0, outputTokens: 700 } } },
+  ]));
+  const compaction = tokensOf(actions).find((entry) => entry.model === 'gpt-5.5-mini');
+  assert.deepEqual(compaction, { model: 'gpt-5.5-mini', inputTokens: 1_000, outputTokens: 700, cacheReadTokens: 4_000, cacheWriteTokens: 0, reasoningTokens: null });
+});
+
+test('tokens: a compaction the runtime reported as a usage event is not counted twice', () => {
+  const { actions } = run(tokenTurn([
+    { type: 'assistant.usage', data: { model: 'gpt-5.5-mini', inputTokens: 5_000, cacheReadTokens: 4_000, outputTokens: 700, interactionType: 'conversation-compaction' } },
+    { type: 'session.compaction_complete', data: { success: true, compactionTokensUsed: { model: 'gpt-5.5-mini', inputTokens: 5_000, cacheReadTokens: 4_000, outputTokens: 700 } } },
+  ]));
+  const compaction = tokensOf(actions).find((entry) => entry.model === 'gpt-5.5-mini');
+  assert.equal(compaction.inputTokens, 1_000);
+  assert.equal(compaction.outputTokens, 700);
+});
+
+test('tokens: a compaction reported as a usage event after compaction_complete is not counted twice either', () => {
+  const { actions } = run(tokenTurn([
+    { type: 'session.compaction_complete', data: { success: true, compactionTokensUsed: { model: 'gpt-5.5-mini', inputTokens: 5_000, cacheReadTokens: 4_000, outputTokens: 700 } } },
+    { type: 'assistant.usage', data: { model: 'gpt-5.5-mini', inputTokens: 5_000, cacheReadTokens: 4_000, outputTokens: 700, interactionType: 'conversation-compaction' } },
+  ]));
+  const compaction = tokensOf(actions).find((entry) => entry.model === 'gpt-5.5-mini');
+  assert.equal(compaction.inputTokens, 1_000);
+  assert.equal(compaction.outputTokens, 700);
+});
+
+test('tokens: a compaction call without its own model id takes the event\'s, then the session\'s', () => {
+  const { actions } = run(tokenTurn([
+    { type: 'session.compaction_complete', data: { success: true, model: 'gpt-5.5-mini', compactionTokensUsed: { inputTokens: 300, outputTokens: 30 } } },
+  ]));
+  assert.equal(tokensOf(actions).find((entry) => entry.model === 'gpt-5.5-mini').inputTokens, 300);
+});
+
+test('tokens: a call without a model id is the turn\'s model\'s', () => {
+  const { actions } = run([
+    { type: 'assistant.usage', data: { model: 'gpt-5.5', inputTokens: 10, outputTokens: 1 } },
+    { type: 'assistant.usage', data: { inputTokens: 5, outputTokens: 2 } },
+    { type: 'assistant.idle', data: {} },
+  ]);
+  assert.deepEqual(tokensOf(actions).map((entry) => [entry.model, entry.inputTokens, entry.outputTokens]), [['gpt-5.5', 15, 3]]);
+});

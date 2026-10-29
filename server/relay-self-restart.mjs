@@ -1,7 +1,8 @@
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import path from 'path';
 import { RELAY_RESTART_EXIT_CODE, RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
 import { relayRuntimeNodeFlags, relayRuntimeNodeFlagsOrNone } from './relay-heap-guard.mjs';
+import { detectRelayHosting } from './services/relay-restart-picture.mjs';
 
 // Role selection travels on argv, never in the environment. The runtime's env is
 // inherited by tmux worker sessions and by the Copilot CLI it launches, and the
@@ -76,6 +77,64 @@ function waitForChildExit(child) {
   });
 }
 
+// A systemctl --user call of the handover: its result, never a throw.
+function runSystemctl(spawnSyncImpl, args) {
+  try {
+    return spawnSyncImpl('systemctl', ['--user', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 }) || { status: null };
+  } catch (error) {
+    return { status: null, error };
+  }
+}
+
+function systemctlFailure(result) {
+  if (result.error) return result.error.message || String(result.error);
+  const said = String(result.stderr || '').trim().split('\n')[0];
+  return `status ${result.status ?? 'none'}${said ? `: ${said}` : ''}`;
+}
+
+/**
+ * The runtime asked for a restart (exit 75). Under a user service whose main
+ * process this supervisor is, systemd restarts the whole service, so the new
+ * supervisor and runtime run the code on disk with fresh Node flags: true
+ * once systemd's stop (SIGTERM) has come. False, with one log line, wherever
+ * that cannot be done (not the unit's main process: a relay started inside a
+ * worker of the service), systemctl fails, or no stop comes within
+ * `handoverWaitMs`; the caller relaunches the runtime itself then.
+ */
+async function handRestartToSystemd({ hosting, spawnSyncImpl, pid, handoverWaitMs, shutdownRequested, isShuttingDown, delay, logger }) {
+  if (!hosting?.systemd || !hosting.userManager || !hosting.unit) return false;
+  const { unit } = hosting;
+  const main = runSystemctl(spawnSyncImpl, ['show', '-p', 'MainPID', '--value', unit]);
+  const mainPid = Number(String(main.stdout ?? '').trim());
+  if (main.status !== 0 || mainPid !== pid) {
+    const whose = main.status === 0 ? `its main process is ${mainPid || 'none'}` : `its main process could not be read (${systemctlFailure(main)})`;
+    logger?.log?.(`[relay] restart: not handed to systemd, ${unit} is not this supervisor's (pid ${pid}; ${whose}).`);
+    return false;
+  }
+  // Clears a failed state and the restart backoff; restart's answer alone decides.
+  runSystemctl(spawnSyncImpl, ['reset-failed', unit]);
+  // A stop that came in meanwhile wins: a queued restart could replace its job.
+  // The calls above block; a signal that arrived during them waits on the
+  // signal pipe, which only the loop's poll phase reads. This runs from the
+  // runtime's 'exit' callback, itself in a poll phase, so one setImmediate
+  // would run in the check phase right after it, before the pipe is read;
+  // the second runs after the next poll phase has delivered the signal.
+  await new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
+  if (isShuttingDown()) {
+    logger?.log?.(`[relay] restart: a stop came in; not restarting ${unit}.`);
+    return true;
+  }
+  const restart = runSystemctl(spawnSyncImpl, ['restart', '--no-block', unit]);
+  if (restart.status !== 0) {
+    logger?.log?.(`[relay] restart: systemctl --user restart --no-block ${unit} failed (${systemctlFailure(restart)}).`);
+    return false;
+  }
+  logger?.log?.(`[relay] restart handed to systemd: ${unit} restarts with the code on disk.`);
+  const stopped = await Promise.race([shutdownRequested.then(() => true), Promise.resolve(delay(handoverWaitMs)).then(isShuttingDown)]);
+  if (!stopped) logger?.log?.(`[relay] restart: systemd did not stop ${unit} within ${Math.round(handoverWaitMs / 1000)} s.`);
+  return stopped;
+}
+
 export async function runDirectRelaySupervisor({
   scriptPath,
   args = [],
@@ -96,16 +155,26 @@ export async function runDirectRelaySupervisor({
   // crashes days apart are not a crash loop.
   crashCountResetMs = 10 * 60 * 1000,
   now = Date.now,
+  // How this process is run (detectRelayHosting); read at the first restart
+  // request when not given.
+  hosting = null,
+  spawnSyncImpl = spawnSync,
+  pid = process.pid,
+  // How long a restart handed to systemd waits for its SIGTERM.
+  handoverWaitMs = 30_000,
 } = {}) {
   let runtimeProc = null;
   let shuttingDown = false;
   let shutdownExitCode = 0;
+  let shutdownArrived;
+  const shutdownRequested = new Promise((resolve) => { shutdownArrived = resolve; });
 
   const requestShutdown = (signal = 'SIGTERM', exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     shutdownExitCode = exitCode;
     stopChildProcess(runtimeProc, { signal });
+    shutdownArrived();
   };
 
   const handleSigInt = () => requestShutdown('SIGINT', 0);
@@ -165,8 +234,20 @@ export async function runDirectRelaySupervisor({
         : null;
       const signal = exitCode === null ? (result.signal || null) : null;
       if (exitCode === RELAY_RESTART_EXIT_CODE) {
-        logger?.log?.(`[relay] runtime requested restart; relaunching ${path.basename(String(scriptPath || ''))}...`);
         crashCount = 0;
+        const handedOver = await handRestartToSystemd({
+          hosting: hosting || detectRelayHosting({ env }),
+          spawnSyncImpl,
+          pid,
+          handoverWaitMs,
+          shutdownRequested,
+          isShuttingDown: () => shuttingDown,
+          delay,
+          logger,
+        });
+        // systemd's stop: this supervisor ends, systemd starts the next one.
+        if (handedOver || shuttingDown) return await exitImpl(shutdownExitCode);
+        logger?.log?.(`[relay] runtime requested restart; relaunching ${path.basename(String(scriptPath || ''))}...`);
         await delay(restartDelayMs);
         continue;
       }

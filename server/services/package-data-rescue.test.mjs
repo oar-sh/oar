@@ -541,3 +541,21 @@ test('failing to look for an old package is no copy failure: the install goes on
     setup.cleanup();
   }
 });
+
+test('an old package\'s copilot.db with its -wal, or a later one\'s oar.db, is copied under its own name', () => {
+  for (const name of ['copilot.db', 'oar.db']) {
+    const setup = createUpdate({ oldDatabase: false });
+    try {
+      const file = path.join(setup.oldServer, 'data', name);
+      writeDatabase(file, `marker-${name}`);
+      fs.writeFileSync(`${file}-wal`, '');
+      assert.equal(rescue(setup).status, 'rescued', name);
+      const target = path.join(setup.dataDir, RESCUE_DIR_NAME, STAMP, 'data');
+      assert.equal(readMarker(path.join(target, name)), `marker-${name}`);
+      assert.ok(fs.existsSync(path.join(target, `${name}-wal`)), `${name}: its -wal too`);
+      assert.deepEqual(fs.readdirSync(target).filter((entry) => entry.endsWith('.db')), [name]);
+    } finally {
+      setup.cleanup();
+    }
+  }
+});

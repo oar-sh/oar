@@ -172,3 +172,32 @@ test('an init with the saved key as its source goes on as a normal turn', async 
   spawns[0].turn.endInput();
   await settled(runner);
 });
+
+test('a Claude API turn books its tokens as the key\'s, cache writes apart', async () => {
+  const stub = makeApiStub();
+  const { spawns, startImpl } = spawningStart();
+  const runner = makeRunner({ stub, startImpl, backend, defaultModel: 'claude-sonnet-5' });
+  const done = runner.handlePendingPayload({ message: { ...baseMessage } });
+  await waitFor(() => totalPushes(spawns) > 0, { label: 'q-1 pushed' });
+  const { turn } = spawns[0];
+  turn.emit(apiInit('native-1'));
+  turn.emit(pushedReplay(turn.pushed[0]));
+  turn.emit(assistantText('answer to q-1'));
+  turn.emit({
+    ...resultMessage('answer to q-1', 'native-1'),
+    modelUsage: { 'claude-sonnet-5': { inputTokens: 40, cacheCreationInputTokens: 1_500, cacheReadInputTokens: 9_000, outputTokens: 70, costUSD: 0.02 } },
+  });
+  assert.equal(await done, true);
+  await waitFor(() => routeCalls(stub, '/api/turn-token-usage').length === 1, { label: 'token report' });
+  const [report] = routeCalls(stub, '/api/turn-token-usage').map((call) => call.body);
+  assert.equal(report.provider, 'claude-api');
+  assert.equal(report.turnId, baseMessage.id);
+  assert.deepEqual(report.models, [{
+    model: 'claude-sonnet-5', inputTokens: 40, cacheWriteTokens: 1_500, cacheReadTokens: 9_000, outputTokens: 70, costUsd: 0.02, costSource: 'claude-code', costUnknown: false,
+  }]);
+  // The key's booking still gets the writes folded into its misses.
+  const [billing] = routeCalls(stub, '/api/claude-api-usage').map((call) => call.body);
+  assert.equal(billing.runCounts[0].missTokens, 1_540);
+  spawns[0].turn.endInput();
+  await settled(runner);
+});

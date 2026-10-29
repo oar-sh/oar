@@ -3,6 +3,323 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.20] — 2026-10-29
+
+Highlights: every plan card gets an "Approve plan" button that approves the
+plan without starting the implementation and keeps the session in plan mode,
+and a session can be locked in plan mode (`planOnly`) so agents cannot take
+it out; plan cards are in the Inbox. Check Usage shows the tokens of every
+turn for every provider: input, output, cache writes and cache reads, for
+today, this month and all time, and by model. The relay backs up its database
+before a new version's migrations and keeps the last two copies; `oar backup`
+takes one by hand. A new database is `oar.db`; an existing install keeps
+running on `copilot.db`, nothing is renamed. Under the systemd service a
+restart hands the relay to systemd with its new code, waits for running turns
+and keeps session workers, and `oar service` works in a git checkout. A paired
+relay's approval cards in the Inbox say what they are about, a card a turn
+there waits on pushes once to your devices, and the badge is current within
+about 20 s. An open fold in the Inbox stays open.
+
+### Added
+
+- **"Approve plan" on every plan card.** It is the first button of every
+  provider's card (the Copilot CLI's own list gets it too), also on cards that
+  were waiting when the relay was updated. It marks the plan approved and
+  queues exactly "Plan approved by the user. Do not implement. Finish only the
+  plan-only steps you were given, then stop." That one turn runs in agent mode
+  (plan mode blocks writes, and the plan doc may need a commit); the session
+  stays in plan mode, so the next message plans again. Pressed while the plan
+  turn still runs, the follow-up waits for it and runs as its own turn.
+- **Plan-only sessions (`planOnly`).** An optional lock, set only when asked:
+  relay_tool `create_session` with `planOnly: true` (no mode named: it starts
+  in plan; another mode is refused), `update_session` with `planOnly: true`
+  (with `mode: "plan"` unless the session is in plan already), or the owner's
+  switch "Plan only: agents can't take this session out of plan mode" in the
+  context modal, for every session. Plan mode alone never sets it.
+  - An agent's `send` or `update_session` that names another mode gets HTTP
+    409, code `plan_only`: "This session is plan-only; agents can't change its
+    mode. Clear planOnly first, or ask the user." Nothing is queued or changed
+    (an update_session dry run refuses before any Allow card). A send without
+    a mode runs in the session's saved mode. An agent's mode change through the preferences route
+    is refused (409), and so is any planOnly change there (403).
+  - `update_session` with `planOnly: false` counts only in the same call that
+    names a mode other than plan (`{planOnly: false, mode: "agent"}`). Alone,
+    or with `mode: "plan"`, it is ignored, and on a plan-only session the answer says
+    "planOnly unchanged: clear it in the same call as the new mode", so a client that
+    sends every property as false cannot drop the lock. The owner's switch
+    clears it any time.
+  - The owner still changes the mode freely; the mode select shows "Plan 🔒".
+    On such a session the card recommends "Approve plan" and asks "This
+    session is plan-only. <label> leaves plan mode. Go on?" before "Implement
+    in autopilot", "Implement with autopilot fleet" and "Stop here and prompt
+    myself".
+  - list_sessions and read_session show `planOnly: true`. A compaction keeps
+    the lock; a turn cut by a usage limit or a restart goes on in plan, except
+    the "Approve plan" turn itself. A plan-only conversation's own agent counts
+    as a plan-mode caller during that turn too.
+  - Migration 0035 adds `conversations.plan_only`.
+  - A relay on 0.9.19 still sends its caller's mode with every `send`: a send
+    from a non-plan 0.9.19 caller to a plan-only session is refused. A
+    `create_session` with planOnly to a 0.9.19 relay creates the session
+    without the lock and says so (`planOnlyWarning`).
+- **Relay event `board_settled`.** A session's subscribers hear when one of
+  its plan cards is settled, "Stop here" included, with `boardId`,
+  `boardType`, `action`, `actionLabel`, `title` and `queuedMessageId`. The
+  line reads:
+
+  ```
+  [relay event] session "<title>" (<id>): board_settled "<card title>" → "<label>" (action <action>, board_id <board id>, queued message <message id>)
+  ```
+
+  For "Stop here" it ends `(action exit_only, board_id <board id>, nothing
+  queued)`. It is one of the default event types, also for subscriptions
+  stored with the 0.9.19 default; `match` applies to its action, label and
+  card title.
+- **Plan cards in the Inbox.** For each session that is neither deleted nor
+  archived, its newest pending plan card, with the plan folded and the card's
+  own buttons (and the plan-only question); plan cards settled in the last
+  day show what was chosen. They count in the badge. A paired relay's Inbox
+  shows their title only, with "Open there".
+- **Other relays' approval cards are easier to notice.** A paired relay's
+  approval card in the Inbox says what it is about: "New session · the
+  session waits", then "relay B · New session requested by 'X': title,
+  model" (or loop guard, write, session settings, watch, start sessions),
+  still with "Open there" only. The agent's prompt, answer or question never
+  leaves its relay. Every relay now checks its paired relays about every
+  20 s, even with no browser open, so the badge is current within about
+  20 s. A card a turn there waits on (an approval, or a question the turn is
+  blocked on) pushes once in total: its own relay pushes as before, and when
+  that reached none of your devices, the first paired relay with push on
+  that checks it pushes instead (`Approval waiting on relay "B"`), with no
+  answer buttons; the tap opens the session there. It follows the device's
+  "questions" toggle and notification settings: with previews off, an
+  approval's body carries no summary, only its kind ("New session · the
+  session waits"); the title names the session only with the device's
+  include-title setting on.
+  - `GET /api/relay-asks/remote/inbox`: approval items gain `variant` and
+    `summary`; with `?push=1` (the caller can push), pending approval and
+    ask_user items gain `notice` (`here|wait|you|other`), and `you` gains
+    `claimed` (`now|before`). A 0.9.19 relay ignores both and never pushes
+    another relay's card. New socket event `inbox_remote_changed`. A push's
+    data may carry `url`. Claims are in memory; no migration.
+- **The relay backs up its database before a new version's migrations.**
+  At the first start of each new version (in a git checkout: of each new
+  commit) it copies the database into `backups/` in the state root
+  (`~/.oar/backups`, `%APPDATA%\oar\backups`; `server/backups/` in a
+  checkout) before the migrations run, as one checked file named after the
+  version that ran on the data, such as
+  `oar-0.9.19-20261103-091500-pre-update.db`. It keeps the last two
+  (`dbBackups.keep` in `config.json`; `dbBackups.enabled: false` turns it off,
+  `dbBackups.dir` moves the folder) and deletes only files it wrote itself:
+  hand-made backups, `MIGRATION.md` and the `backups/<time>/` folders of
+  earlier moves stay as they are, and `oar doctor` lists them as not rotated.
+  When the disk would keep less than max(1 GiB, 5 %) free, or the folder holds
+  a `DO_NOT_TOUCH` file, the copy is skipped with a warning in the log, in
+  About, in `oar doctor` and in the in-app update's log, and the start goes on.
+  Plain restarts take no copy. While it runs, `oar start` says the relay is
+  backing up its database. A start while `oar backup` writes a copy waits
+  for it (up to 15 minutes; `oar start` says so and leaves it running), then
+  makes its own in any case.
+- **`oar backup [--reason <text>]`.** Copies the database while the relay
+  runs, into the same folder with the same name and rotation
+  (`oar-<version>-<time>-manual.db`, or the reason given).
+- **About and `oar doctor` show the database file** by its full path with its
+  size, and the backups: the last one, how many are kept, and the folder.
+
+- **Tokens per turn for every provider, in Check Usage.** Every tab gets a
+  **Tokens** section (today, this month, all time) and **Tokens by model,
+  this month**, with fresh input, output, cache writes and cache reads apart
+  and the share of input the cache served. A figure a provider does not report
+  reads "—" with the reason in the section's note; 0 means reported zero.
+  Copilot turns on your own OpenAI key show as their own group, "Tokens — own
+  OpenAI key". **About OAR** shows each provider's tokens of all time,
+  Claude, Claude API and DeepSeek included. Each turn's tokens are kept per
+  run and model with the chat and go when it is deleted; the daily sums stay.
+  The Claude API and DeepSeek days from before the upgrade are copied in once,
+  with cache writes inside input. Both sections open expanded. Two model ids
+  with one name (a dated and an undated Claude id) are one row, their tokens
+  added up; pointing at the row shows the ids.
+  - Detail rows in `GET /api/usage` may carry a `title`: on a merged Tokens
+    by model row, `Model ids: <id>, <id>`. Those rows are sorted by name.
+  - New worker route `POST /api/turn-token-usage` and tables `turn_token_usage`
+    and `token_usage_days` (migration 0036). Every worker posts after each
+    turn: Claude, Claude API, DeepSeek, Claude cloud, Copilot (plan and own
+    key), Cursor and Grok.
+  - `OAR_DEBUG_TOKEN_USAGE=1` makes the Copilot worker log each model call's
+    raw token counts (no ids).
+
+### Changed
+
+- **No plan summary in a card's follow-up.** "Implement in autopilot",
+  "Implement with autopilot fleet" and "Stop here and prompt myself" queue
+  only their line; the plan is no longer repeated after it.
+- **relay_tool `send` without `mode` leaves the target's mode alone.** It
+  used to run the target's turn in the calling session's mode (a plan-mode
+  agent put the sessions it prompted into plan mode). Name `mode` when a turn
+  should run in a given one. `create_session` without a mode still takes the
+  calling session's.
+- **Switching between plan mode and a writing mode during a running turn
+  queues the message instead of steering it in.** A steer switched the running
+  turn to the message's mode, so a plan turn could gain write access halfway
+  through, or a writing turn lose it. Such a message now waits and runs as its
+  own turn once the current one ends; the composer reads "Queue" for it.
+  Messages in a mode on the same side (agent, ask and autopilot with each
+  other, or plan with plan) steer in as before.
+- **A new database is `oar.db`.** The relay's database file gets the
+  product's name: a database created from nothing is `oar.db` (with
+  `oar.db-wal` and `oar.db-shm`). An existing install keeps running on
+  `copilot.db`; nothing is renamed, and `oar doctor` and About show which file
+  a relay runs on. A database brought over from elsewhere (an earlier
+  install's package, `oar setup --migrate-from`) keeps its own name.
+- **`oar.db` and `copilot.db` in one data folder.** When
+  `oar.db` and `copilot.db` are both there, the start reads both. A
+  `copilot.db` that is not newer, is empty, or holds only what a start of an
+  earlier version writes (no conversation, message or other work; a few
+  start-up settings) is set aside as
+  `copilot.db.older-<time>`, never deleted, and the relay runs on `oar.db`.
+  A `copilot.db` with newer work, or each newer somewhere, stops the start
+  (exit code 78) with both files named and nothing changed: move the one not
+  to go on with into a folder of your own, then start again. An `oar.db-wal`
+  or `oar.db-shm` without `oar.db` stops the start too (a database renamed to
+  `oar.db` later would take its pages in, losing the rows written since):
+  move it into a folder of your own.
+- **Migrations and `npm run deepseek:import` run by hand never create an
+  empty database.** Without a path they take the relay's database in
+  `server/data` (`oar.db`, else `copilot.db`); a path given must exist.
+- **`oar uninstall --purge` says it deletes the database backups** with the
+  state root.
+- **The DeepSeek card's "Tokens by model" is now "Priced tokens by model"**:
+  the cache hits, misses and output its spend estimate prices, beside the
+  Tokens sections every tab gets.
+- **The Claude API card's "Tokens by model" is replaced** by the Tokens
+  sections every tab gets, which show cache writes apart instead of inside
+  "other input". Its spend by model and the cap stay.
+- **Cache writes are no longer lost** for the Claude family, Copilot, Cursor
+  and Grok: the token booking keeps them apart. The older bookings (the Claude
+  API spend, the DeepSeek estimate) still count them as misses, unchanged.
+- **The Claude API spend no longer counts a turn twice** when Claude Code
+  reported one of its results without per-model usage: the next result's
+  growth used to include that turn again.
+- **The systemd service restarts the relay with new code, waits for running
+  turns, and keeps session workers.** A relay under the systemd user service
+  hands a restart (**🌄 Restart web relay**, the **Update** button,
+  `oar update`, `oar restart`) to systemd once its turns are done, which
+  starts a fresh supervisor and runtime from the code on disk; before, only
+  the runtime was relaunched and the supervisor kept its old code. `oar stop`
+  and `oar restart` under the service now go through the relay too and wait
+  for running turns (the unit stays enabled after a stop); `--now` goes
+  through `systemctl --user` at once, as both did before, and so does a relay
+  that does not answer. Without the service, `--now` asks the relay not to
+  wait, as **Restart now** does. The relay starts its session workers in
+  scopes of their own (`systemd-run --user --scope`), so a stop or restart of
+  the service no longer ends them. Detached helpers the relay runs for a
+  while (a provider CLI being installed, a provider login) still end with a
+  full restart of the service. A stop that comes in while the restart is
+  handed to systemd wins: no restart follows. On a host with cgroup v1 next to
+  an unused v2 hierarchy (a bare `0::/` line) the relay still finds its unit.
+- **The unit restarts a failing relay with a backoff and never gives up.**
+  The relay's supervisor relaunches the first two crashes itself; then
+  systemd starts it again after 2 seconds, with longer waits up to 5 minutes
+  (systemd before 254: every 10 seconds). The unit has `KillMode=mixed`, so
+  no runtime of a dead supervisor is left holding the port.
+- **`oar service` works in a git checkout on Linux.**
+  `node bin/oar.js service install` writes a unit that runs
+  `node server/server.js` in the checkout, on its own config, data and logs;
+  `node bin/oar.js start|stop|restart|status` go through it. A hand-made unit
+  counts as the checkout's service only when its `ExecStart` runs
+  `<checkout>/server/server.js`.
+- **Hand-made units are left as they are.** A unit OAR did not write for this
+  install (edited or written by hand, or another install's, such as the
+  global install beside a checkout) is no longer written over by
+  `oar service install` or `oar setup --start`, or deleted by
+  `oar service remove`: they name it and change nothing. `--replace` replaces
+  or removes it, keeping a copy as `oar.service.bak`. `oar service status`
+  says whose the unit is, lists the drop-ins in `oar.service.d/` (your own
+  settings, never touched), and says when lingering is off.
+
+### Fixed
+
+- **Archiving or deleting a chat whose session worker is gone no longer
+  fails with "Couldn't stop this conversation's session".** The relay still
+  tried to stop the worker it last knew of; on Windows that stop could fail
+  on its own and answered 409 `worker-stop-failed` until a later try. A
+  worker whose process has ended counts as stopped. When a stop does fail,
+  the relay log says why.
+- **An open fold in the Inbox no longer closes by itself.** Every change of
+  a question and the minute's check of paired relays drew the Inbox anew,
+  with every **Details** and plan fold closed. An open fold now stays open
+  until you close it or its item leaves the list; the same for a question's
+  **Details** on its card in the session.
+
+### Upgrade notes
+
+- **Under the systemd service, run `oar service install` after updating**
+  (`node bin/oar.js service install` in a checkout) to get the new unit. A
+  hand-made unit is reported and kept; `oar service install --replace` puts
+  OAR's in its place, keeping a copy as `oar.service.bak` (drop-ins in
+  `oar.service.d/` stay and keep applying).
+- **A checkout's hand-made unit that only runs in the checkout is not its
+  service.** A unit with `WorkingDirectory=<checkout>` whose `ExecStart` does
+  not name `<checkout>/server/server.js` (`npm start`, a relative
+  `server/server.js`) is kept as hand-made: `node bin/oar.js start` and
+  `restart` refuse, and `status` says it is not for this checkout. Run
+  `node bin/oar.js service install --replace` to put OAR's unit in its place,
+  keeping a copy as `oar.service.bak`.
+- **The supervisor of 0.9.19 keeps running until the service restarts once
+  by systemd:** at an idle moment, run `oar restart --now`. That restart ends
+  running turns once; after it, restarts wait for them.
+- **Session workers started before that restart may stop at it, once.** They
+  were started inside the service; those started afterwards run in scopes of
+  their own.
+- **Nothing to do for the new database name.** A relay that ran on
+  `copilot.db` goes on running on it. To give it the new name, by hand and
+  with the relay stopped: take a backup (`oar backup --reason pre-rename`),
+  stop the relay fully (`oar stop`, or the systemd service or autostart, so
+  nothing starts it again), check that no program holds the files (Linux:
+  `fuser copilot.db*`; Windows: close database browsers and Explorer previews),
+  make sure no `oar.db-wal` or `oar.db-shm` is there already (move one that
+  is into a folder of your own), rename `copilot.db`, and `copilot.db-wal`
+  and `copilot.db-shm` where they are there, to `oar.db`, `oar.db-wal`,
+  `oar.db-shm`, and start again.
+  `oar doctor` then shows `oar.db`. Scripts of your own that open
+  `copilot.db` by path need the new name first.
+- **Going back to 0.9.19 on `copilot.db` needs no step.** Migrations 0035 and
+  0036 only add the column `conversations.plan_only`, the tables
+  `turn_token_usage` and `token_usage_days` and an index; 0.9.19 opens the
+  database as it is and ignores them, so a plan-only lock does not hold on
+  0.9.19, and the tokens kept so far are there again at the next 0.9.20
+  start. Turns run on 0.9.19 book no tokens.
+- **Going back to a version before 0.9.20 on `oar.db`** (a new 0.9.20 install,
+  or one renamed by hand): stop the relay fully, make sure no
+  `copilot.db-wal` or `copilot.db-shm` is there already (move one that is
+  into a folder of your own), rename `oar.db`, `oar.db-wal` and `oar.db-shm`
+  (those there) to `copilot.db`, `copilot.db-wal`, `copilot.db-shm`, then
+  start the earlier version. A relay still on
+  `copilot.db` needs no step. Skipped, the earlier version starts on a new,
+  empty `copilot.db`; back on 0.9.20 that one is set aside if nothing was done
+  on it, and the start stops with both names if something was.
+- **The first 0.9.20 start backs up the database.** After `oar update` or a
+  `git pull` its name carries the running version and says
+  `pre-update-from-unknown`, such as
+  `oar-0.9.20-20261103-091500-pre-update-from-unknown.db`, though it holds the
+  data of the version before: earlier versions did not record which version
+  ran on the data. After an in-app update it carries the version before. The
+  time in a backup's name is UTC. It needs
+  free space for one more copy of the database; `oar doctor` shows the
+  result. Backups made by hand before (`copilot-pre-*`, `main-*`,
+  `oar-pre-*`) stay where they are and are never counted or deleted.
+- **After going back to an earlier version and up again, run `oar backup`
+  before the upgrade:** versions before 0.9.20 do not record that they ran,
+  so the second upgrade sees no version change and takes no copy.
+- **To restore a backup:** stop the relay, move the live database files
+  (`oar.db*` or `copilot.db*`) into a folder of your own, copy the backup into
+  the data folder (it is one file, no `-wal` or `-shm`), and start the version
+  the data is of. Name it as that version runs on it: `copilot.db` for a
+  version before 0.9.20, else the name the relay ran on. A
+  `pre-update-from-unknown` backup holds the data of the version before the
+  one in its name. Open a backup only read-only
+  (`sqlite3 'file:<backup>?immutable=1'`).
+
 ## [0.9.19] — 2026-10-27
 
 Highlights: a relay that runs out of memory is restarted instead of staying

@@ -44,6 +44,9 @@ export function persistConversationPreferences({
   // The owner's "agents in this conversation may start sessions" (a boolean;
   // `undefined` leaves it alone). The route decides who may write it.
   mayCreateSessions = undefined,
+  // Plan-only: agents cannot take the session out of plan mode (a boolean;
+  // `undefined` leaves it alone). The routes decide who may write it.
+  planOnly = undefined,
   updatedAt = new Date().toISOString(),
   createIfMissing = false,
   createTitle = 'Session',
@@ -60,6 +63,7 @@ export function persistConversationPreferences({
   const writesThinkingDisplay = thinkingDisplay !== undefined;
   const display = writesThinkingDisplay ? parseThinkingDisplay(thinkingDisplay) : null;
   const writesMayCreateSessions = mayCreateSessions !== undefined;
+  const writesPlanOnly = planOnly !== undefined;
   if (!db || !stmts || !convId || !mode) {
     return {
       ok: false,
@@ -71,6 +75,7 @@ export function persistConversationPreferences({
       thinkingEnabled: DEFAULT_THINKING_ENABLED,
       thinkingDisplay: DEFAULT_THINKING_DISPLAY,
       mayCreateSessions: false,
+      planOnly: false,
       updatedAt,
     };
   }
@@ -107,6 +112,10 @@ export function persistConversationPreferences({
     if (writesMayCreateSessions) {
       extraSets.push('may_create_sessions = ?');
       extraValues.push(mayCreateSessions === true ? 1 : 0);
+    }
+    if (writesPlanOnly) {
+      extraSets.push('plan_only = ?');
+      extraValues.push(planOnly === true ? 1 : 0);
     }
     try {
       if (extraSets.length) {
@@ -148,6 +157,9 @@ export function persistConversationPreferences({
       mayCreateSessions: writesMayCreateSessions
         ? mayCreateSessions === true
         : readMayCreateSessions(existing),
+      planOnly: writesPlanOnly
+        ? planOnly === true
+        : readPlanOnly(existing),
       updatedAt,
     };
   });
@@ -157,6 +169,25 @@ export function persistConversationPreferences({
 /** The owner's "agents in this conversation may start sessions" of a conversations row. */
 export function readMayCreateSessions(row) {
   return Number(row?.may_create_sessions) === 1;
+}
+
+/** Whether a conversations row is plan-only (migration 0035; NULL is not). */
+export function readPlanOnly(row) {
+  return Number(row?.plan_only) === 1;
+}
+
+/**
+ * A compaction's new conversation keeps a plan-only source's lock and the
+ * mode it is saved in, so the work goes on as locked as it was. Nothing for
+ * any other source. Returns whether it carried the lock.
+ */
+export function carryPlanOnlyToCompacted({ db, stmts, source, targetConversationId, updatedAt = new Date().toISOString() } = {}) {
+  if (!db || !stmts?.conversationsHavePlanOnly || !readPlanOnly(source)) return false;
+  const target = String(targetConversationId || '').trim();
+  if (!target) return false;
+  const mode = String(source?.preferred_relay_mode || '').trim() || 'plan';
+  db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = ?, updated_at = ? WHERE id = ?`).run(mode, updatedAt, target);
+  return true;
 }
 
 export function persistConversationModelPreference({

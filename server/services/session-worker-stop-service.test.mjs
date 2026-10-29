@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { stopSessionWorkerProcesses } from './session-worker-stop-service.mjs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+
+import { isProcessAlive, stopSessionWorkerProcesses } from './session-worker-stop-service.mjs';
 
 const SID = 'sess-1';
 
@@ -213,6 +216,76 @@ test('an unreadable process list stops nothing blind and says so', async () => {
   assert.match(result.error, /^process-list-unreadable: windows-process-snapshot-unreadable/);
   assert.deepEqual(stopCalls, [], 'the known pid alone is not stopped: its tree would run on');
   assert.deepEqual(result.pids, []);
+});
+
+test('a registry pid whose process is gone counts as stopped: nothing to stop, no stop call', async () => {
+  for (const platform of ['win32', 'linux']) {
+    const calls = [];
+    const result = await stopSessionWorkerProcesses({
+      sdkSessionId: SID,
+      worker: { pid: 4242 },
+      platform,
+      processInspector: {
+        findWindowsProcessTreeForSessionAsync: async () => [],
+        findProcessesForSessionAsync: async () => [],
+        // Windows: the stop's own process read could fail; it is never asked.
+        stopWindowsPidsAsync: async () => { calls.push('stop'); throw new Error('Get-CimInstance timed out'); },
+      },
+      killImpl: (pid, signal) => calls.push([pid, signal]),
+      isPidAliveImpl: () => false,
+      ...fakeClock(),
+    });
+    assert.equal(result.ok, true, platform);
+    assert.deepEqual(result.pids, [], platform);
+    assert.deepEqual(calls, [], platform);
+  }
+});
+
+test('a registry pid that is alive is still stopped when the list does not show it', async () => {
+  const stopCalls = [];
+  const alive = new Set([4242]);
+  const result = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    worker: { pid: 4242 },
+    platform: 'win32',
+    processInspector: {
+      findWindowsProcessTreeForSessionAsync: async () => [{ processId: 81 }],
+      stopWindowsPidsAsync: async (pids) => { stopCalls.push([...pids]); for (const pid of pids) alive.delete(pid); },
+    },
+    isPidAliveImpl: (pid) => alive.has(pid),
+    ...fakeClock(),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(stopCalls, [[81, 4242]]);
+});
+
+test('isProcessAlive: signal 0 reaches it; EPERM is alive, anything else is not', async () => {
+  assert.equal(isProcessAlive(process.pid), true, 'this process');
+  const child = spawn(process.execPath, ['-e', '']);
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 0);
+  assert.equal(isProcessAlive(child.pid), false, 'a child that has ended');
+  const throwing = (code) => ({ killImpl: () => { throw Object.assign(new Error(code), { code }); } });
+  assert.equal(isProcessAlive(4242, throwing('EPERM')), true, 'someone else\'s process');
+  assert.equal(isProcessAlive(4242, throwing('ESRCH')), false);
+  for (const pid of [0, -1, 1.5, 'x', null]) assert.equal(isProcessAlive(pid), false, String(pid));
+});
+
+test('without a check of its own, a stop asks the process itself: an ended worker is not signalled', async () => {
+  const child = spawn(process.execPath, ['-e', '']);
+  await once(child, 'exit');
+  const calls = [];
+  const result = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    worker: { pid: child.pid },
+    platform: 'linux',
+    processInspector: { findProcessesForSessionAsync: async () => [] },
+    killImpl: (pid, signal) => calls.push([pid, signal]),
+    ...fakeClock(),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.pids, []);
+  assert.deepEqual(calls, []);
 });
 
 test('the stop reads the list fresh, off the thread', async () => {

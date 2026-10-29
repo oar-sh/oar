@@ -523,6 +523,14 @@ export function createCopilotSdkSessionRunner({
   // The in-flight ingest POST, exposed only as a test seam. Never awaited by
   // the turn path — that is the entire point of it.
   let usagePostChain = Promise.resolve();
+  // The token booking's post (POST /api/turn-token-usage), a chain and a test
+  // seam like `usagePostChain`. Its run is the row's attempt (a row
+  // delivered again is another run of the turn); a row without one (an older
+  // relay) is booked under this process's own id, so a turn requeued onto a
+  // restarted worker is a second run of it, not the same row.
+  let tokenPostChain = Promise.resolve();
+  const postedTurnTokens = new WeakSet();
+  const tokenRunId = randomUUID();
   // The last catalog content this worker POSTed to `/api/models/snapshot`,
   // as a serialized signature. Identity of CONTENT, not of session: an idle
   // shutdown and resume onto the same catalog must not re-publish it.
@@ -1330,6 +1338,7 @@ export function createCopilotSdkSessionRunner({
       conversationId: message.conversationId,
       sdkSessionId,
       messageId: message.id,
+      attemptId: message.attemptId || null,
       model: result?.model || appliedModel() || defaultModel || '',
       usage,
       contextUsage,
@@ -1352,6 +1361,7 @@ export function createCopilotSdkSessionRunner({
       hasQuotaSnapshots: !!usage?.quotaSnapshots,
       cfiOverage: usage?.quotaSnapshots?.cfi_overage ?? null,
     }));
+    return lastTurnUsage;
   }
 
   /**
@@ -1372,9 +1382,10 @@ export function createCopilotSdkSessionRunner({
    * row still open — for as long as the socket stayed up. The result is unused
    * and the failure is already swallowed, so there was nothing to wait for.
    *
-   * BYOK sessions do not post at all: they spend the user's own OpenAI key
+   * BYOK sessions do not post here: they spend the user's own OpenAI key
    * rather than Copilot quota, and their usage events report `cost: 0`, so
-   * their numbers would only mislead on a card about the Copilot plan.
+   * their numbers would only mislead on a card about the Copilot plan. Their
+   * tokens still go to the token booking (postTurnTokens).
    */
   function postTurnUsage() {
     if (byokProvider || !lastTurnUsage || lastTurnUsage === postedTurnUsage) return;
@@ -1383,6 +1394,39 @@ export function createCopilotSdkSessionRunner({
     // turn path ever reads it.
     usagePostChain = api('POST', '/api/copilot-plan-usage', lastTurnUsage)
       .catch((error) => { dbg('usage ingest failed', error?.message || String(error)); });
+  }
+
+  /**
+   * Report a turn's own captured tokens per model to the token booking,
+   * from that turn's capture: a continuation that captured its
+   * usage meanwhile cannot take the turn's place. Fire-and-forget like the plan usage, but BYOK sessions post
+   * too, under their own billing (`byok-<provider type>`), which the relay
+   * keeps apart from the plan's. No cost: the plan bills in AI units, not
+   * dollars, and an own key's calls report 0.
+   */
+  function postTurnTokens(capture) {
+    if (!capture || postedTurnTokens.has(capture)) return;
+    postedTurnTokens.add(capture);
+    const models = (capture.usage?.models || []).map((entry) => ({
+      model: entry.model,
+      inputTokens: entry.inputTokens,
+      outputTokens: entry.outputTokens,
+      cacheWriteTokens: entry.cacheWriteTokens,
+      cacheReadTokens: entry.cacheReadTokens,
+      reasoningTokens: entry.reasoningTokens,
+    }));
+    if (!models.length || !capture.messageId) return;
+    const billing = byokProvider ? `byok-${String(byokProvider.type || 'openai').trim().toLowerCase()}` : '';
+    tokenPostChain = api('POST', '/api/turn-token-usage', {
+      conversationId: capture.conversationId,
+      turnId: capture.messageId,
+      runId: capture.attemptId || tokenRunId,
+      provider: 'github',
+      billing,
+      ...(sdkSessionId ? { nativeSessionId: sdkSessionId } : {}),
+      at: capture.capturedAt,
+      models,
+    }).catch((error) => { dbg('turn token ingest failed', error?.message || String(error)); });
   }
 
   /**
@@ -3161,7 +3205,14 @@ export function createCopilotSdkSessionRunner({
       model: '',
       // The runner's cross-turn knowledge of background agents rides in, so a
       // later turn's normalizer opens no lane for an agent spawned earlier.
-      normalizer: createNormalizerImpl({ isBackgroundAgent: (agentId) => agentDetails.has(agentId) }),
+      normalizer: createNormalizerImpl({
+        isBackgroundAgent: (agentId) => agentDetails.has(agentId),
+        // The raw counts of every model call, for checking the token rule
+        // against a real provider (counts only).
+        ...(String(env?.OAR_DEBUG_TOKEN_USAGE || '').trim() === '1'
+          ? { debugTokenUsage: (fields) => dbg('token usage', JSON.stringify(fields)) }
+          : {}),
+      }),
       result: null,
       failure: null,
       settled: false,
@@ -3730,7 +3781,7 @@ export function createCopilotSdkSessionRunner({
     const failure = turn.failure;
     // Capture only. The POST fires from driveTurn's `finally`, after the rows
     // have been published.
-    captureTurnUsage(turn.primaryEntry.message, result);
+    turn.usageCapture = captureTurnUsage(turn.primaryEntry.message, result) || null;
 
     const pending = turn.entries.filter((entry) => !entry.settled && entry.turn === turn);
     if (!pending.length) return;
@@ -4166,6 +4217,7 @@ export function createCopilotSdkSessionRunner({
       syncDeliveryReadiness();
       // The ingest is advisory, never awaited, and must never be able to
       // delay a reply that is already written.
+      postTurnTokens(turn.usageCapture);
       postTurnUsage();
     }
   }
@@ -5024,6 +5076,7 @@ export function createCopilotSdkSessionRunner({
     // never awaits this, which is what keeps a slow relay from holding a
     // finished reply.
     whenUsagePosted: () => usagePostChain,
+    whenTokensPosted: () => tokenPostChain,
     // The in-flight model-catalog snapshot POST — the same kind of seam.
     whenModelSnapshotPosted: () => modelSnapshotChain,
     // The in-flight queued-lane read — same kind of seam.

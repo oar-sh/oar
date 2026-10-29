@@ -9,10 +9,12 @@ the Copilot CLI extension, plus the relay internals that used to live in the REA
 The product is **OAR — Open Agent Relay** (`@oar-sh/oar`, binary `oar`). Write it
 `OAR` in prose and `oar` in code. Many internals deliberately still say
 "copilot": the `COPILOT_WEB_RELAY_*` env vars, `.copilot/`-derived host paths,
-DB tables, cookies, and `server/data/copilot.db` either address the real GitHub
-Copilot CLI's contracts or are invisible identifiers whose rename would only buy
-a migration. Do not "fix" them in passing — the deferred rename list lives in
-`docs/plans/oar-rebrand-and-release.md` §11.
+DB tables and cookies either address the real GitHub Copilot CLI's contracts or
+are invisible identifiers whose rename would only buy a migration. Do not "fix"
+them in passing — the deferred rename list lives in
+`docs/plans/oar-rebrand-and-release.md` §11. The database file did get the
+product's name in 0.9.20: `oar.db` for a new database, `copilot.db` still read
+on installs from before (see [The database file and its backups](#the-database-file-and-its-backups)).
 
 ## Rules for coding agents
 
@@ -107,7 +109,12 @@ Its role is chosen by argv, never by the environment:
 - `node server/server.js` — the process stays attached to your terminal as a
   supervisor and runs the real server (`server-runtime.mjs`) in a worker child it
   marks with `--relay-runtime`. Exit code 75 relaunches the worker; any other
-  non-zero exit is retried up to 3 times before the supervisor gives up.
+  non-zero exit is retried up to 3 times before the supervisor gives up. Under
+  a systemd user service whose main process the supervisor is (`systemctl
+  --user show -p MainPID`), exit 75 is handed to systemd instead
+  (`reset-failed` + `restart --no-block`), so the next supervisor and runtime
+  start from the code on disk; no SIGTERM within 30 s, or a failing
+  systemctl, relaunches the worker as above.
 - `node server/server.js --supervised` — runs the server in this process and
   exits 75 on restart, leaving restarts to whoever spawned it. The CLI extension
   passes this so its own bounded-backoff supervision is the only one in play.
@@ -175,7 +182,9 @@ npm link
 npm install -g .
 ```
 
-`oar copilot`, run from any folder, starts the web relay server for that folder's workspace root, then immediately hands the shell to `gh copilot` without a bootstrap prompt. If a relay already answers on the port, the command reuses it and still opens Copilot in the same shell. The other commands (`oar help`) are described in the README; in a checkout `oar start` and `oar service` refuse, and `oar setup`, `oar stop`, `oar restart`, `oar status` and `oar url` work on `server/config.json`.
+`oar copilot`, run from any folder, starts the web relay server for that folder's workspace root, then immediately hands the shell to `gh copilot` without a bootstrap prompt. If a relay already answers on the port, the command reuses it and still opens Copilot in the same shell. The other commands (`oar help`) are described in the README; in a checkout `oar setup`, `oar stop`, `oar restart`, `oar status` and `oar url` work on `server/config.json`.
+
+To run a checkout as a systemd user service (Linux), run `node bin/oar.js service install` from a login shell of your own in the checkout (its `PATH` goes into the unit). The unit runs `node <checkout>/server/server.js` with the checkout as its working directory and no `COPILOT_WEB_RELAY_*` paths, so the relay finds `server/config.json`, its data and `server/logs` as with `npm start`; `node bin/oar.js start|stop|restart|status` then go through it, and without the unit `node bin/oar.js start` refuses. A relay running in a terminal is asked to stop first. Under the unit a restart is a deploy for the supervisor too: `git pull`, then a restart from the web UI or `node bin/oar.js restart` (it waits for running turns) starts the new code, `server.js` included. A worktree is a checkout of its own: its install finds the main checkout's unit as another install's and leaves it, unless `--replace`. A hand-made unit (no OAR marker) is the checkout's service only when its `ExecStart` runs `<checkout>/server/server.js` by its full path; one that only has the checkout as its `WorkingDirectory` (`npm start`, `node server/server.js`) is kept as it is and not used by `start|stop|restart`: `node bin/oar.js service install --replace` puts OAR's unit in its place, keeping a copy.
 
 Relay server output is written to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` (`~/.config/copilot-remote/logs` elsewhere) for git checkouts, or `~/.oar/logs` (`%APPDATA%\oar\logs`) for global installs, unless `COPILOT_WEB_RELAY_LOG_DIR` is set, so it stays out of the CLI terminal.
 
@@ -221,6 +230,69 @@ If the same extension is available both project-local (`.github/extensions/web-r
 2. **Option 3**: support `oar -- [gh copilot args]` pass-through. *Shipped:* `oar copilot -- <args>`
    (or `oar -- <args>`) runs `gh copilot -- <args>`.
 3. **Session resume**: add `--session-id=<...>` handoff once the session orchestration contract is defined.
+
+### The database file and its backups
+
+**The name.** A database made from nothing is `oar.db` (with `oar.db-wal` and `oar.db-shm`). An
+install from before 0.9.20 runs on `copilot.db` until its owner renames it by hand, with the relay
+stopped; the relay never renames a database it runs on. `server/services/database-file.mjs` is the
+only code that spells either name: `resolveDatabaseFile` picks `oar.db`, else `copilot.db`, else a
+new `oar.db` (read only, it never opens or creates a file), and doctor and About show the full path
+of the file in use. `server/services/database-file-scan.test.mjs` fails on a `copilot.db` literal
+anywhere else in `server/`, `bin/`, `shared/` or `scripts/` code: a path built by hand would create an
+empty database under the old name.
+
+**Both names in one folder** (after a downgrade that skipped the rename back, or a stray file) are
+settled at start, under the lock and before the earlier-database adoption (`settleDatabaseFile`).
+Both are read through copies. A `copilot.db` that is not newer (the `newerOf` stamps), is empty, or
+holds only what a start writes (`STARTUP_SETTING_KEYS` and `STARTUP_TABLES`: an earlier version
+started on the folder and nothing was done there) is checkpointed and renamed to
+`copilot.db.older-<time>`, the `-wal`/`-shm` first and the main file last; it is never deleted. A newer
+one, each newer in some table, or a failed check stops the start (exit 78) with both files named
+and nothing changed. A settings key that a start of an earlier version writes goes into
+`STARTUP_SETTING_KEYS` deliberately; any other key makes the start refuse. A database that moves
+(the earlier-database adoption, the install-time rescue, `oar setup --migrate-from`) keeps its own
+name; into a folder that has one already, it takes that one's name. An `oar.db-wal` or `-shm`
+without `oar.db` stops the start (`checkDatabaseFile`), whatever name the relay runs on: SQLite
+replays a -wal into any main file of its name, so a later rename to `oar.db` would lose the rows
+written since. A stray `copilot.db-wal` is only warned about.
+
+**Scripts.** Every migration run by hand (`node server/migrations/00NN-*.mjs [path/to/oar.db]`)
+and `npm run deepseek:import` find the database the same way:
+
+```js
+import { cliDbPath } from '../services/database-file.mjs';
+// in `if (isMain)`, inside the try:
+const dbPath = cliDbPath(process.argv[2], new URL('..', import.meta.url));
+```
+
+The given path, which must be a database file, else the one in `server/data`; never a new empty
+file. A new migration does the same; the scan test checks every one.
+
+**Backups** (`server/services/db-backup-service.mjs`). At the first start of a new version (in a
+checkout: a new commit), between opening the database and `applySchema`, and on `oar backup`. The
+name is `oar-<version>-<YYYYMMDD-HHMMSS>-<reason>.db` (UTC; the version of the data, the one to go
+back to), one self-contained file written with better-sqlite3's online `backup()` in one step, as
+`.partial`, checked, made single-file (`journal_mode=DELETE`) and renamed. The folder is `backups/`
+in the state root, `server/backups/` in a checkout (gitignored, not packed), or `dbBackups.dir`.
+`db-backups.json` in the data folder lists what this relay wrote; rotation keeps `dbBackups.keep`
+and deletes only files listed there, named by the pattern, in that folder and with the size they
+had. Nothing else in the folder is counted, rotated or deleted. One backup of a database at a
+time: `db-backup-progress.json` holds the writer's pid and its identity (start and boot id, checked
+with the relay lock's `lockHolderMayRun`, so a pid reused after a crash or a reboot does not count).
+`oar backup` refuses while that writer runs (`busy`, recorded in `lastResult`); a start waits for it
+up to 15 minutes, with a `db-backup-wait.json` note that `oar start` reads so it leaves the relay
+running, and then makes its own backup in any case (beside the other writer if it still runs: two
+writers never share a name or a temp file); a start removes a progress file whose writer no longer
+runs. A `.partial` (named in the manifest with its writer's pid
+before the copy starts) is removed only once that pid is dead. The app setting `db_last_run`
+(`{ version, commit, at }`) says which version ran last; it is written after a skip or a failure
+too, so a crash loop never repeats the copy.
+
+Open a backup only read-only: `sqlite3 'file:<backup>?immutable=1'`, or
+`new Database(file, { readonly: true })`. A read-write open makes `-wal`/`-shm` beside it and can
+change it. Never copy a live database's main file alone; `oar backup` copies it safely while the
+relay runs.
 
 ### API overview
 
@@ -308,12 +380,15 @@ recurring trap:
   their SDK runtime, never the process), so a live worker keeps executing the
   code it loaded at spawn. That holds for every restart the relay performs
   itself (exit 75, relaunched by `server.js`'s supervisor or the CLI
-  extension), also under the systemd user service. It does not hold for
-  `systemctl --user stop|restart oar` (what `oar stop`, `oar restart` and
-  `oar setup` run when the service is active): the unit sets no `KillMode`,
-  so systemd's default `control-group` stops every process in the service's
-  cgroup, detached workers and a tmux server the service started included;
-  only workers on a tmux server started outside the service survive
+  extension), and under the systemd user service also for its full restarts
+  and stops (the handed-over exit 75, `oar stop`, `--now`, `systemctl --user
+  stop|restart oar`): the unit has `KillMode=mixed`, which ends every process
+  left in the service's cgroup, but the runtime starts its tmux and detached
+  workers through `systemd-run --user --scope --collect --quiet --`, so they
+  run in a `run-*.scope` of their own (`worker-scope.mjs`; probed once per
+  runtime, a plain launch where systemd-run cannot work). A worker on a tmux
+  server or in a process started before 0.9.20, inside the service, is
+  stopped at its first full restart
   (`relay-restart-picture.mjs` describes the same). After changing worker-side code, recycle affected
   workers too — `POST /api/session-worker/<sdkSessionId>/kill` or
   `tmux kill-session -t <sdk-session-id>` — and compare
@@ -946,10 +1021,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **7535 pass / 0 fail / 10 skip on Linux (0.9.19, 2026-10-27)** — the count
+Expected: **0 fail** everywhere; **7949 pass / 0 fail / 10 skip on Linux (0.9.20, 2026-10-29)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
-cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **12 skips** that
-are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`) and run on Linux (0.9.19: **7533 pass / 0 fail / 12 skip**).
+cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **20 skips** that
+are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`, POSIX checkout paths for the systemd unit) and run on Linux (0.9.20, 2026-10-29: **7939 pass / 0 fail / 20 skip**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns
@@ -1018,8 +1093,17 @@ node tests/run-e2e.mjs cache-rebuild.spec.mjs
 
 Specs must resolve the relay URL, auth token, and database exclusively through
 `tests/e2e-env.mjs` (fed by `run-e2e.mjs` via `PLAYWRIGHT_BASE_URL`, `RELAY_TEST_TOKEN`,
-`RELAY_TEST_DATA_DIR`). Never read `server/config.json`, open `server/data/copilot.db`, or
-target `http://127.0.0.1:3333` from a spec — those belong to the live relay.
+`RELAY_TEST_DATA_DIR`). Never read `server/config.json`, open `server/data/oar.db` (or
+`copilot.db`), or target `http://127.0.0.1:3333` from a spec — those belong to the live relay.
+`relayDbPath()` resolves the test relay's file. `npm test` and `run-e2e.mjs` fail a run that
+leaves a new database file in `server/data` or anything in `server/backups` of the checkout
+(`scripts/worktree-data-guard.mjs`).
+
+**The backup specs need room in the temp folder.** `tests/db-backup.spec.mjs` starts relays in
+`os.tmpdir()`, and a relay skips its backup when the disk would keep less than max(1 GiB, 5 %) free.
+On a small temp disk (a tmpfs `/tmp`) the spec skips itself and says so. Run it with `TMPDIR` on a
+disk with more than 1 GiB free (and 5 % of the disk to spare): `TMPDIR=$HOME/tmp npm run test:e2e`.
+For a release gate a skip there counts as a failure.
 
 That isolation env lives in `tests/relay-server-harness.mjs` (`startRelayServer`), which
 `run-e2e.mjs` calls for the server every spec shares. It also pins session-worker routing off and

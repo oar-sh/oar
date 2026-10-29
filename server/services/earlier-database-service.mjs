@@ -4,12 +4,13 @@ import os from 'os';
 import path from 'path';
 
 import { resolveDataDir, resolveUploadDir } from './data-dir-resolution.mjs';
+import {
+  DB_FILE_NAMES, LEGACY_DB_FILE_NAME, newerOf, oneLine, readDatabase, renameWithRetry, resolveDatabaseFile, setAsideDatabase, sideFiles, sleepSync,
+} from './database-file.mjs';
 import { resolveOarRoot } from './oar-state-migration-service.mjs';
 import { resolveStateLayout } from './oar-state-layout.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processStartedAt as defaultProcessStartedAt } from './relay-singleton-guard.mjs';
 
-const DB_FILE = 'copilot.db';
-const DB_FILES = [DB_FILE, `${DB_FILE}-wal`, `${DB_FILE}-shm`];
 const SHA256_NAME = /^[a-f0-9]{64}$/;
 // The install-time rescue's copies (package-data-rescue.mjs), in the data folder.
 export const RESCUE_DIR_NAME = 'rescued-package-data';
@@ -26,43 +27,9 @@ const STAGING_PREFIX = '.earlier-database-';
 // kill cut short is never taken for one; and where it came from.
 const STAGED_CHECKED_FILE = '.checked';
 const STAGED_SOURCE_FILE = 'source.json';
-// The latest change a database records, per table: what tells which of two
-// databases was used last.
-const STAMPS = [
-  ['conversations', 'updated_at'],
-  ['messages', 'timestamp'],
-  ['app_settings', 'updated_at'],
-];
-// Defender or the indexer may hold a file for a moment at boot.
-const RENAME_RETRY_MS = [50, 100, 200, 400, 800];
-const RETRY_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
 
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function renameWithRetry(fsImpl, from, to, sleep = sleepSync) {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      fsImpl.renameSync(from, to);
-      return;
-    } catch (error) {
-      if (!RETRY_CODES.has(error?.code) || attempt >= RENAME_RETRY_MS.length) throw error;
-      sleep(RENAME_RETRY_MS[attempt]);
-    }
-  }
-}
-
-// A quick_check report is many lines: the start and nothing more.
-function oneLine(text) {
-  return String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 2).join(' ').slice(0, 200);
-}
-
-function parseStamp(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const ms = Date.parse(String(value));
-  return Number.isFinite(ms) ? ms : null;
-}
+// Read and compared here and when both database names are in one folder.
+export { newerOf, readDatabase };
 
 function hashToken(value) {
   const token = String(value || '').trim();
@@ -85,53 +52,6 @@ function writeJson(fsImpl, file, value) {
   const temporary = `${file}.tmp`;
   fsImpl.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`);
   renameWithRetry(fsImpl, temporary, file);
-}
-
-function readDatabase(Database, dbPath, { readonly = false, singleFile = false, tick = () => {} } = {}) {
-  const db = new Database(dbPath, readonly ? { readonly: true, fileMustExist: true } : { fileMustExist: true });
-  try {
-    const integrity = String(db.pragma('quick_check', { simple: true }) || '');
-    const has = (table) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
-    const stamps = {};
-    const latest = {};
-    for (const [table, column] of STAMPS) {
-      // Parsed per row, not compared as text: a value that is no time tells nothing.
-      let newest = null;
-      let newestText = null;
-      if (has(table)) {
-        let rows = 0;
-        for (const row of db.prepare(`SELECT ${column} AS value FROM ${table}`).iterate()) {
-          if (++rows % 10000 === 0) tick();
-          const ms = parseStamp(row.value);
-          if (ms !== null && (newest === null || ms > newest)) { newest = ms; newestText = String(row.value); }
-        }
-      }
-      stamps[table] = newest;
-      latest[table] = newestText;
-    }
-    const count = (table) => (has(table) ? Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n || 0) : 0);
-    // The copy goes into place as one file: no -wal or -shm to move with it.
-    if (singleFile && integrity === 'ok') db.pragma('journal_mode = DELETE');
-    return { integrity, stamps, latest, conversations: count('conversations'), messages: count('messages') };
-  } finally {
-    db.close();
-  }
-}
-
-// Which database has the later changes: 'earlier', 'pinned', 'same', or
-// 'both' when each has a table the other changed less recently.
-function newerOf(earlier, pinned) {
-  let earlierNewer = 0;
-  let pinnedNewer = 0;
-  for (const [table] of STAMPS) {
-    const a = earlier[table];
-    const b = pinned ? pinned[table] : null;
-    if (a !== null && (b === null || a > b)) earlierNewer += 1;
-    if (b !== null && (a === null || b > a)) pinnedNewer += 1;
-  }
-  if (earlierNewer && pinnedNewer) return 'both';
-  if (earlierNewer) return 'earlier';
-  return pinnedNewer ? 'pinned' : 'same';
 }
 
 /**
@@ -192,7 +112,6 @@ function adopt({
   if (!layout.dataDir || normalize(dataDir) !== normalize(layout.dataDir)) {
     return { status: 'not-applicable', reason: 'own-folders' };
   }
-  const pinnedDb = path.join(dataDir, DB_FILE);
   const stamp = now().toISOString().replace(/[:.]/g, '-');
   const rename = (from, to) => renameWithRetry(fsImpl, from, to, sleep);
 
@@ -203,8 +122,14 @@ function adopt({
 
   const checkedFile = path.join(dataDir, CHECKED_FILE);
   const checked = readJson(fsImpl, checkedFile)?.sources || [];
+  // A folder's database under either name (oar.db first), or null.
+  // A link to nothing is no database: skipped, as before 0.9.20.
+  const dbNameIn = (dir) => {
+    const file = resolveDatabaseFile(dir, { fsImpl });
+    return file.created || file.dangling.length ? null : file.name;
+  };
   const signatureOf = (dbPath) => {
-    const files = DB_FILES.map((name) => path.join(path.dirname(dbPath), name.replace(DB_FILE, path.basename(dbPath))));
+    const files = sideFiles(path.basename(dbPath)).map((name) => path.join(path.dirname(dbPath), name));
     let size = 0;
     let mtimeMs = 0;
     for (const file of files) {
@@ -233,10 +158,13 @@ function adopt({
     // A copy the rescue did not finish is not a rescue.
     if (name.endsWith('.partial')) continue;
     const dbDir = path.join(rescueRoot, name, 'data');
-    if (seen(signatureOf(path.join(dbDir, DB_FILE)))) continue;
-    const rescue = { kind: 'rescue', dbDir, uploadDirs: [path.join(rescueRoot, name, 'uploads')], cursorDir: path.join(dbDir, 'cursor-agents') };
-    if (exists(path.join(dbDir, DB_FILE))) candidates.push(rescue);
-    else if (!readdir(fsImpl, dbDir).some((file) => file.startsWith(DB_FILE))) filesOnly.push(rescue);
+    const dbName = dbNameIn(dbDir);
+    // One without a database is recorded under the name old packages had.
+    const sourceDb = path.join(dbDir, dbName || LEGACY_DB_FILE_NAME);
+    if (seen(signatureOf(sourceDb))) continue;
+    const rescue = { kind: 'rescue', dbDir, dbName, sourceDb, uploadDirs: [path.join(rescueRoot, name, 'uploads')], cursorDir: path.join(dbDir, 'cursor-agents') };
+    if (dbName) candidates.push(rescue);
+    else if (!readdir(fsImpl, dbDir).some((file) => DB_FILE_NAMES.some((each) => file.startsWith(each)))) filesOnly.push(rescue);
   }
   // 2. Copies an interrupted run left, checked complete: possibly the only
   // one there is. They take the upload and Cursor folders of their source.
@@ -244,12 +172,15 @@ function adopt({
   try { leftovers = fsImpl.readdirSync(dataDir).filter((name) => name.startsWith(STAGING_PREFIX)).sort(); } catch {}
   for (const name of leftovers) {
     const dbDir = path.join(dataDir, name);
-    if (!exists(path.join(dbDir, STAGED_CHECKED_FILE)) || !exists(path.join(dbDir, DB_FILE))) continue;
-    if (seen(signatureOf(path.join(dbDir, DB_FILE)))) continue;
+    const dbName = dbNameIn(dbDir);
+    if (!exists(path.join(dbDir, STAGED_CHECKED_FILE)) || !dbName) continue;
+    if (seen(signatureOf(path.join(dbDir, dbName)))) continue;
     const source = readJson(fsImpl, path.join(dbDir, STAGED_SOURCE_FILE)) || {};
     candidates.push({
       kind: 'leftover',
       dbDir,
+      dbName,
+      sourceDb: path.join(dbDir, dbName),
       uploadDirs: Array.isArray(source.uploadDirs) ? source.uploadDirs : [],
       cursorDir: source.cursorDir || null,
     });
@@ -257,8 +188,9 @@ function adopt({
   // 3. What the relay ran on without the pin (`server/data` or a config
   // `dataDir`, copied from, never renamed); never the pinned folder itself.
   const earlierDir = resolveDataDir({ env: unpinned, configPath, serverDir });
-  const earlierDb = path.join(earlierDir, DB_FILE);
-  if (normalize(earlierDir) !== normalize(dataDir) && exists(earlierDb) && !seen(signatureOf(earlierDb))) {
+  const earlierName = normalize(earlierDir) !== normalize(dataDir) ? dbNameIn(earlierDir) : null;
+  const earlierDb = earlierName ? path.join(earlierDir, earlierName) : null;
+  if (earlierDb && !seen(signatureOf(earlierDb))) {
     const lock = readJson(fsImpl, path.join(earlierDir, 'relay-server.lock'));
     const defaultRoot = resolveOarRoot({ ...env, OAR_STATE_ROOT: '' }, platform);
     const ownRoot = normalize(layout.root) === normalize(defaultRoot)
@@ -269,14 +201,14 @@ function adopt({
         path.join(serverDir, 'uploads'),
         resolveUploadDir({ dataDir: earlierDir, env: unpinned, serverDir, platform }),
       ].filter((dir, index, all) => all.findIndex((other) => normalize(other) === normalize(dir)) === index);
-      candidates.push({ kind: 'earlier', dbDir: earlierDir, uploadDirs, cursorDir: path.join(earlierDir, 'cursor-agents'), lock });
+      candidates.push({ kind: 'earlier', dbDir: earlierDir, dbName: earlierName, sourceDb: earlierDb, uploadDirs, cursorDir: path.join(earlierDir, 'cursor-agents'), lock });
     }
   }
   for (const candidate of filesOnly) {
     const filled = fillMissing({ candidate, dataDir, uploadDir, fsImpl, exists, normalize });
     // Looked at once it all came over; a failed copy is tried again.
     if (!filled.ok) continue;
-    checked.push({ ...signatureOf(path.join(candidate.dbDir, DB_FILE)), outcome: 'files', at: now().toISOString() });
+    checked.push({ ...signatureOf(candidate.sourceDb), outcome: 'files', at: now().toISOString() });
     try { writeJson(fsImpl, checkedFile, { sources: checked }); } catch {}
     logger.log?.(`[data] Copied ${filled.uploads} upload(s) and ${filled.cursorFiles} Cursor file(s) of ${path.dirname(candidate.dbDir)} where missing.`);
   }
@@ -284,7 +216,9 @@ function adopt({
 
   const results = [];
   for (const [index, candidate] of candidates.entries()) {
-    const sourceDb = path.join(candidate.dbDir, DB_FILE);
+    const { sourceDb } = candidate;
+    // Looked up per candidate: one adopted before may have placed it.
+    const pinned = resolveDatabaseFile(dataDir, { fsImpl });
     const progress = trackProgress({
       sourceDb, bytes: signatureOf(sourceDb).size, pid, clock, logger,
       write: (value) => writeJson(fsImpl, path.join(dataDir, TAKEOVER_PROGRESS_FILE), value),
@@ -295,7 +229,7 @@ function adopt({
       backupDir: path.join(layout.root, 'backups', candidates.length > 1 ? `${stamp}-${index}` : stamp),
       dataDir,
       uploadDir,
-      pinnedDb,
+      pinnedName: pinned.created ? null : pinned.name,
       Database,
       fsImpl,
       rename,
@@ -317,23 +251,23 @@ function adopt({
     const packageRoot = normalize(path.dirname(serverDir));
     const ours = candidate.kind !== 'earlier' || normalize(candidate.dbDir).startsWith(packageRoot + path.sep);
     let renamedTo = null;
-    if (ours) try {
-      for (const name of DB_FILES) {
-        const from = path.join(candidate.dbDir, name);
-        if (exists(from)) rename(from, path.join(candidate.dbDir, name.replace(DB_FILE, `${DB_FILE}.${suffix}`)));
-      }
-      renamedTo = path.join(candidate.dbDir, `${DB_FILE}.${suffix}`);
-    } catch {}
+    if (ours) {
+      // Under its own name, `<name>.older-<time>` or `<name>.adopted-<time>`:
+      // checkpointed, the -wal/-shm first and the main file last; a failure
+      // leaves it where it was (it is looked at again only if it changes).
+      const aside = setAsideDatabase({ dir: candidate.dbDir, name: candidate.dbName, suffix, Database, rename, fsImpl });
+      if (aside.ok) renamedTo = aside.renamedTo;
+    }
     checked.push({ ...signature, outcome: result.status, at: now().toISOString(), latest: result.latest, renamedTo });
     try { writeJson(fsImpl, checkedFile, { sources: checked }); } catch {}
     if (result.status === 'adopted') {
       logger.log?.(
-        `[data] Brought over the database this relay ran on until now, ${sourceDb} (${result.conversations} conversations, ${result.messages} messages), to ${pinnedDb}`
+        `[data] Brought over the database this relay ran on until now, ${sourceDb} (${result.conversations} conversations, ${result.messages} messages), to ${result.dbPath}`
         + `${result.uploads ? ` with ${result.uploads} upload(s)` : ''}; the original is kept${renamedTo ? ` as ${renamedTo}` : ` at ${sourceDb}`}`
         + `${result.backupDir ? `, the older database that was there in ${result.backupDir}` : ''}.`,
       );
     } else {
-      logger.log?.(`[data] ${sourceDb} is not newer than ${pinnedDb}; left it${renamedTo ? ` as ${renamedTo}` : ''}, not used.`);
+      logger.log?.(`[data] ${sourceDb} is not newer than ${result.dbPath}; left it${renamedTo ? ` as ${renamedTo}` : ''}, not used.`);
     }
     results.push({ ...result, from: candidate.dbDir, renamedTo, cursorFiles: filled.cursorFiles });
   }
@@ -427,19 +361,21 @@ function finishInterruptedSwap({ dataDir, fsImpl, rename, exists, logger }) {
   const journalPath = path.join(dataDir, SWAP_JOURNAL_FILE);
   const journal = readJson(fsImpl, journalPath);
   if (!journal) return null;
-  const staged = path.join(String(journal.stagingDir || ''), DB_FILE);
+  // A journal 0.9.19 wrote has no name: its database had the name before 0.9.20.
+  const dbName = journal.dbName || LEGACY_DB_FILE_NAME;
+  const staged = path.join(String(journal.stagingDir || ''), dbName);
   try {
     if (exists(staged)) {
       // The copy is not in place yet: what is still in the data folder is
       // the pinned database, and goes where the journal put the rest of it.
       fsImpl.mkdirSync(journal.backupDir, { recursive: true });
-      for (const name of DB_FILES) {
+      for (const name of sideFiles(dbName)) {
         if (exists(path.join(dataDir, name))) rename(path.join(dataDir, name), path.join(journal.backupDir, name));
       }
-      rename(staged, path.join(dataDir, DB_FILE));
-    } else if (!exists(path.join(dataDir, DB_FILE)) && exists(path.join(journal.backupDir, DB_FILE))) {
+      rename(staged, path.join(dataDir, dbName));
+    } else if (!exists(path.join(dataDir, dbName)) && exists(path.join(journal.backupDir, dbName))) {
       // Neither the copy nor a database in place: the pinned one goes back.
-      for (const name of DB_FILES) {
+      for (const name of sideFiles(dbName)) {
         if (exists(path.join(journal.backupDir, name))) rename(path.join(journal.backupDir, name), path.join(dataDir, name));
       }
     }
@@ -457,9 +393,13 @@ function finishInterruptedSwap({ dataDir, fsImpl, rename, exists, logger }) {
 }
 
 function considerCandidate({
-  candidate, stagingDir, backupDir, dataDir, uploadDir, pinnedDb, Database, fsImpl, rename, exists, lockMayRun, normalize, progress,
+  candidate, stagingDir, backupDir, dataDir, uploadDir, pinnedName, Database, fsImpl, rename, exists, lockMayRun, normalize, progress,
 }) {
-  const sourceDb = path.join(candidate.dbDir, DB_FILE);
+  const { sourceDb } = candidate;
+  // It takes the pinned database's name; with none there it keeps its own,
+  // so a database under the name before 0.9.20 stays one an earlier version runs on.
+  const dbName = pinnedName || candidate.dbName;
+  const pinnedDb = path.join(dataDir, dbName);
   const refused = (reason) => ({
     status: 'refused',
     from: candidate.dbDir,
@@ -473,12 +413,14 @@ function considerCandidate({
   try {
     progress.step('copy');
     fsImpl.mkdirSync(stagingDir, { recursive: true });
-    for (const name of DB_FILES) {
-      if (exists(path.join(candidate.dbDir, name))) fsImpl.copyFileSync(path.join(candidate.dbDir, name), path.join(stagingDir, name));
+    // Staged under the name it goes in as, -wal and -shm with it.
+    const stagedNames = sideFiles(dbName);
+    for (const [i, name] of sideFiles(candidate.dbName).entries()) {
+      if (exists(path.join(candidate.dbDir, name))) fsImpl.copyFileSync(path.join(candidate.dbDir, name), path.join(stagingDir, stagedNames[i]));
     }
     // The copy, never the original: opening it applies its -wal.
     progress.step('check');
-    earlier = readDatabase(Database, path.join(stagingDir, DB_FILE), { singleFile: true, tick: progress.tick });
+    earlier = readDatabase(Database, path.join(stagingDir, dbName), { singleFile: true, tick: progress.tick });
   } catch (error) {
     removeStaging();
     return refused(`its database could not be copied and read (${error?.message || error}).`);
@@ -495,17 +437,17 @@ function considerCandidate({
     return refused(`its database could not be copied and read (${error?.message || error}).`);
   }
   let pinned = null;
-  if (exists(pinnedDb)) {
+  if (pinnedName) {
     // Read through a copy as well: opening it, even read-only, would rebuild
     // its -shm, and a refused start must leave it as it was.
     const pinnedCopy = `${stagingDir}-pinned`;
     try {
       progress.step('pinned');
       fsImpl.mkdirSync(pinnedCopy, { recursive: true });
-      for (const name of DB_FILES) {
+      for (const name of sideFiles(dbName)) {
         if (exists(path.join(dataDir, name))) fsImpl.copyFileSync(path.join(dataDir, name), path.join(pinnedCopy, name));
       }
-      pinned = readDatabase(Database, path.join(pinnedCopy, DB_FILE), { tick: progress.tick });
+      pinned = readDatabase(Database, path.join(pinnedCopy, dbName), { tick: progress.tick });
     } catch (error) {
       removeStaging();
       return refused(`the pinned database could not be read (${error?.message || error}).`);
@@ -520,11 +462,11 @@ function considerCandidate({
   const newer = newerOf(earlier.stamps, pinned?.stamps);
   if (newer === 'both') {
     removeStaging();
-    return refused('each database has changes newer than the other\'s. Move the copilot.db, copilot.db-wal and copilot.db-shm of the one not to go on with into a folder of your own, then start again.');
+    return refused(`each database has changes newer than the other's. Move the files of the one not to go on with (${sideFiles(candidate.dbName).join(', ')} in ${candidate.dbDir}, or ${sideFiles(dbName).join(', ')} in ${dataDir}) into a folder of your own, then start again.`);
   }
   if (newer !== 'earlier') {
     removeStaging();
-    return { status: 'kept', latest: earlier.latest };
+    return { status: 'kept', dbPath: pinnedDb, latest: earlier.latest };
   }
 
   // Uploads first: the database about to come over refers to them.
@@ -550,14 +492,14 @@ function considerCandidate({
   const movedAside = [];
   try {
     progress.step('swap');
-    writeJson(fsImpl, journalPath, { stagingDir, backupDir, at: new Date().toISOString() });
-    for (const name of DB_FILES) {
+    writeJson(fsImpl, journalPath, { stagingDir, backupDir, dbName, at: new Date().toISOString() });
+    for (const name of sideFiles(dbName)) {
       if (!exists(path.join(dataDir, name))) continue;
       fsImpl.mkdirSync(backupDir, { recursive: true });
       rename(path.join(dataDir, name), path.join(backupDir, name));
       movedAside.push(name);
     }
-    rename(path.join(stagingDir, DB_FILE), pinnedDb);
+    rename(path.join(stagingDir, dbName), pinnedDb);
   } catch (error) {
     // Back as it was. Only the pinned files this run moved go back; the copy
     // is still in staging, so nothing of it is in the data folder.
@@ -580,6 +522,7 @@ function considerCandidate({
 
   return {
     status: 'adopted',
+    dbPath: pinnedDb,
     backupDir: movedAside.length ? backupDir : null,
     uploads: addedUploads.length,
     conversations: earlier.conversations,

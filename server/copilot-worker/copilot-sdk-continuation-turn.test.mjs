@@ -745,6 +745,34 @@ test('a continuation completing while the previous turn publishes loses nothing'
   await runner.dispose();
 });
 
+test('a continuation that books its usage while the previous turn publishes does not take that turn\'s token booking', async () => {
+  // q-1's `/api/response` is held; the continuation runs, captures its usage
+  // and books its tokens inside that window. q-1 then books its OWN tokens,
+  // under its own id, not the continuation's (counts made up).
+  const usage = (model, inputTokens) => ({ type: 'assistant.usage', ephemeral: true, data: { model, inputTokens, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+  const withUsage = (events, event) => [...events.slice(0, -1), event, events[events.length - 1]];
+  let releaseResponse;
+  const gate = new Promise((resolve) => { releaseResponse = resolve; });
+  const stub = makeContinuationApiStub({
+    routeResponses: {
+      '/api/response': (body) => (body.messageId === 'q-1' ? gate : {}),
+    },
+  });
+  const { client, runner } = setup({ stub, events: withUsage(TIMER_TURN, usage('gpt-5.5', 1_000)) });
+
+  const delivery = runner.handlePendingPayload({ message: baseMessage });
+  await waitFor(() => responsesFor(stub, 'q-1').length === 1, { label: 'first publish in flight' });
+  fireTimer(client, withUsage(TIMER_CONTINUATION, usage('gpt-5.6-luna', 18)));
+  await waitFor(() => bodiesFor(stub, '/api/turn-token-usage').some((body) => body.turnId === 'cont-1'), { label: 'continuation booked' });
+
+  releaseResponse({ ok: true });
+  assert.equal(await delivery, true);
+  await waitFor(() => bodiesFor(stub, '/api/turn-token-usage').length === 2, { label: 'both turns booked' });
+  const booked = Object.fromEntries(bodiesFor(stub, '/api/turn-token-usage').map((body) => [body.turnId, body.models.map((entry) => [entry.model, entry.inputTokens])]));
+  assert.deepEqual(booked, { 'cont-1': [['gpt-5.6-luna', 18]], 'q-1': [['gpt-5.5', 1_000]] });
+  await runner.dispose();
+});
+
 test('continuation events captured by a turn that settles before dispatch are rerouted, not dropped', async () => {
   // The terminator and the follow-on continuation can arrive in ONE synchronous
   // batch: `routeEvent` captures every event to the delivered turn at arrival,

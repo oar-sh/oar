@@ -273,6 +273,42 @@ export function collectUsageTotals(db) {
       usage['claude-cloud'] = { costUsd: toAmount(row.cost), sessions: toCount(row.sessions) };
     }
   }
+  // Every provider's tokens per turn, all time (token_usage_days, migration
+  // 0036): fresh input, output, cache writes and cache reads apart, each
+  // null while no turn reported it, the first day, and whether days copied
+  // at the upgrade are in it. An own key's turns (Copilot) are kept apart
+  // from the plan's.
+  if (tableExists(db, 'token_usage_days')) {
+    const rows = db.prepare(`
+      SELECT provider, billing, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+             SUM(cache_write_tokens) AS cache_write, SUM(cache_read_tokens) AS cache_read, MIN(day) AS since,
+             MIN(CASE WHEN source = 'turns' THEN day END) AS first_turns_day,
+             MAX(CASE WHEN source = 'backfill' THEN 1 ELSE 0 END) AS backfilled
+      FROM token_usage_days
+      GROUP BY provider, billing
+      ORDER BY provider, billing
+    `).all();
+    const nullable = (value) => (value === null || value === undefined ? null : toAmount(value));
+    for (const row of rows) {
+      const tokens = {
+        inputTokens: nullable(row.input),
+        outputTokens: nullable(row.output),
+        cacheWriteTokens: nullable(row.cache_write),
+        cacheReadTokens: nullable(row.cache_read),
+        since: row.since || null,
+        // Days copied at the upgrade (0036) hold cache writes inside input;
+        // the first counted turn's day is where that stops.
+        backfilled: Number(row.backfilled) === 1,
+        firstTurnsDay: row.first_turns_day || null,
+      };
+      const entry = usage[row.provider] || (usage[row.provider] = {});
+      if (row.billing) {
+        (entry.ownKeyTokens || (entry.ownKeyTokens = [])).push({ billing: row.billing, ...tokens });
+      } else {
+        entry.tokens = tokens;
+      }
+    }
+  }
   return usage;
 }
 
@@ -310,10 +346,12 @@ async function fileSize(fsImpl, filePath) {
  * @param {() => object[]} [deps.listWorkers] the session worker registry's entries
  * @param {() => object|null} [deps.getUpdateState] buildUpdateStatePayload()
  * @param {object} [deps.sdkVersions] package version by provider id; read from node_modules when absent
+ * @param {() => object|null} [deps.describeBackups] the database backups (db-backup-service.mjs describeBackups)
  */
 export function createAboutService({
   db,
   dbPath = null,
+  describeBackups = null,
   version = '0.0.0',
   commit = null,
   installMethod = null,
@@ -451,13 +489,34 @@ export function createAboutService({
       usage: totals.usage,
       relay: {
         uptimeSeconds,
+        // The full path: which of the two database names this relay runs on.
+        dbPath: dbPath || null,
         dbBytes: dbFileBytes + walBytes,
         dbFileBytes,
         walBytes,
         runningWorkers: workers.total,
       },
       update: describeUpdate(),
+      backups: readBackups(),
     };
+  }
+
+  // The last backup and how many are kept, for one row; never the listing.
+  function readBackups() {
+    if (!describeBackups) return null;
+    try {
+      const backups = describeBackups();
+      return {
+        enabled: backups.enabled,
+        keep: backups.keep,
+        dir: backups.dir,
+        problem: backups.problem,
+        kept: backups.own.length,
+        lastResult: backups.lastResult,
+      };
+    } catch {
+      return null;
+    }
   }
 
   return { describe };

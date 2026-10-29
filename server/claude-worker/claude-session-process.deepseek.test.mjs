@@ -21,6 +21,7 @@ import {
   settled,
 } from './claude-session-test-harness.mjs';
 import { createDeepSeekClaudeBackend } from '../deepseek-worker/deepseek-claude-backend.mjs';
+import { estimateCost } from '../../shared/deepseek-pricing.mjs';
 
 // The Claude runner with the DeepSeek backend (deepseek-worker/): what it
 // hands the CLI, what it leaves out, and when it starts a fresh one.
@@ -249,6 +250,56 @@ test('a sub-agent\'s usage under a Claude name is reported under the DeepSeek mo
     { model: 'deepseek-flash', hitTokens: 0, missTokens: 12_300, outputTokens: 820 },
     { model: 'deepseek-v4-pro', hitTokens: 0, missTokens: 4_000, outputTokens: 100 },
   ]);
+  spawns[0].turn.endInput();
+  await settled(runner);
+});
+
+test('a DeepSeek turn\'s tokens are booked under the models that served it, at DeepSeek\'s prices', async () => {
+  const stub = makeApiStub();
+  const { spawns, startImpl } = spawningStart();
+  const runner = makeRunner({ stub, startImpl, backend, defaultModel: 'deepseek-flash' });
+  await answerTurn(runner, spawns, { ...deepseekMessage }, {
+    init: true,
+    result: usageResult('q-1', {
+      'deepseek-flash[1m]': flashUsage(12_000, 5_000, 800),
+      'claude-sonnet-5-5': flashUsage(300, 0, 20),
+      'claude-opus-5-5': flashUsage(4_000, 0, 100),
+    }),
+  });
+  await waitFor(() => routeCalls(stub, '/api/turn-token-usage').length === 1, { label: 'token report' });
+  const [report] = routeCalls(stub, '/api/turn-token-usage').map((call) => call.body);
+  assert.equal(report.provider, 'deepseek');
+  assert.equal(report.turnId, deepseekMessage.id);
+  assert.match(report.runId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(report.models.map((entry) => [entry.model, entry.inputTokens, entry.cacheWriteTokens, entry.cacheReadTokens, entry.outputTokens]), [
+    ['deepseek-flash', 12_300, 0, 5_000, 820],
+    ['deepseek-v4-pro', 4_000, 0, 0, 100],
+  ]);
+  // Priced from DeepSeek's table, not Claude Code's figure at Claude's prices.
+  for (const entry of report.models) {
+    const expected = estimateCost({ model: entry.model, at: report.at, hitTokens: entry.cacheReadTokens, missTokens: entry.inputTokens, outputTokens: entry.outputTokens });
+    assert.equal(entry.costSource, 'oar-deepseek-table');
+    assert.ok(Math.abs(entry.costUsd - expected) < 1e-9, `${entry.model}: ${entry.costUsd} vs ${expected}`);
+  }
+  spawns[0].turn.endInput();
+  await settled(runner);
+});
+
+test('a DeepSeek turn priced from OAR\'s table is not "cost unknown", whatever Claude Code\'s cost basis says', async () => {
+  const stub = makeApiStub();
+  const { spawns, startImpl } = spawningStart();
+  const runner = makeRunner({ stub, startImpl, backend, defaultModel: 'deepseek-flash' });
+  // Claude Code has no price for DeepSeek's ids and says so.
+  const unpriced = (input, output) => ({ ...flashUsage(input, 0, output), costUSD: 0, costBasis: 'unknown' });
+  await answerTurn(runner, spawns, { ...deepseekMessage }, {
+    init: true,
+    result: usageResult('q-1', { 'deepseek-flash[1m]': unpriced(12_000, 800) }),
+  });
+  await waitFor(() => routeCalls(stub, '/api/turn-token-usage').length === 1, { label: 'token report' });
+  const [entry] = routeCalls(stub, '/api/turn-token-usage')[0].body.models;
+  assert.equal(entry.costSource, 'oar-deepseek-table');
+  assert.ok(entry.costUsd > 0);
+  assert.equal(entry.costUnknown, false);
   spawns[0].turn.endInput();
   await settled(runner);
 });
@@ -519,6 +570,13 @@ test('a Claude turn posts no DeepSeek usage and keeps its plan usage', async () 
   });
   await waitFor(() => routeCalls(stub, '/api/claude-plan-usage').length === 1, { label: 'claude plan usage' });
   assert.deepEqual(routeCalls(stub, '/api/deepseek-plan-usage'), []);
+  // Its tokens are booked under the subscription, with Claude Code's cost.
+  await waitFor(() => routeCalls(stub, '/api/turn-token-usage').length === 1, { label: 'token report' });
+  const [tokens] = routeCalls(stub, '/api/turn-token-usage').map((call) => call.body);
+  assert.equal(tokens.provider, 'claude');
+  assert.deepEqual(tokens.models, [{
+    model: 'claude-sonnet-5', inputTokens: 900, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 60, costUsd: 0.01, costSource: 'claude-code', costUnknown: false,
+  }]);
   assert.equal(spawns[0].params.backend ?? null, null);
   spawns[0].turn.endInput();
   await settled(runner);

@@ -172,6 +172,19 @@ test('the first message creates the session, streams the turn and publishes the 
   const order = api.calls.map((call) => call.routePath);
   assert.ok(order.indexOf('/api/response') < order.indexOf('/api/claude-context-usage'));
 
+  // The token booking gets the session's running totals under the turn; the
+  // session read's cache fields stand in for the one model that ran.
+  const [tokens] = api.posts('/api/turn-token-usage');
+  assert.equal(tokens.conversationId, CONVERSATION_ID);
+  assert.equal(tokens.turnId, 'queue-message-1');
+  assert.equal(tokens.provider, 'claude-cloud');
+  assert.equal(tokens.nativeSessionId, SESSION_ID);
+  assert.match(tokens.runId, /^[0-9a-f-]{36}$/);
+  assert.equal('models' in tokens, false);
+  assert.deepEqual(tokens.sessionTotals, [{
+    model: MODEL, inputTokens: 10, cacheWriteTokens: 40, cacheReadTokens: 30, outputTokens: 20, costUsd: 0.05, costSource: 'claude-code', costUnknown: false,
+  }]);
+
   assert.equal(runner.isTurnActive(), false);
   assert.equal(runner.getActiveQueueMessageId(), '');
   await runner.dispose();

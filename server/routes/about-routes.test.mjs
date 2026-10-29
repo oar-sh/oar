@@ -69,3 +69,14 @@ test('GET /api/about reports a failure instead of hanging', async () => {
   registerAboutRoutes(bare, { auth: (_req, _res, next) => next() });
   assert.equal((await callRoute(bare.routes.get('GET /api/about'))).statusCode, 503);
 });
+
+test('a shared viewer\'s link token never reaches the About payload (it names the database file)', async () => {
+  const app = createMockApp();
+  registerAboutRoutes(app, { auth, aboutService: { describe: async () => ({ relay: { dbPath: '/home/dev/.oar/data/oar.db' } }) } });
+  const handlers = app.routes.get('GET /api/about');
+  for (const headers of [{}, { authorization: 'Bearer share-link-token' }, { cookie: 'oar_share=share-link-token' }]) {
+    const response = await callRoute(handlers, { headers });
+    assert.equal(response.statusCode, 401);
+    assert.doesNotMatch(JSON.stringify(response.body), /oar\.db/);
+  }
+});

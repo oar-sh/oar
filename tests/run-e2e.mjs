@@ -7,6 +7,7 @@ import {
   startRelayServer,
   stopProcess,
 } from "./relay-server-harness.mjs";
+import { snapshotWorktreeData, worktreeDataChanges } from "../scripts/worktree-data-guard.mjs";
 
 const playwrightCli = path.join(repoRoot, "node_modules", "@playwright", "test", "cli.js");
 const token = randomUUID();
@@ -31,6 +32,8 @@ async function markRelayCopilotReady(relay) {
 
 async function main() {
   let shutdownRequested = false;
+  // Nothing a spec does may leave a database or a backup in this checkout.
+  const worktreeBefore = snapshotWorktreeData(repoRoot);
 
   // Isolate the test server's state (db, singleton lock, uploads, config) from a
   // live relay running out of the same checkout. The env block that does the
@@ -39,6 +42,9 @@ async function main() {
   const relay = await startRelayServer({
     token,
     allowCli: Boolean(String(process.env.RELAY_E2E_ALLOW_CLI || "").trim()),
+    // A cold start on a CI runner (a fresh checkout, the module cache empty)
+    // takes longer than the harness's 30 s default.
+    readyTimeoutMs: 120_000,
   });
   await markRelayCopilotReady(relay);
 
@@ -85,6 +91,11 @@ async function main() {
   process.off("SIGTERM", onSigTerm);
   await stopProcess(relay.proc);
   relay.cleanupStateRoot();
+  const leftBehind = worktreeDataChanges(worktreeBefore, snapshotWorktreeData(repoRoot));
+  if (leftBehind.length) {
+    console.error(`\nA spec left files in this checkout (use a temp folder; or a relay running from this checkout made them): ${leftBehind.join(", ")}`);
+    process.exit(testExitCode || 1);
+  }
   process.exit(testExitCode);
 }
 

@@ -242,6 +242,7 @@ import {
   autoCompactWindowNotes,
   renderAutoCompactControlHtml,
   renderAgentSessionsControlHtml,
+  renderPlanOnlyControlHtml,
   renderAutoCompactNotesHtml,
   renderContextUsageHtml,
   renderThinkingControlHtml,
@@ -441,6 +442,7 @@ import {
   dismissUpdateOutcome,
 } from './update-ui.js';
 import { shouldAutofocusComposerOnLoad } from './composer-keyboard.mjs';
+import { planOnlyModeHint } from './plan-board-shared.mjs';
 
 const MODEL_STORAGE_KEY = 'copilot_selected_model';
 // The New Chat modal used to keep its own model key, so a selection made there
@@ -2068,6 +2070,21 @@ function updateModeSelectorForProvider() {
   select.value = modes.includes(selectedBefore)
     ? selectedBefore
     : (modes.includes(FALLBACK_MODE) ? FALLBACK_MODE : modes[0]);
+  syncModeSelectPlanOnlyHint();
+}
+
+// A plan-only session's mode select says so; the owner may still
+// pick any mode.
+function syncModeSelectPlanOnlyHint() {
+  const select = document.getElementById('mode-select');
+  if (!select) return;
+  const planOnly = conversations[String(currentConvId || '').trim()]?.planOnly === true;
+  const hint = planOnlyModeHint(planOnly);
+  select.title = hint.title;
+  if (planOnly) select.dataset.planOnly = 'true';
+  else delete select.dataset.planOnly;
+  const planOption = Array.from(select.options).find((option) => option.value === 'plan');
+  if (planOption) planOption.textContent = planOnly ? hint.planLabel : (RELAY_MODE_LABELS.plan || hint.planLabel);
 }
 
 function modeOptions() {
@@ -2086,6 +2103,8 @@ async function persistCurrentConversationPreferences() {
   if (!modeSelect || !modelSelect) return;
   const mode = String(modeSelect.value || '').trim() || FALLBACK_MODE;
   const model = String(modelSelect.value || '').trim();
+  // Steer or Queue: a mode across plan from the live turn's queues.
+  syncComposerButtonState();
   // The raw value, not selectedReasoningEffortValue(): a model with no reasoning
   // options leaves the selector empty, and that helper's 'none' fallback would
   // record an effort the user never picked when they only changed the mode.
@@ -2203,6 +2222,7 @@ function applyConversationPreferences({
   } finally {
     suppressConversationPreferenceSync = false;
   }
+  syncModeSelectPlanOnlyHint();
   // Nothing is written to the shared "last used" storage here. Applying a
   // conversation's stored preferences is not a choice: it runs on every open,
   // on the ~1s live poll, on a catalog refresh and on another client's edit,
@@ -3536,6 +3556,12 @@ function initAgentSessionsControl() {
   if (!body || body.dataset.agentSessionsControlBound === 'true') return;
   body.dataset.agentSessionsControlBound = 'true';
   body.addEventListener('change', async (event) => {
+    // Plan-only, for every session.
+    const planOnlyBox = event.target?.closest?.('#ctx-plan-only');
+    if (planOnlyBox) {
+      await changePlanOnly(planOnlyBox);
+      return;
+    }
     const box = event.target?.closest?.('#ctx-may-create-sessions');
     if (!box) return;
     const convId = String(box.dataset.conversationId || '').trim();
@@ -3560,6 +3586,31 @@ function initAgentSessionsControl() {
       agentSessionsControlUpdateInFlight = false;
     }
   });
+}
+
+async function changePlanOnly(box) {
+  const convId = String(box.dataset.conversationId || '').trim();
+  if (!convId || agentSessionsControlUpdateInFlight) return;
+  const wanted = box.checked === true;
+  agentSessionsControlUpdateInFlight = true;
+  box.disabled = true;
+  try {
+    const response = await updateConversationPreferences(convId, { clientId: CLIENT_ID, planOnly: wanted });
+    if (!response) throw new Error('The relay refused the change');
+    const stored = response.planOnly === true;
+    if (conversations[convId]) conversations[convId] = { ...conversations[convId], planOnly: stored };
+    box.checked = stored;
+    if (convId === String(currentConvId || '').trim()) syncModeSelectPlanOnlyHint();
+    showTransientRelayNotice(stored
+      ? 'Plan only: agents can no longer take this session out of plan mode.'
+      : 'Plan only is off: agents may switch this session to another mode.');
+  } catch (error) {
+    box.checked = !wanted;
+    showTransientRelayNotice(`Could not change the setting: ${error?.message || error}`);
+  } finally {
+    box.disabled = false;
+    agentSessionsControlUpdateInFlight = false;
+  }
 }
 
 function initThinkingControl() {
@@ -3741,9 +3792,11 @@ async function loadContextSummaryAndRender(convId) {
   // sessions? Only meaningful there, so only shown there.
   const settingsConversationId = String(payload.resolvedConversationId || trimmedConvId || '').trim();
   const settingsConversation = settingsConversationId ? conversations[settingsConversationId] : null;
-  const agentSessionsHtml = settingsConversation?.origin
+  const agentSessionsHtml = (settingsConversation?.origin
     ? renderAgentSessionsControlHtml({ conversationId: settingsConversationId, mayCreateSessions: settingsConversation.mayCreateSessions === true })
-    : '';
+    : '')
+    // Plan-only, for every session.
+    + (settingsConversationId ? renderPlanOnlyControlHtml({ conversationId: settingsConversationId, planOnly: settingsConversation?.planOnly === true }) : '');
   const detailText = String(payload.text || '').trim();
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.

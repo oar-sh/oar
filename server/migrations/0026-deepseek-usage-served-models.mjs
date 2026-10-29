@@ -29,7 +29,7 @@
  * Idempotent: a database without such rows is left as it is. Safe to run on
  * every boot.
  *
- * Usage: node server/migrations/0026-deepseek-usage-served-models.mjs [path/to/copilot.db]
+ * Usage: node server/migrations/0026-deepseek-usage-served-models.mjs [path/to/oar.db]
  */
 
 import { fileURLToPath } from 'url';
@@ -40,6 +40,7 @@ import { DEEPSEEK_USAGE_CHECKPOINTS_TABLE, DEEPSEEK_USAGE_TOTALS_TABLE } from '.
 import { DEEPSEEK_USAGE_DAYS_TABLE, migrateDeepSeekUsageRequestsDaily } from './0025-deepseek-usage-requests-daily.mjs';
 import { deepseekServedModel } from '../../shared/deepseek-models.mjs';
 import { estimateCost, estimateSearchCost } from '../../shared/deepseek-pricing.mjs';
+import { cliDbPath } from '../services/database-file.mjs';
 
 /** The DeepSeek model a stored model name is folded into, or '' when the row stays. */
 export function deepseekFoldedModel(model) {
@@ -191,11 +192,6 @@ export function migrateDeepSeekUsageServedModels(db) {
   return { applied: result.totalsFolded + result.daysFolded + result.checkpointsFolded > 0, ...result };
 }
 
-function defaultDbPath() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, '..', 'data', 'copilot.db');
-}
-
 export function migrate(dbPath, options = {}) {
   const db = new Database(dbPath, options);
   try {
@@ -207,8 +203,10 @@ export function migrate(dbPath, options = {}) {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const dbPath = process.argv[2] ? path.resolve(process.argv[2]) : defaultDbPath();
   try {
+    // The given path, else the database in server/data (oar.db, else the
+    // name before 0.9.20); never a new one.
+    const dbPath = cliDbPath(process.argv[2], new URL('..', import.meta.url));
     const result = migrate(dbPath);
     console.log(`Migration 0026 on ${dbPath}`);
     console.log(result.applied

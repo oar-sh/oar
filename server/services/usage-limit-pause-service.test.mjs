@@ -123,3 +123,25 @@ test('a switch to the key releases the held turn; the clients hear it after the 
   // Nothing held any more: nothing to release.
   assert.equal(app.service.releaseForBillingSwitch({ conversationId: 'conv-1' }), null);
 });
+
+test('on a plan-only chat a held turn goes on in plan, the "Approve plan" turn in the agent mode it ran in', () => {
+  const APPROVE = 'Plan approved by the user. Do not implement. Finish only the plan-only steps you were given, then stop.';
+  for (const [text, expected] of [['build it', 'plan'], [APPROVE, 'agent']]) {
+    const app = setupChat();
+    app.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = 'conv-1'`).run();
+    app.db.prepare(`UPDATE queue SET relay_mode = 'agent', text = ? WHERE id = 'q-refused'`).run(text);
+    const plan = app.service.planPause({ terminalError: refusal, conversationId: 'conv-1', providerType: 'claude', chatProviderType: 'claude', queueRow: app.queueRow() });
+    app.service.schedulePause(plan, { queueRow: app.queueRow() });
+    const [followUp] = app.followUps();
+    assert.equal(followUp.relay_mode, expected, text);
+    assert.equal(app.db.prepare(`SELECT preferred_relay_mode FROM conversations WHERE id = 'conv-1'`).get().preferred_relay_mode, 'plan');
+  }
+});
+
+test('a chat that is not plan-only goes on in the mode the turn ran in', () => {
+  const app = setupChat();
+  app.db.prepare(`UPDATE queue SET relay_mode = 'autopilot' WHERE id = 'q-refused'`).run();
+  const plan = app.service.planPause({ terminalError: refusal, conversationId: 'conv-1', providerType: 'claude', chatProviderType: 'claude', queueRow: app.queueRow() });
+  app.service.schedulePause(plan, { queueRow: app.queueRow() });
+  assert.equal(app.followUps()[0].relay_mode, 'autopilot');
+});

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import nodePath from 'node:path';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { classifyGrokError } from './grok-sdk-adapter.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
 import { PREVIEW_TOOL_DESCRIPTION } from '../../shared/preview-tool-core.mjs';
@@ -301,6 +302,9 @@ test('plan mode posts a plan_ready board for plan-shaped replies', async () => {
   assert.ok(board);
   assert.equal(board.body.boardType, 'plan_ready');
   assert.equal(board.body.body, planText);
+  // The one shared list, "Approve plan" first.
+  assert.deepEqual(JSON.parse(JSON.stringify(board.body.actions)), JSON.parse(JSON.stringify(PLAN_BOARD_ACTIONS)));
+  assert.equal(board.body.actions[0].id, 'approve_only');
   await runner.dispose();
 });
 
@@ -347,6 +351,46 @@ test('turn usage publishes context usage and plan usage', async () => {
   const planCall = api.calls.find((c) => c.path === '/api/grok-plan-usage');
   assert.ok(planCall, 'plan usage should be published');
   assert.equal(planCall.body.usage.costUsd, 0.004);
+  // The token booking gets the four kinds apart and the agent's own cost; a
+  // field the agent did not report (cache writes) is left out, not 0.
+  await waitForCall(api, '/api/turn-token-usage');
+  const tokenCall = api.calls.find((c) => c.path === '/api/turn-token-usage');
+  assert.equal(tokenCall.body.turnId, 'msg-u');
+  assert.equal(tokenCall.body.provider, 'grok');
+  assert.match(tokenCall.body.runId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(tokenCall.body.models, [{
+    model: 'grok-4.5', inputTokens: 1000, outputTokens: 50, cacheWriteTokens: null, cacheReadTokens: 200, reasoningTokens: null, costUsd: 0.004, costSource: 'provider',
+  }]);
+  await runner.dispose();
+});
+
+async function waitForCall(api, path) {
+  for (let i = 0; i < 100 && !api.calls.some((c) => c.path === path); i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+test('a row with an attempt id books its tokens under that attempt', async () => {
+  const api = createMockApi();
+  async function* usageTurn() {
+    yield {
+      channel: 'result',
+      payload: { text: 'answer', isError: false, errorMessage: '', stopReason: 'end_turn', model: 'grok-4.5', usage: { inputTokens: 10, outputTokens: 2, modelId: 'grok-4.5' } },
+    };
+  }
+  const runner = createGrokTurnRunner({
+    api,
+    sdkSessionId: 'conv-attempt',
+    cwd: process.cwd(),
+    defaultModel: 'grok-4.5',
+    createAgentHandleImpl: async () => makeHandle(),
+    startGrokTurnImpl: () => usageTurn(),
+  });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-a', attemptId: 'attempt-3', conversationId: 'conv-attempt', text: 'x', relayMode: 'agent' },
+  });
+  await waitForCall(api, '/api/turn-token-usage');
+  const tokenCall = api.calls.find((c) => c.path === '/api/turn-token-usage');
+  assert.equal(tokenCall.body.runId, 'attempt-3');
+  assert.equal(tokenCall.body.turnId, 'msg-a');
   await runner.dispose();
 });
 

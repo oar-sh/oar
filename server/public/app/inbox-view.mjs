@@ -11,11 +11,26 @@
 // values of shared/relay-asks.mjs this needs are kept here, and
 // inbox-view.test.mjs asserts they match.
 
+import { boardOutcomeLine } from './relay-board-inline.mjs';
+
 export const RELAY_ASK_SOCKET_EVENT = 'relay_ask_updated';
+export const INBOX_REMOTE_CHANGED_EVENT = 'inbox_remote_changed';
 export const INBOX_ANSWERED_KEEP_MS = 24 * 60 * 60_000;
 export const INBOX_FILTERS = Object.freeze(['all', 'mine', 'agents']);
 
-const CLOSED_STATUSES = new Set(['answered', 'dismissed']);
+// The head label of a paired relay's approval card by its `variant`
+// (REMOTE_RELAY_APPROVAL_VARIANTS of shared/remote-relay-contract.mjs).
+export const INBOX_APPROVAL_VARIANT_LABELS = Object.freeze({
+  create_session: 'New session',
+  loop_guard: 'Loop guard',
+  write: 'Write',
+  session_settings: 'Session settings',
+  watch: 'Watch',
+  local_sessions: 'Start sessions',
+});
+
+// A plan card that was acted on is closed too.
+const CLOSED_STATUSES = new Set(['answered', 'dismissed', 'acted']);
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -71,6 +86,11 @@ function isClosed(item) {
   return CLOSED_STATUSES.has(toText(item?.status));
 }
 
+// When an item was closed: answered, a plan card acted on, else made.
+function closedAt(item) {
+  return item?.answeredAt || item?.actedAt || item?.createdAt;
+}
+
 function newestFirst(a, b) {
   return toText(b?.createdAt).localeCompare(toText(a?.createdAt));
 }
@@ -85,8 +105,8 @@ export function inboxSections(relays, { filter = 'all', now = Date.now() } = {})
     const items = (Array.isArray(relay?.items) ? relay.items : []).filter((item) => item && toText(item.id) && inboxFilterMatches(item, filter));
     const pending = items.filter((item) => toText(item.status) === 'pending').sort(newestFirst);
     const closed = items
-      .filter((item) => isClosed(item) && now - (Date.parse(toText(item.answeredAt || item.createdAt)) || 0) <= INBOX_ANSWERED_KEEP_MS)
-      .sort((a, b) => toText(b.answeredAt || b.createdAt).localeCompare(toText(a.answeredAt || a.createdAt)));
+      .filter((item) => isClosed(item) && now - (Date.parse(toText(closedAt(item))) || 0) <= INBOX_ANSWERED_KEEP_MS)
+      .sort((a, b) => toText(closedAt(b)).localeCompare(toText(closedAt(a))));
     return {
       relay: {
         id: toText(relay?.id),
@@ -145,6 +165,59 @@ export function sessionAsksFromInbox(relays) {
     if (item?.kind === 'ask' && toText(item.id)) asks.set(item.id, { ...item, conversationId: item.session?.id });
   }
   return asks;
+}
+
+// The folds a card has: an ask's `Details` and a plan card's `The plan`.
+export const INBOX_FOLD_SELECTOR = 'details.inbox-item-detail, details.inbox-plan-body';
+
+/**
+ * A fold's key: its card's relay and id, and which fold it is. Every render
+ * builds the cards anew, closed; the keys of the open ones carry them over.
+ */
+export function inboxFoldKey(details) {
+  const card = details?.closest?.('.inbox-item');
+  const itemId = toText(card?.dataset?.itemId);
+  if (!itemId) return '';
+  const fold = details.classList?.contains('inbox-plan-body') ? 'plan' : 'detail';
+  return `${toText(card.dataset.relayId) || 'self'}\n${itemId}\n${fold}`;
+}
+
+/** Notes whether `details` is open in `openFolds` (a Set of fold keys). */
+export function noteInboxFold(openFolds, details) {
+  const key = inboxFoldKey(details);
+  if (!key) return;
+  if (details.open) openFolds.add(key);
+  else openFolds.delete(key);
+}
+
+/** Notes every fold under `root`, as it is now. */
+export function captureInboxFolds(openFolds, root) {
+  for (const details of root?.querySelectorAll?.(INBOX_FOLD_SELECTOR) || []) noteInboxFold(openFolds, details);
+}
+
+/** Opens the folds under `root` that were open before its re-render. */
+export function restoreInboxFolds(openFolds, root) {
+  for (const details of root?.querySelectorAll?.(INBOX_FOLD_SELECTOR) || []) {
+    if (openFolds.has(inboxFoldKey(details))) details.open = true;
+  }
+}
+
+/**
+ * Forgets the folds of items no longer listed (an Inbox load, GET
+ * /api/inbox). A relay that did not answer keeps its folds: its items did
+ * not leave, they are just not shown.
+ */
+export function pruneInboxFolds(openFolds, relays, { now = Date.now() } = {}) {
+  const listed = new Set();
+  const kept = new Set();
+  for (const section of inboxSections(relays, { now })) {
+    if (!section.relay.reachable) kept.add(section.relay.id || 'self');
+    for (const item of [...section.pending, ...section.closed]) listed.add(`${section.relay.id || 'self'}\n${toText(item.id)}`);
+  }
+  for (const key of [...openFolds]) {
+    const [relayId, itemId] = key.split('\n');
+    if (!kept.has(relayId) && !listed.has(`${relayId}\n${itemId}`)) openFolds.delete(key);
+  }
 }
 
 /** Pending items across every relay (the sidebar's badge), whatever the filter. */
@@ -269,10 +342,17 @@ export function buildCardItem(doc, item, { relay = null, now = Date.now() } = {}
   card.dataset.kind = toText(item.kind) || 'ask_user';
   if (relay?.id) card.dataset.relayId = relay.id;
   card.dataset.status = toText(item.status) || 'pending';
-  card.append(headLine(doc, item, { relay, now, label: approval ? 'Approval · the session waits' : 'Question · the session waits' }));
+  // A paired relay's approval says what it is about; one from a
+  // relay without summaries (0.9.19) keeps the plain text.
+  const summary = approval && !relay?.self ? toText(item.summary) : '';
+  const variant = toText(item.variant);
+  const variantLabel = Object.hasOwn(INBOX_APPROVAL_VARIANT_LABELS, variant) ? INBOX_APPROVAL_VARIANT_LABELS[variant] : '';
+  const kindLabel = summary ? (variantLabel || 'Approval') : (approval ? 'Approval' : 'Question');
+  card.append(headLine(doc, item, { relay, now, label: `${kindLabel} · the session waits` }));
   card.append(sessionLine(doc, item, relay));
   if (toText(item.header)) card.append(el(doc, 'div', 'inbox-item-header', item.header));
-  if (toText(item.question)) card.append(el(doc, 'p', 'inbox-item-question', item.question));
+  if (summary) card.append(el(doc, 'p', 'inbox-item-question inbox-item-summary', `${toText(relay?.name) || 'that relay'} · ${summary}`));
+  else if (toText(item.question)) card.append(el(doc, 'p', 'inbox-item-question', item.question));
   else if (approval) card.append(el(doc, 'p', 'inbox-item-question', 'An Allow / Deny card on that relay.'));
   const outcome = outcomeLine(doc, item);
   if (outcome) card.append(outcome);
@@ -321,8 +401,64 @@ export function buildCardItem(doc, item, { relay = null, now = Date.now() } = {}
   return card;
 }
 
+/**
+ * A plan card in the Inbox: the plan folded, and the card's own
+ * buttons, which act as the card in its session does (a plan-only session
+ * asks first). Settled, it says what was chosen. A paired relay's shows its
+ * title alone: "Open there".
+ */
+export function buildPlanItem(doc, item, { relay = null, now = Date.now() } = {}) {
+  const card = el(doc, 'article', 'inbox-item inbox-card inbox-plan');
+  card.dataset.itemId = toText(item.id);
+  card.dataset.kind = 'plan';
+  if (relay?.id) card.dataset.relayId = relay.id;
+  card.dataset.status = toText(item.status) || 'pending';
+  card.append(headLine(doc, item, { relay, now, label: 'Plan · ready for review' }));
+  card.append(sessionLine(doc, item, relay));
+  card.append(el(doc, 'div', 'inbox-item-header', toText(item.title) || 'Plan ready for review'));
+  if (relay?.self && toText(item.body)) {
+    const details = el(doc, 'details', 'inbox-plan-body');
+    details.append(el(doc, 'summary', '', 'The plan'));
+    details.append(el(doc, 'div', 'inbox-plan-text', item.body));
+    card.append(details);
+  }
+  if (item.status !== 'pending') {
+    const outcome = boardOutcomeLine(item);
+    if (outcome) card.append(el(doc, 'div', 'inbox-item-outcome', outcome));
+    return card;
+  }
+  if (!relay?.self) {
+    const url = inboxSessionUrl(relay?.url, item?.session?.id);
+    const actions = el(doc, 'div', 'inbox-item-actions');
+    if (url) {
+      const link = el(doc, 'a', 'inbox-open-there inbox-open-there-button', 'Open there');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      actions.append(link);
+    } else {
+      actions.append(el(doc, 'span', 'inbox-item-note', 'Answer it on that relay.'));
+    }
+    card.append(actions);
+    return card;
+  }
+  const recommended = toText(item.recommendedAction).toLowerCase();
+  const row = el(doc, 'div', 'inbox-item-options inbox-plan-actions');
+  for (const action of Array.isArray(item.actions) ? item.actions : []) {
+    const actionId = toText(action?.id).toLowerCase();
+    if (!actionId) continue;
+    const node = button(doc, `inbox-choice inbox-plan-action${actionId === recommended ? ' inbox-plan-action-recommended' : ''}`, toText(action?.label) || actionId, {
+      relayId: 'self', inboxAction: 'plan-action', boardId: item.id, actionId, sessionId: item?.session?.id,
+    });
+    row.append(node);
+  }
+  card.append(row);
+  return card;
+}
+
 function buildItem(doc, item, relay, now) {
   if (item.kind === 'ask') return buildAskCard(doc, item, { relay, now, mode: 'inbox', answerable: true });
+  if (item.kind === 'plan') return buildPlanItem(doc, item, { relay, now });
   return buildCardItem(doc, item, { relay, now });
 }
 

@@ -30,6 +30,8 @@ export function createRelayCliLauncherService({
   killWaitMs = 700,
   maxKillAttempts = 10,
   log = () => {},
+  // worker-scope.mjs: a scope of its own under a systemd user service.
+  workerScope = null,
 } = {}) {
   let activeJob = null;
   const processInspector = createSessionWorkerProcessInspector({
@@ -119,6 +121,7 @@ export function createRelayCliLauncherService({
       execFileSyncImpl,
       processInspector,
       log,
+      workerScope,
     });
     return launched;
   }

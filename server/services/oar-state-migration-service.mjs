@@ -23,10 +23,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+import { DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile, sideFiles } from './database-file.mjs';
 import { createRelaySingletonGuard } from './relay-singleton-guard.mjs';
 
 export const MIGRATION_MARKER = '.migrated';
-const DB_FILE = 'copilot.db';
 const MAX_LOGS_BYTES = 50 * 1024 * 1024;
 
 export function resolveOarRoot(env = process.env, platform = process.platform) {
@@ -257,16 +257,23 @@ export async function migrateStateToOarRoot({
   const markerPath = path.join(root, MIGRATION_MARKER);
   if (!repoServerDir && fs.existsSync(markerPath)) return { status: 'already-migrated', root };
 
-  const targetDbFiles = [DB_FILE, `${DB_FILE}-wal`, `${DB_FILE}-shm`].map((name) => path.join(dataDir, name));
+  // A database there under either name, and the -wal/-shm of each.
+  const targetDbFiles = DB_FILE_NAMES.flatMap(sideFiles).map((name) => path.join(dataDir, name));
+  const takenTargetDbs = () => DB_FILE_NAMES.map((name) => path.join(dataDir, name)).filter((file) => pathTaken(file));
   const targetLock = path.join(dataDir, 'relay-server.lock');
   // The same checkout once more (a repeated command, an alias): nothing to
   // do while the database it brought is still there.
-  if (repoServerDir && pathTaken(targetDbFiles[0]) && wasMigratedFrom(root, repoServerDir)) {
+  if (repoServerDir && takenTargetDbs().length && wasMigratedFrom(root, repoServerDir)) {
     return { status: 'already-migrated', root, source: repoServerDir };
   }
 
   const sourceData = repoServerDir ? path.join(repoServerDir, 'data') : null;
-  const sourceDb = sourceData ? path.join(sourceData, DB_FILE) : null;
+  // The database keeps its name; with both names there the other comes
+  // along as it is, and the relay's next start compares the two.
+  const sourceFile = sourceData ? resolveDatabaseFile(sourceData) : null;
+  const sourceDb = sourceFile && !sourceFile.created ? sourceFile.path : null;
+  const sourceOther = sourceFile?.both ? path.join(sourceData, LEGACY_DB_FILE_NAME) : null;
+  const targetDb = sourceDb ? path.join(dataDir, path.basename(sourceDb)) : null;
   const sourceRepoConfig = repoServerDir ? path.join(repoServerDir, 'config.json') : null;
   const sourceManagedConfig = managedConfigDir ? path.join(managedConfigDir, 'config.json') : null;
 
@@ -305,20 +312,28 @@ export async function migrateStateToOarRoot({
   const refusedWithConversations = () => ({
     status: 'refused-existing-database',
     root,
-    error: `The state root already has a database with conversations (${targetDbFiles[0]}); `
+    error: `The state root already has a database with conversations (${takenTargetDbs().join(', ')}); `
       + `a migration never overwrites one. To bring ${repoServerDir} over instead: `
       + `stop the relay (oar stop), move ${dataDir} aside, then run the migration again.`,
   });
+  const anyTargetNotFresh = async () => {
+    const Database = await loadDatabase(DatabaseImpl);
+    return takenTargetDbs().some((file) => !isFreshDatabase(Database, file));
+  };
   if (hasDb && existingDbFiles().length) {
-    if (!pathTaken(targetDbFiles[0])) {
+    // A -wal or -shm whose database is not there.
+    const orphans = DB_FILE_NAMES.filter((name) => !pathTaken(path.join(dataDir, name)))
+      .flatMap((name) => sideFiles(name).slice(1).map((side) => path.join(dataDir, side)))
+      .filter((file) => pathTaken(file));
+    if (orphans.length) {
       return {
         status: 'refused-existing-database',
         root,
-        error: `The state root has database files without copilot.db (${existingDbFiles().join(', ')}); `
+        error: `The state root has database files without their database (${orphans.join(', ')}); `
           + 'a migration never mixes a database with them. Move them aside, then run the migration again.',
       };
     }
-    if (!isFreshDatabase(await loadDatabase(DatabaseImpl), targetDbFiles[0])) return refusedWithConversations();
+    if (await anyTargetNotFresh()) return refusedWithConversations();
   }
 
   const copied = [];
@@ -355,7 +370,7 @@ export async function migrateStateToOarRoot({
     }
     // Asked again under the lock: a relay that ran between the first look and
     // the lock may have written conversations into the database meanwhile.
-    if (pathTaken(targetDbFiles[0]) && !isFreshDatabase(await loadDatabase(DatabaseImpl), targetDbFiles[0])) {
+    if (await anyTargetNotFresh()) {
       try { guard.release(); } catch {}
       removeCreated(created);
       return refusedWithConversations();
@@ -384,9 +399,14 @@ export async function migrateStateToOarRoot({
         // Checkpoint first so recent writes leave the WAL, then copy all three
         // files anyway — a hot -wal must never be dropped on the floor.
         sourceCounts = readDbCounts(Database, sourceDb, { checkpoint: true });
-        copyIfExists(sourceDb, targetDbFiles[0], copied, created, skipped);
-        copyIfExists(`${sourceDb}-wal`, targetDbFiles[1], copied, created, skipped);
-        copyIfExists(`${sourceDb}-shm`, targetDbFiles[2], copied, created, skipped);
+        copyIfExists(sourceDb, targetDb, copied, created, skipped);
+        copyIfExists(`${sourceDb}-wal`, `${targetDb}-wal`, copied, created, skipped);
+        copyIfExists(`${sourceDb}-shm`, `${targetDb}-shm`, copied, created, skipped);
+        if (sourceOther) {
+          for (const name of sideFiles(path.basename(sourceOther))) {
+            copyIfExists(path.join(sourceData, name), path.join(dataDir, name), copied, created, skipped);
+          }
+        }
         copyIfExists(path.join(sourceData, 'cursor-agents'), path.join(dataDir, 'cursor-agents'), copied, created, skipped);
       }
 
@@ -410,7 +430,7 @@ export async function migrateStateToOarRoot({
 
       if (hasDb) {
         const Database = await loadDatabase(DatabaseImpl);
-        const targetCounts = readDbCounts(Database, targetDbFiles[0]);
+        const targetCounts = readDbCounts(Database, targetDb);
         const mismatch = targetCounts.integrity !== 'ok'
           || targetCounts.conversations !== sourceCounts.conversations
           || targetCounts.messages !== sourceCounts.messages;

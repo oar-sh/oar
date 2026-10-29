@@ -383,6 +383,24 @@ test('an all_idle there names this relay\'s subscription id', () => {
   assert.match(eventMessages(a.db)[0].text, new RegExp(`linux-test · all_idle: no turn or task is running in the 1 watched session \\(subscription ${mirror.id}\\)`));
 });
 
+test('a board_settled there keeps its board, action and queued message through the fetch', () => {
+  const { a, b, clock, subscribeAcross, pull } = setup();
+  const { remote } = subscribeAcross({ sessionIds: [BUILDER] });
+  assert.ok(remote.events.includes('board_settled'), 'a default there too');
+  b.service.noteBoardSettled(BUILDER, { boardId: 'brd_fixture01', boardType: 'plan', action: 'approve', actionLabel: 'Approve plan', title: 'Ship the orbit camera', queuedMessageId: 'msg-fixture-1' });
+  b.service.noteBoardSettled(BUILDER, { boardId: 'brd_fixture02', boardType: 'plan', action: 'exit_only', actionLabel: 'Stop here', title: 'Plan B', queuedMessageId: null });
+  pull();
+  const stored = a.db.prepare(`SELECT payload_json FROM relay_events WHERE watcher_conversation_id = ? ORDER BY id ASC`).all(WATCHER).map((row) => JSON.parse(row.payload_json));
+  assert.equal(stored.length, 2);
+  assert.equal(stored[0].type, 'board_settled');
+  assert.deepEqual(stored[0].detail, { boardId: 'brd_fixture01', boardType: 'plan', action: 'approve', actionLabel: 'Approve plan', title: 'Ship the orbit camera', queuedMessageId: 'msg-fixture-1' });
+  assert.deepEqual(stored[1].detail, { boardId: 'brd_fixture02', boardType: 'plan', action: 'exit_only', actionLabel: 'Stop here', title: 'Plan B' }, 'a null queued message is left out');
+  clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
+  const [message] = eventMessages(a.db);
+  assert.match(message.text, /linux-test · session "Orbit camera" \(conv-fixture-builder\): board_settled "Ship the orbit camera" → "Approve plan" \(action approve, board_id brd_fixture01, queued message msg-fixture-1\)/);
+  assert.match(message.text, /board_settled "Plan B" → "Stop here" \(action exit_only, board_id brd_fixture02, nothing queued\)/);
+});
+
 test('an end the paired relay never confirms is given up after remoteKeepDays', () => {
   const { a, clock, subscribeAcross } = setup();
   const { mirror } = subscribeAcross({ sessionIds: [BUILDER] });

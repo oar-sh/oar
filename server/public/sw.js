@@ -191,6 +191,14 @@ async function handleNotificationClick(event) {
       if (ok) return;
     }
   }
+  // A card on a paired relay: it carries no question id, only the
+  // link of its session there, and is answered there ("Open there").
+  const url = String(data.url || '');
+  if (!data.questionId && /^https?:\/\//i.test(url)) {
+    event.notification.close();
+    await self.clients.openWindow(url);
+    return;
+  }
   event.notification.close();
   await focusOrOpenConversation(String(data.conversationId || ''));
 }

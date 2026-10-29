@@ -485,6 +485,9 @@ test('event actions default to this relay and validate their arguments', () => {
   assert.match(validate({ action: 'subscribe', sessions: ['all', 'conv-a'] }).error, /not both/);
   assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['nope'] }).error, /events must be some of/);
   assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['subagent_finished', 'task_finished'] }).args.events, ['subagent_finished', 'task_finished']);
+  assert.deepEqual(validate({ action: 'subscribe', sessions: ['conv-a'], events: ['board_settled'] }).args.events, ['board_settled']);
+  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.events.items.enum.includes('board_settled'));
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /board_settled \(the user settled a plan card there: the action and the board id\)/);
   assert.match(validate({ action: 'subscribe', sessions: ['conv-a'], match: '(' }).error, /not a valid regular expression/);
   assert.match(validate({ action: 'unsubscribe' }).error, /subscription_id/);
   assert.deepEqual(validate({ action: 'list_subscriptions', watcher: 'conv-old' }).args, { relay: 'this', watcher: 'conv-old' });
@@ -731,7 +734,7 @@ test('create_session refuses an argument it does not take and lists its argument
   assert.equal(refused.ok, false);
   assert.equal(refused.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
   assert.match(refused.error, /^create_session does not take: groupId, scope, session\./);
-  assert.match(refused.error, /Its arguments: relay, text, provider, model, cwd, repo, branch, mode, effort, title, group, wait_seconds\./);
+  assert.match(refused.error, /Its arguments: relay, text, provider, model, cwd, repo, branch, mode, effort, title, group, wait_seconds, planOnly\./);
   assert.match(refused.error, /Nothing was created\./);
   // The refusal comes first, before any other check of the call.
   assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', bogus: 1 }).error.startsWith('create_session does not take: bogus'), true);
@@ -808,7 +811,7 @@ test('update_session: a full-permission write action on one session, with the se
   assert.equal(isRemoteRelayWriteAction('update_session'), true);
   assert.equal(remoteRelayPermissionAllows('prompt', 'update_session'), false);
   assert.equal(remoteRelayPermissionAllows('full', 'update_session'), true);
-  assert.deepEqual([...REMOTE_RELAY_SESSION_SETTINGS], ['model', 'effort', 'mode', 'auto_compact_window', 'title', 'group', 'thinking_enabled', 'thinking_display', 'cwd']);
+  assert.deepEqual([...REMOTE_RELAY_SESSION_SETTINGS], ['model', 'effort', 'mode', 'auto_compact_window', 'title', 'group', 'thinking_enabled', 'thinking_display', 'cwd', 'planOnly']);
   assert.deepEqual([...REMOTE_RELAY_ACTION_ARGUMENTS.update_session], ['session', ...REMOTE_RELAY_SESSION_SETTINGS]);
   const parsed = validateRemoteRelayToolInput({
     action: 'update_session', relay: 'this', session: ' conv-a ', model: ' claude-opus-5 ', effort: 'HIGH', mode: 'Plan',
@@ -878,7 +881,7 @@ test('update_session: auto_compact_window, thinking and mode are checked for the
 test('update_session refuses an argument it does not take, the owner-only switch with a word on why', () => {
   const refused = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', model: 'x', text: 'go' });
   assert.equal(refused.ok, false);
-  assert.match(refused.error, /^update_session does not take: text\. Its arguments: relay, session, model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd\. Nothing was changed\.$/);
+  assert.match(refused.error, /^update_session does not take: text\. Its arguments: relay, session, model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd, planOnly\. Nothing was changed\.$/);
   const owner = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', may_create_sessions: true });
   assert.equal(owner.ok, false);
   assert.match(owner.error, /does not take: may_create_sessions\..*the owner's setting alone/);
@@ -893,10 +896,13 @@ test('update_session is summarized with the settings it names, and the tool text
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /update_session \{session, \.\.\.\} sets another session's model, effort, mode, auto_compact_window, title, group/);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /A session this conversation started may be changed freely; any other \(the owner's, another agent's, the one that started you\) needs the owner's Allow once per conversation and relay; your own conversation never/);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /A group the owner made is never removed that way \(it may stay empty\)/);
-  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /lasts until the next send that names another mode or comes from a caller in another mode/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /A mode set so stays the session's own: a send without mode runs in it, and a send that names a mode runs that turn alone in it\./);
+  assert.doesNotMatch(REMOTE_RELAY_TOOL_DESCRIPTION, /passes the caller's/);
+  // send leaves the target's mode alone; create_session still takes this session's.
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.mode.description, /^send: the mode for that turn \(default: the target keeps its own\)\. create_session: the new session's mode \(default: this session's\)\. update_session: from now on\.$/);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /unless the owner allowed it for that session \(list_sessions and read_session show mayCreateSessions\)/);
   assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.description, /update_session: change another session's settings/);
-  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /thinking and cwd \(its CLI restarts there; not while it works\)/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /thinking, cwd \(its CLI restarts there; not while it works\) and planOnly/);
   for (const key of ['model', 'mode', 'effort', 'title', 'group', 'cwd']) {
     assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties[key].description, /update_session/, key);
   }
@@ -909,4 +915,26 @@ test('formatSessionGroupList counts the groups a capped list leaves out', () => 
   // A total below the list's own length changes nothing.
   assert.equal(formatSessionGroupList(groups, 20, 1), 'A (grp_a), B (grp_b)');
   assert.equal(formatSessionGroupList(groups), 'A (grp_a), B (grp_b)');
+});
+
+test('planOnly: create_session and update_session take it as a boolean; the schema and the text explain it', () => {
+  const create = validateRemoteRelayToolInput({ action: 'create_session', relay: 'linux-test', text: 'Plan it', planOnly: true });
+  assert.equal(create.ok, true);
+  assert.equal(create.args.planOnly, true);
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'linux-test', text: 'x', planOnly: 'true' }).args.planOnly, true);
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'linux-test', text: 'x', planOnly: false }).args.planOnly, undefined);
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'linux-test', text: 'x', planOnly: 'maybe' }).ok, false);
+  assert.equal(validateRemoteRelayToolInput({ action: 'send', relay: 'linux-test', session: 's', text: 'x', planOnly: true }).ignored?.includes('planOnly'), true, 'send does not take it');
+  const update = validateRemoteRelayToolInput({ action: 'update_session', relay: 'linux-test', session: 's', planOnly: false, mode: 'agent' });
+  assert.equal(update.ok, true);
+  assert.equal(update.args.planOnly, false, 'false is a value: it clears the flag');
+  assert.equal(update.args.mode, 'agent');
+  assert.equal(validateRemoteRelayToolInput({ action: 'update_session', relay: 'linux-test', session: 's', planOnly: 'nah' }).ok, false);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.planOnly.type, 'boolean');
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.planOnly.description, /keep the session in plan mode/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /planOnly:true \(create_session, or update_session together with mode "plan"/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /refused \(code plan_only\)/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /clears it only with planOnly:false and another mode in the same call \(alone, planOnly:false changes nothing, and on a plan-only session the answer says so\)/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.planOnly.description, /only together with a mode other than plan; alone it changes nothing \(on a plan-only session the answer says so\)/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /list_sessions and read_session show planOnly/);
 });

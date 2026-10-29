@@ -298,3 +298,20 @@ test('a session whose worker claimed one of its turns gets no note for another o
   assert.equal(notes(env.db, 'conv-a').length, 0, 'the worker lived through the restart');
   assert.deepEqual(service.pending(), []);
 });
+
+test('on a plan-only session a cut turn goes on in plan, the "Approve plan" turn in the agent mode it ran in', () => {
+  const APPROVE = 'Plan approved by the user. Do not implement. Finish only the plan-only steps you were given, then stop.';
+  for (const [text, expected] of [['Fix the orbit camera', 'plan'], [APPROVE, 'agent']]) {
+    const env = setup();
+    seedConversation(env.db, 'conv-a');
+    env.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = 'conv-a'`).run();
+    const cut = seedRow(env.db, 'q-cut', 'conv-a', { text });
+    const service = env.make();
+    service.captureBoot();
+    env.settleRow('q-cut', 'failed');
+    assert.equal(service.noteOutcome(cut, 'cut'), true);
+    const [note] = notes(env.db, 'conv-a');
+    assert.equal(note.relay_mode, expected, text);
+    assert.equal(env.db.prepare(`SELECT preferred_relay_mode FROM conversations WHERE id = 'conv-a'`).get().preferred_relay_mode, 'plan');
+  }
+});

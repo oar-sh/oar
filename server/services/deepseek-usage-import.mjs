@@ -26,7 +26,7 @@
  * DeepSeek (`readActuals`), so the other keys of the account stay out of it.
  * The relay's own usage tables are never touched.
  *
- * CLI: npm run deepseek:import -- amount.csv cost.csv [path/to/copilot.db]
+ * CLI: npm run deepseek:import -- amount.csv cost.csv [path/to/oar.db]
  */
 
 import { fileURLToPath } from 'url';
@@ -35,6 +35,7 @@ import path from 'path';
 import process from 'process';
 import Database from 'better-sqlite3';
 
+import { cliDbPath } from './database-file.mjs';
 import { DEEPSEEK_API_KEY_SETTING_KEY } from './deepseek-settings-service.mjs';
 import { DEEPSEEK_USAGE_ACTUALS_TABLE, migrateDeepSeekUsageActuals } from '../migrations/0030-deepseek-usage-actuals.mjs';
 
@@ -415,13 +416,8 @@ export function createDeepSeekUsageImportService({ db, getApiKey = () => '', now
   return { importExport, readActuals };
 }
 
-function defaultDbPath() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, '..', 'data', 'copilot.db');
-}
-
 /** The CLI's work: reads the files, imports them into the database at `dbPath`. */
-export function importDeepSeekUsageFiles({ amountPath, costPath, dbPath = defaultDbPath(), now = () => new Date() } = {}) {
+export function importDeepSeekUsageFiles({ amountPath, costPath, dbPath = cliDbPath(null, new URL('..', import.meta.url)), now = () => new Date() } = {}) {
   const amount = fs.readFileSync(amountPath, 'utf8');
   const cost = fs.readFileSync(costPath, 'utf8');
   const db = new Database(dbPath);
@@ -444,11 +440,12 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   const [amountArg, costArg, dbArg] = process.argv.slice(2);
   if (!amountArg || !costArg) {
-    console.error('Usage: npm run deepseek:import -- amount.csv cost.csv [path/to/copilot.db]');
+    console.error('Usage: npm run deepseek:import -- amount.csv cost.csv [path/to/oar.db]');
     process.exit(2);
   }
-  const dbPath = dbArg ? path.resolve(dbArg) : defaultDbPath();
   try {
+    // The given path, else the database in server/data; never a new one.
+    const dbPath = cliDbPath(dbArg, new URL('..', import.meta.url));
     const result = importDeepSeekUsageFiles({ amountPath: path.resolve(amountArg), costPath: path.resolve(costArg), dbPath });
     if (!result.ok) {
       console.error(`DeepSeek usage import refused: ${result.error}`);

@@ -37,6 +37,20 @@ test('"may start sessions" reads the owner\'s switch; without it (or the column)
   assert.equal(createRemoteRelayRepository(old).mayCreateSessions('c-1'), false);
 });
 
+test('plan-only reads the flag; without it (or the column) no session is plan-only', () => {
+  const { db, repo } = setup();
+  assert.equal(repo.planOnly('c-1'), false);
+  db.prepare(`UPDATE conversations SET plan_only = 1 WHERE id = 'c-1'`).run();
+  assert.equal(repo.planOnly('c-1'), true);
+  db.prepare(`UPDATE conversations SET plan_only = 0 WHERE id = 'c-1'`).run();
+  assert.equal(repo.planOnly('c-1'), false);
+  assert.equal(repo.planOnly('c-missing'), false);
+  const old = new Database(':memory:');
+  applySchema(old);
+  old.exec(`ALTER TABLE conversations DROP COLUMN plan_only`);
+  assert.equal(createRemoteRelayRepository(old).planOnly('c-1'), false);
+});
+
 test('unlocks recorded in the same millisecond list in the order they were recorded', () => {
   // Windows' clock often gives two sends in a row the same timestamp; the
   // later relay must not move ahead because its id sorts first.

@@ -118,3 +118,61 @@ test('provider and version text is escaped', () => {
   assert.doesNotMatch(html, /<b>1<\/b>|<img src=x>/);
   assert.match(html, /&lt;b&gt;1&lt;\/b&gt;/);
 });
+
+test('the Database row shows the file the relay runs on with its size', () => {
+  for (const dbPath of ['/home/dev/oar/server/data/oar.db', '/home/dev/.oar/data/copilot.db']) {
+    const html = buildAboutModalHtml(aboutPayload({ relay: { ...aboutPayload().relay, dbPath } }), fixedDates);
+    assert.match(html, new RegExp(`${dbPath.replace(/[.]/g, '\\.')} · 300 MB`), dbPath);
+    assert.match(html, /290 MB \+ 10\.0 MB WAL/);
+  }
+  assert.match(buildAboutModalHtml(aboutPayload(), fixedDates), />300 MB</, 'no path known: the size alone');
+});
+
+test('the Backups row: the last one with its time and size, or why there was none; kept of N and the folder', () => {
+  const base = { enabled: true, keep: 2, dir: '/home/dev/.oar/backups', problem: null, kept: 1 };
+  const html = (backups) => buildAboutModalHtml(aboutPayload({ backups }), fixedDates);
+  assert.match(html({ ...base, lastResult: { status: 'written', at: '2026-11-03T09:15:00.000Z', bytes: 351 * 1024 * 1024 } }),
+    /<span>Backups<\/span><span class="plan-usage-detail-hint">1 kept of 2 · \/home\/dev\/\.oar\/backups<\/span>.*at 2026-11-03T09:15:00\.000Z · 351 MB/);
+  assert.match(html({ ...base, lastResult: { status: 'skipped', at: '2026-11-03T09:15:00.000Z', reason: 'not enough disk space' } }), /skipped at 2026-11-03T09:15:00\.000Z: not enough disk space/);
+  assert.match(html({ ...base, lastResult: { status: 'failed', at: '2026-11-03T09:15:00.000Z', reason: 'disk I/O error' } }), /failed at .*: disk I\/O error/);
+  assert.match(html({ ...base, lastResult: { status: 'busy', at: '2026-11-03T09:15:00.000Z', reason: 'another backup of this database is running (process 4242)' } }), /busy at .*: another backup of this database is running \(process 4242\)/);
+  assert.match(html({ ...base, lastResult: null }), /none yet/);
+  assert.match(html({ ...base, enabled: false, lastResult: null }), /at start: off \(dbBackups\.enabled\); 1 kept of 2/);
+  assert.match(html({ ...base, problem: 'dbBackups.dir in config.json must be an absolute path (it is "x")', lastResult: null }), /1 kept of 2 · dbBackups\.dir in config\.json must be an absolute path \(it is &quot;x&quot;\)/);
+  assert.doesNotMatch(buildAboutModalHtml(aboutPayload(), fixedDates), /Backups/, 'no backups known: no row');
+});
+
+test('the Backups hint has no dangling separator when there is no folder', () => {
+  const html = buildAboutModalHtml(aboutPayload({ backups: { enabled: true, keep: 2, dir: null, problem: null, kept: 0, lastResult: null } }), fixedDates);
+  assert.match(html, /<span class="plan-usage-detail-hint">0 kept of 2<\/span>/);
+});
+
+test('the usage section names every provider\'s tokens of all time, "—" where a kind is unknown, an own key apart', () => {
+  const nb = (text) => text.replace(/ /g, '\u00a0');
+  const html = buildAboutModalHtml(aboutPayload({
+    usage: {
+      github: {
+        premiumRequests: 321.5,
+        turns: 300,
+        tokens: { inputTokens: 70_000, outputTokens: 7_000, cacheWriteTokens: 0, cacheReadTokens: 1_200_000, since: '2026-10-02', backfilled: false, firstTurnsDay: '2026-10-02' },
+        ownKeyTokens: [{ billing: 'byok-openai', inputTokens: 40, outputTokens: 4, cacheWriteTokens: null, cacheReadTokens: 60, since: '2026-10-03', backfilled: false, firstTurnsDay: '2026-10-03' }],
+      },
+      'claude-api': { tokens: { inputTokens: 510, outputTokens: 55, cacheWriteTokens: 300, cacheReadTokens: 4_900, since: '2026-09-14', backfilled: true, firstTurnsDay: '2026-10-02' } },
+      deepseek: { tokens: { inputTokens: 2_000, outputTokens: 800, cacheWriteTokens: null, cacheReadTokens: 7_000, since: '2026-09-18', backfilled: true, firstTurnsDay: null } },
+      grok: { tokens: { inputTokens: null, outputTokens: null, cacheWriteTokens: null, cacheReadTokens: null, since: null, backfilled: false, firstTurnsDay: null } },
+    },
+  }), fixedDates);
+  const usage = html.slice(html.indexOf('data-about-section="usage"'));
+  assert.match(usage, /GitHub Copilot<\/div>.*Premium requests.*Tokens \(all time\)<\/span><span class="plan-usage-detail-hint">in 70.0 k · out 7,000 · cache w 0 · cache r 1.20 M · since /s);
+  // The date as Check Usage writes it, never broken on a phone.
+  assert.ok(usage.includes(`since ${nb('Oct 2, 2026')}</span>`), 'the first day, unbroken');
+  assert.match(usage, /<td class="plan-usage-detail-value"><span class="plan-usage-detail-part">1.28 M<\/span><\/td>/);
+  assert.match(usage, /Tokens \(all time\), own OpenAI key<\/span><span class="plan-usage-detail-hint">in 40 · out 4 · cache w — · cache r 60 · since /);
+  // Copied days: until the first counted turn, input holds cache writes.
+  assert.ok(usage.includes(`since ${nb('Sep 14, 2026')} · input includes cache writes before ${nb('Oct 2, 2026')}</span>`), 'Claude API: copied days dated');
+  assert.ok(usage.includes(`cache w — · cache r 7,000 · since ${nb('Sep 18, 2026')} · input includes cache writes (days from before the upgrade)</span>`), 'DeepSeek: copied days only');
+  // Nothing known at all: the total is unknown too, not 0.
+  assert.match(usage, /Grok<\/div>.*cache w — · cache r —<\/span><\/div><\/td><td class="plan-usage-detail-value"><span class="plan-usage-detail-part">—<\/span><\/td>/s);
+  assert.doesNotMatch(usage, /keep no usage here|where the provider does not report one/);
+  assert.match(usage, /"—" where no turn reported one\. On Claude API and DeepSeek the days from before the upgrade have cache writes inside input\./);
+});

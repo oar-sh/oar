@@ -435,7 +435,7 @@ test('each database newer than the other somewhere: no start, nothing changed or
     const before = bytes(install.pinnedDb);
     const result = adopt(install);
     assert.equal(result.status, 'refused');
-    assert.match(result.error, /each database has changes newer than the other's\. Move the copilot\.db, copilot\.db-wal and copilot\.db-shm of the one not to go on with into a folder of your own/);
+    assert.match(result.error, /each database has changes newer than the other's\. Move the files of the one not to go on with \(copilot\.db, copilot\.db-wal, copilot\.db-shm in .+, or copilot\.db, copilot\.db-wal, copilot\.db-shm in .+\) into a folder of your own/);
     assert.deepEqual(bytes(install.pinnedDb), before);
     assert.ok(fs.existsSync(install.earlierDb));
   } finally {
@@ -862,6 +862,214 @@ test('a journal with neither the copy nor a database in place puts the pinned da
     assert.notEqual(adopt(install).status, 'refused');
     assert.equal(readMarker(install.pinnedDb), 'moved-aside', 'back in place, not an empty database');
     assert.equal(fs.existsSync(path.join(install.dataDir, SWAP_JOURNAL_FILE)), false);
+  } finally {
+    install.cleanup();
+  }
+});
+
+// ─── The two names (0.9.20: oar.db, copilot.db before) ───────────────────────
+
+// A copy of `writeDatabase`'s database whose last change is only in its
+// -wal, under `file` (any name): the -wal pairs by name, so it is copied as
+// `<file>-wal`.
+function writeHotWal(install, file, { marker, at, walValue }) {
+  const hot = path.join(install.root, `hot-${crypto.randomUUID()}`, 'source.db');
+  writeDatabase(hot, { marker, at });
+  const writer = new Database(hot);
+  try {
+    writer.pragma('wal_autocheckpoint = 0');
+    writer.prepare("UPDATE app_settings SET value = ? WHERE key = 'relay_name'").run(walValue);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.copyFileSync(hot, file);
+    fs.copyFileSync(`${hot}-wal`, `${file}-wal`);
+  } finally {
+    writer.close();
+  }
+}
+
+test('a rescue copy holding oar.db is a candidate too; with no database pinned it keeps its name', () => {
+  const install = createInstall();
+  try {
+    const rescue = path.join(install.dataDir, RESCUE_DIR_NAME, '2026-10-20T10-00-00-000Z');
+    writeDatabase(path.join(rescue, 'data', 'oar.db'), { marker: 'rescued-oar', at: '2026-10-20T09:00:00.000Z' });
+    const result = adopt(install);
+    assert.equal(result.status, 'adopted');
+    assert.equal(result.dbPath, path.join(install.dataDir, 'oar.db'));
+    assert.equal(readMarker(path.join(install.dataDir, 'oar.db')), 'rescued-oar');
+    assert.equal(fs.existsSync(install.pinnedDb), false, 'no copilot.db made');
+    assert.ok(fs.existsSync(path.join(rescue, 'data', `oar.db.adopted-${STAMP}`)), 'set aside under its own name');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('no database pinned: a copilot.db brought over stays copilot.db, so an earlier version still runs on it', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(install.earlierDb, { marker: 'package', at: '2026-10-20T09:00:00.000Z' });
+    const result = adopt(install);
+    assert.equal(result.status, 'adopted');
+    assert.equal(result.dbPath, install.pinnedDb);
+    assert.deepEqual(fs.readdirSync(install.dataDir).filter((name) => name.startsWith('oar.db')), []);
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a pinned oar.db and a newer copilot.db: it comes in as oar.db with its -wal rows, the old oar.db to backups/<time>/', () => {
+  const install = createInstall();
+  try {
+    const pinnedOar = path.join(install.dataDir, 'oar.db');
+    writeDatabase(pinnedOar, { marker: 'pinned-oar', at: '2026-10-01T09:00:00.000Z' });
+    writeHotWal(install, install.earlierDb, { marker: 'package', at: '2026-10-20T09:00:00.000Z', walValue: 'package-wal-only' });
+    const result = adopt(install);
+    assert.equal(result.status, 'adopted');
+    assert.equal(result.dbPath, pinnedOar);
+    assert.equal(readMarker(pinnedOar), 'package-wal-only', 'the copy took its -wal along under the new name');
+    assert.deepEqual(fs.readdirSync(install.dataDir).filter((name) => name.startsWith('copilot.db')), []);
+    assert.equal(readMarker(path.join(result.backupDir, 'oar.db')), 'pinned-oar', 'the old one under its own name');
+    // Set aside checkpointed: no -wal left, its rows in its main file (read
+    // after the look at the folder: opening it makes a -wal again).
+    assert.deepEqual(fs.readdirSync(install.earlierDir).filter((name) => name.endsWith('-wal')), []);
+    assert.equal(readMarker(path.join(install.earlierDir, `copilot.db.adopted-${STAMP}`)), 'package-wal-only');
+    assert.match(install.logs.join('\n'), /to .*oar\.db/);
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a pinned copilot.db and a newer oar.db in the package: it comes in as copilot.db', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(install.pinnedDb, { marker: 'pinned', at: '2026-10-01T09:00:00.000Z' });
+    writeDatabase(path.join(install.earlierDir, 'oar.db'), { marker: 'package-oar', at: '2026-10-20T09:00:00.000Z' });
+    const result = adopt(install);
+    assert.equal(result.status, 'adopted');
+    assert.equal(readMarker(install.pinnedDb), 'package-oar');
+    assert.equal(fs.existsSync(path.join(install.dataDir, 'oar.db')), false);
+    assert.ok(fs.existsSync(path.join(install.earlierDir, `oar.db.adopted-${STAMP}`)));
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('the refusal for two databases each newer somewhere names the files by their names', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(path.join(install.dataDir, 'oar.db'), { marker: 'pinned', at: '2026-10-20T09:00:00.000Z' });
+    writeDatabase(install.earlierDb, { marker: 'package', at: '2026-10-01T09:00:00.000Z' });
+    const db = new Database(install.earlierDb);
+    db.prepare("UPDATE app_settings SET updated_at = '2026-10-25T09:00:00.000Z'").run();
+    db.close();
+    const result = adopt(install);
+    assert.equal(result.status, 'refused');
+    assert.match(result.error, /\(copilot\.db, copilot\.db-wal, copilot\.db-shm in .*, or oar\.db, oar\.db-wal, oar\.db-shm in .*\)/);
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('the journal names the database; a kill after the pinned oar.db moved aside ends with the copy as oar.db', () => {
+  const install = createInstall();
+  try {
+    const pinnedOar = path.join(install.dataDir, 'oar.db');
+    writeDatabase(pinnedOar, { marker: 'older', at: '2026-10-01T09:00:00.000Z' });
+    const staging = path.join(install.dataDir, '.earlier-database-T0-0');
+    writeDatabase(path.join(staging, 'oar.db'), { marker: 'checked-copy', at: '2026-10-20T09:00:00.000Z' });
+    const backupDir = path.join(install.stateRoot, 'backups', 'T0');
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.renameSync(pinnedOar, path.join(backupDir, 'oar.db'));
+    fs.writeFileSync(path.join(install.dataDir, SWAP_JOURNAL_FILE), JSON.stringify({ stagingDir: staging, backupDir, dbName: 'oar.db' }));
+    assert.notEqual(adopt(install).status, 'refused');
+    assert.equal(readMarker(pinnedOar), 'checked-copy');
+    assert.equal(fs.existsSync(install.pinnedDb), false, 'no copilot.db');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a journal naming oar.db with neither the copy nor a database in place puts the pinned oar.db back', () => {
+  const install = createInstall();
+  try {
+    const backupDir = path.join(install.stateRoot, 'backups', 'T0');
+    writeDatabase(path.join(backupDir, 'oar.db'), { marker: 'moved-aside', at: '2026-10-01T09:00:00.000Z' });
+    fs.mkdirSync(install.dataDir, { recursive: true });
+    fs.writeFileSync(path.join(install.dataDir, SWAP_JOURNAL_FILE), JSON.stringify({
+      stagingDir: path.join(install.dataDir, '.earlier-database-T0-0'), backupDir, dbName: 'oar.db',
+    }));
+    assert.notEqual(adopt(install).status, 'refused');
+    assert.equal(readMarker(path.join(install.dataDir, 'oar.db')), 'moved-aside');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('the journal written during a swap carries the name the database goes in as', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(path.join(install.dataDir, 'oar.db'), { marker: 'older', at: '2026-10-01T09:00:00.000Z' });
+    writeDatabase(install.earlierDb, { marker: 'package', at: '2026-10-20T09:00:00.000Z' });
+    let journal = null;
+    const fsImpl = {
+      ...fs,
+      renameSync: (from, to) => {
+        const file = path.join(install.dataDir, SWAP_JOURNAL_FILE);
+        if (!journal && fs.existsSync(file)) journal = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return fs.renameSync(from, to);
+      },
+    };
+    assert.equal(adopt(install, { fsImpl }).status, 'adopted');
+    assert.equal(journal?.dbName, 'oar.db');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a candidate set aside moves its main file last; a reader that blocks the checkpoint leaves it in place', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(install.pinnedDb, { marker: 'current', at: '2026-10-20T09:00:00.000Z' });
+    writeDatabase(install.earlierDb, { marker: 'old-package', at: '2026-10-01T09:00:00.000Z' });
+    fs.writeFileSync(`${install.earlierDb}-shm`, Buffer.alloc(32768));
+    const order = [];
+    const fsImpl = { ...fs, renameSync: (from, to) => { if (path.dirname(from) === install.earlierDir) order.push(path.basename(from)); return fs.renameSync(from, to); } };
+    assert.equal(adopt(install, { fsImpl }).status, 'kept');
+    assert.equal(order.at(-1), 'copilot.db', 'the main file last');
+
+    const second = createInstall();
+    try {
+      writeDatabase(second.pinnedDb, { marker: 'current', at: '2026-10-20T09:00:00.000Z' });
+      writeDatabase(second.earlierDb, { marker: 'old-package', at: '2026-10-01T09:00:00.000Z' });
+      const writer = new Database(second.earlierDb);
+      writer.pragma('wal_autocheckpoint = 0');
+      writer.prepare("UPDATE app_settings SET value = 'x'").run();
+      const reader = new Database(second.earlierDb, { readonly: true });
+      reader.prepare('BEGIN').run();
+      reader.prepare('SELECT 1 FROM app_settings').get();
+      try {
+        const result = adopt(second);
+        assert.equal(result.renamedTo, null, 'not renamed while a reader holds its -wal');
+        assert.ok(fs.existsSync(second.earlierDb));
+      } finally {
+        reader.prepare('COMMIT').run();
+        reader.close();
+        writer.close();
+      }
+    } finally {
+      second.cleanup();
+    }
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a candidate folder whose database name is a link to nothing is skipped, as before 0.9.20', { skip: process.platform === 'win32' }, () => {
+  const install = createInstall();
+  try {
+    writeDatabase(install.pinnedDb, { marker: 'current', at: '2026-10-20T09:00:00.000Z' });
+    fs.mkdirSync(install.earlierDir, { recursive: true });
+    fs.symlinkSync(path.join(install.root, 'gone.db'), install.earlierDb);
+    assert.equal(adopt(install).status, 'no-earlier-database');
   } finally {
     install.cleanup();
   }

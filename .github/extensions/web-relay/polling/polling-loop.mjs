@@ -8,6 +8,7 @@ import { getActiveSession } from "../runtime/session-registry.mjs";
 import { DEFAULT_QUESTION_TIMEOUT_MS } from "../../../../shared/question-timeout.mjs";
 import { waitForRelayQuestion } from "../../../../shared/question-wait.mjs";
 import { EMPTY_TURN_COMPLETION_NOTE } from "../../../../shared/empty-turn-completion.mjs";
+import { planBoardActionsFromCli } from "../../../../shared/plan-board-actions.mjs";
 import { stripPromptContextPrefix } from "../skills/prompt-context.mjs";
 import {
   isOpenAIImageTerminalError,
@@ -319,34 +320,9 @@ function extractToolCallInputObject(value, toolName, depth = 0) {
 }
 
 function normalizePlanBoardActions(rawActions, recommendedAction = "") {
-  const ids = Array.isArray(rawActions)
-    ? rawActions
-      .map((entry) => {
-        if (typeof entry === "string") return entry.trim().toLowerCase();
-        if (entry && typeof entry === "object") {
-          return String(entry.id || entry.actionId || entry.value || "").trim().toLowerCase();
-        }
-        return "";
-      })
-      .filter(Boolean)
-    : [];
-  const sourceIds = ids.length ? ids : ["autopilot", "interactive", "exit_only"];
-  const seen = new Set();
-  const deduped = [];
-  for (const id of sourceIds) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    deduped.push(id);
-  }
   const recommended = String(recommendedAction || "").trim().toLowerCase();
   return {
-    actions: deduped.map((id) => {
-      if (id === "autopilot_fleet") return { id, label: "Implement with autopilot fleet", mode: "autopilot" };
-      if (id === "autopilot") return { id, label: "Implement in autopilot", mode: "autopilot" };
-      if (id === "interactive") return { id, label: "Stop here and prompt myself", mode: "agent" };
-      if (id === "exit_only") return { id, label: "Stop here", mode: "agent" };
-      return { id, label: id.replace(/[_-]+/g, " "), mode: null };
-    }),
+    actions: planBoardActionsFromCli(rawActions),
     recommendedAction: recommended || null,
   };
 }

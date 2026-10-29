@@ -14,16 +14,13 @@
 // shape of the final prose. Both paths are wired — the hook is primary, the
 // text heuristic is the fallback — which is the Claude worker's arrangement.
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 
 /**
- * Kept identical across workers. `exit_only` dismisses; `autopilot` and
- * `interactive` queue a follow-up user message in the mapped relay mode.
+ * The one list every worker posts (shared/plan-board-actions.mjs): `exit_only`
+ * dismisses; the others queue a follow-up user message in the mapped mode.
  */
-export const PLAN_BOARD_ACTIONS = [
-  { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
-  { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
-  { id: 'exit_only', label: 'Stop here', mode: 'agent' },
-];
+export { PLAN_BOARD_ACTIONS };
 
 /**
  * How many list-ish lines a final message needs before it is treated as a plan.

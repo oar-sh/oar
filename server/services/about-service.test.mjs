@@ -108,6 +108,47 @@ test('usage totals sum what the providers reported and leave the others out', as
   assert.equal(usage.grok, undefined, 'Grok stored nothing');
 });
 
+test('every provider\'s tokens per turn, all time: the four kinds apart, unknown kept unknown, an own key apart', async () => {
+  const db = fixtureDb();
+  db.prepare(`INSERT INTO message_usage_snapshots (response_message_id, conversation_id, premium_delta_used, captured_at) VALUES (?, ?, ?, ?)`).run('m-4', 'conv-fixture-report', 1, '2026-03-02T10:00:00.000Z');
+  const day = db.prepare(`
+    INSERT INTO token_usage_days (day, provider, billing, model, source, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, turn_count, first_seen_at, last_seen_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'a', 'a', 'a')
+  `);
+  // Counts made up.
+  day.run('2026-09-14', 'claude-api', '', 'claude-sonnet-5-5', 'backfill', 500, 50, null, 4000);
+  day.run('2026-10-02', 'claude-api', '', 'claude-sonnet-5-5', 'turns', 10, 5, 300, 900);
+  day.run('2026-10-02', 'github', '', 'gpt-5.5', 'turns', 70, 7, 0, 100);
+  day.run('2026-10-03', 'github', 'byok-openai', 'gpt-5.5', 'turns', 40, 4, null, 60);
+  day.run('2026-10-03', 'grok', '', 'grok-5', 'turns', 9, 1, null, null);
+  const { usage } = await collectAboutTotals(db, { yieldToLoop: async () => {} });
+  // Copied days and counted turns together: the copied days are flagged, with
+  // the day the counted turns start (until then input holds cache writes).
+  assert.deepEqual(usage['claude-api'], {
+    tokens: { inputTokens: 510, outputTokens: 55, cacheWriteTokens: 300, cacheReadTokens: 4900, since: '2026-09-14', backfilled: true, firstTurnsDay: '2026-10-02' },
+  });
+  // The plan's premium requests stay; the own key's tokens are not mixed into the plan's.
+  assert.deepEqual(usage.github, {
+    premiumRequests: 1,
+    turns: 1,
+    tokens: { inputTokens: 70, outputTokens: 7, cacheWriteTokens: 0, cacheReadTokens: 100, since: '2026-10-02', backfilled: false, firstTurnsDay: '2026-10-02' },
+    ownKeyTokens: [{ billing: 'byok-openai', inputTokens: 40, outputTokens: 4, cacheWriteTokens: null, cacheReadTokens: 60, since: '2026-10-03', backfilled: false, firstTurnsDay: '2026-10-03' }],
+  });
+  assert.deepEqual(usage.grok.tokens, { inputTokens: 9, outputTokens: 1, cacheWriteTokens: null, cacheReadTokens: null, since: '2026-10-03', backfilled: false, firstTurnsDay: '2026-10-03' });
+});
+
+test('a provider with copied days only is flagged, with no counted-turn day yet', async () => {
+  const db = fixtureDb();
+  db.prepare(`
+    INSERT INTO token_usage_days (day, provider, billing, model, source, input_tokens, output_tokens, cache_read_tokens, turn_count, first_seen_at, last_seen_at, updated_at)
+    VALUES ('2026-09-18', 'deepseek', '', 'deepseek-flash', 'backfill', 2000, 800, 7000, 5, 'a', 'a', 'a')
+  `).run();
+  const { usage } = await collectAboutTotals(db, { yieldToLoop: async () => {} });
+  assert.deepEqual(usage.deepseek.tokens, {
+    inputTokens: 2000, outputTokens: 800, cacheWriteTokens: null, cacheReadTokens: 7000, since: '2026-09-18', backfilled: true, firstTurnsDay: null,
+  });
+});
+
 function fakeFs(files) {
   return {
     readFileSync(filePath) {
@@ -305,4 +346,43 @@ test('the database size counts the database file and its WAL', async () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('About names the database file it runs on by its full path, oar.db or copilot.db', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-about-'));
+  try {
+    for (const name of ['oar.db', 'copilot.db']) {
+      const dbPath = path.join(dir, name);
+      const db = new Database(dbPath);
+      applySchema(db);
+      const { relay } = await aboutService({ db, dbPath }).service.describe();
+      assert.equal(relay.dbPath, dbPath, name);
+      assert.ok(relay.dbBytes > 0, name);
+      db.close();
+    }
+    const db = new Database(':memory:');
+    applySchema(db);
+    assert.equal((await aboutService({ db }).service.describe()).relay.dbPath, null, 'none known: null');
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('About carries one line on the database backups: the last result and how many are kept, not the listing', async () => {
+  const db = new Database(':memory:');
+  applySchema(db);
+  const describeBackups = () => ({
+    enabled: true, keep: 2, dir: '/home/dev/.oar/backups', problem: null, warnings: [],
+    lastResult: { status: 'written', at: '2026-11-03T09:15:00.000Z', file: 'oar-0.9.19-20261103-091500-pre-update.db', bytes: 368050176 },
+    own: [{ file: 'a' }, { file: 'b' }], changed: [], others: [{ name: 'main-0.9.19.db', bytes: 1 }],
+  });
+  const { backups } = await aboutService({ db, describeBackups }).service.describe();
+  assert.deepEqual(backups, {
+    enabled: true, keep: 2, dir: '/home/dev/.oar/backups', problem: null, kept: 2,
+    lastResult: { status: 'written', at: '2026-11-03T09:15:00.000Z', file: 'oar-0.9.19-20261103-091500-pre-update.db', bytes: 368050176 },
+  });
+  assert.equal((await aboutService({ db, describeBackups: () => { throw new Error('x'); } }).service.describe()).backups, null);
+  assert.equal((await aboutService({ db }).service.describe()).backups, null);
+  db.close();
 });

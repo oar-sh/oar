@@ -31,7 +31,7 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function reserveFreePort() {
+function reserveAnyFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.unref();
@@ -46,6 +46,21 @@ export function reserveFreePort() {
       });
     });
   });
+}
+
+/**
+ * A free port on 127.0.0.1. `RELAY_E2E_PORT_FLOOR` (e.g. 40000) keeps the
+ * test relays above a range the host's own services use: the OS is asked
+ * again until it hands out a port at or above it.
+ */
+export async function reserveFreePort() {
+  const floor = Number(process.env.RELAY_E2E_PORT_FLOOR || 0);
+  if (!Number.isInteger(floor) || floor <= 0) return reserveAnyFreePort();
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const port = await reserveAnyFreePort();
+    if (port >= floor) return port;
+  }
+  throw new Error(`No free test port at or above ${floor}`);
 }
 
 export async function waitForServerReady(baseUrl, authToken, proc, timeoutMs = 30_000) {
@@ -137,7 +152,25 @@ export function createStateRoot() {
   // one of these appears, then exits 0 (writing grokAuthFile) or non-zero.
   const grokLoginAuthorizedFile = path.join(stateRoot, "grok-login-authorized");
   const grokLoginDeniedFile = path.join(stateRoot, "grok-login-denied");
+  // The relay runs from this checkout, whose database backups would go to
+  // its own server/backups: they go into the state root instead. The rest
+  // is what the relay writes into a config.json it does not find (its
+  // DEFAULT_CONFIG). A spec that writes its own config.json keeps the key.
+  const dbBackupsDir = path.join(stateRoot, "db-backups");
+  fs.writeFileSync(
+    path.join(stateRoot, "config.json"),
+    `${JSON.stringify({
+      authToken: "",
+      port: 3333,
+      pollIntervalMs: 3000,
+      conversationSessionMode: "isolated",
+      localhostOnly: true,
+      dbBackups: { enabled: true, keep: 2, dir: dbBackupsDir },
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
   return {
+    dbBackupsDir,
     stateRoot,
     dataDir,
     claudeConfigDir,
@@ -339,14 +372,20 @@ export async function startRelayServer({
   // The state root of an earlier handle (after its `kill()`): the relay
   // restarts on the same database and settings. Pass its port too.
   state = null,
+  // How long a start may take: longer for a relay that backs its database
+  // up or compares two database files first (fsyncs on a loaded disk).
+  readyTimeoutMs = 30_000,
 } = {}) {
   const resolvedPort = port || await reserveFreePort();
   const baseUrl = `http://127.0.0.1:${resolvedPort}`;
   const paths = state || createStateRoot();
   if (persistWorkerConfig) {
+    const configPath = path.join(paths.stateRoot, "config.json");
+    let existing = {};
+    try { existing = JSON.parse(fs.readFileSync(configPath, "utf8")); } catch {}
     fs.writeFileSync(
-      path.join(paths.stateRoot, "config.json"),
-      `${JSON.stringify({ authToken: token, port: resolvedPort, localhostOnly: true }, null, 2)}\n`,
+      configPath,
+      `${JSON.stringify({ ...existing, authToken: token, port: resolvedPort, localhostOnly: true }, null, 2)}\n`,
       { mode: 0o600 },
     );
   }
@@ -396,7 +435,7 @@ export async function startRelayServer({
   };
 
   try {
-    await waitForServerReady(baseUrl, token, proc);
+    await waitForServerReady(baseUrl, token, proc, readyTimeoutMs);
   } catch (error) {
     await stopProcess(proc);
     removeStateRoot(paths.stateRoot);

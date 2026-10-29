@@ -25,13 +25,14 @@
  * reads the new table, and a share it creates has no lineage, which this build
  * reads as the share's own token.
  *
- * Usage: node server/migrations/0016-share-access-log.mjs [path/to/copilot.db]
+ * Usage: node server/migrations/0016-share-access-log.mjs [path/to/oar.db]
  */
 
 import { fileURLToPath } from 'url';
 import path from 'path';
 import process from 'process';
 import Database from 'better-sqlite3';
+import { cliDbPath } from '../services/database-file.mjs';
 
 function tableExists(db, name) {
   return !!db
@@ -79,11 +80,6 @@ export function migrateShareAccessLog(db) {
   return { applied: columnsAdded > 0 || tablesAdded > 0 || lineagesSet > 0, columnsAdded, tablesAdded, lineagesSet };
 }
 
-function defaultDbPath() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, '..', 'data', 'copilot.db');
-}
-
 export function migrate(dbPath, options = {}) {
   const db = new Database(dbPath, options);
   try {
@@ -95,8 +91,10 @@ export function migrate(dbPath, options = {}) {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const dbPath = process.argv[2] ? path.resolve(process.argv[2]) : defaultDbPath();
   try {
+    // The given path, else the database in server/data (oar.db, else the
+    // name before 0.9.20); never a new one.
+    const dbPath = cliDbPath(process.argv[2], new URL('..', import.meta.url));
     const result = migrate(dbPath);
     console.log(`Migration 0016 on ${dbPath}`);
     console.log(result.applied

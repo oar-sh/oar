@@ -28,13 +28,14 @@
  *
  * Additive and idempotent. Safe to run on every boot.
  *
- * Usage: node server/migrations/0031-queue-provider.mjs [path/to/copilot.db]
+ * Usage: node server/migrations/0031-queue-provider.mjs [path/to/oar.db]
  */
 
 import { fileURLToPath } from 'url';
 import path from 'path';
 import process from 'process';
 import Database from 'better-sqlite3';
+import { cliDbPath } from '../services/database-file.mjs';
 
 export const QUEUE_PROVIDER_COLUMN = 'provider';
 export const QUEUE_PROVIDER_TRIGGERS = Object.freeze(['queue_provider_after_insert', 'queue_provider_after_requeue']);
@@ -112,11 +113,6 @@ export function migrateQueueProvider(db) {
   return { applied: columnsAdded > 0 || triggersAdded > 0 || rowsFilled > 0, columnsAdded, triggersAdded, rowsFilled };
 }
 
-function defaultDbPath() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, '..', 'data', 'copilot.db');
-}
-
 export function migrate(dbPath, options = {}) {
   const db = new Database(dbPath, options);
   try {
@@ -128,8 +124,10 @@ export function migrate(dbPath, options = {}) {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const dbPath = process.argv[2] ? path.resolve(process.argv[2]) : defaultDbPath();
   try {
+    // The given path, else the database in server/data (oar.db, else the
+    // name before 0.9.20); never a new one.
+    const dbPath = cliDbPath(process.argv[2], new URL('..', import.meta.url));
     const result = migrate(dbPath);
     console.log(`Migration 0031 on ${dbPath}`);
     console.log(result.applied

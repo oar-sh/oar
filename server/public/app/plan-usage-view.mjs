@@ -280,7 +280,7 @@ function renderChart(chart) {
 
 function renderDetailSection(section) {
   const rows = section.rows.map((row) => `
-    <tr>
+    <tr${row.title ? ` title="${escapeHtml(row.title)}"` : ''}>
       <td class="plan-usage-detail-label">${escapeHtml(row.label)}${row.hint ? `<span class="plan-usage-detail-hint">${escapeHtml(row.hint)}</span>` : ''}</td>
       <td class="plan-usage-detail-value">${String(row.value).split(' · ').map((part) => `<span class="plan-usage-detail-part">${escapeHtml(part)}</span>`).join(' · ')}</td>
     </tr>

@@ -5,6 +5,11 @@
 // dropped, so a new hint the client reads must be added here too (the
 // multi-select flag was once silently stripped this way).
 
+import {
+  REMOTE_RELAY_APPROVAL_SUMMARY_MAX,
+  REMOTE_RELAY_APPROVAL_VARIANTS,
+} from '../../shared/remote-relay-contract.mjs';
+
 /**
  * @param {unknown} rawContext
  * @param {{ normalizeRelayMode?: (mode: string) => string | null, defaultRelayMode?: string }} [options]
@@ -41,6 +46,12 @@ export function sanitizeRelayQuestionContext(rawContext, {
   // Claude's short question label ("Workers", "Visibility").
   if (typeof rawContext.header === 'string' && rawContext.header.trim()) {
     context.header = rawContext.header.trim().slice(0, 120);
+  }
+  // An approval card's kind and one-line summary, what a paired
+  // relay's Inbox shows of it: a listed variant only, the summary bounded.
+  if (REMOTE_RELAY_APPROVAL_VARIANTS.includes(rawContext.variant)) context.variant = rawContext.variant;
+  if (typeof rawContext.summary === 'string' && rawContext.summary.trim()) {
+    context.summary = rawContext.summary.trim().replace(/\s+/g, ' ').slice(0, REMOTE_RELAY_APPROVAL_SUMMARY_MAX);
   }
   return Object.keys(context).length ? context : null;
 }

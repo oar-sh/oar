@@ -141,11 +141,24 @@ export function configuredHeapLimit({ configPath, fsImpl = fs } = {}) {
   return Number.isInteger(mb) && mb >= MIN_HEAP_LIMIT_MB ? { mb } : { invalid: value };
 }
 
-function freeBytes(dir, fsImpl) {
+// Free bytes on the disk of `dir`, or null when unknown. Also used by the
+// database backup's space check (db-backup-service.mjs), with diskBytes.
+export function freeBytes(dir, fsImpl) {
   try {
     if (typeof fsImpl.statfsSync !== 'function') return null;
     const stats = fsImpl.statfsSync(dir);
     return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null;
+  }
+}
+
+// The size of the disk of `dir`, or null when unknown.
+export function diskBytes(dir, fsImpl) {
+  try {
+    if (typeof fsImpl.statfsSync !== 'function') return null;
+    const stats = fsImpl.statfsSync(dir);
+    return Number(stats.blocks) * Number(stats.bsize);
   } catch {
     return null;
   }

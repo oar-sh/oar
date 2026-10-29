@@ -98,7 +98,7 @@ test('the summary has the export\'s and the card\'s currency', async () => {
 
 test('a failure is logged on the relay and answered with a generic message', async () => {
   const logged = [];
-  const service = { importExport: () => { throw new Error('SQLITE_FULL: /secret/path/copilot.db'); } };
+  const service = { importExport: () => { throw new Error('SQLITE_FULL: /secret/path/oar.db'); } };
   const { route } = setup({ service, logError: (message, err) => logged.push([message, err.message]) });
   const res = await callRoute(route, { body: { amount: AMOUNT, cost: COST } });
   assert.equal(res.statusCode, 500);

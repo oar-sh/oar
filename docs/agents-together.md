@@ -47,9 +47,13 @@ new one, and Claude's tool is `mcp__relay__relay_tool`. Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, change their settings, answer questions, stop turns, archive). In the *ask* and *plan* relay
-modes, every write action first asks you with a question card. For a session it starts, an agent
+modes, every write action first asks you with a question card. The agent of a
+plan-only conversation (see **Plan-only sessions** below) counts as a plan-mode caller, also during
+the one agent turn after **Approve plan**: its `create_session` defaults to plan too. For a session it starts, an agent
 can set the provider, model, relay mode and reasoning effort; what it leaves out follows the
-session it works in, as far as the other relay offers it. The providers to choose from are the
+session it works in, as far as the other relay offers it. A `send` sets a session's mode only
+when it names one; without a mode the session keeps its own (before 0.9.20 it got the caller's
+mode). The approval card shows a mode for a `send` only when one was named. The providers to choose from are the
 other relay's, as `relay_info` lists them; an unknown one is refused with that list. A session
 started before a relay update can use the providers the update added, without a restart. A `send` that names no model or effort
 keeps the ones the session there uses. A model in `create_session` or `send` that the provider
@@ -94,15 +98,32 @@ makes a new group, and `"none"` takes the session out of its group. A group you 
 this way: when an agent takes out its last session, the group stays, shown empty in your sidebar (rename
 or dissolve it from its menu; nothing removes it by itself), and agents can name it again. A group an
 agent made, by name or by starting sessions, goes once it is empty. A new folder restarts the session's CLI there and is
-refused while a turn or a background task runs. A mode set this way lasts until the next `send` that
-names another mode or comes from a caller in another mode (a `send` without a mode passes the caller's
-own). An agent may change freely only a session its own conversation started (here, or on a paired
+refused while a turn or a background task runs. A mode set this way lasts until the next
+`update_session` that names another mode (a `send` that names a mode runs only that turn in it,
+and one without a mode leaves the session's mode as it is). An agent may change freely only a session its own conversation started (here, or on a paired
 relay when that relay recorded this conversation as the starter). Any other session, yours, another
 agent's or the one that started the agent, needs your **Allow** first: a question card, once per
 conversation and relay, that covers that conversation's later changes to such sessions there; **Deny**
 refuses the call. If a step fails after others were written, the answer lists in `changed` what was
 written. An agent never changes the conversation it runs in, nor the switch that lets a session's agents
 start sessions (see [the rules](#agent-sessions) below).
+
+**Plan-only sessions.** A session can be locked in plan mode, so that agents can't take it out of
+it. The lock is set only when asked: by an agent's `create_session` or `update_session` with
+`planOnly: true` (`update_session` together with `mode: "plan"` unless the session is in plan
+already), or by you with **Plan only: agents can't take this session out of plan mode** in the
+[context modal](web-ui.md#relay-modes). Plan mode alone never sets it. A `create_session` with
+`planOnly: true` and no mode starts in plan; with another mode it is refused before anything is
+created. A relay too old for the lock creates the session without it, and the answer says so
+(`planOnlyWarning`). While the lock is on, an agent's `send` or `update_session` that names another
+mode is refused (409, `plan_only`): "This session is plan-only; agents can't change its mode. Clear
+planOnly first, or ask the user." A `send` without a mode runs in the session's saved mode. An agent clears the lock
+only in the same `update_session` that names a mode other than plan (`{planOnly: false, mode:
+"agent"}`); `planOnly: false` alone, or with `mode: "plan"`, is ignored, and on a plan-only session the answer says
+"planOnly unchanged: clear it in the same call as the new mode." You can clear it, and change the
+mode, at any time. `list_sessions` and `read_session` show `planOnly: true`. A relay on 0.9.19
+still sends its caller's mode with every `send`, so a `send` from a 0.9.19 caller that is not in
+plan mode to a plan-only session on 0.9.20 is refused.
 
 `read_task_output` returns the tail of a shell or monitor task's output on a relay (up to 500
 lines), how many minutes it has been quiet, and the pass/fail counts when the output is a known
@@ -209,7 +230,8 @@ asks to be woken when something happens there. It works for every provider, on t
 it was asked with [ask](#questions-that-dont-block)), an error (a failed turn,
 the usage limit, a worker that died), a reply (with a preview), a background agent that finished,
 a background agent or shell task that failed (a shell command that exits non-zero counts), a
-session that went quiet while working (15 minutes by default), and the moment nothing runs any
+session that went quiet while working (15 minutes by default), a plan card you settled with any
+of its buttons, **Stop here** included (`board_settled`), and the moment nothing runs any
 more in the watched sessions. A shell command that ended well wakes the watcher only when it asks
 for every task end (`task_finished` in `events`, with `task_started` for the starts): a busy session
 runs many, and each would cost the watcher a turn. A subscription names sessions, or `all`
@@ -230,8 +252,20 @@ that conversation, whoever asked for it, so restarts cannot chain into a loop; t
 and a `once` subscription held back this way ends. This one needs no approval card when it names no
 sessions (it watches no session), and it is for this relay only.
 
+**A settled plan card.** `board_settled` is part of the default and is not urgent. Its line names
+the card, the button and what it queued, in exactly this form:
+
+```
+[relay event] session "<session title>" (<session id>): board_settled "<card title>" → "<label>" (action <action id>, board_id <board id>, queued message <message id>)
+```
+
+For **Stop here** the parenthesis ends `…, nothing queued)`. The event's detail has `boardId`,
+`boardType`, `action`, `actionLabel`, `title` and `queuedMessageId` (null for `exit_only`). A
+subscription's `match` applies to it too (the action id, the label and the card title).
+
 Subscriptions made before this default changed without naming events get the new default by
-themselves; those that named their events keep them. A paired relay that runs an older OAR applies its own
+themselves, `board_settled` included (also those stored with the 0.9.19 default list); those that
+named their events keep them. A paired relay that runs an older OAR applies its own
 default and refuses `subagent_finished` by name.
 
 **What it looks like.** OAR writes a short message into the watcher's conversation: a new turn
@@ -358,7 +392,9 @@ one place: the asks, and the cards sessions wait on (questions and approval card
 and on every paired relay that answers. They are grouped by relay, newest first, each with its
 session (a link that opens it), its age and its relay. **Mine** narrows the list to the sessions
 you started, **Agents** to the ones an agent started. What you answered or dismissed stays for a
-day under a divider.
+day under a divider. Plan cards are listed too (see [the web UI](web-ui.md#relay-modes)); a paired
+relay's plan card shows only its title and status, with **Open there**, and is never answered
+over the pairing.
 
 You answer an ask here as in its session: an option, typed text, or **Dismiss**. That holds for
 an ask on a paired relay too: the answer goes there through the pairing. A card a session on this
@@ -366,6 +402,27 @@ relay waits on is answered here as well (a card with several fields or several p
 session instead). A paired relay's cards, its approval cards above all, are answered only on that
 relay: the Inbox shows them with **Open there**. The pairing carries answers to asks only, never
 to a card, so a relay you paired with can never approve anything here.
+
+A paired relay's approval card says what it is about, never what the agent would send: its kind
+("New session · the session waits", Loop guard, Write, Session settings, Watch, Start sessions)
+and a line such as `relay B · New session requested by 'X': title, model` or
+`relay B · Loop guard: 30 prompts by 'Y'`, where X is the requesting session. A relay before
+0.9.20 shows "An Allow / Deny card on that relay." instead.
+
+This relay checks each paired relay about every 20 s, even with no browser open, so the badge
+follows within about 20 s. A card a turn there waits on (an approval, or a question the turn is
+blocked on; not a plan card or an ask that doesn't block) pushes once in total. Its own relay
+pushes as always. When that push reached none of your devices (none is set up there, or every
+send failed; a device with that relay open in the foreground counts as reached), the first paired
+relay with push on that checks it claims the card and pushes it: `Approval waiting on relay "B"` or
+`A question waits on relay "B"`, with no answer buttons; the tap opens the session there. The push
+follows your "questions" toggle and the device's notification settings: with previews on, an
+approval's body is its summary line; with previews off, the body carries no summary, only its kind
+("New session · the session waits"). The notification's title names the session only when the
+device's **Include conversation title** setting is on, as for this relay's own pushes. Claims
+are kept in memory. After a restart of the
+card's relay, a card is claimable again; after a restart of the relay that claimed it, it is not
+pushed again. A relay that stops between claiming a card and pushing it pushes nothing for it.
 
 Everything an ask shows was written by an agent, maybe on another relay: the Inbox shows it as
 plain text, never as formatting or links. On a phone it is one column with full-width buttons.

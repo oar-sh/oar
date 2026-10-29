@@ -14,6 +14,7 @@ export const RELAY_EVENT_SOCKET_EVENT = 'relay_event_subscriptions';
 
 const EVENT_TYPES = new Set([
   'question_asked',
+  'question_answered',
   'error',
   'turn_end',
   'task_started',
@@ -21,6 +22,7 @@ const EVENT_TYPES = new Set([
   'task_failed',
   'stalled',
   'all_idle',
+  'board_settled',
   'heartbeat',
   'link_lost',
   'link_restored',
@@ -35,6 +37,7 @@ const LINE_PREFIX = '[relay event] ';
 
 const TYPE_LABELS = Object.freeze({
   question_asked: 'question',
+  question_answered: 'answer',
   error: 'error',
   turn_end: 'reply',
   task_started: 'task started',
@@ -42,6 +45,7 @@ const TYPE_LABELS = Object.freeze({
   task_failed: 'task failed',
   stalled: 'stalled',
   all_idle: 'all idle',
+  board_settled: 'plan card settled',
   heartbeat: 'heartbeat',
   link_lost: 'link lost',
   link_restored: 'link back',

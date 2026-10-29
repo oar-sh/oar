@@ -326,20 +326,7 @@ export function buildClaudeApiPlanCard({
       note: 'Claude API turns on this relay only; the Console has every request on the key.',
       open: true,
     }));
-    details.push(buildDetailSection({
-      id: 'claude-api-tokens-by-model',
-      label: 'Tokens by model, this month',
-      rows: month.models.map((entry) => {
-        const input = entry.hitTokens + entry.missTokens;
-        return {
-          label: modelLabel(entry.model, settings),
-          value: `cache read ${formatTokens(entry.hitTokens)} · other input ${formatTokens(entry.missTokens)} · output ${formatTokens(entry.outputTokens)}`,
-          hint: input > 0 ? `${Math.round((entry.hitTokens / input) * 100)}% of input from the cache` : null,
-        };
-      }),
-      note: 'Other input includes the writes to the prompt cache.',
-      open: true,
-    }));
+    // Tokens by model: the Tokens sections every tab gets (plan-usage-tokens.mjs).
   }
 
   return buildProviderCard({
@@ -395,7 +382,19 @@ export function createClaudeApiPlanUsage({
     return buildClaudeApiPlanCard({ settings, spend, resetAt, timeZone: zoneName, error });
   }
 
-  return { readSpend, getCapState, buildCard };
+  /**
+   * A model's name as the card shows it: the Console's display name, else
+   * the Claude label for the id (the Tokens sections use it too).
+   */
+  function labelModel(model) {
+    try {
+      return modelLabel(model, getSettings());
+    } catch {
+      return null;
+    }
+  }
+
+  return { readSpend, getCapState, buildCard, modelLabel: labelModel };
 }
 
 /**

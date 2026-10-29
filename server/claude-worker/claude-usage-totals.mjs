@@ -159,3 +159,61 @@ export function claudeBillingTotals(modelUsage, { usage = null, model = '' } = {
   }
   return [...totals.values()].filter((entry) => entry.hitTokens + entry.missTokens + entry.outputTokens > 0 || entry.costUsd > 0);
 }
+
+/**
+ * The CLI's totals per model with the four token kinds apart, for the token
+ * booking (POST /api/turn-token-usage): `[{ model, inputTokens,
+ * cacheWriteTokens, cacheReadTokens, outputTokens, costUsd, costUnknown }]`.
+ * `inputTokens` is fresh input (Anthropic counts cache reads and writes
+ * apart). Read like claudeBillingTotals: `modelUsage` (running totals, with
+ * Claude Code's cost estimate) or `usage` alone under the turn's model (no
+ * cost: `costUsd` null). `modelKey` maps the CLI's model names to the
+ * relay's, as in claudeUsageTotals; the `[1m]` tier is dropped. Models with
+ * no tokens and no cost are left out.
+ */
+export function claudeTokenTotals(modelUsage, {
+  usage = null,
+  model = '',
+  modelKey = (value) => String(value ?? '').trim(),
+} = {}) {
+  const totals = new Map();
+  const add = (name, entry) => {
+    const key = String(modelKey(name) ?? '').trim().toLowerCase().replace(/\[1m\]$/, '');
+    if (!key) return;
+    const current = totals.get(key) || {
+      model: key, inputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0, costUsd: null, costUnknown: false,
+    };
+    current.inputTokens += entry.inputTokens;
+    current.cacheWriteTokens += entry.cacheWriteTokens;
+    current.cacheReadTokens += entry.cacheReadTokens;
+    current.outputTokens += entry.outputTokens;
+    if (entry.costUsd !== null) current.costUsd = (current.costUsd ?? 0) + entry.costUsd;
+    current.costUnknown = current.costUnknown || entry.costUnknown;
+    totals.set(key, current);
+  };
+  if (modelUsage && typeof modelUsage === 'object' && !Array.isArray(modelUsage)) {
+    for (const [name, entry] of Object.entries(modelUsage)) {
+      if (!entry || typeof entry !== 'object') continue;
+      add(name, {
+        inputTokens: count(entry.inputTokens),
+        cacheWriteTokens: count(entry.cacheCreationInputTokens),
+        cacheReadTokens: count(entry.cacheReadInputTokens),
+        outputTokens: count(entry.outputTokens),
+        costUsd: costOf(entry.costUSD),
+        costUnknown: entry.costBasis === 'unknown',
+      });
+    }
+  } else if (usage && typeof usage === 'object') {
+    add(model, {
+      inputTokens: count(usage.input_tokens),
+      cacheWriteTokens: count(usage.cache_creation_input_tokens),
+      cacheReadTokens: count(usage.cache_read_input_tokens),
+      outputTokens: count(usage.output_tokens),
+      costUsd: null,
+      costUnknown: false,
+    });
+  }
+  return [...totals.values()].filter((entry) => (
+    entry.inputTokens + entry.cacheWriteTokens + entry.cacheReadTokens + entry.outputTokens > 0 || entry.costUsd > 0
+  ));
+}

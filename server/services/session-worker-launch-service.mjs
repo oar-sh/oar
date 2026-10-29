@@ -1126,6 +1126,9 @@ export async function launchSessionCli({
   locateExecutableImpl = locateExecutable,
   // Asked after a failed spawn whether its folder is gone (the error, or null).
   checkWorkingDirectoryImpl = missingWorkingDirectoryError,
+  // Under a systemd user service: puts the worker in a scope of its own
+  // (worker-scope.mjs). None: the worker starts as it is.
+  workerScope = null,
 } = {}) {
   const target = String(targetSessionId || '').trim();
   if (!target) throw new Error('missing-target-session-id');
@@ -1237,7 +1240,7 @@ export async function launchSessionCli({
       ? prepareWorkerLogFile(target, launchSessionEnv)
       : null;
     try {
-      execFileSyncImpl('tmux', [
+      const tmuxArgs = [
         'new-session',
         '-d',
         '-s',
@@ -1251,7 +1254,10 @@ export async function launchSessionCli({
           workerLogPath: tmuxWorkerLogPath || '',
           extraCliArgs: extensionCliArgs,
         }),
-      ], {
+      ];
+      // A tmux server this call starts is in the worker's own scope.
+      const tmuxLaunch = workerScope ? workerScope.wrap('tmux', tmuxArgs) : { command: 'tmux', args: tmuxArgs };
+      execFileSyncImpl(tmuxLaunch.command, tmuxLaunch.args, {
         env: tmuxEnv,
         stdio: ['ignore', 'ignore', 'ignore'],
       });
@@ -1351,7 +1357,10 @@ export async function launchSessionCli({
       }
     }
   }
-  const child = spawnImpl(spawnCommand, spawnArgs, {
+  // POSIX: in a scope of its own under a systemd user service; the process
+  // id is still the worker's.
+  const detachedLaunch = platform !== 'win32' && workerScope ? workerScope.wrap(spawnCommand, spawnArgs) : { command: spawnCommand, args: spawnArgs };
+  const child = spawnImpl(detachedLaunch.command, detachedLaunch.args, {
     cwd: launchProcessCwd,
     env: launchSessionEnv,
     detached: true,

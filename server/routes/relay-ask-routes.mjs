@@ -27,12 +27,15 @@
 //                                          relay from its Inbox: asks only;
 //                                          an approval or any other card is
 //                                          never answered over the pairing
-//   GET  /api/relay-asks/remote/inbox      what its Inbox shows of this relay
+//   GET  /api/relay-asks/remote/inbox      what its Inbox shows of this relay;
+//                                          `?push=1`: it can push, and each
+//                                          card a turn waits on says who does
+//                                          (`notice`)
 //
 // Every text of an ask or card is an agent's: it goes out as data, and the
 // browser shows it as plain text.
 
-import { REMOTE_RELAY_ERROR_CODES } from '../../shared/remote-relay-contract.mjs';
+import { REMOTE_INBOX_CLAIMS, REMOTE_INBOX_NOTICES, REMOTE_RELAY_ERROR_CODES } from '../../shared/remote-relay-contract.mjs';
 import { RELAY_ASK_LIMITS, relayQuestionKind } from '../../shared/relay-asks.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
 import { findOriginRemoteRelay, admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
@@ -53,6 +56,8 @@ const RELAY_ASK_ERROR_STATUS = Object.freeze({
 const INBOX_REMOTE_TIMEOUT_MS = 5_000;
 // Cards answered in the last day are listed under the divider, at most these.
 const INBOX_ANSWERED_CARDS_MAX = 50;
+// Plan cards, pending (one per session) and settled in the last day, at most these each.
+const INBOX_PLAN_CARDS_MAX = 50;
 // Registry states that mean "do not even try" for the Inbox.
 const UNREACHABLE_STATES = new Set(['offline', 'unauthorized']);
 
@@ -90,7 +95,15 @@ export function inboxItemOfCard(question, session, { forRemote = false } = {}) {
     createdAt: question?.createdAt || null,
     ...(question?.status === 'answered' ? { answeredAt: question?.answeredAt || null } : {}),
   };
-  if (forRemote && kind === 'approval') return { ...base, question: '' };
+  // Its kind and summary say what it is about, never what it would send.
+  if (forRemote && kind === 'approval') {
+    return {
+      ...base,
+      question: '',
+      ...(toText(context.variant) ? { variant: toText(context.variant) } : {}),
+      ...(toText(context.summary) ? { summary: toText(context.summary) } : {}),
+    };
+  }
   const fields = schemaFields(question?.requestSchema);
   return {
     ...base,
@@ -104,6 +117,37 @@ export function inboxItemOfCard(question, session, { forRemote = false } = {}) {
       ...(question?.status === 'answered' ? { answer: String(question?.answer || '') } : {}),
       sdkSessionId: question?.sdkSessionId || null,
     }),
+  };
+}
+
+/**
+ * One Inbox item of a plan card (a formatted relay board). A paired
+ * relay's Inbox gets its title and status alone, "Open there": a card is
+ * never answered over the pairing. `question` repeats the title for one
+ * that does not know plan items (0.9.19 shows it as a card's question).
+ */
+export function inboxItemOfPlanBoard(board, session, { forRemote = false } = {}) {
+  const title = toText(board?.title) || 'Plan ready for review';
+  const status = toText(board?.status) || 'pending';
+  const base = {
+    id: toText(board?.id),
+    kind: 'plan',
+    session,
+    title,
+    status,
+    createdAt: board?.createdAt || null,
+  };
+  if (forRemote) return { ...base, question: title };
+  return {
+    ...base,
+    ...(status !== 'pending' ? { actedAt: board?.actedAt || null } : {}),
+    body: String(board?.body || ''),
+    actions: (Array.isArray(board?.actions) ? board.actions : [])
+      .map((action) => ({ id: toText(action?.id), label: toText(action?.label) || toText(action?.id) }))
+      .filter((action) => action.id),
+    recommendedAction: toText(board?.recommendedAction) || null,
+    planOnly: board?.planOnly === true,
+    selectedAction: toText(board?.selectedAction) || null,
   };
 }
 
@@ -139,6 +183,8 @@ export function registerRelayAskRoutes(app, deps) {
     db,
     stmts,
     formatQuestionRow,
+    // Plan cards (relay boards) in the Inbox, formatted as their routes do.
+    formatRelayBoardRow = null,
     relayAskService = null,
     relayAskLinkService = null,
     remoteRelayInbound = null,
@@ -146,12 +192,35 @@ export function registerRelayAskRoutes(app, deps) {
     // calls them (remote-relay-client.mjs): the Inbox of paired relays.
     remoteRelayRegistry = null,
     remoteRelayClient = null,
+    // push-dispatch-service.mjs questionNotice: whether this relay's own push
+    // of a card reached a device.
+    questionNotice = null,
     now = () => Date.now(),
   } = deps;
 
   const conversationStmt = db?.prepare?.(`SELECT id, title, origin_json FROM conversations WHERE id = ?`) || null;
   const answeredCardsStmt = db?.prepare?.(`
     SELECT * FROM relay_questions WHERE status = 'answered' AND answered_at >= ? ORDER BY answered_at DESC LIMIT ?
+  `) || null;
+
+  // Plan cards: of each session that is neither deleted nor
+  // archived the newest pending one (an older one stays in its session),
+  // and the ones settled in the last day.
+  const planBoardSessionFilter = `c.status != 'deleted' AND COALESCE(c.archived, 0) = 0`;
+  const pendingPlanBoardsStmt = db?.prepare?.(`
+    SELECT b.* FROM relay_boards b JOIN conversations c ON c.id = b.conversation_id
+    WHERE b.status = 'pending' AND b.board_type = 'plan_ready' AND ${planBoardSessionFilter}
+      AND NOT EXISTS (
+        SELECT 1 FROM relay_boards newer
+        WHERE newer.conversation_id = b.conversation_id AND newer.status = 'pending' AND newer.board_type = 'plan_ready'
+          AND (newer.created_at > b.created_at OR (newer.created_at = b.created_at AND newer.rowid > b.rowid))
+      )
+    ORDER BY b.created_at DESC LIMIT ?
+  `) || null;
+  const settledPlanBoardsStmt = db?.prepare?.(`
+    SELECT b.* FROM relay_boards b JOIN conversations c ON c.id = b.conversation_id
+    WHERE b.status IN ('acted', 'dismissed') AND b.board_type = 'plan_ready' AND b.acted_at >= ? AND ${planBoardSessionFilter}
+    ORDER BY b.acted_at DESC LIMIT ?
   `) || null;
 
   function sessionOf(id) {
@@ -204,13 +273,20 @@ export function registerRelayAskRoutes(app, deps) {
     return { relayId, name: toText(paired?.name) || claimed || toText(request.origin?.relayName) || relayId };
   }
 
-  /** What an Inbox shows of this relay: its asks, and the cards turns wait on. */
-  function localInboxItems({ forRemote = false } = {}) {
+  /**
+   * What an Inbox shows of this relay: its asks, and the cards turns wait on.
+   * `read`, when given, learns whether the pending cards could be read
+   * (`read.pendingCards`): a failed read lists none, which is not "none pending".
+   */
+  function localInboxItems({ forRemote = false, read = null } = {}) {
     const items = (relayAskService?.isAvailable?.() ? relayAskService.listHere() : []).map(inboxItemOfAsk);
     let pending = [];
     try {
       pending = stmts.listQuestions.all('pending', null, null).map(formatQuestionRow).filter(Boolean);
-    } catch {}
+      if (read) read.pendingCards = true;
+    } catch {
+      if (read) read.pendingCards = false;
+    }
     let answered = [];
     try {
       const since = new Date(now() - RELAY_ASK_LIMITS.answeredKeepMs).toISOString();
@@ -218,6 +294,19 @@ export function registerRelayAskRoutes(app, deps) {
     } catch {}
     for (const question of [...pending, ...answered]) {
       items.push(inboxItemOfCard(question, sessionOf(question.conversationId), { forRemote }));
+    }
+    if (typeof formatRelayBoardRow === 'function') {
+      let boards = [];
+      try {
+        const since = new Date(now() - RELAY_ASK_LIMITS.answeredKeepMs).toISOString();
+        boards = [
+          ...(pendingPlanBoardsStmt?.all(INBOX_PLAN_CARDS_MAX) || []),
+          ...(settledPlanBoardsStmt?.all(since, INBOX_PLAN_CARDS_MAX) || []),
+        ].map(formatRelayBoardRow).filter(Boolean);
+      } catch {}
+      for (const board of boards) {
+        items.push(inboxItemOfPlanBoard(board, sessionOf(board.conversationId), { forRemote }));
+      }
     }
     return items.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
   }
@@ -375,11 +464,52 @@ export function registerRelayAskRoutes(app, deps) {
     }
   });
 
-  // GET /api/relay-asks/remote/inbox — what a paired relay's Inbox shows of this one.
+  // Who pushes a card a turn waits on: question id → the paired
+  // relay (its id) that claimed it. In memory: after a restart a
+  // card is just claimable again.
+  const claims = new Map();
+
+  /**
+   * `notice` (and with `you`, `claimed`) for each pending approval and
+   * ask_user item, for a caller that can push: this relay's own push
+   * decides first, then the first caller to find it missed claims it.
+   */
+  function addNotices(items, callerRelayId) {
+    const pendingIds = new Set();
+    const noticed = items.map((item) => {
+      if (item.status !== 'pending' || (item.kind !== 'approval' && item.kind !== 'ask_user')) return item;
+      pendingIds.add(item.id);
+      let own = null;
+      try {
+        own = typeof questionNotice === 'function' ? questionNotice(item.id) : null;
+      } catch {}
+      if (own === 'reached') return { ...item, notice: REMOTE_INBOX_NOTICES.here };
+      if (own === 'pending') return { ...item, notice: REMOTE_INBOX_NOTICES.wait };
+      const claim = claims.get(item.id);
+      if (!claim) {
+        claims.set(item.id, callerRelayId);
+        return { ...item, notice: REMOTE_INBOX_NOTICES.you, claimed: REMOTE_INBOX_CLAIMS.now };
+      }
+      if (claim === callerRelayId) return { ...item, notice: REMOTE_INBOX_NOTICES.you, claimed: REMOTE_INBOX_CLAIMS.before };
+      return { ...item, notice: REMOTE_INBOX_NOTICES.other };
+    });
+    // A card no longer pending needs no claim.
+    for (const id of claims.keys()) {
+      if (!pendingIds.has(id)) claims.delete(id);
+    }
+    return noticed;
+  }
+
+  // GET /api/relay-asks/remote/inbox — what a paired relay's Inbox shows of
+  // this one. `?push=1`: the caller can push, and learns who pushes each card.
   app.get('/api/relay-asks/remote/inbox', auth, (req, res) => {
     const caller = admitPairedRelay(req, res);
     if (!caller) return;
-    const items = localInboxItems({ forRemote: true });
+    const read = {};
+    let items = localInboxItems({ forRemote: true, read });
+    // Pending cards that could not be read are not "no card pending": the
+    // claims stay, and no card is claimed or offered on this read.
+    if (toText(req.query?.push) === '1' && read.pendingCards) items = addNotices(items, caller.relayId);
     res.json({ ok: true, items, pending: pendingOf(items) });
   });
 

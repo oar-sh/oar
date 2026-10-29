@@ -179,7 +179,7 @@ node --test .github/extensions/web-relay/skills/*.test.mjs
 ### Structured answers not appearing
 - Check browser console for rendering errors
 - Verify `request_schema` is valid JSON: Relay logs may show schema parse errors
-- Check migration was applied: `server/data/copilot.db` should have `relay_questions.structured_answer` column
+- Check migration was applied: the relay's database (`server/data/oar.db`, or `copilot.db` on installs from before 0.9.20) should have `relay_questions.structured_answer` column
 
 ## Contributing
 

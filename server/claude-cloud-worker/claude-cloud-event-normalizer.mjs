@@ -1,4 +1,5 @@
 import { capThought } from '../../shared/thought-cap.mjs';
+import { tokenUsageModel } from '../../shared/turn-token-usage.mjs';
 import {
   compactBoundaryActivityAction,
   displayToolName,
@@ -69,6 +70,57 @@ export function readCloudResult(payload) {
 }
 
 /**
+ * A cloud session's running token totals per model, for the token booking
+ * (POST /api/turn-token-usage with `sessionTotals`; the relay books what
+ * they grew by): `[{ model, inputTokens, cacheWriteTokens, cacheReadTokens,
+ * outputTokens, costUsd, costSource, costUnknown }]` out of a result's
+ * `modelUsage`. A field the entry does not carry is null, not 0. The cache
+ * fields of the session read (`sessionTokens`, readCloudSessionUsage) cover
+ * the whole session, so they stand in only when the session ran one model;
+ * with more, a missing field stays null. Model ids drop the `[1m]` tier.
+ */
+export function cloudSessionTokenTotals(modelUsage, sessionTokens = null) {
+  if (!modelUsage || typeof modelUsage !== 'object' || Array.isArray(modelUsage)) return [];
+  const count = (value) => {
+    const n = finiteOrNull(value);
+    return n === null || n < 0 ? null : Math.trunc(n);
+  };
+  const totals = new Map();
+  for (const [name, entry] of Object.entries(modelUsage)) {
+    const model = tokenUsageModel(name);
+    if (!model || !entry || typeof entry !== 'object') continue;
+    const costUsd = finiteOrNull(entry.costUSD);
+    const next = {
+      model,
+      inputTokens: count(entry.inputTokens),
+      cacheWriteTokens: count(entry.cacheCreationInputTokens),
+      cacheReadTokens: count(entry.cacheReadInputTokens),
+      outputTokens: count(entry.outputTokens),
+      costUsd: costUsd === null || costUsd < 0 ? null : costUsd,
+      costSource: null,
+      costUnknown: entry.costBasis === 'unknown',
+    };
+    const current = totals.get(model);
+    if (!current) {
+      totals.set(model, next);
+      continue;
+    }
+    for (const field of ['inputTokens', 'cacheWriteTokens', 'cacheReadTokens', 'outputTokens', 'costUsd']) {
+      if (next[field] !== null) current[field] = (current[field] ?? 0) + next[field];
+    }
+    current.costUnknown = current.costUnknown || next.costUnknown;
+  }
+  const entries = [...totals.values()];
+  if (entries.length === 1 && sessionTokens) {
+    const [only] = entries;
+    if (only.cacheWriteTokens === null) only.cacheWriteTokens = count(sessionTokens.cacheWriteTokens);
+    if (only.cacheReadTokens === null) only.cacheReadTokens = count(sessionTokens.cacheReadTokens);
+  }
+  for (const entry of entries) entry.costSource = entry.costUsd === null ? null : 'claude-code';
+  return entries;
+}
+
+/**
  * What `GET /v1/code/sessions/{id}` says after a turn, for the relay's usage
  * routes: the context occupancy in the shape `/api/claude-context-usage`
  * stores, the session's cost so far, and the session's page on claude.ai.
@@ -99,6 +151,14 @@ export function readCloudSessionUsage(sessionBody, { model = '' } = {}) {
     };
   return {
     contextUsage,
+    // The session's token totals over every model: what the token booking
+    // falls back on for the cache fields (cloudSessionTokenTotals).
+    tokens: {
+      inputTokens: finiteOrNull(usage.input_tokens),
+      outputTokens: finiteOrNull(usage.output_tokens),
+      cacheReadTokens: finiteOrNull(usage.cache_read_tokens),
+      cacheWriteTokens: finiteOrNull(usage.cache_write_tokens),
+    },
     costUsd: finiteOrNull(usage.cost_usd),
     sessionUrl: String(shape?.session_url || sessionBody?.sessionUrl || '').trim() || null,
     workerStatus: String(shape?.worker_status || '').trim().toLowerCase() || null,

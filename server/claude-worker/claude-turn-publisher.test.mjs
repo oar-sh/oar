@@ -498,3 +498,188 @@ test('no billing report without the route (DeepSeek) or without a run', async ()
   await noRun.publisher.publishPlanUsage({ message, state: turnState({ 'claude-sonnet-5-5': sonnetUsage(1, 1, 0) }), sdkSessionId: 'sid-1' });
   assert.deepEqual(noRun.calls.map((call) => call.routePath), ['/api/claude-plan-usage']);
 });
+
+// The token booking (POST /api/turn-token-usage): every
+// Claude-family worker posts the turn's tokens per model with the four kinds
+// apart, the turn's total so far under the turn's id.
+function tokenPublisher(extra = {}) {
+  const calls = [];
+  const publisher = createClaudeTurnPublisher({
+    api: async (method, routePath, body) => { calls.push({ routePath, body }); return { ok: true }; },
+    billingUsageRoute: '/api/claude-api-usage',
+    billingKind: 'claude',
+    turnTokenProvider: 'claude',
+    ...extra,
+  });
+  const posts = () => calls.filter((call) => call.routePath === '/api/turn-token-usage').map((call) => call.body);
+  return { publisher, calls, posts };
+}
+
+const opusUsage = (input, write, read, output, costUSD, extra = {}) => ({
+  inputTokens: input, cacheCreationInputTokens: write, cacheReadInputTokens: read, outputTokens: output, costUSD, ...extra,
+});
+const fields = (entry) => [entry.inputTokens, entry.cacheWriteTokens, entry.cacheReadTokens, entry.outputTokens];
+
+test('the turn\'s tokens go out with cache writes and reads apart, the turn and the run', async () => {
+  const { publisher, calls, posts } = tokenPublisher();
+  await publisher.publishPlanUsage({
+    message, state: turnState({ 'claude-opus-5-5[1m]': opusUsage(100, 2000, 30000, 400, 0.5) }), sdkSessionId: 'sid-1', runId: 'run-1',
+  });
+  assert.equal(calls[0].routePath, '/api/turn-token-usage');
+  const [post] = posts();
+  assert.equal(post.conversationId, 'conv-1');
+  assert.equal(post.turnId, 'q-1');
+  assert.equal(post.runId, 'run-1');
+  assert.equal(post.provider, 'claude');
+  assert.equal(post.nativeSessionId, 'native-1');
+  assert.deepEqual(post.models, [{
+    model: 'claude-opus-5-5', inputTokens: 100, cacheWriteTokens: 2000, cacheReadTokens: 30000, outputTokens: 400,
+    costUsd: 0.5, costSource: 'claude-code', costUnknown: false,
+  }]);
+  // The Claude API booking still folds the writes into its misses.
+  const billing = calls.find((call) => call.routePath === '/api/claude-api-usage').body;
+  assert.equal(billing.runCounts[0].missTokens, 2100);
+});
+
+test('each turn posts what the session totals grew by; a sub-agent\'s model is its own entry', async () => {
+  const { publisher, posts } = tokenPublisher();
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(100, 1000, 0, 50, 0.2) }), sdkSessionId: 'sid-1', runId: 'run-1' });
+  await publisher.publishPlanUsage({
+    message: { ...message, id: 'q-2' },
+    state: turnState({ 'claude-opus-5-5': opusUsage(160, 1200, 9000, 90, 0.35), 'claude-haiku-5-5': opusUsage(10, 0, 0, 5, 0.001) }),
+    sdkSessionId: 'sid-1',
+    runId: 'run-1',
+  });
+  const second = posts()[1];
+  assert.equal(second.turnId, 'q-2');
+  assert.deepEqual(second.models.map((entry) => [entry.model, ...fields(entry)]), [
+    ['claude-opus-5-5', 60, 200, 9000, 40],
+    ['claude-haiku-5-5', 10, 0, 0, 5],
+  ]);
+  assert.ok(Math.abs(second.models[0].costUsd - 0.15) < 1e-9);
+});
+
+test('two results in one turn post the turn\'s running total; the same result published twice adds nothing', async () => {
+  const { publisher, posts } = tokenPublisher();
+  const first = turnState({ 'claude-opus-5-5': opusUsage(100, 0, 0, 10, 0.1) });
+  const second = turnState({ 'claude-opus-5-5': opusUsage(150, 0, 500, 30, 0.2) });
+  for (const state of [first, first, second]) {
+    await publisher.publishPlanUsage({ message, state, sdkSessionId: 'sid-1', runId: 'run-1' });
+  }
+  assert.deepEqual(posts().map((post) => [post.turnId, ...fields(post.models[0])]), [
+    ['q-1', 100, 0, 0, 10],
+    ['q-1', 100, 0, 0, 10],
+    ['q-1', 150, 0, 500, 30],
+  ]);
+});
+
+test('a resumed process\'s first result posts the turn\'s main loop, unpriced', async () => {
+  const { publisher, posts } = tokenPublisher();
+  const state = turnState(
+    { 'claude-opus-5-5': opusUsage(9000, 50000, 400000, 3000, 4.2) },
+    { input_tokens: 80, cache_creation_input_tokens: 300, cache_read_input_tokens: 7000, output_tokens: 60 },
+  );
+  state.result.model = 'claude-opus-5-5';
+  await publisher.publishPlanUsage({ message, state, sdkSessionId: 'sid-1', runId: 'run-2', resumedSessionId: 'native-1' });
+  const [entry] = posts()[0].models;
+  assert.deepEqual(fields(entry), [80, 300, 7000, 60]);
+  assert.equal(entry.costUsd, null);
+  assert.equal(entry.costUnknown, true);
+  // Its next turn counts from the restored totals, not from zero.
+  await publisher.publishPlanUsage({
+    message: { ...message, id: 'q-2' }, state: turnState({ 'claude-opus-5-5': opusUsage(9010, 50000, 400000, 3010, 4.25) }), sdkSessionId: 'sid-1', runId: 'run-2', resumedSessionId: 'native-1',
+  });
+  assert.deepEqual(fields(posts()[1].models[0]), [10, 0, 0, 10]);
+});
+
+test('a late result of an older turn below the baseline posts nothing new', async () => {
+  const { publisher, posts } = tokenPublisher();
+  const older = turnState({ 'claude-opus-5-5': opusUsage(100, 0, 0, 10, 0.1) });
+  const newer = turnState({ 'claude-opus-5-5': opusUsage(180, 0, 0, 20, 0.2) });
+  await publisher.publishPlanUsage({ message: { ...message, id: 'q-2' }, state: newer, sdkSessionId: 'sid-1', runId: 'run-1' });
+  await publisher.publishPlanUsage({ message, state: older, sdkSessionId: 'sid-1', runId: 'run-1' });
+  // The newer turn holds the growth; the older one has nothing of its own left.
+  assert.deepEqual(posts().map((post) => post.turnId), ['q-2']);
+  assert.deepEqual(fields(posts()[0].models[0]), [180, 0, 0, 20]);
+});
+
+test('a /clear (a new CLI session id in the same process) starts the count over', async () => {
+  const { publisher, posts } = tokenPublisher({ billingKind: 'claude-api', turnTokenProvider: 'claude-api' });
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(100, 0, 0, 10, 0.1) }), sdkSessionId: 'sid-1', runId: 'run-1' });
+  const cleared = turnState({ 'claude-opus-5-5': opusUsage(20, 0, 0, 2, 0.01) });
+  cleared.result.sessionId = 'native-2';
+  await publisher.publishPlanUsage({ message: { ...message, id: 'q-2' }, state: cleared, sdkSessionId: 'sid-1', runId: 'run-1' });
+  assert.deepEqual(posts().map((post) => [post.provider, post.nativeSessionId, ...fields(post.models[0])]), [
+    ['claude-api', 'native-1', 100, 0, 0, 10],
+    ['claude-api', 'native-2', 20, 0, 0, 2],
+  ]);
+});
+
+test('without a run id the publisher names its own, the same for its whole life', async () => {
+  const { publisher, posts } = tokenPublisher({ billingUsageRoute: null });
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(1, 0, 0, 1, 0) }), sdkSessionId: 'sid-1' });
+  await publisher.publishPlanUsage({ message: { ...message, id: 'q-2' }, state: turnState({ 'claude-opus-5-5': opusUsage(2, 0, 0, 2, 0) }), sdkSessionId: 'sid-1' });
+  const [a, b] = posts();
+  assert.match(a.runId, /^[0-9a-f-]{36}$/);
+  assert.equal(a.runId, b.runId);
+  const other = tokenPublisher({ billingUsageRoute: null });
+  await other.publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(1, 0, 0, 1, 0) }), sdkSessionId: 'sid-1' });
+  assert.notEqual(other.posts()[0].runId, a.runId);
+});
+
+test('no token post without a provider (Claude cloud\'s publisher) or without a result', async () => {
+  const { publisher, posts } = tokenPublisher({ turnTokenProvider: null });
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(1, 0, 0, 1, 0) }), sdkSessionId: 'sid-1', runId: 'run-1' });
+  assert.equal(posts().length, 0);
+  const noResult = tokenPublisher();
+  await noResult.publisher.publishPlanUsage({ message, state: { result: null, planUsage: null, modelUsage: null }, sdkSessionId: 'sid-1', runId: 'run-1' });
+  assert.equal(noResult.posts().length, 0);
+});
+
+test('a turn re-run by a new CLI process posts that run\'s tokens only, under its own run', async () => {
+  const { publisher, posts } = tokenPublisher();
+  // q-1 ends with an error result under run-1; the worker's next CLI process re-runs it.
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(1_000, 0, 0, 10, 0.1) }), sdkSessionId: 'sid-1', runId: 'run-1' });
+  await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(500, 0, 0, 5, 0.05) }), sdkSessionId: 'sid-1', runId: 'run-2' });
+  assert.deepEqual(posts().map((post) => [post.turnId, post.runId, ...fields(post.models[0])]), [
+    ['q-1', 'run-1', 1_000, 0, 0, 10],
+    ['q-1', 'run-2', 500, 0, 0, 5],
+  ]);
+});
+
+test('a result without modelUsage raises the baseline: modelUsage, then usage alone, then modelUsage counts each turn once', async () => {
+  const { publisher, calls, posts } = tokenPublisher({ billingKind: 'claude-api', turnTokenProvider: 'claude-api' });
+  const withTotals = (input) => turnState({ 'claude-opus-5-5': opusUsage(input, 0, 0, 0, input / 1000) });
+  const usageOnly = turnState(null, { input_tokens: 50, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 });
+  usageOnly.result.model = 'claude-opus-5-5';
+  await publisher.publishPlanUsage({ message, state: withTotals(100), sdkSessionId: 'sid-1', runId: 'run-1' });
+  await publisher.publishPlanUsage({ message: { ...message, id: 'q-2' }, state: usageOnly, sdkSessionId: 'sid-1', runId: 'run-1' });
+  // The CLI's running totals now hold both turns: 100 + 50 + this turn's 30.
+  await publisher.publishPlanUsage({ message: { ...message, id: 'q-3' }, state: withTotals(180), sdkSessionId: 'sid-1', runId: 'run-1' });
+  assert.deepEqual(posts().map((post) => [post.turnId, post.models[0].inputTokens]), [['q-1', 100], ['q-2', 50], ['q-3', 30]]);
+  // The Claude API booking's run counts mirror it: 100, 150, 180, never 230.
+  const billing = calls.filter((call) => call.routePath === '/api/claude-api-usage').map((call) => call.body.runCounts[0].missTokens);
+  assert.deepEqual(billing, [100, 150, 180]);
+});
+
+test('the token post never holds the turn: a hanging or failing post, or a throwing price, still lets the publish go on', async () => {
+  for (const mode of ['hang', 'reject', 'throw-price']) {
+    const calls = [];
+    const publisher = createClaudeTurnPublisher({
+      api: (method, routePath, body) => {
+        calls.push(routePath);
+        if (routePath === '/api/turn-token-usage' && mode === 'hang') return new Promise(() => {});
+        if (routePath === '/api/turn-token-usage' && mode === 'reject') return Promise.reject(new Error('relay away'));
+        return Promise.resolve({ ok: true });
+      },
+      billingUsageRoute: '/api/claude-api-usage',
+      billingKind: 'claude',
+      turnTokenProvider: 'claude',
+      ...(mode === 'throw-price' ? { turnTokenCost: () => { throw new Error('odd model'); } } : {}),
+    });
+    await publisher.publishPlanUsage({ message, state: turnState({ 'claude-opus-5-5': opusUsage(1, 0, 0, 1, 0) }), sdkSessionId: 'sid-1', runId: 'run-1' });
+    // The bookings after it went out, and the publish returned.
+    assert.ok(calls.includes('/api/claude-api-usage'), `${mode}: ${calls.join(', ')}`);
+    assert.ok(calls.includes('/api/claude-plan-usage'), `${mode}: ${calls.join(', ')}`);
+  }
+});

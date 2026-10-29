@@ -615,6 +615,9 @@ export function createClaudeSessionRunner({
     // Both Claude billings report to the Claude API booking; DeepSeek has
     // its own.
     ...(claudeBillingOf(workerKind) ? { billingUsageRoute: '/api/claude-api-usage', billingKind: workerKind } : {}),
+    // Every Claude-family worker books its turns' tokens.
+    turnTokenProvider: workerKind,
+    ...(typeof backend?.turnTokenCost === 'function' ? { turnTokenCost: backend.turnTokenCost } : {}),
     ...(backend
       ? {
           describeFailure: backend.describeFailure,

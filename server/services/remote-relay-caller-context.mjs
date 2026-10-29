@@ -4,6 +4,7 @@ import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import {
   REMOTE_RELAY_APPROVAL_SOURCE,
+  REMOTE_RELAY_APPROVAL_SUMMARY_MAX,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_PROVIDERS,
 } from '../../shared/remote-relay-contract.mjs';
@@ -103,15 +104,19 @@ const APPROVAL_VERBS = Object.freeze({
 
 /**
  * How the remote turn would run, as far as this relay knows it: the mode (the
- * requested one, else the calling session's, which the dispatcher passes on),
+ * requested one; for a new session else the calling session's, which the
+ * dispatcher passes on; a send without one leaves the target's own),
  * the provider a new session gets (requested, else the caller's), the model
  * and working directory when the agent asked for them, and the session group
  * a new session goes into (`group`, as the target resolved it).
  */
 function describeRemoteTurn(action, args, caller, group = null) {
   const parts = [];
-  const mode = toText(args.mode).toLowerCase() || toText(caller?.mode).toLowerCase();
+  const planOnly = action === 'create_session' && args.planOnly === true;
+  const mode = toText(args.mode).toLowerCase()
+    || (action === 'create_session' ? (planOnly ? 'plan' : toText(caller?.mode).toLowerCase()) : '');
   if (mode) parts.push(`Mode: ${mode}`);
+  if (planOnly) parts.push('Plan only');
   if (action === 'create_session') {
     const requested = toText(args.provider).toLowerCase();
     const callerProvider = toText(caller?.provider).toLowerCase();
@@ -147,6 +152,7 @@ function describeSettingsChange(args) {
   if (typeof args.thinking_enabled === 'boolean') parts.push(`Thinking: ${args.thinking_enabled ? 'on' : 'off'}`);
   if (toText(args.thinking_display)) parts.push(`Thinking text: ${toText(args.thinking_display) === 'omitted' ? 'hidden' : 'visible'}`);
   if (toText(args.cwd)) parts.push(`Folder: ${excerpt(args.cwd)} (its CLI restarts there)`);
+  if (typeof args.planOnly === 'boolean') parts.push(`planOnly: ${args.planOnly}`);
   return parts.join(' · ');
 }
 
@@ -274,6 +280,58 @@ export function formatRemoteRelayApprovalPrompt({ relay, action, args = {}, call
   return lines.join('\n\n');
 }
 
+// A name inside a summary line: short, so the line keeps its point.
+const SUMMARY_NAME_MAX = 60;
+
+function summaryName(value) {
+  const text = toText(value).replace(/\s+/g, ' ');
+  return text.length > SUMMARY_NAME_MAX ? `${text.slice(0, SUMMARY_NAME_MAX - 1)}…` : text;
+}
+
+/**
+ * What an approval card is about, for another relay's Inbox and push:
+ * `{ variant, summary }`. The summary names the kind, the
+ * requesting session and the reason (titles, a model, counts), never the
+ * prompt, the answer or the question the agent would send: those stay on
+ * this relay, in the card itself. Same inputs as the card text.
+ */
+export function formatApprovalSummary({ relay, action, args = {}, caller = null, agentPrompts = 0, localSessions = false, watch = null, sessionSettings = null } = {}) {
+  const requester = `'${summaryName(caller?.title) || shortId(caller?.conversationId)}'`;
+  const by = `requested by ${requester}`;
+  const local = relay?.local === true;
+  const where = local ? 'this relay' : `relay "${summaryName(relay?.name) || 'a remote relay'}"`;
+  let variant;
+  let summary;
+  if (watch && typeof watch === 'object') {
+    variant = 'watch';
+    if (watch.kind === 'transfer') {
+      const count = Number(watch.count) || 0;
+      summary = `Take over ${count} event subscription${count === 1 ? '' : 's'} ${by}`;
+    } else {
+      const count = Array.isArray(watch.sessions) ? watch.sessions.length : 0;
+      summary = `Watch ${watch.all ? 'ALL sessions' : `${count} session${count === 1 ? '' : 's'}`} ${by}`;
+    }
+  } else if (sessionSettings && typeof sessionSettings === 'object') {
+    variant = 'session_settings';
+    summary = `Change settings of '${summaryName(sessionSettings.title) || shortId(sessionSettings.session || args.session)}' ${by}`;
+  } else if (agentPrompts > 0) {
+    variant = 'loop_guard';
+    summary = `Loop guard: ${agentPrompts} prompts by ${requester}`;
+  } else if (localSessions) {
+    variant = 'local_sessions';
+    summary = `Start sessions on this relay ${by}`;
+  } else if (action === 'create_session') {
+    variant = 'create_session';
+    const details = [summaryName(args.title), summaryName(args.model)].filter(Boolean).join(', ');
+    summary = `New session ${by}${details ? `: ${details}` : ''}`;
+  } else {
+    variant = 'write';
+    const verb = APPROVAL_VERBS[action] || toText(action).replace(/_/g, ' ') || 'act';
+    summary = `${verb.charAt(0).toUpperCase()}${verb.slice(1)} on ${where} ${by}`;
+  }
+  return { variant, summary: summary.slice(0, REMOTE_RELAY_APPROVAL_SUMMARY_MAX) };
+}
+
 export function createRemoteRelayCallerContext({
   db,
   repository,
@@ -292,8 +350,12 @@ export function createRemoteRelayCallerContext({
   questionTimeoutMs = DEFAULT_QUESTION_TIMEOUT_MS,
 } = {}) {
   const questionStatements = questions || createQuestionRepository(db);
+  // Plan-only (migration 0035): NULL on a schema without it.
+  const conversationsHavePlanOnly = db.prepare(`PRAGMA table_info(conversations)`).all()
+    .some((column) => column.name === 'plan_only');
   const getConversation = db.prepare(`
-    SELECT id, title, preferred_relay_mode, preferred_model, preferred_reasoning_effort FROM conversations WHERE id = ?
+    SELECT id, title, preferred_relay_mode, preferred_model, preferred_reasoning_effort,
+      ${conversationsHavePlanOnly ? 'plan_only' : 'NULL AS plan_only'} FROM conversations WHERE id = ?
   `);
   const getRuntimeSession = db.prepare(`SELECT provider_type, provider_model, model FROM runtime_sessions WHERE conversation_id = ?`);
   const listProcessingRows = db.prepare(`
@@ -360,9 +422,10 @@ export function createRemoteRelayCallerContext({
   }
 
   /**
-   * `{ conversationId, title, provider, model, effort, mode, processingRowId,
-   * attemptId, userMessageId, hops, originRelayIds }` for the conversation
-   * making the call.
+   * `{ conversationId, title, provider, model, effort, mode, planOnly,
+   * processingRowId, attemptId, userMessageId, hops, originRelayIds }` for the
+   * conversation making the call. A plan-only conversation's `mode` is its
+   * saved one, not its live turn's.
    * `effort` is the reasoning effort of the live turn, else the one the
    * conversation prefers ('' when neither is known).
    * `hops` is how many relays the current turn's prompt already crossed: 0
@@ -388,13 +451,21 @@ export function createRemoteRelayCallerContext({
     const originRelayIds = [...new Set(origins.map((origin) => toText(origin.relayId)))];
     // The prompt with the most hops: what a schedule of this turn's passes on.
     const origin = origins.reduce((best, entry) => (!best || originHops(entry) > originHops(best) ? entry : best), null);
+    const planOnly = Number(conversation?.plan_only) === 1;
     return {
       conversationId: id,
       title: toText(conversation?.title),
       provider: toText(runtime?.provider_type).toLowerCase() || 'github',
       model: toText(live?.model) || toText(runtime?.provider_model) || toText(runtime?.model) || toText(conversation?.preferred_model) || '',
       effort: (toText(live?.reasoning_effort) || toText(conversation?.preferred_reasoning_effort)).toLowerCase(),
-      mode: normalizeMode(live?.relay_mode || conversation?.preferred_relay_mode),
+      // A plan-only conversation's mode is its saved one (plan): the one write
+      // turn of "Approve plan" runs in agent mode, and what it starts or sends
+      // must not pass for an agent-mode caller's (an agent session by default,
+      // no approval card).
+      mode: normalizeMode(planOnly
+        ? (conversation?.preferred_relay_mode || live?.relay_mode)
+        : (live?.relay_mode || conversation?.preferred_relay_mode)),
+      planOnly,
       processingRowId: live?.id || null,
       attemptId: toText(live?.attempt_id) || null,
       userMessageId: live?.id || null,
@@ -474,6 +545,8 @@ export function createRemoteRelayCallerContext({
       conversationId: toText(conversationId) || row.conversation_id,
       relayMode,
       header: watch ? WATCH_HEADER : (localSessions || (sessionSettings && local) ? LOCAL_SESSIONS_HEADER : APPROVAL_HEADER),
+      // What a paired relay's Inbox and push show of this card.
+      ...formatApprovalSummary({ relay, action, args, caller: callerContext, agentPrompts, localSessions, watch, sessionSettings }),
     }, { normalizeRelayMode: normalizeMode, defaultRelayMode });
     questionStatements.insertQuestion.run(
       questionId,

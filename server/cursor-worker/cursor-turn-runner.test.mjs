@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createCursorTurnRunner, buildCursorPlanReadyBoardPayload, cursorModeNudge } from './cursor-turn-runner.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
@@ -326,6 +327,9 @@ test('plan mode with a plan-shaped reply posts the plan_ready board via the fall
   assert.equal(board.body.boardType, 'plan_ready');
   assert.equal(board.body.title, 'Plan ready for review');
   assert.equal(board.body.context.source, 'plan-mode-fallback');
+  // The one shared list, "Approve plan" first.
+  assert.deepEqual(JSON.parse(JSON.stringify(board.body.actions)), JSON.parse(JSON.stringify(PLAN_BOARD_ACTIONS)));
+  assert.equal(board.body.actions[0].id, 'approve_only');
   assert.ok(stub.calls.find((call) => call.routePath === '/api/response'), 'response still published');
 
   assert.equal(buildCursorPlanReadyBoardPayload({ message: baseMessage, planText: '' }), null);
@@ -652,6 +656,70 @@ test('usage seen mid-turn is published even when no terminal status arrives', as
   assert.equal(post.body.contextUsage.totalTokens, 1000);
   const response = stub.calls.find((call) => call.routePath === '/api/response');
   assert.equal(response.body.text, 'answer without a status message.');
+});
+
+test('a turn\'s tokens go to the token booking under the turn\'s model, the run named by the attempt', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[
+      evInit(),
+      evDelta('answer.'),
+      // Cursor reports no cache writes here: the field is left out, not 0.
+      evUsage({ inputTokens: 800, outputTokens: 200, cacheReadTokens: 5000 }),
+    ]]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  await runner.handlePendingPayload({ message: { ...baseMessage, attemptId: 'attempt-7' } });
+  const post = stub.calls.find((call) => call.routePath === '/api/turn-token-usage');
+  assert.ok(post, 'the turn\'s tokens are posted');
+  assert.equal(post.body.turnId, baseMessage.id);
+  assert.equal(post.body.runId, 'attempt-7');
+  assert.equal(post.body.provider, 'cursor');
+  assert.equal(post.body.models.length, 1);
+  const [entry] = post.body.models;
+  assert.ok(entry.model, 'booked under the turn\'s model');
+  assert.deepEqual([entry.inputTokens, entry.outputTokens, entry.cacheReadTokens], [800, 200, 5000]);
+  assert.equal(entry.cacheWriteTokens, undefined);
+  assert.equal('costUsd' in entry, false);
+});
+
+test('a row without an attempt id is booked under the worker\'s own run id', async () => {
+  const stub = makeApiStub();
+  const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+    createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+    startCursorRunImpl: queuedTurns([[evInit(), evDelta('a.'), evUsage({ inputTokens: 1, outputTokens: 1 })]]),
+    readContextWindowImpl: async () => 200000,
+  }));
+  const message = { ...baseMessage };
+  delete message.attemptId;
+  await runner.handlePendingPayload({ message });
+  const post = stub.calls.find((call) => call.routePath === '/api/turn-token-usage');
+  assert.match(post.body.runId, /^[0-9a-f-]{36}$/);
+});
+
+test('a token post that hangs or fails does not hold the turn; reasoning goes along when reported', async () => {
+  for (const mode of ['hang', 'reject']) {
+    const stub = makeApiStub();
+    const api = stub.api;
+    stub.api = (method, routePath, body) => {
+      if (routePath === '/api/turn-token-usage') {
+        stub.calls.push({ method, routePath, body });
+        return mode === 'hang' ? new Promise(() => {}) : Promise.reject(new Error('relay away'));
+      }
+      return api(method, routePath, body);
+    };
+    const runner = createCursorTurnRunner(baseRunnerOptions(stub, {
+      createAgentHandleImpl: recordingHandleFactory({ createCalls: [], closes: [] }),
+      startCursorRunImpl: queuedTurns([[evInit(), evDelta('answer.'), evUsage({ inputTokens: 10, outputTokens: 2, reasoningTokens: 1 })]]),
+      readContextWindowImpl: async () => 200000,
+    }));
+    await runner.handlePendingPayload({ message: { ...baseMessage } });
+    const post = stub.calls.find((call) => call.routePath === '/api/turn-token-usage');
+    assert.equal(post.body.models[0].reasoningTokens, 1, mode);
+    const response = stub.calls.find((call) => call.routePath === '/api/response');
+    assert.ok(response, `${mode}: the reply is published`);
+  }
 });
 
 test('multi-step turns publish a per-call estimate, flagged as such', async () => {

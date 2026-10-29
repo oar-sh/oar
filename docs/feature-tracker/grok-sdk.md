@@ -31,7 +31,7 @@ the CLI can be **installed and updated** from the provider panel, and the accoun
 | Reasoning effort | Partial | Composer effort forwarded on `session/prompt` `_meta.reasoningEffort` (best-effort; live CLI honoring unverified) |
 | Attachments / images | Partial | Path notes only (ACP image capability often false) |
 | Nested subagent prose | Partial | Lifecycle chips only. Detection keys on the tool name/title (ACP `kind` is the tool *category* and never matches — fixed 2026-08-16); a task/agent-shaped title opens the run |
-| Plan boards (`plan_ready`) | Implemented | Text-shape fallback (`countPlanLikeLines` ≥ 2) like Cursor |
+| Plan boards (`plan_ready`) | Implemented | Text-shape fallback (`countPlanLikeLines` ≥ 2) like Cursor; the shared buttons and follow-ups (**Approve plan**, **Implement in autopilot**, **Stop here and prompt myself**, **Stop here**) |
 | Busy retry | Implemented | One close-and-recreate retry on `grok.agent_busy`, and only before anything streamed — a replay over dispatched frames would duplicate visible text (2026-08-16) |
 | Question cards (ask user) | **Not implemented — protocol gap** | ACP exposes no free-form ask-user surface; `session/request_permission` is tool-permission only and is auto-approved. Revisit if the Grok CLI adds one. |
 | Empty-turn completion | Implemented | A terminal non-error result with no prose publishes the shared `EMPTY_TURN_COMPLETION_NOTE` instead of requeue-until-cap (2026-08-16) |

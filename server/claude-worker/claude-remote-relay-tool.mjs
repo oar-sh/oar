@@ -75,6 +75,7 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   group: z.string().nullable().optional().describe(FIELDS.group.description),
   auto_compact_window: number('auto_compact_window'),
   thinking_enabled: z.boolean().optional().describe(FIELDS.thinking_enabled.description),
+  planOnly: z.boolean().optional().describe(FIELDS.planOnly.description),
   thinking_display: choice('thinking_display', REMOTE_RELAY_THINKING_DISPLAYS),
   question_id: text('question_id'),
   // ask: the contract's validator refuses a question or detail that is too

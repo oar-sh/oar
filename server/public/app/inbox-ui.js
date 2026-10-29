@@ -13,12 +13,18 @@
 import { apiFetch, answerRelayQuestion } from './api-client.js';
 import { currentConvId, IS_SHARED_VIEW, setCurrentConv, showTransientRelayNotice } from './store.js';
 import { isStatusViewActive, leaveStatusView } from './status-view.mjs';
+import { actOnRelayBoard } from './relay-board-view.js';
 import {
   buildAskCard,
+  captureInboxFolds,
   createCoalescedRefresh,
   inboxPendingCount,
   INBOX_FILTERS,
+  INBOX_FOLD_SELECTOR,
+  noteInboxFold,
+  pruneInboxFolds,
   renderInbox,
+  restoreInboxFolds,
   sessionAsksFromInbox,
 } from './inbox-view.mjs';
 
@@ -37,6 +43,10 @@ let clickBound = false;
 let started = false;
 // Typed answers, kept across re-renders: `${relayId}:${itemId}` → text.
 const drafts = new Map();
+// The open folds (a card's Details, a plan card's plan), kept across
+// re-renders the same way: every socket change and the minute's poll draw
+// the cards anew, closed. Forgotten when the item leaves the list.
+const openFolds = new Set();
 // This relay's asks for the session cards: id → ask (each Inbox load
 // replaces it; the socket updates single asks in between).
 let sessionAsks = new Map();
@@ -104,9 +114,11 @@ function renderInboxNow({ opening = false } = {}) {
   const host = document.getElementById('messages');
   if (!host) return;
   const focused = captureDrafts(host);
+  if (host.querySelector('.inbox-view')) captureInboxFolds(openFolds, host);
   const top = opening ? inboxScrollTop : host.scrollTop;
   host.replaceChildren(renderInbox(document, { relays, filter, now: Date.now(), loading: !loaded }));
   restoreDrafts(host, focused);
+  restoreInboxFolds(openFolds, host);
   host.scrollTop = top;
   const title = document.getElementById('chat-title');
   if (title) {
@@ -122,6 +134,7 @@ async function loadInbox() {
     loaded = true;
     // Built anew from each load: an ask withdrawn or cancelled meanwhile goes.
     sessionAsks = sessionAsksFromInbox(relays);
+    pruneInboxFolds(openFolds, relays);
   }
   syncInboxBadge();
   renderInboxNow();
@@ -268,6 +281,15 @@ async function answerCard(card, data, { choice = '' } = {}) {
   return true;
 }
 
+// A plan card's button in the Inbox: the card's own action, with
+// the plan-only question first; a card settled meanwhile just shows so.
+async function actOnPlanItem(data) {
+  const own = relays.find((relay) => relay?.self === true);
+  const item = (Array.isArray(own?.items) ? own.items : []).find((entry) => entry?.kind === 'plan' && entry.id === data.boardId) || null;
+  const board = item ? { ...item, conversationId: item.session?.id } : null;
+  return !!(await actOnRelayBoard(data.boardId, data.actionId, { board }));
+}
+
 async function handleAction(target) {
   const data = { ...target.dataset };
   const card = target.closest('.inbox-item');
@@ -294,6 +316,7 @@ async function handleAction(target) {
     else if (data.inboxAction === 'dismiss') done = await answerAsk(card, data, { dismiss: true });
     else if (data.inboxAction === 'card-choice') done = await answerCard(card, data, { choice: data.choice });
     else if (data.inboxAction === 'card-answer') done = await answerCard(card, data);
+    else if (data.inboxAction === 'plan-action') done = await actOnPlanItem(data);
   } finally {
     if (!done) for (const node of buttons) node.disabled = false;
   }
@@ -318,6 +341,13 @@ function bindClicks() {
     const key = field ? draftKey(field) : '';
     if (key) drafts.set(key, field.value);
   });
+  // A fold opened or closed by hand. `toggle` does not bubble: caught on the
+  // way down. Also covers a session's card that a transcript render dropped
+  // before renderSessionAskCards drew it again.
+  host?.addEventListener('toggle', (event) => {
+    const details = event.target instanceof Element && event.target.matches(INBOX_FOLD_SELECTOR) ? event.target : null;
+    if (details && details.isConnected) noteInboxFold(openFolds, details);
+  }, true);
 }
 
 // ─── The card in the session ──────────────────────────────────────────────────
@@ -341,6 +371,7 @@ export function renderSessionAskCards() {
   if (key === sessionCardKey && existing.length === shown.length && [...existing].every((node) => node.isConnected)) return;
   sessionCardKey = key;
   const focused = captureDrafts(host);
+  existing.forEach((node) => captureInboxFolds(openFolds, node));
   existing.forEach((node) => node.remove());
   const firstQuestion = host.querySelector('.relay-question-container');
   for (const ask of shown) {
@@ -350,6 +381,7 @@ export function renderSessionAskCards() {
     wrapper.append(buildAskCard(document, { ...ask, session: ask.session || { id } }, { relay: { id: 'self', self: true }, mode: 'session', now: Date.now() }));
     if (firstQuestion) host.insertBefore(wrapper, firstQuestion);
     else host.append(wrapper);
+    restoreInboxFolds(openFolds, wrapper);
   }
   restoreDrafts(host, focused);
 }

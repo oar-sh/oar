@@ -13,9 +13,18 @@ const STATE_LABELS = Object.freeze({
 
 const USAGE_LABELS = Object.freeze({
   github: 'GitHub Copilot',
+  claude: 'Claude',
+  'claude-api': 'Claude API',
+  'claude-cloud': 'Claude Cloud',
   cursor: 'Cursor',
   grok: 'Grok',
-  'claude-cloud': 'Claude Cloud',
+  deepseek: 'DeepSeek',
+});
+
+const OWN_KEY_LABELS = Object.freeze({
+  'byok-openai': 'OpenAI',
+  'byok-anthropic': 'Anthropic',
+  'byok-azure': 'Azure OpenAI',
 });
 
 function esc(value) {
@@ -133,11 +142,67 @@ function providerState(provider) {
   return `<span class="about-state" data-state="${esc(state)}">${esc(STATE_LABELS[state])}</span>${esc(count)}`;
 }
 
+// A token count of the token booking: "—" where no turn reported it.
+function knownCount(value) {
+  return value === null || value === undefined || value === '' ? null : finite(value);
+}
+
+function tokenAmount(value) {
+  return knownCount(value) === null ? '—' : formatAmount(value);
+}
+
+/**
+ * "Oct 29, 2026" for a `YYYY-MM-DD` day, as Check Usage writes it, joined
+ * by no-break spaces so a phone never wraps inside it.
+ */
+export function aboutDayLabel(day) {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  if (!day || Number.isNaN(date.getTime())) return String(day || '');
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).replace(/ /g, '\u00a0');
+}
+
+/**
+ * The all-time tokens: their sum, and the four kinds with the first day.
+ * Days copied at the upgrade (Claude API, DeepSeek) hold cache writes inside
+ * input, and the hint says until when.
+ */
+function tokenRow(label, tokens) {
+  const fields = [tokens.inputTokens, tokens.outputTokens, tokens.cacheWriteTokens, tokens.cacheReadTokens];
+  const known = fields.map(knownCount).filter((value) => value !== null);
+  const total = known.length ? known.reduce((sum, value) => sum + value, 0) : null;
+  const parts = [`in ${tokenAmount(tokens.inputTokens)} · out ${tokenAmount(tokens.outputTokens)} · cache w ${tokenAmount(tokens.cacheWriteTokens)} · cache r ${tokenAmount(tokens.cacheReadTokens)}`];
+  if (tokens.since) parts.push(`since ${aboutDayLabel(tokens.since)}`);
+  if (tokens.backfilled) {
+    parts.push(tokens.firstTurnsDay
+      ? `input includes cache writes before ${aboutDayLabel(tokens.firstTurnsDay)}`
+      : 'input includes cache writes (days from before the upgrade)');
+  }
+  // One unbroken part: on a phone the unit stays with its number (the
+  // section's values otherwise wrap anywhere, for paths).
+  return row(label, `<span class="plan-usage-detail-part">${esc(tokenAmount(total))}</span>`, { hint: parts.join(' · ') });
+}
+
+function tokenRows(usage) {
+  const rows = [];
+  if (usage.tokens) rows.push(tokenRow('Tokens (all time)', usage.tokens));
+  for (const entry of Array.isArray(usage.ownKeyTokens) ? usage.ownKeyTokens : []) {
+    const key = OWN_KEY_LABELS[entry.billing] || String(entry.billing || '').replace(/^byok-/, '') || 'own';
+    rows.push(tokenRow(`Tokens (all time), own ${key} key`, entry));
+  }
+  return rows;
+}
+
 function usageRows(id, usage) {
+  return [...providerUsageRows(id, usage), ...tokenRows(usage)];
+}
+
+function providerUsageRows(id, usage) {
   if (id === 'github') {
+    if (usage.premiumRequests === undefined) return [];
     return [row('Premium requests', esc(formatAmount(usage.premiumRequests)), { hint: `over ${formatCount(usage.turns)} replies` })];
   }
   if (id === 'cursor') {
+    if (usage.totalTokens === undefined) return [];
     return [
       row('Tokens', esc(formatAmount(usage.totalTokens)), {
         hint: `${formatAmount(usage.inputTokens)} in · ${formatAmount(usage.outputTokens)} out · ${formatAmount((finite(usage.cacheReadTokens) || 0) + (finite(usage.cacheWriteTokens) || 0))} cache`,
@@ -146,12 +211,14 @@ function usageRows(id, usage) {
     ];
   }
   if (id === 'grok') {
+    if (usage.totalTokens === undefined) return [];
     return [
       row('Tokens', esc(formatAmount(usage.totalTokens)), { hint: `${formatAmount(usage.inputTokens)} in · ${formatAmount(usage.outputTokens)} out` }),
       row('Cost', esc(formatUsd(usage.costUsd)), { hint: `over ${formatCount(usage.turns)} turns` }),
     ];
   }
   if (id === 'claude-cloud') {
+    if (usage.costUsd === undefined) return [];
     return [row('Cost', esc(formatUsd(usage.costUsd)), { hint: `over ${formatCount(usage.sessions)} cloud sessions` })];
   }
   return [];
@@ -171,6 +238,22 @@ function buildUpdateSection(update, formatDateTime) {
   return section('update', 'Updates', note(
     'Update checks are off. Turn on <button type="button" class="plan-usage-link about-inline-button" data-about-open-settings>Settings › General › Check for updates automatically</button> to see the latest version here.',
   ));
+}
+
+// The database backups: the last result (time, size or why not), how many of
+// how many are kept, and the folder.
+function backupsRow(backups, formatDateTime) {
+  const last = backups.lastResult || null;
+  let value = 'none yet';
+  if (last?.status === 'written') value = `${formatDateTime(last.at)} · ${formatBytes(last.bytes)}`;
+  else if (last?.status === 'skipped') value = `skipped ${formatDateTime(last.at)}: ${last.reason || ''}`;
+  else if (last?.status === 'failed') value = `failed ${formatDateTime(last.at)}: ${last.reason || ''}`;
+  else if (last?.status === 'busy') value = `busy ${formatDateTime(last.at)}: ${last.reason || ''}`;
+  const kept = `${formatCount(backups.kept)} kept of ${formatCount(backups.keep)}`;
+  const hint = backups.enabled === false
+    ? `at start: off (dbBackups.enabled); ${kept}`
+    : [kept, backups.problem || backups.dir].filter(Boolean).join(' · ');
+  return row('Backups', esc(value), { hint });
 }
 
 /**
@@ -217,13 +300,14 @@ export function buildAboutModalHtml(about = {}, {
   sections.push(section('usage', 'Usage', (usageIds.length
     ? usageIds.map((id) => `<div class="about-usage-provider">${esc(USAGE_LABELS[id])}</div>${table(usageRows(id, usage[id]))}`).join('')
     : note('No provider has reported usage yet.'))
-    + note('What the providers report and this relay keeps: Copilot premium requests per reply, Cursor and Grok tokens and cost per billing cycle, Claude Cloud cost per session. Claude Code and OpenAI turns keep no usage here.')));
+    + note('What the providers report and this relay keeps: Copilot premium requests per reply, Cursor and Grok tokens and cost per billing cycle, Claude Cloud cost per session, and every provider\'s tokens of all time: fresh input, output, cache writes and cache reads, "—" where no turn reported one. On Claude API and DeepSeek the days from before the upgrade have cache writes inside input. The tokens stay when a chat is deleted; Check Usage shows them by day and model.')));
 
   const relay = about.relay || {};
   sections.push(section('relay', 'Relay', table([
     row('Uptime', esc(formatUptime(relay.uptimeSeconds))),
-    row('Database', esc(formatBytes(relay.dbBytes)), { hint: `${formatBytes(relay.dbFileBytes)} + ${formatBytes(relay.walBytes)} WAL` }),
+    row('Database', esc(relay.dbPath ? `${relay.dbPath} · ${formatBytes(relay.dbBytes)}` : formatBytes(relay.dbBytes)), { hint: `${formatBytes(relay.dbFileBytes)} + ${formatBytes(relay.walBytes)} WAL` }),
     row('Running workers', esc(formatCount(relay.runningWorkers))),
+    ...(about.backups ? [backupsRow(about.backups, formatDateTime)] : []),
   ])));
 
   sections.push(buildUpdateSection(about.update || {}, formatDateTime));

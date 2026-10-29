@@ -313,7 +313,7 @@ test('a subscription stored with exactly the old default gets the new one; lists
   const named = service.subscribe({ watcherConversationId: OTHER, sessionIds: [BUILDER], events: ['task_finished', 'turn_end'] });
 
   const listed = service.listSubscriptions({ watcherConversationId: WATCHER })[0];
-  assert.deepEqual(listed.events, ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle']);
+  assert.deepEqual(listed.events, ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle', 'board_settled']);
   assert.ok(service.listSubscriptions({ watcherConversationId: DOCS })[0].events.includes('task_finished'));
   assert.deepEqual(service.listSubscriptions({ watcherConversationId: OTHER })[0].events, ['task_finished', 'turn_end']);
 
@@ -327,6 +327,60 @@ test('a subscription stored with exactly the old default gets the new one; lists
   assert.match(eventMessages(db)[0].text, /task_finished "Proofread" \(subagent, exit ok\)/);
   // Read, never rewritten: the stored row is as it was.
   assert.equal(db.prepare(`SELECT events_json FROM relay_event_subscriptions WHERE id = ?`).get(legacy.id).events_json, legacyJson);
+});
+
+test('noteBoardSettled tells the session\'s default subscribers, with the action and the board; a list without it is not told', () => {
+  const { db, service, clock } = setup();
+  const OTHER = 'conv-fixture-other';
+  seedConversation(db, OTHER, 'Release notes');
+  const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  assert.ok(sub.events.includes('board_settled'), 'a default');
+  service.subscribe({ watcherConversationId: OTHER, sessionIds: [BUILDER], events: ['turn_end', 'error'] });
+  const told = service.noteBoardSettled(BUILDER, {
+    boardId: 'brd_fixture01',
+    boardType: 'plan',
+    action: 'approve',
+    actionLabel: 'Approve plan',
+    title: 'Ship the orbit camera',
+    queuedMessageId: 'msg-fixture-1',
+  });
+  assert.equal(told, 1);
+  const [row] = db.prepare(`SELECT type, urgent, payload_json FROM relay_events WHERE watcher_conversation_id = ?`).all(WATCHER);
+  assert.equal(row.type, 'board_settled');
+  assert.equal(Number(row.urgent), 0, 'not urgent');
+  assert.deepEqual(JSON.parse(row.payload_json).detail, {
+    boardId: 'brd_fixture01',
+    boardType: 'plan',
+    action: 'approve',
+    actionLabel: 'Approve plan',
+    title: 'Ship the orbit camera',
+    queuedMessageId: 'msg-fixture-1',
+  });
+  clock.advance(30_000);
+  const [message] = eventMessages(db);
+  assert.match(message.text, /board_settled "Ship the orbit camera" → "Approve plan" \(action approve, board_id brd_fixture01, queued message msg-fixture-1\)/);
+  assert.equal(eventMessages(db, OTHER).length, 0, 'its list does not name board_settled');
+
+  // exit_only ("Stop here") queues nothing.
+  assert.equal(service.noteBoardSettled(BUILDER, { boardId: 'brd_fixture02', boardType: 'plan', action: 'exit_only', actionLabel: 'Stop here', title: 'Plan B', queuedMessageId: null }), 1);
+  const stored = db.prepare(`SELECT payload_json FROM relay_events WHERE watcher_conversation_id = ? ORDER BY id DESC LIMIT 1`).get(WATCHER);
+  assert.equal(JSON.parse(stored.payload_json).detail.queuedMessageId, null);
+  assert.equal(JSON.parse(stored.payload_json).detail.action, 'exit_only');
+  clock.advance(30_000);
+  assert.match(eventMessages(db).at(-1).text, /board_settled "Plan B" → "Stop here" \(action exit_only, board_id brd_fixture02, nothing queued\)/);
+  assert.equal(service.noteBoardSettled(BUILDER, { action: 'approve' }), 0, 'no board id, no event');
+  assert.equal(service.noteBoardSettled('', { boardId: 'brd_fixture03' }), 0);
+});
+
+test('a match on board_settled is tried on the action id', () => {
+  const { db, service, clock } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['board_settled'], match: '\\bexit_only\\b' });
+  service.noteBoardSettled(BUILDER, { boardId: 'brd_fixture01', action: 'approve', actionLabel: 'Approve plan', title: 'Plan A', queuedMessageId: 'msg-fixture-1' });
+  clock.advance(30_000);
+  assert.equal(eventMessages(db).length, 0, 'approve does not match');
+  service.noteBoardSettled(BUILDER, { boardId: 'brd_fixture02', action: 'exit_only', actionLabel: 'Stop here', title: 'Plan B', queuedMessageId: null });
+  clock.advance(30_000);
+  assert.match(eventMessages(db)[0].text, /action exit_only/);
 });
 
 test('a watcher that names exactly the old default list keeps shell command ends', () => {

@@ -70,7 +70,7 @@ const FORBIDDEN = [
   { name: 'test file', pattern: /\.(test|spec)\.mjs$/ },
   { name: 'test harness', pattern: /-test-harness\.mjs$/ },
   { name: 'test fixture', pattern: /(^|\/)fixtures\// },
-  { name: 'server data', pattern: /^server\/(data|logs)\// },
+  { name: 'server data', pattern: /^server\/(data|logs|backups)\// },
   { name: 'upload payload', pattern: /^server\/uploads\/(?!README\.md$)./ },
   { name: 'repo test tree', pattern: /^tests\// },
   { name: 'docs/screenshots', pattern: /^docs\// },
@@ -130,6 +130,9 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
     paths.some((p) => p.startsWith('.github/extensions/web-relay/')),
     'tarball is missing the Copilot CLI extension',
   );
+  // A checkout's database backups (server/backups) never go into the package.
+  const { files = [] } = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  assert.ok(files.includes('!server/backups/'), 'package.json files must leave out server/backups/');
   // Developer documentation lives on GitHub, not in the package.
   for (const absent of ['server/README.md', '.github/extensions/web-relay/README.md']) {
     assert.ok(!paths.includes(absent), `tarball ships ${absent}, which belongs on GitHub only`);

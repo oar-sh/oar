@@ -4,6 +4,7 @@ node_modules/
 server/config.json
 server/data/
 server/logs/
+server/backups/
 server/uploads/*
 !server/uploads/README.md
 !server/uploads/image_input.md

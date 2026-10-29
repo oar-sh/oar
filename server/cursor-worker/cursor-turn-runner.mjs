@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { buildCursorUserMessage } from './cursor-attachments.mjs';
 import { buildCursorContextUsage } from './cursor-context-usage.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
@@ -23,6 +24,7 @@ import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instr
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
 
 // Stale-auth recovery budget per turn: expiry is routine on long-lived
@@ -33,12 +35,6 @@ const MAX_STALE_AUTH_RETRIES = 2;
 // Recreate a handle proactively once it has sat idle past this window; the
 // exchanged auth goes stale around the 4h mark while the API key stays valid.
 const STALE_HANDLE_IDLE_MS = 30 * 60_000;
-
-const PLAN_BOARD_ACTIONS = [
-  { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
-  { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
-  { id: 'exit_only', label: 'Stop here', mode: 'agent' },
-];
 
 // The Cursor SDK's SendOptions carries only model/mode/callbacks — there is
 // no per-turn instruction channel — so ask/autopilot steering rides on the
@@ -447,6 +443,45 @@ export function createCursorTurnRunner({
     });
   }
 
+  // A process without the row's attempt id names its run once (POST
+  // /api/turn-token-usage): a turn requeued onto a restarted worker is a
+  // second run of it.
+  const tokenRunId = randomUUID();
+
+  /**
+   * Ship the turn's tokens to the token booking: the SDK's usage
+   * for the turn, all its model calls together, under the turn's model.
+   * Cursor counts fresh input apart from the cache (cursor-context-usage.mjs
+   * adds the three up). No cost: the SDK prices no single turn. A field the
+   * SDK left out stays out, and the relay keeps it unknown. Fire-and-forget:
+   * it never throws and the turn does not wait on it.
+   */
+  async function publishTurnTokens(message, state, model, normalizer) {
+    try {
+      const usage = state.lastUsage || normalizer?.lastUsage || null;
+      const turnModel = state.responseModel || model || '';
+      if (!usage || typeof usage !== 'object' || !turnModel || !message?.id) return;
+      await api('POST', '/api/turn-token-usage', {
+        conversationId: message.conversationId,
+        turnId: String(message.id),
+        runId: message.attemptId || tokenRunId,
+        provider: 'cursor',
+        ...(agentHandle?.agentId ? { nativeSessionId: agentHandle.agentId } : {}),
+        at: new Date().toISOString(),
+        models: [{
+          model: turnModel,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cacheWriteTokens: usage.cacheWriteTokens,
+          cacheReadTokens: usage.cacheReadTokens,
+          reasoningTokens: usage.reasoningTokens,
+        }],
+      });
+    } catch (error) {
+      dbg('turn token publish failed', error?.message || String(error));
+    }
+  }
+
   /**
    * Report the agent's cumulative billed usage so the relay can book this
    * turn's increase against the configured monthly allowance. The model is
@@ -704,6 +739,7 @@ export function createCursorTurnRunner({
       // (the auth retry swaps it), so a discarded attempt's usage is not
       // republished over the retry's.
       await publishContextUsage(message, state, model, normalizer);
+      void publishTurnTokens(message, state, model, normalizer);
       await publishPlanUsage(message, state, model);
     }
 

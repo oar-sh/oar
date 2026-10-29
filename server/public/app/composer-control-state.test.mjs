@@ -6,6 +6,7 @@ import {
   countUploadingAttachments,
   hasUploadingAttachments,
   SETUP_REQUIRED_TEXT,
+  PLAN_BOUNDARY_QUEUE_TITLE,
 } from './composer-control-state.mjs';
 
 test('a draft exists when there is text or an attachment', () => {
@@ -260,4 +261,18 @@ test('the setup state locks the composer and carries its placeholder', () => {
   for (const input of [{}, { hasActiveTurn: true, hasDraft: true }, { archived: true }, { sendInFlight: true }]) {
     assert.equal(deriveComposerControlState(input).composerDisabled, undefined);
   }
+});
+
+// The relay queues a message whose mode is on the other side of plan
+// mode from the live turn's instead of steering it in, so the control says so.
+test('a draft across plan mode from the live turn reads Queue, not Steer', () => {
+  const state = deriveComposerControlState({ hasActiveTurn: true, hasDraft: true, steeringSupported: true, crossesPlanMode: true });
+  assert.equal(state.action, 'queue');
+  assert.equal(state.label, 'Queue');
+  assert.equal(state.title, PLAN_BOUNDARY_QUEUE_TITLE);
+  assert.equal(state.disabled, false);
+  // Without a live turn the flag means nothing.
+  assert.equal(deriveComposerControlState({ hasDraft: true, steeringSupported: true, crossesPlanMode: true }).action, 'send');
+  // On the same side it steers as before.
+  assert.equal(deriveComposerControlState({ hasActiveTurn: true, hasDraft: true, steeringSupported: true, crossesPlanMode: false }).action, 'steer');
 });

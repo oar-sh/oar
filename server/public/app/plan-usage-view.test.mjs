@@ -154,6 +154,25 @@ test('detail sections render collapsed with their note', () => {
   assert.match(html, /Approximate, from local transcripts/);
 });
 
+test('a Tokens section renders each kind as its own part, "—" kept, with the reason in its note', () => {
+  const html = renderPlanUsageHtml(
+    report({
+      details: [{
+        id: 'github-token-usage-byok-openai',
+        label: 'Tokens — own OpenAI key',
+        note: 'OpenAI does not report cache writes. Counting since Oct 1, 2026.',
+        rows: [{ label: 'Today', value: 'in 1.2M · out 340k · cache w — · cache r 45.3M', hint: '97% of input from the cache' }],
+      }],
+    }),
+    { now: NOW },
+  );
+  assert.match(html, /<summary>Tokens — own OpenAI key<\/summary>/);
+  assert.match(html, /<span class="plan-usage-detail-part">cache w —<\/span>/);
+  assert.equal((html.match(/plan-usage-detail-part/g) || []).length, 4);
+  assert.match(html, /OpenAI does not report cache writes\./);
+  assert.match(html, /97% of input from the cache/);
+});
+
 test('card content is HTML-escaped', () => {
   const html = renderPlanUsageHtml(
     report({ message: '<img src=x onerror=alert(1)>', meters: [meter({ label: '<script>' })] }),
@@ -573,6 +592,22 @@ test('a note with a label and a value is a row of figures; on a card with figure
   assert.ok(plain.indexOf('data-note-id="about"') < plain.indexOf('data-section-id="by-model"'));
   assert.match(plain, /data-section-id="by-model">/);
   assert.doesNotMatch(plain, /plan-usage-facts/);
+});
+
+test('a detail row with a title shows it when pointed at; one without has none', () => {
+  const section = {
+    id: 'claude-token-usage-by-model',
+    label: 'Tokens by model, this month',
+    open: true,
+    rows: [
+      { label: 'Claude Opus 5.5', value: 'in 150 · out 15', hint: null, title: 'Model ids: claude-opus-5-5, claude-opus-5-5-<dated>' },
+      { label: 'Claude Haiku 4.5', value: 'in 1 · out 1', hint: null },
+    ],
+    note: null,
+  };
+  const html = renderPlanUsageHtml(report({ meters: [], details: [section] }), { now: NOW });
+  assert.match(html, /<tr title="Model ids: claude-opus-5-5, claude-opus-5-5-&lt;dated&gt;">\s*<td class="plan-usage-detail-label">Claude Opus 5\.5</);
+  assert.match(html, /<tr>\s*<td class="plan-usage-detail-label">Claude Haiku 4\.5</);
 });
 
 test('the Claude API card renders from the server\'s builder: its tab, the cap bar in dollars, "estimate incomplete"', async () => {

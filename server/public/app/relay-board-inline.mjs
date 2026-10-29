@@ -11,6 +11,8 @@
 // board when the agent wrote its plan as the answer. Then the text is shown
 // once, as the reply, and the board adds only its buttons.
 
+import { PLAN_BOARD_LABELS } from './plan-board-shared.mjs';
+
 function plain(text) {
   return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
@@ -32,7 +34,8 @@ export function chosenActionLabel(board) {
   if (!chosen) return '';
   const actions = Array.isArray(board?.actions) ? board.actions : [];
   const action = actions.find((item) => String(item?.id || '').trim().toLowerCase() === chosen);
-  return String(action?.label || '').trim() || chosen.replace(/[_-]+/g, ' ');
+  // A card stored before "Approve plan" existed does not list it.
+  return String(action?.label || '').trim() || (Object.hasOwn(PLAN_BOARD_LABELS, chosen) ? PLAN_BOARD_LABELS[chosen] : chosen.replace(/[_-]+/g, ' '));
 }
 
 /** The line that replaces the buttons once the board is settled; '' while it is pending. */

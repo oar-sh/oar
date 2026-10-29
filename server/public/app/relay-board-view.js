@@ -1,5 +1,6 @@
 import {
   IS_SHARED_VIEW,
+  conversations,
   currentConvId,
   escHtml,
   relayBoards,
@@ -12,9 +13,11 @@ import {
   boardsOfConversation,
 } from './relay-board-inline.mjs';
 import {
+  loadRelayBoard as loadRelayBoardApi,
   loadRelayBoards as loadRelayBoardsApi,
   submitRelayBoardAction as submitRelayBoardActionApi,
 } from './api-client.js';
+import { planBoardConfirmText } from './plan-board-shared.mjs';
 import { renderMarkdownPreview } from './router.js';
 import { attachCodeCopyButtons } from './code-copy.mjs';
 import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
@@ -203,27 +206,52 @@ export function renderRelayBoards() {
   return added;
 }
 
-export async function submitRelayBoardAction(boardId, actionId) {
+/**
+ * Settle a board, from its card or from the Inbox (`board`: what the caller
+ * shows, when the store has no copy; `controls`: the buttons to hold while
+ * it goes). On a plan-only session an action that leaves plan mode asks
+ * first. A board the other view settled meanwhile is shown as settled, with
+ * no alert. Returns the board as it is now, or null when nothing was done.
+ */
+export async function actOnRelayBoard(boardId, actionId, { board: shown = null, controls = [] } = {}) {
   const id = String(boardId || '').trim();
   const nextActionId = String(actionId || '').trim();
-  if (!id || !nextActionId) return;
-  const card = document.querySelector(`.relay-board-inline[data-board-id="${CSS.escape(id)}"]`);
-  const controls = card ? card.querySelectorAll('button') : [];
+  if (!id || !nextActionId) return null;
+  const board = relayBoards.get(id) || shown;
+  // The flag as the page knows it now; the board's own copy otherwise.
+  const conversation = conversations[String(board?.conversationId || shown?.session?.id || '').trim()] || null;
+  const planOnly = typeof conversation?.planOnly === 'boolean' ? conversation.planOnly : board?.planOnly === true;
+  const action = (Array.isArray(board?.actions) ? board.actions : [])
+    .find((item) => String(item?.id || '').trim().toLowerCase() === nextActionId.toLowerCase());
+  const question = planBoardConfirmText({ planOnly, actionId: nextActionId, label: action?.label });
+  if (question && !window.confirm(question)) return null;
   controls.forEach((control) => { control.disabled = true; });
-  const send = beginOwnSend();
-
+  let status = 0;
   try {
-    const r = await submitRelayBoardActionApi(id, nextActionId);
-    if (!r?.board) throw new Error('Failed to submit board action');
+    const r = await submitRelayBoardActionApi(id, nextActionId, { onErrorResponse: (response) => { status = response.status; } });
+    let settled = r?.board || null;
+    // Settled by the other view (or another page) meanwhile: show what was chosen.
+    if (!settled && status === 409) settled = (await loadRelayBoardApi(id))?.board || null;
+    if (!settled) throw new Error('Failed to submit board action');
     // Kept once it is settled: the reply goes on showing the plan and says
     // what was chosen.
-    relayBoards.set(id, r.board);
+    relayBoards.set(id, settled);
     window.renderConvList?.();
     renderRelayBoards();
-    scrollAfterOwnSend(send);
+    return settled;
   } catch (error) {
     controls.forEach((control) => { control.disabled = false; });
     alert(error.message || 'Failed to submit board action');
+    return null;
   }
+}
+
+export async function submitRelayBoardAction(boardId, actionId) {
+  const id = String(boardId || '').trim();
+  if (!id || !String(actionId || '').trim()) return;
+  const card = document.querySelector(`.relay-board-inline[data-board-id="${CSS.escape(id)}"]`);
+  const controls = card ? [...card.querySelectorAll('button')] : [];
+  const send = beginOwnSend();
+  if (await actOnRelayBoard(id, actionId, { controls })) scrollAfterOwnSend(send);
 }
 

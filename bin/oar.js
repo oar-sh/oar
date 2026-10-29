@@ -14,6 +14,8 @@ import {
 } from '../server/services/oar-state-migration-service.mjs';
 import { readConfiguredDataDir, resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
 import { RESCUE_DIR_NAME, TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
+import { DB_FILE_NAME, DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile } from '../server/services/database-file.mjs';
+import { BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE, backupDatabase, configWarnings, describeBackups, sanitizeReason } from '../server/services/db-backup-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
 import {
   getLauncherLogDir,
@@ -23,15 +25,16 @@ import {
   resolveStateLayout,
 } from '../server/services/oar-state-layout.mjs';
 import {
-  buildDefaultConfig, buildServicePath, buildSystemdUnit, describeRelayAddress, DOCTOR_PROBES, generateAuthToken,
-  NPM_ALLOW_SCRIPTS_ARG, parseCliArgs, primaryLanAddress, renderDoctorReport, resolveNpmInvocation, usageText,
+  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, describeRelayAddress, DOCTOR_PROBES, generateAuthToken,
+  listSystemdDropIns, NPM_ALLOW_SCRIPTS_ARG, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderDoctorReport,
+  resolveNpmInvocation, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
 } from '../server/services/oar-cli-helpers.mjs';
 import { describeConfiguredTunnel, describeTunnelState } from '../server/services/cloudflared-tunnel-service.mjs';
 import { createPrompter, PromptAborted, runMenu } from '../server/services/oar-cli-menu.mjs';
 import { createWindowsPortCheck, isWsl, isWslNat, windowsPortWarning } from '../server/services/oar-cli-wsl.mjs';
 import { readEnvValue, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 import { createProcessLister } from '../server/services/process-list-service.mjs';
-import { createWindowsAutostartService, launcherScriptsMatch } from '../server/services/windows-autostart-service.mjs';
+import { backupPathFor, createWindowsAutostartService, launcherScriptsMatch } from '../server/services/windows-autostart-service.mjs';
 import {
   BOOT_ELEVATION_SCRIPT_FILENAME, BOOT_TASK_XML_FILENAME,
   bootTaskLabel, createWindowsBootAutostartService, describeHandMade, describeWindowsAutostart, handMadeLines, switchBlockers,
@@ -82,10 +85,17 @@ function readRelayLock(lockPath) {
 // pid, and that pid is the lock's holder still (lockHolderMayRun: a pid
 // reused after a crash is not).
 function readTakeover(lockPath, isProcessAliveImpl = isProcessAlive) {
-  const progress = readJsonFile(path.join(path.dirname(lockPath), TAKEOVER_PROGRESS_FILE));
   const lock = readJsonFile(lockPath);
-  const pid = Number.parseInt(String(progress?.pid ?? ''), 10);
-  return Number.isInteger(pid) && Number(lock?.pid) === pid && lockHolderMayRun({ lock, isProcessAlive: isProcessAliveImpl }) ? progress : null;
+  if (!lockHolderMayRun({ lock, isProcessAlive: isProcessAliveImpl })) return null;
+  // Also while it compares two database files, backs its database up, or
+  // waits for an `oar backup` to finish first; each file counts only with
+  // the lock's pid (one a crash left does not).
+  for (const name of [TAKEOVER_PROGRESS_FILE, BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE]) {
+    const progress = readJsonFile(path.join(path.dirname(lockPath), name));
+    const pid = Number.parseInt(String(progress?.pid ?? ''), 10);
+    if (Number.isInteger(pid) && Number(lock?.pid) === pid) return progress;
+  }
+  return null;
 }
 
 // The lock a relay that did not come up found held, and whether its holder
@@ -100,7 +110,12 @@ function heldLock(lockPath, isProcessAliveImpl = isProcessAlive) {
 
 function takeoverLine(takeover, logDir) {
   const what = takeover ? ` (${takeover.from}, ${Math.max(1, Math.round(Number(takeover.bytes || 0) / 1048576))} MB)` : '';
-  return `[oar] The relay${takeover ? ` (process ${takeover.pid})` : ''} is bringing over the database it ran on until now${what} and is still running; it answers once that is done. Its log: ${path.join(String(logDir || ''), 'server.log')}`;
+  const doing = {
+    backup: `is backing up its database${what} before this version's migrations`,
+    compare: `is comparing its two database files${what}`,
+    'wait-backup': `is waiting for \`oar backup\` (process ${takeover?.waitingFor}) to finish before its own backup`,
+  }[takeover?.task] || `is bringing over the database it ran on until now${what}`;
+  return `[oar] The relay${takeover ? ` (process ${takeover.pid})` : ''} ${doing} and is still running; it answers once that is done. Its log: ${path.join(String(logDir || ''), 'server.log')}`;
 }
 
 // As the server tells it: a process this user may not signal (EPERM) lives.
@@ -741,10 +756,12 @@ async function probeRelayBehindLock({
 }
 
 /**
- * Makes sure the relay of a global install runs, without a Copilot session
- * tied to it: an already running relay is left alone, an installed systemd
- * user service is started, and anywhere else the server is started detached,
- * so it outlives this command.
+ * Makes sure the relay of an install runs, without a Copilot session tied to
+ * it: an already running relay is left alone, an installed systemd user
+ * service is started, and anywhere else the server of a global install is
+ * started detached, so it outlives this command. `serviceInstalled` says
+ * whether the unit there is this install's (unset: any unit is); `lockPath`
+ * is the relay's lock (default: in the layout's data folder).
  */
 export async function ensureRelayRunning({
   packageRoot = resolvePackageRoot(),
@@ -763,12 +780,13 @@ export async function ensureRelayRunning({
   homeDir = os.homedir(),
   platform = process.platform,
   logger = console,
+  serviceInstalled = null,
+  lockPath = path.join(layout.dataDir, 'relay-server.lock'),
 } = {}) {
   const port = normalizePort(config?.port) ?? 3333;
   const token = String(config?.authToken || '').trim();
   const statusUrl = `http://localhost:${port}/api/status`;
   const logDir = getLauncherLogDir(env, layout);
-  const lockPath = path.join(layout.dataDir, 'relay-server.lock');
   const answer = await probeRelayBehindLock({
     statusUrl, token, lockPath, port, fetchImpl, isProcessAliveImpl, lockGraceMs, logger,
   });
@@ -780,8 +798,12 @@ export async function ensureRelayRunning({
     return { ok: false, how: 'port-taken', logDir };
   }
 
-  if (fs.existsSync(systemdUnitPath(homeDir)) && systemdUserAvailable({ platform, spawnSyncImpl })) {
+  const unitThere = serviceInstalled ?? fs.existsSync(systemdUnitPath(homeDir));
+  if (unitThere && systemdUserAvailable({ platform, spawnSyncImpl })) {
     runQuiet('systemctl', ['--user', 'daemon-reload'], { spawnSyncImpl });
+    // A unit that failed (a crash loop, a stop on purpose) is started afresh,
+    // with its restart backoff from the start.
+    runQuiet('systemctl', ['--user', 'reset-failed', 'oar'], { spawnSyncImpl });
     if (!runQuiet('systemctl', ['--user', 'enable', '--now', 'oar'], { spawnSyncImpl })) {
       logger.error?.('[oar] systemctl --user enable --now oar failed — see: systemctl --user status oar');
       return { ok: false, how: 'service', logDir };
@@ -886,6 +908,15 @@ function installPaths(ctx) {
   };
 }
 
+// The data folder the relay of this install runs on: in a checkout as the
+// relay resolves it (COPILOT_WEB_RELAY_DATA_DIR, the config's dataDir,
+// server/data); a global install's relay is pinned to the state root's
+// (COPILOT_WEB_RELAY_DATA_DIR wins there too).
+function relayDataDir(ctx, paths) {
+  if (paths.layout.checkout) return resolveDataDir({ env: ctx.env, configPath: paths.configPath, serverDir: path.join(ctx.packageRoot, 'server') });
+  return resolveRelayStateDirs({ env: ctx.env, layout: paths.layout }).dataDir || paths.dataDir;
+}
+
 function endpointOf(config) {
   const port = normalizePort(config?.port) ?? 3333;
   return { port, token: String(config?.authToken || '').trim(), statusUrl: `http://localhost:${port}/api/status` };
@@ -925,13 +956,16 @@ async function pollUntil(check, { waitMs, pollMs }) {
   }
 }
 
-/** Asks the relay to stop or restart itself; it does so once no turn is running. */
-async function requestShutdown(ctx, endpoint, restart) {
+/**
+ * Asks the relay to stop or restart itself; it does so once no turn is
+ * running, or at once with `immediate` (`--now` of a relay without a service).
+ */
+async function requestShutdown(ctx, endpoint, restart, { immediate = false } = {}) {
   try {
     const response = await ctx.fetchImpl(`http://localhost:${endpoint.port}/api/relay/shutdown`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${endpoint.token}` },
-      body: JSON.stringify({ restart, reason: 'oar-cli', requestedBy: 'oar-cli' }),
+      body: JSON.stringify({ restart, reason: 'oar-cli', requestedBy: 'oar-cli', ...(immediate ? { immediate: true } : {}) }),
       signal: AbortSignal.timeout(5000),
     });
     if (!response?.ok) return null;
@@ -944,26 +978,37 @@ async function requestShutdown(ctx, endpoint, restart) {
   }
 }
 
+// systemd restarts the service at once, its restart backoff cleared first.
+function restartService(ctx) {
+  runQuiet('systemctl', ['--user', 'daemon-reload'], ctx);
+  runQuiet('systemctl', ['--user', 'reset-failed', 'oar'], ctx);
+  if (runQuiet('systemctl', ['--user', 'restart', 'oar'], ctx)) return true;
+  ctx.logger.error('[oar] systemctl --user restart oar failed — see: systemctl --user status oar');
+  return false;
+}
+
 /**
  * Restarts this install's running relay so that it reads the config again.
- * The service is restarted by systemd. Any other relay is asked on the port
- * and with the token it runs with (`old`): its supervisor starts a new runtime
- * with the same arguments and environment, and that runtime reads the config
- * file, so a new port, token or access setting applies. Done when the relay
- * answers on the config's port with the config's token.
+ * The relay is asked on the port and with the token it runs with (`old`):
+ * once no turn is running it exits for a restart, and a new runtime with the
+ * same arguments and environment reads the config file, so a new port, token
+ * or access setting applies. Under the service (`viaService`) its supervisor
+ * hands that restart to systemd, which starts the code on disk afresh; there
+ * systemd restarts it at once with `now`, or when the relay does not answer
+ * (`answered` false) or refuses. Done when the relay answers on the config's
+ * port with the config's token.
  */
-async function restartRelay(ctx, paths, { old, viaService }) {
+async function restartRelay(ctx, paths, { old, viaService, answered = true, now = false }) {
   const { logger, fetchImpl } = ctx;
   const next = endpointOf(paths.config);
-  if (viaService) {
-    runQuiet('systemctl', ['--user', 'daemon-reload'], ctx);
-    if (!runQuiet('systemctl', ['--user', 'restart', 'oar'], ctx)) {
-      logger.error('[oar] systemctl --user restart oar failed — see: systemctl --user status oar');
-      return { ok: false, reason: 'service' };
+  if (viaService && (now || !answered)) {
+    if (!restartService(ctx)) return { ok: false, reason: 'service' };
+  } else if (!(await requestShutdown(ctx, old, true, { immediate: now }))) {
+    if (!viaService) {
+      logger.error('[oar] The relay did not accept the restart request. Restart it from the web UI (⋯ → Restart web relay).');
+      return { ok: false, reason: 'restart-refused' };
     }
-  } else if (!(await requestShutdown(ctx, old, true))) {
-    logger.error('[oar] The relay did not accept the restart request. Restart it from the web UI (⋯ → Restart web relay).');
-    return { ok: false, reason: 'restart-refused' };
+    if (!restartService(ctx)) return { ok: false, reason: 'service' };
   }
   const up = await pollUntil(async () => {
     const { answer, status } = await readRelayStatus({ ...next, fetchImpl });
@@ -1122,12 +1167,13 @@ export async function runAutostart(options = {}) {
   const paths = installPaths(ctx);
   const { logger } = ctx;
   const target = ctx.argv.find((arg) => [...AUTOSTART_MODES, 'status'].includes(arg)) || 'status';
+  if (ctx.platform === 'linux') {
+    const replace = ctx.argv.includes('--replace') ? ['--replace'] : [];
+    return runService({ ...options, argv: [{ status: 'status', off: 'remove' }[target] || 'install', ...replace] });
+  }
   if (paths.layout.checkout) {
     logger.error('[oar] This is a git checkout — autostart is for global installs.');
     return { code: 1, reason: 'git-checkout' };
-  }
-  if (ctx.platform === 'linux') {
-    return runService({ ...options, argv: [{ status: 'status', off: 'remove' }[target] || 'install'] });
   }
   if (ctx.platform !== 'win32') {
     logger.error(`[oar] Autostart is not supported on ${ctx.platform === 'darwin' ? 'macOS' : ctx.platform} yet. Start the relay with: oar start`);
@@ -1158,9 +1204,75 @@ async function askAutostart(ctx, paths) {
   }
 }
 
-/** 'active' (systemd runs the relay), 'installed', 'none', or 'unavailable' on this host. */
+// What a systemctl call printed, or null when it could not run.
+function systemctlOutput(ctx, args) {
+  try {
+    const result = ctx.spawnSyncImpl('systemctl', ['--user', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 });
+    return result?.error ? null : result || null;
+  } catch {
+    return null;
+  }
+}
+
+// States in which systemd runs the relay, starts it (a restart backoff
+// included) or stops it: `oar stop` and `oar restart` go to systemd then.
+const SYSTEMD_RUNNING_STATES = ['active', 'activating', 'reloading', 'refreshing', 'deactivating'];
+
+function systemdUnitActive(ctx) {
+  const result = systemctlOutput(ctx, ['is-active', 'oar']);
+  if (!result) return false;
+  const state = String(result.stdout ?? '').trim();
+  return state ? SYSTEMD_RUNNING_STATES.includes(state) : result.status === 0;
+}
+
+// What this install's unit would be built from.
+function unitInstall(ctx, paths) {
+  return {
+    nodeBin: ctx.nodeBin,
+    packageRoot: ctx.packageRoot,
+    configPath: paths.configPath,
+    dataDir: paths.dataDir,
+    logDir: paths.logDir,
+    checkout: Boolean(paths.layout.checkout),
+  };
+}
+
+/**
+ * The unit at ~/.config/systemd/user/oar.service: `text` (null when there is
+ * none), `kind` (classifySystemdUnit: whose it is, for this install) and
+ * `ours` (it is this install's service: start, stop and restart go through
+ * it). A hand-made unit is a global install's service, the one it has; a
+ * checkout's only when its ExecStart runs that checkout's server.js (running
+ * in the checkout is not enough), so a worktree never takes over the unit of
+ * another relay.
+ */
+function readSystemdUnit(ctx, paths) {
+  const unitPath = systemdUnitPath(ctx.homeDir);
+  const text = readText(unitPath);
+  if (text === null) return { path: unitPath, text, kind: null, ours: false };
+  const kind = classifySystemdUnit({ text, install: unitInstall(ctx, paths) });
+  const ours = kind !== 'other-install'
+    && !(kind === 'hand-made' && paths.layout.checkout && !systemdUnitRunsCheckout(text, ctx.packageRoot));
+  return { path: unitPath, text, kind, ours };
+}
+
+// The relay's own lock: a checkout's data folder may be the config's dataDir.
+function relayLockPath(ctx, paths) {
+  return paths.layout.checkout ? path.join(relayDataDir(ctx, paths), 'relay-server.lock') : paths.lockPath;
+}
+
+// How a command of this install is typed: a checkout has no `oar` on PATH.
+function oarCommand(paths) {
+  return paths.layout.checkout ? 'node bin/oar.js' : 'oar';
+}
+
+/**
+ * 'active' (systemd runs the relay, starts or stops it), 'installed',
+ * 'none', 'other' (oar.service is another OAR install's), or 'unavailable'
+ * on this host.
+ */
 async function serviceState(ctx, paths) {
-  if (paths.layout.checkout) return 'unavailable';
+  if (paths.layout.checkout && ctx.platform !== 'linux') return 'unavailable';
   if (ctx.platform === 'win32') {
     try {
       return windowsAutostart(ctx, paths).getState().enabled || await windowsBootTaskReady(ctx, paths) ? 'installed' : 'none';
@@ -1169,30 +1281,65 @@ async function serviceState(ctx, paths) {
     }
   }
   if (!systemdUserAvailable(ctx)) return 'unavailable';
-  if (!fs.existsSync(systemdUnitPath(ctx.homeDir))) return 'none';
-  return runQuiet('systemctl', ['--user', 'is-active', '--quiet', 'oar'], ctx) ? 'active' : 'installed';
+  const unit = readSystemdUnit(ctx, paths);
+  if (unit.text === null) return 'none';
+  if (!unit.ours) return 'other';
+  return systemdUnitActive(ctx) ? 'active' : 'installed';
 }
 
-function writeSystemdUnit(ctx, paths) {
-  const unitPath = systemdUnitPath(ctx.homeDir);
-  fs.mkdirSync(path.dirname(unitPath), { recursive: true });
-  fs.writeFileSync(unitPath, buildSystemdUnit({
-    nodeBin: ctx.nodeBin,
-    packageRoot: ctx.packageRoot,
-    configPath: paths.configPath,
-    dataDir: paths.dataDir,
-    logDir: paths.logDir,
+const UNIT_KIND_TEXT = {
+  generated: 'written by OAR for this install',
+  'generated-earlier': 'written by an earlier OAR version',
+  'other-install': 'written by OAR for another install',
+  'hand-made': 'hand-made',
+};
+
+/**
+ * Writes this install's unit, unless the one there is hand-made or another
+ * install's: that one stays as it is (`kept`), unless `replace`, which keeps
+ * a copy of it first. `changed` when the text on disk is new.
+ */
+function writeSystemdUnit(ctx, paths, { replace = false } = {}) {
+  const { logger } = ctx;
+  const unit = readSystemdUnit(ctx, paths);
+  if (unit.text !== null && ['hand-made', 'other-install'].includes(unit.kind) && !replace) {
+    return { kept: unit };
+  }
+  let backup = null;
+  if (unit.text !== null && ['hand-made', 'other-install'].includes(unit.kind)) {
+    backup = backupPathFor(unit.path, path.dirname(unit.path));
+    fs.copyFileSync(unit.path, backup);
+    logger.log(`[oar] Kept a copy of ${unit.path} as ${backup}`);
+  }
+  const text = buildSystemdUnit({
+    ...unitInstall(ctx, paths),
     pathEnv: buildServicePath({ nodeBin: ctx.nodeBin, envPath: ctx.env.PATH, homeDir: ctx.homeDir }),
-  }));
-  ctx.logger.log(`[oar] Wrote ${unitPath}`);
+    systemdVersion: parseSystemdVersion(systemctlOutput(ctx, ['--version'])?.stdout),
+  });
+  fs.mkdirSync(path.dirname(unit.path), { recursive: true });
+  fs.writeFileSync(unit.path, text);
+  logger.log(`[oar] Wrote ${unit.path}`);
+  // A Node of a version manager is gone once another version replaces it.
+  if (/\/(\.nvm|\.fnm|\.volta|\.asdf|versions?)\//.test(String(ctx.nodeBin))) {
+    logger.log(`[oar] The service runs the Node at ${ctx.nodeBin}; after switching Node versions, run ${oarCommand(paths)} service install again.`);
+  }
   // Lingering keeps the user's services up while nobody is logged in;
   // without it the relay of a headless host stops at logout.
   if (!runQuiet('loginctl', ['enable-linger', ctx.userName || os.userInfo().username], ctx)) {
-    ctx.logger.log('[oar] Could not enable lingering — the relay stops when you log out. Enable it with: loginctl enable-linger "$USER"');
+    logger.log('[oar] Could not enable lingering — the relay stops when you log out. Enable it with: loginctl enable-linger "$USER"');
   }
+  return { written: true, changed: unit.text !== text, backup };
+}
+
+// One line for a unit `oar service install` (or `remove`) leaves as it is.
+function keptUnitLine(ctx, paths, unit, action = 'install') {
+  const whose = unit.kind === 'other-install' ? `written by OAR for another install (${systemdUnitMarkerRoot(unit.text)})` : 'hand-made';
+  const what = action === 'remove' ? 'To remove it' : 'To replace it with this install\'s';
+  return `[oar] Left as it is: ${unit.path} (${whose}). ${what}, keeping a copy: ${oarCommand(paths)} service ${action} --replace`;
 }
 
 function startRelay(ctx, paths) {
+  const unit = ctx.platform === 'linux' ? readSystemdUnit(ctx, paths) : { text: null };
   return ensureRelayRunning({
     packageRoot: ctx.packageRoot,
     layout: paths.layout,
@@ -1210,6 +1357,8 @@ function startRelay(ctx, paths) {
     homeDir: ctx.homeDir,
     platform: ctx.platform,
     logger: ctx.logger,
+    serviceInstalled: unit.text !== null && unit.ours,
+    lockPath: relayLockPath(ctx, paths),
   });
 }
 
@@ -1289,8 +1438,9 @@ export async function runStart(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
   const { logger } = ctx;
-  if (paths.layout.checkout) {
-    logger.error('[oar] This is a git checkout — start the relay with: npm start');
+  // A checkout starts only through its service; anywhere else it runs in a terminal.
+  if (paths.layout.checkout && !['active', 'installed'].includes(await serviceState(ctx, paths))) {
+    logger.error('[oar] This is a git checkout — start the relay with: npm start, or run it as a service: node bin/oar.js service install');
     return { code: 1, reason: 'git-checkout' };
   }
   const missing = requireConfig(ctx, paths);
@@ -1307,28 +1457,40 @@ export async function runStart(options = {}) {
   return { code: result.ok ? 0 : 1, reason: result.ok ? 'started' : 'server-not-ready' };
 }
 
-/** `oar stop` — systemd stops the service; any other relay stops itself once no turn is running. */
+// systemd stops the service at once; running turns end.
+function stopService(ctx, paths) {
+  if (!runQuiet('systemctl', ['--user', 'stop', 'oar'], ctx)) {
+    ctx.logger.error('[oar] systemctl --user stop oar failed — see: systemctl --user status oar');
+    return { code: 1, reason: 'service' };
+  }
+  ctx.logger.log(`[oar] The relay service is stopped. It starts again at the next boot (without lingering: at the next login); to take it out: ${oarCommand(paths)} service remove`);
+  return { code: 0, reason: 'stopped' };
+}
+
+/**
+ * `oar stop` — the relay stops itself once no turn is running, under the
+ * service too (its unit stays enabled). `--now` under the service, or a
+ * service whose relay does not answer: systemd stops it at once. `--now` of
+ * any other relay asks it to stop without waiting.
+ */
 export async function runStop(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
   const { logger } = ctx;
   const missing = requireConfig(ctx, paths);
   if (missing) return missing;
-  if ((await serviceState(ctx, paths)) === 'active') {
-    if (!runQuiet('systemctl', ['--user', 'stop', 'oar'], ctx)) {
-      logger.error('[oar] systemctl --user stop oar failed — see: systemctl --user status oar');
-      return { code: 1, reason: 'service' };
-    }
-    logger.log('[oar] The relay service is stopped. It starts again at the next boot (without lingering: at the next login); to take it out: oar service remove');
-    return { code: 0, reason: 'stopped' };
-  }
+  const now = ctx.argv.includes('--now');
+  const viaService = (await serviceState(ctx, paths)) === 'active';
+  if (viaService && now) return stopService(ctx, paths);
   const relay = await findRelay(ctx, paths);
+  if (viaService && relay.answer !== 'oar') return stopService(ctx, paths);
   if (relay.answer === 'none') {
     logger.log('[oar] The relay is not running.');
     return { code: 0, reason: 'not-running' };
   }
   if (relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
-  if (!(await requestShutdown(ctx, relay.endpoint, false))) {
+  if (!(await requestShutdown(ctx, relay.endpoint, false, { immediate: now }))) {
+    if (viaService) return stopService(ctx, paths);
     logger.error('[oar] The relay did not accept the stop request.');
     return { code: 1, reason: 'stop-refused' };
   }
@@ -1336,11 +1498,19 @@ export async function runStop(options = {}) {
     async () => (await probeRelayPort({ ...relay.endpoint, fetchImpl: ctx.fetchImpl })) === 'none',
     { waitMs: ctx.stopWaitMs, pollMs: ctx.pollMs },
   );
-  logger.log(closed ? '[oar] The relay is stopped.' : '[oar] The relay is still busy; it stops by itself when its running turns finish.');
+  const command = oarCommand(paths);
+  const enabled = viaService ? ` The service stays enabled: it starts again at the next boot, or with: ${command} start` : '';
+  logger.log(closed
+    ? `[oar] The relay is stopped.${enabled}`
+    : `[oar] The relay is still busy; it stops by itself when its running turns finish (at once: ${command} stop --now).${enabled}`);
   return { code: 0, reason: closed ? 'stopped' : 'stop-queued' };
 }
 
-/** `oar restart` — restarts a running relay, starts a stopped one. */
+/**
+ * `oar restart` — restarts a running relay once no turn is running (`--now`:
+ * at once), starts a stopped one. Under the service systemd restarts it at
+ * once with `--now`, or when the relay does not answer.
+ */
 export async function runRestart(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
@@ -1350,7 +1520,9 @@ export async function runRestart(options = {}) {
   const relay = await findRelay(ctx, paths);
   if (!viaService && relay.answer === 'none') return runStart(options);
   if (!viaService && relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
-  const outcome = await restartRelay(ctx, paths, { old: relay.endpoint, viaService });
+  const outcome = await restartRelay(ctx, paths, {
+    old: relay.endpoint, viaService, answered: relay.answer === 'oar', now: ctx.argv.includes('--now'),
+  });
   if (outcome.ok) await showAddress(ctx, paths);
   return { code: outcome.ok ? 0 : 1, reason: outcome.reason };
 }
@@ -1401,7 +1573,7 @@ export async function runStatus(options = {}) {
   else if (status.relay === 'stopped') logger.log(`[oar] The relay is stopped (port ${status.port}, ${access}). Start it with: oar start`);
   else logger.log(`[oar] Port ${status.port} is in use by another program, or by a relay with another token.`);
   if (status.service !== 'unavailable') {
-    logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed', none: 'not installed' }[status.service]}`);
+    logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed', none: 'not installed', other: 'not installed (oar.service belongs to another OAR install)' }[status.service]}`);
   }
   if (status.tunnel) logger.log(`[oar] Tunnel: ${status.tunnel}`);
   for (const warning of status.warnings) logger.log(`[oar] ${warning}`);
@@ -1443,14 +1615,47 @@ async function runWindowsService(ctx, paths, action) {
   return { code: 0, reason: `service-${action}` };
 }
 
+// The relay paths a checkout's service does not get: the relay it runs
+// finds its config, data and logs in the checkout.
+const CHECKOUT_UNPINNED_ENV = ['COPILOT_WEB_RELAY_CONFIG', 'COPILOT_WEB_RELAY_DATA_DIR', 'COPILOT_WEB_RELAY_LOG_DIR'];
+
+// `oar service status` on Linux: the state, whose the unit is, its drop-ins, lingering.
+function reportSystemdService(ctx, paths, state) {
+  const { logger } = ctx;
+  const command = oarCommand(paths);
+  const unit = readSystemdUnit(ctx, paths);
+  if (unit.text === null) {
+    logger.log('[oar] Service: not installed');
+    return;
+  }
+  logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed, not running', other: 'not installed for this install' }[state]}`);
+  const whose = unit.kind === 'other-install'
+    ? `${UNIT_KIND_TEXT[unit.kind]} (${systemdUnitMarkerRoot(unit.text)})`
+    : `${UNIT_KIND_TEXT[unit.kind]}${unit.ours ? '' : ', not for this checkout'}`;
+  logger.log(`[oar] Unit: ${unit.path} (${whose})`);
+  if (unit.kind === 'generated-earlier') logger.log(`[oar] It is from an earlier OAR version; write this version's with: ${command} service install`);
+  if (['hand-made', 'other-install'].includes(unit.kind)) {
+    logger.log(`[oar] OAR leaves it as it is. To replace it with this install's, keeping a copy: ${command} service install --replace`);
+  }
+  for (const dropIn of listSystemdDropIns(ctx.homeDir)) logger.log(`[oar] Drop-in: ${dropIn} (your own settings, kept)`);
+  const user = ctx.userName || os.userInfo().username;
+  let linger = '';
+  try {
+    const result = ctx.spawnSyncImpl('loginctl', ['show-user', user, '-p', 'Linger', '--value'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 });
+    linger = String(result?.stdout ?? '').trim();
+  } catch {}
+  if (linger === 'no') logger.log('[oar] Lingering is off: the relay stops when you log out. Switch it on with: loginctl enable-linger "$USER"');
+}
+
 /** `oar service install|remove|status` — the systemd user service on Linux, the autostart entry on Windows. */
 export async function runService(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
   const { logger } = ctx;
   const action = ctx.argv.find((arg) => ['install', 'remove', 'status'].includes(arg)) || 'status';
-  if (paths.layout.checkout) {
-    logger.error('[oar] This is a git checkout — the service is for global installs.');
+  const replace = ctx.argv.includes('--replace');
+  if (paths.layout.checkout && ctx.platform !== 'linux') {
+    logger.error('[oar] This is a git checkout — the service is for global installs here.');
     return { code: 1, reason: 'git-checkout' };
   }
   if (ctx.platform === 'win32') return runWindowsService(ctx, paths, action);
@@ -1458,37 +1663,60 @@ export async function runService(options = {}) {
     logger.error(`[oar] The service is not supported on ${ctx.platform === 'darwin' ? 'macOS' : ctx.platform} yet. Start the relay with: oar start`);
     return { code: 1, reason: 'unsupported' };
   }
+  const command = oarCommand(paths);
   if (!systemdUserAvailable(ctx)) {
     const wslHint = isWsl(ctx) ? ' In WSL, switch systemd on: systemd=true under [boot] in /etc/wsl.conf, then restart the distro (from Windows: wsl --terminate <distro>).' : '';
-    logger.error(`[oar] No systemd user session here, so there is no service to install.${wslHint} Start the relay with: oar start`);
+    const start = paths.layout.checkout ? 'npm start' : 'oar start';
+    logger.error(`[oar] No systemd user session here, so there is no service to install.${wslHint} Start the relay with: ${start}`);
     return { code: 1, reason: 'no-systemd' };
   }
-  const unitPath = systemdUnitPath(ctx.homeDir);
   const state = await serviceState(ctx, paths);
   if (action === 'status') {
-    logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed, not running', none: 'not installed' }[state]}`);
+    reportSystemdService(ctx, paths, state);
     return { code: 0, reason: 'service-status' };
   }
   if (action === 'remove') {
-    if (state === 'none') {
+    const unit = readSystemdUnit(ctx, paths);
+    if (unit.text === null) {
       logger.log('[oar] The service is not installed.');
       return { code: 0, reason: 'service-remove' };
     }
+    if (['hand-made', 'other-install'].includes(unit.kind)) {
+      if (!replace) {
+        logger.error(keptUnitLine(ctx, paths, unit, 'remove'));
+        return { code: 1, reason: 'hand-made-unit' };
+      }
+      const backup = backupPathFor(unit.path, path.dirname(unit.path));
+      fs.copyFileSync(unit.path, backup);
+      logger.log(`[oar] Kept a copy of ${unit.path} as ${backup}`);
+    }
     runQuiet('systemctl', ['--user', 'disable', '--now', 'oar'], ctx);
-    try { fs.unlinkSync(unitPath); } catch {}
+    try { fs.unlinkSync(unit.path); } catch {}
     runQuiet('systemctl', ['--user', 'daemon-reload'], ctx);
-    logger.log(`[oar] Removed ${unitPath}; the relay is stopped. Start it by hand with: oar start`);
+    logger.log(`[oar] Removed ${unit.path}; the relay is stopped. Start it by hand with: ${paths.layout.checkout ? 'npm start' : 'oar start'}`);
     return { code: 0, reason: 'service-remove' };
   }
   const missing = requireConfig(ctx, paths);
   if (missing) return missing;
-  writeSystemdUnit(ctx, paths);
+  if (paths.layout.checkout) {
+    for (const name of CHECKOUT_UNPINNED_ENV.filter((key) => String(ctx.env[key] || '').trim())) {
+      logger.log(`[oar] ${name} is set in this shell; the service does not get it. If the relay needs it, put it in ~/.config/systemd/user/oar.service.d/*.conf`);
+    }
+  }
+  const wasActive = state === 'active' || (state === 'other' && systemdUnitActive(ctx));
+  const written = writeSystemdUnit(ctx, paths, { replace });
+  if (written.kept) {
+    logger.error(keptUnitLine(ctx, paths, written.kept));
+    return { code: 1, reason: 'hand-made-unit' };
+  }
   runQuiet('systemctl', ['--user', 'daemon-reload'], ctx);
-  if (state !== 'active' && (await findRelay(ctx, paths)).answer === 'oar') {
+  if (wasActive) {
+    if (written.changed) logger.log(`[oar] The new unit applies at the next restart: ${command} restart --now`);
+  } else if ((await findRelay(ctx, paths)).answer === 'oar') {
     // A relay started by hand holds the port and the lock: it makes way first.
     if ((await runStop({ ...options, argv: [] })).reason !== 'stopped') {
       runQuiet('systemctl', ['--user', 'enable', 'oar'], ctx);
-      logger.log('[oar] The service is installed and takes over at the next boot (without lingering: at the next login), or once the relay has stopped: oar start');
+      logger.log(`[oar] The service is installed and takes over at the next boot (without lingering: at the next login), or once the relay has stopped: ${command} start`);
       return { code: 0, reason: 'service-install' };
     }
   }
@@ -1638,7 +1866,10 @@ export async function runSetup(options = {}) {
 
   const startRequested = has('--start') && !layout.checkout;
   const viaService = running && (await serviceState(ctx, paths)) === 'active';
-  if (startRequested && systemdUserAvailable(ctx)) writeSystemdUnit(ctx, paths);
+  if (startRequested && systemdUserAvailable(ctx)) {
+    const written = writeSystemdUnit(ctx, paths);
+    if (written.kept) logger.log(keptUnitLine(ctx, paths, written.kept));
+  }
 
   let outcome = null;
   if (changed) {
@@ -1751,9 +1982,9 @@ function purgeRefusal(ctx, dir, marker = null) {
   return '';
 }
 
-// An OAR state root: its config, or a database in its data folder.
-const looksLikeStateRoot = (dir) => fs.existsSync(path.join(dir, 'config.json')) || fs.existsSync(path.join(dir, 'data', 'copilot.db'));
-const looksLikeDataDir = (dir) => fs.existsSync(path.join(dir, 'copilot.db'));
+// An OAR state root: its config, or a database (either name) in its data folder.
+const looksLikeDataDir = (dir) => DB_FILE_NAMES.some((name) => fs.existsSync(path.join(dir, name)));
+const looksLikeStateRoot = (dir) => fs.existsSync(path.join(dir, 'config.json')) || looksLikeDataDir(path.join(dir, 'data'));
 
 /**
  * What `oar uninstall --purge` deletes: the state root (`refused` when
@@ -1783,7 +2014,11 @@ function purgePlan(ctx, paths) {
     const checkout = checkoutAround(dir);
     add(dir, checkout ? `a data folder in the git checkout ${checkout}` : 'a data folder outside the state root', looksLikeDataDir);
   }
-  return { root, refused, extra, skipped };
+  // Backups the config keeps outside the state root are never deleted.
+  const configuredBackups = paths.config?.dbBackups?.dir;
+  const backupsElsewhere = typeof configuredBackups === 'string' && path.isAbsolute(configuredBackups)
+    && !isInside(path.resolve(configuredBackups), root) && path.resolve(configuredBackups) !== root ? path.resolve(configuredBackups) : null;
+  return { root, refused, extra, skipped, backupsElsewhere };
 }
 // Deletes `target` except the paths in `keep` (and the folders they are in).
 function deleteTree(target, keep) {
@@ -1793,16 +2028,6 @@ function deleteTree(target, keep) {
     return;
   }
   for (const name of fs.readdirSync(target)) deleteTree(path.join(target, name), keep);
-}
-
-// A unit `oar service install` wrote for this install: the same lines, with
-// whatever Node and PATH it was written with.
-function systemdUnitIsGenerated(ctx, paths, text) {
-  const nodeBin = String(text).match(/^ExecStart=(\S+) /m)?.[1] || ctx.nodeBin;
-  const strip = (unit) => String(unit).split('\n').filter((line) => !line.startsWith('Environment="PATH=')).join('\n').trim();
-  return strip(text) === strip(buildSystemdUnit({
-    nodeBin, packageRoot: ctx.packageRoot, configPath: paths.configPath, dataDir: paths.dataDir, logDir: paths.logDir,
-  }));
 }
 
 function readText(filePath) {
@@ -1840,9 +2065,9 @@ async function removeGeneratedEntries(ctx, paths, done) {
     done.push(...signin.filter((entry) => entry.generated).map((entry) => `removed ${entry.path}`));
     kept.push(...now.entries.filter((entry) => !entry.generated));
   } else {
-    const unitPath = systemdUnitPath(ctx.homeDir);
-    const unit = readText(unitPath);
-    if (unit !== null && !systemdUnitIsGenerated(ctx, paths, unit)) kept.push({ path: unitPath });
+    // Only a unit OAR wrote for this install (this version or 0.9.19) goes.
+    const { path: unitPath, text: unit, kind } = readSystemdUnit(ctx, paths);
+    if (unit !== null && !['generated', 'generated-earlier'].includes(kind)) kept.push({ path: unitPath });
     else if (unit !== null) {
       runQuiet('systemctl', ['--user', 'disable', '--now', 'oar'], ctx);
       fs.rmSync(unitPath, { force: true });
@@ -1910,7 +2135,8 @@ export async function runUninstall(options = {}) {
       return { code: 1, reason: 'purge-unsafe' };
     }
     for (const item of plan.skipped) logger.log(`[oar] Not deleted, and not offered: ${item.path} (${item.why}).`);
-    logger.log(`[oar] --purge deletes ${plan.root} for good: the config, the database with every conversation, the uploads and the logs.`);
+    logger.log(`[oar] --purge deletes ${plan.root} for good: the config, the database with every conversation, its backups, the uploads and the logs.`);
+    if (plan.backupsElsewhere) logger.log(`[oar] Not deleted: the database backups in ${plan.backupsElsewhere} (dbBackups.dir in the config); delete them yourself if you want them gone.`);
     if ((await prompter.line('Type "delete" to confirm: ')) !== 'delete') {
       logger.log('[oar] Not confirmed. Nothing was changed.');
       return { code: 1, reason: 'purge-not-confirmed' };
@@ -2004,7 +2230,17 @@ export async function runUninstall(options = {}) {
 export async function runDoctor(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
-  const dbPath = path.join(paths.dataDir, 'copilot.db');
+  // The file the relay runs on (read only: nothing is created).
+  const dataDir = relayDataDir(ctx, paths);
+  const databaseFile = resolveDatabaseFile(dataDir);
+  const dbPath = databaseFile.path;
+  const databaseNotes = [
+    ...(databaseFile.both ? [`${path.join(dataDir, LEGACY_DB_FILE_NAME)} is also there; the next start compares the two`] : []),
+    ...databaseFile.dangling.map((file) => `${file} is a link to a file that is not there`),
+    ...databaseFile.orphans.map((file) => (path.basename(file).startsWith(`${DB_FILE_NAME}-`)
+      ? `${file} is there without ${path.join(dataDir, DB_FILE_NAME)}: the relay does not start until it is moved away`
+      : `${file} is there without its database (not used, never deleted); move it away before renaming a database to that name`)),
+  ];
 
   let dbSizeBytes = null;
   try { dbSizeBytes = fs.statSync(dbPath).size; } catch {}
@@ -2023,6 +2259,7 @@ export async function runDoctor(options = {}) {
 
   const port = endpointOf(paths.config).port;
   const holder = paths.config ? createWindowsPortCheck(ctx)(port) : null;
+  const backups = describeBackups({ layout: paths.layout, serverDir: path.join(ctx.packageRoot, 'server'), dataDir, config: paths.config });
   ctx.logger.log(renderDoctorReport({
     version: readPackageVersion(ctx.packageRoot),
     nodeVersion: process.version,
@@ -2032,12 +2269,68 @@ export async function runDoctor(options = {}) {
     config: paths.config,
     dbPath,
     dbSizeBytes,
+    databaseNotes,
+    backups,
+    now: Date.now(),
     probes,
     warnings: holder ? [windowsPortWarning(port, holder)] : [],
     // The relay resolves a relative cloudflaredTunnel.binary against server/.
     tunnel: describeConfiguredTunnel(paths.config?.cloudflaredTunnel, { env: ctx.env, configBaseDir: path.join(ctx.packageRoot, 'server') }),
   }));
   return { code: 0, reason: 'doctor' };
+}
+
+/**
+ * `oar backup [--reason <text>]`: a copy of the relay's database, online
+ * (safe while the relay runs), into the backup folder with the start's
+ * name, manifest and rotation (db-backup-service.mjs). Never creates a
+ * database; never touches db_last_run. Exit 1 when no copy could be made,
+ * 0 for a copy or a skip (with its warning).
+ */
+export async function runBackup(options = {}) {
+  const ctx = cliContext(options);
+  const paths = installPaths(ctx);
+  const dataDir = relayDataDir(ctx, paths);
+  const argv = ctx.argv || [];
+  const reasonAt = argv.indexOf('--reason');
+  const given = reasonAt === -1 ? argv.find((arg) => arg.startsWith('--reason='))?.slice('--reason='.length) : argv[reasonAt + 1];
+  const reason = given === undefined ? 'manual' : sanitizeReason(given);
+  const fail = (message, why = 'backup-failed') => {
+    ctx.logger.error(`[oar] ${message}`);
+    return { code: 1, reason: why };
+  };
+  const file = resolveDatabaseFile(dataDir);
+  if (file.created || file.dangling.length) {
+    return fail(`No database in ${dataDir} to back up (neither ${DB_FILE_NAME} nor ${LEGACY_DB_FILE_NAME}).`, 'no-database');
+  }
+  for (const warning of configWarnings(paths.config)) ctx.logger.error(warning);
+  let source;
+  try {
+    const Database = (await import('better-sqlite3')).default;
+    source = new Database(file.path, { readonly: true, fileMustExist: true });
+    const say = { log: (line) => ctx.logger.log(String(line).replace(/^\[backup\]/, '[oar]')), warn: (line) => ctx.logger.error(String(line).replace(/^\[backup\]/, '[oar]')) };
+    const result = await backupDatabase({
+      source,
+      Database,
+      dbPath: file.path,
+      dataDir,
+      layout: paths.layout,
+      serverDir: path.join(ctx.packageRoot, 'server'),
+      config: paths.config,
+      version: readPackageVersion(ctx.packageRoot),
+      reason,
+      logger: say,
+      ...(ctx.isProcessAliveImpl ? { isProcessAlive: ctx.isProcessAliveImpl } : {}),
+      ...(ctx.fsImpl ? { fsImpl: ctx.fsImpl } : {}),
+    });
+    if (result.status === 'busy') return fail(`Not backing up now: ${result.reason}; run oar backup again once it is done.`, 'backup-busy');
+    if (result.status === 'failed') return { code: 1, reason: 'backup-failed' };
+    return { code: 0, reason: result.status === 'written' ? 'backup-written' : 'backup-skipped', file: result.file ? path.join(result.dir, result.file) : null };
+  } catch (error) {
+    return fail(`The backup of ${file.path} failed: ${error?.message || error}.`);
+  } finally {
+    try { source?.close(); } catch {}
+  }
 }
 
 /**
@@ -2177,7 +2470,7 @@ async function runMenuCommand(options = {}) {
       doctor: run(runDoctor),
       copilot: run(launchRelay),
       service: async (status) => {
-        const action = { none: 'install', unavailable: 'status' }[status.service] || 'remove';
+        const action = { none: 'install', unavailable: 'status', other: 'status' }[status.service] || 'remove';
         if (action === 'remove' && !(await ctx.prompter.yesNo('Remove the service?', { defaultYes: false }))) return null;
         return runService({ ...options, argv: [action] });
       },
@@ -2200,6 +2493,7 @@ const COMMANDS = {
   uninstall: runUninstall,
   copilot: launchRelay,
   doctor: runDoctor,
+  backup: runBackup,
   update: runUpdate,
   help: async ({ logger = console } = {}) => {
     logger.log(usageText());

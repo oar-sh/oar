@@ -59,7 +59,7 @@ function formatQuestionRow(row) {
   };
 }
 
-function boot({ inboundEnabled = true, client = null } = {}) {
+function boot({ inboundEnabled = true, client = null, boards = false, questionNotice = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   seed(db);
@@ -96,6 +96,8 @@ function boot({ inboundEnabled = true, client = null } = {}) {
     parseQuestionRequest: (value) => { try { return JSON.parse(value); } catch { return null; } },
     normalizeQuestionChoices: (choices) => (Array.isArray(choices) ? choices.map(String) : []),
     formatQuestionRow,
+    ...(boards ? { formatRelayBoardRow: (row) => formatBoardRow(db, row) } : {}),
+    ...(questionNotice ? { questionNotice } : {}),
     normalizeRelayMode: (mode) => String(mode || '').trim() || null,
     DEFAULT_RELAY_MODE: 'agent',
     remoteRelayInbound,
@@ -131,7 +133,39 @@ function boot({ inboundEnabled = true, client = null } = {}) {
     return captured;
   }
   const card = (id) => db.prepare(`SELECT status, answer FROM relay_questions WHERE id = ?`).get(id);
-  return { db, asks, told, calls, call, card };
+  return { db, stmts, asks, told, calls, call, card };
+}
+
+// As server-runtime.mjs formats a board row, reduced to what the Inbox reads.
+function formatBoardRow(db, row) {
+  if (!row) return null;
+  const conversation = db.prepare(`SELECT plan_only FROM conversations WHERE id = ?`).get(row.conversation_id);
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    boardType: row.board_type,
+    title: row.title,
+    body: row.body,
+    actions: JSON.parse(row.actions_json || '[]'),
+    recommendedAction: row.recommended_action || null,
+    status: row.status,
+    selectedAction: row.selected_action || null,
+    actedAt: row.acted_at || null,
+    createdAt: row.created_at,
+    planOnly: Number(conversation?.plan_only) === 1,
+  };
+}
+
+let boardCounter = 0;
+function seedBoard(db, { conversationId = SESSION, status = 'pending', boardType = 'plan_ready', createdAt = NOW, actedAt = null, title = 'Plan ready for review', body = '1. Split the parser' } = {}) {
+  boardCounter += 1;
+  const id = `board-${boardCounter}`;
+  db.prepare(`
+    INSERT INTO relay_boards (id, queue_id, conversation_id, message_id, board_type, relay_mode, title, body, actions_json, recommended_action, context_json, status, selected_action, acted_at, created_at, updated_at)
+    VALUES (?, 'q-turn', ?, ?, ?, 'plan', ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+  `).run(id, conversationId, `msg-${id}`, boardType, title, body, JSON.stringify([{ id: 'approve_only', label: 'Approve plan' }, { id: 'autopilot', label: 'Implement in autopilot' }]),
+    status, status === 'pending' ? null : 'approve_only', actedAt, createdAt, createdAt);
+  return id;
 }
 
 const QUESTION = { question: 'Which database?', options: ['Postgres', 'SQLite'], detail: '<img src=x onerror=alert(1)>' };
@@ -308,4 +342,157 @@ test('the Inbox lists this relay and every paired relay that answers; an ask the
   assert.deepEqual(fx.calls.at(-1), { relay: 'r-lab', method: 'POST', path: RELAY_ASK_REMOTE_PATHS.answer, body: { id: 'ask_there01', answer: '', choice: 'Yes', via: 'bench-relay' } });
   assert.equal((await fx.call('POST', '/api/inbox/relays/:relayId/asks/:id/answer', { params: { relayId: 'r-nope', id: 'x' } })).status, 404);
   assert.equal((await fx.call('GET', '/api/inbox', { headers: FROM_PAIRED })).status, 403, 'another relay\'s agent reads no Inbox');
+});
+
+// ─── Plan cards ─────────────────────────────────────────────────────
+
+test('the Inbox lists each session\'s newest pending plan card and the ones settled in the last day', async () => {
+  const fx = boot({ boards: true });
+  const older = seedBoard(fx.db, { createdAt: '2026-03-01T10:00:00.000Z', title: 'Old plan' });
+  const newest = seedBoard(fx.db, { createdAt: '2026-03-02T09:00:00.000Z', title: 'New plan' });
+  const lead = seedBoard(fx.db, { conversationId: LEAD, createdAt: '2026-03-02T08:00:00.000Z' });
+  seedBoard(fx.db, { boardType: 'generic', title: 'Not a plan card' });
+  const settled = seedBoard(fx.db, { conversationId: LEAD, status: 'acted', actedAt: new Date().toISOString(), title: 'Approved plan' });
+  seedBoard(fx.db, { conversationId: LEAD, status: 'dismissed', actedAt: '2020-01-01T00:00:00.000Z', title: 'Long ago' });
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1 WHERE id = ?`).run(SESSION);
+  const own = await fx.call('GET', '/api/inbox');
+  const items = own.body.relays[0].items.filter((item) => item.kind === 'plan');
+  assert.deepEqual(items.map((item) => item.id).sort(), [newest, lead, settled].sort());
+  assert.ok(!items.some((item) => item.id === older), 'an older pending card stays in its session');
+  const item = items.find((entry) => entry.id === newest);
+  assert.equal(item.title, 'New plan');
+  assert.equal(item.body, '1. Split the parser');
+  assert.deepEqual(item.actions.map((action) => action.id), ['approve_only', 'autopilot']);
+  assert.equal(item.planOnly, true);
+  assert.equal(item.status, 'pending');
+  assert.equal(item.session.id, SESSION);
+  assert.equal(item.session.title, 'Cache layer');
+  const done = items.find((entry) => entry.id === settled);
+  assert.equal(done.status, 'acted');
+  assert.equal(done.selectedAction, 'approve_only');
+  assert.ok(done.actedAt);
+  // The badge counts the pending ones with the cards.
+  const pendingAll = own.body.relays[0].items.filter((entry) => entry.status === 'pending').length;
+  assert.equal(own.body.pending, own.body.relays.reduce((sum, relay) => sum + relay.items.filter((entry) => entry.status === 'pending').length, 0));
+  assert.ok(pendingAll >= 2, 'the two pending plan cards count');
+});
+
+test('no plan card of a deleted or archived session', async () => {
+  const fx = boot({ boards: true });
+  seedBoard(fx.db);
+  seedBoard(fx.db, { conversationId: LEAD });
+  fx.db.prepare(`UPDATE conversations SET status = 'deleted' WHERE id = ?`).run(SESSION);
+  fx.db.prepare(`UPDATE conversations SET archived = 1 WHERE id = ?`).run(LEAD);
+  const own = await fx.call('GET', '/api/inbox');
+  assert.equal(own.body.relays[0].items.filter((item) => item.kind === 'plan').length, 0);
+});
+
+test('a paired relay\'s Inbox gets a plan card\'s title and status alone', async () => {
+  const fx = boot({ boards: true });
+  const id = seedBoard(fx.db, { title: 'Ship the cache', body: 'secret plan body' });
+  const remote = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
+  const there = remote.body.items.find((item) => item.id === id);
+  assert.deepEqual(Object.keys(there).sort(), ['createdAt', 'id', 'kind', 'question', 'session', 'status', 'title']);
+  assert.equal(there.kind, 'plan');
+  assert.equal(there.title, 'Ship the cache');
+  assert.equal(there.question, 'Ship the cache', 'an older Inbox shows it as the card\'s question');
+  assert.equal(JSON.stringify(remote.body).includes('secret plan body'), false);
+  assert.equal(remote.body.pending, remote.body.items.filter((item) => item.status === 'pending').length);
+  // A settled one: the same keys, not when it was settled.
+  fx.db.prepare(`UPDATE relay_boards SET status = 'acted', selected_action = 'approve_only', acted_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+  const settled = (await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED })).body.items.find((item) => item.id === id);
+  assert.deepEqual(Object.keys(settled).sort(), ['createdAt', 'id', 'kind', 'question', 'session', 'status', 'title']);
+  assert.equal(settled.status, 'acted');
+});
+
+test('without the board formatter the Inbox lists no plan cards (an older wiring)', async () => {
+  const fx = boot();
+  seedBoard(fx.db);
+  const own = await fx.call('GET', '/api/inbox');
+  assert.equal(own.body.relays[0].items.filter((item) => item.kind === 'plan').length, 0);
+});
+test('a paired relay\'s Inbox gets an approval card\'s variant and summary, still without its text', async () => {
+  const fx = boot();
+  fx.db.prepare(`UPDATE relay_questions SET request = ? WHERE id = 'card-approval'`).run(JSON.stringify({
+    request: null,
+    context: { source: 'remote_relay', header: 'Remote relay', variant: 'write', summary: 'Send a prompt on relay "linux-test" requested by \'Lead\'' },
+    allowFreeform: false,
+  }));
+  const inbox = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
+  const item = inbox.body.items.find((entry) => entry.id === 'card-approval');
+  assert.equal(item.question, '');
+  assert.equal(item.variant, 'write');
+  assert.equal(item.summary, 'Send a prompt on relay "linux-test" requested by \'Lead\'');
+  assert.ok(!JSON.stringify(item).includes('Rebuild the sidebar'), 'the card text stays here');
+  assert.equal('options' in item, false);
+});
+
+// ─── Who pushes a card a turn waits on ─────────────────────────────
+
+const FROM_OTHER = { 'x-oar-remote-origin': 'instance-other', 'x-oar-remote-hops': '1' };
+
+function noticesOf(body) {
+  return Object.fromEntries(body.items.filter((item) => 'notice' in item).map((item) => [item.id, [item.notice, item.claimed]]));
+}
+
+test('?push=1: this relay\'s own push decides first; a missed card is claimed by the first caller, and the claim sticks', async () => {
+  const ledger = new Map([['card-approval', 'pending']]);
+  const fx = boot({ boards: true, questionNotice: (id) => ledger.get(id) ?? null });
+  fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
+  seedBoard(fx.db);
+  const read = async (headers, push = true) => (await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers, query: push ? { push: '1' } : {} })).body;
+
+  // The approval's push is not settled; the ask_user card was never pushed here (from before a restart).
+  assert.deepEqual(noticesOf(await read(FROM_PAIRED)), { 'card-approval': ['wait', undefined], 'card-ask-user': ['you', 'now'] });
+  // Decision 5: only cards a turn waits on (relay_questions rows: approvals,
+  // ask_user) say who pushes; a non-blocking ask and a plan card never do.
+  const listed = (await read(FROM_PAIRED)).items;
+  assert.deepEqual(listed.filter((item) => item.kind === 'ask' || item.kind === 'plan').map((item) => [item.kind, 'notice' in item, 'claimed' in item]), [['ask', false, false], ['plan', false, false]]);
+  ledger.set('card-approval', 'reached');
+  assert.deepEqual(noticesOf(await read(FROM_PAIRED)), { 'card-approval': ['here', undefined], 'card-ask-user': ['you', 'before'] });
+  assert.deepEqual(noticesOf(await read(FROM_OTHER)), { 'card-approval': ['here', undefined], 'card-ask-user': ['other', undefined] });
+  ledger.set('card-approval', 'missed');
+  assert.deepEqual(noticesOf(await read(FROM_OTHER)), { 'card-approval': ['you', 'now'], 'card-ask-user': ['other', undefined] });
+  assert.deepEqual(noticesOf(await read(FROM_PAIRED)), { 'card-approval': ['other', undefined], 'card-ask-user': ['you', 'before'] });
+});
+
+test('without ?push=1 nothing is claimed and no notice goes out', async () => {
+  const fx = boot({ questionNotice: () => null });
+  const plain = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
+  assert.deepEqual(noticesOf(plain.body), {});
+  assert.ok(plain.body.items.every((item) => !('claimed' in item)));
+  const pushing = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_OTHER, query: { push: '1' } });
+  assert.deepEqual(noticesOf(pushing.body), { 'card-approval': ['you', 'now'], 'card-ask-user': ['you', 'now'] }, 'the plain read claimed nothing');
+});
+
+test('a card no longer pending loses its claim; a card that was never claimed is claimable at any age', async () => {
+  const fx = boot();
+  fx.db.prepare(`UPDATE relay_questions SET created_at = '2026-03-01T00:00:00.000Z'`).run();
+  const read = async (headers) => noticesOf((await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers, query: { push: '1' } })).body);
+  assert.deepEqual(await read(FROM_PAIRED), { 'card-approval': ['you', 'now'], 'card-ask-user': ['you', 'now'] }, 'without a push service here every card is claimable');
+  fx.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = 'Dark', answered_at = ? WHERE id = 'card-ask-user'`).run(NOW);
+  assert.deepEqual(await read(FROM_OTHER), { 'card-approval': ['other', undefined] });
+  fx.db.prepare(`UPDATE relay_questions SET status = 'pending', answer = NULL, answered_at = NULL WHERE id = 'card-ask-user'`).run();
+  assert.deepEqual(await read(FROM_OTHER), { 'card-approval': ['other', undefined], 'card-ask-user': ['you', 'now'] }, 'its old claim went with it');
+});
+
+test('a restart of this relay forgets the claims: its cards are claimable again', async () => {
+  const read = async (fx, headers) => noticesOf((await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers, query: { push: '1' } })).body);
+  const before = boot();
+  assert.deepEqual(await read(before, FROM_OTHER), { 'card-approval': ['you', 'now'], 'card-ask-user': ['you', 'now'] });
+  assert.deepEqual(await read(before, FROM_PAIRED), { 'card-approval': ['other', undefined], 'card-ask-user': ['other', undefined] });
+  const after = boot();
+  assert.deepEqual(await read(after, FROM_PAIRED), { 'card-approval': ['you', 'now'], 'card-ask-user': ['you', 'now'] });
+});
+
+test('a read whose pending cards fail to load keeps the claims, and claims nothing', async () => {
+  const fx = boot();
+  const read = async (headers) => noticesOf((await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers, query: { push: '1' } })).body);
+  assert.deepEqual(await read(FROM_PAIRED), { 'card-approval': ['you', 'now'], 'card-ask-user': ['you', 'now'] });
+  const listQuestions = fx.stmts.listQuestions;
+  fx.stmts.listQuestions = { all() { throw new Error('database is locked'); } };
+  assert.deepEqual(await read(FROM_OTHER), {}, 'no card listed, none offered');
+  fx.stmts.listQuestions = listQuestions;
+  assert.deepEqual(await read(FROM_OTHER), { 'card-approval': ['other', undefined], 'card-ask-user': ['other', undefined] }, 'the claims survived the failed read');
+  assert.deepEqual(await read(FROM_PAIRED), { 'card-approval': ['you', 'before'], 'card-ask-user': ['you', 'before'] });
 });

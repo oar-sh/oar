@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 
 import {
-  exitWhenIdle, launchRelay, main, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUrl,
+  exitWhenIdle, launchRelay, main, runBackup, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUrl,
 } from '../bin/oar.js';
 import { PromptAborted } from './services/oar-cli-menu.mjs';
 import { processIdentity } from './services/relay-singleton-guard.mjs';
@@ -62,23 +62,64 @@ function fakeRelay(install, { port, token, lan = false, running = true, busy = f
 }
 
 // systemctl and loginctl of a host with (or without) a systemd user session.
-function fakeSystemd(install, { available = true, active = false, relay = null } = {}) {
-  const state = { active, calls: [] };
+// `activeState` is what `is-active` prints while the unit is not plainly
+// active or inactive (activating during a restart backoff, deactivating).
+function fakeSystemd(install, { available = true, active = false, relay = null, activeState = null, version = 257, linger = 'yes' } = {}) {
+  const state = { active, activeState, calls: [] };
   state.impl = (command, args = []) => {
     const line = [command, ...args].join(' ');
     if (command === 'systemctl') {
       if (!available) return { status: 1 };
       state.calls.push(line);
-      if (args.includes('is-active')) return { status: state.active ? 0 : 3 };
+      if (args.includes('--version')) return { status: 0, stdout: `systemd ${version} (${version}.1-1)\n+PAM +AUDIT\n` };
+      if (args.includes('is-active')) {
+        const answer = state.activeState || (state.active ? 'active' : 'inactive');
+        return { status: answer === 'active' ? 0 : 3, stdout: `${answer}\n` };
+      }
       if (args.includes('--now') && args.includes('enable')) { state.active = true; relay?.loadConfig(); }
       if (args.includes('restart')) relay?.loadConfig();
       if (args.includes('stop') || args.includes('disable')) { state.active = false; if (relay) relay.running = false; }
       return { status: 0 };
     }
-    if (command === 'loginctl') { state.calls.push(line); return { status: 0 }; }
+    if (command === 'loginctl') {
+      state.calls.push(line);
+      return args.includes('show-user') ? { status: 0, stdout: `${linger}\n` } : { status: 0 };
+    }
     return { status: 1 };
   };
   return state;
+}
+
+// A git checkout as `makeInstall` lays it out: `.git` beside the package, the
+// config in server/.
+function makeCheckout(t, { config = EXISTING } = {}) {
+  const install = makeInstall(t);
+  fs.mkdirSync(path.join(install.packageRoot, '.git'), { recursive: true });
+  install.configPath = path.join(install.packageRoot, 'server', 'config.json');
+  install.readConfig = () => JSON.parse(fs.readFileSync(install.configPath, 'utf8'));
+  if (config) fs.writeFileSync(install.configPath, JSON.stringify(config));
+  return install;
+}
+
+// What `oar service install` writes for `install` (generated: this version's).
+async function unitFor(install, { checkout = false, earlier = false, nodeBin = '/opt/node/bin/node' } = {}) {
+  const { buildServicePath, buildSystemdUnit, buildSystemdUnit0919 } = await import('./services/oar-cli-helpers.mjs');
+  const args = {
+    nodeBin,
+    packageRoot: install.packageRoot,
+    configPath: install.configPath,
+    dataDir: path.join(install.stateRoot, 'data'),
+    logDir: path.join(install.stateRoot, 'logs'),
+    pathEnv: buildServicePath({ nodeBin, envPath: '/usr/bin', homeDir: install.homeDir }),
+    checkout,
+    systemdVersion: 257,
+  };
+  return earlier ? buildSystemdUnit0919(args) : buildSystemdUnit(args);
+}
+
+function writeUnit(install, text) {
+  fs.mkdirSync(path.dirname(install.unitPath), { recursive: true });
+  fs.writeFileSync(install.unitPath, text);
 }
 
 // Answers for the questions of `oar setup`, in order; a test that expects no
@@ -95,7 +136,9 @@ function scripted(answers = []) {
 
 function makeInstall(t, { config = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-cli-commands-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // Retries only as extra safety on Windows: every test closes its own
+  // databases before this runs.
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   // No .git beside the package: the layout of a global install.
   const packageRoot = path.join(root, 'pkg');
   fs.mkdirSync(path.join(packageRoot, 'server'), { recursive: true });
@@ -428,15 +471,29 @@ test('in a terminal the restart is a question; yes is the default, no leaves the
   assert.equal(fs.existsSync(no.previousPath), false);
 });
 
-test('the service is restarted by systemd, not through the relay', async (t) => {
+test('setup restarts the service through the relay, which waits for its turns', async (t) => {
   const install = makeInstall(t, { config: EXISTING });
-  fs.mkdirSync(path.dirname(install.unitPath), { recursive: true });
-  fs.writeFileSync(install.unitPath, '[Unit]\n');
+  writeUnit(install, '[Unit]\n');
   const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
   const systemd = fakeSystemd(install, { active: true, relay });
   const result = await runSetup(install.options({ argv: ['--port', '4150'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl }));
   assert.equal(result.code, 0);
-  assert.deepEqual(relay.shutdowns, []);
+  // Asked on the port it runs on; its supervisor hands the restart to systemd.
+  assert.deepEqual(relay.shutdowns.map(({ port, restart }) => ({ port, restart })), [{ port: 4100, restart: true }]);
+  assert.ok(!systemd.calls.some((call) => /systemctl --user (restart|stop)/.test(call)), systemd.calls.join('\n'));
+  assert.equal(relay.port, 4150);
+});
+
+test('setup under the service falls back to systemd when the relay refuses the restart', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  writeUnit(install, '[Unit]\n');
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const answer = relay.fetch;
+  relay.fetch = async (url, options) => (String(url).endsWith('/api/relay/shutdown') ? { ok: false, status: 501 } : answer(url, options));
+  const systemd = fakeSystemd(install, { active: true, relay });
+  const result = await runSetup(install.options({ argv: ['--port', '4150'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl }));
+  assert.equal(result.code, 0);
+  assert.ok(systemd.calls.indexOf('systemctl --user reset-failed oar') < systemd.calls.indexOf('systemctl --user restart oar'));
   assert.ok(systemd.calls.includes('systemctl --user restart oar'));
   assert.equal(relay.port, 4150);
 });
@@ -463,8 +520,11 @@ test('setup --start installs the service where systemd answers and starts the re
   const systemd = fakeSystemd(install, { relay });
   const result = await runSetup(install.options({ argv: ['--defaults', '--start'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl }));
   assert.deepEqual(result, { code: 0, reason: 'setup-complete' });
+  // The unit as the generator writes it: a state path with a backslash (a
+  // Windows temp folder, where this runs on win32) is quoted and escaped.
   const unit = fs.readFileSync(install.unitPath, 'utf8');
-  assert.ok(unit.includes(`Environment=COPILOT_WEB_RELAY_CONFIG=${install.configPath}`));
+  assert.equal(unit, await unitFor(install));
+  assert.match(unit, /^Environment="?COPILOT_WEB_RELAY_CONFIG=/m);
   assert.ok(systemd.calls.includes('loginctl enable-linger dev'));
   assert.ok(systemd.calls.includes('systemctl --user enable --now oar'));
   assert.deepEqual(install.spawned, []);
@@ -849,14 +909,85 @@ test('stop: a busy relay stops later, a foreign port holder is not touched, the 
   assert.deepEqual(await runRestart(own), { code: 1, reason: 'port-taken' });
   assert.match(foreign.output(), /A relay of this install seems to run \(process 4242\).*restart it from its web UI/);
 
+});
+
+test('stop under the service goes through the relay; --now and a silent relay go to systemd', async (t) => {
   const service = makeInstall(t, { config: EXISTING });
-  fs.mkdirSync(path.dirname(service.unitPath), { recursive: true });
-  fs.writeFileSync(service.unitPath, '[Unit]\n');
+  writeUnit(service, '[Unit]\n');
   const serviceRelay = fakeRelay(service, { port: 4100, token: 'old-token' });
   const systemd = fakeSystemd(service, { active: true, relay: serviceRelay });
-  assert.deepEqual(await runStop(service.options({ fetchImpl: serviceRelay.fetch, spawnSyncImpl: systemd.impl })), { code: 0, reason: 'stopped' });
+  const options = (argv, overrides = {}) => service.options({ argv, fetchImpl: serviceRelay.fetch, spawnSyncImpl: systemd.impl, ...overrides });
+  assert.deepEqual(await runStop(options([])), { code: 0, reason: 'stopped' });
+  assert.deepEqual(serviceRelay.shutdowns.map(({ restart, immediate }) => ({ restart, immediate })), [{ restart: false, immediate: undefined }]);
+  assert.ok(!systemd.calls.includes('systemctl --user stop oar'));
+  assert.match(service.output(), /The relay is stopped\. The service stays enabled: it starts again at the next boot, or with: oar start/);
+
+  // A busy relay stops once its turns finish; the unit stays enabled.
+  const busy = makeInstall(t, { config: EXISTING });
+  writeUnit(busy, '[Unit]\n');
+  const busyRelay = fakeRelay(busy, { port: 4100, token: 'old-token', busy: true });
+  const busySystemd = fakeSystemd(busy, { active: true, relay: busyRelay });
+  assert.deepEqual(await runStop(busy.options({ argv: [], fetchImpl: busyRelay.fetch, spawnSyncImpl: busySystemd.impl })), { code: 0, reason: 'stop-queued' });
+  assert.match(busy.output(), /stops by itself when its running turns finish \(at once: oar stop --now\)\. The service stays enabled/);
+  assert.ok(!busySystemd.calls.includes('systemctl --user stop oar'));
+
+  // --now: systemd, without asking the relay.
+  serviceRelay.running = true;
+  systemd.active = true;
+  serviceRelay.shutdowns.length = 0;
+  service.lines.length = 0;
+  assert.deepEqual(await runStop(options(['--now'])), { code: 0, reason: 'stopped' });
   assert.ok(systemd.calls.includes('systemctl --user stop oar'));
   assert.deepEqual(serviceRelay.shutdowns, []);
+  assert.match(service.output(), /The relay service is stopped\./);
+
+  // A unit in its restart backoff: nothing answers, systemd stops it.
+  systemd.calls.length = 0;
+  systemd.activeState = 'activating';
+  assert.deepEqual(await runStop(options([])), { code: 0, reason: 'stopped' });
+  assert.ok(systemd.calls.includes('systemctl --user stop oar'));
+  systemd.activeState = null;
+
+  // A relay that answers with another token (changed by hand): systemd too.
+  const changed = makeInstall(t, { config: EXISTING });
+  writeUnit(changed, '[Unit]\n');
+  const changedRelay = fakeRelay(changed, { port: 4100, token: 'another-token' });
+  const changedSystemd = fakeSystemd(changed, { active: true, relay: changedRelay });
+  assert.deepEqual(await runStop(changed.options({ argv: [], fetchImpl: changedRelay.fetch, spawnSyncImpl: changedSystemd.impl })), { code: 0, reason: 'stopped' });
+  assert.ok(changedSystemd.calls.includes('systemctl --user stop oar'));
+});
+
+test('under the service, a relay still on its earlier port and token is asked there', async (t) => {
+  const install = makeInstall(t, { config: { ...EXISTING, port: 4150, authToken: 'new-token' } });
+  writeUnit(install, '[Unit]\n');
+  fs.mkdirSync(path.dirname(install.previousPath), { recursive: true });
+  fs.writeFileSync(install.previousPath, JSON.stringify({ port: 4100, authToken: 'old-token' }));
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const systemd = fakeSystemd(install, { active: true, relay });
+  assert.deepEqual(await runRestart(install.options({ argv: [], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl })), { code: 0, reason: 'restarted' });
+  assert.deepEqual(relay.shutdowns.map(({ port, auth, restart }) => ({ port, auth, restart })), [{ port: 4100, auth: 'Bearer old-token', restart: true }]);
+  assert.ok(!systemd.calls.includes('systemctl --user restart oar'));
+  assert.equal(relay.port, 4150);
+  assert.equal(fs.existsSync(install.previousPath), false);
+});
+
+test('--now of a relay without a service asks it not to wait for its turns', async (t) => {
+  // systemd is there, but no unit: --now never goes to systemctl.
+  const install = makeInstall(t, { config: EXISTING });
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const systemd = fakeSystemd(install, { relay });
+  const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+  assert.deepEqual(await runStop(options(['--now'])), { code: 0, reason: 'stopped' });
+  assert.equal(relay.shutdowns[0].immediate, true);
+  assert.equal(relay.shutdowns[0].restart, false);
+  relay.running = true;
+  assert.equal((await runRestart(options(['--now']))).code, 0);
+  assert.deepEqual(relay.shutdowns.slice(1).map(({ restart, immediate }) => ({ restart, immediate })), [{ restart: true, immediate: true }]);
+  assert.deepEqual(systemd.calls.filter((call) => /stop|restart|reset-failed|enable/.test(call)), []);
+  // Without --now the request waits for the turns, as before.
+  relay.running = true;
+  await runStop(options([]));
+  assert.equal(relay.shutdowns.at(-1).immediate, undefined);
 });
 
 test('restart restarts a running relay through its API, the service through systemd, and starts a stopped one', async (t) => {
@@ -867,14 +998,29 @@ test('restart restarts a running relay through its API, the service through syst
   assert.match(install.output(), /The relay restarted\./);
   assert.match(install.output(), /Relay URL:/);
 
+  // Under the service: through the relay too, which waits for its turns.
   const service = makeInstall(t, { config: EXISTING });
-  fs.mkdirSync(path.dirname(service.unitPath), { recursive: true });
-  fs.writeFileSync(service.unitPath, '[Unit]\n');
+  writeUnit(service, '[Unit]\n');
   const serviceRelay = fakeRelay(service, { port: 4100, token: 'old-token' });
   const systemd = fakeSystemd(service, { active: true, relay: serviceRelay });
-  assert.equal((await runRestart(service.options({ fetchImpl: serviceRelay.fetch, spawnSyncImpl: systemd.impl }))).code, 0);
-  assert.ok(systemd.calls.includes('systemctl --user restart oar'));
-  assert.deepEqual(serviceRelay.shutdowns, []);
+  const options = (argv) => service.options({ argv, fetchImpl: serviceRelay.fetch, spawnSyncImpl: systemd.impl });
+  assert.deepEqual(await runRestart(options([])), { code: 0, reason: 'restarted' });
+  assert.equal(serviceRelay.shutdowns.length, 1);
+  assert.equal(serviceRelay.shutdowns[0].restart, true);
+  assert.ok(!systemd.calls.includes('systemctl --user restart oar'));
+
+  // --now: systemd at once, its backoff cleared first.
+  assert.deepEqual(await runRestart(options(['--now'])), { code: 0, reason: 'restarted' });
+  assert.equal(serviceRelay.shutdowns.length, 1);
+  const reset = systemd.calls.indexOf('systemctl --user reset-failed oar');
+  assert.ok(reset > -1 && systemd.calls.indexOf('systemctl --user restart oar') > reset);
+
+  // A relay that does not answer (its unit restarting, or hung): systemd.
+  systemd.calls.length = 0;
+  serviceRelay.running = false;
+  assert.deepEqual(await runRestart(options([])), { code: 0, reason: 'restarted' });
+  assert.deepEqual(systemd.calls.filter((call) => /reset-failed|restart/.test(call)), ['systemctl --user reset-failed oar', 'systemctl --user restart oar']);
+  assert.equal(serviceRelay.shutdowns.length, 1);
 
   const stopped = makeInstall(t, { config: EXISTING });
   const stoppedRelay = fakeRelay(stopped, { port: 4100, token: 'old-token', running: false });
@@ -907,7 +1053,8 @@ test('service install on Linux writes the unit, enables lingering and starts the
   assert.deepEqual(await runService(options(['install'])), { code: 0, reason: 'service-install' });
   const unit = fs.readFileSync(install.unitPath, 'utf8');
   assert.ok(unit.includes('ExecStart=/opt/node/bin/node '));
-  assert.ok(unit.includes(`Environment=COPILOT_WEB_RELAY_DATA_DIR=${path.join(install.stateRoot, 'data')}`));
+  assert.equal(unit, await unitFor(install));
+  assert.match(unit, /^Environment="?COPILOT_WEB_RELAY_DATA_DIR=/m);
   assert.ok(systemd.calls.includes('loginctl enable-linger dev'));
   assert.ok(systemd.calls.includes('systemctl --user daemon-reload'));
   assert.ok(systemd.calls.includes('systemctl --user enable --now oar'));
@@ -942,8 +1089,7 @@ test('service install first stops a relay that was started by hand', async (t) =
 
 test('service remove on Linux disables the service, deletes the unit and reloads systemd', async (t) => {
   const install = makeInstall(t, { config: EXISTING });
-  fs.mkdirSync(path.dirname(install.unitPath), { recursive: true });
-  fs.writeFileSync(install.unitPath, '[Unit]\n');
+  writeUnit(install, await unitFor(install));
   const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
   const systemd = fakeSystemd(install, { active: true, relay });
   const options = install.options({ argv: ['remove'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
@@ -1003,15 +1149,322 @@ test('on win32 the service is the autostart entry of the web UI', async (t) => {
   assert.deepEqual(autostart.sets, [true, false]);
 });
 
-test('the service is not there on macOS yet, and not for a git checkout', async (t) => {
+test('the service is not there on macOS yet, nor for a git checkout outside Linux', async (t) => {
   const install = makeInstall(t, { config: EXISTING });
   assert.deepEqual(await runService(install.options({ argv: ['install'], platform: 'darwin' })), { code: 1, reason: 'unsupported' });
   assert.match(install.output(), /not supported on macOS yet\. Start the relay with: oar start/);
 
-  fs.mkdirSync(path.join(install.packageRoot, '.git'));
+  const checkout = makeCheckout(t);
+  for (const platform of ['darwin', 'win32']) {
+    assert.deepEqual(await runService(checkout.options({ argv: ['install'], platform })), { code: 1, reason: 'git-checkout' });
+    assert.deepEqual(await runStart(checkout.options({ platform })), { code: 1, reason: 'git-checkout' });
+  }
+  // On Linux without systemd: no service, and npm start for the relay.
+  checkout.lines.length = 0;
+  assert.deepEqual(await runService(checkout.options({ argv: ['install'] })), { code: 1, reason: 'no-systemd' });
+  assert.match(checkout.output(), /Start the relay with: npm start/);
+  // Without its unit a checkout is not started in the background.
+  assert.deepEqual(await runStart(checkout.options({ spawnSyncImpl: fakeSystemd(checkout).impl })), { code: 1, reason: 'git-checkout' });
+  assert.match(checkout.output(), /npm start, or run it as a service: node bin\/oar\.js service install/);
+  assert.deepEqual(checkout.spawned, []);
+});
+
+test('service install in a git checkout writes the checkout unit and starts it through systemd', async (t) => {
+  const install = makeCheckout(t);
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+  const systemd = fakeSystemd(install, { relay });
+  const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+  assert.deepEqual(await runService(options(['install'])), { code: 0, reason: 'service-install' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), await unitFor(install, { checkout: true }));
+  const unit = fs.readFileSync(install.unitPath, 'utf8');
+  assert.ok(unit.includes(`WorkingDirectory=${install.packageRoot}\n`));
+  assert.doesNotMatch(unit, /COPILOT_WEB_RELAY_/);
+  assert.ok(systemd.calls.includes('loginctl enable-linger dev'));
+  const reload = systemd.calls.indexOf('systemctl --user daemon-reload');
+  const reset = systemd.calls.indexOf('systemctl --user reset-failed oar');
+  const enable = systemd.calls.indexOf('systemctl --user enable --now oar');
+  assert.ok(reload > -1 && reset > reload && enable > reset, systemd.calls.join('\n'));
+  assert.deepEqual(install.spawned, []);
+
   install.lines.length = 0;
-  assert.deepEqual(await runService(install.options({ argv: ['install'] })), { code: 1, reason: 'git-checkout' });
-  assert.deepEqual(await runStart(install.options()), { code: 1, reason: 'git-checkout' });
+  assert.deepEqual(await runService(options(['status'])), { code: 0, reason: 'service-status' });
+  assert.match(install.output(), /Service: installed, running/);
+  assert.match(install.output(), new RegExp(`Unit: ${install.unitPath.replace(/[\\.]/g, '\\$&')} \\(written by OAR for this install\\)`));
+
+  // start, status and stop of the checkout go through the unit.
+  assert.deepEqual(await runStop(options([])), { code: 0, reason: 'stopped' });
+  assert.equal(relay.shutdowns.at(-1).restart, false);
+  assert.match(install.output(), /starts again at the next boot, or with: node bin\/oar\.js start/);
+  systemd.active = false;
+  systemd.calls.length = 0;
+  assert.deepEqual(await runStart(options([])), { code: 0, reason: 'started' });
+  assert.ok(systemd.calls.indexOf('systemctl --user reset-failed oar') < systemd.calls.indexOf('systemctl --user enable --now oar'));
+  install.lines.length = 0;
+  assert.equal((await runStatus(options([]))).code, 0);
+  assert.match(install.output(), /Service: installed, running/);
+  assert.deepEqual(install.spawned, []);
+});
+
+test('a checkout service install warns about relay paths of the shell, and about a versioned Node', async (t) => {
+  const install = makeCheckout(t);
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+  const systemd = fakeSystemd(install, { relay });
+  const options = install.options({
+    argv: ['install'],
+    fetchImpl: relay.fetch,
+    spawnSyncImpl: systemd.impl,
+    nodeBin: '/home/dev/.nvm/versions/node/v24.1.0/bin/node',
+  });
+  options.env = { ...options.env, COPILOT_WEB_RELAY_DATA_DIR: '/home/dev/scratch' };
+  assert.equal((await runService(options)).code, 0);
+  assert.match(install.output(), /COPILOT_WEB_RELAY_DATA_DIR is set in this shell; the service does not get it/);
+  assert.doesNotMatch(install.output(), /COPILOT_WEB_RELAY_CONFIG is set/);
+  assert.match(install.output(), /runs the Node at \/home\/dev\/\.nvm\/versions\/node\/v24\.1\.0\/bin\/node; after switching Node versions, run node bin\/oar\.js service install again/);
+  assert.doesNotMatch(fs.readFileSync(install.unitPath, 'utf8'), /scratch/);
+});
+
+test('a checkout service waits for the lock of the data folder its config names', async (t) => {
+  const install = makeCheckout(t);
+  const dataDir = path.join(install.root, 'elsewhere-data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(install.configPath, JSON.stringify({ ...EXISTING, dataDir }));
+  const lockPath = path.join(dataDir, 'relay-server.lock');
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 4242 }));
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+  const systemd = fakeSystemd(install, { relay });
+  writeUnit(install, await unitFor(install, { checkout: true }));
+  // No relay answers and the lock's process is alive: the leftover lock goes first.
+  const result = await runStart(install.options({ fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl, isProcessAliveImpl: (pid) => pid === 4242 }));
+  assert.equal(result.code, 0);
+  assert.match(install.output(), new RegExp(`Removing a leftover relay lock \\(${lockPath.replace(/[\\.]/g, '\\$&')}\\)`));
+});
+
+test('a hand-made unit is left byte-identical; --replace keeps a copy and writes the generated one', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const systemd = fakeSystemd(install, { relay, active: true });
+  const handMade = '[Unit]\nDescription=my relay\n\n[Service]\nExecStart=/usr/local/bin/node /srv/oar/server/server.js\n';
+  writeUnit(install, handMade);
+  const dropIns = path.join(path.dirname(install.unitPath), 'oar.service.d');
+  fs.mkdirSync(dropIns);
+  fs.writeFileSync(path.join(dropIns, 'libstdcxx.conf'), '[Service]\nEnvironment=LD_PRELOAD=/opt/lib/libstdc++.so.6\n');
+  const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+
+  await runService(options(['status']));
+  assert.match(install.output(), /Service: installed, running/);
+  assert.match(install.output(), /Unit: .*oar\.service \(hand-made\)/);
+  assert.match(install.output(), /OAR leaves it as it is\. To replace it with this install's, keeping a copy: oar service install --replace/);
+  assert.match(install.output(), /Drop-in: .*libstdcxx\.conf \(your own settings, kept\)/);
+
+  install.lines.length = 0;
+  systemd.calls.length = 0;
+  assert.deepEqual(await runService(options(['install'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), handMade);
+  assert.match(install.output(), /Left as it is: .*oar\.service \(hand-made\)\. To replace it with this install's, keeping a copy: oar service install --replace/);
+  assert.deepEqual(systemd.calls.filter((call) => !call.includes('show-environment') && !call.includes('is-active')), []);
+
+  // remove leaves it too.
+  assert.deepEqual(await runService(options(['remove'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), handMade);
+  assert.match(install.output(), /To remove it, keeping a copy: oar service remove --replace/);
+  assert.ok(!systemd.calls.includes('systemctl --user disable --now oar'));
+
+  install.lines.length = 0;
+  assert.deepEqual(await runService(options(['install', '--replace'])), { code: 0, reason: 'service-install' });
+  const backup = `${install.unitPath}.bak`;
+  assert.equal(fs.readFileSync(backup, 'utf8'), handMade);
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), await unitFor(install));
+  assert.match(install.output(), /Kept a copy of .*oar\.service as .*oar\.service\.bak/);
+  assert.match(install.output(), /The new unit applies at the next restart: oar restart --now/);
+  assert.equal(fs.readFileSync(path.join(dropIns, 'libstdcxx.conf'), 'utf8'), '[Service]\nEnvironment=LD_PRELOAD=/opt/lib/libstdc++.so.6\n');
+
+  // A second replace keeps the first copy.
+  writeUnit(install, `${handMade}# again\n`);
+  assert.equal((await runService(options(['install', '--replace']))).code, 0);
+  assert.equal(fs.readFileSync(backup, 'utf8'), handMade);
+  assert.equal(fs.readFileSync(`${backup}-2`, 'utf8'), `${handMade}# again\n`);
+
+  // remove --replace keeps a copy and removes it.
+  writeUnit(install, handMade);
+  assert.deepEqual(await runService(options(['remove', '--replace'])), { code: 0, reason: 'service-remove' });
+  assert.equal(fs.existsSync(install.unitPath), false);
+  assert.equal(fs.readFileSync(`${backup}-3`, 'utf8'), handMade);
+  assert.ok(systemd.calls.includes('systemctl --user disable --now oar'));
+});
+
+test('a unit of 0.9.19 is rewritten; one of this version again only says so when its text changed', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
+  const systemd = fakeSystemd(install, { relay, active: true });
+  writeUnit(install, await unitFor(install, { earlier: true }));
+  const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+  await runService(options(['status']));
+  assert.match(install.output(), /\(written by an earlier OAR version\)/);
+  assert.match(install.output(), /from an earlier OAR version; write this version's with: oar service install/);
+
+  install.lines.length = 0;
+  assert.deepEqual(await runService(options(['install'])), { code: 0, reason: 'service-install' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), await unitFor(install));
+  assert.equal(fs.existsSync(`${install.unitPath}.bak`), false);
+  assert.match(install.output(), /applies at the next restart: oar restart --now/);
+  assert.deepEqual(relay.shutdowns, []);
+
+  install.lines.length = 0;
+  assert.equal((await runService(options(['install']))).code, 0);
+  assert.doesNotMatch(install.output(), /applies at the next restart/);
+});
+
+test('a systemd older than 254 gets the unit without the backoff', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+  const systemd = fakeSystemd(install, { relay, version: 249 });
+  assert.equal((await runService(install.options({ argv: ['install'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl }))).code, 0);
+  const unit = fs.readFileSync(install.unitPath, 'utf8');
+  assert.match(unit, /^RestartSec=10$/m);
+  assert.doesNotMatch(unit, /RestartSteps/);
+});
+
+test('a worktree leaves the unit of the checkout it came from, and does not start that relay', async (t) => {
+  const main = makeCheckout(t);
+  const mainRelay = fakeRelay(main, { port: 4100, token: 'old-token', running: false });
+  const mainSystemd = fakeSystemd(main, { relay: mainRelay });
+  assert.equal((await runService(main.options({ argv: ['install'], spawnSyncImpl: mainSystemd.impl, fetchImpl: mainRelay.fetch }))).code, 0);
+  const mainUnit = fs.readFileSync(main.unitPath, 'utf8');
+
+  const worktree = makeCheckout(t);
+  const systemd = fakeSystemd(worktree, { active: true });
+  const options = (argv) => worktree.options({ argv, homeDir: main.homeDir, spawnSyncImpl: systemd.impl });
+  assert.deepEqual(await runService(options(['install'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(main.unitPath, 'utf8'), mainUnit);
+  assert.match(worktree.output(), new RegExp(`Left as it is: .*oar\\.service \\(written by OAR for another install \\(${main.packageRoot.replace(/[\\.]/g, '\\$&')}\\)\\)\\. To replace it with this install's, keeping a copy: node bin/oar\\.js service install --replace`));
+
+  worktree.lines.length = 0;
+  await runService(options(['status']));
+  assert.match(worktree.output(), /Service: not installed for this install/);
+  assert.match(worktree.output(), /written by OAR for another install/);
+  await runStatus(options([]));
+  assert.match(worktree.output(), /Service: not installed \(oar\.service belongs to another OAR install\)/);
+
+  // start and stop of the worktree leave the other relay's unit alone.
+  systemd.calls.length = 0;
+  assert.deepEqual(await runStart(options([])), { code: 1, reason: 'git-checkout' });
+  assert.equal((await runStop(options([]))).reason, 'not-running');
+  assert.deepEqual(systemd.calls.filter((call) => /enable|stop|restart|reset-failed/.test(call)), []);
+});
+
+test('a checkout leaves a hand-made unit of another relay alone: no systemctl change for start, stop, restart, --now', async (t) => {
+  // A global install's hand-made unit (no OAR marker), and a worktree with a config of its own, its relay not running.
+  const worktree = makeCheckout(t, { config: { ...EXISTING, port: 4200 } });
+  const handMade = '[Service]\nExecStart=/home/dev/.nvm/versions/node/v22.1.0/bin/node /home/dev/.oar/npm/lib/node_modules/@oar-sh/oar/server/server.js\nEnvironment=COPILOT_WEB_RELAY_CONFIG=/home/dev/.oar/config.json\n';
+  writeUnit(worktree, handMade);
+  const systemd = fakeSystemd(worktree, { active: true });
+  const options = (argv) => worktree.options({ argv, spawnSyncImpl: systemd.impl });
+  const mutations = () => systemd.calls.filter((call) => /\b(stop|restart|enable|reset-failed|disable|daemon-reload)\b/.test(call));
+
+  assert.deepEqual(await runStart(options([])), { code: 1, reason: 'git-checkout' });
+  assert.equal((await runStop(options([]))).reason, 'not-running');
+  assert.equal((await runStop(options(['--now']))).reason, 'not-running');
+  assert.deepEqual(await runRestart(options([])), { code: 1, reason: 'git-checkout' });
+  assert.deepEqual(await runRestart(options(['--now'])), { code: 1, reason: 'git-checkout' });
+  assert.deepEqual(mutations(), []);
+  assert.deepEqual(worktree.spawned, []);
+
+  worktree.lines.length = 0;
+  await runService(options(['status']));
+  assert.match(worktree.output(), /Service: not installed for this install/);
+  assert.match(worktree.output(), /\(hand-made, not for this checkout\)/);
+  await runStatus(options([]));
+  assert.match(worktree.output(), /oar\.service belongs to another OAR install/);
+  // install and remove keep refusing it.
+  assert.deepEqual(await runService(options(['install'])), { code: 1, reason: 'hand-made-unit' });
+  assert.deepEqual(await runService(options(['remove'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(worktree.unitPath, 'utf8'), handMade);
+  assert.deepEqual(mutations(), []);
+});
+
+// A checkout's root is a real temp folder here, so a POSIX one; on win32 it
+// has a drive letter, which no Linux unit names (the rule itself is tested
+// with POSIX paths on every platform in oar-cli-helpers.test.mjs).
+test('a hand-made unit that runs this checkout is its service', { skip: process.platform === 'win32' && 'a checkout root is a POSIX path' }, async (t) => {
+  for (const unit of [
+    (root) => `[Service]\nExecStart=/usr/local/bin/node ${root}/server/server.js\n`,
+    (root) => `[Service]\nWorkingDirectory=${root}\nExecStart=/usr/bin/env node ${root}/server/server.js\n`,
+    (root) => `[Service]\nExecStart="/opt/my node/node" "${root}/server/../server/server.js"\n`,
+  ]) {
+    const install = makeCheckout(t);
+    writeUnit(install, unit(install.packageRoot));
+    const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+    const systemd = fakeSystemd(install, { relay });
+    const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+    assert.deepEqual(await runStart(options([])), { code: 0, reason: 'started' });
+    assert.ok(systemd.calls.includes('systemctl --user enable --now oar'));
+    install.lines.length = 0;
+    await runService(options(['status']));
+    assert.match(install.output(), /Service: installed, running/);
+    assert.match(install.output(), /\(hand-made\)\n/);
+  }
+});
+
+test('a hand-made unit that only runs in the checkout is not its service, and is kept', { skip: process.platform === 'win32' && 'a checkout root is a POSIX path' }, async (t) => {
+  const install = makeCheckout(t);
+  const handMade = `[Service]\nWorkingDirectory=${install.packageRoot}\nExecStart=/usr/bin/env node server/server.js\n`;
+  writeUnit(install, handMade);
+  const relay = fakeRelay(install, { port: 4100, token: 'old-token', running: false });
+  const systemd = fakeSystemd(install, { relay, active: true });
+  const options = (argv) => install.options({ argv, fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl });
+  const mutations = () => systemd.calls.filter((call) => /\b(stop|restart|enable|reset-failed|disable|daemon-reload)\b/.test(call));
+
+  await runService(options(['status']));
+  assert.match(install.output(), /Service: not installed for this install/);
+  assert.match(install.output(), /\(hand-made, not for this checkout\)/);
+  assert.deepEqual(await runStart(options([])), { code: 1, reason: 'git-checkout' });
+  assert.deepEqual(await runService(options(['install'])), { code: 1, reason: 'hand-made-unit' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), handMade);
+  assert.deepEqual(mutations(), []);
+});
+
+test('a unit that is starting (restart backoff) or stopping counts as the running service', async (t) => {
+  for (const activeState of ['activating', 'reloading', 'deactivating']) {
+    const install = makeInstall(t, { config: EXISTING });
+    const systemd = fakeSystemd(install, { activeState });
+    writeUnit(install, await unitFor(install));
+    const options = (argv) => install.options({ argv, spawnSyncImpl: systemd.impl });
+    await runService(options(['status']));
+    assert.match(install.output(), /Service: installed, running/);
+    assert.deepEqual(await runStop(options([])), { code: 0, reason: 'stopped' });
+    assert.ok(systemd.calls.includes('systemctl --user stop oar'), activeState);
+  }
+  for (const activeState of ['failed', 'inactive']) {
+    const install = makeInstall(t, { config: EXISTING });
+    writeUnit(install, await unitFor(install));
+    await runService(install.options({ argv: ['status'], spawnSyncImpl: fakeSystemd(install, { activeState }).impl }));
+    assert.match(install.output(), /Service: installed, not running/);
+  }
+});
+
+test('service status says when lingering is off', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  writeUnit(install, await unitFor(install));
+  await runService(install.options({ argv: ['status'], spawnSyncImpl: fakeSystemd(install, { linger: 'no' }).impl }));
+  assert.match(install.output(), /Lingering is off: the relay stops when you log out/);
+  const on = makeInstall(t, { config: EXISTING });
+  writeUnit(on, await unitFor(on));
+  await runService(on.options({ argv: ['status'], spawnSyncImpl: fakeSystemd(on).impl }));
+  assert.doesNotMatch(on.output(), /Lingering/);
+});
+
+test('setup --start leaves a hand-made unit as it is and starts the relay through it', async (t) => {
+  const install = makeInstall(t);
+  const relay = fakeRelay(install, { port: 3333, token: '', running: false });
+  const systemd = fakeSystemd(install, { relay });
+  const handMade = '[Service]\nExecStart=/usr/bin/node /srv/oar/server/server.js\n';
+  writeUnit(install, handMade);
+  const result = await runSetup(install.options({ argv: ['--defaults', '--start'], fetchImpl: relay.fetch, spawnSyncImpl: systemd.impl }));
+  assert.deepEqual(result, { code: 0, reason: 'setup-complete' });
+  assert.equal(fs.readFileSync(install.unitPath, 'utf8'), handMade);
+  assert.match(install.output(), /Left as it is: .*oar\.service \(hand-made\)/);
+  assert.ok(systemd.calls.includes('systemctl --user enable --now oar'));
+  assert.ok(!systemd.calls.includes('loginctl enable-linger dev'));
 });
 
 test('status names the built-in tunnel only when the config switches it on, and says why it cannot start', async (t) => {
@@ -1043,4 +1496,254 @@ test('a command ends through the exit code, and is only forced out when somethin
   assert.equal(scheduled.ms, 3000);
   scheduled.fn();
   assert.deepEqual(calls, [3]);
+});
+
+test('doctor names the database file the relay runs on, oar.db or copilot.db, and creates none', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  const doctor = async () => {
+    install.lines.length = 0;
+    assert.equal((await runDoctor(install.options({ spawnSyncImpl: () => ({ status: 1 }) }))).code, 0);
+    return install.output();
+  };
+  assert.match(await doctor(), new RegExp(`database      : ${path.join(dataDir, 'oar.db').replace(/[\\.]/g, '\\$&')} \\(not created yet\\)`));
+  assert.equal(fs.existsSync(dataDir), false, 'nothing created');
+
+  fs.mkdirSync(dataDir);
+  fs.writeFileSync(path.join(dataDir, 'copilot.db'), Buffer.alloc(2 * 1048576));
+  assert.match(await doctor(), new RegExp(`database      : ${path.join(dataDir, 'copilot.db').replace(/[\\.]/g, '\\$&')} \\(2\\.0 MB\\)`));
+  assert.deepEqual(fs.readdirSync(dataDir), ['copilot.db']);
+
+  fs.writeFileSync(path.join(dataDir, 'oar.db'), Buffer.alloc(1048576));
+  const both = await doctor();
+  assert.match(both, /database      : .*oar\.db \(1\.0 MB\)/);
+  assert.match(both, /\n {18}.*copilot\.db is also there; the next start compares the two/);
+
+  fs.rmSync(path.join(dataDir, 'copilot.db'));
+  fs.writeFileSync(path.join(dataDir, 'copilot.db-wal'), 'missed by a rename');
+  assert.match(await doctor(), /\n {18}.*copilot\.db-wal is there without its database \(not used, never deleted\)/);
+  assert.deepEqual(fs.readdirSync(dataDir).sort(), ['copilot.db-wal', 'oar.db']);
+});
+
+// ─── oar backup ──────────────────────────────────────────────────────────────
+
+// A disk with room (the test machine's may not pass the backup's check).
+const roomyDisk = { ...fs, statfsSync: () => ({ bavail: 1e12, bsize: 1, blocks: 1e12 }) };
+
+function seedRelayDatabase(install, name = 'oar.db') {
+  const dataDir = path.join(install.stateRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  const db = new Database(path.join(dataDir, name));
+  db.pragma('journal_mode = WAL');
+  db.exec('CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT); CREATE TABLE conversations (id TEXT PRIMARY KEY)');
+  db.prepare("INSERT INTO app_settings VALUES ('db_last_run', '{\"version\":\"9.9.8\"}', 'x')").run();
+  db.prepare("INSERT INTO conversations VALUES ('c1')").run();
+  return { dataDir, db, backupDir: path.join(install.stateRoot, 'backups') };
+}
+
+const backupFiles = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.db')).sort() : []);
+
+test('oar backup beside a running relay: a checked copy named after this version, db_last_run untouched', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { db, backupDir } = seedRelayDatabase(install);
+  // Closed in the test itself, before makeInstall's folder removal (the
+  // after hooks run in the order they were added; Windows refuses to
+  // remove a folder with an open database in it).
+  try {
+    // The relay's connection stays open and writes on.
+    db.pragma('wal_autocheckpoint = 0');
+    db.prepare("INSERT INTO conversations VALUES ('only-in-the-wal')").run();
+    const result = await runBackup(install.options({ argv: ['--reason', 'Pre Rename!'], fsImpl: roomyDisk }));
+    assert.equal(result.code, 0, install.output());
+    assert.equal(result.reason, 'backup-written');
+    const [file] = backupFiles(backupDir);
+    assert.match(file, /^oar-9\.9\.9-\d{8}-\d{6}-pre-rename\.db$/);
+    const copy = new Database(path.join(backupDir, file), { readonly: true });
+    assert.equal(copy.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 2, 'the -wal rows too');
+    copy.close();
+    assert.equal(db.prepare("SELECT value FROM app_settings WHERE key = 'db_last_run'").get().value, '{"version":"9.9.8"}');
+    assert.match(install.output(), /\[oar\] written .*oar-9\.9\.9-.*-pre-rename\.db \(.* MB, quick_check ok, .* s\)/);
+  } finally {
+    db.close();
+  }
+});
+
+test('oar backup counts toward keep and rotates; with dbBackups.enabled false it still runs', async (t) => {
+  const install = makeInstall(t, { config: { ...EXISTING, dbBackups: { enabled: false, keep: 1 } } });
+  const { db, backupDir } = seedRelayDatabase(install);
+  // The relay's connection is not needed open here: closed before the run.
+  db.close();
+  assert.equal((await runBackup(install.options({ argv: [], fsImpl: roomyDisk }))).code, 0);
+  const [first] = backupFiles(backupDir);
+  assert.match(first, /-manual\.db$/);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal((await runBackup(install.options({ argv: ['--reason', 'second'], fsImpl: roomyDisk }))).code, 0);
+  assert.deepEqual(backupFiles(backupDir).map((name) => name.replace(/\d{8}-\d{6}/, 'T')), ['oar-9.9.9-T-second.db'], 'keep 1: the first rotated out');
+});
+
+test('oar backup with no database fails and creates none; with both names it backs up oar.db', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  const none = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  assert.deepEqual(none, { code: 1, reason: 'no-database' });
+  assert.match(install.output(), /No database in .*data to back up \(neither oar\.db nor copilot\.db\)/);
+  assert.equal(fs.existsSync(dataDir), false);
+
+  const legacy = seedRelayDatabase(install, 'copilot.db');
+  legacy.db.close();
+  const current = seedRelayDatabase(install, 'oar.db');
+  current.db.prepare("INSERT INTO conversations VALUES ('c2')").run();
+  current.db.close();
+  assert.equal((await runBackup(install.options({ argv: [], fsImpl: roomyDisk }))).code, 0);
+  const copy = new Database(path.join(current.backupDir, backupFiles(current.backupDir)[0]), { readonly: true });
+  assert.equal(copy.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 2, 'oar.db, not copilot.db');
+  copy.close();
+});
+
+test('oar backup: a guarded folder is a skip (exit 0, said); a copy that fails is exit 1; --reason needs a value', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { db, backupDir } = seedRelayDatabase(install);
+  db.close();
+  fs.mkdirSync(backupDir, { recursive: true });
+  fs.writeFileSync(path.join(backupDir, 'DO_NOT_TOUCH.md'), '');
+  const skipped = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  assert.deepEqual([skipped.code, skipped.reason], [0, 'backup-skipped']);
+  assert.match(install.output(), /\[oar\] skipped: .*DO_NOT_TOUCH\.md guards .*: nothing is written there/);
+  fs.rmSync(path.join(backupDir, 'DO_NOT_TOUCH.md'));
+
+  fs.writeFileSync(path.join(install.stateRoot, 'data', 'oar.db'), 'not a database at all, just text that is long enough');
+  for (const side of ['-wal', '-shm']) fs.rmSync(path.join(install.stateRoot, 'data', `oar.db${side}`), { force: true });
+  const failed = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  assert.equal(failed.code, 1);
+  assert.deepEqual(backupFiles(backupDir), []);
+
+  install.lines.length = 0;
+  assert.deepEqual(await main(install.options({ argv: ['backup', '--reason'] })), { code: 2, reason: 'usage' });
+  assert.match(install.output(), /--reason needs a value/);
+});
+
+test('start while the relay backs up its database says so, not that it did not come up', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'relay-server.lock'), JSON.stringify({ format: 2, pid: 5151, tokenHash: 'x', holder: null }));
+  fs.writeFileSync(path.join(dataDir, 'db-backup-progress.json'), JSON.stringify({ pid: 5151, task: 'backup', from: path.join(dataDir, 'oar.db'), bytes: 351 * 1048576 }));
+  const result = await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 }));
+  assert.deepEqual(result, { code: 0, reason: 'bringing-over' });
+  assert.match(install.output(), /The relay \(process 5151\) is backing up its database \(.+oar\.db, 351 MB\) before this version's migrations and is still running/);
+  fs.rmSync(path.join(dataDir, 'db-backup-progress.json'));
+  fs.writeFileSync(path.join(dataDir, 'earlier-database-progress.json'), JSON.stringify({ pid: 5151, task: 'compare', from: path.join(dataDir, 'copilot.db'), bytes: 2 * 1048576 }));
+  install.lines.length = 0;
+  await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 }));
+  assert.match(install.output(), /is comparing its two database files \(.+copilot\.db, 2 MB\)/);
+});
+
+test('doctor lists the backups: folder, settings, this relay\'s, the last result, and other files here, not rotated', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { db, backupDir } = seedRelayDatabase(install);
+  db.close();
+  await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  fs.writeFileSync(path.join(backupDir, 'main-0.9.19-20261020.db'), Buffer.alloc(1048576));
+  fs.writeFileSync(path.join(backupDir, 'MIGRATION.md'), 'receipt');
+  install.lines.length = 0;
+  await runDoctor(install.options({ spawnSyncImpl: () => ({ status: 1 }) }));
+  const output = install.output();
+  assert.match(output, new RegExp(`backups       : ${backupDir.replace(/[\\.]/g, '\\$&')}\n`));
+  assert.match(output, /at start: on, keep 2/);
+  assert.match(output, /last: written oar-9\.9\.9-\d{8}-\d{6}-manual\.db \(0\.0 MB\), less than an hour ago/);
+  assert.match(output, /this relay's \(1 of 2\):\n {20}oar-9\.9\.9-.*-manual\.db/);
+  assert.match(output, /other files here \(not rotated\):\n {20}main-0\.9\.19-20261020\.db  1\.0 MB\n {20}MIGRATION\.md  0\.0 MB/);
+});
+
+test('oar backup and doctor use the data folder the relay runs on: a checkout\'s config dataDir, COPILOT_WEB_RELAY_DATA_DIR', async (t) => {
+  const install = makeInstall(t);
+  // A checkout (.git beside the package): server/config.json names dataDir,
+  // and an old server/data/copilot.db is still there.
+  fs.mkdirSync(path.join(install.packageRoot, '.git'));
+  const live = path.join(install.root, 'live-data');
+  fs.mkdirSync(live);
+  fs.writeFileSync(path.join(install.packageRoot, 'server', 'config.json'), JSON.stringify({ ...EXISTING, dataDir: live, dbBackups: { dir: path.join(install.root, 'bk') } }));
+  const stale = seedRelayDatabase({ stateRoot: path.join(install.packageRoot, 'server') }, 'copilot.db');
+  stale.db.close();
+  const relayDb = new Database(path.join(live, 'oar.db'));
+  relayDb.exec('CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT); CREATE TABLE conversations (id TEXT PRIMARY KEY)');
+  relayDb.prepare("INSERT INTO conversations VALUES ('live-1'), ('live-2')").run();
+  relayDb.close();
+  const result = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  assert.equal(result.code, 0, install.output());
+  const copy = new Database(result.file, { readonly: true });
+  assert.equal(copy.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 2, 'the live database, not the stale one');
+  copy.close();
+  assert.ok(fs.existsSync(path.join(live, 'db-backups.json')), 'the manifest beside the live database');
+  install.lines.length = 0;
+  await runDoctor(install.options({ spawnSyncImpl: () => ({ status: 1 }) }));
+  assert.match(install.output(), new RegExp(`database      : ${path.join(live, 'oar.db').replace(/[\\.]/g, '\\$&')}`));
+
+  // A global install: COPILOT_WEB_RELAY_DATA_DIR wins over the state root's data.
+  const global = makeInstall(t, { config: EXISTING });
+  const pinned = path.join(global.root, 'pinned');
+  fs.mkdirSync(pinned);
+  new Database(path.join(pinned, 'oar.db')).close();
+  const options = global.options({ argv: [], fsImpl: roomyDisk });
+  options.env = { ...options.env, COPILOT_WEB_RELAY_DATA_DIR: pinned };
+  assert.equal((await runBackup(options)).code, 0, global.output());
+  assert.ok(fs.existsSync(path.join(pinned, 'db-backups.json')));
+});
+
+test('oar backup while another live process backs the same database up: refused with a line, its progress file untouched', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { db, dataDir } = seedRelayDatabase(install);
+  db.close();
+  const progress = path.join(dataDir, 'db-backup-progress.json');
+  fs.writeFileSync(progress, JSON.stringify({ pid: 5151, task: 'backup' }));
+  const result = await runBackup(install.options({ argv: [], fsImpl: roomyDisk, isProcessAliveImpl: (pid) => pid === 5151 }));
+  assert.deepEqual(result, { code: 1, reason: 'backup-busy' });
+  assert.match(install.output(), /\[oar\] Not backing up now: another backup of this database is running \(process 5151\); run oar backup again once it is done\./);
+  assert.deepEqual(JSON.parse(fs.readFileSync(progress, 'utf8')), { pid: 5151, task: 'backup' });
+});
+
+test('oar backup: an unexpected error is one [oar] line and exit 1, not a crash', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  // A folder named oar.db: opening it throws past backupDatabase.
+  fs.mkdirSync(path.join(install.stateRoot, 'data', 'oar.db'), { recursive: true });
+  const result = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  assert.deepEqual(result, { code: 1, reason: 'backup-failed' });
+  assert.match(install.output(), /^\[oar\] The backup of .*oar\.db failed: /m);
+});
+
+test('start: a stale take-over progress file does not hide the backup in progress', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'relay-server.lock'), JSON.stringify({ format: 2, pid: 5151, tokenHash: 'x', holder: null }));
+  fs.writeFileSync(path.join(dataDir, 'earlier-database-progress.json'), JSON.stringify({ pid: 4040, from: 'old', bytes: 1 }));
+  fs.writeFileSync(path.join(dataDir, 'db-backup-progress.json'), JSON.stringify({ pid: 5151, task: 'backup', from: path.join(dataDir, 'oar.db'), bytes: 1048576 }));
+  await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 }));
+  assert.match(install.output(), /is backing up its database/);
+});
+
+test('doctor names backups whose size changed since they were written: listed apart, not rotated', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { db, backupDir } = seedRelayDatabase(install);
+  db.close();
+  const result = await runBackup(install.options({ argv: [], fsImpl: roomyDisk }));
+  fs.appendFileSync(result.file, 'changed');
+  install.lines.length = 0;
+  await runDoctor(install.options({ spawnSyncImpl: () => ({ status: 1 }) }));
+  assert.match(install.output(), new RegExp(`changed since written, not rotated:\\n {20}${path.basename(result.file).replace(/[.]/g, '\\.')}`));
+  assert.ok(backupFiles(backupDir).length === 1);
+});
+
+test('start while the relay waits for oar backup: it is left running and said to be waiting, not that it did not come up', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const dataDir = path.join(install.stateRoot, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'relay-server.lock'), JSON.stringify({ format: 2, pid: 5151, tokenHash: 'x', holder: null }));
+  fs.writeFileSync(path.join(dataDir, 'db-backup-progress.json'), JSON.stringify({ pid: 6262, task: 'backup' }));
+  fs.writeFileSync(path.join(dataDir, 'db-backup-wait.json'), JSON.stringify({ pid: 5151, task: 'wait-backup', waitingFor: 6262 }));
+  const result = await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 || pid === 6262 }));
+  assert.deepEqual(result, { code: 0, reason: 'bringing-over' });
+  assert.deepEqual(install.spawned, [], 'not started again, not killed');
+  assert.match(install.output(), /The relay \(process 5151\) is waiting for `oar backup` \(process 6262\) to finish before its own backup and is still running/);
+  assert.doesNotMatch(install.output(), /did not come up/);
 });

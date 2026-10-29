@@ -17,7 +17,7 @@ import {
 } from '../services/conversation-history-page.mjs';
 import { MESSAGE_PIN_LIMIT, buildPinList } from '../services/message-pin-list.mjs';
 import { buildHiddenMessageList } from '../services/hidden-message-list.mjs';
-import { persistConversationPreferences, readMayCreateSessions } from '../services/conversation-preferences-service.mjs';
+import { persistConversationPreferences, readMayCreateSessions, readPlanOnly } from '../services/conversation-preferences-service.mjs';
 import { parseAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import {
   claudeBackgroundCommandLimitSettingsFields,
@@ -57,6 +57,7 @@ import {
   DEEPSEEK_REASONING_EFFORTS,
   DEFAULT_DEEPSEEK_MODEL,
   DEFAULT_DEEPSEEK_REASONING_EFFORT,
+  deepseekModelLabel,
   deepseekReasoningEffortFor,
 } from '../../shared/deepseek-models.mjs';
 import {
@@ -103,6 +104,7 @@ import {
   resolveSessionGroupReference,
   validateRemoteRelaySessionSettings,
 } from '../../shared/remote-relay-contract.mjs';
+import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import {
   buildCloudSourceRecord,
   buildConversationCloudPayload,
@@ -148,6 +150,7 @@ import {
 import { parseRestartResumeUpdate } from '../services/restart-resume-service.mjs';
 import { removeClaudeSessionLeftovers } from '../services/claude-session-leftovers.mjs';
 import { deepseekStartingBalanceNote } from '../services/plan-usage-deepseek.mjs';
+import { appendTokenSections } from '../services/plan-usage-tokens.mjs';
 import { DEEPSEEK_USAGE_CHECKPOINTS_TABLE } from '../migrations/0024-deepseek-usage-totals.mjs';
 import { claudeProjectDirSlug } from '../services/claude-session-root-service.mjs';
 
@@ -2243,6 +2246,9 @@ export function registerSessionsRoutes(app, deps) {
     // The once-per-episode notes for stopped self-started turns on the key
     // (plan-usage-claude-api.mjs): a saved setting starts every chat afresh.
     claudeApiStopLedger = null,
+    // Tokens per turn and per day (services/token-usage-service.mjs): a
+    // deleted chat drops its turn rows. Absent in older wiring and most tests.
+    tokenUsageService = null,
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -2580,6 +2586,8 @@ export function registerSessionsRoutes(app, deps) {
     if (findDeepSeekUsageCheckpointsTable.get(DEEPSEEK_USAGE_CHECKPOINTS_TABLE)) {
       db.prepare(`DELETE FROM ${DEEPSEEK_USAGE_CHECKPOINTS_TABLE} WHERE conversation_id = ?`).run(conversationId);
     }
+    // Its turns' tokens go with it; the day sums behind Check Usage stay.
+    tokenUsageService?.forgetConversation?.(conversationId);
     // The share access log goes with it; the share rows follow the foreign key.
     shares().forgetConversation(conversationId);
     db.prepare(`DELETE FROM conversations WHERE id = ?`).run(conversationId);
@@ -3398,6 +3406,7 @@ export function registerSessionsRoutes(app, deps) {
         origin: parseRemoteRelayOriginJson(r.origin_json),
         // The owner let this agent-started session's agents start sessions.
         mayCreateSessions: readMayCreateSessions(r),
+        planOnly: readPlanOnly(r),
         // Set on Claude Cloud conversations: repository, branch, session link.
         cloud: buildConversationCloudPayload({
           cloudSourceJson: r.cloud_source_json,
@@ -4158,6 +4167,7 @@ export function registerSessionsRoutes(app, deps) {
       draftUpdatedByClientId: conv.draft_updated_by_client_id || null,
       origin: parseRemoteRelayOriginJson(conv.origin_json),
       mayCreateSessions: readMayCreateSessions(conv),
+      planOnly: readPlanOnly(conv),
       cloud: conversationCloudPayload(conv, runtimeSession),
       group: conversationGroupPayload(conversationId),
       groupPosition: conversationGroupPositionOf(conv),
@@ -4864,6 +4874,7 @@ export function registerSessionsRoutes(app, deps) {
       // Set on conversations another relay's agent created ("via <relay>").
       origin: parseRemoteRelayOriginJson(conv.origin_json),
       mayCreateSessions: readMayCreateSessions(conv),
+      planOnly: readPlanOnly(conv),
       // Set on Claude Cloud conversations: repository, branch, session link.
       cloud: conversationCloudPayload(conv, runtimeSession),
       // The session group it is in, with the other members; null when none.
@@ -5086,6 +5097,7 @@ export function registerSessionsRoutes(app, deps) {
         ? { thinkingDisplay: parseThinkingDisplay(body.thinkingDisplay) }
         : {}),
       ...(mentions('mayCreateSessions') ? { mayCreateSessions: body.mayCreateSessions === true } : {}),
+      ...(mentions('planOnly') ? { planOnly: body.planOnly === true } : {}),
       updatedAt: now,
       createIfMissing: !existing,
       createTitle: 'Session',
@@ -5099,6 +5111,7 @@ export function registerSessionsRoutes(app, deps) {
       thinkingEnabled: persisted.thinkingEnabled ?? null,
       thinkingDisplay: persisted.thinkingDisplay ?? null,
       mayCreateSessions: persisted.mayCreateSessions === true,
+      planOnly: persisted.planOnly === true,
       updatedAt: persisted.updatedAt,
       senderClientId,
     };
@@ -5127,6 +5140,26 @@ export function registerSessionsRoutes(app, deps) {
       if (!stmts.conversationsHaveMayCreateSessions) {
         return res.status(503).json({ error: 'This setting is unavailable until the relay restarts (its storage is missing).' });
       }
+    }
+    // Plan-only: the owner's toggle here. Agents set and clear it through
+    // update_session only (its dry run and Allow card), never through this
+    // route, and they cannot change a plan-only session's mode here either.
+    const remoteRequest = readRemoteRelayRequest(req, remoteRelayInbound).remote;
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'planOnly')) {
+      if (remoteRequest) {
+        return res.status(403).json({ error: 'Agents set plan-only through relay_tool update_session, not through this route.' });
+      }
+      if (typeof req.body.planOnly !== 'boolean') {
+        return res.status(400).json({ error: 'planOnly must be true or false' });
+      }
+      if (!stmts.conversationsHavePlanOnly) {
+        return res.status(503).json({ error: 'This setting is unavailable until the relay restarts (its storage is missing).' });
+      }
+    }
+    if (remoteRequest && readPlanOnly(existing)
+      && Object.prototype.hasOwnProperty.call(req.body || {}, 'preferredRelayMode')
+      && planOnlyRefusesMode(req.body.preferredRelayMode)) {
+      return res.status(409).json(PLAN_ONLY_REFUSAL);
     }
 
     const persisted = applyConversationPreferences({ conversationId, existing, body: req.body || {}, senderClientId });
@@ -5168,6 +5201,7 @@ export function registerSessionsRoutes(app, deps) {
       thinking_enabled: parseThinkingEnabled(conv.thinking_enabled),
       thinking_display: parseThinkingDisplay(conv.thinking_display),
       cwd: String(workspace?.currentWorkspaceRootPath || workspace?.configuredWorkspaceRootPath || conv.configured_workspace_root_path || '').trim() || null,
+      planOnly: readPlanOnly(conv),
     };
   }
 
@@ -5201,7 +5235,7 @@ export function registerSessionsRoutes(app, deps) {
    * body }`. The plan holds what changes (`changed`, in the order of the
    * contract's settings) and how.
    */
-  function planSessionSettings(conversation, raw) {
+  function planSessionSettings(conversation, raw, { remote = false } = {}) {
     const conversationId = String(conversation.id);
     const fail = (status, error, extra = {}) => ({ ok: false, status, body: { ok: false, error, ...extra } });
     const settingsInput = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
@@ -5235,6 +5269,30 @@ export function registerSessionsRoutes(app, deps) {
         plan.preferences.preferredRelayMode = wanted.mode;
         change('mode');
       }
+    }
+    // Plan-only, read as it is after this call: one that clears the flag may
+    // name another mode too, one that keeps or sets it may not. Checked before
+    // anything else is planned, so a dry run refuses before any Allow card.
+    if (wanted.planOnly !== undefined && !stmts.conversationsHavePlanOnly) {
+      return fail(503, 'planOnly is unavailable until the relay restarts (its storage is missing). Nothing was changed.', { code: SESSION_SETTINGS_INVALID });
+    }
+    // planOnly:false counts only in the call that switches to another mode:
+    // alone (or with plan) it is passed over, so a caller that fills every
+    // property with false never drops the lock by accident.
+    if (wanted.planOnly === false && !(wanted.mode !== undefined && wanted.mode !== 'plan')) {
+      delete wanted.planOnly;
+      if (current.planOnly === true) plan.notes.push('planOnly unchanged: clear it in the same call as the new mode.');
+    }
+    const planOnlyAfter = wanted.planOnly !== undefined ? wanted.planOnly === true : current.planOnly === true;
+    if (remote && planOnlyAfter && wanted.mode !== undefined && planOnlyRefusesMode(wanted.mode)) {
+      return fail(409, `${PLAN_ONLY_REFUSAL.error} Nothing was changed.`, { code: PLAN_ONLY_REFUSAL.code });
+    }
+    if (wanted.planOnly !== undefined && wanted.planOnly !== current.planOnly) {
+      if (wanted.planOnly === true && (wanted.mode !== undefined ? wanted.mode : current.mode) !== 'plan') {
+        return fail(400, `planOnly keeps a session in plan mode, and this one is in ${current.mode} mode: add mode: "plan" in the same call. Nothing was changed.`, { code: SESSION_SETTINGS_INVALID });
+      }
+      plan.preferences.planOnly = wanted.planOnly;
+      change('planOnly');
     }
     if (wanted.auto_compact_window !== undefined) {
       const window = wanted.auto_compact_window === 'auto' ? null : parseAutoCompactWindow(wanted.auto_compact_window);
@@ -5422,7 +5480,7 @@ export function registerSessionsRoutes(app, deps) {
     }
     const conversationId = String(conversation.id);
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const planned = planSessionSettings(conversation, body.settings);
+    const planned = planSessionSettings(conversation, body.settings, { remote: remoteRequest.remote === true });
     if (!planned.ok) return res.status(planned.status).json(planned.body);
     const { plan } = planned;
     const createdBy = parseRemoteRelayOriginJson(conversation.origin_json);
@@ -6074,6 +6132,7 @@ export function registerSessionsRoutes(app, deps) {
         stopOverrides: sessionWorkerStopOverrides,
       });
       if (!stopped.ok) {
+        console.warn(`[delete] Not deleted ${id}: its worker did not stop (${stopped.error || 'unknown'}; remaining pids ${(stopped.remainingPids || []).join(',') || 'none'}).`);
         return {
           statusCode: 409,
           body: {
@@ -6220,6 +6279,7 @@ export function registerSessionsRoutes(app, deps) {
             stopOverrides: sessionWorkerStopOverrides,
           });
           if (!stopped.ok) {
+            console.warn(`[archive] Not archived ${id}: its worker did not stop (${stopped.error || 'unknown'}; remaining pids ${(stopped.remainingPids || []).join(',') || 'none'}).`);
             return {
               statusCode: 409,
               body: {
@@ -6829,10 +6889,27 @@ export function registerSessionsRoutes(app, deps) {
     // new chat would be stored as the default one and reset the composer. An
     // omitted or unknown mode still falls back to the default rather than 400,
     // because a new chat is worth starting either way.
-    const bootstrapRelayMode = normalizeRelayModePreference(req.body?.relayMode ?? req.body?.preferredRelayMode, {
-      supportedRelayModes: SUPPORTED_RELAY_MODES,
-      fallbackMode: DEFAULT_RELAY_MODE,
-    });
+    // Plan-only: a session that starts locked in plan mode. With no
+    // mode named it starts in plan; a mode that is not plan is refused.
+    const bootstrapPlanOnly = Object.prototype.hasOwnProperty.call(req.body || {}, 'planOnly') ? req.body.planOnly : undefined;
+    if (bootstrapPlanOnly !== undefined && typeof bootstrapPlanOnly !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'planOnly must be true or false', code: 'PLAN_ONLY_INVALID' });
+    }
+    const namedBootstrapMode = req.body?.relayMode ?? req.body?.preferredRelayMode;
+    if (bootstrapPlanOnly === true) {
+      if (!stmts.conversationsHavePlanOnly) {
+        return res.status(503).json({ ok: false, error: 'planOnly is unavailable until the relay restarts (its storage is missing). No conversation was created.', code: 'PLAN_ONLY_UNAVAILABLE' });
+      }
+      if (String(namedBootstrapMode ?? '').trim() && String(namedBootstrapMode).trim().toLowerCase() !== 'plan') {
+        return res.status(400).json({ ok: false, error: `planOnly keeps a session in plan mode; it cannot start in ${String(namedBootstrapMode).trim()} mode. No conversation was created.`, code: 'PLAN_ONLY_MODE' });
+      }
+    }
+    const bootstrapRelayMode = bootstrapPlanOnly === true
+      ? 'plan'
+      : normalizeRelayModePreference(namedBootstrapMode, {
+        supportedRelayModes: SUPPORTED_RELAY_MODES,
+        fallbackMode: DEFAULT_RELAY_MODE,
+      });
     // The New Chat modal's reasoning choice is validated with the same rules the
     // first send would apply, so the composer can restore it from the server
     // instead of guessing from localStorage.
@@ -6910,6 +6987,7 @@ export function registerSessionsRoutes(app, deps) {
           preferredRelayMode: bootstrapRelayMode,
           preferredModel: selectedModel,
           preferredReasoningEffort: bootstrapReasoning.effort,
+          ...(bootstrapPlanOnly === true ? { planOnly: true } : {}),
           updatedAt: now,
         });
         return { boundRuntimeSession, preferences };
@@ -7028,6 +7106,8 @@ export function registerSessionsRoutes(app, deps) {
         preferredRelayMode,
         preferredModel,
         preferredReasoningEffort,
+        // Echoed so the calling relay can tell this relay knows the flag.
+        planOnly: preferences?.planOnly === true,
         configuredWorkspaceRootPath: workspaceRootState?.configuredWorkspaceRootPath || null,
         configuredWorkspaceRootName: workspaceRootState?.configuredWorkspaceRootName || null,
         currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
@@ -9141,6 +9221,22 @@ export function registerSessionsRoutes(app, deps) {
       deepseekActuals: deepseekEnabled ? readDeepSeekActuals() : null,
       claudeApiCard,
     });
+    // Every tab's Tokens sections, from the token booking.
+    if (tokenUsageService) {
+      appendTokenSections(report.providers, (options) => tokenUsageService.readPeriods(options), {
+        // A tab names its models as its other rows do: the Claude API tab as
+        // its spend rows (the Console's names), DeepSeek with its own labels,
+        // the Claude tab with Claude's; the raw id where there is none.
+        modelLabelFor: (provider) => {
+          if (provider === 'claude-api' && typeof claudeApiPlanUsage?.modelLabel === 'function') {
+            return (model) => claudeApiPlanUsage.modelLabel(model);
+          }
+          if (provider === 'deepseek') return (model) => deepseekModelLabel(model);
+          if (provider === 'claude') return (model) => claudeAttributionModelLabel(model);
+          return null;
+        },
+      });
+    }
 
     // Legacy top-level fields stay alongside `providers` so an older cached
     // client shell keeps working through a PWA update.

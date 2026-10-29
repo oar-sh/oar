@@ -174,7 +174,7 @@ export function formatSubagentStats(data) {
  * figures keep the FIRST call's time-to-first-token (that is the number a user
  * experiences as "did it start answering").
  */
-function createUsageAccumulator() {
+function createUsageAccumulator({ debugTokenUsage = null } = {}) {
   const totals = {
     inputTokens: 0,
     outputTokens: 0,
@@ -195,8 +195,61 @@ function createUsageAccumulator() {
     isByok: null,
     quotaSnapshots: null,
   };
+  // The token booking's view (POST /api/turn-token-usage): the same calls,
+  // per model, the four token kinds apart. A field no call of the model
+  // carried stays null, so "not reported" is not booked as 0.
+  const byModel = new Map();
+  let compactionCalls = 0;
+  // A compaction's call as `session.compaction_complete` reports it, kept
+  // apart until the snapshot: it is booked only if no usage event of the
+  // compaction class came in the turn, before or after it.
+  const compactionTokens = new Map();
+  function addTokens(model, data, into = byModel) {
+    const key = String(model || '').trim();
+    const bucket = into.get(key) || {
+      model: key, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, reasoningTokens: null,
+    };
+    const count = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    };
+    const cacheRead = count(data.cacheReadTokens);
+    const cacheWrite = count(data.cacheWriteTokens);
+    const prompt = count(data.inputTokens);
+    // Fresh input is the prompt count less the cache reads and writes, per
+    // call, floored at 0. Inferred, not verified: the bundled runtime reads
+    // OpenAI-style `prompt_tokens` with `prompt_tokens_details.cached_tokens`
+    // (and cache creation), where the prompt count includes the cache. A
+    // real-provider check at the merge gate confirms it, reading the raw
+    // counts that OAR_DEBUG_TOKEN_USAGE=1 logs.
+    const fresh = prompt === null ? null : Math.max(0, prompt - (cacheRead || 0) - (cacheWrite || 0));
+    for (const [field, value] of [
+      ['inputTokens', fresh],
+      ['outputTokens', count(data.outputTokens)],
+      ['cacheReadTokens', cacheRead],
+      ['cacheWriteTokens', cacheWrite],
+      ['reasoningTokens', count(data.reasoningTokens)],
+    ]) {
+      if (value !== null) bucket[field] = (bucket[field] ?? 0) + value;
+    }
+    into.set(key, bucket);
+  }
   function add(data, { allowModel = true } = {}) {
     if (!data || typeof data !== 'object') return;
+    if (typeof debugTokenUsage === 'function') {
+      debugTokenUsage({
+        model: data.model ?? null,
+        interactionType: data.interactionType ?? null,
+        inputTokens: data.inputTokens ?? null,
+        cacheReadTokens: data.cacheReadTokens ?? null,
+        cacheWriteTokens: data.cacheWriteTokens ?? null,
+        outputTokens: data.outputTokens ?? null,
+        reasoningTokens: data.reasoningTokens ?? null,
+      });
+    }
+    addTokens(data.model, data);
+    if (String(data.interactionType || '').trim() === 'conversation-compaction') compactionCalls += 1;
     totals.modelCalls += 1;
     if (!allowModel) totals.subagentModelCalls += 1;
     for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'cost']) {
@@ -222,13 +275,38 @@ function createUsageAccumulator() {
   }
   return {
     add,
+    /**
+     * A compaction's own model call, from `session.compaction_complete`'s
+     * `compactionTokensUsed`: booked unless the runtime reports it, before
+     * or after, as an `assistant.usage` of the compaction class.
+     */
+    addCompaction(tokensUsed, fallbackModel = '') {
+      if (!tokensUsed || typeof tokensUsed !== 'object') return;
+      addTokens(tokensUsed.model || fallbackModel, tokensUsed, compactionTokens);
+    },
     setQuotaSnapshots(snapshots) {
       if (snapshots && typeof snapshots === 'object' && Object.keys(snapshots).length) {
         totals.quotaSnapshots = snapshots;
       }
     },
     snapshot() {
-      return totals.modelCalls ? { ...totals } : (totals.quotaSnapshots ? { ...totals } : null);
+      // A call without a model id is the turn's main model's.
+      const models = [];
+      const buckets = [...byModel.values(), ...(compactionCalls > 0 ? [] : compactionTokens.values())];
+      for (const bucket of buckets) {
+        const model = bucket.model || totals.model;
+        const same = models.find((entry) => entry.model === model);
+        if (!same) {
+          models.push({ ...bucket, model });
+          continue;
+        }
+        for (const field of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']) {
+          if (bucket[field] !== null) same[field] = (same[field] ?? 0) + bucket[field];
+        }
+      }
+      const tokenModels = models.filter((entry) => entry.model);
+      if (!totals.modelCalls && !totals.quotaSnapshots && !tokenModels.length) return null;
+      return { ...totals, models: tokenModels };
     },
   };
 }
@@ -242,6 +320,9 @@ export function createCopilotEventNormalizer({
   // The runner's answer to "is this agent id a background agent?" — shared
   // across turns, unlike this normalizer's own `backgroundRuns`.
   isBackgroundAgent = () => false,
+  // Called with the raw token counts of every model call (no ids), when the
+  // worker runs with OAR_DEBUG_TOKEN_USAGE=1.
+  debugTokenUsage = null,
 } = {}) {
   let sessionModel = '';
   let sessionId = '';
@@ -250,7 +331,7 @@ export function createCopilotEventNormalizer({
   let terminalEmitted = false;
   let contextUsage = null;
   let interactionId = '';
-  const usage = createUsageAccumulator();
+  const usage = createUsageAccumulator({ debugTokenUsage });
 
   // Assistant text is assembled per `messageId`. A tool-using request produces
   // several assistant messages (the first typically empty with `toolRequests`,
@@ -866,6 +947,8 @@ export function createCopilotEventNormalizer({
         return [activityAction('Compacting the conversation context…')];
       }
       case 'session.compaction_complete': {
+        // Its model call costs tokens too (booked with the turn it ran in).
+        usage.addCompaction(data.compactionTokensUsed, data.model || sessionModel);
         if (data.success === false) {
           const reason = String(data.error || '').trim();
           return [activityAction(truncate(reason ? `Context compaction failed: ${reason}` : 'Context compaction failed'))];

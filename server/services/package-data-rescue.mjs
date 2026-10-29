@@ -17,17 +17,19 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { DB_FILE_NAMES, sideFiles } from './database-file.mjs';
 import { RESCUE_DIR_NAME, copyMissing, isRetiredName } from './earlier-database-service.mjs';
 import { resolveRelayStateDirs, resolveStateLayout } from './oar-state-layout.mjs';
 
-const DB_FILES = ['copilot.db', 'copilot.db-wal', 'copilot.db-shm'];
+// Old packages only ever held the name before 0.9.20; a later one may hold oar.db.
+const DB_FILES = DB_FILE_NAMES.flatMap(sideFiles);
 
 // What a relay left in a package's server folder; a folder that cannot be
 // read throws (no copy failure: nothing was detected yet).
 function hasRelayData(fsImpl, serverDir) {
   const has = (...parts) => fsImpl.existsSync(path.join(serverDir, ...parts));
   const anyUpload = (...parts) => has(...parts) && fsImpl.readdirSync(path.join(serverDir, ...parts)).some((name) => /^[a-f0-9]{64}$/.test(name));
-  return has('data', 'copilot.db') || has('data', 'cursor-agents') || has('config.json') || anyUpload('uploads') || anyUpload('data', 'uploads');
+  return DB_FILE_NAMES.some((name) => has('data', name)) || has('data', 'cursor-agents') || has('config.json') || anyUpload('uploads') || anyUpload('data', 'uploads');
 }
 
 /** Where npm's reify moves a package it replaces (@npmcli/arborist retire-path.js). */

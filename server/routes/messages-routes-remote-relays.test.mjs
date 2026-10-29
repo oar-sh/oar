@@ -325,6 +325,17 @@ test('an agent\'s prompt carries its origin, never unlocks, and leaves the draft
   assert.equal(fx.queueRow(body.messageId).relay_mode, 'autopilot');
 });
 
+test('an agent\'s prompt that names no mode runs in the session\'s own', async () => {
+  const fx = boot();
+  const text = withRemotePromptHeader('go on with the plan', ORIGIN);
+  const { status, body } = await fx.send(text, { origin: ORIGIN, relayMode: undefined }, { headers: agentHeaders });
+  assert.equal(status, 200, JSON.stringify(body));
+  // The relay_tool send of 0.9.20 names no mode unless the agent did: the
+  // turn runs in the mode the session is in, not the caller's.
+  assert.equal(fx.queueRow(body.messageId).relay_mode, 'ask');
+  assert.equal(fx.conversationRow().preferred_relay_mode, 'ask');
+});
+
 test('the header alone marks a prompt as an agent\'s: a minimal origin is stored and nothing unlocks', async () => {
   const fx = boot();
   const { status, body } = await fx.send('@linux-test ping', {}, {
@@ -611,4 +622,36 @@ test('a turn an agent started pushes no "reply ready"; the user\'s own turn stil
   await flush();
   assert.equal(fx.pushes.length, 1);
   assert.equal(fx.pushes[0].data.type, 'turnComplete');
+});
+
+// ─── Plan-only ─────────────────────────────────────────────────────
+
+test('a plan-only session refuses an agent\'s send that names another mode; without one it runs in plan', async () => {
+  const fx = boot();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(CONV);
+  const text = withRemotePromptHeader('implement it now', ORIGIN);
+  const queuedBefore = fx.db.prepare(`SELECT COUNT(*) AS n FROM queue`).get().n;
+  for (const extra of [{ relayMode: 'agent' }, { relayMode: 'autopilot' }, { relayMode: undefined, mode: 'agent' }, { relayMode: 'nonsense' }]) {
+    const refused = await fx.send(text, { origin: ORIGIN, ...extra }, { headers: agentHeaders });
+    assert.equal(refused.status, 409, JSON.stringify(extra));
+    assert.equal(refused.body.code, 'plan_only');
+    assert.match(refused.body.error, /plan-only; agents can't change its mode/);
+  }
+  assert.equal(fx.db.prepare(`SELECT COUNT(*) AS n FROM queue`).get().n, queuedBefore, 'nothing queued');
+  assert.equal(fx.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE text = ?`).get(text).n, 0, 'nothing stored');
+
+  const named = await fx.send(text, { origin: ORIGIN, relayMode: 'plan' }, { headers: agentHeaders });
+  assert.equal(named.status, 200);
+  assert.equal(fx.queueRow(named.body.messageId).relay_mode, 'plan');
+  const unnamed = await fx.send(withRemotePromptHeader('go on planning', ORIGIN), { origin: ORIGIN, relayMode: undefined }, { headers: agentHeaders });
+  assert.equal(unnamed.status, 200);
+  assert.equal(fx.queueRow(unnamed.body.messageId).relay_mode, 'plan');
+});
+
+test('the owner\'s own send to a plan-only session is not limited', async () => {
+  const fx = boot();
+  fx.db.prepare(`UPDATE conversations SET plan_only = 1, preferred_relay_mode = 'plan' WHERE id = ?`).run(CONV);
+  const own = await fx.send('do it yourself then', { relayMode: 'agent' });
+  assert.equal(own.status, 200);
+  assert.equal(fx.queueRow(own.body.messageId).relay_mode, 'agent');
 });

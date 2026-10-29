@@ -260,7 +260,10 @@ export function buildCardNote({ id, text, link = null, hours = null, label = nul
   };
 }
 
-/** A collapsible block of label/value rows shown under the meters. */
+/**
+ * A collapsible block of label/value rows shown under the meters. A row may
+ * carry a `title`, shown when pointing at it (the model ids behind one name).
+ */
 export function buildDetailSection({ id, label, rows = [], note = null, open = false } = {}) {
   const sectionId = toTrimmedString(id);
   const sectionLabel = toTrimmedString(label);
@@ -270,7 +273,8 @@ export function buildDetailSection({ id, label, rows = [], note = null, open = f
       const rowLabel = toTrimmedString(row?.label);
       const rowValue = row?.value === 0 ? '0' : toTrimmedString(row?.value);
       if (!rowLabel || rowValue === null) return null;
-      return { label: rowLabel, value: rowValue, hint: toTrimmedString(row?.hint) };
+      const rowTitle = toTrimmedString(row?.title);
+      return { label: rowLabel, value: rowValue, hint: toTrimmedString(row?.hint), ...(rowTitle ? { title: rowTitle } : {}) };
     })
     .filter(Boolean);
   if (!normalizedRows.length) return null;

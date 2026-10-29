@@ -18,13 +18,14 @@
  * detached process, a console window on Windows) and keeps its tasks when
  * the runtime exits. A restart (exit 75) is taken by the relay's own
  * supervisor or by the Copilot CLI extension, which start a new runtime;
- * the workers report back to it. A shutdown under a systemd service is
- * different: the service stops, and systemd stops every process of the
- * service, which takes the workers with it unless they live outside it (a
- * tmux session on a tmux server the user started elsewhere survives). The
- * relay cannot tell which, so they "may stop". A Claude Cloud session runs at
- * Anthropic and is never affected. `oar restart` and `oar stop` through
- * systemd do not come through here at all.
+ * the workers report back to it. Under a systemd user service the
+ * supervisor hands that restart to systemd, which stops and starts the
+ * whole service, and a shutdown stops it: systemd ends every process of the
+ * service then. The workers this relay starts there run in scopes of their
+ * own (worker-scope.mjs) and keep running; a worker on a tmux server or in a
+ * process started before 0.9.20, inside the service, may stop once. A Claude Cloud session runs at
+ * Anthropic and is never affected. `oar restart` and `oar stop` come through
+ * here too (they ask the relay); only their `--now` goes to systemd directly.
  */
 
 import fs from 'node:fs';
@@ -37,8 +38,10 @@ function toText(value) {
 
 /**
  * How this relay process is run, from its environment and argv: whether a
- * systemd service runs it, and whether an outer supervisor (the Copilot CLI
- * extension, `--supervised`) owns its restarts.
+ * systemd service runs it (`unit`: the service, `userManager`: a user's
+ * systemd runs it, not the system's), and whether an outer supervisor (the
+ * Copilot CLI extension, `--supervised`) owns its restarts. The supervisor
+ * and the runtime ask the same way.
  */
 export function detectRelayHosting({
   env = process.env,
@@ -47,34 +50,70 @@ export function detectRelayHosting({
   readCgroup = () => fs.readFileSync('/proc/self/cgroup', 'utf8'),
 } = {}) {
   // systemd sets INVOCATION_ID for the processes of a unit, and a service's
-  // cgroup ends in `.service` (a terminal's shell sits in a `.scope`).
+  // cgroup ends in `.service` (a terminal's shell sits in a `.scope`). Every
+  // process the service starts inherits INVOCATION_ID; one in a scope of its
+  // own (a session worker) is not the service.
   let systemd = false;
+  let unit = '';
+  let userManager = false;
   if (platform === 'linux' && toText(env?.INVOCATION_ID)) {
     let cgroup = '';
     try { cgroup = String(readCgroup() || ''); } catch {}
-    systemd = cgroup.split('\n').some((line) => /\.service\/?$/.test(line.trim()));
+    // The unified line (`0::/…`, the only one on cgroup v2) when it names a
+    // service, else v1's `name=systemd` hierarchy: on a hybrid host the
+    // unified line may be a bare `0::/` that says nothing. Controller lines
+    // (`10:memory:/…`) are not systemd's view: on a hybrid host they stop at
+    // `user@<uid>.service`.
+    const isService = (entry) => /\.service\/?$/.test(entry || '');
+    const lines = cgroup.split('\n').map((entry) => entry.trim());
+    const unified = lines.find((entry) => entry.startsWith('0::'));
+    const named = lines.find((entry) => /^\d+:name=systemd:/.test(entry));
+    const line = isService(unified) ? unified : isService(named) ? named : '';
+    if (line) {
+      systemd = true;
+      const cgroupPath = line.slice(line.indexOf(':', line.indexOf(':') + 1) + 1).replace(/\/$/, '');
+      unit = cgroupPath.split('/').pop();
+      userManager = /\/user@\d+\.service\//.test(cgroupPath);
+    }
   }
   const supervised = Array.isArray(argv) && argv.includes('--supervised');
-  return { systemd, supervised, platform };
+  return { systemd, supervised, platform, unit, userManager };
 }
 
-/** Whether the session workers outlive this action, and why, in one line each. */
+/**
+ * Whether the session workers outlive this action, and why, in one line each.
+ * `hosting.workerScopes`: whether this relay starts its workers in scopes of
+ * their own (worker-scope.mjs `inUse`); unset counts as no.
+ */
 export function describeRestartSurvival({ action = 'restart', hosting = {} } = {}) {
   const restart = action === 'restart';
+  // Under a user service a restart is handed to systemd, which restarts the
+  // whole service; elsewhere only the runtime is started anew.
+  const wholeService = hosting.systemd && (!restart || hosting.userManager);
+  if (wholeService && hosting.workerScopes !== true) {
+    return {
+      action: restart ? 'restart' : 'shutdown',
+      workersSurvive: false,
+      summary: `The relay runs as a systemd service: ${restart ? 'a restart restarts' : 'shutting it down stops'} the service and every process in it, `
+        + 'and this relay could not start its session workers outside it, so they and their background tasks may stop too '
+        + '(a worker in a tmux session the service did not start keeps running).',
+    };
+  }
+  if (wholeService) {
+    return {
+      action: restart ? 'restart' : 'shutdown',
+      workersSurvive: true,
+      summary: `The relay runs as a systemd service: ${restart ? 'a restart restarts' : 'shutting it down stops'} the service and every process in it. `
+        + 'Session workers this relay started run in scopes of their own and keep running, with their background tasks; '
+        + `they report back ${restart ? 'to the new relay within a minute' : 'when it starts again'}. A worker on a tmux server or in a process started before OAR 0.9.20, inside the service, may stop once.`,
+    };
+  }
   if (restart) {
     return {
       action: 'restart',
       workersSurvive: true,
       summary: 'Session workers are separate processes and keep running through a relay restart, with their background tasks; '
         + 'they report back to the new relay within a minute.',
-    };
-  }
-  if (hosting.systemd) {
-    return {
-      action: 'shutdown',
-      workersSurvive: false,
-      summary: 'The relay runs as a systemd service: shutting it down stops the service and every process in it, '
-        + 'so session workers and their background tasks may stop too (a worker in a tmux session the service did not start keeps running).',
     };
   }
   return {
@@ -185,6 +224,8 @@ export function createRestartPictureCollector({
   // () => [{ conversationId, description }]: tasks held since a restart.
   listHeldTasks = () => [],
   hosting = detectRelayHosting(),
+  // Whether the workers start in scopes of their own (worker-scope.mjs `inUse`).
+  workerScopes = () => false,
   providerOf = () => '',
   titleOf = undefined,
 } = {}) {
@@ -204,6 +245,10 @@ export function createRestartPictureCollector({
     try { backgroundBlockers = backgroundWorkView?.backgroundBlockers?.() || []; } catch {}
     let heldTasks = [];
     try { heldTasks = listHeldTasks() || []; } catch {}
-    return buildRestartPicture({ action, queueRows, backgroundBlockers, heldTasks, hosting, providerOf, ...(titleOf ? { titleOf } : {}) });
+    let scopes;
+    try { scopes = workerScopes(); } catch {}
+    return buildRestartPicture({
+      action, queueRows, backgroundBlockers, heldTasks, hosting: { ...hosting, workerScopes: scopes }, providerOf, ...(titleOf ? { titleOf } : {}),
+    });
   };
 }

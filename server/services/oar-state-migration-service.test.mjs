@@ -639,7 +639,7 @@ test('stray -wal/-shm files without a database are refused in words that say so'
     assert.equal(result.status, 'refused-existing-database');
     assert.doesNotMatch(result.error, /with conversations/);
     assert.match(result.error, /copilot\.db-wal/);
-    assert.match(result.error, /without copilot\.db/);
+    assert.match(result.error, /without their database/);
   } finally {
     db.close();
   }
@@ -671,6 +671,80 @@ test('a database that got a conversation before the lock was taken is refused un
     assert.equal(countRows(targetDb, 'conversations'), 1, 'the database is untouched');
     assert.ok(!fs.existsSync(path.join(target, 'backups')));
     assert.ok(!fs.existsSync(path.join(target, 'data', 'relay-server.lock')), 'the lock is released');
+  } finally {
+    db.close();
+  }
+});
+
+// ─── The two names (0.9.20: oar.db, copilot.db before) ───────────────────────
+
+// The checkout's database renamed to `name`, with its -wal.
+function renameSourceDb(dataDir, name) {
+  for (const side of ['', '-wal', '-shm']) {
+    const from = path.join(dataDir, `copilot.db${side}`);
+    if (fs.existsSync(from)) fs.renameSync(from, path.join(dataDir, `${name}${side}`));
+  }
+}
+
+test('the database keeps its name: copilot.db stays copilot.db, oar.db stays oar.db', async () => {
+  for (const name of ['copilot.db', 'oar.db']) {
+    const { serverDir, dataDir, db } = seedRepoServerDir();
+    db.close();
+    renameSourceDb(dataDir, name);
+    const target = path.join(tempDir('oar-mig-target-'), 'oar-root');
+    const result = await migrateStateToOarRoot({ targetRoot: target, repoServerDir: serverDir, logger: {} });
+    assert.equal(result.status, 'migrated', name);
+    assert.equal(countRows(path.join(target, 'data', name), 'messages'), 20, name);
+    const other = name === 'oar.db' ? 'copilot.db' : 'oar.db';
+    assert.equal(fs.existsSync(path.join(target, 'data', other)), false, `${name}: no ${other}`);
+  }
+});
+
+test('both names in the checkout: both come over under their own names, for the relay\'s start to compare', async () => {
+  const { serverDir, dataDir, db } = seedRepoServerDir();
+  db.close();
+  renameSourceDb(dataDir, 'oar.db');
+  const stray = new Database(path.join(dataDir, 'copilot.db'));
+  stray.exec('CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT)');
+  stray.close();
+  const target = path.join(tempDir('oar-mig-target-'), 'oar-root');
+  const result = await migrateStateToOarRoot({ targetRoot: target, repoServerDir: serverDir, logger: {} });
+  assert.equal(result.status, 'migrated');
+  assert.equal(countRows(path.join(target, 'data', 'oar.db'), 'messages'), 20, 'oar.db is the one checked');
+  assert.ok(fs.existsSync(path.join(target, 'data', 'copilot.db')));
+});
+
+test('a target holding oar.db counts as a database already there; with conversations it is refused, fresh it moves aside', async () => {
+  const { serverDir, db } = seedRepoServerDir();
+  try {
+    const used = path.join(tempDir('oar-mig-target-'), 'oar-root');
+    seedTargetDb(path.join(used, 'data'), { conversations: 1 });
+    renameSourceDb(path.join(used, 'data'), 'oar.db');
+    const refused = await migrateStateToOarRoot({ targetRoot: used, repoServerDir: serverDir, logger: {} });
+    assert.equal(refused.status, 'refused-existing-database');
+    assert.match(refused.error, /already has a database with conversations \(.*oar\.db\)/);
+
+    const fresh = path.join(tempDir('oar-mig-target-'), 'oar-root');
+    seedTargetDb(path.join(fresh, 'data'));
+    renameSourceDb(path.join(fresh, 'data'), 'oar.db');
+    const moved = await migrateStateToOarRoot({ targetRoot: fresh, repoServerDir: serverDir, logger: {} });
+    assert.equal(moved.status, 'migrated');
+    assert.ok(fs.existsSync(path.join(moved.movedAsideTo, 'oar.db')), 'the fresh oar.db moved aside');
+    assert.equal(fs.existsSync(path.join(fresh, 'data', 'oar.db')), false, 'and not left beside the copilot.db that came');
+  } finally {
+    db.close();
+  }
+});
+
+test('an oar.db-wal without oar.db in the target is refused, named', async () => {
+  const { serverDir, db } = seedRepoServerDir();
+  try {
+    const target = path.join(tempDir('oar-mig-target-'), 'oar-root');
+    fs.mkdirSync(path.join(target, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(target, 'data', 'oar.db-wal'), 'stray');
+    const result = await migrateStateToOarRoot({ targetRoot: target, repoServerDir: serverDir, logger: {} });
+    assert.equal(result.status, 'refused-existing-database');
+    assert.match(result.error, /without their database \(.*oar\.db-wal\)/);
   } finally {
     db.close();
   }

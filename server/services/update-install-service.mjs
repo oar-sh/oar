@@ -114,6 +114,9 @@ export function createUpdateInstallService({
   writeSetting,
   deleteSetting,
   requestRelayShutdown,
+  // The line on the next start's database backup (db-backup-service.mjs),
+  // said in the log before npm installs; null says nothing.
+  describeNextBackup = null,
   logger = console,
 } = {}) {
   const listeners = new Set();
@@ -206,6 +209,16 @@ export function createUpdateInstallService({
     lastError = null;
     deleteSetting(UPDATE_OUTCOME_SETTING_KEY);
     broadcast();
+    // Seen before the restart: whether the new version's first start backs
+    // up the database, or why not (a full disk).
+    if (describeNextBackup) {
+      try {
+        const line = describeNextBackup();
+        if (line) appendLog(`${line}\n`);
+      } catch (error) {
+        appendLog(`[backup] Whether the next start backs up the database could not be told (${error?.message || error}).\n`);
+      }
+    }
 
     // npm itself is a shim on Windows; spawn npm.cmd through a shell there
     // (args are fixed strings + a validated semver, so no injection surface).

@@ -18,6 +18,8 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { resumeRelayMode } from '../../shared/plan-only.mjs';
+import { readPlanOnly } from './conversation-preferences-service.mjs';
 import {
   USAGE_LIMIT_CODE,
   USAGE_LIMIT_KIND,
@@ -300,7 +302,12 @@ export function createUsageLimitPauseService({
       const latestModel = stmts.getLatestConversationModel?.get?.(plan.conversationId)?.model || null;
       const model = String(queueRow?.model || '').trim() || latestModel || null;
       const modelVariant = String(queueRow?.model_variant_id || '').trim() || latestModel || model;
-      const relayMode = String(queueRow?.relay_mode || '').trim() || 'agent';
+      // On a plan-only session only the "Approve plan" turn goes on in agent mode.
+      const relayMode = resumeRelayMode({
+        relayMode: queueRow?.relay_mode,
+        text: queueRow?.text,
+        planOnly: readPlanOnly(stmts.getConvAnyStatus?.get?.(plan.conversationId)),
+      });
       const owner = String(queueRow?.owner_sdk_session_id || '').trim() || null;
       stmts.insertMsg.run(
         messageId,

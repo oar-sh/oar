@@ -877,7 +877,7 @@ export function buildDeepSeekPlanCard({
     }));
     details.push(buildDetailSection({
       id: 'deepseek-tokens-by-model',
-      label: 'Tokens by model',
+      label: 'Priced tokens by model',
       rows: spend.models.map((entry) => {
         const input = entry.hitTokens + entry.missTokens;
         return {

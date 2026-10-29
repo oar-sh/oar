@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  cloudSessionTokenTotals,
   createClaudeCloudEventNormalizer,
   isInterruptedCloudResult,
   readCloudResult,
@@ -198,7 +199,13 @@ test('readCloudSessionUsage maps the session onto the context-usage shape, wrapp
   assert.equal(usage.sessionUrl, SESSION_URL);
   assert.equal(usage.workerStatus, 'running');
   assert.deepEqual(readCloudSessionUsage({ response_shape: session }), usage);
-  assert.deepEqual(readCloudSessionUsage({ id: 'x' }), { contextUsage: null, costUsd: null, sessionUrl: null, workerStatus: null });
+  assert.deepEqual(readCloudSessionUsage({ id: 'x' }), {
+    contextUsage: null,
+    tokens: { inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null },
+    costUsd: null,
+    sessionUrl: null,
+    workerStatus: null,
+  });
 });
 
 test('toCloudSequence reads the wire\'s string numbers', () => {
@@ -229,4 +236,30 @@ test('a thinking block the cloud sends without its text becomes a placeholder th
     message: { id: 'msg_example_32', role: 'assistant', content: [{ type: 'thinking', thinking: '' }] },
   });
   assert.deepEqual(normalizer.normalize(bare), []);
+});
+
+test('session token totals: missing fields stay null; the session read fills the cache only for a single model', () => {
+  const session = { inputTokens: 900, outputTokens: 90, cacheReadTokens: 7000, cacheWriteTokens: 600 };
+  assert.deepEqual(cloudSessionTokenTotals({ 'claude-opus-5-5[1m]': { inputTokens: 10, outputTokens: 2, costUSD: 0.3 } }, session), [{
+    model: 'claude-opus-5-5', inputTokens: 10, cacheWriteTokens: 600, cacheReadTokens: 7000, outputTokens: 2, costUsd: 0.3, costSource: 'claude-code', costUnknown: false,
+  }]);
+  // Two models: the session-wide cache figures cannot be split, so they stay unknown.
+  const two = cloudSessionTokenTotals({
+    'claude-opus-5-5': { inputTokens: 10, outputTokens: 2, costUSD: 0.3 },
+    'claude-haiku-5-5': { inputTokens: 4, outputTokens: 1, cacheReadInputTokens: 0, costBasis: 'unknown' },
+  }, session);
+  assert.deepEqual(two.map((entry) => [entry.model, entry.cacheWriteTokens, entry.cacheReadTokens, entry.costUsd, entry.costSource, entry.costUnknown]), [
+    ['claude-opus-5-5', null, null, 0.3, 'claude-code', false],
+    ['claude-haiku-5-5', null, 0, null, null, true],
+  ]);
+  // Reported cache fields win over the session read.
+  const reported = cloudSessionTokenTotals({ 'claude-opus-5-5': { inputTokens: 1, cacheReadInputTokens: 5, cacheCreationInputTokens: 0 } }, session);
+  assert.deepEqual([reported[0].cacheReadTokens, reported[0].cacheWriteTokens], [5, 0]);
+  assert.deepEqual(cloudSessionTokenTotals(null, session), []);
+});
+
+test('the session read carries the session\'s token totals', () => {
+  const read = readCloudSessionUsage({ external_metadata: { usage: { input_tokens: 1, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 4 } } });
+  assert.deepEqual(read.tokens, { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4 });
+  assert.deepEqual(readCloudSessionUsage({}).tokens, { inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null });
 });

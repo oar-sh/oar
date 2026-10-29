@@ -36,7 +36,7 @@ When changing anything related to the web relay (`server/` or `.github/extension
    - Trace extension flow in `server/logs/ext-debug.log` for same window:
      - `session.send: queuing for msgId ...`
      - `session.sendAndWait: completed ...` (or failure/retry signals)
-   - Check DB queue truth in `server/data/copilot.db` (`queue` table) for the specific row status (`pending`/`processing`/`done`) and ownership (`owner_sdk_session_id`, `runtime_session_id`).
+   - Check DB queue truth in the relay's database, `server/data/oar.db` (`server/data/copilot.db` on installs from before 0.9.20; `oar doctor` names it), `queue` table, for the specific row status (`pending`/`processing`/`done`) and ownership (`owner_sdk_session_id`, `runtime_session_id`).
    - Check live runtime snapshot via authenticated `GET /api/status`:
      - `sessionWorker.workers[]` entry for the target `sdkSessionId`
      - `activeBridgeOwner`
@@ -59,7 +59,7 @@ Do not consider relay-related work complete until restart + status + log checks 
   `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1` so no real CLI clients or workers are launched)
   and may run beside a live relay. Playwright specs must get the relay URL, token, and DB
   path from `tests/e2e-env.mjs` only — never read `server/config.json`, never open
-  `server/data/copilot.db`, and never target `http://127.0.0.1:3333` from a test.
+  `server/data/oar.db` (or `copilot.db`), and never target `http://127.0.0.1:3333` from a test.
 - **Never run `tests/agents/` smoke tests or anything that sends prompts through the live
   relay or spawns Copilot CLI clients without explicit user permission** (see rule 11 above).
   They are excluded from `npm test` on purpose.

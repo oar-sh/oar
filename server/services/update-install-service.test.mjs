@@ -244,3 +244,18 @@ test('clearOutcome removes a persisted outcome', () => {
   service.clearOutcome();
   assert.equal(service.getSnapshot().lastOutcome, null);
 });
+
+test('the log says, before npm installs, whether the next start backs up the database', async () => {
+  const store = settingsStore();
+  const line = '[backup] The next start backs up the database (351.0 MB) to /home/dev/.oar/backups before the new version\'s migrations.';
+  const { service } = createService(store, { output: ['added 1 package'], describeNextBackup: () => line });
+  await service.startUpdate({ version: '0.9.2' });
+  const { log } = service.getSnapshot();
+  assert.ok(log.indexOf(line) >= 0 && log.indexOf(line) < log.indexOf('added 1 package'), 'the line comes first');
+  const attempt = JSON.parse(store.rows.get(UPDATE_ATTEMPT_SETTING_KEY));
+  assert.match(attempt.logTail, /The next start backs up the database/);
+
+  const broken = createService(settingsStore(), { describeNextBackup: () => { throw new Error('statfs failed'); } });
+  assert.equal((await broken.service.startUpdate({ version: '0.9.2' })).ok, true, 'never stops the update');
+  assert.match(broken.service.getSnapshot().log, /could not be told \(statfs failed\)/);
+});

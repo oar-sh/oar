@@ -896,6 +896,9 @@ test("renders a video preview viewer with preload and start time options", async
   const token = relayToken();
   await page.goto(`/?token=${encodeURIComponent(token)}`);
   await page.waitForLoadState("networkidle");
+  // Set by bootstrap.js, which loads after the page (a dynamic import):
+  // networkidle can come first on a slow runner.
+  await page.waitForFunction(() => typeof window.openUploadedAttachmentViewer === "function");
 
   await page.evaluate(() => {
     window.openUploadedAttachmentViewer(
@@ -1599,6 +1602,9 @@ test("mobile send blurs composer and keeps newest message in view", async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/?token=${encodeURIComponent(token)}`);
   await page.waitForLoadState("networkidle");
+  // Set by bootstrap.js, which loads after the page (a dynamic import):
+  // networkidle can come first on a slow runner.
+  await page.waitForFunction(() => typeof window.appendMessage === "function");
 
   await page.route("**/api/message", async (route) => {
     const payload = JSON.parse(route.request().postData() || "{}");
@@ -1699,6 +1705,9 @@ test("mobile chat title exposes and copies the sdk session id", async ({ page, r
     });
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.openConversation === "function");
     await page.evaluate(async (id) => {
       await window.openConversation(id);
     }, conversationId);
@@ -1811,6 +1820,9 @@ test("chat title color matches active conversation list color", async ({ page, r
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.openConversation === "function");
     await page.evaluate(async (id) => {
       await window.openConversation(id);
     }, conversationId);

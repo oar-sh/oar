@@ -220,7 +220,7 @@ test.describe.serial("Provider CLI install rows", () => {
 
   test("a failed Grok turn offers Install Grok CLI, and it opens the confirm sheet", async ({ page }) => {
     const conversationId = `cli-install-cta-${Date.now()}`;
-    const db = new DatabaseSync(path.join(relay.dataDir, "copilot.db"));
+    const db = new DatabaseSync(path.join(relay.dataDir, "oar.db"));
     try {
       const now = new Date().toISOString();
       db.prepare(`

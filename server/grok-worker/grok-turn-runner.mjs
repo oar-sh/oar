@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   createGrokAgentHandle,
   startGrokTurn,
@@ -11,14 +12,9 @@ import { createPreviewInstructionsProvider } from '../../shared/preview-instruct
 import { fetchRemoteRelayInflight } from '../../shared/remote-relay-tool-core.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
+import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { explainLaunchFailure, missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
-
-const PLAN_BOARD_ACTIONS = [
-  { id: 'autopilot', label: 'Implement in autopilot', mode: 'autopilot' },
-  { id: 'interactive', label: 'Stop here and prompt myself', mode: 'agent' },
-  { id: 'exit_only', label: 'Stop here', mode: 'agent' },
-];
 
 // Grok has no exit-plan tool, so the only board source is the plan-mode
 // text-shape fallback; the payload matches the Claude/Cursor workers'.
@@ -352,6 +348,47 @@ export function createGrokTurnRunner({
     });
   }
 
+  // A process without the row's attempt id names its run once (POST
+  // /api/turn-token-usage): a turn requeued onto a restarted worker is a
+  // second run of it.
+  const tokenRunId = randomUUID();
+
+  /**
+   * Ship the turn's tokens to the token booking: per model where
+   * the agent breaks them down, else the turn's totals under its model, with
+   * the agent's own cost. Grok counts fresh input apart from the cache
+   * (grok-context-usage.mjs adds the three up). Advisory, fire-and-forget.
+   */
+  async function publishTurnTokens(message, state, model) {
+    const usage = state.turnUsage;
+    if (!usage || !message?.id) return;
+    const entry = (source, entryModel) => ({
+      model: entryModel,
+      inputTokens: source.inputTokens,
+      outputTokens: source.outputTokens,
+      cacheWriteTokens: source.cacheCreationTokens,
+      cacheReadTokens: source.cachedReadTokens,
+      reasoningTokens: source.reasoningTokens,
+      ...(source.costUsd !== null && source.costUsd !== undefined ? { costUsd: source.costUsd, costSource: 'provider' } : {}),
+    });
+    const turnModel = state.responseModel || usage.modelId || model || '';
+    const models = Array.isArray(usage.modelUsage) && usage.modelUsage.length
+      ? usage.modelUsage.map((item) => entry(item, item.model))
+      : (turnModel ? [entry(usage, turnModel)] : []);
+    if (!models.length) return;
+    await api('POST', '/api/turn-token-usage', {
+      conversationId: message.conversationId,
+      turnId: String(message.id),
+      runId: message.attemptId || tokenRunId,
+      provider: 'grok',
+      ...(sdkSessionId ? { nativeSessionId: sdkSessionId } : {}),
+      at: usage.capturedAt || new Date().toISOString(),
+      models,
+    }).catch((error) => {
+      dbg('turn token publish failed', error?.message || String(error));
+    });
+  }
+
   /**
    * Ship per-turn token/cost totals for the Check Usage Grok card. Advisory:
    * failures never disturb the turn reply.
@@ -521,6 +558,7 @@ export function createGrokTurnRunner({
       // awaits made it false.
       void publishContextUsage(message, state, model).catch(() => {});
       void publishPlanUsage(message, state).catch(() => {});
+      void publishTurnTokens(message, state, model).catch(() => {});
     }
 
     if (aborted) {

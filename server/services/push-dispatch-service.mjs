@@ -1,6 +1,8 @@
 'use strict';
 
 import { providerDisplayName } from '../public/app/conversation-provider-indicator.mjs';
+import { DEFAULT_QUESTION_TIMEOUT_MS } from '../../shared/question-timeout.mjs';
+import { REMOTE_RELAY_APPROVAL_VARIANT_LABELS, remoteConversationUrl } from '../../shared/remote-relay-contract.mjs';
 
 /**
  * Web Push dispatch: decides whether a push should go out at all (suppressed
@@ -29,6 +31,17 @@ const MAX_TITLE_CHARS = 120;
 // weight; drop it after this many consecutive failures.
 const FAILURE_PRUNE_THRESHOLD = 8;
 const PUSH_TTL_SECONDS = 12 * 60 * 60;
+// A push service that stops answering fails the send after this long (the
+// request's socket timeout), so no dispatch waits on it for good.
+export const PUSH_SEND_TIMEOUT_MS = 30_000;
+// The notice ledger: whether a question's own push reached a device,
+// kept as long as a question lives. A push still `pending` after this long
+// counts as missed, so a paired relay may push instead. With the send timeout
+// above, every send has settled (sent, or failed and so `missed`) well before
+// this: a late send of this relay's cannot land after a paired relay pushed.
+// The guard is for a dispatch that hangs anywhere else.
+const NOTICE_KEEP_MS = DEFAULT_QUESTION_TIMEOUT_MS;
+const NOTICE_PENDING_MAX_MS = 2 * 60_000;
 
 const EVENT_LABELS = Object.freeze({
   // A question's title names the provider that asks (questionTitle).
@@ -41,7 +54,14 @@ const EVENT_LABELS = Object.freeze({
   relayRestart: { title: 'Relay restart waiting', generic: 'The queued relay restart has waited its maximum time.' },
 });
 
-function eventTitle(type, providerName) {
+// A card on a paired relay: named by its kind and that relay.
+const REMOTE_GENERIC_APPROVAL = 'An Allow / Deny card waits there.';
+
+function eventTitle(type, providerName, { relayName = null, remoteKind = null } = {}) {
+  const relay = String(relayName || '').trim();
+  if (type === 'question' && relay) {
+    return remoteKind === 'approval' ? `Approval waiting on relay "${relay}"` : `A question waits on relay "${relay}"`;
+  }
   const name = String(providerName || '').trim();
   if (type === 'question' && name) return `${name} needs your input`;
   return EVENT_LABELS[type].title;
@@ -88,7 +108,15 @@ export function normalizePushPreferences(raw) {
  * Render the notification payload for one subscription. Pure so every content
  * preference combination is unit-testable.
  *
- * @param {{ type: string, conversationTitle?: string|null, providerName?: string|null, body?: string|null, data?: object }} event
+ * A card on a paired relay (`relayName`, `remoteKind` 'approval' |
+ * 'ask_user') is titled by that relay. Its body follows the preview
+ * preference like any question's: an approval shows its `summary` (kind,
+ * requesting session, reason: no prompt text, but session titles), and with
+ * the preview off only its kind label ("New session · the session waits"),
+ * so no title reaches a lock screen against the device's setting. It never
+ * carries a question id or choices, so it shows no answer buttons.
+ *
+ * @param {{ type: string, conversationTitle?: string|null, providerName?: string|null, relayName?: string|null, remoteKind?: string|null, variant?: string|null, summary?: string|null, body?: string|null, data?: object }} event
  * @param {object} preferences canonical shape from normalizePushPreferences
  */
 export function renderPushNotification(event, preferences) {
@@ -96,7 +124,8 @@ export function renderPushNotification(event, preferences) {
   const prefs = normalizePushPreferences(preferences);
   const labels = EVENT_LABELS[type];
 
-  const baseTitle = eventTitle(type, event?.providerName);
+  const remote = type === 'question' && String(event?.relayName || '').trim() !== '';
+  const baseTitle = eventTitle(type, event?.providerName, { relayName: event?.relayName, remoteKind: event?.remoteKind }).slice(0, MAX_TITLE_CHARS);
   let title = baseTitle;
   const conversationTitle = String(event?.conversationTitle || '').trim();
   if (prefs.content.includeTitle && conversationTitle) {
@@ -104,7 +133,13 @@ export function renderPushNotification(event, preferences) {
   }
 
   let body = labels.generic;
-  const text = String(event?.body || '').trim();
+  if (remote && event?.remoteKind === 'approval') {
+    const variant = String(event?.variant || '');
+    const kindLabel = Object.hasOwn(REMOTE_RELAY_APPROVAL_VARIANT_LABELS, variant) ? REMOTE_RELAY_APPROVAL_VARIANT_LABELS[variant] : '';
+    body = kindLabel ? `${kindLabel} · the session waits` : REMOTE_GENERIC_APPROVAL;
+  }
+  // A remote approval's preview is its summary, never the card's text.
+  const text = String((remote && event?.remoteKind === 'approval' ? event?.summary : event?.body) || '').trim();
   // cliOffline has no conversation text to preview; the generic body is the message.
   if (text && SYSTEM_BODY_TYPES.has(type)) {
     body = text.slice(0, MAX_FULL_PREVIEW_CHARS);
@@ -119,10 +154,14 @@ export function renderPushNotification(event, preferences) {
 
   const data = event?.data && typeof event.data === 'object' ? { ...event.data } : {};
   data.type = type;
+  if (remote) {
+    delete data.questionId;
+    delete data.choices;
+  }
 
   // A distinct tag per event so notifications stack instead of replacing each
   // other (decision: one notification per event, no coalescing).
-  const tagSeed = String(data.questionId || data.boardId || data.messageId || data.conversationId || Date.now());
+  const tagSeed = String(data.tag || data.questionId || data.boardId || data.messageId || data.conversationId || Date.now());
   return {
     title,
     body,
@@ -195,6 +234,7 @@ export function createPushDispatchService({
   recordStatusEvent = () => {},
   uuid,
   logger = console,
+  now = () => Date.now(),
 }) {
   const sql = {
     listAll: db.prepare(`
@@ -374,7 +414,7 @@ export function createPushDispatchService({
       await webpush.sendNotification(
         { endpoint: row.endpoint, keys },
         JSON.stringify(payload),
-        { TTL: PUSH_TTL_SECONDS, urgency: 'high' },
+        { TTL: PUSH_TTL_SECONDS, urgency: 'high', timeout: PUSH_SEND_TIMEOUT_MS },
       );
       sql.markSuccess.run(new Date().toISOString(), row.id);
       return { sent: true };
@@ -409,7 +449,7 @@ export function createPushDispatchService({
    * Fire-and-forget push for one event. Never throws; suppression failures
    * fail closed (no push when the active-device state is unknown).
    */
-  async function dispatch({ type, conversationId = null, body = null, data = {}, providerName = null }) {
+  async function dispatch({ type, conversationId = null, body = null, data = {}, providerName = null, relayName = null, remoteKind = null, variant = null, summary = null, conversationTitle: titleOf = null }) {
     try {
       if (!PUSH_EVENT_TYPES.includes(type)) return { outcome: 'invalid-type' };
 
@@ -434,8 +474,12 @@ export function createPushDispatchService({
 
       const event = {
         type,
-        conversationTitle: conversationTitle(conversationId),
+        conversationTitle: titleOf || conversationTitle(conversationId),
         providerName,
+        relayName,
+        remoteKind,
+        variant,
+        summary,
         body,
         data: { ...data, conversationId: conversationId || undefined },
       };
@@ -458,6 +502,48 @@ export function createPushDispatchService({
     }
   }
 
+  /** True when some device takes question pushes: enabled, with its "questions" toggle on. */
+  function hasQuestionSubscribers() {
+    try {
+      return sql.listAll.all().some((row) => {
+        const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
+        return preferences.enabled && preferences.events.question === true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  // question id → { state: 'pending' | 'reached' | 'missed', at }. In memory:
+  // after a restart a question has no entry, and a paired relay may push it.
+  const notices = new Map();
+
+  function pruneNotices() {
+    const cutoff = now() - NOTICE_KEEP_MS;
+    for (const [id, entry] of notices) {
+      if (entry.at < cutoff) notices.delete(id);
+    }
+  }
+
+  function noteNotice(id, state) {
+    pruneNotices();
+    notices.set(id, { state, at: now() });
+  }
+
+  /**
+   * Whether this relay's own push of a question reached a device:
+   * `reached` (sent to one, or a device is active here), `missed`, `pending`
+   * while it is not settled, or null when this relay never pushed it (a card
+   * from before a restart). Read by a paired relay's Inbox (`?push=1`).
+   */
+  function questionNotice(questionId) {
+    const id = String(questionId || '').trim();
+    const entry = id ? notices.get(id) : null;
+    if (!entry || entry.at < now() - NOTICE_KEEP_MS) return null;
+    if (entry.state === 'pending' && now() - entry.at > NOTICE_PENDING_MAX_MS) return 'missed';
+    return entry.state;
+  }
+
   // Semantic wrappers so each io.emit call site stays a single line and the
   // payload construction lives in one place.
   function notifyQuestion(question) {
@@ -468,7 +554,9 @@ export function createPushDispatchService({
       .map((choice) => String(choice || '').trim())
       .filter((choice) => choice && choice.length <= 120)
       .slice(0, 3);
-    return dispatch({
+    const id = String(question?.id || '').trim();
+    if (id) noteNotice(id, 'pending');
+    const pushed = dispatch({
       type: 'question',
       conversationId: question?.conversationId || null,
       providerName: conversationProviderName(question?.conversationId),
@@ -476,6 +564,40 @@ export function createPushDispatchService({
       data: {
         questionId: question?.id || undefined,
         choices: choices.length ? choices : undefined,
+      },
+    });
+    if (!id) return pushed;
+    return pushed.then((result) => {
+      const reached = result?.outcome === 'suppressed' || (result?.outcome === 'dispatched' && Number(result.sent) > 0);
+      noteNotice(id, reached ? 'reached' : 'missed');
+      return result;
+    });
+  }
+
+  /**
+   * A card a turn on a paired relay waits on, which this relay claimed
+   * (remote-inbox-watch-service.mjs): the "questions" toggle and the
+   * active-device suppression apply as to this relay's own. The tap opens
+   * its session there; no question id, no choices: it is answered there.
+   */
+  function notifyRemoteCard({ relay, item } = {}) {
+    const relayId = String(relay?.id || '').trim();
+    const id = String(item?.id || '').trim();
+    const approval = item?.kind === 'approval';
+    const url = remoteConversationUrl(relay?.url, item?.session?.id);
+    return dispatch({
+      type: 'question',
+      relayName: String(relay?.name || '').trim() || relayId || 'another relay',
+      remoteKind: approval ? 'approval' : 'ask_user',
+      variant: approval ? String(item?.variant || '').trim() || null : null,
+      summary: approval ? String(item?.summary || '').trim() || null : null,
+      // An ask_user card's question, which paired relays already get, goes through the preview preference.
+      body: approval ? null : String(item?.question || '').trim() || null,
+      conversationTitle: String(item?.session?.title || '').trim() || null,
+      data: {
+        url: /^https?:\/\//i.test(url) ? url : undefined,
+        remoteRelayId: relayId || undefined,
+        tag: `remote-${relayId}-${id}`,
       },
     });
   }
@@ -536,6 +658,9 @@ export function createPushDispatchService({
     deleteDevice,
     dispatch,
     notifyQuestion,
+    questionNotice,
+    hasQuestionSubscribers,
+    notifyRemoteCard,
     notifyTurnComplete,
     notifyTurnFailed,
     notifyBoard,

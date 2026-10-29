@@ -15,6 +15,7 @@ import {
 } from '../services/relay-queue-gate-service.mjs';
 import {
   persistConversationModelPreference as persistConversationModelPreferenceTx,
+  readPlanOnly,
 } from '../services/conversation-preferences-service.mjs';
 import { fallbackReasoningEffort, inheritedConversationModel } from '../services/conversation-model-fallback.mjs';
 import { killTmuxSession } from '../services/session-worker-launch-service.mjs';
@@ -86,8 +87,11 @@ import {
 import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
 import { recordClaudeCliStart } from '../services/claude-session-leftovers.mjs';
 import { normalizeClaudeBilling } from '../services/claude-billing-switch-service.mjs';
+import { normalizeTurnTokenUsageReport } from '../../shared/turn-token-usage.mjs';
 import { createClaudeApiStopNoteLedger } from '../services/plan-usage-claude-api.mjs';
 import { normalizeClaudeApiUsageReport } from '../services/claude-api-usage-service.mjs';
+import { planBoundaryHoldSql } from '../repositories/message-repository.mjs';
+import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import {
   admitRemoteRelayRequest,
   readRemoteRelayRequest,
@@ -921,6 +925,23 @@ export function resolveResponderConversationMismatch({
   };
 }
 
+/**
+ * Whether a pending row must wait for its conversation's live turn to end
+ * instead of being handed to the worker, which would steer it into that turn.
+ * A steer switches the live turn's mode (the Claude worker re-applies the
+ * permission mode on every delivery), so across plan mode it would change
+ * what the running turn may do: an "Approve plan" follow-up would give a
+ * running plan turn write access, and a plan message would take it from a
+ * running write turn. Rows on the same side of plan mode steer as before.
+ */
+export function crossesPlanBoundaryOfLiveTurn({ stmts, row } = {}) {
+  const conversationId = String(row?.conversation_id || '').trim();
+  if (!conversationId || typeof stmts?.listProcessingQueueByConversation?.all !== 'function') return false;
+  const isPlan = (mode) => String(mode || '').trim().toLowerCase() === 'plan';
+  const pendingIsPlan = isPlan(row.relay_mode);
+  return stmts.listProcessingQueueByConversation.all(conversationId)
+    .some((live) => String(live?.id || '') !== String(row.id || '') && isPlan(live?.relay_mode) !== pendingIsPlan);
+}
 export function dequeuePendingMessage({
   db,
   stmts,
@@ -970,6 +991,10 @@ export function dequeuePendingMessage({
         : stmts.findPending.get(currentIso);
     }
     if (!next) return null;
+    // Across plan mode, a row waits for the live turn instead of steering in.
+    // The claim statements leave such rows out (planBoundaryHoldSql); this is
+    // the fail-closed backstop for one that does not.
+    if (crossesPlanBoundaryOfLiveTurn({ stmts, row: next })) return null;
     // One processing attempt = one attempt_id. Minted here for every claim —
     // even for callers that never echo it back — so finalization, requeue, and
     // question writes can be fenced to the attempt that actually owns the row.
@@ -2049,6 +2074,8 @@ export function registerMessagesRoutes(app, deps) {
     claudeBillingSwitchService = null,
     // The Claude API booking (claude-api-usage-service.mjs).
     claudeApiUsageService = null,
+    // Tokens per turn for every provider (token-usage-service.mjs).
+    tokenUsageService = null,
     // The delivery fence's runtime half for GET /api/pending, as on the
     // socket: the Claude API claim check (null: no refusal) and what a fenced
     // row does (the swap, or fail closed).
@@ -2640,6 +2667,7 @@ export function registerMessagesRoutes(app, deps) {
           AND rs.sdk_session_id = ?
       )
       AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
+      AND ${planBoundaryHoldSql('q')}
     ORDER BY q.timestamp ASC, q.rowid ASC
     LIMIT 1
   `);
@@ -4804,6 +4832,12 @@ export function registerMessagesRoutes(app, deps) {
       ? normalizeRelayMode(existingConversation.preferred_relay_mode)
       : null;
     const requestedRelayMode = savedRelayMode || normalizeRelayMode(relayMode || mode);
+    // Plan-only: an agent's send that names another mode is refused
+    // and nothing is queued (nor a billing switched). Without a mode it runs
+    // in the session's own. The owner's own sends are not limited.
+    if (remoteRequest.remote && readPlanOnly(existingConversation) && planOnlyRefusesMode(relayMode || mode)) {
+      return res.status(409).json({ ...PLAN_ONLY_REFUSAL, conversationId });
+    }
     const trimmedText = stripRelayPromptContext(text, requestedRelayMode || relayMode || mode);
     const normalizedAttachments = normalizeAttachments(rawAttachments);
     const requestedAttachmentCount = Math.min(
@@ -6609,6 +6643,59 @@ export function registerMessagesRoutes(app, deps) {
       try { checkClaudeApiCap('usage'); } catch {}
     }
     res.json({ ok: true, billing: booked.billing, basis: booked.basis, models: booked.booked.map((entry) => entry.model) });
+  });
+
+  // POST /api/turn-token-usage — every worker reports, after a turn, the
+  // turn's tokens per model (`models`), or a Claude cloud worker the
+  // session's running totals (`sessionTotals`), keyed by turn, run and model
+  // (shared/turn-token-usage.mjs). Advisory and idempotent: a retried or
+  // reordered report books only what it adds (token-usage-service.mjs).
+  // Who ran the turn is the relay's to say: the chat's provider, and for a
+  // Claude chat the posting worker's registered kind (the billing can switch
+  // between turns). A body that says otherwise is logged. A deleted chat
+  // takes no report, so a late retry cannot book its turn a second time; an
+  // archived one does.
+  app.post('/api/turn-token-usage', auth, (req, res) => {
+    touchCli();
+    if (!tokenUsageService) return res.status(501).json({ error: 'Token usage storage is unavailable' });
+    const parsed = normalizeTurnTokenUsageReport(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    const { report } = parsed;
+    const conversationId = report.conversationId;
+    if (!stmts.getConv?.get?.(conversationId)) return res.status(404).json({ error: 'Conversation not found' });
+    // The binding's provider wins over the report's. A chat whose binding is
+    // gone for a moment (a cache rebuild) still books, as the provider the
+    // report states.
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+    const chatProvider = String(runtimeSession?.provider_type || report.provider || '').trim().toLowerCase();
+    let provider = chatProvider;
+    let billing = '';
+    if (chatProvider === 'openai') {
+      // A chat on the user's own OpenAI key runs on the Copilot SDK.
+      provider = 'github';
+      billing = 'byok-openai';
+    } else if (chatProvider === 'github') {
+      billing = report.billing;
+    } else if (normalizeClaudeBilling(chatProvider)) {
+      const requesterSid = normalizeSessionWorkerId(readBridgeIdentity(req)?.sessionId);
+      const registeredKind = normalizeClaudeBilling(requesterSid ? sessionWorkerRegistry?.getWorker?.(requesterSid)?.kind : '');
+      // The worker that ran the turn, then the chat's billing; the report's
+      // own word only when the chat has no binding.
+      provider = registeredKind || normalizeClaudeBilling(chatProvider);
+    } else if (!['claude-cloud', 'deepseek', 'cursor', 'grok'].includes(chatProvider)) {
+      return res.status(409).json({ error: 'Conversation keeps no token usage' });
+    }
+    if (report.provider && report.provider !== provider) {
+      console.warn(`[${ts()}] token usage conv=${conversationId.slice(0, 8)} stated=${report.provider} booked=${provider}`);
+    }
+    if (report.sessionTotals && provider !== 'claude-cloud') {
+      return res.status(400).json({ error: 'sessionTotals is for Claude cloud only' });
+    }
+    const booked = report.sessionTotals
+      ? tokenUsageService.recordCloudSessionTotals({ conversationId, provider, billing, report })
+      : tokenUsageService.recordTurn({ conversationId, provider, billing, report });
+    if (!booked) return res.status(501).json({ error: 'Token usage storage is unavailable' });
+    res.json({ ok: true, provider, billing, models: booked.map((entry) => entry.model) });
   });
 
   // POST /api/claude-plan-usage — Claude worker reports the session's

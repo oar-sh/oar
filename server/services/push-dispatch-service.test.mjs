@@ -8,6 +8,7 @@ import {
   normalizePushPreferences,
   renderPushNotification,
   PUSH_EVENT_TYPES,
+  PUSH_SEND_TIMEOUT_MS,
 } from './push-dispatch-service.mjs';
 import { PUSH_SUBSCRIPTIONS_SCHEMA } from '../migrations/0003-push-subscriptions.mjs';
 import { questionCardHeadLabel } from '../public/app/conversation-provider-indicator.mjs';
@@ -572,4 +573,158 @@ test('a question push names each provider as its question card does', async () =
     titles,
     providers.map((provider) => questionCardHeadLabel({ runtimeProviderType: provider }).replace(/ question$/, ' needs your input')),
   );
+});
+
+// ── The notice ledger ────────────────────────────────────────────
+
+function makeLedgerService(db, options = {}) {
+  let clock = Date.parse('2026-03-02T10:00:00.000Z');
+  const service = createPushDispatchService({
+    db,
+    webpush: options.webpush || { sendNotification: async () => ({ statusCode: 201 }) },
+    hasActiveDevice: options.hasActiveDevice || (() => false),
+    uuid: nextUuid,
+    logger: { warn: () => {} },
+    now: () => clock,
+  });
+  return { service, advance: (ms) => { clock += ms; } };
+}
+
+test('the ledger: a push that reached a device, or an active device here, is reached; anything else is missed', async () => {
+  const sent = makeLedgerService(makeDb());
+  subscribeDevice(sent.service);
+  assert.equal(sent.service.questionNotice('q-sent'), null, 'never pushed: no entry');
+  const pushing = sent.service.notifyQuestion({ id: 'q-sent', conversationId: 'c', prompt: 'Go?' });
+  assert.equal(sent.service.questionNotice('q-sent'), 'pending', 'not settled while the push runs');
+  await pushing;
+  assert.equal(sent.service.questionNotice('q-sent'), 'reached');
+
+  const suppressed = makeLedgerService(makeDb(), { hasActiveDevice: () => true });
+  subscribeDevice(suppressed.service);
+  await suppressed.service.notifyQuestion({ id: 'q-active', prompt: 'Go?' });
+  assert.equal(suppressed.service.questionNotice('q-active'), 'reached');
+
+  const nobody = makeLedgerService(makeDb());
+  assert.deepEqual(await nobody.service.notifyQuestion({ id: 'q-none', prompt: 'Go?' }), { outcome: 'no-subscribers' });
+  assert.equal(nobody.service.questionNotice('q-none'), 'missed');
+
+  const failing = makeLedgerService(makeDb(), { webpush: { sendNotification: async () => { throw Object.assign(new Error('boom'), { statusCode: 500 }); } } });
+  subscribeDevice(failing.service);
+  assert.equal((await failing.service.notifyQuestion({ id: 'q-failed', prompt: 'Go?' })).sent, 0);
+  assert.equal(failing.service.questionNotice('q-failed'), 'missed');
+
+  const db = makeDb();
+  const broken = makeLedgerService(db);
+  db.exec('DROP TABLE push_subscriptions');
+  assert.deepEqual(await broken.service.notifyQuestion({ id: 'q-error', prompt: 'Go?' }), { outcome: 'error' });
+  assert.equal(broken.service.questionNotice('q-error'), 'missed');
+});
+
+test('the ledger: a push stuck pending counts as missed after two minutes; entries go after the question lifetime', async () => {
+  let release;
+  const { service, advance } = makeLedgerService(makeDb(), { webpush: { sendNotification: () => new Promise((resolve) => { release = resolve; }) } });
+  subscribeDevice(service);
+  const pushing = service.notifyQuestion({ id: 'q-stuck', prompt: 'Go?' });
+  advance(119_000);
+  assert.equal(service.questionNotice('q-stuck'), 'pending');
+  advance(2_000);
+  assert.equal(service.questionNotice('q-stuck'), 'missed');
+  release({ statusCode: 201 });
+  await pushing;
+  assert.equal(service.questionNotice('q-stuck'), 'reached');
+  advance(8 * 60 * 60_000 + 1_000);
+  assert.equal(service.questionNotice('q-stuck'), null);
+});
+
+test('question subscribers: an enabled device with questions on', () => {
+  const { service } = makeLedgerService(makeDb());
+  assert.equal(service.hasQuestionSubscribers(), false);
+  const off = subscribeDevice(service, { deviceId: 'off', preferences: { events: { question: false } } });
+  assert.equal(service.hasQuestionSubscribers(), false);
+  subscribeDevice(service, { deviceId: 'disabled', preferences: { enabled: false } });
+  assert.equal(service.hasQuestionSubscribers(), false);
+  service.updateDevice(off.id, { preferences: { events: { question: true } } });
+  assert.equal(service.hasQuestionSubscribers(), true);
+});
+
+// ── A card on a paired relay ─────────────────────────────────────
+
+test('a paired relay\'s card is titled by that relay; an approval\'s body is its summary; no question id, no choices', () => {
+  const approval = renderPushNotification({
+    type: 'question', relayName: 'relay-b', remoteKind: 'approval', summary: 'New session requested by \'Lead\': Docs pass',
+    data: { url: 'https://relay-b.example.test/?conv=conv-1', remoteRelayId: 'r-b', tag: 'remote-r-b-q1', questionId: 'q1', choices: ['Allow', 'Deny'] },
+  }, normalizePushPreferences({ content: { preview: 'full' } }));
+  assert.equal(approval.title, 'Approval waiting on relay "relay-b"');
+  assert.equal(approval.body, 'New session requested by \'Lead\': Docs pass');
+  assert.equal(approval.tag, 'oar-question-remote-r-b-q1');
+  assert.equal('questionId' in approval.data, false);
+  assert.equal('choices' in approval.data, false);
+  assert.equal(approval.data.url, 'https://relay-b.example.test/?conv=conv-1');
+
+  const question = { type: 'question', relayName: 'relay-b', remoteKind: 'ask_user', body: 'Which theme should the docs use?', data: { tag: 'remote-r-b-q2' } };
+  const hidden = renderPushNotification(question, normalizePushPreferences({}));
+  assert.equal(hidden.title, 'A question waits on relay "relay-b"');
+  assert.equal(hidden.body, 'The agent asked a question.', 'the question text goes through the preview preference');
+  assert.equal(renderPushNotification(question, normalizePushPreferences({ content: { preview: 'truncated', previewChars: 20 } })).body, 'Which theme should t…');
+});
+
+test('an approval\'s push body follows the preview preference: its summary when previews are on, its kind label alone when off', () => {
+  const event = { type: 'question', relayName: 'relay-b', remoteKind: 'approval', variant: 'create_session', summary: 'New session requested by \'Lead\': Docs pass, claude-sonnet-5', body: 'NOT THE CARD TEXT', data: {} };
+  assert.equal(renderPushNotification(event, normalizePushPreferences({ content: { preview: 'full' } })).body, 'New session requested by \'Lead\': Docs pass, claude-sonnet-5');
+  assert.equal(renderPushNotification(event, normalizePushPreferences({ content: { preview: 'truncated', previewChars: 24 } })).body, 'New session requested by…');
+  const off = renderPushNotification(event, normalizePushPreferences({ content: { preview: 'none' } }));
+  assert.equal(off.body, 'New session · the session waits', 'no session title against the device\'s setting');
+  assert.equal(renderPushNotification({ ...event, variant: 'loop_guard' }, normalizePushPreferences({})).body, 'Loop guard · the session waits');
+  assert.equal(renderPushNotification({ ...event, variant: 'something_new' }, normalizePushPreferences({})).body, 'An Allow / Deny card waits there.');
+  assert.equal(renderPushNotification({ ...event, variant: null, summary: null }, normalizePushPreferences({ content: { preview: 'full' } })).body, 'An Allow / Deny card waits there.');
+});
+
+test('notifyRemoteCard pushes through the questions toggle and the active-device rule, with the link to the session there', async () => {
+  const sent = [];
+  let active = false;
+  const { service } = makeService(makeDb(), {
+    hasActiveDevice: () => active,
+    webpush: { sendNotification: async (subscription, payload) => { sent.push(JSON.parse(payload)); return { statusCode: 201 }; } },
+  });
+  subscribeDevice(service, { deviceId: 'phone', preferences: { content: { includeTitle: true, preview: 'full' } } });
+  subscribeDevice(service, { deviceId: 'quiet', preferences: { events: { question: false } } });
+  const relay = { id: 'r-b', name: 'relay-b', url: 'https://relay-b.example.test/' };
+  const item = { id: 'q1', kind: 'approval', session: { id: 'conv-1', title: 'Lead' }, question: '', variant: 'loop_guard', summary: 'Loop guard: 30 prompts by \'Lead\'' };
+  assert.deepEqual(await service.notifyRemoteCard({ relay, item }), { outcome: 'dispatched', sent: 1, failed: 0 });
+  assert.equal(sent.length, 1, 'the device with questions off gets none');
+  assert.equal(sent[0].title, 'Approval waiting on relay "relay-b" — Lead');
+  assert.equal(sent[0].body, 'Loop guard: 30 prompts by \'Lead\'');
+  assert.deepEqual(sent[0].data, { url: 'https://relay-b.example.test/?conv=conv-1', remoteRelayId: 'r-b', tag: 'remote-r-b-q1', type: 'question' });
+  assert.equal(service.questionNotice('q1'), null, 'another relay\'s card is not in this relay\'s ledger');
+  active = true;
+  assert.deepEqual(await service.notifyRemoteCard({ relay, item }), { outcome: 'suppressed' });
+  active = false;
+  await service.notifyRemoteCard({ relay: { ...relay, url: 'javascript:alert(1)' }, item });
+  assert.equal(sent[1].data.url, undefined, 'only an http(s) link');
+});
+
+test('every send has a 30 s timeout; a send that timed out counts as missed, so the card is claimable', async () => {
+  const options = [];
+  const { service } = makeLedgerService(makeDb(), {
+    webpush: {
+      sendNotification: async (_subscription, _payload, sendOptions) => {
+        options.push(sendOptions);
+        // What web-push rejects with when the push service stops answering.
+        throw new Error('Socket timeout');
+      },
+    },
+  });
+  subscribeDevice(service);
+  const result = await service.notifyQuestion({ id: 'q-timeout', prompt: 'Go?' });
+  assert.equal(PUSH_SEND_TIMEOUT_MS, 30_000);
+  assert.equal(options[0].timeout, PUSH_SEND_TIMEOUT_MS);
+  assert.deepEqual({ outcome: result.outcome, sent: result.sent }, { outcome: 'dispatched', sent: 0 });
+  assert.equal(service.questionNotice('q-timeout'), 'missed', 'settled long before the 2-minute guard');
+});
+
+test('a variant that is no listed one gets no label, whatever its name', () => {
+  for (const variant of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    const payload = renderPushNotification({ type: 'question', relayName: 'relay-b', remoteKind: 'approval', variant, summary: 'S', data: {} }, normalizePushPreferences({}));
+    assert.equal(payload.body, 'An Allow / Deny card waits there.', variant);
+  }
 });

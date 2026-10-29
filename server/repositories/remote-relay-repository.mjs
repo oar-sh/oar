@@ -75,6 +75,12 @@ export function createRemoteRelayRepository(db) {
   const getMayCreateSessions = hasMayCreateColumn
     ? db.prepare(`SELECT may_create_sessions FROM conversations WHERE id = ?`)
     : null;
+  // Plan-only (migration 0035). Without the column no session is.
+  const hasPlanOnlyColumn = db.prepare(`PRAGMA table_info(conversations)`).all()
+    .some((column) => column.name === 'plan_only');
+  const getPlanOnly = hasPlanOnlyColumn
+    ? db.prepare(`SELECT plan_only FROM conversations WHERE id = ?`)
+    : null;
 
   return {
     hasUnlock(conversationId, remoteRelayId) {
@@ -160,6 +166,10 @@ export function createRemoteRelayRepository(db) {
     /** Did the owner let the agents of this (agent-started) conversation start sessions? */
     mayCreateSessions(conversationId) {
       return Number(getMayCreateSessions?.get(String(conversationId || ''))?.may_create_sessions) === 1;
+    },
+    /** Is this conversation plan-only (agents cannot take it out of plan mode)? */
+    planOnly(conversationId) {
+      return Number(getPlanOnly?.get(String(conversationId || ''))?.plan_only) === 1;
     },
   };
 }

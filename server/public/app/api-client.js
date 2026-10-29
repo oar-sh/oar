@@ -1709,13 +1709,14 @@ export async function loadRelayBoard(boardId) {
   return apiFetch(`/api/relay-board/${encodeURIComponent(id)}`);
 }
 
-export async function submitRelayBoardAction(boardId, actionId) {
+export async function submitRelayBoardAction(boardId, actionId, { onErrorResponse } = {}) {
   const id = String(boardId || '').trim();
   const action = String(actionId || '').trim();
   if (!id || !action) return null;
   return apiFetch(`/api/relay-board/${encodeURIComponent(id)}/action`, {
     method: 'POST',
     body: JSON.stringify({ actionId: action }),
+    onErrorResponse,
   });
 }
 

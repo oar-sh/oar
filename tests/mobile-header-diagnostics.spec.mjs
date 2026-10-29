@@ -98,6 +98,9 @@ test.describe.serial("mobile header diagnostics", () => {
 
       await page.goto(`/?token=${encodeURIComponent(token)}`);
       await page.waitForLoadState("networkidle");
+      // Set by bootstrap.js, which loads after the page (a dynamic import):
+      // networkidle can come first on a slow runner.
+      await page.waitForFunction(() => typeof window.openConversation === "function");
       await page.evaluate(async (id) => {
         if (id) await window.openConversation(id);
       }, conversationId);

@@ -1775,6 +1775,13 @@ export function createRelayEventService({
     choice: 'text',
     dismissed: 'bool',
     via: 'text',
+    // board_settled
+    boardId: 'text',
+    boardType: 'text',
+    action: 'text',
+    actionLabel: 'text',
+    title: 'text',
+    queuedMessageId: 'text',
     description: 'text',
     summary: 'text',
     taskId: 'text',
@@ -2370,6 +2377,28 @@ export function createRelayEventService({
     return told.size + recorded;
   }
 
+  /**
+   * The user settled a plan card (board) of a session (routes/relay-board-routes.mjs):
+   * the subscriptions on that session that take board_settled are told, as
+   * for any event (paired relays' through their fetch). `queuedMessageId` is
+   * the follow-up message the action queued, null for exit_only. Returns how
+   * many watchers got it.
+   */
+  function noteBoardSettled(conversationId, detail = {}) {
+    if (!available) return 0;
+    const boardId = toText(detail?.boardId);
+    if (!toText(conversationId) || !boardId) return 0;
+    const queuedMessageId = toText(detail.queuedMessageId);
+    return record('board_settled', conversationId, {
+      boardId,
+      boardType: toText(detail.boardType).slice(0, 80) || null,
+      action: toText(detail.action).slice(0, 80),
+      actionLabel: toText(detail.actionLabel).slice(0, 200),
+      title: String(detail.title ?? '').slice(0, 500),
+      queuedMessageId: queuedMessageId || null,
+    });
+  }
+
   /** The tracker's edge: a background task started or ended. */
   function noteTaskEdge({ type, conversationId, task } = {}) {
     if (!available || !task) return;
@@ -2651,6 +2680,7 @@ export function createRelayEventService({
     noteError,
     noteQuestion,
     noteQuestionAnswered,
+    noteBoardSettled,
     noteTaskEdge,
     noteConversationGone,
     noteRestartRequested,

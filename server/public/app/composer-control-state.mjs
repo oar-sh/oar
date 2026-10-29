@@ -19,6 +19,9 @@ export function hasUploadingAttachments(attachments = []) {
   return countUploadingAttachments(attachments) > 0;
 }
 
+// A message whose mode is on the other side of plan mode from the live turn's.
+export const PLAN_BOUNDARY_QUEUE_TITLE = 'Queued behind the running turn: plan mode and the writing modes do not steer into each other';
+
 // Why a message sent right now queues instead of steering — worker-reported
 // hold reasons mapped to a human title. Stopping a turn lives on the message
 // bubbles, never here, so every state below is a Send/Steer/Queue shape.
@@ -49,6 +52,10 @@ export function deriveComposerControlState({
   // the relay holds the message and it steers in once the hold clears.
   steeringHeld = false,
   steeringHoldReason = null,
+  // The composer's mode is on the other side of plan mode from the live turn's:
+  // the relay queues such a message behind the turn instead of steering it in
+  // (a steer would switch what the running turn may do).
+  crossesPlanMode = false,
   // An archived conversation: its worker is stopped and it is out of the
   // live list; sending would start it again behind the user's back.
   archived = false,
@@ -83,10 +90,13 @@ export function deriveComposerControlState({
   // The label/title/action for a draft typed during a live turn: steer into it
   // where the provider supports that (queued while steering is held), queue
   // behind it otherwise.
-  const steerNow = !!steeringSupported && !held;
+  const crossing = active && !!crossesPlanMode;
+  const steerNow = !!steeringSupported && !held && !crossing;
   const midTurnAction = steerNow ? 'steer' : 'queue';
   const midTurnLabel = steerNow ? 'Steer' : 'Queue';
-  const midTurnTitle = held
+  const midTurnTitle = crossing
+    ? PLAN_BOUNDARY_QUEUE_TITLE
+    : held
     ? (STEERING_HOLD_TITLES[String(steeringHoldReason || '').trim()]
       || 'Will steer in once steering resumes')
     : (steeringSupported

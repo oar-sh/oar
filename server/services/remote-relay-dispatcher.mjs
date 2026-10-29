@@ -31,6 +31,7 @@ import {
   withRemotePromptHeader,
 } from '../../shared/remote-relay-contract.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
+import { PLAN_ONLY_ERROR_CODE, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { matchQuestionChoice } from '../../shared/question-answer-rule.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES, RELAY_EVENT_RELAY_LEVEL_TYPES } from '../../shared/relay-events.mjs';
@@ -1540,6 +1541,8 @@ export function createRemoteRelayDispatcher({
       ...(createdBy && ctx?.relay?.local && createdBy === ctx.conversationId ? { startedByYou: true } : {}),
       // The owner let this agent-started session's agents start sessions.
       ...(row?.mayCreateSessions === true ? { mayCreateSessions: true } : {}),
+      // Agents cannot take it out of plan mode.
+      ...(row?.planOnly === true ? { planOnly: true } : {}),
       // The session group it sits in (sessions an agent started here are
       // grouped under that agent's session; the owner can group by hand).
       ...sessionGroupField(row, groups),
@@ -1794,6 +1797,7 @@ export function createRemoteRelayDispatcher({
         ...sessionActivityFields(conversation, { console: true }),
         ...(via ? { via } : {}),
         ...(conversation?.mayCreateSessions === true ? { mayCreateSessions: true } : {}),
+        ...(conversation?.planOnly === true ? { planOnly: true } : {}),
         ...(group ? { group } : {}),
         openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
       },
@@ -2148,7 +2152,8 @@ export function createRemoteRelayDispatcher({
     // Grok pins its model at bootstrap and refuses any other, so it gets none.
     const model = requestedModel
       || (provider === 'grok' ? '' : (toText(conversation?.preferredModel) || toText(runtime.providerModel) || toText(runtime.model)));
-    const mode = args.mode || ctx.caller.mode || toText(conversation?.preferredRelayMode) || '';
+    // Only a mode the agent names: without one the target runs in its own.
+    const mode = toText(args.mode);
     // The remote runs a prompt that names no effort with its provider's
     // default, not with the one the session is set to: pass that one on, so
     // the session keeps its own. This session's effort is never mirrored here.
@@ -2296,7 +2301,14 @@ export function createRemoteRelayDispatcher({
         note = `${provider} on relay "${ctx.relay.name}" does not offer ${ctx.caller.model}; the session uses its default model ${model || '(none)'}.`;
       }
     }
-    const mode = args.mode || ctx.caller.mode || toText(catalog.status.defaultRelayMode) || '';
+    // planOnly starts the session locked in plan mode: with no mode named it
+    // starts in plan; another mode named is refused before anything is made.
+    const planOnly = args.planOnly === true || toText(args.planOnly).toLowerCase() === 'true';
+    if (planOnly && planOnlyRefusesMode(args.mode)) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+        `planOnly keeps a session in plan mode; it cannot start in ${toText(args.mode)} mode. Leave mode out or name "plan". No session was created.`);
+    }
+    const mode = args.mode || (planOnly ? 'plan' : ctx.caller.mode) || toText(catalog.status.defaultRelayMode) || '';
     const title = args.title || firstLine(args.text, TITLE_MAX) || 'Remote session';
     const origin = await buildOrigin(ctx);
 
@@ -2327,6 +2339,7 @@ export function createRemoteRelayDispatcher({
         providerType: provider,
         ...(model ? { model } : {}),
         ...(mode ? { relayMode: mode } : {}),
+        ...(planOnly ? { planOnly: true } : {}),
         ...(effort ? { reasoningEffort: effort } : {}),
         title,
         ...(args.cwd ? { cwd: args.cwd } : {}),
@@ -2372,6 +2385,11 @@ export function createRemoteRelayDispatcher({
     } else if (args.group && (!group || (ctx.group?.id && group.id !== ctx.group.id))) {
       groupWarning = `The session was created, but not in group "${clipLine(args.group, 80)}": ${groupWhere(ctx)} put it ${group ? `in "${group.name || group.id}" (${group.id})` : 'in no group'}. Tell the user.`;
     }
+    // A relay that knows planOnly echoes it; an older one created the session
+    // without the lock (in the mode asked for).
+    const planOnlyWarning = planOnly && bootstrap?.planOnly !== true
+      ? `The session was created WITHOUT the plan-only lock: ${groupWhere(ctx)} ignored planOnly (its OAR is older and does not take it). It started in ${mode || 'its default'} mode, but agents can switch it to another mode. Tell the user.`
+      : null;
     const boundModel = toText(bootstrap?.selectedModel) || model;
     // A relay that swapped the asked model for another (one that predates
     // these checks does for Copilot) is named, never passed over in silence.
@@ -2436,14 +2454,20 @@ export function createRemoteRelayDispatcher({
         // The session group it went into, as list_sessions shows it.
         group,
         ...(groupWarning ? { groupWarning } : {}),
+        ...(planOnly ? { planOnly: bootstrap?.planOnly === true } : {}),
+        ...(planOnlyWarning ? { planOnlyWarning } : {}),
       },
     });
-    if (!groupWarning) return result;
+    if (!groupWarning && !planOnlyWarning) return result;
     // Never a plain success: the summary and the note say what is missing.
+    const missing = [
+      groupWarning ? `no group: ${groupReported ? 'not applied' : 'target too old'}` : '',
+      planOnlyWarning ? 'no plan-only lock: target too old' : '',
+    ].filter(Boolean).join('; ');
     return {
       ...result,
-      summary: `${result.summary} (no group: ${groupReported ? 'not applied' : 'target too old'})`,
-      note: [groupWarning, result.note].map(toText).filter(Boolean).join(' '),
+      summary: `${result.summary} (${missing})`,
+      note: [groupWarning, planOnlyWarning, result.note].map(toText).filter(Boolean).join(' '),
     };
   }
 
@@ -2638,6 +2662,10 @@ export function createRemoteRelayDispatcher({
     }
     if (remoteCode === SESSION_SETTINGS_CODES.busy) {
       return failed(409, C.busy, text, { reason: toText(body.reason) || null });
+    }
+    // A plan-only session: no other mode while the flag stays.
+    if (remoteCode === PLAN_ONLY_ERROR_CODE) {
+      return failed(409, PLAN_ONLY_ERROR_CODE, text, { note: 'Clear the flag in the same call (planOnly: false with the mode), or ask the user.' });
     }
     if (remoteCode === SESSION_SETTINGS_CODES.groupNotFound || remoteCode === SESSION_SETTINGS_CODES.groupAmbiguous) {
       return failed(400, C.unknownGroup, text, {
@@ -3486,6 +3514,13 @@ export function createRemoteRelayDispatcher({
       return failure(404, C.notFound, what ? `${what} was not found on relay "${relay.name}".` : message, extra);
     }
     const remoteCode = toText(remoteBody?.code) || null;
+    // A plan-only session refused a mode the agent named.
+    if (remoteCode === PLAN_ONLY_ERROR_CODE) {
+      const session = args.session ? `Session ${args.session} on relay "${relay.name}"` : `Relay "${relay.name}"`;
+      return failure(409, PLAN_ONLY_ERROR_CODE,
+        `${session} is plan-only: agents can't switch it to another mode. Send without mode (it runs in plan), or clear planOnly with update_session first, or ask the user. Nothing was sent.`,
+        { ...extra, remoteCode });
+    }
     const supportedModels = Array.isArray(remoteBody?.supportedModels) ? remoteBody.supportedModels.slice(0, 50) : null;
     // A refused effort: the ones the remote's model takes, so the agent can pick one.
     const supportedEfforts = isEffortRejection(error) ? supportedEffortsOf(error) : [];

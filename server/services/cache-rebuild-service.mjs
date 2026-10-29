@@ -1,5 +1,7 @@
 'use strict';
 
+import { forgetTurnTokenRows } from './token-usage-service.mjs';
+
 function normalizeId(value) {
   return String(value || '').trim();
 }
@@ -99,6 +101,8 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM queue WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM messages WHERE conversation_id = ?`).run(sid);
       db.prepare(`DELETE FROM runtime_sessions WHERE conversation_id = ?`).run(sid);
+      // Its turns' tokens go too; the day sums stay.
+      forgetTurnTokenRows(db, [sid]);
       db.prepare(`DELETE FROM conversations WHERE id = ?`).run(sid);
     })();
     closePreviews(sid);
@@ -164,6 +168,9 @@ export function createCacheRebuildService({
       db.prepare(`DELETE FROM queue`).run();
       db.prepare(`DELETE FROM messages`).run();
       db.prepare(`DELETE FROM runtime_sessions`).run();
+      // The turn tokens of the chats removed for good; a hand-titled chat
+      // stays, and keeps them.
+      forgetTurnTokenRows(db, db.prepare(`SELECT id FROM conversations WHERE status = 'deleted' OR title_source != 'manual'`).all().map((row) => row.id));
       db.prepare(`DELETE FROM conversations WHERE status = 'deleted' OR title_source != 'manual'`).run();
       for (const conversationId of manualTitleConversations) {
         db.prepare(`

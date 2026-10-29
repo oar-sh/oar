@@ -150,6 +150,9 @@ test.describe.serial("push notification settings", () => {
     });
     await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
     await page.waitForLoadState("networkidle");
+    // Set by bootstrap.js, which loads after the page (a dynamic import):
+    // networkidle can come first on a slow runner.
+    await page.waitForFunction(() => typeof window.connectSocket === "function");
 
     await page.evaluate(async () => {
       const socket = await window.connectSocket();

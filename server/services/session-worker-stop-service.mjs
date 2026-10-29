@@ -22,12 +22,17 @@ function toPidList(rows, extraPid) {
 
 // The process list is read off the relay's thread, fresh (a stop must see
 // the children started a moment ago). Throws when the list could not be
-// read: the caller must not pretend it stopped what it could not see.
-async function enumeratePids({ sdkSessionId, worker, processInspector, platform }) {
+// read: the caller must not pretend it stopped what it could not see. The
+// registry's pid counts only while that process is alive: a worker that is
+// gone is stopped already (on Windows its stop call alone could fail).
+async function enumeratePids({ sdkSessionId, worker, processInspector, platform, isPidAliveImpl }) {
   const rows = platform === 'win32'
     ? await processInspector?.findWindowsProcessTreeForSessionAsync?.(sdkSessionId, { fresh: true })
     : await processInspector?.findProcessesForSessionAsync?.(sdkSessionId, { fresh: true });
-  return toPidList(rows || [], worker?.pid);
+  const listed = toPidList(rows || []);
+  const workerPid = Number(worker?.pid);
+  const workerAlive = Number.isInteger(workerPid) && workerPid > 0 && (listed.includes(workerPid) || isPidAliveImpl(workerPid));
+  return workerAlive ? toPidList(rows || [], workerPid) : listed;
 }
 
 async function stopWindowsPids(processInspector, pids) {
@@ -36,13 +41,29 @@ async function stopWindowsPids(processInspector, pids) {
 
 export const PROCESS_LIST_UNREADABLE = 'process-list-unreadable';
 
+/**
+ * Whether `pid` is a live process: signal 0 reaches it. EPERM means it
+ * exists but belongs to someone else: alive. The default for every stop
+ * that is given no check of its own.
+ */
+export function isProcessAlive(pid, { killImpl = (target, signal) => process.kill(target, signal) } = {}) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return false;
+  try {
+    killImpl(value, 0);
+    return true;
+  } catch (error) {
+    return String(error?.code || '').toUpperCase() === 'EPERM';
+  }
+}
+
 export async function stopSessionWorkerProcesses({
   sdkSessionId,
   worker = null,
   processInspector = null,
   platform = process.platform,
   killImpl = (pid, signal) => process.kill(pid, signal),
-  isPidAliveImpl = () => false,
+  isPidAliveImpl = isProcessAlive,
   killTmuxSessionImpl = null,
   sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   nowMs = Date.now,
@@ -67,7 +88,7 @@ export async function stopSessionWorkerProcesses({
 
   let pids;
   try {
-    pids = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
+    pids = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
   } catch (error) {
     // Nothing is stopped blind: the known pid alone would leave the tree
     // running, and the caller would relaunch next to it.
@@ -115,7 +136,7 @@ export async function stopSessionWorkerProcesses({
   try {
     if (platform === 'win32') {
       // Re-enumerate: children spawned after the first snapshot are invisible to it.
-      const rediscovered = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform });
+      const rediscovered = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
       escalationTargets = [...new Set([...remainingPids, ...rediscovered.filter((pid) => isPidAliveImpl(pid))])];
       await stopWindowsPids(processInspector, escalationTargets);
     } else {

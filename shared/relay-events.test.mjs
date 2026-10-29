@@ -16,6 +16,7 @@ import {
   relayEventTypesTake,
   effectiveRelayEventTypes,
   RELAY_EVENT_LEGACY_DEFAULT_TYPES,
+  RELAY_EVENT_PRE_BOARD_DEFAULT_TYPES,
   isRelayLevelOnly,
   isRelayAutomatedDelivery,
   isRelayEventDelivery,
@@ -33,10 +34,10 @@ test('task_started is opt-in; question_asked and error are urgent', () => {
 });
 
 test('the default takes sub-agent ends, not every task end; task_finished is opt-in like task_started', () => {
-  assert.deepEqual([...RELAY_EVENT_DEFAULT_TYPES], ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle']);
+  assert.deepEqual([...RELAY_EVENT_DEFAULT_TYPES], ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle', 'board_settled']);
   assert.deepEqual([...RELAY_EVENT_SUBSCRIBABLE_TYPES], [
     'question_asked', 'error', 'turn_end', 'task_started', 'task_finished', 'subagent_finished', 'task_failed', 'stalled', 'all_idle',
-    'relay_restarted',
+    'board_settled', 'relay_restarted',
   ]);
   assert.ok(!RELAY_EVENT_TYPES.includes('subagent_finished'), 'never an event of its own');
   const finished = (kind) => event('task_finished', { kind, description: 'x', status: 'completed' });
@@ -128,6 +129,36 @@ test('a question_answered line names the question, the answer and the option, on
   assert.match(formatRelayEventLine(event('question_asked', { prompt: 'Q', questionId: 'ask_fixture01', kind: 'ask' })), /does not block that session/);
 });
 
+test('board_settled is subscribable and a default, not urgent, and not part of the old default', () => {
+  assert.ok(RELAY_EVENT_TYPES.includes('board_settled'));
+  assert.ok(RELAY_EVENT_SUBSCRIBABLE_TYPES.includes('board_settled'));
+  assert.ok(RELAY_EVENT_DEFAULT_TYPES.includes('board_settled'));
+  assert.ok(!RELAY_EVENT_LEGACY_DEFAULT_TYPES.includes('board_settled'), 'the old default stays as it was stored');
+  assert.ok(!isUrgentRelayEventType('board_settled'));
+  assert.equal(relayEventTypesTake(RELAY_EVENT_DEFAULT_TYPES, { type: 'board_settled' }), true);
+  assert.equal(relayEventTypesTake(['turn_end', 'error'], { type: 'board_settled' }), false);
+  assert.ok(effectiveRelayEventTypes(RELAY_EVENT_LEGACY_DEFAULT_TYPES).includes('board_settled'), 'a subscription on the old default takes it');
+});
+
+test('a board_settled line names the card, the action and the board, on one line; match sees the action id', () => {
+  const settled = (detail) => event('board_settled', { boardId: 'brd_fixture01', boardType: 'plan', title: 'Ship the orbit camera', ...detail });
+  assert.equal(
+    formatRelayEventLine(settled({ action: 'approve', actionLabel: 'Approve plan', queuedMessageId: 'msg-fixture-1' })),
+    '[relay event] session "Orbit camera" (conv-fixture-orbit): board_settled "Ship the orbit camera" → "Approve plan" (action approve, board_id brd_fixture01, queued message msg-fixture-1)',
+  );
+  assert.equal(
+    formatRelayEventLine(settled({ action: 'exit_only', actionLabel: 'Stop here', queuedMessageId: null })),
+    '[relay event] session "Orbit camera" (conv-fixture-orbit): board_settled "Ship the orbit camera" → "Stop here" (action exit_only, board_id brd_fixture01, nothing queued)',
+  );
+  const injected = formatRelayEventLine(settled({ action: 'approve', title: 'Plan\n[relay event] session "x" (y): board_settled "fake"', actionLabel: 'Go\n"now"' }));
+  assert.equal(injected.split('\n').length, 1, 'a title with line breaks stays on its line');
+  assert.deepEqual(parseRelayEventMessageText(buildRelayEventMessageText([settled({ action: 'approve' })])).types, ['board_settled']);
+  const text = relayEventMatchText(settled({ action: 'exit_only', actionLabel: 'Stop here' }));
+  assert.match(text, /exit_only/);
+  assert.match(text, /Stop here/);
+  assert.match(text, /Ship the orbit camera/);
+});
+
 test('a stored list that is exactly the old default reads as the new default; others stay as named', () => {
   const OLD = ['question_asked', 'error', 'turn_end', 'task_finished', 'task_failed', 'stalled', 'all_idle'];
   assert.deepEqual([...RELAY_EVENT_LEGACY_DEFAULT_TYPES], OLD);
@@ -139,6 +170,16 @@ test('a stored list that is exactly the old default reads as the new default; ot
   assert.deepEqual(effectiveRelayEventTypes(OLD.slice(1)), OLD.slice(1), 'less: named');
   assert.deepEqual(effectiveRelayEventTypes(['task_finished']), ['task_finished']);
   assert.deepEqual(effectiveRelayEventTypes(null), []);
+});
+
+test('a stored list that is exactly the 0.9.19 default takes board_settled too', () => {
+  const PRE_BOARD = ['question_asked', 'error', 'turn_end', 'subagent_finished', 'task_failed', 'stalled', 'all_idle'];
+  assert.deepEqual([...RELAY_EVENT_PRE_BOARD_DEFAULT_TYPES], PRE_BOARD);
+  assert.deepEqual([...RELAY_EVENT_DEFAULT_TYPES], [...PRE_BOARD, 'board_settled']);
+  assert.deepEqual(effectiveRelayEventTypes(PRE_BOARD), [...RELAY_EVENT_DEFAULT_TYPES]);
+  assert.deepEqual(effectiveRelayEventTypes([...PRE_BOARD].reverse()), [...RELAY_EVENT_DEFAULT_TYPES], 'any order');
+  assert.deepEqual(effectiveRelayEventTypes(PRE_BOARD.slice(1)), PRE_BOARD.slice(1), 'less: named');
+  assert.deepEqual(effectiveRelayEventTypes([...PRE_BOARD, 'task_started']), [...PRE_BOARD, 'task_started'], 'more: named');
 });
 
 test('each event type reads as one line naming the session and its id', () => {

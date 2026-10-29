@@ -612,6 +612,15 @@ function steeringHoldForConversation(conversationId) {
   return { held: false, reason: null };
 }
 
+// Plan mode on one side, the writing modes on the other (a turn's mode not yet
+// known crosses nothing).
+function modesCrossPlan(turnMode, composerMode) {
+  const turn = String(turnMode || '').trim().toLowerCase();
+  const composer = String(composerMode || '').trim().toLowerCase();
+  if (!turn || !composer) return false;
+  return (turn === 'plan') !== (composer === 'plan');
+}
+
 function syncSendButtonState() {
   const btn = document.getElementById('send-btn');
   if (!btn) return;
@@ -631,6 +640,7 @@ function syncSendButtonState() {
     steeringSupported: conversationSupportsSteering(currentConvId),
     steeringHeld: steeringHold.held,
     steeringHoldReason: steeringHold.reason,
+    crossesPlanMode: modesCrossPlan(currentTurn?.mode, document.getElementById('mode-select')?.value),
     archived: conversations[String(currentConvId || '').trim()]?.archived === true,
     setupRequired: !String(currentConvId || '').trim() && isProviderSetupRequired(),
   });
@@ -1202,10 +1212,15 @@ function setConversationTurnState(conversationId, state = null) {
     syncSendButtonState();
     return;
   }
+  const messageId = String(state.messageId || '').trim();
+  const previous = activeTurnsByConversation.get(conversationKey);
   activeTurnsByConversation.set(conversationKey, {
-    messageId: String(state.messageId || '').trim(),
+    messageId,
     status: String(state.status || 'processing').trim().toLowerCase() || 'processing',
     cancelRequested: state.cancelRequested === true,
+    // The live turn's relay mode (the in-flight snapshot carries it); a status
+    // update for the same turn keeps the one already known.
+    mode: String(state.mode || (previous?.messageId === messageId ? previous.mode : '') || '').trim().toLowerCase(),
   });
   syncSendButtonState();
 }
@@ -2293,7 +2308,7 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   const liveStreamSeq = relayStreamStateByMessageId.get(messageId)?.seq || 0;
   const liveStreamText = relayStreamTextByMessageId.get(messageId);
   clearRelayStreamState();
-  setConversationTurnState(currentConvId, { messageId, status: 'processing' });
+  setConversationTurnState(currentConvId, { messageId, status: 'processing', mode: inFlight?.mode });
   const activities = mergeRelayActivityTexts(
     relayActivities.get(messageId) || [],
     Array.isArray(inFlight.activities) ? inFlight.activities : [],
