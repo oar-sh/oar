@@ -1,16 +1,19 @@
 // Relay schedules on the page: the header's "N scheduled" chip with its list
 // and Cancel buttons (on a conversation a schedule fires into or that set
-// one), and the "scheduled" marker on the sidebar row of a conversation a
-// schedule fires into. The relay sends the whole active list on every change
+// one), and the "Scheduled" line in the sidebar row's ⓘ menu of a
+// conversation a schedule fires into. The relay sends the whole active list on every change
 // (socket `relay_schedules`); the page loads it once at start.
 
 import { apiFetch } from './api-client.js';
+import { FONT_SCALE_CHANGE_EVENT, getUiScale } from './font-scaling.js';
+import { isOpeningGestureClick } from './tap-actions.js';
 import { conversations, currentConvId, escHtml, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
 import {
   nextScheduledAt,
-  renderScheduledBadgeHtml,
+  renderScheduleChipHtml,
   renderSchedulePanelHtml,
   scheduleChipText,
+  scheduledInfoText,
   schedulesOf,
 } from './relay-schedule-view.mjs';
 
@@ -18,7 +21,35 @@ let schedules = [];
 let renderedChipKey = '';
 let panelOpen = false;
 let panelConversationId = '';
+// What the open list hangs from when the chip has no box (phone landscape
+// hides the meta line): the ︙ button its menu entry was picked from.
+let panelAnchor = null;
+// When the list last opened: the touch that opened it from ︙ still has its
+// click to come.
+let panelOpenedAt = 0;
 const changeListeners = new Set();
+
+/** The schedule chip's text for a conversation ("2 scheduled"), or '' when it has none. */
+export function relayScheduleChipText(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (IS_SHARED_VIEW || !id) return '';
+  return scheduleChipText(schedulesOf(schedules, id));
+}
+
+/**
+ * Opens the schedule chip's list, as a tap on the chip does, from elsewhere
+ * (the ︙ entry in phone landscape). `anchor` places it while the chip is
+ * not drawn.
+ */
+export function openRelaySchedulePanel({ anchor = null } = {}) {
+  ensurePanel();
+  setPanelOpen(true, { anchor });
+}
+
+/** Closes the schedule chip's list (back closes it before anything else). */
+export function closeRelaySchedulePanel() {
+  if (panelOpen) setPanelOpen(false);
+}
 
 /** Runs after every change of the list (the sidebar re-renders its markers). */
 export function onRelaySchedulesChanged(listener) {
@@ -40,10 +71,10 @@ export async function loadRelaySchedules() {
   if (response && Array.isArray(response.schedules)) applyRelaySchedules(response.schedules);
 }
 
-/** The sidebar's marker for one conversation. */
-export function relayScheduleMarkerHtml(conversationId) {
+/** The line of the sidebar row's ⓘ menu for one conversation, or ''. */
+export function relayScheduleInfoText(conversationId) {
   if (IS_SHARED_VIEW) return '';
-  return renderScheduledBadgeHtml(schedules, conversationId, { escHtml });
+  return scheduledInfoText(schedules, conversationId);
 }
 
 async function cancelSchedule(scheduleId, button) {
@@ -60,7 +91,8 @@ async function cancelSchedule(scheduleId, button) {
 }
 
 // A fixed popover on <body>, placed under the chip, like the subscriptions'
-// list: the title slot clips its overflow.
+// list: the title slot clips its overflow. Opened from ︙ (phone landscape,
+// no chip drawn), it hangs from ︙ instead.
 function ensurePanel() {
   let panel = document.getElementById('relay-schedule-panel');
   if (panel) return panel;
@@ -76,50 +108,67 @@ function ensurePanel() {
     void cancelSchedule(cancelButton.getAttribute('data-schedule-id'), cancelButton);
   });
   document.addEventListener('click', (event) => {
-    if (!panelOpen) return;
+    if (!panelOpen || isOpeningGestureClick(event, panelOpenedAt)) return;
     // composedPath: a Cancel click may have re-rendered the panel already.
     const path = event.composedPath();
-    if (path.includes(panel) || path.some((node) => node instanceof Element && node.classList.contains('relay-schedule-chip'))) return;
+    if (path.includes(panel) || (panelAnchor && path.includes(panelAnchor)) || path.some((node) => node instanceof Element && node.classList.contains('relay-schedule-chip'))) return;
     setPanelOpen(false);
   });
   document.addEventListener('keydown', (event) => {
     if (!panelOpen || event.key !== 'Escape') return;
     event.stopPropagation();
+    const anchor = panelAnchor;
     setPanelOpen(false);
-    document.querySelector('#chat-title-relay-schedules .relay-schedule-chip')?.focus?.();
+    const chip = document.querySelector('#chat-title-relay-schedules .relay-schedule-chip');
+    (chip?.getClientRects?.().length ? chip : anchor || chip)?.focus?.();
   }, true);
   window.addEventListener('resize', () => { if (panelOpen) placePanel(); });
+  window.addEventListener(FONT_SCALE_CHANGE_EVENT, () => { if (panelOpen) placePanel(); });
   return panel;
 }
 
-function setPanelOpen(open) {
+function setPanelOpen(open, { anchor = null } = {}) {
+  if (open && !panelOpen) panelOpenedAt = Date.now();
   panelOpen = Boolean(open);
+  panelAnchor = panelOpen ? anchor : null;
   renderedChipKey = '';
   syncRelayScheduleHeader();
+}
+
+// A box to place against, or null: an element that is not drawn has none.
+function drawnRect(element) {
+  const rect = element?.getBoundingClientRect?.();
+  return rect && (rect.width || rect.height) ? rect : null;
 }
 
 function placePanel() {
   const panel = document.getElementById('relay-schedule-panel');
   const chip = document.querySelector('#chat-title-relay-schedules .relay-schedule-chip');
   if (!panel || panel.hidden) return;
-  const rect = chip?.getBoundingClientRect?.();
-  if (!rect || (!rect.width && !rect.height)) {
+  // Under the chip; with no chip drawn, under the anchor, right edges lined up.
+  const chipRect = drawnRect(chip);
+  const rect = chipRect || drawnRect(panelAnchor);
+  if (!rect) {
     panel.hidden = true;
     return;
   }
-  const margin = 8;
+  // 8px edge, 4px gap and a 120px floor at 100 %, scaled with the zoom.
+  const scale = getUiScale();
+  const margin = 8 * scale;
   const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
-  const top = Math.round(rect.bottom + 4);
+  const top = Math.round(rect.bottom + 4 * scale);
   panel.style.top = `${top}px`;
-  panel.style.maxHeight = `${Math.max(120, window.innerHeight - top - margin)}px`;
+  panel.style.maxHeight = `${Math.round(Math.max(120 * scale, window.innerHeight - top - margin))}px`;
   panel.style.left = '0px';
   const width = panel.offsetWidth;
-  const left = Math.max(margin, Math.min(rect.left, viewportWidth - width - margin));
+  const preferred = chipRect ? rect.left : rect.right - width;
+  const left = Math.max(margin, Math.min(preferred, viewportWidth - width - margin));
   panel.style.left = `${Math.round(left)}px`;
 }
 
 function ensureHeaderElements() {
-  const slot = document.getElementById('chat-title-slot');
+  // Beside the other meta lines in #chat-title-meta; the slot is the fallback.
+  const slot = document.getElementById('chat-title-meta') || document.getElementById('chat-title-slot');
   if (!slot) return null;
   let line = document.getElementById('chat-title-relay-schedules');
   if (!line) {
@@ -127,7 +176,7 @@ function ensureHeaderElements() {
     line.id = 'chat-title-relay-schedules';
     line.hidden = true;
     const after = document.getElementById('chat-title-relay-events') || document.getElementById('chat-title-origin');
-    if (after?.nextSibling) slot.insertBefore(line, after.nextSibling);
+    if (after?.parentNode === slot && after.nextSibling) slot.insertBefore(line, after.nextSibling);
     else slot.appendChild(line);
     line.addEventListener('click', (event) => {
       const target = event.target instanceof Element ? event.target : null;
@@ -164,7 +213,7 @@ export function syncRelayScheduleHeader() {
   }
   const next = nextScheduledAt(mine);
   const nextText = next ? new Date(next).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-  line.innerHTML = `<button type="button" class="relay-watch-chip relay-schedule-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-schedule-panel" title="Prompts the relay queues at set times (agents set them with relay_tool schedule)">⏰ ${escHtml(chipText)}${nextText ? ` <span class="relay-watch-hint">next ${escHtml(nextText)}</span>` : ''}</button>`;
+  line.innerHTML = renderScheduleChipHtml(mine, { panelOpen, nextText, escHtml });
   line.hidden = false;
   panel.innerHTML = panelOpen ? renderSchedulePanelHtml(schedules, id, { conversations, escHtml }) : '';
   panel.hidden = !panelOpen;

@@ -285,12 +285,28 @@ export function leaveStatusView() {
   return wasActive;
 }
 
-export async function toggleStatusView() {
+/**
+ * Nothing to go back to (opened with nothing open, as after an unknown
+ * link): the header and the transcript give way to the empty screen.
+ * Loaded on demand: the transcript's module is already in the page.
+ */
+async function showNothingOpen() {
+  const { clearOpenConversation } = await import('./journal-view.js');
+  clearOpenConversation({ history: false });
+}
+
+/**
+ * Opens Status, or leaves it for the conversation it was opened from. Opened
+ * from the Inbox there is none stored: `returnTo` (the session the history
+ * stands on) is opened instead, so the transcript never keeps Status's rows.
+ */
+export async function toggleStatusView({ returnTo = '' } = {}) {
   if (statusViewActive) {
     leaveStatusView();
-    const restoreId = previousConversationId;
+    const restoreId = previousConversationId || String(returnTo || '').trim();
     previousConversationId = '';
     if (restoreId) await window.openConversation?.(restoreId, { restoreScroll: true });
+    else await showNothingOpen();
     return;
   }
   previousConversationId = String(currentConvId || '').trim();

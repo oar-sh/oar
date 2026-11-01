@@ -4,7 +4,11 @@
 // and the pop closes the viewer. Closing by any other means (the × button,
 // Escape, a swipe down) pops that entry itself so history is left as it
 // was, and the pop that follows is recognised as our own and ignored. The
-// address never changes: the entry carries only its state.
+// address never changes: the entry carries only its state, its place in the
+// stack and the visit's marks of the entry below (session-history.mjs, the
+// back guard).
+
+import { HISTORY_POSITION, inheritedVisitMarks } from './back-guard.mjs';
 
 export const VIEWER_HISTORY_MARK = 'oarFileViewer';
 const OWN_POP_WINDOW_MS = 1500;
@@ -18,7 +22,11 @@ export function createViewerHistory({ history, onBack, now = () => Date.now(), m
     /** The viewer came up: one entry, however many files it then shows. */
     opened() {
       if (state.pushed) return;
-      history.pushState({ [mark]: true }, '');
+      const below = history.state;
+      const entry = { ...inheritedVisitMarks(below), [mark]: true };
+      const position = below?.[HISTORY_POSITION];
+      if (Number.isFinite(position)) entry[HISTORY_POSITION] = position + 1;
+      history.pushState(entry, '');
       state.pushed = true;
     },
     /** The viewer went away by itself: take its entry back out of history. */
@@ -38,6 +46,9 @@ export function createViewerHistory({ history, onBack, now = () => Date.now(), m
       }
       state.ownPopAt = 0;
       if (!state.pushed) return;
+      // Our entry is still the current one: what was popped lay above it
+      // (a dialog opened over the viewer), the viewer stays.
+      if (history.state?.[mark]) return;
       state.pushed = false;
       onBack?.();
     },

@@ -16,6 +16,7 @@ import {
   summaryModalState,
 } from './store.js';
 import { updateMessagePin } from './api-client.js';
+import { notifyHeaderActionsChanged } from './header-priority-actions.mjs';
 
 export const PINNED_MESSAGES_MODAL_KIND = 'pinned-messages';
 
@@ -93,12 +94,16 @@ function syncPinnedHeaderButton() {
   const button = document.getElementById('pinned-messages-btn');
   if (!button) return;
   const count = getConversationPins(currentConversationId).length;
+  // Available or not; whether it fits in the header or goes into ︙ is the
+  // priority+ pass's call, which reads the count from here.
   button.hidden = IS_SHARED_VIEW || !count;
+  button.dataset.count = IS_SHARED_VIEW ? '0' : String(count);
   const countEl = button.querySelector('.header-icon-count');
   if (countEl) countEl.textContent = count ? String(count) : '';
   const label = count ? `Pinned messages (${count})` : 'Pinned messages';
   button.setAttribute('title', label);
   button.setAttribute('aria-label', label);
+  notifyHeaderActionsChanged();
 }
 
 function pinnedModalContent() {

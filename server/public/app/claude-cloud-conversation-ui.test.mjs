@@ -86,7 +86,7 @@ test('a cloud conversation shows its repository and loses what does not apply', 
   assert.equal(el('cloud-session-line').hidden, false);
   assert.deepEqual(lineTexts(), ['☁ example-org/sample-repo', 'main']);
   assert.deepEqual(lineLinks(), [REPO_URL]);
-  // No session to open yet; the ⋯ menu itself is decided elsewhere
+  // No session to open yet; the ︙ menu itself is decided elsewhere
   // (chat-actions-menu-state.mjs) from this answer.
   assert.equal(cloudUi.currentCloudSessionUrl(), null);
   assert.equal(el('image-input').getAttribute('accept'), 'image/jpeg,image/png,image/gif,image/webp');
@@ -152,13 +152,21 @@ test('switching to a local conversation gives everything back', () => {
   assert.equal(cloudUi.currentCloudSessionUrl(), null);
   assert.equal(el('image-input').hasAttribute('accept'), false);
   assert.equal(el('attach-btn').title, 'Attach file');
-  assert.equal(el('chat-title-cwd').textContent, '/home/dev/sample-repo');
+  // The whole path for a desktop, its last folder for the phone's meta row.
+  assert.equal(el('chat-title-cwd').querySelector('.chat-meta-long').textContent, '/home/dev/sample-repo');
+  assert.equal(el('chat-title-cwd').querySelector('.chat-meta-short').textContent, 'sample-repo');
+  assert.equal(el('chat-title-cwd').title, '/home/dev/sample-repo');
+  // A tap shows the whole path on a phone (CSS reads the class); a second one folds it.
+  el('chat-title-cwd').click();
+  assert.equal(el('chat-title-cwd').classList.contains('chat-title-cwd-expanded'), true);
+  el('chat-title-cwd').click();
+  assert.equal(el('chat-title-cwd').classList.contains('chat-title-cwd-expanded'), false);
   opened.length = 0;
   assert.equal(cloudUi.openCurrentCloudSession(), false);
   assert.deepEqual(opened, []);
 });
 
-test('the ⋯ menu entries are left to their own owner', () => {
+test('the ︙ menu entries are left to their own owner', () => {
   // Change CWD and Open on claude.ai are decided with the rest of the menu;
   // this sync must not write them, or a later menu decision could be undone.
   const changeCwd = el('chat-menu-change-cwd');

@@ -16,8 +16,9 @@ import {
   updateSessionPill,
   updateCompactButton,
   closeSidebar,
+  collapseSidebarAfterListPick,
   applyContextUsageBar,
-  isMobileComposerViewport,
+  isPhoneComposerViewport,
   releaseComposerFocusAfterSend,
   saveConversationScrollTop,
   loadConversationReadingAnchor,
@@ -34,6 +35,7 @@ import {
   pruneConversationGroups,
   hasSessionWorkerStatus,
   setConversationGroupFoldChoice,
+  setConversationGroupFoldChoices,
 } from './store.js';
 import { archiveConfirmationFor } from './archive-confirm.mjs';
 import { arrangeConversationList, conversationGroupPosition } from './conversation-group-order.mjs';
@@ -41,9 +43,13 @@ import { describeDragItems, dropAnnouncement, groupMoveStep } from './conversati
 import { bindConversationListDrag } from './conversation-list-drag.mjs';
 import { applyFetchedTurnStateToConversation } from './conversation-turn-state.mjs';
 import {
+  groupActivityText,
   groupIsActive,
+  groupSessionCountText,
   groupSummaryText,
+  groupTitleTone,
   memberStateClass,
+  memberTone,
   resolveGroupFold,
   summarizeGroupMembers,
   toggledGroupFoldChoice,
@@ -85,6 +91,7 @@ import { runRelayErrorCta, renderMessages, renderNoConversationState, restoreInF
 import { mergeTailPage } from './transcript-reading-anchor.mjs';
 import { readWindowRetention } from './conversation-window-retention.mjs';
 import { MENU_SEPARATOR, bindLongPress, closeContextMenu, openContextMenu } from './context-menu.mjs';
+import { getUiScale } from './font-scaling.js';
 import {
   isBackgroundTasksSnapshotCurrent,
   setBackgroundTasksConversation,
@@ -136,9 +143,16 @@ import {
   resolveCloudSourceAutoFill,
   validateCloudSourceInputs,
 } from './claude-cloud-ui.mjs';
-import { renderConversationOriginMarkerHtml } from './remote-relay-origin-view.mjs';
-import { relayEventWatchedMarkerHtml } from './relay-event-subscriptions-ui.js';
-import { relayScheduleMarkerHtml } from './relay-schedules-ui.js';
+import { conversationOriginInfo } from './remote-relay-origin-view.mjs';
+import { relayEventWatchedInfoText } from './relay-event-subscriptions-ui.js';
+import { relayScheduleInfoText } from './relay-schedules-ui.js';
+import {
+  noteConversationCleared,
+  noteConversationGone,
+  noteConversationMissing,
+  noteConversationShown,
+  syncSessionDocumentTitle,
+} from './session-history-ui.js';
 import {
   normalizeConversationFilter,
   conversationMatchesFilter,
@@ -364,10 +378,11 @@ function isConversationProcessing(conversation, workerState) {
   return runtimeStatus === 'processing';
 }
 
-export async function loadConversations() {
+// `openLast: false` when the address names the conversation to open instead.
+export async function loadConversations({ openLast = true } = {}) {
   await refreshConversations({ preservePagination: false });
-  const lastId = localStorage.getItem('copilot_last_conv');
-  if (lastId) await openConversation(lastId, { restoreScroll: true });
+  const lastId = openLast ? localStorage.getItem('copilot_last_conv') : '';
+  if (lastId) await openConversation(lastId, { restoreScroll: true, history: 'replace' });
 }
 
 export async function refreshConversations(options = {}) {
@@ -540,6 +555,13 @@ function conversationRowState(conversation, pendingByConversation = getPendingQu
   // event or fetch said (the worker was killed, or the relay restarted).
   let sessionState = String(conversation?.sessionState || '').trim();
   if (sessionState === 'background_only' && hasSessionWorkerStatus() && !isWorkerStateLive(workerState)) sessionState = 'idle';
+  const memberState = memberStateClass({
+    pendingCount,
+    visualState,
+    processing,
+    activeTurn: conversation?.activeTurn === true,
+    sessionState,
+  });
   return {
     visualState,
     processing,
@@ -549,13 +571,9 @@ function conversationRowState(conversation, pendingByConversation = getPendingQu
     // "Stop all running" acts on, and what keeps an archive from it.
     live: processing || pendingCount > 0 || conversation?.activeTurn === true || sessionState === 'running_turn' || sessionState === 'background_only',
     // The member class the group's head row sums up (conversation-group-state.mjs).
-    memberState: memberStateClass({
-      pendingCount,
-      visualState,
-      processing,
-      activeTurn: conversation?.activeTurn === true,
-      sessionState,
-    }),
+    memberState,
+    // Its colour in the group's name.
+    tone: memberTone({ memberState, visualState }),
   };
 }
 
@@ -571,6 +589,14 @@ function groupDisplayName(groupId) {
   return String(info?.name || head?.title || info?.displayName || 'Group').trim() || 'Group';
 }
 
+/** A synthetic head's meta line: when its newest row was active, and how many rows it has. */
+function groupMetaText(group, summary) {
+  const ms = Number(group?.activityMs) || 0;
+  const when = ms > 0 ? fmtDate(new Date(ms).toISOString()) : '';
+  const count = groupSessionCountText(summary?.count || 0);
+  return when ? `${when} · ${count}` : count;
+}
+
 /** The loaded rows of a group, in the current view and across it. */
 function groupMemberRows(groupId, { inViewOnly = true } = {}) {
   return Object.values(conversations).filter((conversation) => String(conversation?.groupId || '') === groupId
@@ -580,15 +606,16 @@ function groupMemberRows(groupId, { inViewOnly = true } = {}) {
 /**
  * What a head row shows for its group: the classes of every row in it, the
  * head included (the menu's "Archive group (N)" and "Stop all running (N)"
- * count the same rows), their summary, and the first row a waiting card
- * sits in.
+ * count the same rows), their summary, the colour of the group's name, and
+ * the first row a waiting card sits in.
  */
 function describeGroupForHead(group, viewOf) {
   const rows = group.head ? [group.head, ...group.members] : [...group.members];
   const states = rows.map((row) => viewOf(row).memberState);
   const summary = summarizeGroupMembers(states);
+  const titleTone = groupTitleTone(rows.map((row) => viewOf(row).tone));
   const firstWaiting = rows.find((row) => viewOf(row).memberState === 'waiting') || null;
-  return { summary, firstWaiting, forcedOpen: false };
+  return { summary, titleTone, firstWaiting, forcedOpen: false };
 }
 
 export function renderConvList() {
@@ -618,31 +645,32 @@ function paintConvList() {
     if (!rowViews.has(id)) rowViews.set(id, conversationRowState(conversation, pendingByConversation));
     return rowViews.get(id);
   };
-  const foldChoices = readConversationGroupFoldChoices();
+  const foldChoices = readConversationGroupFoldChoices({ archived: conversationListArchivedView });
   const groupDescriptions = new Map();
   // Groups order with the same rules the list route pages by; a group is
   // folded once nothing in it runs or waits, unless the user chose otherwise.
+  // A folded group still shows the open conversation under its head.
   const items = arrangeConversationList(inView, conversationGroups, {
     matches: activeFilter ? (row) => conversationMatchesFilter(row, activeFilter) : null,
     groupNameMatches: activeFilter ? (info) => conversationMatchesFilter({ title: info?.displayName || info?.name }, activeFilter) : null,
     // An owner's group an agent emptied shows in the live list, empty.
     emptyGroups: !conversationListArchivedView,
+    keepVisibleId: currentConvId || null,
     isOpen: (groupId, group) => {
       const described = describeGroupForHead(group, viewOf);
-      const holdsOpenConversation = !!currentConvId && group.members.some((row) => row.id === currentConvId);
       // Open whatever the choice: the fold button then says so and does nothing.
-      described.forcedOpen = holdsOpenConversation || !!activeFilter;
+      described.forcedOpen = !!activeFilter;
       groupDescriptions.set(groupId, described);
       if (convListTransientOpenGroups.has(groupId)) return true;
       return resolveGroupFold({
         choice: foldChoices[groupId] || null,
         active: groupIsActive(described.summary),
-        holdsOpenConversation,
         filterActive: !!activeFilter,
       });
     },
   });
   lastConvListDragItems = describeDragItems(items);
+  syncConversationGroupsFoldAllButton(items, !!activeFilter);
   const footerHtml = (() => {
     if (activeFilter) {
       // While a filter is active the drain loads older pages by itself; a
@@ -664,30 +692,31 @@ function paintConvList() {
     const emptyText = activeFilter && inView.length > 0
       ? 'No conversations match your filter'
       : (conversationListArchivedView ? 'No archived conversations' : 'No conversations yet');
-    list.innerHTML = `<div style="padding:12px;color:var(--muted);font-size:0.85rem;text-align:center">${emptyText}</div>${footerHtml}`;
+    list.innerHTML = `<div style="padding:calc(6px * var(--ui-scale)) calc(7px * var(--ui-scale));color:var(--muted);font-size:0.85rem;text-align:center">${emptyText}</div>${footerHtml}`;
     lastConvListHtml = '';
     scheduleConversationListBoundaryCheck();
     return;
   }
   // The head row's pill: the member count and what the members are doing;
   // while folded, its "waiting" part opens the member the card sits in.
-  const groupPillHtml = (item) => {
+  // withCount: false on a synthetic head, whose meta line says the count.
+  const groupPillHtml = (item, { withCount = true } = {}) => {
     const described = groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf);
-    const text = groupSummaryText(described.summary);
+    const text = withCount ? groupSummaryText(described.summary) : groupActivityText(described.summary);
     if (!text) return '';
     const waitingId = described.firstWaiting ? String(described.firstWaiting.id) : '';
     // Inline like the row's own buttons: the row's click handler must not
     // run (it would open the head and re-render the list first).
     // The full text is the title: a narrow sidebar shortens the pill with an ellipsis.
     const title = waitingId ? `${text} · open the session that is waiting for you` : text;
-    return `<span class="conv-group-summary conv-group-summary-${described.summary.strongest}" title="${escHtml(title)}"${waitingId ? ` data-open-waiting="${escHtml(waitingId)}" role="button" tabindex="0" onclick="event.stopPropagation();openConversation('${escHtml(waitingId)}')"` : ''}>${escHtml(text)}</span>`;
+    return `<span class="conv-group-summary conv-group-summary-${described.summary.strongest}" title="${escHtml(title)}"${waitingId ? ` data-open-waiting="${escHtml(waitingId)}" role="button" tabindex="0" onclick="event.stopPropagation();openConversation('${escHtml(waitingId)}',{fromList:true})"` : ''}>${escHtml(text)}</span>`;
   };
   const foldButtonHtml = (item) => {
     const forced = (groupDescriptions.get(item.group.id) || {}).forcedOpen === true || item.group.contextOnly === true || !!activeFilter;
     const label = forced
-      ? (activeFilter ? 'Open while the filter is on' : 'Open while its chat is open')
+      ? 'Open while the filter is on'
       : (item.group.open ? 'Fold group' : 'Unfold group');
-    return `<button class="conv-group-fold" type="button" data-group-fold="${escHtml(item.group.id)}" aria-expanded="${item.group.open ? 'true' : 'false'}" aria-label="${label}" title="${label}"${forced ? ' disabled' : ''} onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">${item.group.open ? '▾' : '▸'}</button>`;
+    return `<button class="conv-group-fold" type="button" data-group-fold="${escHtml(item.group.id)}" aria-expanded="${item.group.open ? 'true' : 'false'}" aria-label="${label}" title="${label}"${forced ? ' disabled' : ''} onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')"><span class="conv-group-chevron${convListFoldTurning.has(item.group.id) ? ' conv-group-chevron-turn' : ''}" aria-hidden="true">›</span></button>`;
   };
   const rowHtml = (c, item) => {
     const view = viewOf(c);
@@ -696,30 +725,43 @@ function paintConvList() {
     const providerIndicatorHtml = providerIndicatorLabel
       ? `<span class="conv-provider-indicator"${providerIndicatorKey ? ` data-provider="${providerIndicatorKey}"` : ''}>${providerIndicatorLabel}</span>`
       : '';
-    // "↗ win-test": another relay's agent created this conversation.
-    // "via agent · “title”": an agent in that conversation on this relay did.
-    // A member under its creator's head row says that already, so it is left out there.
-    const originMarkerHtml = item.kind === 'member' && item.group.head && c.origin?.local === true && c.origin.conversationId === item.group.head.id
-      ? ''
-      : renderConversationOriginMarkerHtml(c, { conversations });
-    // "watched": a session another conversation watches by id (relay events).
-    const watchedMarkerHtml = relayEventWatchedMarkerHtml(c.id);
-    // "scheduled": a schedule fires into this session (relay_tool schedule).
-    const scheduledMarkerHtml = relayScheduleMarkerHtml(c.id);
+    // The ⓘ and its menu: an agent started this conversation (here or on
+    // another relay), another conversation watches it (relay events), a
+    // schedule fires into it (relay_tool schedule). A member under its
+    // creator's head row says the origin already, so it is left out there.
+    const origin = item.kind === 'member' && item.group.head && c.origin?.local === true && c.origin.conversationId === item.group.head.id
+      ? null
+      : conversationOriginInfo(c, { conversations });
+    const infoEntries = conversationRowInfoEntries({
+      origin,
+      watched: relayEventWatchedInfoText(c.id),
+      scheduled: relayScheduleInfoText(c.id),
+    });
+    if (infoEntries.length) convListRowInfo.set(String(c.id), infoEntries);
+    const infoButtonHtml = conversationRowInfoButtonHtml(c.id, infoEntries);
     const groupClass = item.kind === 'head' ? ' conv-group-head' : (item.kind === 'member' ? ' conv-group-member' : '');
     const groupAttr = item.kind === 'head' || item.kind === 'member' ? ` data-group-id="${escHtml(item.group.id)}"` : '';
+    // A head row's title is the group's name, coloured by all its rows.
+    const toneAttr = item.kind === 'head' ? ` data-group-tone="${escHtml((groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf)).titleTone)}"` : '';
     // A head row shows the name the group was given by hand; until then the
     // conversation's own title (the group's name follows it).
     const handName = item.kind === 'head' ? String(item.group.info?.name || '').trim() : '';
     const rowTitle = handName || c.title;
     const titleAttr = handName && handName !== c.title ? ` title="${escHtml(`${handName} · ${c.title}`)}"` : '';
+    const titleHtml = `<div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}</div>`;
+    // With open questions the title and its "N open" pill share a row in
+    // which only the title gives way; the pill is never cut.
+    const openCount = pendingByConversation[c.id];
+    const titleRowHtml = openCount
+      ? `<div class="conv-title-row">${titleHtml}<span class="conv-open-questions">${openCount} open</span></div>`
+      : titleHtml;
     return `
-    <div class="conv-item worker-ui-${view.visualState}${view.working ? ' conv-working' : ''}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr} onclick="openConversation('${c.id}')">
-      <div class="conv-title"${titleAttr}>${item.kind === 'head' ? foldButtonHtml(item) : ''}${escHtml(rowTitle)}${pendingByConversation[c.id] ? ` <span class="conv-open-questions">${pendingByConversation[c.id]} open</span>` : ''}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">${fmtDate(c.updatedAt)} · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span>${item.kind === 'head' ? groupPillHtml(item) : ''}${originMarkerHtml}${watchedMarkerHtml}${scheduledMarkerHtml}${providerIndicatorHtml}</div>
+    <div class="conv-item worker-ui-${view.visualState}${view.working ? ' conv-working' : ''}${c.id === currentConvId ? ' active' : ''}${c.archived ? ' archived' : ''}${groupClass}" data-conversation-id="${c.id}"${groupAttr}${toneAttr} onclick="openConversation('${c.id}',{fromList:true})">
+      ${titleRowHtml}
+      <div class="conv-meta"><span class="conv-meta-primary"><span class="conv-meta-date">${fmtDate(c.updatedAt)}</span><span class="conv-meta-count"> · ${c.messageCount} msg${c.messageCount !== 1 ? 's' : ''}</span></span>${item.kind === 'head' ? groupPillHtml(item) : ''}${infoButtonHtml}${providerIndicatorHtml}</div>
       ${c.archived
         ? `<button class="conv-archive" onclick="unarchiveConv(event,'${c.id}')" title="Unarchive" aria-label="Unarchive">📂</button>`
-        : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄</button>`}
+        : `<button class="conv-archive" onclick="archiveConv(event,'${c.id}')" title="Archive" aria-label="Archive">🗄️</button>`}
       <button class="conv-delete" onclick="deleteConv(event,'${c.id}')" title="Delete">🗑</button>
     </div>`;
   };
@@ -733,16 +775,17 @@ function paintConvList() {
       return `
     <div class="conv-item conv-group-head conv-group-synthetic conv-group-empty worker-ui-offline" data-group-id="${escHtml(item.group.id)}" title="An agent moved the last session out of this group; rename or dissolve it from its menu.">
       <div class="conv-title">${escHtml(name)}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">group · empty</span></div>
+      <div class="conv-meta"><span class="conv-meta-primary">${groupSessionCountText(0)}</span></div>
     </div>`;
     }
     const described = groupDescriptions.get(item.group.id) || describeGroupForHead(item.group, viewOf);
     return `
-    <div class="conv-item conv-group-head conv-group-synthetic worker-ui-${described.summary.strongest === 'waiting' ? 'question' : 'offline'}" data-group-id="${escHtml(item.group.id)}" onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">
+    <div class="conv-item conv-group-head conv-group-synthetic worker-ui-offline" data-group-id="${escHtml(item.group.id)}" data-group-tone="${escHtml(described.titleTone)}" onclick="toggleConversationGroupFold(event,'${escHtml(item.group.id)}')">
       <div class="conv-title">${foldButtonHtml(item)}${escHtml(name)}</div>
-      <div class="conv-meta"><span class="conv-meta-primary">group</span>${groupPillHtml(item)}</div>
+      <div class="conv-meta"><span class="conv-meta-primary">${escHtml(groupMetaText(item.group, described.summary))}</span>${groupPillHtml(item, { withCount: false })}</div>
     </div>`;
   };
+  convListRowInfo.clear();
   const listHtml = `${items.map((item) => (item.conversation ? rowHtml(item.conversation, item) : syntheticHeadHtml(item))).join('')}${footerHtml}`;
   if (listHtml !== lastConvListHtml) {
     list.innerHTML = listHtml;
@@ -750,6 +793,7 @@ function paintConvList() {
   }
   bindConversationContextMenu(list);
   bindConversationGroupControls(list);
+  bindConversationInfoButtons(list);
   window.syncChatTitleControls?.();
   scheduleConversationListBoundaryCheck();
 }
@@ -767,15 +811,105 @@ function bindConversationGroupControls(list) {
     if (!waiting || !list.contains(waiting)) return;
     event.preventDefault();
     event.stopPropagation();
-    void (window.openConversation || openConversation)(waiting.dataset.openWaiting);
+    void (window.openConversation || openConversation)(waiting.dataset.openWaiting, { fromList: true });
+  });
+}
+
+// ─── The row's ⓘ: who started it, who watches it, what is scheduled ─────────
+// One small button in the meta line stands for all three; its menu lists
+// them, each with its action (or as a line of text where there is none).
+
+// The menu entries of the rows as last drawn, by conversation id.
+const convListRowInfo = new Map();
+
+/**
+ * The entries of a row's ⓘ menu, in a fixed order. `origin` is
+ * conversationOriginInfo()'s answer, `watched` and `scheduled` their lines
+ * ('' for none). `short` is the entry's word in the button's label.
+ */
+function conversationRowInfoEntries({ origin = null, watched = '', scheduled = '' } = {}) {
+  const entries = [];
+  if (origin?.label) entries.push({ id: 'origin', short: 'started by an agent', label: origin.label, origin });
+  if (watched) entries.push({ id: 'watched', short: 'watched', label: watched });
+  if (scheduled) entries.push({ id: 'scheduled', short: 'scheduled', label: scheduled });
+  return entries;
+}
+
+function conversationRowInfoButtonHtml(conversationId, entries) {
+  if (!entries.length) return '';
+  const label = `Details: ${entries.map((entry) => entry.short).join(', ')}`;
+  return `<button type="button" class="conv-info-btn" data-conv-info="${escHtml(conversationId)}" aria-haspopup="menu" aria-label="${escHtml(label)}" title="${escHtml(label)}">ⓘ</button>`;
+}
+
+function conversationRowInfoMenuItems(entries) {
+  return entries.map((entry) => {
+    const origin = entry.id === 'origin' ? entry.origin : null;
+    if (origin?.kind === 'local' && origin.linkable) {
+      // As the header's "via agent" marker: openOriginConversation says so
+      // when that conversation is gone by now.
+      return { id: entry.id, label: entry.label, onSelect: () => { void openOriginConversation(null, { dataset: { originConversationId: origin.conversationId } }, { fromList: true }); } };
+    }
+    if (origin?.kind === 'remote' && origin.href) {
+      // As the message badge of such an agent: its session on that relay.
+      return { id: entry.id, label: entry.label, onSelect: () => { window.open(origin.href, '_blank', 'noopener'); } };
+    }
+    return { id: entry.id, label: entry.label, note: true };
+  });
+}
+
+/** Opens the ⓘ menu of a row under its button. */
+function openConversationRowInfoMenu(button) {
+  const id = String(button?.dataset?.convInfo || '').trim();
+  const entries = convListRowInfo.get(id);
+  if (!entries?.length) return;
+  const rect = button.getBoundingClientRect();
+  const gap = 4 * getUiScale();
+  // Esc is a key, so the returned focus would show its ring (and the row's
+  // archive and delete icons) even after a mouse click: it shows only if
+  // the button had a visible focus when the menu opened.
+  const focusVisible = !!button.matches?.(':focus-visible');
+  openContextMenu(rect.left, rect.bottom + gap, conversationRowInfoMenuItems(entries), {
+    // The list may have been drawn anew meanwhile: the row's button by id.
+    onEscape: () => {
+      document.querySelector(`#conv-list .conv-info-btn[data-conv-info="${CSS.escape(id)}"]`)?.focus?.({ preventScroll: true, focusVisible });
+    },
   });
 }
 
 /**
- * Folds or unfolds a group; the choice is kept until the user changes it. A
- * group held open (its chat is open, or a filter is on) keeps its choice.
+ * The ⓘ opens its menu and never the row: caught on the way down (capture),
+ * before the row's own click handler opens the conversation. Bound once.
+ */
+function bindConversationInfoButtons(list) {
+  if (!list || list.dataset.infoButtonsBound === '1') return;
+  list.dataset.infoButtonsBound = '1';
+  list.addEventListener('click', (event) => {
+    const button = event.target?.closest?.('.conv-info-btn');
+    if (!button || !list.contains(button)) return;
+    event.stopPropagation();
+    // The release of a long press that opened the row's menu: that menu stays.
+    if (event.defaultPrevented) return;
+    event.preventDefault();
+    openConversationRowInfoMenu(button);
+  }, true);
+}
+
+/**
+ * Folds or unfolds a group; the choice is kept until the user changes it,
+ * apart for the live list and the Archived view. A group held open by a
+ * filter keeps its choice. A folded group still shows the open conversation.
  * The fold button keeps the focus across the re-render.
  */
+// Groups whose fold the user just toggled: their chevron turns once on the
+// next paint (the list is drawn anew, so a transition has nothing to start from).
+const convListFoldTurning = new Set();
+
+function turnGroupChevrons(groupIds) {
+  for (const id of groupIds) convListFoldTurning.add(id);
+  renderConvList();
+  convListFoldTurning.clear();
+}
+
 export function toggleConversationGroupFold(event, groupId) {
   event?.stopPropagation?.();
   event?.preventDefault?.();
@@ -785,9 +919,53 @@ export function toggleConversationGroupFold(event, groupId) {
   if (button?.disabled) return;
   const currentlyOpen = button ? button.getAttribute('aria-expanded') === 'true' : true;
   convListTransientOpenGroups.delete(id);
-  setConversationGroupFoldChoice(id, toggledGroupFoldChoice(currentlyOpen));
-  renderConvList();
-  document.querySelector(`#conv-list [data-group-fold="${CSS.escape(id)}"]`)?.focus?.({ preventScroll: true });
+  setConversationGroupFoldChoice(id, toggledGroupFoldChoice(currentlyOpen), { archived: conversationListArchivedView });
+  turnGroupChevrons([id]);
+  // Keyboard toggles keep the focus; a click or tap (detail > 0) does not,
+  // or the redrawn button would show a focus ring.
+  if (!(Number(event?.detail) > 0)) {
+    document.querySelector(`#conv-list [data-group-fold="${CSS.escape(id)}"]`)?.focus?.({ preventScroll: true });
+  }
+}
+
+// The groups the fold-all button acts on: those in the list as last drawn.
+let conversationListFoldableGroups = { ids: [], anyOpen: false };
+
+/**
+ * The filter row's fold-all button: ➖ while a group in the list is open
+ * (folds them all), ➕ once all are folded (unfolds them all). Hidden
+ * without a group; disabled under a filter, which holds every group open.
+ */
+function syncConversationGroupsFoldAllButton(items, filterActive) {
+  const heads = items.filter((item) => item.kind === 'head' && !item.group.empty);
+  const anyOpen = heads.some((item) => item.group.open);
+  conversationListFoldableGroups = { ids: heads.map((item) => item.group.id), anyOpen };
+  const button = document.getElementById('conv-groups-fold-all');
+  if (!button) return;
+  button.hidden = heads.length === 0;
+  button.disabled = filterActive;
+  const label = filterActive
+    ? 'Groups stay open while the filter is on'
+    : (anyOpen ? 'Fold all groups' : 'Unfold all groups');
+  const glyph = anyOpen ? '➖' : '➕';
+  if (button.textContent !== glyph) button.textContent = glyph;
+  if (button.title !== label) {
+    button.title = label;
+    button.setAttribute('aria-label', label);
+  }
+}
+
+/** Folds every group in the list, or unfolds them all once all are folded. */
+export function toggleAllConversationGroupFolds(event) {
+  event?.stopPropagation?.();
+  event?.preventDefault?.();
+  const button = document.getElementById('conv-groups-fold-all');
+  if (button?.disabled) return;
+  const { ids, anyOpen } = conversationListFoldableGroups;
+  if (!ids.length) return;
+  for (const id of ids) convListTransientOpenGroups.delete(id);
+  setConversationGroupFoldChoices(ids, anyOpen ? 'folded' : 'open', { archived: conversationListArchivedView });
+  turnGroupChevrons(ids);
 }
 
 // keepTranscript: the page shows a window this payload must not replace (the
@@ -1010,7 +1188,8 @@ function applyCachedConversationState(id, response, { viewAnchor = null } = {}) 
 // The "via agent" marker (sidebar row, header, message badge): opens the
 // conversation whose agent started this one. The marker sits inside a sidebar
 // row that opens on click itself, so the click stops here.
-export function openOriginConversation(event, element) {
+// `options` go to openConversation (`fromList` for a pick from a list row's ⓘ).
+export function openOriginConversation(event, element, options = {}) {
   event?.stopPropagation?.();
   event?.preventDefault?.();
   const id = String(element?.dataset?.originConversationId || '').trim();
@@ -1021,7 +1200,7 @@ export function openOriginConversation(event, element) {
     renderConvList();
     return null;
   }
-  return openConversation(id);
+  return openConversation(id, options);
 }
 
 // The fresh answer for a conversation whose kept window is on the page (drawn
@@ -1085,6 +1264,53 @@ function applyFreshOverCachedConversation(id, response, { cached, keepTranscript
   saveConversationScrollTop(id, messagesEl.scrollTop);
 }
 
+const LAST_OPENED_CONVERSATION_KEY = 'copilot_last_conv';
+
+function readLastOpenedConversationId() {
+  try {
+    return String(localStorage.getItem(LAST_OPENED_CONVERSATION_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/** The header and the document take the title the loaded payload gave the record. */
+function syncOpenedConversationTitle(id) {
+  if (String(currentConvId || '').trim() !== String(id || '').trim()) return;
+  const title = String(conversations[id]?.title || '').trim();
+  const titleEl = document.getElementById('chat-title');
+  if (title && titleEl && titleEl.textContent !== title && !document.body.classList.contains('chat-title-editing')) {
+    titleEl.textContent = title;
+    window.syncChatTitleControls?.();
+  }
+  syncSessionDocumentTitle();
+}
+
+/**
+ * The relay knows no conversation `id` (deleted elsewhere, a mistyped or
+ * stale link). Back or forward onto it steps on past it; anything else
+ * leaves nothing open, without `?conv=` in the address, and says so. The
+ * conversation the next start opens stays the one it was.
+ */
+function showConversationUnknown(id, { lastOpenedBefore = '' } = {}) {
+  conversationPayloadCache.forget(id);
+  if (conversations[id]) {
+    delete conversations[id];
+    renderConvList();
+  }
+  // Stepped over: the pop that follows opens what lies there.
+  const stepsOn = noteConversationMissing(id);
+  clearOpenConversation({ history: !stepsOn });
+  renderNoConversationState();
+  window.syncComposerButtonState?.();
+  window.syncComposerPlaceholder?.();
+  try {
+    if (lastOpenedBefore && lastOpenedBefore !== id) localStorage.setItem(LAST_OPENED_CONVERSATION_KEY, lastOpenedBefore);
+    else localStorage.removeItem(LAST_OPENED_CONVERSATION_KEY);
+  } catch {}
+  showTransientRelayNotice('That conversation is not on this relay. It may have been deleted.', 6000);
+}
+
 export async function openConversation(id, options = {}) {
   // The Inbox owns the transcript like the status view does.
   const didLeaveInboxView = leaveInboxView();
@@ -1102,7 +1328,13 @@ export async function openConversation(id, options = {}) {
   const switchingConversation = !!nextConversationId && previousConversationId !== nextConversationId;
   if (switchingConversation && previousConversationId && !IS_SHARED_VIEW) keepPlaceOfConversationLeft(previousConversationId);
   const capturedVersion = ++openConversationVersion;
+  // Put back if the relay knows no such conversation: a wrong link must not
+  // become the one the next start opens.
+  const lastOpenedBefore = readLastOpenedConversationId();
   setCurrentConv(id);
+  // One history entry per switch (`history`: 'replace' at load, 'none' when
+  // back or forward opened it); reopening the one on screen adds none.
+  noteConversationShown(nextConversationId, options.history);
   if (repoBrowserState.activeRoot === 'workspace') {
     repoBrowserState.tree = null;
     repoBrowserState.nodeMap = new Map();
@@ -1114,6 +1346,9 @@ export async function openConversation(id, options = {}) {
     repoBrowserState.error = '';
   }
   closeSidebar();
+  // A pick from the list (`fromList`) also collapses the persistent list of
+  // a phone turned sideways; a long press for the row menu never opens.
+  if (options.fromList) collapseSidebarAfterListPick();
   // Reopening the conversation on screen (session bind, clicking it again, a
   // push or search jump) must leave its composer alone: emptied attachments
   // would read as a user edit and be saved, dropping them from the draft.
@@ -1156,9 +1391,13 @@ export async function openConversation(id, options = {}) {
     ? String(savedAnchor.messageId || '').trim()
     : '';
   const cachedJumpEpoch = cached ? getTranscriptJumpEpoch() : 0;
+  let unknownToRelay = false;
   const load = (around = aroundMessageId || anchorMessageId) => loadConversation(id, {
     limit: around ? 40 : 20,
     aroundMessageId: around || undefined,
+    onErrorResponse: (response) => {
+      if (response?.status === 404) unknownToRelay = true;
+    },
   });
   const stillWanted = () => shouldApplyConversationLoad({
     requestedConversationId: id,
@@ -1172,6 +1411,10 @@ export async function openConversation(id, options = {}) {
     ? await loadKeepingLiveRows(load, getTranscriptLiveRowEpoch)
     : { response: await load(), stale: false };
   if (!stillWanted()) return;
+  if (!fetched && unknownToRelay) {
+    showConversationUnknown(nextConversationId, { lastOpenedBefore });
+    return;
+  }
   let r = fetched;
   const anchorFound = !!anchorMessageId && payloadHasMessage(r, anchorMessageId);
   if (r && anchorMessageId && !anchorFound) {
@@ -1217,6 +1460,9 @@ export async function openConversation(id, options = {}) {
     restoreInFlightThinking(null);
     renderMessages([]);
   }
+  // A conversation the list does not hold (an archived one, a link) had only
+  // its id to show until now: the payload names it.
+  if (r) syncOpenedConversationTitle(id);
   await loadRelayQuestions(id);
   await loadRelayBoards();
   if (!shouldApplyConversationLoad({
@@ -1230,7 +1476,9 @@ export async function openConversation(id, options = {}) {
   applyContextUsageBar(null);
   scheduleContextUsageRefresh(id, 0);
   const composer = document.getElementById('msg-input');
-  if (isMobileComposerViewport()) {
+  // A phone, either way round, gets no focus here: it would raise the
+  // keyboard over the conversation just opened.
+  if (isPhoneComposerViewport()) {
     releaseComposerFocusAfterSend(composer);
   } else {
     composer.focus();
@@ -2646,6 +2894,8 @@ export function isArchivedConversationsView() {
 }
 
 export async function toggleArchivedConversations(next = !conversationListArchivedView) {
+  // A group held open by a drop belongs to the view it happened in.
+  if ((next === true) !== conversationListArchivedView) convListTransientOpenGroups.clear();
   conversationListArchivedView = next === true;
   const toggle = document.getElementById('conv-archived-toggle');
   if (toggle) {
@@ -2699,7 +2949,7 @@ function askBeforeArchive(id, confirmation) {
         <p>${escHtml(confirmation.message)}</p>
         <p>${escHtml(confirmation.detail)}</p>
         <div class="summary-modal-actions">
-          <button class="chat-title-action-btn" type="button" data-archive-confirm="1">🗄 Archive</button>
+          <button class="chat-title-action-btn" type="button" data-archive-confirm="1">🗄️ Archive</button>
           <button class="chat-title-action-btn" type="button" data-archive-cancel="1">Cancel</button>
         </div>
       `,
@@ -2785,7 +3035,7 @@ function conversationMenuItems(id) {
         { id: 'group-remove', label: 'Remove from group', onSelect: () => { void removeConversationFromGroup(id); } },
       ];
   return [
-    { id: 'open', label: 'Open', onSelect: () => { void openConversation(id); } },
+    { id: 'open', label: 'Open', onSelect: () => { void openConversation(id, { fromList: true }); } },
     { id: 'edit-title', label: 'Edit title', onSelect: () => { void openFirst(() => window.openChatTitleEditor?.()); } },
     MENU_SEPARATOR,
     { id: 'stop-turn', label: 'Stop turn', disabled: !running, onSelect: () => { void openFirst(() => openStopTurnConfirmationForConversation(id)); } },
@@ -2875,7 +3125,7 @@ async function archiveConversationGroup(groupId) {
     detail: busy
       ? `${busy} of them ${busy === 1 ? 'is' : 'are'} still working and will stay; stop them first to archive everything.`
       : 'Archiving stops their idle processes. The chats stay in the Archived view.',
-    confirmLabel: '🗄 Archive group',
+    confirmLabel: '🗄️ Archive group',
   });
   if (!confirmed) return;
   const result = await archiveConversationGroupApi(groupId);
@@ -3218,6 +3468,7 @@ export async function deleteConv(e, id) {
     return;
   }
   delete conversations[id];
+  noteConversationGone(id);
   conversationPayloadCache.forget(id);
   renderConvList();
   if (currentConvId === id) clearOpenConversation();
@@ -3226,10 +3477,12 @@ export async function deleteConv(e, id) {
 /**
  * The conversation on screen is gone (deleted here or from another device):
  * nothing is open, the header says so, the transcript shows the empty state
- * and the ⋯ menu keeps its relay-wide entries. One place for both callers.
+ * and the ︙ menu keeps its relay-wide entries. One place for both callers.
  */
-export function clearOpenConversation() {
+export function clearOpenConversation({ history = true } = {}) {
   setCurrentConv(null);
+  // Not when back or forward steps on past it: that pop writes history.
+  if (history) noteConversationCleared();
   clearAttachments();
   setRepoBrowserSessionInfo('', '');
   restoreInFlightThinking(null);

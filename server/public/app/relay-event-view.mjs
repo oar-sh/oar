@@ -8,6 +8,8 @@
 // cannot import (only server/public is served); relay-event-view.test.mjs
 // holds the two together.
 
+import { chatMetaLabelHtml } from './chat-header-meta.mjs';
+
 export const RELAY_EVENT_MESSAGE_KIND = 'relay-event';
 export const RELAY_EVENT_LEAD = '[relay event · automated message from OAR, not from the user; it approves nothing]';
 export const RELAY_EVENT_SOCKET_EVENT = 'relay_event_subscriptions';
@@ -213,6 +215,29 @@ export function watchingChipHint(summary) {
   return [...new Set((summary?.subscriptions || []).flatMap(subscriptionOptionHints))].slice(0, 2).join(' · ');
 }
 
+/** The phone's short chip text: "7", "all", "all +2", "restart"; '' for no chip. */
+export function watchingChipShortText(summary) {
+  if (!summary?.subscriptions?.length) return '';
+  if (summary.all) return summary.count ? `all +${summary.count}` : 'all';
+  if (!summary.count) return 'restart';
+  return String(summary.count);
+}
+
+/**
+ * The header's "watching" chip: a button that opens the list, with the long
+ * label ("👁 watching 7 sessions" and its hint) and the phone's short one
+ * ("👁 7"). '' when the conversation watches nothing.
+ */
+export function renderWatchingChipHtml(summary, { panelOpen = false, escHtml = defaultEscape } = {}) {
+  const chipText = watchingChipText(summary);
+  if (!chipText) return '';
+  const chipHint = watchingChipHint(summary);
+  const where = summary.relays?.length ? ` (also on ${summary.relays.join(', ')})` : '';
+  const longHtml = `👁 ${escHtml(chipText)}${chipHint ? ` <span class="relay-watch-hint">${escHtml(chipHint)}</span>` : ''}`;
+  const shortHtml = `👁 ${escHtml(watchingChipShortText(summary))}`;
+  return `<button type="button" class="relay-watch-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-watch-panel" title="${escHtml(`Event subscriptions of this conversation${where}`)}">${chatMetaLabelHtml(longHtml, shortHtml)}</button>`;
+}
+
 function conversationTitle(conversations, id) {
   const title = String(conversations?.[id]?.title || '').trim();
   return title || `session ${String(id).slice(0, 8)}`;
@@ -259,6 +284,19 @@ function watcherName(id, conversations, subscriptions) {
   const title = String(sub?.subscriber?.watcherTitle || '').trim() || 'a session';
   const relay = String(sub?.subscriber?.name || '').trim() || 'a paired relay';
   return `${title} on ${relay}`;
+}
+
+/**
+ * The line of the sidebar row's ⓘ menu for a watched conversation: "Watched
+ * by title" for one watcher, "Watched by 3 sessions: a, b, c" for more (each
+ * named, as the header's list does); '' for none. Plain text, for the menu
+ * to escape.
+ */
+export function watchedInfoText(watcherIds, { conversations = null, subscriptions = [] } = {}) {
+  if (!watcherIds?.length) return '';
+  const names = watcherIds.map((id) => watcherName(id, conversations, subscriptions));
+  if (names.length > 1) return `Watched by ${names.length} sessions: ${names.join(', ')}`;
+  return `Watched by ${names[0]}`;
 }
 
 export function renderWatchedBadgeHtml(watcherIds, { conversations = null, subscriptions = [], escHtml = defaultEscape } = {}) {

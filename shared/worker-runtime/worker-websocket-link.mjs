@@ -1,3 +1,5 @@
+import { buildIdsDiffer } from "../build-id.mjs";
+
 function normalizeText(value) {
   const text = String(value || "").trim();
   return text || null;
@@ -70,6 +72,10 @@ export function createWorkerWebSocketLink({
   // every hello and ready: the relay hands a Claude chat's row only to a
   // worker of the row's billing.
   workerKind = null,
+  // The build id of the code this worker started on (shared/build-id.mjs),
+  // stated in every hello and ready next to the kind: the relay recycles a
+  // worker whose build differs from its own once the worker is idle.
+  buildId = null,
   minBackoffMs = 1000,
   maxBackoffMs = 8_000,
   jitterMs = 250,
@@ -121,6 +127,12 @@ export function createWorkerWebSocketLink({
   let lastPongAt = null;
   let lastQueueChangedAt = null;
   let lastDeliveryAt = null;
+  // The build id the relay named in its latest server.hello (null when it
+  // named none), and whether this connection has already logged that it
+  // differs from ours: the relay acks every worker.hello with another
+  // server.hello, and the log needs the news only once per connection.
+  let relayBuildId = null;
+  let buildMismatchLogged = false;
 
   function getNowMs() {
     const value = Number(now());
@@ -175,6 +187,7 @@ export function createWorkerWebSocketLink({
       sessionId: normalizeText(getSessionId()),
       pid: normalizePositiveInt(getPid()),
       ...(normalizeText(workerKind) ? { kind: normalizeText(workerKind) } : {}),
+      ...(normalizeText(buildId) ? { buildId: normalizeText(buildId) } : {}),
       ...(held ? { ready: false } : {}),
     });
     if (sent) lastHelloSentAt = getNowMs();
@@ -203,6 +216,7 @@ export function createWorkerWebSocketLink({
       sessionId: normalizeText(getSessionId()),
       pid: normalizePositiveInt(getPid()),
       ...(normalizeText(workerKind) ? { kind: normalizeText(workerKind) } : {}),
+      ...(normalizeText(buildId) ? { buildId: normalizeText(buildId) } : {}),
     });
     if (sent) lastReadySentAt = getNowMs();
     return sent;
@@ -393,6 +407,7 @@ export function createWorkerWebSocketLink({
         clearReadyRefreshTimer();
         // The next connection may reach a different (restarted) relay.
         serverCapabilities = new Set();
+        buildMismatchLogged = false;
       }
       if (stopped || !reconnect) return true;
       // A newer socket is already under way and owns the reconnect.
@@ -440,6 +455,13 @@ export function createWorkerWebSocketLink({
       }
       if (payload?.type === "server.hello") {
         serverCapabilities = new Set(Array.isArray(payload.capabilities) ? payload.capabilities.map(String) : []);
+        relayBuildId = normalizeText(payload.buildId);
+        // Only a line in the log: the relay decides when to replace this
+        // worker, and the worker takes no action of its own on it.
+        if (!buildMismatchLogged && buildIdsDiffer(relayBuildId, normalizeText(buildId))) {
+          buildMismatchLogged = true;
+          dbg(`relay build ${relayBuildId}, mine ${normalizeText(buildId)}: the relay will recycle this worker when idle`);
+        }
         if (!serverHelloSeen) {
           serverHelloSeen = true;
           // The handshake is complete: only now does the backoff start over.
@@ -536,6 +558,7 @@ export function createWorkerWebSocketLink({
       lastPongAt,
       lastQueueChangedAt,
       lastDeliveryAt,
+      relayBuildId,
     };
   }
 

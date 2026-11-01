@@ -982,7 +982,9 @@ export async function loadConversation(id, options = {}) {
   const aroundMessageId = String(options.aroundMessageId || '').trim();
   if (aroundMessageId) params.set('aroundMessageId', aroundMessageId);
   const query = params.toString();
-  return apiFetch(`/api/conversation/${convId}${query ? `?${query}` : ''}`);
+  // `onErrorResponse` tells a conversation the relay does not know (404) from a failed load.
+  const onErrorResponse = typeof options.onErrorResponse === 'function' ? options.onErrorResponse : undefined;
+  return apiFetch(`/api/conversation/${convId}${query ? `?${query}` : ''}`, onErrorResponse ? { onErrorResponse } : undefined);
 }
 
 export async function refreshConversationHistory(id, options = {}) {
@@ -1247,7 +1249,7 @@ export async function createConversationShareLink(id) {
   });
 }
 
-// Share management (Settings → Shared conversations, the ⋯ menu). These throw
+// Share management (Settings → Shared conversations, the ︙ menu). These throw
 // with the relay's reason, so the caller can say why an action failed.
 export async function listConversationShares() {
   return apiFetchOrThrow('/api/shares');

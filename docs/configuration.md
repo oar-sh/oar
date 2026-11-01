@@ -6,11 +6,11 @@ Every setting in the web UI, every key of the config file, and every environment
 
 *On oar.sh: [Settings](https://oar.sh/docs/reference/settings/)*
 
-The modal is organised into seven tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Claude API**, **Claude Cloud**, **Grok**, **Cursor**, and **DeepSeek** sub-tab), **Relays**, **Previews**, **Sharing**, **Notifications**, and **Features** — and reopens on the tab you used last. The `⋯` menu opens it with no conversation open too, so a fresh install can turn on a provider before the first chat; until a provider is ready, the empty screen and **New Chat** point to Settings → Providers. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
+The modal is organised into seven tabs — **General**, **Providers** (with a **Copilot**, **OpenAI**, **Claude**, **Claude API**, **Claude Cloud**, **Grok**, **Cursor**, and **DeepSeek** sub-tab), **Relays**, **Previews**, **Sharing**, **Notifications**, and **Features** — and reopens on the tab you used last. The **︙** menu opens it with no conversation open too, so a fresh install can turn on a provider before the first chat; until a provider is ready, the empty screen and **New Chat** point to Settings → Providers. Unless noted as per browser, these settings live in the relay database rather than the config file, and apply to every browser that connects:
 
 | Tab | Setting | Default | What it does |
 | --- | ------- | ------- | ------------ |
-| General | Theme, Text scaling | dark theme | Per browser |
+| General | Theme, Text scaling | dark theme, 100 % | Per browser. Text scaling zooms the whole app, not only the text, like a pinch or Ctrl/⌘+wheel (see [Zoom](web-ui.md#zoom)) |
 | General | Show Suspend host action | on | Per browser: shows **💤 Suspend host** in the conversation menu. The entry is there on every relay, but suspending works only when the relay runs on Windows; elsewhere it just says so (see [The conversation menu](web-ui.md#the-conversation-menu)) |
 | General | Jump to the end when I send a message | on | Per browser: sending a message takes you to the end of the conversation; off, you stay where you are reading (see [While a turn runs](web-ui.md#while-a-turn-runs)) |
 | General | Messages kept per conversation for switching back | `200` | Per browser: how many loaded messages each of the last eight conversations keeps around the place you were reading, so switching back returns there (100 to 1,000, or no limit; see [While a turn runs](web-ui.md#while-a-turn-runs)) |

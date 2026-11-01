@@ -1,3 +1,5 @@
+import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
+
 const SETTINGS_TAB_STORAGE_KEY = 'copilot_settings_tab';
 const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 
@@ -109,6 +111,7 @@ export function ensureSettingsTabsBound() {
   const modal = document.getElementById('settings-modal');
   if (!modal) return;
   settingsTabsBound = true;
+  watchTabStripFades();
   modal.addEventListener('click', handleTabClick);
   modal.addEventListener('keydown', handleTabKeydown);
 }
@@ -125,5 +128,14 @@ export function selectSettingsTab(tab, providerTab) {
   if (applyTabState('data-settings-provider-tab', 'data-settings-provider-panel', nextProviderTab)) {
     writeLocalStorage(SETTINGS_PROVIDER_TAB_STORAGE_KEY, nextProviderTab);
   }
+  // The selected tabs whole, clear of the strips' fades (a closed dialog
+  // is not laid out: openSettingsModal does it again once it shows).
+  revealSettingsTabs();
   return { tab: nextTab, providerTab: nextProviderTab };
+}
+
+/** Each Settings strip: its selected tab scrolled into view, its fade marked. */
+export function revealSettingsTabs() {
+  const modal = document.getElementById('settings-modal');
+  if (modal) revealSelectedTabs(modal);
 }

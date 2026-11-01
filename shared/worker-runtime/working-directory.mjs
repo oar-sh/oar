@@ -16,7 +16,7 @@ import fs from 'node:fs';
 export const WORKING_DIRECTORY_MISSING_CODE = 'working-directory-missing';
 
 export const WORKING_DIRECTORY_GUIDANCE =
-  'Restore the folder, or choose another working directory for this conversation (⋯ → Change CWD), '
+  'Restore the folder, or choose another working directory for this conversation (︙ → Change CWD), '
   + 'then send the message again.';
 
 // What a failed launch says, in the words of the SDKs: Node's spawn error, the

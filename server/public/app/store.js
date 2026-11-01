@@ -7,6 +7,8 @@ import { isChatInteractionHeld } from './selection-guard.mjs';
 import { nextSubagentStatus } from './subagent-fold.mjs';
 import { useStrictStrikethrough } from './markdown-strikethrough.mjs';
 import { parseGroupFoldChoices, pruneGroupFoldChoices } from './conversation-group-state.mjs';
+import { isPhoneLandscapeLayout, shouldCollapseListAfterPick, syncPhoneLandscapeAttribute } from './phone-landscape.mjs';
+import { FONT_SCALE_CHANGE_EVENT } from './font-scaling.js';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -265,26 +267,37 @@ export function pruneConversationGroups(keepGroupIds) {
   return dropped;
 }
 
-export function readConversationGroupFoldChoices() {
-  return parseGroupFoldChoices(localStorage.getItem(CONVERSATION_GROUP_FOLDS_STORAGE_KEY) || '');
+// The live list and the Archived view keep their fold choices apart.
+function conversationGroupFoldsStorageKey(archived) {
+  return archived === true ? `${CONVERSATION_GROUP_FOLDS_STORAGE_KEY}_archived` : CONVERSATION_GROUP_FOLDS_STORAGE_KEY;
+}
+
+export function readConversationGroupFoldChoices({ archived = false } = {}) {
+  return parseGroupFoldChoices(localStorage.getItem(conversationGroupFoldsStorageKey(archived)) || '');
 }
 
 // The stored fold choices are trimmed to the loaded groups only past this
-// size: a choice for a group on an older page or in the other view must
-// not go with every toggle.
+// size: a choice for a group on an older page must not go with every toggle.
 const CONVERSATION_GROUP_FOLDS_MAX = 300;
 
-/** Stores the user's fold choice for a group. */
-export function setConversationGroupFoldChoice(groupId, choice) {
-  const id = String(groupId || '').trim();
-  if (!id) return;
-  let next = readConversationGroupFoldChoices();
-  if (Object.keys(next).length > CONVERSATION_GROUP_FOLDS_MAX) {
-    next = pruneGroupFoldChoices(next, [...Object.keys(conversationGroups), id]);
+/** Stores the user's fold choice for a group, in the live list or the Archived view. */
+export function setConversationGroupFoldChoice(groupId, choice, { archived = false } = {}) {
+  setConversationGroupFoldChoices([groupId], choice, { archived });
+}
+
+/** Stores one fold choice for several groups at once (fold all, unfold all). */
+export function setConversationGroupFoldChoices(groupIds, choice, { archived = false } = {}) {
+  const ids = (Array.isArray(groupIds) ? groupIds : []).map((groupId) => String(groupId || '').trim()).filter(Boolean);
+  if (!ids.length) return;
+  let next = readConversationGroupFoldChoices({ archived });
+  if (Object.keys(next).length + ids.length > CONVERSATION_GROUP_FOLDS_MAX) {
+    next = pruneGroupFoldChoices(next, [...Object.keys(conversationGroups), ...ids]);
   }
-  if (choice === 'open' || choice === 'folded') next[id] = choice;
-  else delete next[id];
-  localStorage.setItem(CONVERSATION_GROUP_FOLDS_STORAGE_KEY, JSON.stringify(next));
+  for (const id of ids) {
+    if (choice === 'open' || choice === 'folded') next[id] = choice;
+    else delete next[id];
+  }
+  localStorage.setItem(conversationGroupFoldsStorageKey(archived), JSON.stringify(next));
 }
 
 export function setConversationWatcherCount(conversationId, count) {
@@ -744,6 +757,14 @@ export function isMobileComposerViewport() {
   return window.matchMedia('(max-width: 680px)').matches;
 }
 
+// A phone either way round: the portrait layout above, or a phone turned
+// sideways, which has the desktop layout (:root[data-phone-landscape]).
+// Opening a session leaves the message box unfocused here, so no keyboard
+// comes up by itself.
+export function isPhoneComposerViewport() {
+  return isMobileComposerViewport() || isPhoneLandscapeLayout();
+}
+
 export function releaseComposerFocusAfterSend(input) {
   if (!input || !isMobileComposerViewport()) return;
   try { input.blur(); } catch {}
@@ -1131,18 +1152,30 @@ function measureSidebarHeaderMinWidthPx() {
     sectionCount += 1;
   }
 
+  // New Chat grows into the free room, so its box says nothing: its label's
+  // own width is what the head wraps by.
   const newConversationButton = document.getElementById('new-conv-btn');
   if (isVisibleElement(newConversationButton)) {
     const buttonStyle = window.getComputedStyle(newConversationButton);
-    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
+    let labelWidth = 0;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(newConversationButton);
+      labelWidth = range.getBoundingClientRect().width || 0;
+    } catch {}
+    const natural = labelWidth
+      + parseCssPx(buttonStyle.paddingLeft) + parseCssPx(buttonStyle.paddingRight)
+      + parseCssPx(buttonStyle.borderLeftWidth) + parseCssPx(buttonStyle.borderRightWidth);
+    neededWidth += Math.ceil(Math.max(parseCssPx(buttonStyle.minWidth), natural));
     sectionCount += 1;
   }
 
+  // These two keep their own width (Inbox grows with its count).
   for (const id of ['status-btn', 'inbox-btn']) {
     const headerButton = document.getElementById(id);
     if (!isVisibleElement(headerButton)) continue;
     const buttonStyle = window.getComputedStyle(headerButton);
-    neededWidth += Math.ceil(parseCssPx(buttonStyle.minWidth));
+    neededWidth += Math.ceil(Math.max(parseCssPx(buttonStyle.minWidth), headerButton.getBoundingClientRect().width || 0));
     sectionCount += 1;
   }
 
@@ -1260,6 +1293,23 @@ export function toggleSidebar(forceOpen = null) {
   setDesktopSidebarCollapsed(!nextOpen);
 }
 
+/**
+ * A session picked from the list (a tap on its row, or Open in its menu). A
+ * phone turned sideways has the desktop's persistent list; the pick collapses
+ * it, as the overlay list closes on a portrait phone (openConversation's
+ * closeSidebar). A long press never gets here: it opens the row menu, and
+ * the click its release makes is swallowed (context-menu.mjs).
+ */
+export function collapseSidebarAfterListPick() {
+  const collapse = shouldCollapseListAfterPick({
+    phoneLandscape: isPhoneLandscapeLayout(),
+    overlayList: isOverlaySidebarViewport(),
+    listOpen: isSidebarOpen(),
+  });
+  if (collapse) toggleSidebar(false);
+  return collapse;
+}
+
 export function syncSidebarLayoutState() {
   applySidebarWidthPercent(readSidebarWidthPercentForCurrentOrientation(), { persist: false });
   if (isOverlaySidebarViewport()) {
@@ -1312,10 +1362,29 @@ export function initSidebarLayout() {
   const resync = () => syncSidebarLayoutState();
   window.addEventListener('resize', resync, { passive: true });
   window.addEventListener('orientationchange', resync, { passive: true });
+  // A zoom changes the head's buttons, and with them the narrowest list.
+  window.addEventListener(FONT_SCALE_CHANGE_EVENT, resync);
   const chatHeader = document.getElementById('chat-header');
   if (chatHeader && typeof ResizeObserver === 'function') {
     const observer = new ResizeObserver(syncMobileSidebarTopOffset);
     observer.observe(chatHeader);
+  }
+  // The Inbox count arrives after the first pass (and changes): the list
+  // widens to keep the head on one row where it can. Neither button takes
+  // its width from the list's, so this cannot feed back.
+  if (typeof ResizeObserver === 'function') {
+    const headButtons = ['status-btn', 'inbox-btn'].map((id) => document.getElementById(id)).filter(Boolean);
+    const widths = new Map();
+    const headObserver = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        const width = Math.round(entry.contentRect?.width || 0);
+        if (widths.get(entry.target) !== width) changed = true;
+        widths.set(entry.target, width);
+      }
+      if (changed && !isOverlaySidebarViewport()) syncSidebarLayoutState();
+    });
+    for (const button of headButtons) headObserver.observe(button);
   }
 }
 
@@ -1436,6 +1505,8 @@ function syncScreenShortSide() {
   if (!shortSide) return;
   document.documentElement.style.setProperty('--screen-short-side', `${shortSide}px`);
   document.documentElement.toggleAttribute('data-phone-screen', shortSide <= 500);
+  // The same screen, turned sideways: :root[data-phone-landscape].
+  syncPhoneLandscapeAttribute(window);
 }
 
 export function syncViewportMetrics() {

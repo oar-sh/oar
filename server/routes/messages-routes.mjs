@@ -45,6 +45,7 @@ import { DEFAULT_CLAUDE_REASONING_EFFORTS } from '../services/provider-reasoning
 import { claudeBaseModelId, claudeLongContextModelId } from '../../shared/model-id.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
 import { normalizeBackgroundTaskDigest } from '../../shared/worker-runtime/background-task-digest.mjs';
+import { normalizeBuildId } from '../../shared/build-id.mjs';
 import {
   DEFAULT_TASK_STALL_MINUTES,
   TASK_OUTPUT_LIMITS,
@@ -1201,6 +1202,12 @@ export async function dequeuePendingMessageForWorkerLoop({
   workerKind = null,
   onBillingFence = null,
   claudeApiClaimCheck = null,
+  // () → true while the replacement fence (services/worker-replacement.mjs)
+  // is up for the requesting process. The caller asks it before calling; it
+  // is asked again before every claim, since ensureWorker and a transient
+  // error's backoff both wait, and the worker recycle can raise the fence
+  // meanwhile.
+  isReplacementFenced = null,
 } = {}) {
   const requesterSid = normalizeSessionWorkerId(requesterSessionId);
   const routingWithWorker = routingEnabled && requesterSid;
@@ -1275,6 +1282,18 @@ export async function dequeuePendingMessageForWorkerLoop({
 
   let attempt = 0;
   while (attempt <= retryLimit) {
+    // The process asking is being replaced: no row is claimed for it, the
+    // same answer as the caller's own fence check gives.
+    if (routingWithWorker && typeof isReplacementFenced === 'function' && isReplacementFenced() === true) {
+      return {
+        message: null,
+        blockedReason: 'worker-replacement',
+        worker: supervisor?.getWorkerState?.(requesterSid) || null,
+        lifecycle: supervisor?.getLifecycleState?.(requesterSid) || null,
+        fallbackRestart: null,
+        attempts: attempt,
+      };
+    }
     const currentIso = String(nowIso || '').trim() || new Date().toISOString();
     try {
       const message = dequeuePendingMessage({
@@ -2065,6 +2084,9 @@ export function registerMessagesRoutes(app, deps) {
     // killTmuxSessionImpl). Tests must inject these instead of relying on the
     // host OS, so the suite behaves identically on Windows and POSIX.
     sessionWorkerStopOverrides = null,
+    // The replacement fence (services/worker-replacement.mjs): a worker
+    // process the recycle is replacing is handed no work by /api/pending.
+    workerReplacementFence = null,
     resolveSessionStateRoot,
     fetchUsageSummary = null,
     planUsageService = null,
@@ -6245,7 +6267,10 @@ export function registerMessagesRoutes(app, deps) {
           // Whether a billing swap may replace the worker now, and why not.
           || (stored.releasable ?? null) !== (steering.releasable ?? null)
           || (stored.releaseHold || null) !== (steering.releaseHold || null)
-          || (stored.backgroundTaskCount || 0) !== (steering.backgroundTaskCount || 0);
+          || (stored.backgroundTaskCount || 0) !== (steering.backgroundTaskCount || 0)
+          // Whether the worker's CLI child still runs: the worker recycle
+          // waits for it to be gone, so a flip must be stored.
+          || (stored.cliAlive ?? null) !== (steering.cliAlive ?? null);
         if (workerForSteering && changed) {
           sessionWorkerRegistry?.upsertWorker?.({ ...workerForSteering, steering });
           // Pushed rather than left for the clients' status poll: the
@@ -6261,6 +6286,16 @@ export function registerMessagesRoutes(app, deps) {
         const workerForKind = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
         if (workerForKind && workerForKind.kind !== heartbeatKind) {
           sessionWorkerRegistry?.upsertWorker?.({ ...workerForKind, kind: heartbeatKind });
+        }
+      }
+      // The build id of the code the worker started on, recorded the same way:
+      // only when it says one and the registry has another, so quiet
+      // heartbeats stay write-free.
+      const heartbeatBuildId = normalizeBuildId(req.body?.buildId);
+      if (heartbeatBuildId) {
+        const workerForBuild = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+        if (workerForBuild && workerForBuild.buildId !== heartbeatBuildId) {
+          sessionWorkerRegistry?.upsertWorker?.({ ...workerForBuild, buildId: heartbeatBuildId });
         }
       }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
@@ -7009,6 +7044,24 @@ export function registerMessagesRoutes(app, deps) {
           restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
         });
       }
+      // The process asking is being replaced (the worker recycle): no work,
+      // as for a killed session, so no turn starts on the pid being stopped.
+      // Unlike the killed marker, the fence outlives the marker's grace and
+      // every clearRestartSchedule; the new worker has another pid and takes
+      // what waited meanwhile.
+      if (workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true) {
+        return res.json({
+          message: null,
+          routing: {
+            enabled: true,
+            requesterSessionId,
+            blockedReason: 'worker-replacement',
+            lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
+            fallbackRestart: null,
+          },
+          restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+        });
+      }
       sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     }
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
@@ -7103,6 +7156,8 @@ export function registerMessagesRoutes(app, deps) {
         workerKind: httpPendingWorkerKind(requesterSessionId),
         claudeApiClaimCheck,
         onBillingFence: onClaudeBillingFence,
+        // The fence check above, asked again before every claim.
+        isReplacementFenced: () => workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true,
         telemetry: (payload = {}) => {
           if (!sessionWorkerRoutingEnabled) return;
           emitSessionWorkerTelemetry(payload.event, {
@@ -7323,6 +7378,7 @@ export function registerMessagesRoutes(app, deps) {
                 workerKind: httpPendingWorkerKind(requesterSessionId),
                 claudeApiClaimCheck,
                 onBillingFence: onClaudeBillingFence,
+                isReplacementFenced: () => workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true,
               });
               if (recoveryDequeue?.message) {
                 msg = recoveryDequeue.message;

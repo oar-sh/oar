@@ -6,7 +6,7 @@ import { relayDbPath, relayToken } from "./e2e-env.mjs";
 // hide the path, show the file name). One turn names a host path in its tool
 // line and its reply; a sub-agent of it reads a file by its absolute path.
 //
-// "Preview as shared" opens from the ⋯ menu without making a share link: the
+// "Preview as shared" opens from the ︙ menu without making a share link: the
 // redactions are highlighted, a relative path that is left is flagged, and no
 // absolute path reaches the page. A share link shows the same text without
 // any highlight. In the shared view a sub-agent row opens the viewer

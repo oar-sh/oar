@@ -136,6 +136,30 @@ test.describe("sub-agent viewer", () => {
       await expect(page.locator("#subagent-viewer-meta")).toContainText("Opus 5.5");
       await expect(page.locator("#subagent-viewer-meta")).toContainText("general-purpose");
       await expect(page.locator("#subagent-viewer-stop")).toBeVisible();
+      // Stop asks first; Cancel leaves the agent running and the viewer open.
+      await page.locator("#subagent-viewer-stop").click();
+      await expect(page.locator('#summary-modal [data-subagent-stop-confirm]')).toBeVisible();
+      await page.locator('#summary-modal [data-subagent-stop-cancel]').click();
+      await expect(page.locator('#summary-modal [data-subagent-stop-confirm]')).toBeHidden();
+      await expect(modal).toHaveClass(/visible/);
+      await expect(page.locator("#subagent-viewer-stop")).toBeEnabled();
+      // Back closes the confirm first and leaves the viewer open.
+      await page.locator("#subagent-viewer-stop").click();
+      await expect(page.locator('#summary-modal [data-subagent-stop-confirm]')).toBeVisible();
+      // Its entry lies above the viewer's.
+      await expect.poll(() => page.evaluate(() => Boolean(history.state?.oarOverlay))).toBe(true);
+      await page.goBack();
+      await expect(page.locator('#summary-modal [data-subagent-stop-confirm]')).toBeHidden();
+      await expect(modal).toHaveClass(/visible/);
+      // Confirmed, the stop goes to the agent's background task. (No worker
+      // runs here: the relay answers 409, and the viewer stays.)
+      await page.locator("#subagent-viewer-stop").click();
+      const stopRequest = page.waitForRequest((request) => request.method() === "POST"
+        && new URL(request.url()).pathname === `/api/conversation/${conversationId}/background-task/task-${stamp}/stop`);
+      await page.locator('#summary-modal [data-subagent-stop-confirm]').click();
+      await stopRequest;
+      await expect(page.locator('#summary-modal [data-subagent-stop-confirm]')).toBeHidden();
+      await expect(modal).toHaveClass(/visible/);
       const entries = modal.locator(".sav-entry");
       await expect(entries).toHaveCount(29);
       // Thoughts and tool output are folded; reply text is shown.

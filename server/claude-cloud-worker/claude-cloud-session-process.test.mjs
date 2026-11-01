@@ -1503,3 +1503,295 @@ test('the agent continuing on its own is a continuation too; a turn the relay wi
   assert.equal(api.posts('/api/response').at(-1).text, 'Answer.');
   await runner.dispose();
 });
+
+// ---------------------------------------------------------------------------
+// When the relay may replace this worker (releaseHold)
+
+test('a turn holds the release; between turns with an idle session nothing does', async () => {
+  const api = makeApi();
+  const cloud = makeCloud();
+  const { runner, timers } = makeRunner({ api, cloud });
+  assert.equal(runner.releaseHold(), '');
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  assert.equal(runner.releaseHold(), 'turn');
+  stream.emit(turnResult(10, { result: 'Done.' }));
+  assert.equal(await done, true);
+
+  // The read after the reply said idle: nothing to wait for, nothing to read again.
+  assert.equal(runner.releaseHold(), '');
+  assert.equal(timers.pending(20_000).length, 0);
+  await runner.dispose();
+});
+
+test('a turn that ended here without its result holds the release until the cloud is done with it', async () => {
+  let status = 'running';
+  const api = makeApi();
+  const cloud = makeCloud({ session: () => cloudSession({ workerStatus: status }) });
+  const { runner, timers, control } = makeRunner({ api, cloud });
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  await control.abort();
+  assert.equal(timers.fire(30_000), 1);
+  assert.equal(await done, true);
+
+  // No turn here, but the stopped one may still run in the cloud; no read of
+  // the session yet, so the unfinished turn alone holds.
+  assert.equal(runner.isTurnActive(), false);
+  assert.equal(cloud.callsOf('getSession').length, 0);
+  assert.equal(runner.releaseHold(), 'background');
+
+  // Read again later: still working, still held, and read again after that.
+  assert.equal(timers.fire(20_000), 1);
+  await waitFor(() => cloud.callsOf('getSession').length === 1 && timers.pending(20_000).length === 1, 'recheck rescheduled');
+  assert.equal(runner.releaseHold(), 'background');
+
+  // The late result settles the unfinished turn; the session said it was
+  // working, so the release waits for the next read.
+  stream.emit(stoppedResult(5));
+  await tick(10);
+  assert.equal(runner.releaseHold(), 'background');
+
+  status = 'idle';
+  assert.equal(timers.fire(20_000), 1);
+  await waitFor(() => runner.releaseHold() === '', 'released once idle');
+  assert.equal(timers.pending(20_000).length, 0);
+  await runner.dispose();
+});
+
+test('an idle session clears turns that ended here without their result', async () => {
+  const api = makeApi();
+  const cloud = makeCloud({ session: cloudSession({ workerStatus: 'idle' }) });
+  const { runner, timers, control } = makeRunner({ api, cloud });
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  await waitFor(() => cloud.streams.length, 'stream opened');
+  await control.abort();
+  timers.fire(30_000);
+  await done;
+  assert.equal(runner.releaseHold(), 'background');
+
+  // An idle cloud has no result left to send.
+  assert.equal(timers.fire(20_000), 1);
+  await waitFor(() => runner.releaseHold() === '', 'released');
+  await runner.dispose();
+});
+
+test('a session still working after the reply holds the release until a read says idle', async () => {
+  let status = 'running';
+  const api = makeApi();
+  const cloud = makeCloud({ session: () => cloudSession({ workerStatus: status }) });
+  const { runner, timers } = makeRunner({ api, cloud });
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(turnResult(10, { result: 'Done.' }));
+  assert.equal(await done, true);
+
+  // The turn is over, but the cloud may run one of its own that no delivery
+  // started: a fresh worker would not see it.
+  assert.equal(runner.isTurnActive(), false);
+  assert.equal(runner.releaseHold(), 'background');
+  assert.equal(timers.pending(20_000).length, 1);
+
+  status = 'idle';
+  timers.fire(20_000);
+  await waitFor(() => runner.releaseHold() === '', 'released once idle');
+  await runner.dispose();
+});
+
+test('a turn the session started by itself holds the release while the relay registers it', async () => {
+  let open = null;
+  const gate = new Promise((resolve) => { open = resolve; });
+  const api = makeApi({ '/api/continuation-turn': () => gate.then(() => ({ ok: true, messageId: 'cont-1', attemptId: 'attempt-c1' })) });
+  const cloud = makeCloud();
+  const { runner } = makeRunner({ api, cloud });
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(turnResult(3, { result: 'Done.' }));
+  await done;
+
+  stream.emit(assistantText(4, 'Continuing on my own.'));
+  await waitFor(() => api.posts('/api/continuation-turn').length === 1, 'registration asked');
+  assert.equal(runner.isTurnActive(), false);
+  assert.equal(runner.releaseHold(), 'turn');
+
+  open();
+  await waitFor(() => runner.isTurnActive(), 'continuation open');
+  assert.equal(runner.releaseHold(), 'turn');
+  stream.emit(turnResult(5, { result: 'Summary.' }));
+  await waitFor(() => !runner.isTurnActive(), 'continuation closed');
+  assert.equal(runner.releaseHold(), '');
+  await runner.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// A fresh worker binds the stored session at start
+
+const BINDING_ROUTE = `/api/claude-cloud-session?conversationId=${CONVERSATION_ID}`;
+const relayError = (status) => Object.assign(new Error(`HTTP ${status} ${BINDING_ROUTE}`), { status });
+
+test('a fresh worker opens the stored session\'s stream at start and follows a turn started on claude.ai', async () => {
+  const api = makeApi({
+    [BINDING_ROUTE]: { ok: true, sessionId: SESSION_ID, lastSequence: '9' },
+    '/api/continuation-turn': { ok: true, messageId: 'cont-1', attemptId: 'attempt-c1' },
+  });
+  const cloud = makeCloud({
+    sendSequences: [20],
+    // What happened after the stored cursor and before this worker started:
+    // read past, not mirrored again.
+    listPages: [{
+      events: [userPrompt(10, 'Earlier'), assistantText(11, 'Earlier reply.'), turnResult(12, { result: 'Earlier reply.' })],
+      nextCursor: null,
+    }],
+  });
+  const { runner } = makeRunner({ api, cloud });
+
+  assert.equal(await runner.attachOnStart(), true);
+  assert.deepEqual(api.calls.filter((call) => call.method === 'GET').map((call) => call.routePath), [BINDING_ROUTE]);
+  assert.deepEqual(cloud.callsOf('listEvents').map((call) => call.options.cursor), ['9']);
+  assert.deepEqual(cloud.callsOf('openEventStream').map((call) => call.lastEventId), ['12']);
+  assert.equal(api.posts('/api/continuation-turn').length, 0);
+  assert.equal(runner.releaseHold(), '');
+
+  // Nothing delivered yet: a message sent on claude.ai becomes a continuation.
+  const [stream] = cloud.streams;
+  stream.emit(userPrompt(13, 'Hello from claude.ai'), sessionInit(14), assistantText(15, 'Hello back.'));
+  await waitFor(() => api.posts('/api/continuation-turn').length === 1, 'continuation registered');
+  await waitFor(() => runner.isTurnActive(), 'continuation open');
+  stream.emit(turnResult(16, { result: 'Hello back.' }));
+  await waitFor(() => api.posts('/api/response').length === 1, 'continuation answered');
+  assert.equal(api.posts('/api/response')[0].messageId, 'cont-1');
+  await waitFor(() => !runner.isTurnActive(), 'continuation closed');
+  assert.equal(api.posts('/api/claude-cloud-session').at(-1).lastSequence, '16');
+
+  // A delivery afterwards goes into the bound session without reading the log again.
+  const next = runner.handlePendingPayload({ message: relayMessage({ id: 'queue-message-2', ...boundTo('16') }) });
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent');
+  stream.emit(turnResult(21, { result: 'Done.' }));
+  assert.equal(await next, true);
+  assert.equal(cloud.callsOf('listEvents').length, 1);
+  assert.equal(cloud.streams.length, 1);
+  await runner.dispose();
+});
+
+test('a session working at start is attached once a later read says idle', async () => {
+  let status = 'running';
+  const api = makeApi({ [BINDING_ROUTE]: { ok: true, sessionId: SESSION_ID, lastSequence: '9' } });
+  const cloud = makeCloud({ session: () => cloudSession({ workerStatus: status }) });
+  const { runner, timers } = makeRunner({ api, cloud });
+
+  // The running turn may be a delivered one a dead worker left behind: its
+  // redelivery follows it from the log, so it is not taken up here.
+  assert.equal(await runner.attachOnStart(), false);
+  assert.equal(cloud.callsOf('openEventStream').length, 0);
+  assert.equal(cloud.callsOf('listEvents').length, 0);
+  assert.equal(runner.releaseHold(), 'background');
+  assert.equal(timers.pending(20_000).length, 1);
+
+  status = 'idle';
+  timers.fire(20_000);
+  await waitFor(() => cloud.streams.length === 1, 'stream opened once idle');
+  assert.deepEqual(cloud.callsOf('listEvents').map((call) => call.options.cursor), ['9']);
+  assert.equal(cloud.callsOf('openEventStream')[0].lastEventId, '9');
+  assert.equal(runner.releaseHold(), '');
+  await waitFor(() => timers.pending(20_000).length === 0, 'no more rechecks');
+  await runner.dispose();
+});
+
+test('a conversation without a cloud session, or a relay without the route, attaches nothing at start', async () => {
+  const unbound = makeApi({ [BINDING_ROUTE]: { ok: true, sessionId: null, lastSequence: null } });
+  const unboundCloud = makeCloud();
+  const first = makeRunner({ api: unbound, cloud: unboundCloud });
+  assert.equal(await first.runner.attachOnStart(), false);
+  assert.equal(unboundCloud.calls.length, 0);
+  assert.equal(first.timers.pending(20_000).length, 0);
+
+  // 404 is for good: asked once. Another failure is asked again, three times in all.
+  const missing = makeApi({ [BINDING_ROUTE]: () => { throw relayError(404); } });
+  const second = makeRunner({ api: missing, cloud: makeCloud() });
+  assert.equal(await second.runner.attachOnStart(), false);
+  assert.equal(missing.calls.length, 1);
+  assert.deepEqual(second.sleeps, []);
+
+  const flaky = makeApi({ [BINDING_ROUTE]: () => { throw relayError(503); } });
+  const third = makeRunner({ api: flaky, cloud: makeCloud() });
+  assert.equal(await third.runner.attachOnStart(), false);
+  assert.equal(flaky.calls.length, 3);
+  assert.deepEqual(third.sleeps, [5_000, 5_000]);
+
+  // The first delivery binds the session as before.
+  const api = makeApi({ [BINDING_ROUTE]: () => { throw relayError(404); } });
+  const cloud = makeCloud({ sendSequences: [20] });
+  const { runner } = makeRunner({ api, cloud });
+  await runner.attachOnStart();
+  const done = runner.handlePendingPayload({ message: relayMessage(boundTo('9')) });
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent');
+  await waitFor(() => cloud.streams.length === 1, 'stream opened');
+  cloud.streams[0].emit(turnResult(21, { result: 'Done.' }));
+  assert.equal(await done, true);
+  await runner.dispose();
+});
+
+test('a delivery that arrives while the stored session is read at start waits for it', async () => {
+  let answer = null;
+  const binding = new Promise((resolve) => { answer = resolve; });
+  const api = makeApi({ [BINDING_ROUTE]: () => binding });
+  const cloud = makeCloud({ sendSequences: [20] });
+  const { runner } = makeRunner({ api, cloud });
+
+  const attached = runner.attachOnStart();
+  const done = runner.handlePendingPayload({ message: relayMessage(boundTo('9')) });
+  await tick(10);
+  assert.equal(cloud.calls.length, 0);
+
+  answer({ ok: true, sessionId: SESSION_ID, lastSequence: '9' });
+  assert.equal(await attached, true);
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent after the attach');
+  // The log was read once, by the attach; the delivery did not read it again.
+  assert.equal(cloud.callsOf('listEvents').length, 1);
+  cloud.streams[0].emit(turnResult(21, { result: 'Done.' }));
+  assert.equal(await done, true);
+  assert.equal(cloud.streams.length, 1);
+  await runner.dispose();
+});
+
+test('a session that stays working is read for two hours, then left with one warning until the next delivery', async () => {
+  let clock = Date.parse('2026-10-30T10:00:00Z');
+  const lines = [];
+  const api = makeApi();
+  const cloud = makeCloud({ sendSequences: [20], session: cloudSession({ workerStatus: 'running' }) });
+  const { runner, timers } = makeRunner({ api, cloud, now: () => clock, dbg: (...parts) => lines.push(parts.join(' ')) });
+
+  const done = runner.handlePendingPayload({ message: relayMessage() });
+  const [stream] = await waitFor(() => cloud.streams.length && cloud.streams, 'stream opened');
+  stream.emit(turnResult(10, { result: 'Done.' }));
+  await done;
+  assert.equal(timers.pending(20_000).length, 1);
+
+  // Still working an hour later: read again.
+  clock += 60 * 60_000;
+  timers.fire(20_000);
+  await waitFor(() => timers.pending(20_000).length === 1, 'read again');
+
+  // Two hours in: no further read, one warning, and the hold stays.
+  clock += 60 * 60_000;
+  const reads = cloud.callsOf('getSession').length;
+  timers.fire(20_000);
+  await waitFor(() => cloud.callsOf('getSession').length === reads + 1, 'last read');
+  await tick(10);
+  assert.equal(timers.pending(20_000).length, 0);
+  const warnings = lines.filter((line) => line.startsWith('warning: the cloud session has not been idle for 120 min'));
+  assert.equal(warnings.length, 1);
+  assert.equal(runner.releaseHold(), 'background');
+
+  // The next delivery starts the reads again.
+  const next = runner.handlePendingPayload({ message: relayMessage({ id: 'queue-message-2', ...boundTo('10') }) });
+  await waitFor(() => cloud.callsOf('sendUserMessage').length === 1, 'sent');
+  stream.emit(turnResult(21, { result: 'Done again.' }));
+  assert.equal(await next, true);
+  assert.equal(timers.pending(20_000).length, 1);
+  await runner.dispose();
+});

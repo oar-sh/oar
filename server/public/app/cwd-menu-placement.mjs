@@ -2,6 +2,7 @@
 // Kept DOM-free so they can run under `node --test` without a browser.
 
 const FLIP_THRESHOLD_PX = 180;
+const FALLBACK_WIDTH_PX = 260;
 
 function clamp(value, min, max) {
   if (max < min) return min;
@@ -11,17 +12,28 @@ function clamp(value, min, max) {
 /**
  * Decide where the fixed-position picker panel should sit relative to its trigger.
  * Used on desktop only; the mobile layout is a bottom sheet driven purely by CSS.
+ *
+ * `gap`, `edge`, `minHeight`, `maxHeight` are design sizes at 100 %; `scale`
+ * is the UI zoom (font-scaling.js getUiScale) they are multiplied by, so the
+ * panel keeps its proportions next to the scaled stylesheet. The trigger rect
+ * and the viewport are measured, never scaled.
  */
 export function resolveCwdMenuPlacement({
   triggerRect,
   viewportWidth = 0,
   viewportHeight = 0,
   panelHeight = 0,
-  gap = 6,
-  edge = 8,
-  minHeight = 140,
-  maxHeight = 300,
+  gap: gapBase = 6,
+  edge: edgeBase = 8,
+  minHeight: minHeightBase = 140,
+  maxHeight: maxHeightBase = 300,
+  scale = 1,
 } = {}) {
+  const factor = Number.isFinite(Number(scale)) && Number(scale) > 0 ? Number(scale) : 1;
+  const gap = gapBase * factor;
+  const edge = edgeBase * factor;
+  const minHeight = minHeightBase * factor;
+  const maxHeight = maxHeightBase * factor;
   const top = Number(triggerRect?.top) || 0;
   const left = Number(triggerRect?.left) || 0;
   const width = Math.max(0, Number(triggerRect?.width) || 0);
@@ -30,13 +42,13 @@ export function resolveCwdMenuPlacement({
 
   const spaceBelow = Math.max(0, viewportHeight - bottom - gap - edge);
   const spaceAbove = Math.max(0, top - gap - edge);
-  const flip = spaceBelow < FLIP_THRESHOLD_PX && spaceAbove > spaceBelow;
+  const flip = spaceBelow < FLIP_THRESHOLD_PX * factor && spaceAbove > spaceBelow;
   const available = flip ? spaceAbove : spaceBelow;
 
   const desiredHeight = panelHeight > 0 ? Math.min(panelHeight, maxHeight) : maxHeight;
   const resolvedMaxHeight = clamp(Math.min(desiredHeight, available), Math.min(minHeight, available), maxHeight);
 
-  const resolvedWidth = width > 0 ? width : 260;
+  const resolvedWidth = width > 0 ? width : FALLBACK_WIDTH_PX * factor;
   const maxLeft = Math.max(edge, viewportWidth - resolvedWidth - edge);
   const resolvedLeft = clamp(left, edge, maxLeft);
   const resolvedTop = flip

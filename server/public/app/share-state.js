@@ -1,6 +1,6 @@
 // The relay's active public shares, as it last reported them: one entry per
 // shared conversation (Settings → Shared conversations) and whether the open
-// conversation has one (the ⋯ menu's "Stop sharing"). Read from GET /api/shares
+// conversation has one (the ︙ menu's "Stop sharing"). Read from GET /api/shares
 // when the socket connects and again on every share event; no DOM here.
 
 import { listConversationShares } from './api-client.js';

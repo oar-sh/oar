@@ -176,7 +176,7 @@ project root. Sessions without an explicit configured CWD launch in the relay's 
 A plain `cd <path>` chat command persists to that conversation's configured CWD only — it does not
 affect other sessions or the global relay root.
 
-Use the chat header **⋯** menu and choose **🗂️ Change CWD** to switch the selected session's next
+Use the chat header **︙** menu and choose **🗂️ Change CWD** to switch the selected session's next
 launch directory from the list of known directories. The CWD picker always stays available; the
 launch action is only enabled for the selected CLI when it is not running.
 
@@ -244,7 +244,7 @@ If you host the relay behind a subpath, set `remotePath` in `server/config.json`
 
 ## Model Selection
 
-The composer includes a model picker next to the Send button.
+The composer's **⚙** settings (the label row above the message box) include a model picker.
 Models are now populated dynamically from the active Copilot CLI runtime using
 raw model IDs (no relay-specific aliases). The selected model ID is sent as-is
 for each message.
@@ -376,8 +376,8 @@ Enabling (or changing the default model) triggers model discovery: a short-lived
 opened purely to serve a `supportedModels()` control request, with a 20 s timeout. Discovered
 `claude-*` IDs — including bracketed capability variants such as `claude-opus-5[1m]` — are stored and
 added to the model catalog. Bare aliases (`default`, `sonnet`) are dropped in favour of the explicit IDs.
-In the composer, `[1m]` variants are folded into their base model: the base ID is the only dropdown
-entry, and the variant is selected through the context-size dropdown (`long_context` composes the
+In the composer, `[1m]` variants are folded into their base model: the base ID is the only Model
+entry, and the variant is selected through the Context window field (`long_context` composes the
 `[1m]` ID on send and in the persisted per-conversation model preference).
 
 Disabling Claude rebinds conversations that have not yet sent a message back to the default provider,
@@ -456,7 +456,7 @@ truth, and the relay asks:
 - **Placeholder.** A live Claude worker on older code cannot answer, but its heartbeat says whether
   background work holds its process (`steering.autoCompactWindow.backgroundWork`). While this
   runtime has not heard from that worker about its tasks, the session reads `background_only` with
-  one task "background work, details not reported since the relay restarted (Kill session in its ⋯
+  one task "background work, details not reported since the relay restarted (Kill session in its ︙
   menu ends it)", the panel shows the
   same row without a Stop button, and a host suspend waits. It is derived on read
   (`services/background-work-view.mjs`), raises no event, and goes when the set arrives, the flag
@@ -951,8 +951,8 @@ finishes.
 
 `POST /api/conversation/:id/billing` moves a Claude chat between `claude` (the subscription) and
 `claude-api` (the key): `{ to: "claude" | "claude-api", by?: "user" | "agent" | "usage-limit",
-message? }` (`provider` is taken for `to`; `by` defaults to `user`). The composer's toggle, the
-usage-limit note's button (`by: "usage-limit"`, to the key only, else `400 CLAUDE_BILLING_INVALID`)
+message? }` (`provider` is taken for `to`; `by` defaults to `user`). The Billing toggle in the composer's ⚙
+settings, the usage-limit note's button (`by: "usage-limit"`, to the key only, else `400 CLAUDE_BILLING_INVALID`)
 and an agent's `send` with a provider use it. `checkSwitch`
 (`services/claude-billing-switch-service.mjs`) runs first, and a refusal answers with its status and
 `code`:
@@ -1402,9 +1402,9 @@ An event message renders as a compact row (`relay-event-view.mjs`) folded to its
 **replayed** tag, and the user's fold is kept across re-renders. A watcher's header shows **👁 watching
 N sessions** (or all; sessions on paired relays count, the chip's title names those relays), which
 opens its subscriptions with an **Unsubscribe** button each (`lab-relay · Report builder`); a watched
-session shows a **watched** badge in its header and, when watched by id, in the sidebar (a
-subscription to all would badge every row; one on a paired relay badges none of this relay's
-sessions). On the watched relay the badge names a paired relay's watcher with its relay.
+session shows a **watched** badge in its header and, when watched by id, a *Watched by …* entry in
+its sidebar row's **ⓘ** menu (a subscription to all would mark every row; one on a paired relay
+marks none of this relay's sessions). On the watched relay the badge names a paired relay's watcher with its relay.
 The list comes from `GET /api/relay-events/subscriptions` and the `relay_event_subscriptions`
 socket event (the whole active list after every change).
 
@@ -1468,7 +1468,8 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
   hour and pruned after a week. At most 20 active schedules fire into one conversation, and one
   conversation sets at most 20.
 - **UI.** Socket `relay_schedules` carries the whole active list on every change. The sidebar row
-  of a conversation a schedule fires into shows **scheduled**; the header shows "⏰ N scheduled"
+  of a conversation a schedule fires into has a *Scheduled · next …* entry in its **ⓘ** menu; the
+  header shows "⏰ N scheduled"
   (with the next time) on a conversation that has or set schedules, and opens their list with a
   **Cancel** button each.
 
@@ -1584,7 +1585,8 @@ images, calling the OpenAI Images API directly rather than going through a CLI w
 
 ## Relay Mode Selection
 
-The composer also includes a per-message mode picker:
+The composer's **⚙** settings also include a per-message mode picker (**Mode**; the composer's
+label shortens `autopilot` to "Auto"):
 
 - `plan`
 - `ask`
@@ -1645,7 +1647,8 @@ usage modal, shown for every session. Plan mode alone never sets it.
   other than plan (`{planOnly: false, mode: "agent"}`). Alone, or with `mode: "plan"`, it is ignored,
   not refused, and on a plan-only session the answer notes "planOnly unchanged: clear it in the same call as the new mode."
   The owner's toggle clears it any time, and the owner can always change the mode in the UI; the
-  mode select shows "Plan 🔒" with a dashed accent border and a title on a plan-only session.
+  mode select in the composer's ⚙ settings shows "Plan 🔒" with a dashed accent border and a title
+  on a plan-only session, and the composer's label reads "Plan 🔒" too.
 - The plan card recommends "Approve plan" and asks before "Implement in autopilot", "Implement with
   autopilot fleet" and "Stop here and prompt myself":
   `This session is plan-only. <label> leaves plan mode. Go on?`. "Approve plan" and "Stop here"
@@ -2279,7 +2282,7 @@ follow-up, or a second time in the same runtime. The browser renders it as a com
 
 ### Git changes modal
 
-The **🌿 Git changes** entry in the conversation `⋯` menu opens a modal over the conversation's
+The **🌿 Git changes** entry in the conversation **︙** menu opens a modal over the conversation's
 workspace root, backed by `services/git-changes-service.mjs` and `routes/git-routes.mjs`:
 
 - `GET /api/git/status?conversationId=…` — branch, upstream, ahead/behind, and every changed file
@@ -2461,8 +2464,9 @@ Copilot extension engine's prompt builder (`shared/worker-runtime/prompt-context
 it and `relay-tools.md` does not contain it, and a Claude Cloud session gets no relay guidance at
 all, so those two are not told.
 
-The browser UI keeps the usage button in the sidebar header, and that button continues to
-call `/api/usage` directly. It now renders the unified plan-usage report — one card per
+The browser UI keeps the usage button (**📊**) in the chat header, or as **📊 Check Usage** in the
+**︙** menu when the header has no room for it, and that button continues to call `/api/usage`
+directly. It now renders the unified plan-usage report — one card per
 provider with meters, reset countdowns and collapsible cost detail — via
 `public/app/plan-usage-view.mjs`, falling back to the old Copilot-only text summary when
 the response carries no `providers` array (an older relay, or one without the plan-usage

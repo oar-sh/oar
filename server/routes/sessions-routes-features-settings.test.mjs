@@ -57,7 +57,7 @@ function sampleFlagState({ restartRequired = false } = {}) {
   }];
 }
 
-function registerFeaturesRoutes({ getFeatureFlagsSettingsState, setFeatureFlagSetting } = {}) {
+function registerFeaturesRoutes({ getFeatureFlagsSettingsState, setFeatureFlagSetting, overrides = {} } = {}) {
   const app = createMockApp();
   const auth = (_req, _res, next) => next();
   registerSessionsRoutes(app, {
@@ -119,6 +119,7 @@ function registerFeaturesRoutes({ getFeatureFlagsSettingsState, setFeatureFlagSe
     resolveSessionStateRoot: () => null,
     getFeatureFlagsSettingsState,
     setFeatureFlagSetting,
+    ...overrides,
   });
   return { app, auth };
 }
@@ -229,4 +230,78 @@ test('the session-worker status payload reports the real fallback-restart flag',
   assert.equal(buildSessionWorkerStatusPayload({
     featureFlags: {},
   }).fallbackRestartEnabled, false);
+});
+
+const RELAY_BUILD = '0.9.21+0123456789ab';
+const OLD_BUILD = '0.9.20+fedcba987654';
+
+function statusWorker(sdkSessionId, fields = {}) {
+  return { sdkSessionId, status: 'ready', pid: 4100, kind: 'claude', ...fields };
+}
+
+test('the session-worker status payload names each worker\'s build, its start and whether it runs other code than the relay', () => {
+  const recycle = { relayBuildId: RELAY_BUILD, staleCount: 2, inFlight: 1, recycled: 3, waiting: [{ sdkSessionId: 'old', hold: 'turn' }] };
+  const payload = buildSessionWorkerStatusPayload({
+    supervisorSnapshot: {
+      workers: [
+        statusWorker('same', { buildId: RELAY_BUILD, startedAt: '2026-10-30T21:00:00.000Z' }),
+        statusWorker('old', { buildId: OLD_BUILD, startedAt: '2026-10-29T08:00:00.000Z' }),
+        statusWorker('silent'),
+      ],
+    },
+    relayBuildId: RELAY_BUILD,
+    recycleStatus: recycle,
+  });
+  assert.equal(payload.buildId, RELAY_BUILD);
+  assert.deepEqual(payload.recycle, recycle);
+  assert.deepEqual(
+    payload.workers.map(({ sdkSessionId, buildId, startedAt, stale }) => ({ sdkSessionId, buildId, startedAt, stale })),
+    [
+      { sdkSessionId: 'same', buildId: RELAY_BUILD, startedAt: '2026-10-30T21:00:00.000Z', stale: false },
+      { sdkSessionId: 'old', buildId: OLD_BUILD, startedAt: '2026-10-29T08:00:00.000Z', stale: true },
+      { sdkSessionId: 'silent', buildId: null, startedAt: null, stale: true },
+    ],
+  );
+  assert.equal(payload.workers[0].kind, 'claude', 'the registry fields still pass through');
+});
+
+test('a relay that does not know its own build calls no worker stale, and no recycle reads as null', () => {
+  const payload = buildSessionWorkerStatusPayload({
+    supervisorSnapshot: { workers: [statusWorker('old', { buildId: OLD_BUILD }), statusWorker('silent')] },
+  });
+  assert.equal(payload.buildId, null);
+  assert.equal(payload.recycle, null);
+  assert.deepEqual(payload.workers.map((worker) => worker.stale), [false, false]);
+});
+
+test('/api/status carries the relay build id, the recycle status and the per-worker build fields', async () => {
+  const runtimeState = {
+    cliOnline: true,
+    buildId: RELAY_BUILD,
+    workerRecycle: () => ({ relayBuildId: RELAY_BUILD, staleCount: 1, inFlight: 0, recycled: 0, waiting: [] }),
+  };
+  const { app } = registerFeaturesRoutes({
+    overrides: {
+      runtimeState,
+      stmts: { countRuntimeSessions: { get: () => ({ cnt: 0 }) } },
+      sessionWorkerSupervisor: {
+        snapshot: () => ({ workers: [statusWorker('old', { buildId: OLD_BUILD }), statusWorker('same', { buildId: RELAY_BUILD })] }),
+      },
+    },
+  });
+  const response = await callRoute(app.routes.get('GET /api/status'));
+  assert.equal(response.statusCode, 200);
+  const { sessionWorker } = response.body;
+  assert.equal(sessionWorker.buildId, RELAY_BUILD);
+  assert.equal(sessionWorker.recycle.staleCount, 1);
+  assert.deepEqual(sessionWorker.workers.map((worker) => [worker.sdkSessionId, worker.buildId, worker.stale]), [
+    ['old', OLD_BUILD, true],
+    ['same', RELAY_BUILD, false],
+  ]);
+
+  // A recycle status that throws leaves the rest of the status standing.
+  runtimeState.workerRecycle = () => { throw new Error('not yet'); };
+  const degraded = await callRoute(app.routes.get('GET /api/status'));
+  assert.equal(degraded.statusCode, 200);
+  assert.equal(degraded.body.sessionWorker.recycle, null);
 });

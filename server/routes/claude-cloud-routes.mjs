@@ -6,6 +6,9 @@
 //                                     environment, account, login state
 //   POST /api/settings/claude-cloud   { enabled?, defaultModel?, environmentId? }
 //   POST /api/claude-cloud-session    the worker's binding report
+//   GET  /api/claude-cloud-session    `?conversationId=` (or the sdk session
+//                                     id) → the stored binding a starting
+//                                     worker attaches to
 //   GET  /api/claude-cloud/repos      the repositories New Chat may suggest
 //                                     (`?refresh=1` reads them afresh)
 //   GET  /api/claude-cloud/branches   `?repo=<owner/name or URL>` → its branches
@@ -76,6 +79,22 @@ export function registerClaudeCloudRoutes(app, deps = {}) {
       const result = claudeCloudSessionService.recordWorkerReport(req.body);
       if (!result.ok) return res.status(result.statusCode || 400).json({ error: result.error });
       return res.json({ ok: true, cloud: result.cloud });
+    });
+
+    // GET /api/claude-cloud-session?conversationId=<id> — a starting Claude
+    // Cloud worker asks which cloud session it is bound to and from which
+    // sequence to read on, so it opens the event stream before any delivery
+    // (a relaunched worker follows the turns the session starts by itself
+    // from its start). The id may be the conversation id or the sdk session
+    // id. `{ ok, sessionId, lastSequence }`, `sessionId: null` when there is
+    // no cloud session; 404 only for an unknown conversation.
+    app.get('/api/claude-cloud-session', auth, (req, res) => {
+      touchCli();
+      const raw = req.query?.conversationId ?? req.query?.sdkSessionId;
+      const id = Array.isArray(raw) ? raw[0] : raw;
+      const result = claudeCloudSessionService.describeStoredBinding(typeof id === 'string' ? id : '');
+      if (!result.ok) return res.status(result.statusCode || 400).json({ error: result.error });
+      return res.json({ ok: true, sessionId: result.sessionId, lastSequence: result.lastSequence });
     });
   }
 

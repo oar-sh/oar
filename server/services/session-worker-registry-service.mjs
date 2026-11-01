@@ -1,5 +1,7 @@
 'use strict';
 
+import { normalizeBuildId } from '../../shared/build-id.mjs';
+
 function normalizeSessionId(value) {
   const text = String(value || '').trim();
   return text || null;
@@ -141,6 +143,12 @@ export function normalizeWorkerSteeringSnapshot(raw) {
     const tasks = Number(raw.backgroundTaskCount);
     snapshot.backgroundTaskCount = Number.isInteger(tasks) && tasks > 0 ? Math.min(tasks, 999) : 0;
   }
+  // Whether the worker's CLI child still runs. The recycle replaces a worker
+  // only once that child is gone, because a live CLI may hold scheduled jobs
+  // of its own (CronCreate, ScheduleWakeup) that a stop would lose. Only a
+  // worker that reports it carries the key: an absent key means "cannot say",
+  // which the recycle treats differently from false.
+  if (typeof raw.cliAlive === 'boolean') snapshot.cliAlive = raw.cliAlive;
   return snapshot;
 }
 
@@ -160,6 +168,12 @@ function sanitizeState(raw = null) {
     lastError: String(base.lastError || '').trim() || null,
     steering: normalizeWorkerSteeringSnapshot(base.steering),
     kind: normalizeWorkerKind(base.kind),
+    // The build id of the code the worker process started on, as it stated
+    // it; null when it did not say or said something malformed.
+    buildId: normalizeBuildId(base.buildId),
+    // When the relay first heard of the current pid: the process's age as far
+    // as the relay can tell, without asking the OS. Null without a pid.
+    startedAt: normalizeTimestamp(base.startedAt, null),
     updatedAt: normalizeTimestamp(base.updatedAt, nowIso),
     createdAt,
   };
@@ -266,11 +280,33 @@ export function createSessionWorkerRegistry() {
     // heartbeated — indefinitely, if none ever did.
     // The kind is the same: a process's own word. An upsert that does not
     // state it keeps the known one, unless the process it described is gone.
+    // The build id and the start time follow the same rule.
     const statesKind = Object.prototype.hasOwnProperty.call(rawState, 'kind');
+    const statesBuildId = Object.prototype.hasOwnProperty.call(rawState, 'buildId');
+    const statesStartedAt = Object.prototype.hasOwnProperty.call(rawState, 'startedAt');
     if (!statesKind) next.kind = existing?.kind || null;
+    if (!statesBuildId) next.buildId = existing?.buildId || null;
+    if (!statesStartedAt) next.startedAt = existing?.startedAt || null;
     if (existing && isWorkerReplacedOrGone(existing, next)) {
       next.steering = null;
       if (!statesKind) next.kind = null;
+      if (!statesBuildId) next.buildId = null;
+      if (!statesStartedAt) next.startedAt = null;
+    }
+    // A pid the entry did not have before is the first the relay hears of
+    // that process, so its start time is now. Callers spread the old entry
+    // into the upsert that brings the new pid, so a stated startedAt counts
+    // only when it is not the old process's own.
+    // The build id is that process's own word as well, and it arrives with its
+    // hello or heartbeat, not with the upsert that brings the pid. A build id
+    // equal to the old entry's is the old process's, spread in, and would make
+    // a recycled worker read as the old code (or an old worker as current)
+    // until the new one spoke; it is dropped. A different one was stated for
+    // this process and stays.
+    if (next.pid && next.pid !== existing?.pid) {
+      const statedOwnStart = statesStartedAt && next.startedAt && next.startedAt !== existing?.startedAt;
+      if (!statedOwnStart) next.startedAt = new Date().toISOString();
+      if (next.buildId && next.buildId === existing?.buildId) next.buildId = null;
     }
     clearIndexesForSession(existing);
     bySession.set(state.sdkSessionId, next);

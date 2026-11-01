@@ -461,6 +461,29 @@ export function createMessageRepository(db) {
           WHERE status = 'processing'
             AND NULLIF(owner_sdk_session_id, '') = ?
         `),
+        // The worker recycle's quiet window (worker-recycle-service.mjs): the
+        // last time the session had a delivery or a turn end, as an ISO
+        // string, or NULL when the queue holds no row of it. Over the rows the
+        // session owns: a row is stamped with its owner at enqueue under
+        // session-worker routing and at the latest by its claim, and a
+        // conversation rebound to another session leaves its old rows with the
+        // session that ran them. The queue keeps no completion time
+        // (setDone clears processing_at), so a turn's end is its response
+        // message's timestamp; the claim and the heartbeat lease
+        // (owner_last_claimed_at) and the assignment stand for the delivery.
+        // Each column is COALESCEd: SQLite's multi-argument MAX() is NULL as
+        // soon as one argument is.
+        getOwnerLastActivityAt: db.prepare(`
+          SELECT MAX(NULLIF(MAX(
+            COALESCE(q.processing_at, ''),
+            COALESCE(q.owner_assigned_at, ''),
+            COALESCE(q.owner_last_claimed_at, ''),
+            COALESCE(m.timestamp, '')
+          ), '')) AS last_activity_at
+          FROM queue q
+          LEFT JOIN messages m ON m.id = q.response_message_id
+          WHERE NULLIF(q.owner_sdk_session_id, '') = ?
+        `),
         recoverProcessingRowKeepOwner: db.prepare(`
           UPDATE queue
           SET status = 'pending',

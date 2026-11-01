@@ -709,6 +709,12 @@ export function createCopilotSdkSessionRunner({
   // card), so they hold the stall watchdog and the idle shutdown too — but
   // not steering: nobody is answering a card here.
   let pendingRelayToolCalls = 0;
+  // Deliveries `handlePendingPayload` is still working on. Most become (or
+  // steer into) `activeTurn` at once, but a steer that waits on the turn's
+  // send, its row or the relay context can find the turn gone and open its
+  // own afterwards: in that gap no turn exists, and the worker must still
+  // not read as replaceable (`releaseHold`).
+  let admittingDeliveries = 0;
   // `relay_tool` is registered only while this relay has paired remotes.
   // Asked once when the worker starts; a session build waits for that first
   // answer (it is async anyway), and every runtime stop asks again so the
@@ -4739,7 +4745,62 @@ export function createCopilotSdkSessionRunner({
     const canSteer = canAcceptSteering();
     const holdReason = turnActive && !canSteer ? steeringHoldReason(turn) : null;
     const messageId = String(turn?.currentOwner?.message?.id || turn?.message?.id || '').trim() || null;
-    return { turnActive, canSteer, holdReason, messageId, supported: true, cancellableIds: cancellableIds() };
+    // `releasable`: the relay may stop this worker and launch a fresh one now
+    // (its recycle after a deploy), the same fields the Claude worker sends.
+    const hold = releaseHold();
+    return {
+      turnActive,
+      canSteer,
+      holdReason,
+      messageId,
+      supported: true,
+      cancellableIds: cancellableIds(),
+      releasable: !hold,
+      releaseHold: hold || null,
+      // As the task panel counts them: with the registry it is the truth, and
+      // the event-scraped shell set would count its shells a second time.
+      backgroundTaskCount: sessionRpc.tasks ? backgroundTasks.size : backgroundShells.size(),
+      // The runtime process (the CLI child) is up: a client or a session
+      // handle exists until `stopRuntime` clears both. The relay's recycle
+      // replaces a stale worker only once it is releasable AND this is false;
+      // releasable with the runtime up is the idle window, left to the idle
+      // shutdown.
+      cliAlive: Boolean(client || session),
+    };
+  }
+
+  /**
+   * What keeps this worker from being replaced now ('' when nothing does):
+   * the idle shutdown's gates (`evaluateLifecycle`) and the runtime tree's
+   * busy check, named with the relay's hold words. Stopping the worker ends
+   * the runtime, and with it the turn, the card a human is answering, a
+   * compaction, and every background shell and agent.
+   *
+   *  - 'question': a question card or an ask-mode approval is open;
+   *  - 'compaction': the runtime is compacting the session;
+   *  - 'turn': a turn is running or still publishing its rows, a `relay_tool`
+   *    call is out, an image row is on the relay's image routes, or a
+   *    delivery is on its way in;
+   *  - 'background': a background shell or agent is live, a settled shell's
+   *    continuation is due (`continuationGraceMs`), a registry read is due
+   *    or under way, or the task registry has failed to answer: in the last
+   *    two "nothing is running" is not known (`backgroundWorkHoldsRuntime`
+   *    holds the runtime on the same grounds).
+   */
+  function releaseHold() {
+    if (pendingHumanRequests > 0) return 'question';
+    if (isCompacting()) return 'compaction';
+    if (
+      activeTurn || publishingTurns.size > 0 || pendingRelayToolCalls > 0
+      || directImageMessages.size > 0 || admittingDeliveries > 0
+    ) return 'turn';
+    if (backgroundShells.size() > 0 || backgroundTasks.size > 0) return 'background';
+    if (continuationDueSince && Date.now() - continuationDueSince < continuationGraceMs) return 'background';
+    // A read of the registry that is debounced, queued or on its way may
+    // still find a live agent or shell the last answer did not have.
+    if (sessionRpc.tasks && (taskRefreshTimer || taskRefreshQueued > 0 || taskRefreshInFlight)) return 'background';
+    if (sessionRpc.tasks && taskRefreshFailures > 0 && taskRefreshFailures < MAX_TASK_REFRESH_FAILURES) return 'background';
+    return '';
   }
 
   /**
@@ -4883,6 +4944,18 @@ export function createCopilotSdkSessionRunner({
   }
 
   async function handlePendingPayload(pending) {
+    // A payload without a message is refused at once, as it always was: it
+    // admits nothing.
+    if (!pending?.message) return false;
+    admittingDeliveries += 1;
+    try {
+      return await admitPendingPayload(pending);
+    } finally {
+      admittingDeliveries -= 1;
+    }
+  }
+
+  async function admitPendingPayload(pending) {
     const message = pending?.message || null;
     if (!message) return false;
     // An image model is no chat model: its row goes to the relay's image

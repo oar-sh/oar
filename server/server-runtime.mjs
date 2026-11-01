@@ -75,6 +75,9 @@ import { createDeepSeekUsageImportService } from './services/deepseek-usage-impo
 import { createClaudeApiSettingsService } from './services/claude-api-settings-service.mjs';
 import { createClaudeBillingSwitchService, normalizeClaudeBilling } from './services/claude-billing-switch-service.mjs';
 import { createClaudeBillingSwapService } from './services/claude-billing-swap-service.mjs';
+import { createWorkerReplacement, createWorkerReplacementFence } from './services/worker-replacement.mjs';
+import { sessionLaunchMutex } from './services/session-launch-mutex-service.mjs';
+import { createWorkerRecycleService, sweepArchivedWorkers } from './services/worker-recycle-service.mjs';
 import { createClaudeApiUsageService } from './services/claude-api-usage-service.mjs';
 import { createTokenUsageService } from './services/token-usage-service.mjs';
 import { createClaudeApiCapWatch, createClaudeApiPlanUsage, createClaudeApiStopNoteLedger } from './services/plan-usage-claude-api.mjs';
@@ -119,7 +122,8 @@ import { createActiveDeviceTracker } from './services/push-active-device-service
 import { registerPushRoutes } from './routes/push-routes.mjs';
 import { registerAboutRoutes } from './routes/about-routes.mjs';
 import { registerRelayRestartRoutes } from './routes/relay-restart-routes.mjs';
-import { createAboutService, resolveBuildCommit } from './services/about-service.mjs';
+import { createAboutService } from './services/about-service.mjs';
+import { resolveBuildId } from '../shared/build-id.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
 import {
   normalizeDriveAbsolutePath as _normalizeDriveAbsolutePath,
@@ -298,7 +302,12 @@ const INSTALL_METHOD = fs.existsSync(path.join(PACKAGE_ROOT, '.git')) ? 'git-che
 // When this relay process started, and the commit its code came from (read
 // once: a checkout moved on later still runs the code it started with).
 const RELAY_STARTED_AT = new Date(Date.now() - process.uptime() * 1000).toISOString();
-const BUILD_COMMIT = resolveBuildCommit(PACKAGE_ROOT);
+// The build id (version plus commit) names that code for the session workers:
+// a worker that states another one started on older code. Read in the same
+// pass as the commit so the two cannot disagree.
+const RELAY_BUILD = resolveBuildId(PACKAGE_ROOT);
+const BUILD_COMMIT = RELAY_BUILD.commit;
+const BUILD_ID = RELAY_BUILD.id;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 const PWA_MANIFEST_PATH = path.join(PUBLIC_DIR, 'manifest.webmanifest');
@@ -2006,6 +2015,8 @@ const runtimeTimers = {
   claudeApiCapClock: null,
   memoryLog: null,
   memoryWatch: null,
+  // Once, 30 s after the relay listens: archived sessions' workers stopped.
+  archivedWorkerSweep: null,
 };
 
 function normalizeRemotePath(value) {
@@ -6550,6 +6561,23 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
     };
   }
+  // The process asking is being replaced (the worker recycle passed its holds
+  // for it): no work, as for a killed session; the worker stays ready, and
+  // what waits goes to the new one. Unlike the killed marker above, this
+  // survives the marker's grace and every clearRestartSchedule.
+  if (workerReplacementFence.isHeld(requesterSessionId, pid)) {
+    return {
+      message: null,
+      routing: {
+        enabled: true,
+        requesterSessionId,
+        blockedReason: 'worker-replacement',
+        lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
+        fallbackRestart: null,
+      },
+      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
+    };
+  }
   sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
   if (runtimeState.relayPaused) {
     return { message: null, paused: true, reason: 'relay_paused' };
@@ -6629,6 +6657,9 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     workerKind: workerKind || sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.kind || null,
     claudeApiClaimCheck,
     onBillingFence: handleClaudeBillingFence,
+    // The fence check above, asked again before every claim: ensureWorker
+    // and a transient error's backoff both wait.
+    isReplacementFenced: () => workerReplacementFence.isHeld(requesterSessionId, pid),
   });
   if (!dequeueResult?.message) {
     return {
@@ -6942,48 +6973,38 @@ async function sweepDeadWorkerProcessingRowsOnce() {
 // claude-billing-swap-service.mjs): a Claude chat's next row of the other
 // billing is refused to the worker it has, which is replaced, once idle, by
 // one of the row's kind. The old one is stopped like the kill route does, and
-// the new one launched only once every process of the session is gone.
+// the new one launched only once every process of the session is gone
+// (services/worker-replacement.mjs, which the worker recycle below shares).
+// The two get one instance each so a failed stop's warning names the caller.
+// They share one replacement fence, the one the deliveries check (the socket
+// delivery above and /api/pending): a process being replaced is handed no
+// work. The worker recycle raises it; the billing swap does not, since its
+// own delivery fence already keeps the other billing's rows from the old
+// worker.
+const workerReplacementFence = createWorkerReplacementFence();
+function createRuntimeWorkerReplacement(tag) {
+  return createWorkerReplacement({
+    registry: sessionWorkerRegistry,
+    supervisor: sessionWorkerSupervisor,
+    processInspector: sessionWorkerProcessInspector,
+    stopSessionWorkerProcesses,
+    isProcessAlive,
+    killTmuxSession,
+    logger: console,
+    logPrefix: () => `${runtimeLogPrefix()}${tag} `,
+    fence: workerReplacementFence,
+  });
+}
+// A stop that fails backs off (the swap service retries it) and clears the
+// killed marker, so the session's worker, alive or relaunched, keeps asking
+// for work meanwhile. The fence still keeps the other billing's rows from it.
+const billingSwapWorkerReplacement = createRuntimeWorkerReplacement('BILLING SWAP');
 const claudeBillingSwapService = createClaudeBillingSwapService({
   getWorker: (sid) => sessionWorkerRegistry?.getWorker?.(sid) || null,
   // A row the session claimed and has not finished: never stopped under it.
   hasRunningTurn: (sid) => (stmts.listProcessingRowsForOwner?.all?.(sid) || []).length > 0,
-  stopWorker: async (sid) => {
-    const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
-    // Nothing may start the session while it is being stopped: a launch then
-    // would adopt the old process, kind and all.
-    sessionWorkerSupervisor?.markKilled?.(sid);
-    // A stop that fails backs off (the swap service retries it): the killed
-    // marker goes with it, so the session's worker, alive or relaunched,
-    // keeps asking for work meanwhile. The fence still keeps the other
-    // billing's rows from it.
-    const backOff = (error, remainingPids = []) => {
-      sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
-      console.warn(`${runtimeLogPrefix()}BILLING SWAP STOP FAILED session=${sid.slice(0, 8)} ${error}${remainingPids.length ? ` remaining=${remainingPids.join(',')}` : ''} — kill marker cleared, retrying with a backoff`);
-      return { ok: false, error, remainingPids };
-    };
-    let stopped = null;
-    try {
-      await sessionWorkerSupervisor?.cancelPendingStart?.(sid, { wait: true });
-      stopped = await stopSessionWorkerProcesses({
-        sdkSessionId: sid,
-        worker,
-        processInspector: sessionWorkerProcessInspector,
-        isPidAliveImpl: isProcessAlive,
-        killTmuxSessionImpl: killTmuxSession,
-      });
-    } catch (error) {
-      return backOff(String(error?.message || error || 'worker-stop-failed'));
-    }
-    if (!stopped.ok) return backOff(stopped.error || 'worker-survived-stop', stopped.remainingPids || []);
-    sessionWorkerRegistry?.removeWorker?.(sid);
-    sessionWorkerSupervisor?.resetHealth?.(sid, { clearFailureCount: false });
-    return { ok: true };
-  },
-  launchWorker: async (sid) => {
-    sessionWorkerSupervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
-    const launched = await sessionWorkerSupervisor?.ensureWorker?.(sid, { allowProcessReuse: false });
-    return { ok: launched?.ok === true, error: launched?.error || null };
-  },
+  stopWorker: billingSwapWorkerReplacement.stopWorker,
+  launchWorker: billingSwapWorkerReplacement.launchWorker,
   onStuck: ({ conversationId, rowBilling, attempts, reason }) => {
     if (!conversationId) return;
     const at = new Date().toISOString();
@@ -7014,6 +7035,95 @@ const claudeBillingSwapService = createClaudeBillingSwapService({
   },
   logger: console,
 });
+
+// Whether a worker's session is one the relay keeps no worker for: its
+// conversation is archived (or deleted), or there is no conversation behind
+// the session at all. A conversation in use found either way (the runtime
+// session's, or the one naming the session id) keeps its worker: a session
+// is never stopped for good on a missing link alone.
+function isWorkerSessionArchived(sid) {
+  const runtime = stmts.getRuntimeSessionBySdkSessionId?.get?.(sid) || null;
+  const viaRuntime = runtime?.conversation_id ? (stmts.getConvAnyStatus?.get?.(runtime.conversation_id) || null) : null;
+  const viaSessionId = stmts.getConvBySdkSessionId?.get?.(sid) || null;
+  const inUse = (conversation) => Boolean(conversation)
+    && Number(conversation.archived || 0) !== 1
+    && String(conversation.status || '').trim().toLowerCase() !== 'deleted';
+  return !inUse(viaRuntime) && !inUse(viaSessionId);
+}
+
+// The worker recycle (services/worker-recycle-service.mjs): a worker that
+// runs older code than this relay (another build id, or none stated) is
+// replaced between turns by one on this relay's code; an archived session's
+// is stopped for good. Its own replacement instance, so a failed stop says
+// WORKER RECYCLE rather than BILLING SWAP.
+const recycleWorkerReplacement = createRuntimeWorkerReplacement('WORKER RECYCLE');
+const workerRecycleService = createWorkerRecycleService({
+  relayBuildId: BUILD_ID,
+  listWorkers: () => sessionWorkerRegistry.listWorkers(),
+  getWorker: (sid) => sessionWorkerRegistry.getWorker(sid),
+  // A row the session claimed and has not finished: never stopped under it.
+  hasRunningTurn: (sid) => (stmts.listProcessingRowsForOwner?.all?.(sid) || []).length > 0,
+  // From the supervisor's lifecycle, not its firstObservedHeartbeatAt: that
+  // is set only for a worker it launched itself, and the workers that
+  // reconnect after a relay restart (the ones most likely stale) never get it.
+  hasHeartbeated: (sid) => {
+    const lc = sessionWorkerSupervisor.getLifecycleState(sid);
+    return !!lc?.lastHeartbeatAt && !lc?.awaitingHeartbeat;
+  },
+  isArchived: (sid) => isWorkerSessionArchived(sid),
+  // The session's last delivery or turn end, for a worker that does not say
+  // whether its CLI child runs (message-repository getOwnerLastActivityAt).
+  quietSince: (sid) => {
+    const at = Date.parse(stmts.getOwnerLastActivityAt?.get?.(sid)?.last_activity_at || '');
+    return Number.isFinite(at) ? at : null;
+  },
+  stopWorker: recycleWorkerReplacement.stopWorker,
+  launchWorker: recycleWorkerReplacement.launchWorker,
+  fence: recycleWorkerReplacement.fence,
+  // The stop and the launch under the per-session launch mutex the Change
+  // CWD relaunch and the launch routes take (sessions-routes.mjs).
+  runExclusive: (sid, fn) => sessionLaunchMutex.runExclusive(sid, fn),
+  logger: console,
+});
+
+// Once at start, after the restart's own worker reconnects settled: what
+// still runs for an archived conversation is stopped and stays stopped.
+// Through the recycle's replacement, one session at a time; never throws.
+async function sweepArchivedSessionWorkersAtStart() {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return null;
+  if (runtimeShutdownStarted) return null;
+  // The first lookup reads the process list afresh; the rest share it for the
+  // inspector's cache moment, so a long archive costs one read, not one each.
+  let freshRead = true;
+  return sweepArchivedWorkers({
+    listArchivedSessionIds: () => (stmts.listArchivedRuntimeSessionIds?.all?.() || []).map((row) => row?.sdk_session_id),
+    hasLiveProcess: async (sid) => {
+      if (runtimeShutdownStarted) return false;
+      const pid = Number(sessionWorkerRegistry?.getWorker?.(sid)?.pid);
+      if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) return true;
+      const fresh = freshRead;
+      freshRead = false;
+      return Boolean(await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sid, { fresh }));
+    },
+    isArchived: (sid) => isWorkerSessionArchived(sid),
+    // The process the fence keeps deliveries from during the stop: the
+    // registry's live pid, else the one the process list shows, else none
+    // (every process of the session is fenced then).
+    workerPid: async (sid) => {
+      const pid = Number(sessionWorkerRegistry?.getWorker?.(sid)?.pid);
+      if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) return pid;
+      const found = await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sid);
+      return Number(found?.processId) || null;
+    },
+    stopWorker: recycleWorkerReplacement.stopWorker,
+    // Guarded as the recycle's archived stop is: a message that unarchives
+    // the session meanwhile must not start a turn on the process being
+    // stopped.
+    fence: workerReplacementFence,
+    runExclusive: (sid, fn) => sessionLaunchMutex.runExclusive(sid, fn),
+    logger: console,
+  });
+}
 
 // The Claude API monthly cap (plan decision 12): `{ reached, error? }`. The
 // one seam the claim check below, the billing switch, an agent's send and a
@@ -7187,6 +7297,16 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
     const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
     if (worker && worker.kind !== kind) sessionWorkerRegistry?.upsertWorker?.({ ...worker, kind });
   },
+  // The build id a worker says it started on: the registry keeps it so a
+  // worker on older code can be told from one on the relay's.
+  onWorkerBuildId: (sessionId, buildId) => {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return;
+    const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
+    if (worker && worker.buildId !== buildId) sessionWorkerRegistry?.upsertWorker?.({ ...worker, buildId });
+  },
+  // Sent in server.hello, so a worker on other code can say so in its log.
+  buildId: BUILD_ID,
   isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
   pollIntervalMs: 500,
@@ -7198,6 +7318,10 @@ runtimeTimers.deadWorkerSweep = setInterval(() => {
   });
 }, 30_000);
 if (typeof runtimeTimers.deadWorkerSweep.unref === 'function') runtimeTimers.deadWorkerSweep.unref();
+// Workers on older code are recycled only where the relay launches them;
+// with routing off the service never starts. Its timer is its own (unref'd)
+// and stops with the runtime timers.
+if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true) workerRecycleService.start();
 const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
   sessionWorkerRegistry,
   sessionWorkerSupervisor,
@@ -7357,6 +7481,13 @@ let relayPaused = false;
 const relayBridgeOwnerService = createRelayBridgeOwnerService();
 
 const runtimeState = {
+  // The relay's own build id, read once at start; null when package.json
+  // names no version.
+  buildId: BUILD_ID,
+  // The worker recycle's status() (the relay's build id, the stale count,
+  // the recycles in flight and done, who waits on what): a function, so a
+  // route reads it when asked and needs no wiring of its own.
+  workerRecycle: () => workerRecycleService.status(),
   get cliOnline() { return cliOnline; },
   set cliOnline(value) { cliOnline = value; },
   get relayPaused() { return relayPaused; },
@@ -7693,6 +7824,8 @@ const sharedRouteDeps = {
   sessionWorkerSupervisor,
   sessionWorkerRegistry,
   sessionWorkerProcessInspector,
+  // /api/pending refuses work to a process the worker recycle is replacing.
+  workerReplacementFence,
   buildContextResponseText,
   readContextFromSessionEvents,
   sessionHistoryRefreshService,
@@ -7859,6 +7992,9 @@ registerAboutRoutes(app, {
     dbPath: DB_PATH,
     version: RUNNING_VERSION,
     commit: BUILD_COMMIT,
+    // The workers' build ids are counted against this one (the About modal's
+    // "Workers: 14, 3 on an older build").
+    buildId: BUILD_ID,
     installMethod: INSTALL_METHOD,
     startedAt: RELAY_STARTED_AT,
     packageRoot: PACKAGE_ROOT,
@@ -8494,6 +8630,7 @@ function clearRuntimeTimers() {
     try { clearTimeout(timer); } catch {}
   }
   subagentRecordRetention?.stop();
+  try { workerRecycleService.stop(); } catch {}
   try { taskHealthPoller.stop(); } catch {}
   try { taskOutputRooms.stop(); } catch {}
   runtimeTimers.cliStatus = null;
@@ -8503,6 +8640,7 @@ function clearRuntimeTimers() {
   runtimeTimers.pendingWorkerPrime = null;
   runtimeTimers.sharedViewerPrune = null;
   runtimeTimers.restoredTaskSettle = null;
+  runtimeTimers.archivedWorkerSweep = null;
   try { relayRestartQueue.dispose(); } catch {}
 }
 
@@ -8714,4 +8852,16 @@ httpServer.listen(config.port, listenHost, () => {
   // Deferred and unref'd (a few seconds behind the startup import's own CLI
   // spawn); a relay without an installed Copilot CLI skips it entirely.
   copilotModelDiscoveryService.scheduleStartupRefresh();
+  // Archived conversations' workers: stopped once, 30 s in, so the workers
+  // that reconnect after the restart and the first prime have settled. With
+  // routing off the relay launches no workers, so there is nothing to sweep.
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true) {
+    runtimeTimers.archivedWorkerSweep = setTimeout(() => {
+      runtimeTimers.archivedWorkerSweep = null;
+      sweepArchivedSessionWorkersAtStart().catch((error) => {
+        console.warn(`${runtimeLogPrefix()}WORKER RECYCLE archived sweep failed: ${error?.message || error}`);
+      });
+    }, 30_000);
+    runtimeTimers.archivedWorkerSweep.unref?.();
+  }
 });

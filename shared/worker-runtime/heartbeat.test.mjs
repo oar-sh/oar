@@ -204,3 +204,39 @@ test('a worker that states its kind says it in every beat; one that does not sen
   await plain.pulseHeartbeat();
   assert.equal('workerKind' in plainCalls[0].body, false);
 });
+
+test('a worker that states its build id says it in every beat next to its kind; one that does not sends no key', async () => {
+  const calls = [];
+  let timer = null;
+  const controller = createHeartbeatController({
+    api: async (method, path, body) => { calls.push({ method, path, body }); },
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => timer,
+    setHeartbeatTimer: (value) => { timer = value; },
+    getActiveQueueMessageId: () => '',
+    workerKind: 'claude',
+    buildId: '0.9.21+0123456789ab',
+  });
+  await controller.pulseHeartbeat();
+  await controller.pulseHeartbeat();
+  assert.deepEqual(calls.map((call) => [call.body.workerKind, call.body.buildId]), [
+    ['claude', '0.9.21+0123456789ab'],
+    ['claude', '0.9.21+0123456789ab'],
+  ]);
+  const { controller: plain, calls: plainCalls } = makeController();
+  await plain.pulseHeartbeat();
+  assert.equal('buildId' in plainCalls[0].body, false);
+  // An empty id (an unreadable package.json) is no id at all.
+  const blank = createHeartbeatController({
+    api: async (method, path, body) => { calls.push({ method, path, body }); },
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => timer,
+    setHeartbeatTimer: (value) => { timer = value; },
+    getActiveQueueMessageId: () => '',
+    buildId: '  ',
+  });
+  await blank.pulseHeartbeat();
+  assert.equal('buildId' in calls.at(-1).body, false);
+});

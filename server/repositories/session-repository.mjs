@@ -100,6 +100,25 @@ export function createSessionRepository(db) {
         getRuntimeSessionBySdkSessionId: db.prepare(`SELECT * FROM runtime_sessions WHERE sdk_session_id = ?`),
         getRuntimeSessionById: db.prepare(`SELECT * FROM runtime_sessions WHERE id = ?`),
         listRuntimeSessions: db.prepare(`SELECT rs.*, c.title AS conversation_title, c.updated_at AS conversation_updated_at FROM runtime_sessions rs LEFT JOIN conversations c ON c.id = rs.conversation_id ORDER BY rs.last_used_at DESC`),
+        // The session ids of archived conversations: the worker sweep at relay
+        // start stops what still runs for them. A runtime session id is unique
+        // (idx_runtime_sessions_sdk_session_id), but a conversation's own
+        // sdk_session_id is not: an id that a conversation in use (not
+        // archived, not deleted) names too is left out, so that
+        // conversation's worker is never stopped for an archived one.
+        listArchivedRuntimeSessionIds: db.prepare(`
+          SELECT DISTINCT rs.sdk_session_id AS sdk_session_id
+          FROM runtime_sessions rs
+          JOIN conversations c ON c.id = rs.conversation_id
+          WHERE c.archived = 1
+            AND NULLIF(rs.sdk_session_id, '') IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM conversations live_c
+              WHERE live_c.sdk_session_id = rs.sdk_session_id
+                AND COALESCE(live_c.archived, 0) = 0
+                AND live_c.status != 'deleted'
+            )
+        `),
         insertRuntimeSession: db.prepare(runtimeSessionsSupportProviders
           ? `INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id, provider_type, provider_model) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`
           : `INSERT INTO runtime_sessions (id, conversation_id, strategy, runtime_key, model, status, created_at, last_used_at, sdk_session_id) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`),

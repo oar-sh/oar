@@ -42,7 +42,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.20 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.21 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -55,7 +55,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.20'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.21'` before the command.
 
 ## npm
 
@@ -150,7 +150,7 @@ A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_S
 *On oar.sh: [Updates](https://oar.sh/docs/updates/)*
 
 - **Global install:** **⚙️ Settings → General → Check for updates** shows a newer release with an **Update** button, which installs it with npm and restarts the relay once no turn is running. `oar update` does the same from a terminal. Automatic checks are opt-in: **Check for updates automatically** asks oar.sh about twice a day. `OAR_NO_UPDATE_CHECK=1` in the relay's environment blocks every check, manual ones included.
-- **Git checkout:** `git pull`, `npm install`, then restart the relay (**🌄 Restart web relay** in the conversation's `⋯` menu).
+- **Git checkout:** `git pull`, `npm install`, then restart the relay (**🌄 Restart web relay** in the conversation's **︙** menu).
 
 The first start of a new version (in a checkout: of a new commit) copies the database into the backup folder before that version's migrations, and keeps the last two (`dbBackups` in [the configuration](configuration.md)). The in-app update says before it installs whether that copy will be made, or why not (a full disk). To go back, see [Restore a database backup](troubleshooting.md#restore-a-database-backup).
 

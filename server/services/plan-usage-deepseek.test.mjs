@@ -520,6 +520,38 @@ test('the budget bar is in the budget\'s own currency, whatever the balance is i
   }
 });
 
+test('the budget month turns over at 00:00 UTC on the 1st: the month before never counts, the 1st does, whatever the clock\'s zone', () => {
+  const balance = { ok: true, isAvailable: true, balances: [{ currency: 'CNY', total: 110 }], fetchedAt: FETCHED_AT };
+  const row = (dayValue, costCny) => ({ day: dayValue, model: 'deepseek-flash', costUsd: costCny / 7, costCny, toolsCostUsd: 0, toolsCostCny: 0 });
+  const days = { firstDay: '2026-10-21', days: [row('2026-10-21', 10), row('2026-10-31', 5), row('2026-11-01', 2), row('2026-11-15', 1), row('2026-11-30', 0.5)] };
+  const budgetAt = (now, actuals = null) => buildDeepSeekPlanCard({ balance, totals: TOTALS, days, monthlyBudget: 20, monthlyBudgetCurrency: 'CNY', now, actuals })
+    .meters.find((meter) => meter.id === 'deepseek-monthly-budget');
+  for (const [now, used, resetAt, since] of [
+    ['2026-10-31T23:30:00.000Z', 15, '2026-11-01T00:00:00.000Z', 'Oct 1'],
+    ['2026-11-01T00:00:00.000Z', 2, '2026-12-01T00:00:00.000Z', 'Nov 1'],
+    ['2026-11-01T00:30:00.000Z', 2, '2026-12-01T00:00:00.000Z', 'Nov 1'],
+    ['2026-11-15T12:00:00.000Z', 3, '2026-12-01T00:00:00.000Z', 'Nov 1'],
+    ['2026-11-30T23:30:00.000Z', 3.5, '2026-12-01T00:00:00.000Z', 'Nov 1'],
+    ['2026-12-31T23:30:00.000Z', 0, '2027-01-01T00:00:00.000Z', 'Dec 1'],
+    // A clock with an offset counts by its UTC instant: 00:30 on the 1st
+    // at UTC+01:00 is still the 31st in UTC, 23:30 on the 31st at UTC−05:00
+    // already the 1st.
+    ['2026-11-01T00:30:00+01:00', 15, '2026-11-01T00:00:00.000Z', 'Oct 1'],
+    ['2026-10-31T23:30:00-05:00', 2, '2026-12-01T00:00:00.000Z', 'Nov 1'],
+  ]) {
+    const meter = budgetAt(now);
+    assert.deepEqual([meter.used, meter.resetAt, meter.estimated], [used, resetAt, true], now);
+    assert.equal(meter.note, `This relay's estimated spend since ${since} (UTC); starts over on the 1st.`, now);
+  }
+  // Export days of the month before leave the 1st's bar estimated; one of
+  // the 1st makes it partly actual from then on.
+  const exportOf = (dayValue) => ({ through: `${dayValue}T23:00:00+00:00`, rows: [{ day: dayValue, model: 'deepseek-flash', hitTokens: 0, missTokens: 500, outputTokens: 50, requestCount: 3, cost: 4, currency: 'CNY' }] });
+  assert.equal(budgetAt('2026-11-01T00:30:00.000Z', exportOf('2026-10-31')).estimated, true);
+  const actual = budgetAt('2026-11-02T00:30:00.000Z', exportOf('2026-11-01'));
+  assert.deepEqual([actual.used, actual.estimated], [4, false]);
+  assert.match(actual.note, /^Spend since Nov 1: actual on the days of the DeepSeek export/);
+});
+
 test('the daily chart: the last 30 UTC days stacked by model, empty days included, with a word on where the history starts', () => {
   const balance = { ok: true, isAvailable: true, balances: [{ currency: 'CNY', total: 110, granted: 10, toppedUp: 100 }], fetchedAt: FETCHED_AT };
   const card = buildDeepSeekPlanCard({ balance, totals: TOTALS, days: DAYS, now: NOW });

@@ -277,7 +277,7 @@ export function renderAttachmentPreview() {
     const annotatable = att.isImage && att.previewUrl && isAnnotatableImageType(att.type);
     const thumb = att.isImage && att.previewUrl
       ? `<img src="${escHtml(att.previewUrl)}" alt="${escHtml(att.name)}"${annotatable ? ` onclick="openAnnotateEditorForPending(${idx})" title="Annotate ${escHtml(att.name)}" style="cursor: pointer;"` : ''}>`
-      : `<div class="attachment-preview-meta" style="height:88px;display:flex;align-items:center;justify-content:center">📎</div>`;
+      : `<div class="attachment-preview-meta" style="height:calc(88px * var(--ui-scale));display:flex;align-items:center;justify-content:center">📎</div>`;
     const annotateBadge = annotatable
       ? `<span class="attachment-preview-annotate" aria-hidden="true">🖍️</span>`
       : '';

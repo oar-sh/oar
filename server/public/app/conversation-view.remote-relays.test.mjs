@@ -125,6 +125,14 @@ test('a stray mention hint never shows on a user bubble', () => {
   assert.match(bubble.textContent, /ask @linux-test to run it/);
 });
 
+/** The row's ⓘ clicked as a person would; the menu it opened. */
+function openInfoMenu(item) {
+  item.querySelector('.conv-info-btn').dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+  const menu = document.querySelector('.context-menu');
+  assert.ok(menu, 'the ⓘ opens its menu');
+  return menu;
+}
+
 test('the sidebar marks conversations another relay created', () => {
   for (const key of Object.keys(conversations)) delete conversations[key];
   conversations['c-remote'] = {
@@ -138,8 +146,22 @@ test('the sidebar marks conversations another relay created', () => {
   assert.equal(items.length, 2);
   const remote = items.find((item) => item.querySelector('.conv-title').textContent.startsWith('report builder'));
   const local = items.find((item) => item.querySelector('.conv-title').textContent.startsWith('sidebar polish'));
-  assert.equal(remote.querySelector('.conv-meta .conv-origin-marker').textContent, '↗ win-test');
-  assert.equal(local.querySelector('.conv-origin-marker'), null);
+  const button = remote.querySelector('.conv-meta button.conv-info-btn');
+  assert.equal(button.getAttribute('aria-label'), 'Details: started by an agent');
+  const menu = openInfoMenu(remote);
+  const entry = menu.querySelector('[data-menu-item="origin"]');
+  assert.equal(entry.textContent, 'Started by an agent on relay “win-test”');
+  // With the relay's URL it opens the session there, in a new tab.
+  const opened = [];
+  const nativeOpen = window.open;
+  window.open = (...args) => { opened.push(args); };
+  try {
+    entry.click();
+  } finally {
+    window.open = nativeOpen;
+  }
+  assert.deepEqual(opened, [['https://relay-a.example.test/?conv=conv-src', '_blank', 'noopener']]);
+  assert.equal(local.querySelector('.conv-info-btn'), null);
 });
 
 // ─── Sessions an agent on this relay started (origin.local) ──────────────────
@@ -156,6 +178,7 @@ const LOCAL_ORIGIN = {
 };
 const sidebarItem = (title) => [...document.querySelectorAll('#conv-list .conv-item')]
   .find((item) => item.querySelector('.conv-title').textContent.startsWith(title));
+const settleOpen = () => new Promise((resolve) => setTimeout(resolve, 20));
 const headerOrigin = () => document.getElementById('chat-title-origin');
 
 function seedAgentSessions() {
@@ -171,49 +194,47 @@ function seedAgentSessions() {
   };
 }
 
-test('the sidebar marks a session an agent here started, and the marker opens that agent\'s conversation', async () => {
+test('the sidebar marks a session an agent here started, and its ⓘ line opens that agent\'s conversation', async () => {
   seedAgentSessions();
   setCurrentConv('c-made');
   journal.renderConvList();
 
-  const marker = sidebarItem('docs pass').querySelector('.conv-meta button.conv-origin-marker');
-  assert.ok(marker, 'the marker is a button inside the row');
-  assert.equal(marker.textContent, 'via agent · “release checklist”');
-  assert.equal(marker.dataset.originConversationId, 'c-lead');
+  const menu = openInfoMenu(sidebarItem('docs pass'));
+  const entry = menu.querySelector('button[data-menu-item="origin"]');
+  assert.ok(entry, 'the line is a button in the menu');
+  assert.equal(entry.textContent, 'Started by an agent in “release checklist”');
   // The other rows are as before.
-  assert.equal(sidebarItem('report builder').querySelector('.conv-origin-marker').textContent, '↗ win-test');
-  assert.equal(sidebarItem('report builder').querySelector('button.conv-origin-marker'), null);
-  assert.equal(sidebarItem('release checklist').querySelector('.conv-origin-marker'), null);
+  assert.ok(sidebarItem('report builder').querySelector('.conv-info-btn'));
+  assert.equal(sidebarItem('release checklist').querySelector('.conv-info-btn'), null);
 
-  // JSDOM does not run the inline handler; call what it names. The row's own
-  // click (open THIS conversation) must not fire as well.
-  assert.equal(marker.getAttribute('onclick'), 'openOriginConversation(event, this)');
-  let stopped = false;
-  await journal.openOriginConversation({ stopPropagation() { stopped = true; }, preventDefault() {} }, marker);
-  assert.equal(stopped, true);
+  entry.click();
+  await settleOpen();
+  assert.equal(document.querySelector('.context-menu'), null, 'the menu closes');
   assert.equal(store.currentConvId, 'c-lead');
   assert.equal(document.getElementById('chat-title').textContent, 'release checklist');
   assert.ok(sidebarItem('release checklist').classList.contains('active'));
 });
 
-test('the sidebar marker follows a rename and turns into plain text when that conversation is deleted', async () => {
+test('the sidebar ⓘ line follows a rename and turns into plain text when that conversation is deleted', async () => {
   seedAgentSessions();
   setCurrentConv('c-made');
   conversations['c-lead'] = { ...conversations['c-lead'], title: 'release 2 checklist' };
   journal.renderConvList();
-  const stale = sidebarItem('docs pass').querySelector('button.conv-origin-marker');
-  assert.equal(stale.textContent, 'via agent · “release 2 checklist”');
+  const stale = openInfoMenu(sidebarItem('docs pass')).querySelector('button[data-menu-item="origin"]');
+  assert.equal(stale.textContent, 'Started by an agent in “release 2 checklist”');
 
   delete conversations['c-lead'];
-  // A click on a marker drawn before the deletion goes nowhere.
-  await journal.openOriginConversation({ stopPropagation() {}, preventDefault() {} }, stale);
+  // A line drawn before the deletion goes nowhere.
+  stale.click();
+  await settleOpen();
   assert.equal(store.currentConvId, 'c-made');
 
-  const item = sidebarItem('docs pass');
-  assert.equal(item.querySelector('button.conv-origin-marker'), null);
-  const plain = item.querySelector('span.conv-origin-marker');
+  const menu = openInfoMenu(sidebarItem('docs pass'));
+  assert.equal(menu.querySelector('button[data-menu-item="origin"]'), null);
+  const plain = menu.querySelector('.context-menu-note[data-menu-item="origin"]');
   // The title the conversation had when the session was created.
-  assert.equal(plain.textContent, 'via agent · “release checklist”');
+  assert.equal(plain.textContent, 'Started by an agent in “release checklist”');
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 });
 
 test('the header shows "via agent" for a local origin only', () => {
@@ -224,7 +245,9 @@ test('the header shows "via agent" for a local origin only', () => {
   originUi.syncConversationOriginHeader();
   assert.equal(headerOrigin().hidden, false);
   const button = headerOrigin().querySelector('button.conv-origin-agent');
-  assert.equal(button.textContent, 'via agent · “release checklist”');
+  // The long label for a desktop, the short one for the phone's meta row.
+  assert.equal(button.querySelector('.chat-meta-long').textContent, 'via agent · “release checklist”');
+  assert.equal(button.querySelector('.chat-meta-short').textContent, '↗ release checklist');
   assert.equal(button.dataset.originConversationId, 'c-lead');
   // Synced again with nothing changed: the same node, so a tap is never lost.
   originUi.syncConversationOriginHeader();
@@ -244,7 +267,7 @@ test('the header shows "via agent" for a local origin only', () => {
   originUi.syncConversationOriginHeader();
   assert.equal(headerOrigin().hidden, false);
   assert.equal(headerOrigin().querySelector('button'), null);
-  assert.equal(headerOrigin().textContent, 'via agent · “release checklist”');
+  assert.equal(headerOrigin().querySelector('.chat-meta-long').textContent, 'via agent · “release checklist”');
 });
 
 test('a conversation opened before the list knew it takes its origin from the detail answer', () => {
@@ -254,7 +277,7 @@ test('a conversation opened before the list knew it takes its origin from the de
   journal.applyLoadedConversationState('c-made', { title: 'docs pass', messages: [], origin: LOCAL_ORIGIN });
   assert.deepEqual(conversations['c-made'].origin, LOCAL_ORIGIN);
   originUi.syncConversationOriginHeader();
-  assert.equal(headerOrigin().querySelector('button').textContent, 'via agent · “release checklist”');
+  assert.equal(headerOrigin().querySelector('button .chat-meta-long').textContent, 'via agent · “release checklist”');
 
   // An answer without the field (an older relay) keeps what the list said; an
   // explicit null is a real "nobody but a person".
@@ -268,8 +291,11 @@ test('a conversation opened before the list knew it takes its origin from the de
 
 test('the header line sits between the title and the folder, and the app keeps it in sync', () => {
   const slot = document.getElementById('chat-title-slot');
-  assert.deepEqual([...slot.children].map((node) => node.id), [
-    'chat-title-primary', 'chat-title-origin', 'chat-title-cwd', 'chat-title-session-usage',
+  assert.deepEqual([...slot.children].map((node) => node.id), ['chat-title-primary', 'chat-title-meta']);
+  // The lines under the title share #chat-title-meta (one sideways row on a phone).
+  const meta = document.getElementById('chat-title-meta');
+  assert.deepEqual([...meta.children].map((node) => node.id), [
+    'chat-title-origin', 'chat-title-cwd', 'chat-title-session-usage',
   ]);
   // bootstrap.js cannot be loaded here as a whole: its header sync has to call
   // this one, and the marker's inline handler has to exist on window.

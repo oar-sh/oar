@@ -107,6 +107,7 @@ import {
   openOriginConversation,
   openConversationGroupPicker,
   toggleConversationGroupFold,
+  toggleAllConversationGroupFolds,
   isConversationWorking,
 } from './journal-view.js';
 import {
@@ -153,8 +154,8 @@ import {
 import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
 import { backgroundTasksSnapshotMark } from './background-tasks-view.mjs';
 import { newerPageReachesEnd } from './transcript-island.mjs';
-import { initPinnedMessagesView, setPinsConversation } from './pinned-messages-view.mjs';
-import { initHiddenMessagesView, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
+import { initPinnedMessagesView, openPinnedMessagesModal, setPinsConversation } from './pinned-messages-view.mjs';
+import { initHiddenMessagesView, openHiddenMessagesModal, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
 import { handleAttachmentInput, retryAttachmentUpload, openAnnotateEditorForPending, openAnnotateEditorForPreview, handleComposerPaste, handleComposerDrop, refreshComposerAttachmentWarning, removeAttachment, clearAttachments, openUploadedAttachmentViewer, setFilePreviewMode, toggleFilePreviewHtml, copyFilePreviewImage, closeFilePreview, goBackFilePreview, openWorkspaceFilePreview, openWorkspaceFilePreviewFromRepo, setRepoBrowserRoot, setRepoBrowserViewMode, toggleRepoBrowserHidden, toggleRepoBrowserHeavy, refreshRepoBrowser, focusRepoTree, setRepoCurrentPath, confirmRepoBrowserCwdPick, startRepoNewFolder } from './attachments-view.js';
@@ -237,6 +238,20 @@ import {
   isInstalledAppMode,
 } from './pwa-install.js';
 import { armBackGuardOnFirstInteraction } from './back-guard.mjs';
+import {
+  armSessionHistoryOnFirstInteraction,
+  initSessionHistory,
+  sessionHistoryConversation,
+  sessionHistoryEntryAgain,
+  syncSessionDocumentTitle,
+} from './session-history-ui.js';
+// What back closes, beyond the closers imported elsewhere in this file.
+import { closeAnnotateEditor } from './annotate-editor.js';
+import { closeEmojiPicker } from './emoji-view.js';
+import { closeChangeCwdMenu } from './cwd-picker.js';
+import { closeRelayWatchPanel } from './relay-event-subscriptions-ui.js';
+import { closeRelaySchedulePanel } from './relay-schedules-ui.js';
+import { isInboxViewActive } from './inbox-ui.js';
 import { initScrollbarHover } from './scrollbar-hover.mjs';
 import {
   autoCompactWindowNotes,
@@ -255,7 +270,8 @@ import {
   formatAutoCompactWindowLabel,
 } from './auto-compact-window-options.mjs';
 import { renderPlanUsageHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
-import { initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
+import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
+import { FONT_SCALE_CHANGE_EVENT, getUiScale, initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
 import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
@@ -384,6 +400,8 @@ import {
 import { applyPendingActionsFromStatus, initHostSuspendUi } from './host-suspend-ui.js';
 import { applyUsageLimitFromStatus, initUsageLimitUi } from './usage-limit-ui.js';
 import { initClaudeBillingToggle, renderClaudeBillingToggle } from './claude-billing-toggle-ui.js';
+import { closeComposerSettings, initComposerSettings, scheduleComposerSettingsSync } from './composer-settings-ui.js';
+import { initPhoneLandscape } from './phone-landscape-ui.js';
 import {
   startClaudeRelogin,
   submitClaudeLoginCodeFromInput,
@@ -411,16 +429,43 @@ import {
 import { isCurrentConversationClaudeCloud, openCurrentCloudSession, syncClaudeCloudConversationUi } from './claude-cloud-conversation-ui.js';
 import {
   CHAT_ACTIONS_MENU_ENTRY_IDS,
+  CHAT_ACTIONS_MENU_META_CHIP_IDS,
   CHAT_ACTIONS_MENU_META_IDS,
+  chatActionsMenuMetaChipLabels,
+  resolveChatActionsMenuPlacement,
   resolveChatActionsMenuState,
 } from './chat-actions-menu-state.mjs';
+import {
+  HEADER_ACTIONS_CHANGE_EVENT,
+  HEADER_BANNER_OWN_ROW_QUERY,
+  HEADER_PRIORITY_ACTIONS,
+  HEADER_TITLE_MIN_REM,
+  fitHeaderPriorityActions,
+  headerPriorityMenuIdsFor,
+  headerReservedWidth,
+  resolveHeaderActionAvailability,
+  resolveQuestionBannerMode,
+} from './header-priority-actions.mjs';
+import { PHONE_LANDSCAPE_ATTRIBUTE, PHONE_LANDSCAPE_CHANGE_EVENT } from './phone-landscape.mjs';
 import { subscribeProviderReadiness, updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { hasActiveShare, refreshShares, subscribeShares } from './share-state.js';
 import { openStopSharingConfirmation } from './shared-conversations-settings.js';
 import { showAbout, syncAboutMenuLabel } from './about-ui.js';
-import { syncConversationOriginHeader } from './conversation-origin-ui.js';
-import { loadRelayEventSubscriptions, onRelayEventSubscriptionsChanged, syncRelayEventHeader } from './relay-event-subscriptions-ui.js';
-import { loadRelaySchedules, onRelaySchedulesChanged, syncRelayScheduleHeader } from './relay-schedules-ui.js';
+import { conversationOriginMenuEntry, syncConversationOriginHeader } from './conversation-origin-ui.js';
+import {
+  loadRelayEventSubscriptions,
+  onRelayEventSubscriptionsChanged,
+  openRelayWatchPanel,
+  relayWatchingChipText,
+  syncRelayEventHeader,
+} from './relay-event-subscriptions-ui.js';
+import {
+  loadRelaySchedules,
+  onRelaySchedulesChanged,
+  openRelaySchedulePanel,
+  relayScheduleChipText,
+  syncRelayScheduleHeader,
+} from './relay-schedules-ui.js';
 import { leaveInboxView, startInbox, toggleInboxView } from './inbox-ui.js';
 import {
   previewAgentSessionsMaxWait,
@@ -816,8 +861,9 @@ function initPushNotificationClientHooks() {
   });
 }
 
-// ?push_conv=<id> (a notification tap) and ?conv=<id> (another relay's
-// provenance badge links here) both open that conversation once.
+// ?push_conv=<id> (a notification tap, consumed) and ?conv=<id> (the open
+// session's address: a reload, a copied link, another relay's provenance
+// badge) open that conversation at load.
 function consumePushConversationDeepLink() {
   return consumeConversationDeepLink();
 }
@@ -931,27 +977,58 @@ function initNetworkLifecycleHandling() {
 }
 
 function syncThemeMenuLabel() {
-  const button = document.getElementById('chat-menu-theme-toggle');
-  if (!button) return;
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  button.textContent = isLight ? '🌙 Night mode' : '☀️ Day mode';
+  const button = document.getElementById('chat-menu-theme-toggle');
+  if (button) button.textContent = isLight ? '🌙 Night mode' : '☀️ Day mode';
+  // The header twin: the glyph alone, the words in its tooltip.
+  const inline = document.getElementById('theme-toggle-btn');
+  if (inline) {
+    const label = isLight ? 'Night mode' : 'Day mode';
+    inline.textContent = isLight ? '🌙' : '☀️';
+    inline.title = label;
+    inline.setAttribute('aria-label', label);
+  }
+}
+
+function toggleThemeFromHeader() {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  updateTheme(isLight ? 'dark' : 'light');
+  syncThemeMenuLabel();
+}
+
+// One priority+ action (header-priority-actions.mjs): its header button and
+// its ︙ twin run the same handler. A header button that already carries its
+// own binding (an inline onclick, a view module's listener) passes
+// `inline: false`, and only the twin is bound here.
+function bindHeaderPriorityAction(key, run, { inline = true } = {}) {
+  const action = HEADER_PRIORITY_ACTIONS.find((entry) => entry.key === key);
+  if (!action) return;
+  const inlineBtn = inline ? document.getElementById(action.inlineId) : null;
+  if (inlineBtn && inlineBtn.dataset.headerActionBound !== '1') {
+    inlineBtn.dataset.headerActionBound = '1';
+    inlineBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      run(event);
+    });
+  }
+  const twin = document.getElementById(action.menuId);
+  if (twin && twin.dataset.headerActionBound !== '1') {
+    twin.dataset.headerActionBound = '1';
+    bindMenuAction(twin, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      run(event);
+    });
+  }
 }
 
 function initThemeMenuToggle() {
-  const themeBtn = document.getElementById('chat-menu-theme-toggle');
-  if (!themeBtn) return;
-  themeBtn.hidden = false;
   syncThemeMenuLabel();
-  if (themeBtn.dataset.bound === '1') return;
-  themeBtn.dataset.bound = '1';
-  bindMenuAction(themeBtn, (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-    updateTheme(isLight ? 'dark' : 'light');
-    syncThemeMenuLabel();
-    closeChatActionsMenu();
-  });
+  // Day/Night is the shared view's one action too, so it is bound in both.
+  bindHeaderPriorityAction('theme', () => toggleThemeFromHeader());
 }
 
 function disableSharedControl(element, {
@@ -1025,18 +1102,16 @@ function applySharedReaderUi() {
   if (effortSelect) effortSelect.hidden = true;
   if (modeSelect) modeSelect.hidden = true;
   // One source for the menu: the resolver's shared branch (Day/Night only,
-  // trigger usable). The loop below stays as a guard for entries the resolver
-  // does not know.
+  // in the header or in ︙, whichever fits). The loop stays as a guard for
+  // entries the resolver does not know; the sync after it decides Day/Night
+  // and the trigger.
   applyChatActionsMenuState(resolveChatActionsMenuState({ sharedMode: true }));
   if (chatMenu && themeBtn) {
     for (const child of Array.from(chatMenu.children)) {
       if (child !== themeBtn) hideSharedMenuEntry(child);
     }
-    themeBtn.hidden = false;
-    themeBtn.removeAttribute('aria-hidden');
-    themeBtn.disabled = false;
-    themeBtn.tabIndex = 0;
     syncThemeMenuLabel();
+    syncChatActionsMenuState();
   } else if (chatMenuBtn) {
     chatMenuBtn.hidden = true;
   }
@@ -1460,6 +1535,8 @@ function syncSessionLockNote({ pinnedModel = '' } = {}) {
   }
   // The billing toggle sits under the note and follows the same chat.
   renderClaudeBillingToggle();
+  // The composer's label shows the lock and the model.
+  scheduleComposerSettingsSync();
 }
 
 function applyModelMetadataHardFail(message = '') {
@@ -2223,6 +2300,8 @@ function applyConversationPreferences({
     suppressConversationPreferenceSync = false;
   }
   syncModeSelectPlanOnlyHint();
+  // Values set here fire no change event: the composer's label reads them.
+  scheduleComposerSettingsSync();
   // Nothing is written to the shared "last used" storage here. Applying a
   // conversation's stored preferences is not a choice: it runs on every open,
   // on the ~1s live poll, on a catalog refresh and on another client's edit,
@@ -2887,7 +2966,7 @@ function renderModelVariantCatalogBody() {
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
   const providerTabButtons = `
-    <div class="summary-tab-strip" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+    <div class="summary-tab-strip" style="display:flex;flex-wrap:wrap;gap:calc(4px * var(--ui-scale)) calc(5px * var(--ui-scale));align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
@@ -3006,7 +3085,7 @@ function renderModelVariantCatalogBody() {
     `;
   }).join('');
   const bodyHtml = `
-    <div style="display:flex;flex-direction:column;gap:10px">
+    <div style="display:flex;flex-direction:column;gap:calc(5px * var(--ui-scale))">
       ${providerTabButtons}
       <div style="font-size:0.8rem;color:var(--muted)">
         Saved globally for this relay. Refreshed: <strong>${escHtml(refreshedLabel)}</strong>
@@ -3018,12 +3097,12 @@ function renderModelVariantCatalogBody() {
         Each model shows all supported reasoning efforts above its selectable variants.
       </div>
       ${warnings.map((line) => `<div style="font-size:0.78rem;color:var(--warn,#f7c873)">${line}</div>`).join('')}
-      <div style="display:grid;gap:10px">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
+      <div style="display:grid;gap:calc(5px * var(--ui-scale))">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
     </div>
   `;
   renderSummaryModalContent({
     title: '🤗 Select Models',
-    subtitle: 'Choose model variants shown in the composer selector',
+    subtitle: "Choose model variants shown under Model in the composer's ⚙ settings",
     bodyHtml,
     refresh: async () => {
       const refreshed = await refreshModelVariantCatalog();
@@ -3277,6 +3356,7 @@ function selectUsageTab(root, provider) {
   for (const panel of root.querySelectorAll('[data-usage-panel]')) {
     panel.hidden = panel.dataset.usagePanel !== target;
   }
+  revealSelectedTabs(root);
   usageTabProviderOverride = target;
   if (!usageCardIsFresh(target)) {
     refreshUsageProvider(target).catch(() => {});
@@ -3336,6 +3416,10 @@ function renderUsageReport(report, account, { updating = '' } = {}) {
     kind: 'usage',
   });
   if (updating) markUsageCardUpdating(updating, true);
+  // A new strip each render: its selected tab in view, its fade marked.
+  watchTabStripFades();
+  const body = document.getElementById('summary-modal-body');
+  if (body) revealSelectedTabs(body);
   return true;
 }
 
@@ -3820,11 +3904,15 @@ async function showUsage() {
   // A fresh open follows the current session's provider again; only a click
   // inside the modal pins a tab (for the Refresh button's sake).
   usageTabProviderOverride = null;
-  const btn = document.getElementById('chat-menu-usage') || document.getElementById('usage-btn');
-  if (btn) {
-    btn.textContent = '⏳';
-    btn.disabled = true;
-  }
+  // The header button and its ︙ twin both show the wait.
+  const usageButtons = ['chat-menu-usage', 'usage-btn'].map((id) => document.getElementById(id)).filter(Boolean);
+  const setUsageBusy = (busy) => {
+    for (const button of usageButtons) {
+      button.textContent = busy ? '⏳' : (button.id === 'chat-menu-usage' ? '📊 Check Usage' : '📊');
+      button.disabled = busy;
+    }
+  };
+  setUsageBusy(true);
   // What was shown last time is shown again at once; only the open tab's
   // provider is read live, and its card is swapped in when the answer comes.
   const kept = lastUsageReport || readStoredUsageReport();
@@ -3838,10 +3926,7 @@ async function showUsage() {
   });
   try {
     if (kept && renderUsageReport(kept, null, { updating: activeProvider })) {
-      if (btn) {
-        btn.textContent = btn.id === 'chat-menu-usage' ? '📊 Check Usage' : '📊';
-        btn.disabled = false;
-      }
+      setUsageBusy(false);
       await refreshUsageProvider(activeProvider);
       return;
     }
@@ -3856,10 +3941,7 @@ async function showUsage() {
       kind: 'usage',
     });
   } finally {
-    if (btn) {
-      btn.textContent = btn.id === 'chat-menu-usage' ? '📊 Check Usage' : '📊';
-      btn.disabled = false;
-    }
+    setUsageBusy(false);
   }
 }
 
@@ -3913,7 +3995,7 @@ function renderSessionInstructionDocs(docs) {
     return '<div class="summary-loading">No session instruction files were found.</div>';
   }
 
-  return `<div style="display:flex;flex-direction:column;gap:12px">${
+  return `<div style="display:flex;flex-direction:column;gap:calc(6px * var(--ui-scale))">${
     items.map((doc) => {
       const title = String(doc?.title || doc?.sessionId || 'Session instructions').trim();
       const name = String(doc?.name || '').trim();
@@ -3923,13 +4005,13 @@ function renderSessionInstructionDocs(docs) {
       const updatedAt = String(doc?.updatedAt || '').trim();
       const content = escHtml(String(doc?.content || '').trim());
       return `
-        <details open style="border:1px solid var(--border);border-radius:10px;background:var(--bg3);padding:10px 12px">
+        <details open style="border:1px solid var(--border);border-radius:calc(10px * var(--ui-scale));background:var(--bg3);padding:calc(5px * var(--ui-scale)) calc(7px * var(--ui-scale))">
           <summary style="cursor:pointer;font-weight:600;outline:none">${escHtml(title)}</summary>
-          <div style="margin-top:6px;font-size:0.78rem;color:var(--muted)">
+          <div style="margin-top:calc(3px * var(--ui-scale));font-size:0.78rem;color:var(--muted)">
             ${escHtml(summary || sessionId)}
             ${updatedAt ? ` · ${escHtml(updatedAt)}` : ''}
           </div>
-          <pre style="margin-top:10px;white-space:pre-wrap;word-break:break-word">${content}</pre>
+          <pre style="margin-top:calc(5px * var(--ui-scale));white-space:pre-wrap;word-break:break-word">${content}</pre>
         </details>
       `;
     }).join('')
@@ -4501,12 +4583,321 @@ function applyChatActionsMenuState(state) {
   }
 }
 
-// The ⋯ menu as it should look right now: the trigger and every entry,
+// ── Priority+ header actions ──
+// Pins, hidden, search, context, Check Usage, Day/Night and fullscreen sit in
+// the header while it has room and fall back into ︙ in reverse priority
+// order (header-priority-actions.mjs decides; this measures and applies).
+// The twin ids the last fit put into ︙; null before the header was measured,
+// which keeps the menu's old reach (Day/Night, Check Usage).
+let headerPriorityMenuIds = null;
+// The inputs the last full fit measured with (headerFitSignature); a pass
+// whose inputs are the same keeps the placement and measures nothing.
+let headerPriorityFitSignature = '';
+
+function headerPriorityActionAvailability() {
+  const pins = document.getElementById('pinned-messages-btn');
+  const hiddenBtn = document.getElementById('hidden-messages-btn');
+  const fullscreen = document.getElementById('fullscreen-btn');
+  return resolveHeaderActionAvailability({
+    sharedMode: isSharedReaderMode(),
+    pinCount: Number(pins?.dataset.count || 0),
+    hiddenCount: Number(hiddenBtn?.dataset.count || 0),
+    fullscreenAvailable: fullscreen?.dataset.headerAvailable === '1',
+  });
+}
+
+function cssPixels(value) {
+  const number = parseFloat(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function isHeaderBannerOnOwnRow() {
+  return typeof window.matchMedia === 'function' && window.matchMedia(HEADER_BANNER_OWN_ROW_QUERY).matches;
+}
+
+// The question banner's two widths, measured with its compact chip shown
+// and then its full text: the chip ("❓ N", what the fit reserves) and the
+// least the full text needs ("❓ N open questions" plus padding and border;
+// the "latest in …" tail may end in an ellipsis). Zero when it does not show.
+// Leaves the banner in its full form; the caller sets the mode.
+function measureQuestionBanner(banner) {
+  if (!banner) return { visible: false, compact: 0, fullMin: 0 };
+  banner.removeAttribute('data-compact');
+  if (!banner.offsetWidth) return { visible: false, compact: 0, fullMin: 0 };
+  const count = banner.querySelector('.pending-question-count');
+  const style = getComputedStyle(banner);
+  const frame = cssPixels(style.paddingLeft) + cssPixels(style.paddingRight)
+    + cssPixels(style.borderLeftWidth) + cssPixels(style.borderRightWidth);
+  // Rounded up: a fraction short would cut the last letter.
+  const fullMin = Math.ceil((count ? count.getBoundingClientRect().width : banner.scrollWidth) + frame);
+  banner.setAttribute('data-compact', '');
+  const compact = Math.ceil(banner.getBoundingClientRect().width);
+  banner.removeAttribute('data-compact');
+  return { visible: true, compact, fullMin };
+}
+
+// The width of everything on the header's first row that never overflows
+// (headerReservedWidth): its padding, ☰, the title's minimum, ︙, the
+// question banner's compact chip while it shares that row, and the flex gaps
+// between them. Read on every full pass: all of it moves with --font-scale.
+function headerFixedWidth(header, bannerCompactWidth) {
+  const style = getComputedStyle(header);
+  const rootFont = cssPixels(getComputedStyle(document.documentElement).fontSize) || 16;
+  return headerReservedWidth({
+    padding: cssPixels(style.paddingLeft) + cssPixels(style.paddingRight),
+    titleMin: HEADER_TITLE_MIN_REM * rootFont,
+    toggle: document.getElementById('sidebar-toggle')?.offsetWidth || 0,
+    banner: bannerCompactWidth,
+    menu: document.getElementById('chat-actions-menu-wrap')?.offsetWidth || 0,
+    gap: cssPixels(style.columnGap || style.gap),
+    // On a phone the banner has a row of its own (the ≤680px header CSS).
+    bannerOwnRow: isHeaderBannerOnOwnRow(),
+  });
+}
+
+// Everything the fit depends on, in one string: the header's width, the
+// title, the banner, the counts and availability, the theme (the glyphs'
+// widths), the scale and the layout. Cheap to read: no element is shown or
+// hidden for it.
+function headerFitSignature(header, availability) {
+  const root = document.documentElement;
+  const rootStyle = getComputedStyle(root);
+  const title = document.getElementById('chat-title');
+  const banner = document.getElementById('pending-question-banner');
+  return JSON.stringify([
+    header.clientWidth,
+    rootStyle.fontSize,
+    rootStyle.getPropertyValue('--ui-scale'),
+    root.getAttribute('data-theme'),
+    root.hasAttribute(PHONE_LANDSCAPE_ATTRIBUTE),
+    isHeaderBannerOnOwnRow(),
+    document.body.classList.contains('chat-title-editing'),
+    title?.hidden, title?.textContent,
+    banner?.className, banner?.hidden, banner?.textContent,
+    document.getElementById('sidebar-toggle')?.hidden,
+    document.getElementById('chat-actions-menu-btn')?.hidden,
+    document.getElementById('pinned-messages-btn')?.dataset.count,
+    document.getElementById('hidden-messages-btn')?.dataset.count,
+    document.getElementById('fullscreen-btn')?.textContent,
+    document.getElementById('theme-toggle-btn')?.textContent,
+    availability,
+  ]);
+}
+
+// The last placement, minus whatever is no longer available. Measures nothing.
+function keepHeaderPriorityPlacement(availability) {
+  for (const action of HEADER_PRIORITY_ACTIONS) {
+    const inline = document.getElementById(action.inlineId);
+    if (inline && !availability[action.key]) inline.hidden = true;
+  }
+  if (Array.isArray(headerPriorityMenuIds)) {
+    const availableMenuIds = new Set(headerPriorityMenuIdsFor(Object.keys(availability).filter((key) => availability[key])));
+    headerPriorityMenuIds = headerPriorityMenuIds.filter((id) => availableMenuIds.has(id));
+  }
+  return headerPriorityMenuIds;
+}
+
+// Shows inline what fits and hides the rest; returns the twin ids for ︙.
+// A header that cannot be measured (hidden, not laid out) keeps the last
+// placement, minus whatever is no longer available. Unless `force`, a pass
+// whose inputs are those of the last one keeps its placement too: the hide
+// and measure below runs only when something it reads has changed.
+function syncHeaderPriorityFit({ force = false } = {}) {
+  const availability = headerPriorityActionAvailability();
+  const header = document.getElementById('chat-header');
+  const actions = document.getElementById('chat-header-actions');
+  const measurable = !!(header && actions && header.clientWidth && typeof getComputedStyle === 'function');
+  if (!measurable) return keepHeaderPriorityPlacement(availability);
+  const signature = headerFitSignature(header, availability);
+  if (!force && signature === headerPriorityFitSignature && Array.isArray(headerPriorityMenuIds)) {
+    return keepHeaderPriorityPlacement(availability);
+  }
+  headerPriorityFitSignature = signature;
+  // Un-hide every available button before measuring: a hidden one is 0 wide.
+  // All of this runs in one task, so nothing is painted in between.
+  const widths = {};
+  for (const action of HEADER_PRIORITY_ACTIONS) {
+    const inline = document.getElementById(action.inlineId);
+    if (!inline) continue;
+    inline.hidden = !availability[action.key];
+    if (availability[action.key]) widths[action.key] = inline.offsetWidth;
+  }
+  const gap = cssPixels(getComputedStyle(actions).columnGap || getComputedStyle(actions).gap);
+  // The question banner sits between the title and the actions. The fit
+  // reserves its compact chip only, so an action goes into ︙ before the
+  // banner could push it; then the banner takes what the row has left.
+  const banner = document.getElementById('pending-question-banner');
+  const phoneOwnRow = isHeaderBannerOnOwnRow();
+  const phoneLandscape = document.documentElement.hasAttribute(PHONE_LANDSCAPE_ATTRIBUTE);
+  const bannerSize = measureQuestionBanner(banner);
+  const reserved = headerFixedWidth(header, phoneOwnRow ? 0 : bannerSize.compact);
+  // Where ☰, the title's minimum, the chip and ︙ alone overflow the first
+  // row (a narrow #main at a large zoom), the banner takes a row of its own,
+  // as on a phone, and the fit no longer reserves it.
+  const ownRow = phoneOwnRow || resolveQuestionBannerMode({
+    visible: bannerSize.visible,
+    phoneLandscape,
+    room: header.clientWidth - reserved + bannerSize.compact,
+    compact: bannerSize.compact,
+  }) === 'row';
+  const available = header.clientWidth - (ownRow ? headerFixedWidth(header, 0) : reserved);
+  const fit = fitHeaderPriorityActions({
+    widths,
+    gap,
+    available,
+    availability,
+  });
+  const inlineKeys = new Set(fit.inline);
+  for (const action of HEADER_PRIORITY_ACTIONS) {
+    const inline = document.getElementById(action.inlineId);
+    if (inline) inline.hidden = !inlineKeys.has(action.key);
+  }
+  if (banner) {
+    const headerStyle = getComputedStyle(header);
+    const mode = resolveQuestionBannerMode({
+      visible: bannerSize.visible,
+      ownRow,
+      phoneLandscape,
+      room: available - fit.used + bannerSize.compact,
+      compact: bannerSize.compact,
+      contentWidth: header.clientWidth - cssPixels(headerStyle.paddingLeft) - cssPixels(headerStyle.paddingRight),
+      fullMin: bannerSize.fullMin,
+    });
+    banner.toggleAttribute('data-compact', mode === 'compact');
+    // The phone's header CSS places the banner on its own row by itself; a
+    // wider header needs this attribute for it.
+    banner.toggleAttribute('data-own-row', mode === 'row' && !phoneOwnRow);
+  }
+  headerPriorityMenuIds = headerPriorityMenuIdsFor(fit.menu);
+  // Measured at least once (the e2e helpers wait for it).
+  actions.dataset.headerFit = '1';
+  return headerPriorityMenuIds;
+}
+
+// The pins and hidden twins carry the count their header button shows.
+function syncHeaderPriorityTwinLabels() {
+  const label = (buttonId, twinId, text, icon) => {
+    const twin = document.getElementById(twinId);
+    if (!twin) return;
+    const count = Number(document.getElementById(buttonId)?.dataset.count || 0);
+    twin.textContent = count ? `${icon} ${text} (${count})` : `${icon} ${text}`;
+  };
+  label('pinned-messages-btn', 'chat-menu-pins', 'Pinned messages', '📍');
+  label('hidden-messages-btn', 'chat-menu-hidden', 'Hidden from shared viewers', '🙈');
+}
+
+// At most one fit per frame. A pass asked for by an observer of one of the
+// fit's inputs (`force`) measures; one asked for by a header sync (every list
+// paint ends in one) measures only if headerFitSignature says something
+// changed. Either way it runs before the next paint.
+let headerPriorityFrame = 0;
+let headerPriorityForce = false;
+function scheduleHeaderPrioritySync({ force = false } = {}) {
+  if (force) headerPriorityForce = true;
+  if (headerPriorityFrame) return;
+  headerPriorityFrame = requestAnimationFrame(() => {
+    headerPriorityFrame = 0;
+    const forced = headerPriorityForce;
+    headerPriorityForce = false;
+    syncChatActionsMenuState({ fit: forced ? 'force' : 'now' });
+    // The header moved or changed size: the open menu follows it.
+    if (forced) placeChatActionsMenu();
+  });
+}
+
+// Every reason the fit can change: the header's own box (window, drawer,
+// font scale), the title, the banner, the theme (the glyph's width), a view's
+// counts or fullscreen verdict (HEADER_ACTIONS_CHANGE_EVENT), the font scale
+// and the phone turning. Conversation switches reach it through
+// syncChatTitleControls.
+function initHeaderPriorityActions({ sharedMode = false } = {}) {
+  if (!sharedMode) {
+    bindHeaderPriorityAction('pins', () => openPinnedMessagesModal(), { inline: false });
+    bindHeaderPriorityAction('hidden', () => openHiddenMessagesModal(), { inline: false });
+    bindHeaderPriorityAction('search', () => openMessageSearchModal(), { inline: false });
+    bindHeaderPriorityAction('context', () => { void showContext(); }, { inline: false });
+    bindHeaderPriorityAction('usage', () => {
+      showUsage().catch((error) => {
+        alert(error?.message || 'Failed to load usage');
+      });
+    });
+    bindHeaderPriorityAction('fullscreen', () => { void toggleFullscreen(); }, { inline: false });
+  }
+  if (window.__headerPriorityObserversBound) return;
+  window.__headerPriorityObserversBound = true;
+  const forced = () => scheduleHeaderPrioritySync({ force: true });
+  const header = document.getElementById('chat-header');
+  if (header && typeof ResizeObserver === 'function') {
+    new ResizeObserver(forced).observe(header);
+  } else {
+    window.addEventListener('resize', forced);
+  }
+  // The open ︙ menu stays inside the window (a turn, the keyboard).
+  window.addEventListener('resize', () => placeChatActionsMenu());
+  if (typeof MutationObserver === 'function') {
+    new MutationObserver(forced)
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    const title = document.getElementById('chat-title');
+    if (title) {
+      new MutationObserver(forced)
+        .observe(title, { childList: true, characterData: true, subtree: true });
+    }
+    // The pending-question banner shares the first row on a wide screen: it
+    // takes room when it shows (on a phone it has a row of its own).
+    const banner = document.getElementById('pending-question-banner');
+    if (banner) {
+      new MutationObserver(forced)
+        .observe(banner, { attributes: true, attributeFilter: ['class', 'hidden'], childList: true, characterData: true, subtree: true });
+    }
+  }
+  window.addEventListener(HEADER_ACTIONS_CHANGE_EVENT, forced);
+  window.addEventListener(FONT_SCALE_CHANGE_EVENT, forced);
+  window.addEventListener(PHONE_LANDSCAPE_CHANGE_EVENT, forced);
+  document.addEventListener('fullscreenchange', forced);
+  syncChatActionsMenuState({ fit: 'force' });
+}
+
+// The meta line's chips the conversation on screen has, for their ︙
+// stand-ins in phone landscape (where that line is hidden), with the labels.
+function chatActionsMenuMetaChips(convId) {
+  if (!convId || isSharedReaderMode()) return { chips: {}, labels: null };
+  const watching = relayWatchingChipText(convId);
+  const schedules = relayScheduleChipText(convId);
+  const origin = conversationOriginMenuEntry();
+  return {
+    chips: { watching: !!watching, schedules: !!schedules, origin: !!origin },
+    labels: chatActionsMenuMetaChipLabels({ watching, origin: origin?.label || '' }),
+  };
+}
+
+function syncChatActionsMenuMetaChipLabels(labels) {
+  if (!labels) return;
+  for (const [chip, id] of Object.entries(CHAT_ACTIONS_MENU_META_CHIP_IDS)) {
+    const entry = document.getElementById(id);
+    if (entry && labels[chip] && entry.textContent !== labels[chip]) entry.textContent = labels[chip];
+  }
+}
+
+// The ︙ menu as it should look right now: the trigger and every entry,
 // decided in chat-actions-menu-state.mjs from the conversation on screen.
-function syncChatActionsMenuState() {
+// `fit`: 'schedule' (the default) keeps the twins the last fit chose and asks
+// for a fit before the next paint; 'now' fits first if any of its inputs
+// changed; 'force' fits first whatever.
+function syncChatActionsMenuState({ fit = 'schedule' } = {}) {
   const convId = String(currentConvId || '').trim();
   const conversation = convId ? (conversations[convId] || null) : null;
   const isCloud = !!convId && isCurrentConversationClaudeCloud();
+  let headerMenuIds;
+  if (fit === 'now' || fit === 'force') {
+    headerMenuIds = syncHeaderPriorityFit({ force: fit === 'force' });
+  } else {
+    headerMenuIds = keepHeaderPriorityPlacement(headerPriorityActionAvailability());
+    scheduleHeaderPrioritySync();
+  }
+  syncHeaderPriorityTwinLabels();
+  const metaChips = chatActionsMenuMetaChips(convId);
+  syncChatActionsMenuMetaChipLabels(metaChips.labels);
+  const fullscreenBtn = document.getElementById('fullscreen-btn');
   const state = resolveChatActionsMenuState({
     sharedMode: isSharedReaderMode(),
     conversationId: convId,
@@ -4517,20 +4908,60 @@ function syncChatActionsMenuState() {
     editing: !!convId && chatTitleEditingConversationId === convId,
     suspendVisible: isSuspendHostActionVisible(),
     hasActiveShare: hasActiveShare(convId),
+    headerMenuIds,
+    // As the header button: disabled where the browser cannot go fullscreen.
+    fullscreenSupported: !fullscreenBtn?.disabled,
+    phoneLandscape: document.documentElement.hasAttribute(PHONE_LANDSCAPE_ATTRIBUTE),
+    metaChips: metaChips.chips,
   });
+  const trigger = document.getElementById('chat-actions-menu-btn');
+  const triggerWasHidden = !!trigger?.hidden;
   applyChatActionsMenuState(state);
+  // ︙ coming or going changes the room the fit has (the shared view's menu
+  // empties once Day/Night fits): one more pass settles it.
+  if (trigger && !!trigger.hidden !== triggerWasHidden) scheduleHeaderPrioritySync({ force: true });
   return state;
 }
 
 // The menu follows the relay's share list (made, renewed, stopped anywhere).
 subscribeShares(() => syncChatActionsMenuState());
 
+// Keeps the open ︙ menu inside the viewport and #main (never off-screen,
+// never under the sidebar) and caps its height at what is left below it,
+// where it scrolls (resolveChatActionsMenuPlacement decides).
+function placeChatActionsMenu() {
+  const menu = document.getElementById('chat-actions-menu');
+  if (!menu || menu.hidden) return;
+  // Measured as CSS places it; where the reader scrolled to stays.
+  const scrollTop = menu.scrollTop;
+  menu.style.right = '';
+  menu.style.maxWidth = '';
+  menu.style.maxHeight = '';
+  const rect = menu.getBoundingClientRect();
+  if (!rect.width && !rect.height) return;
+  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  const main = document.getElementById('main')?.getBoundingClientRect?.();
+  const bounds = {
+    left: Math.max(0, main && main.width ? main.left : 0),
+    right: Math.min(viewportWidth, main && main.width ? main.right : viewportWidth),
+    bottom: Math.min(viewportHeight, main && main.height ? main.bottom : viewportHeight),
+  };
+  // 8px from the edges and a 120px floor at 100 %, scaled with the zoom.
+  const scale = getUiScale();
+  const placement = resolveChatActionsMenuPlacement({ rect, bounds, margin: 8 * scale, minHeight: 120 * scale });
+  if (placement.right) menu.style.right = `${placement.right}px`;
+  if (placement.maxWidth !== null) menu.style.maxWidth = `${placement.maxWidth}px`;
+  menu.style.maxHeight = `${placement.maxHeight}px`;
+  if (scrollTop) menu.scrollTop = scrollTop;
+}
+
 function toggleChatActionsMenu() {
   const menu = document.getElementById('chat-actions-menu');
   const trigger = document.getElementById('chat-actions-menu-btn');
   if (!menu || !trigger) return;
   // The entries match the moment of the tap, as Refresh history already does.
-  syncChatActionsMenuState();
+  syncChatActionsMenuState({ fit: 'now' });
   if (trigger.hidden || trigger.disabled) return;
   syncRefreshHistoryMenuState();
   syncThemeMenuLabel();
@@ -4538,6 +4969,10 @@ function toggleChatActionsMenu() {
   const willOpen = !!menu.hidden;
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  if (willOpen) {
+    placeChatActionsMenu();
+    menu.scrollTop = 0;
+  }
 }
 
 function isConversationLocallyProcessing(conversation) {
@@ -4644,12 +5079,14 @@ function syncChatTitleControls() {
   const editing = convId && chatTitleEditingConversationId === convId;
   document.body.classList.toggle('chat-title-editing', !!editing);
   if (title) title.hidden = editing;
-  // The ⋯ trigger and its entries: relay-wide ones stay with no conversation
-  // open, so Settings is always one tap away.
+  // The ︙ trigger and its entries: relay-wide ones stay with no conversation
+  // open, so Settings is always one tap away. The header's fit is only asked
+  // for here (once per frame at most, and it measures only when its inputs
+  // changed): every list paint ends in this call.
   syncChatActionsMenuState();
   const archiveBtn = document.getElementById('chat-menu-archive');
   if (archiveBtn) {
-    archiveBtn.textContent = conversation?.archived === true ? '📂 Unarchive conversation' : '🗄 Archive conversation';
+    archiveBtn.textContent = conversation?.archived === true ? '📂 Unarchive conversation' : '🗄️ Archive conversation';
   }
   if (editor) {
     editor.hidden = !editing;
@@ -4731,6 +5168,7 @@ function applyConversationTitleUpdate(conversationId, title, updatedAt) {
   if (currentConvId === id) {
     const titleEl = document.getElementById('chat-title');
     if (titleEl) titleEl.textContent = nextTitle;
+    syncSessionDocumentTitle();
   }
   renderConvList();
 }
@@ -4907,6 +5345,11 @@ async function initApp() {
         renderConvList();
       },
     });
+    // The ⚙ panel and the label row above the message box.
+    initComposerSettings({ isSharedReaderMode, showContext: () => showContext() });
+    // A phone turned sideways: its typing mode folds the label row and the
+    // task line into floating buttons while the keyboard is up.
+    initPhoneLandscape({ isSharedReaderMode });
   }
   setupViewportTracking();
   bindChatSelectionGuard();
@@ -4938,24 +5381,37 @@ async function initApp() {
     event.stopPropagation();
     toggleChatActionsMenu();
   });
+  // Header buttons and their ︙ twins (Check Usage among them), and the
+  // passes that decide which of them fit.
+  initHeaderPriorityActions({ sharedMode });
   if (!sharedMode) {
     const chatMenuEditBtn = document.getElementById('chat-menu-edit-title');
-    const chatMenuUsageBtn = document.getElementById('chat-menu-usage');
-    bindMenuAction(chatMenuUsageBtn, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      lockChatActionsMenuShield(350);
-      closeChatActionsMenu();
-      showUsage().catch((error) => {
-        alert(error?.message || 'Failed to load usage');
-      });
-    });
     bindMenuAction(chatMenuEditBtn, (event) => {
       event.preventDefault();
       event.stopPropagation();
       lockChatActionsMenuShield(350);
       closeChatActionsMenu();
       openChatTitleEditor();
+    });
+    // Phone landscape hides the meta line: these stand in for its chips and
+    // do what a tap on the chip does. The lists open under ︙, the chip
+    // having no box to hang from.
+    const metaChipAction = (id, run) => bindMenuAction(document.getElementById(id), (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      run();
+    });
+    metaChipAction(CHAT_ACTIONS_MENU_META_CHIP_IDS.watching, () => {
+      openRelayWatchPanel({ anchor: document.getElementById('chat-actions-menu-btn') });
+    });
+    metaChipAction(CHAT_ACTIONS_MENU_META_CHIP_IDS.schedules, () => {
+      openRelaySchedulePanel({ anchor: document.getElementById('chat-actions-menu-btn') });
+    });
+    metaChipAction(CHAT_ACTIONS_MENU_META_CHIP_IDS.origin, () => {
+      const origin = conversationOriginMenuEntry();
+      if (origin) void openOriginConversation(null, { dataset: { originConversationId: origin.conversationId } });
     });
     const chatMenuCompactBtn = document.getElementById('chat-menu-compact');
     if (chatMenuCompactBtn && !chatMenuCompactBtn.hidden && !chatMenuCompactBtn.disabled) {
@@ -5267,7 +5723,9 @@ async function initApp() {
   initPushNotificationClientHooks();
   // Browsers without Background Sync replay the outbox from the page instead.
   void initOutboxFallbackReplay();
-  await loadConversations();
+  // Read before anything opens: the address then follows the open session.
+  const pushConversationId = consumePushConversationDeepLink();
+  await loadConversations({ openLast: !pushConversationId });
   // The sidebar's "watched" badges follow the subscriptions.
   onRelayEventSubscriptionsChanged(() => renderConvList());
   void loadRelayEventSubscriptions();
@@ -5276,9 +5734,8 @@ async function initApp() {
   void loadRelaySchedules();
   // The Inbox's count, and the cards of questions that don't block.
   startInbox();
-  const pushConversationId = consumePushConversationDeepLink();
   if (pushConversationId) {
-    await openConversation(pushConversationId).catch(() => {});
+    await openConversation(pushConversationId, { history: 'replace' }).catch(() => {});
   }
   await loadRelayQuestions(currentConvId);
   await loadRelayBoards();
@@ -5333,6 +5790,31 @@ async function bootstrap() {
   }
   const urlToken = getTokenFromUrl();
   if (urlToken) stripTokenFromUrl();
+  // Back and forward walk the sessions opened, and back closes an open
+  // overlay first (session-history.mjs).
+  initSessionHistory({
+    openConversation,
+    openSidebar,
+    closeSidebar,
+    closeComposerSettings,
+    closeChatActionsMenu,
+    closeSummaryModal,
+    closeSettingsModal,
+    closeMessageSearchModal,
+    closeRepoBrowser,
+    closeNewConversationModelModal,
+    // Leaving the Inbox goes back to the conversation it was opened from.
+    // Opened from Status it stored none: `returnTo` is the session history stands on.
+    closeInboxView: ({ returnTo = '' } = {}) => { if (isInboxViewActive()) void toggleInboxView({ returnTo }); },
+    closeChangeCwdMenu: () => closeChangeCwdMenu({ focusTrigger: true }),
+    closeGitChangesModal,
+    closeGitDiffViewer,
+    closeTmuxInspector: closeTmuxInspectorView,
+    closeAnnotateEditor,
+    closeRelayWatchPanel,
+    closeRelaySchedulePanel,
+    closeEmojiPicker,
+  });
   // In the installed app the system back button must never close the app;
   // a tab keeps its own back button. After the token is gone from the
   // address, so the entries the guard lays down carry the clean one.
@@ -5341,7 +5823,10 @@ async function bootstrap() {
     enabled: isInstalledAppMode(),
     target: window,
     onFloor: () => showTransientRelayNotice('Press back again to close the app', 2500),
+    entryAgain: sessionHistoryEntryAgain,
   });
+  // Armed after the guard: on a phone the session list lies above its floor.
+  armSessionHistoryOnFirstInteraction(window);
   const persistedToken = consumeLegacyPersistedAuthToken();
   const bootstrapToken = String(urlToken || persistedToken || '').trim();
   const existingSession = await verifyExistingSession(bootstrapToken);
@@ -5480,17 +5965,20 @@ window.deleteConv = deleteConv;
 window.archiveConv = archiveConv;
 window.openConversationGroupPicker = openConversationGroupPicker;
 window.toggleConversationGroupFold = toggleConversationGroupFold;
+window.toggleAllConversationGroupFolds = toggleAllConversationGroupFolds;
 window.unarchiveConv = unarchiveConv;
 window.toggleArchivedConversations = toggleArchivedConversations;
 window.refreshNewConversationCloudRepoList = refreshNewConversationCloudRepoList;
 window.openConversation = openConversation;
 window.openOriginConversation = openOriginConversation;
 // The Inbox and Status share the transcript's place: opening one leaves the other.
+// Closed by its button, one opened from the other goes back to the session
+// history stands on.
 window.toggleStatusView = () => {
   leaveInboxView();
-  return toggleStatusView();
+  return toggleStatusView({ returnTo: sessionHistoryConversation() });
 };
-window.toggleInboxView = toggleInboxView;
+window.toggleInboxView = () => toggleInboxView({ returnTo: sessionHistoryConversation() });
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;

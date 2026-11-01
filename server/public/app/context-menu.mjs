@@ -1,8 +1,8 @@
 // A context menu for the conversation list: right-click on a desktop, a long
-// press on a phone. One menu at a time, closed by a pointer-down outside it,
+// press on a phone (and the row's ⓘ details menu). One menu at a time, closed by a pointer-down outside it,
 // Escape, a scroll or a resize, like a native menu; flipped at the screen
 // edge rather than clipped. The entries are buttons, so keyboard users get
-// focus on the first one.
+// focus on the first one; a menu of text lines only takes the focus itself.
 
 const LONG_PRESS_MS = 500;
 const LONG_PRESS_SLOP_PX = 10;
@@ -24,9 +24,12 @@ export function closeContextMenu() {
 
 /**
  * Open a menu at viewport coordinates. `items`: `{ label, onSelect, danger?,
- * disabled?, id? }`, or MENU_SEPARATOR between groups. Returns the menu node.
+ * disabled?, id? }`, `{ label, note: true, id? }` for a line of text without
+ * an action, or MENU_SEPARATOR between groups. `onEscape` runs after Escape
+ * closed the menu. `label` names the menu for a screen reader. A menu of
+ * text lines only is focused itself. Returns the menu node.
  */
-export function openContextMenu(x, y, items, { documentRef = document, windowRef = window } = {}) {
+export function openContextMenu(x, y, items, { documentRef = document, windowRef = window, onEscape = null, label = '' } = {}) {
   closeOpenMenu?.();
   const menu = documentRef.createElement('div');
   menu.className = 'context-menu';
@@ -48,6 +51,8 @@ export function openContextMenu(x, y, items, { documentRef = document, windowRef
     if (event.key === 'Escape') {
       event.stopPropagation();
       close();
+      // The opener can take the focus back (a button that opened the menu).
+      onEscape?.();
       return;
     }
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
@@ -70,6 +75,17 @@ export function openContextMenu(x, y, items, { documentRef = document, windowRef
       continue;
     }
     if (!item) continue;
+    if (item.note === true) {
+      // Read in the menu, skipped by the arrow keys (they move between buttons).
+      const line = documentRef.createElement('div');
+      line.className = 'context-menu-note';
+      line.setAttribute('role', 'menuitem');
+      line.setAttribute('aria-disabled', 'true');
+      if (item.id) line.dataset.menuItem = String(item.id);
+      line.textContent = String(item.label ?? '');
+      menu.append(line);
+      continue;
+    }
     const entry = documentRef.createElement('button');
     entry.type = 'button';
     entry.className = `context-menu-item${item.danger ? ' context-menu-item-danger' : ''}`;
@@ -99,7 +115,22 @@ export function openContextMenu(x, y, items, { documentRef = document, windowRef
   documentRef.addEventListener('keydown', onKey, true);
   windowRef.addEventListener('resize', close);
   windowRef.addEventListener('scroll', close, true);
-  queueMicrotask(() => menu.querySelector('button:not([disabled])')?.focus());
+  const firstButton = menu.querySelector('button:not([disabled])');
+  if (label) menu.setAttribute('aria-label', String(label));
+  if (!firstButton) {
+    // Only lines of text: the menu itself takes the focus, so a screen
+    // reader reads them out and a second Enter does not reopen it. Its name
+    // is those lines unless the opener gave one.
+    menu.tabIndex = -1;
+    if (!label) {
+      const lines = [...menu.querySelectorAll('.context-menu-note')].map((line) => line.textContent.trim()).filter(Boolean);
+      menu.setAttribute('aria-label', lines.join('. ') || 'Details');
+    }
+  }
+  queueMicrotask(() => {
+    if (closeOpenMenu !== close) return;
+    (firstButton || menu).focus?.({ preventScroll: true });
+  });
   return menu;
 }
 

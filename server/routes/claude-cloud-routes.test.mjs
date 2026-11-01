@@ -209,6 +209,47 @@ test('POST /api/claude-cloud-session refuses what is not a cloud conversation', 
   assert.deepEqual(claude.events, []);
 });
 
+test('GET /api/claude-cloud-session answers the stored binding a starting worker attaches to', async () => {
+  const { app, stmts, authCalls, touched } = createHarness();
+  stmts.updateRuntimeSessionClaudeCloudSession.run(SESSION_ID, '21', 0.18, NOW, 'conv-1');
+
+  const res = await callRoute(app, 'GET /api/claude-cloud-session', {}, { conversationId: 'conv-1' });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, sessionId: SESSION_ID, lastSequence: '21' });
+  assert.equal(authCalls.length, 1, 'behind the relay auth');
+  assert.equal(touched.length, 1);
+
+  // The worker knows only its sdk session id: resolved through the runtime session row.
+  stmts.insertConv.run('conv-2', 'Second chat', NOW, NOW);
+  stmts.insertRuntimeSession.run('rs-2', 'conv-2', 'isolated', 'rs-2', 'claude-sonnet-5-5', NOW, NOW, 'sdk-session-2', 'claude-cloud', 'claude-sonnet-5-5');
+  stmts.updateRuntimeSessionClaudeCloudSession.run('cse_01EXAMPLEbbbbbbbbbbbbbbbb', '7', null, NOW, 'conv-2');
+  const bySdk = await callRoute(app, 'GET /api/claude-cloud-session', {}, { conversationId: 'sdk-session-2' });
+  assert.deepEqual(bySdk.body, { ok: true, sessionId: 'cse_01EXAMPLEbbbbbbbbbbbbbbbb', lastSequence: '7' });
+});
+
+test('GET /api/claude-cloud-session is sessionId null without a cloud session, 404 only for an unknown conversation', async () => {
+  const { app, stmts } = createHarness();
+  // The first message has not created the session yet.
+  const none = await callRoute(app, 'GET /api/claude-cloud-session', {}, { conversationId: 'conv-1' });
+  assert.equal(none.statusCode, 200);
+  assert.deepEqual(none.body, { ok: true, sessionId: null, lastSequence: null });
+
+  // A known conversation without a runtime session, and one of another provider.
+  stmts.insertConv.run('conv-3', 'No runtime yet', NOW, NOW);
+  assert.deepEqual((await callRoute(app, 'GET /api/claude-cloud-session', {}, { conversationId: 'conv-3' })).body, {
+    ok: true, sessionId: null, lastSequence: null,
+  });
+  const claude = createHarness({ providerType: 'claude' });
+  assert.deepEqual((await callRoute(claude.app, 'GET /api/claude-cloud-session', {}, { conversationId: 'conv-1' })).body, {
+    ok: true, sessionId: null, lastSequence: null,
+  });
+
+  const unknown = await callRoute(app, 'GET /api/claude-cloud-session', {}, { conversationId: 'conv-none' });
+  assert.equal(unknown.statusCode, 404);
+  assert.deepEqual(unknown.body, { error: 'Conversation not found' });
+  assert.equal((await callRoute(app, 'GET /api/claude-cloud-session', {}, {})).statusCode, 400);
+});
+
 const REPOS_KEYS = ['complete', 'error', 'fetchedAt', 'ok', 'repos', 'source'];
 const REPO_KEYS = ['accessible', 'archived', 'defaultBranch', 'description', 'name', 'owner', 'private', 'pushedAt', 'recentAt', 'repoUrl', 'slug'];
 

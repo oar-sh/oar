@@ -157,16 +157,27 @@ export function buildClaudeCloudDelivery({ conversation = null, runtimeSession =
   if (!isClaudeCloudProviderType(runtimeSession?.provider_type)) return null;
   const source = parseCloudSourceJson(conversation?.cloud_source_json);
   if (!source) return null;
-  const sessionId = toText(runtimeSession?.claude_cloud_session_id);
-  const lastSequence = toText(runtimeSession?.claude_cloud_last_sequence);
   const fallback = toText(fallbackEnvironmentId);
   return {
-    sessionId: isSafeClaudeCloudId(sessionId) ? sessionId : null,
-    lastSequence: SEQUENCE_PATTERN.test(lastSequence) ? lastSequence : null,
+    ...readStoredClaudeCloudBinding(runtimeSession),
     repoUrl: source.repoUrl,
     branch: source.branch,
     environmentId: source.environmentId || (isSafeClaudeCloudId(fallback) ? fallback : null),
     title: toText(conversation?.title) || 'New Conversation',
+  };
+}
+
+/**
+ * The cloud session a runtime session row is bound to and the cursor its
+ * worker reads on from: `{ sessionId, lastSequence }`, each null when absent
+ * or not in the shape the worker may put into a request path.
+ */
+export function readStoredClaudeCloudBinding(runtimeSession = null) {
+  const sessionId = toText(runtimeSession?.claude_cloud_session_id);
+  const lastSequence = toText(runtimeSession?.claude_cloud_last_sequence);
+  return {
+    sessionId: isSafeClaudeCloudId(sessionId) ? sessionId : null,
+    lastSequence: SEQUENCE_PATTERN.test(lastSequence) ? lastSequence : null,
   };
 }
 
@@ -265,6 +276,31 @@ export function createClaudeCloudSessionService({
   }
 
   /**
+   * GET /api/claude-cloud-session: the binding a starting worker attaches to
+   * before any delivery (so it follows the turns the session starts by
+   * itself, as the worker it replaces did). `id` is the conversation id or
+   * the runtime session's sdk session id, which is all a worker knows of its
+   * conversation. A known conversation that has no cloud session (none yet,
+   * or another provider) answers `sessionId: null`; only an unknown id is
+   * 404. Returns `{ ok, statusCode, error }` or `{ ok: true, sessionId,
+   * lastSequence }`.
+   */
+  function describeStoredBinding(id = '') {
+    const key = toText(id);
+    if (!key) return { ok: false, statusCode: 400, error: 'Missing conversationId' };
+    const runtimeSession = stmts.getRuntimeSessionByConversation?.get?.(key)
+      || stmts.getRuntimeSessionBySdkSessionId?.get?.(key)
+      || null;
+    if (!runtimeSession && !stmts.getConvAnyStatus?.get?.(key)) {
+      return { ok: false, statusCode: 404, error: 'Conversation not found' };
+    }
+    if (!runtimeSession || !isClaudeCloudProviderType(runtimeSession.provider_type)) {
+      return { ok: true, sessionId: null, lastSequence: null };
+    }
+    return { ok: true, ...readStoredClaudeCloudBinding(runtimeSession) };
+  }
+
+  /**
    * Archives the cloud session of a conversation that is being deleted or
    * archived here. Best effort: it returns at once (true when an archive was
    * started), and a failure is logged and never reaches the caller.
@@ -322,5 +358,11 @@ export function createClaudeCloudSessionService({
     return true;
   }
 
-  return { cloudPayloadFor, recordWorkerReport, archiveSessionInBackground, unarchiveSessionInBackground };
+  return {
+    cloudPayloadFor,
+    recordWorkerReport,
+    describeStoredBinding,
+    archiveSessionInBackground,
+    unarchiveSessionInBackground,
+  };
 }

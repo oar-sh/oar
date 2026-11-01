@@ -10,9 +10,12 @@ import {
   relayEventSummaryText,
   renderRelayEventRowHtml,
   renderWatchedBadgeHtml,
+  renderWatchingChipHtml,
   renderWatchingPanelHtml,
+  watchedInfoText,
   watchersOf,
   watchingChipHint,
+  watchingChipShortText,
   watchingChipText,
   watchingSummary,
 } from './relay-event-view.mjs';
@@ -181,4 +184,47 @@ test('a paired relay\'s watcher is named with its relay on the badge', () => {
     renderWatchedBadgeHtml(watchers, { subscriptions: subs }),
     '<span class="conv-watched-badge" title="Watched by Relay assistant on win-test">watched</span>',
   );
+  assert.equal(watchedInfoText(watchers, { subscriptions: subs }), 'Watched by Relay assistant on win-test');
+});
+
+test('the sidebar ⓘ line names one watcher, and counts and names more', () => {
+  const conversations = { 'conv-watcher': { title: 'Relay assistant' }, 'conv-other': { title: 'Moss garden log' } };
+  assert.equal(watchedInfoText(['conv-watcher'], { conversations }), 'Watched by Relay assistant');
+  assert.equal(watchedInfoText(['conv-watcher', 'conv-other'], { conversations }), 'Watched by 2 sessions: Relay assistant, Moss garden log');
+  // A paired relay's watcher among them carries its relay's name.
+  const subs = [{ id: 'sub_h', watcher: 'remote:relay-fixture-b', relay: 'self', subscriber: { relayId: 'relay-fixture-b', name: 'tide-box', watcherId: 'conv-far', watcherTitle: 'Tide tables' }, scope: 'sessions', sessions: [{ id: 'conv-1' }], events: ['turn_end'] }];
+  assert.equal(
+    watchedInfoText(['conv-watcher', 'remote:relay-fixture-b:conv-far'], { conversations, subscriptions: subs }),
+    'Watched by 2 sessions: Relay assistant, Tide tables on tide-box',
+  );
+  assert.equal(watchedInfoText([], { conversations }), '');
+  assert.equal(watchedInfoText(null), '');
+});
+
+test('the header chip carries the long label with its hint and the phone\'s short one', () => {
+  const html = renderWatchingChipHtml(watchingSummary(SUBS, 'conv-watcher'), { panelOpen: true });
+  assert.match(html, /^<button type="button" class="relay-watch-chip" aria-expanded="true" aria-controls="relay-watch-panel" title="Event subscriptions of this conversation">/);
+  assert.match(html, /<span class="chat-meta-long">👁 watching 2 sessions<\/span><span class="chat-meta-short">👁 2<\/span><\/button>$/);
+  assert.equal(renderWatchingChipHtml(watchingSummary(SUBS, 'conv-1')), '', 'no subscription, no chip');
+  assert.match(renderWatchingChipHtml(watchingSummary(SUBS, 'conv-watcher')), /aria-expanded="false"/);
+});
+
+test('the short chip text: the count, "all", "all +N", or "restart"', () => {
+  assert.equal(watchingChipShortText(watchingSummary(SUBS, 'conv-watcher')), '2');
+  assert.equal(watchingChipShortText(watchingSummary(SUBS, 'conv-other')), 'all');
+  assert.equal(watchingChipShortText(watchingSummary(SUBS, 'conv-1')), '');
+  assert.equal(watchingChipShortText(null), '');
+  const subs = [
+    { id: 'sub_j', watcher: 'conv-w', relay: 'self', scope: 'all', sessions: 'all', events: ['turn_end'], digestMinutes: 30 },
+    { id: 'sub_k', watcher: 'conv-w', relay: 'self', scope: 'sessions', sessions: [{ id: 'conv-2' }], events: ['error'] },
+  ];
+  assert.equal(watchingChipShortText(watchingSummary(subs, 'conv-w')), 'all +1');
+  // The hint and a paired relay stay with the long label and the tooltip.
+  const html = renderWatchingChipHtml(watchingSummary(subs, 'conv-w'));
+  assert.match(html, /<span class="chat-meta-long">👁 watching all sessions \(\+1 listed\) <span class="relay-watch-hint">digest 30 min<\/span><\/span>/);
+  assert.match(html, /<span class="chat-meta-short">👁 all \+1<\/span>/);
+  const restart = [{ id: 'sub_l', watcher: 'conv-w', relay: 'self', scope: 'sessions', sessions: [], events: ['relay_restarted'], once: true }];
+  assert.equal(watchingChipShortText(watchingSummary(restart, 'conv-w')), 'restart');
+  const paired = [{ id: 'sub_m', watcher: 'conv-w', relay: 'rr_fixture', relayName: 'lab-relay', remoteId: 'sub_x', scope: 'sessions', sessions: [{ id: 'conv-9', title: '<b>' }], events: ['turn_end'] }];
+  assert.match(renderWatchingChipHtml(watchingSummary(paired, 'conv-w')), /title="Event subscriptions of this conversation \(also on lab-relay\)"/);
 });

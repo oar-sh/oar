@@ -235,6 +235,15 @@ export function createGrokTaskPublisher({
     stop,
     /** The ids of the live terminals, for the heartbeat's digest. */
     backgroundTaskIds: () => liveEntries().map((entry) => entry.taskId),
+    /**
+     * Terminals whose process runs and that the agent has not released, from
+     * the moment they start: a superset of the live ids, which wait out the
+     * publish grace first. What may die with the worker, so the relay must
+     * not replace it while any is open (the steering snapshot's count); a
+     * `sleep 600` started a second before a recycle is as live as one the
+     * panel already shows.
+     */
+    openTerminalCount: () => [...terminals.values()].filter((entry) => !entry.exited && !entry.released).length,
     /** The relay asked for the set again (heartbeat answer). */
     resync: () => publish({ resync: true }),
     /** The relay answered a heartbeat: settle notices kept for it go out. */

@@ -130,7 +130,7 @@ function renderDeviceList() {
       || (localSubscriptionEndpoint && device.endpoint === localSubscriptionEndpoint);
     const row = document.createElement('div');
     row.className = 'push-device-row settings-row';
-    row.style.gap = '8px';
+    row.style.gap = 'calc(5px * var(--ui-scale))';
 
     const info = document.createElement('div');
     info.style.flex = '1';
@@ -140,7 +140,7 @@ function renderDeviceList() {
     if (!device.preferences?.enabled) name.textContent += ' — disabled';
     const meta = document.createElement('div');
     meta.className = 'settings-help';
-    meta.style.marginTop = '2px';
+    meta.style.marginTop = 'calc(2px * var(--ui-scale))';
     meta.textContent = `Last delivery: ${formatDeviceTimestamp(device.lastSuccessAt)}${device.lastError ? ` · last error: ${device.lastError}` : ''}`;
     info.appendChild(name);
     info.appendChild(meta);

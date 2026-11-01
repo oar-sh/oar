@@ -76,7 +76,8 @@ test('the file viewer still closes with back, and only the step out of the app i
   const listeners = [() => viewer.onPopState(), () => guard.onPopState()];
 
   viewer.opened();
-  assert.deepEqual(history.state, { [VIEWER_HISTORY_MARK]: true });
+  // The viewer's entry carries the app mark on: a reload on it lays no second floor.
+  assert.deepEqual(history.state, { [BACK_GUARD_APP]: true, [VIEWER_HISTORY_MARK]: true });
   history.back();
   history.flush(...listeners);
   assert.equal(viewerClosed, 1);
@@ -117,6 +118,18 @@ test('armed at the first touch or key, once, and from then on back stays in the 
   const left = history.flush(() => target.fire('popstate'));
   assert.deepEqual(left, []);
   assert.deepEqual(history.state, { [BACK_GUARD_APP]: true });
+});
+
+test('entryAgain names the entry pushed back above the floor, which keeps the app mark', () => {
+  const history = fakeHistory();
+  const urls = [];
+  const pushState = history.pushState;
+  history.pushState = (state, title, url) => { urls.push(url); pushState(state); };
+  const guard = installBackGuard({ history, entryAgain: () => ({ state: { oarList: true, oarPos: 1 }, url: '/?conv=conv-heron' }) });
+  history.back();
+  history.flush(() => guard.onPopState());
+  assert.deepEqual(history.state, { oarList: true, oarPos: 1, [BACK_GUARD_APP]: true });
+  assert.equal(urls.at(-1), '/?conv=conv-heron');
 });
 
 test('not installed where the back button is the browser\'s (a tab, the shared view)', () => {

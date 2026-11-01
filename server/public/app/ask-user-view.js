@@ -17,6 +17,7 @@ import { questionCardHeadLabel } from './conversation-provider-indicator.mjs';
 import { questionAcceptsFreeText } from './question-answer-rule.mjs';
 import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
 import { renderSessionAskCards } from './inbox-ui.js';
+import { isConversationAutoOpenHeld } from './session-history-ui.js';
 
 let relayQuestionRenderHash = '';
 let renderedRelayQuestionIds = new Set();
@@ -124,13 +125,20 @@ export async function loadRelayQuestions(conversationId) {
   window.renderConvList?.();
   window.syncComposerButtonState?.();
 
-  if (!conversationId && pending.length) {
+  // Nothing open: the latest question's conversation opens. Not from the
+  // Inbox or Status, which show nothing open too: they are being read. And
+  // in place of the empty screen, not as a step of its own in history. Nor
+  // after a link the relay did not know: its notice keeps the screen empty
+  // until the reader opens something.
+  const readingAView = document.body?.classList?.contains('inbox-view-active')
+    || document.body?.classList?.contains('status-view-active');
+  if (!conversationId && pending.length && !readingAView && !isConversationAutoOpenHeld()) {
     const latest = pending
       .slice()
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0];
     const targetConversationId = String(latest?.conversationId || '').trim();
     if (targetConversationId && targetConversationId !== currentConvId && conversations[targetConversationId]) {
-      await window.openConversation?.(targetConversationId);
+      await window.openConversation?.(targetConversationId, { history: 'replace' });
       return;
     }
   }
@@ -171,10 +179,16 @@ export function updatePendingQuestionBanner() {
   banner.dataset.targetQuestionId = String(latest?.id || '').trim();
   const count = pending.length;
   const currentCount = currentConvId ? pending.filter((q) => q?.conversationId === currentConvId).length : 0;
-  const convTitle = escHtml(conversations[targetConversationId]?.title || targetConversationId || 'conversation');
-  banner.innerHTML = currentCount > 0
-    ? `❓ ${count} open question${count === 1 ? '' : 's'}`
-    : `❓ ${count} open question${count === 1 ? '' : 's'} · latest in ${convTitle}`;
+  const rawTitle = String(conversations[targetConversationId]?.title || targetConversationId || 'conversation');
+  const countText = `❓ ${count} open question${count === 1 ? '' : 's'}`;
+  const tailText = currentCount > 0 ? '' : ` · latest in ${rawTitle}`;
+  // The full text, and the compact chip "❓ N" the header fit switches to
+  // (data-compact) where the row is short. Either way the button's name and
+  // tooltip are the full text.
+  banner.innerHTML = `<span class="pending-question-full"><span class="pending-question-count">${escHtml(countText)}</span>${tailText ? `<span class="pending-question-tail">${escHtml(tailText)}</span>` : ''}</span>`
+    + `<span class="pending-question-compact" aria-hidden="true">❓ ${count}</span>`;
+  banner.title = `${countText}${tailText}`;
+  banner.setAttribute('aria-label', `${countText}${tailText}`);
   banner.classList.add('visible');
   banner.disabled = false;
 }

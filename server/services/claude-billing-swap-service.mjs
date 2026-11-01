@@ -28,29 +28,16 @@
  * the fence lets them through, and the waiting state ages out.
  */
 
+import { workerReleaseHold } from './worker-replacement.mjs';
+
 export const CLAUDE_BILLING_SWAP_WAIT_TTL_MS = 15_000;
 
 /**
- * What keeps a worker from being replaced now: null when nothing does, else
- * 'turn', 'question', 'compaction' or 'background'. From the steering
- * snapshot its heartbeat sends; a worker too old to say `releasable` is read
- * from the rest of it.
+ * What keeps a worker from being replaced now (worker-replacement.mjs, which
+ * the worker recycle shares). Kept under its old name for the importers that
+ * know it by that.
  */
-export function claudeWorkerReleaseHold(worker) {
-  if (!worker) return null;
-  const steering = worker.steering || null;
-  if (steering && typeof steering.releasable === 'boolean') {
-    return steering.releasable ? null : (steering.releaseHold || 'turn');
-  }
-  if (steering) {
-    if (steering.holdReason === 'question') return 'question';
-    if (steering.holdReason === 'compaction') return 'compaction';
-    if (steering.turnActive) return 'turn';
-    if (steering.autoCompactWindow?.backgroundWork) return 'background';
-    return null;
-  }
-  return String(worker.status || '') === 'processing' ? 'turn' : null;
-}
+export const claudeWorkerReleaseHold = workerReleaseHold;
 
 export function createClaudeBillingSwapService({
   // sid → the registry's entry for the session's worker, or null.
@@ -208,7 +195,7 @@ export function createClaudeBillingSwapService({
       running = true;
       noteProbeFailure(sid, state, fence, error);
     }
-    const hold = running ? 'turn' : claudeWorkerReleaseHold(worker);
+    const hold = running ? 'turn' : workerReleaseHold(worker);
     if (hold) {
       setPending(sid, state, {
         to: fence.rowBilling,

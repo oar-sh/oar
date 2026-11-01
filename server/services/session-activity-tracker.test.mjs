@@ -337,7 +337,7 @@ test('background work a live worker reports without a set shows as one placehold
     id: UNREPORTED_BACKGROUND_TASK_ID,
     kind: 'unknown',
     type: null,
-    description: 'background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)',
+    description: 'background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)',
     startedAt: null,
     lastActivityAt: null,
     status: 'running',

@@ -667,6 +667,9 @@ export function createGrokTurnRunner({
     // The terminals as background tasks: the heartbeat's digest and resync,
     // the panel's Stop, kept settle notices.
     backgroundTaskIds: () => terminalTasks?.backgroundTaskIds() || [],
+    // Every terminal that runs and is not released, published or not yet:
+    // the steering snapshot's background count (grok-worker-steering.mjs).
+    openTerminalCount: () => terminalTasks?.openTerminalCount?.() || 0,
     resyncBackgroundTasks: () => terminalTasks?.resync(),
     stopBackgroundTask: (taskId) => terminalTasks?.stop(taskId) || false,
     flushKeptTaskSettles: () => terminalTasks?.flushKeptSettles(),

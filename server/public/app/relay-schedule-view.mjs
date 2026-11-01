@@ -1,5 +1,5 @@
-// Relay schedules in the browser: the "scheduled" marker on a conversation's
-// sidebar row and the header's "N scheduled" chip with its list and Cancel
+// Relay schedules in the browser: the "Scheduled" line in the ⓘ menu of a
+// conversation's sidebar row and the header's "N scheduled" chip with its list and Cancel
 // buttons.
 //
 // DOM-free on purpose, like relay-event-view.mjs: the callers own the
@@ -8,6 +8,8 @@
 // The interval words mirror shared/relay-schedules.mjs, which the browser
 // cannot import (only server/public is served); relay-schedule-view.test.mjs
 // holds the two together.
+
+import { chatMetaLabelHtml } from './chat-header-meta.mjs';
 
 export const RELAY_SCHEDULE_SOCKET_EVENT = 'relay_schedules';
 export const RELAY_SCHEDULE_MESSAGE_KIND = 'relay-schedule';
@@ -76,18 +78,42 @@ export function scheduleChipText(schedules) {
   return count ? `${count} scheduled` : '';
 }
 
+/** The phone's short chip text: the next time ("04:15"), else the count; '' for no chip. */
+export function scheduleChipShortText(schedules, { nextText = '' } = {}) {
+  const count = activeList(schedules).length;
+  if (!count) return '';
+  return String(nextText || '').trim() || String(count);
+}
+
+/**
+ * The header's chip: a button that opens the list, with the long label
+ * ("⏰ 1 scheduled next 04:15 AM") and the phone's short one ("⏰ 04:15 AM").
+ * `nextText` is the next fire time as the caller formats it. '' for none.
+ */
+export function renderScheduleChipHtml(schedules, { panelOpen = false, nextText = '', escHtml = defaultEscape } = {}) {
+  const chipText = scheduleChipText(schedules);
+  if (!chipText) return '';
+  const longHtml = `⏰ ${escHtml(chipText)}${nextText ? ` <span class="relay-watch-hint">next ${escHtml(nextText)}</span>` : ''}`;
+  const shortHtml = `⏰ ${escHtml(scheduleChipShortText(schedules, { nextText }))}`;
+  return `<button type="button" class="relay-watch-chip relay-schedule-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-schedule-panel" title="Prompts the relay queues at set times (agents set them with relay_tool schedule)">${chatMetaLabelHtml(longHtml, shortHtml)}</button>`;
+}
+
 function conversationTitle(conversations, id, fallback = '') {
   const title = String(conversations?.[id]?.title || fallback || '').trim();
   return title || `session ${String(id).slice(0, 8)}`;
 }
 
-/** The sidebar's marker for a conversation a schedule fires into, or ''. */
-export function renderScheduledBadgeHtml(schedules, conversationId, { escHtml = defaultEscape, formatTime = defaultFormatTime } = {}) {
+/**
+ * The line of the sidebar row's ⓘ menu for a conversation schedules fire
+ * into: "Scheduled · next 04:15", "2 schedules · next 04:15"; '' for none.
+ * Plain text, for the menu to escape.
+ */
+export function scheduledInfoText(schedules, conversationId, { formatTime = defaultFormatTime } = {}) {
   const into = schedulesInto(schedules, conversationId);
   if (!into.length) return '';
   const next = nextScheduledAt(into);
-  const hint = `${into.length} schedule${into.length === 1 ? '' : 's'}${next ? ` · next ${formatTime(next)}` : ''}`;
-  return `<span class="conv-scheduled-badge" title="${escHtml(hint)}">scheduled</span>`;
+  const what = into.length === 1 ? 'Scheduled' : `${into.length} schedules`;
+  return next ? `${what} · next ${formatTime(next)}` : what;
 }
 
 /**

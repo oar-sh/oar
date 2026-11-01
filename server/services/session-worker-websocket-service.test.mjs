@@ -596,3 +596,78 @@ test('a worker\'s stated kind rides every delivery request from its socket, and 
   assert.equal(requests.at(-1).workerKind, null);
   service.stop();
 });
+
+test('both server.hello frames carry the relay build id, and leave the key out when it is unknown', async () => {
+  const httpServer = new EventEmitter();
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    buildId: '0.9.21+0123456789ab',
+  });
+  service.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const socket = lastWss.sockets.at(-1);
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-build', pid: 90 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  const hellos = socket.sent.map((payload) => JSON.parse(payload)).filter((frame) => frame.type === 'server.hello');
+  assert.deepEqual(hellos.map((hello) => hello.reason), ['connected', 'ack']);
+  for (const hello of hellos) assert.equal(hello.buildId, '0.9.21+0123456789ab');
+  service.stop();
+
+  const bare = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+  });
+  bare.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const bareHello = JSON.parse(lastWss.sockets.at(-1).sent.find((payload) => payload.includes('"type":"server.hello"')));
+  assert.equal(Object.hasOwn(bareHello, 'buildId'), false);
+  bare.stop();
+});
+
+test('a worker\'s stated build id is reported once per change, and a malformed one is ignored', async () => {
+  const httpServer = new EventEmitter();
+  const reports = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    onWorkerBuildId: (sessionId, buildId, pid) => reports.push({ sessionId, buildId, pid }),
+  });
+  service.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const socket = lastWss.sockets.at(-1);
+  const send = async (frame) => {
+    socket.emit('message', JSON.stringify({ sessionId: 'sdk-build', pid: 91, ...frame }));
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  await send({ type: 'worker.hello', buildId: ' 0.9.20+aaaaaaaaaaaa ' });
+  assert.deepEqual(reports, [{ sessionId: 'sdk-build', buildId: '0.9.20+aaaaaaaaaaaa', pid: 91 }]);
+  // The same value again, from a ready or a repeated hello, reports nothing.
+  await send({ type: 'worker.ready', buildId: '0.9.20+aaaaaaaaaaaa' });
+  await send({ type: 'worker.hello', buildId: '0.9.20+aaaaaaaaaaaa' });
+  assert.equal(reports.length, 1);
+  // Malformed values are dropped and do not displace the known one.
+  await send({ type: 'worker.ready', buildId: '0.9.20 plus spaces' });
+  await send({ type: 'worker.ready', buildId: 'x'.repeat(81) });
+  await send({ type: 'worker.ready', buildId: 42 });
+  assert.equal(reports.length, 1);
+  // A changed value is reported.
+  await send({ type: 'worker.ready', buildId: '0.9.21+bbbbbbbbbbbb' });
+  assert.deepEqual(reports.at(-1), { sessionId: 'sdk-build', buildId: '0.9.21+bbbbbbbbbbbb', pid: 91 });
+  assert.equal(reports.length, 2);
+
+  // A worker that states no build id reports nothing.
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const quiet = lastWss.sockets.at(-1);
+  quiet.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-old', pid: 92 }));
+  quiet.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-old', pid: 92 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reports.length, 2);
+  service.stop();
+});

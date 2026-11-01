@@ -3,6 +3,218 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.21] — 2026-11-01
+
+Highlights: the chat screen is more compact. The mode, model, effort,
+context window and billing of a chat move behind **⚙** in a slim label row
+above the message box, such as `🔒 Opus 5.5 · high · Auto`. The header menu
+is now **︙**, and the header's icon buttons stay there while there is room
+and move into it when there is not. Spacing is about halved across the app,
+with controls and hit areas at 28 px. Back and forward walk through the
+conversations you opened, with `?conv=<id>` in the address bar, and back
+closes what is open on top first. A pinch, Ctrl/⌘+wheel or Text scaling
+zooms the whole app, not only the text. A phone held sideways keeps the
+phone's layout. A session group folds while one of its chats is open, the
+filter row folds or unfolds all groups at once, and a group's name takes
+its sessions' colour. The origin, watched and scheduled pills of a sidebar
+row become one **ⓘ**. After a deploy, the relay replaces each session worker
+still on the old code once its session is idle, so a restart no longer
+leaves old worker code running.
+
+### Added
+
+- **Chat settings behind ⚙ in the composer.** A slim label row above the
+  message box holds **⚙**, a label that says what the next message runs
+  with (model · effort · mode, such as `🔒 Opus 5.5 · high · Auto`, with the
+  context window added when it is not the model's default), the billing pill
+  of a Claude chat, the file browser, **📎** and, on a desktop, **🙂**. **⚙**,
+  or a tap on the label, opens the settings: **Mode**, **Model** with the
+  lock note under it, **Effort**, **Context window**, **Billing** and
+  **🧠 Context usage**. A tap on one part of the label opens them at that
+  field, and the **Subscription** or **API key** pill at **Billing**. On a
+  desktop they open as a popover above the row, on a phone as a sheet from
+  the bottom; **✕**, Escape, a tap outside or back closes them. An image
+  chat shows **Quality** and **Image size** in place of Effort and Context
+  window; a Claude Cloud chat has only **Model**. The label reads **Auto**
+  for the autopilot mode (the settings keep the full name) and **Plan 🔒**
+  on a plan-only session.
+- **Back and forward through conversations.** Each conversation you open is
+  one step in the browser's history, with `?conv=<id>` in the address bar,
+  so back and forward walk through them, and a reload or a copied address
+  opens that conversation. The tab's title is the conversation's title.
+  Back first closes what is open on top: the session list on a phone, the
+  Inbox or Status view, the composer's settings, the **︙** menu, a row's
+  menu, dialogs, the git, tmux and annotate views, the watch and schedule
+  panels, the emoji picker and the Change CWD folder list. On a phone, back
+  from the first conversation you opened shows the session list, then the
+  installed app's *Press back again to close the app* as before.
+  - A link to a conversation the relay does not know (deleted, or a wrong
+    id) clears the view with a notice and keeps the last conversation; back
+    and forward step over it from then on, and nothing opens by itself until
+    you pick a conversation. A link to an archived conversation shows its
+    title.
+  - No address is written before the first conversation shows, so a link
+    survives an early tap. A jump from the Inbox to a question replaces the
+    history entry instead of adding one.
+  - A notification tap still opens `?push_conv=<id>`; the address then
+    reads `?conv=<id>`.
+- **Zoom scales the whole app.** A pinch, Ctrl+wheel (⌘+wheel on a Mac) or
+  **⚙️ Settings → General → Text scaling** now zooms text, buttons,
+  spacing, the sidebar, menus and dialogs alike, so the layout keeps its
+  proportions; at 100 % nothing changes. Popovers and sheets are placed
+  anew on a change. The new-chat dialog's selects and inputs follow the
+  zoom too (they stayed at the browser's fixed 13.33 px).
+- **A phone held sideways keeps the phone's layout.** The header is one
+  line. While the keyboard is up, the composer's label row folds into a
+  floating **⚙** that opens the settings and keeps the keyboard up, and the
+  background-task line into a floating **🤖**; both come back when the
+  keyboard goes down. Picking a conversation closes the session list and
+  does not bring up the keyboard (a long press does not pick). The **︙**
+  menu gains entries for the watch list, the schedules and the origin.
+- **Fold a group with its chat open, and fold all.** A group folds even
+  while one of its sessions is open; that session stays under the folded
+  head until you open another one, and opening a member of a folded group
+  leaves it folded. A drop on that kept row is a drop on the folded head.
+  While the list has groups, the filter row has a fold-all button: **➖**
+  folds every group, **➕** unfolds them all once all are folded. It counts
+  as your own choice for each group and is disabled while the list is
+  filtered. The Archived view keeps its folds apart from the live list.
+- **A group's name takes its sessions' colour:** red while one waits for
+  you, bright green while one works, dark green while one is idle with its
+  session ready, else the plain title colour. Archived heads stay muted.
+- **ⓘ on sidebar rows.** The origin, watched and scheduled pills of a row
+  fold into one **ⓘ** in its second line. Its menu lists each with its
+  action: *Started by an agent in "…"* (or *on relay "…"*), which opens
+  that conversation or the session on the other relay, *Watched by …* with
+  the watchers' names, and *Scheduled · next …* (or *N schedules · next
+  …*). A member under the head row of the session that started it leaves
+  the origin out.
+- **Session workers are recycled after a deploy.** Every worker states the
+  build id (version and commit) it started on; a worker on another build than
+  the relay, or one too old to say, is stopped and relaunched by the relay
+  once it is idle, the way **Change CWD → 🚀 Set new CWD and (re)launch**
+  does, so a restart no longer leaves old worker code running. An archived conversation's worker is
+  stopped for good. `/api/status` and the About modal show which build each
+  worker runs.
+  - Idle means no running turn, open question card, compaction, background
+    task or message on its way in, and the worker's CLI has ended. A CLI
+    ends by itself about 10 minutes after the last delivery or turn, so a
+    session is usually replaced some 10 minutes after its last turn. A
+    worker too old to say whether its CLI runs is replaced after 10 minutes
+    without a delivery or turn end. At most two are replaced at a time, one
+    start every 3 seconds, and each session once per relay build.
+  - Nothing is lost: the new worker resumes the native session, and a
+    message sent meanwhile waits and goes to the new worker. A Cursor
+    session is the exception for background shells and tasks, which its SDK
+    does not report: only the 10-minute quiet window protects them.
+  - **About OAR** shows *Workers: 14, all on this build* or *Workers: 14,
+    3 on an older build*. `/api/status` gives the relay's `buildId` and,
+    per worker, `buildId`, `startedAt` and `stale`, and the recycle's
+    `staleCount`, replacements and the sessions it waits on with the reason.
+    relay_tool's session items carry `worker { kind, buildId, stale }`.
+    The relay log has `[worker-recycle]` lines for each replacement and,
+    at most once a minute per session, what it waits for.
+  - A Claude Cloud worker opens its event stream from the stored cursor at
+    start, so turns the cloud session starts by itself are followed after a
+    replacement too. New worker route `GET /api/claude-cloud-session`.
+  - The troubleshooting guide has a section, *Workers after a deploy*.
+
+### Changed
+
+- **The header menu is ︙, and the icon buttons move into it when the
+  header is narrow.** **📍** pins and **🙈** hidden messages (while there
+  are any), **🔍** search, **🧠** context usage, **📊** Check Usage,
+  **☀️/🌙** Day/Night and **⛶** fullscreen stay in the header while there is
+  room and move into **︙** under their full names otherwise, the last ones
+  first. The menu stays inside the window, is capped in height and scrolls.
+  Fullscreen is disabled where the browser has none. Relay refusals, log
+  lines and help texts that named the `⋯` menu now name **︙**.
+- **The open-question banner sits between the title and the header
+  buttons,** so **︙** always stays at the right edge. Where room is short
+  (a phone held sideways, a narrow desktop window) it shrinks to a **❓ N**
+  chip; on a wider header it takes at most 40 % of the row and ends in "…".
+  A long title ends in "…" too. When even the chip, **☰** and **︙** do not
+  fit next to the title, as at 150 % zoom with the sidebar open, the banner
+  takes a row of its own; on a phone held upright it always does.
+- **About half the spacing, and 28 px controls.** Paddings, margins and
+  gaps in menus, the sidebar, dialogs, Settings, cards, bubbles and panels
+  are about halved, and controls that were 30 to 46 px high are 28 px, also
+  dialog buttons and tabs. Every hit area is at least 28 px at 100 %: the
+  row's **ⓘ**, fold, archive and delete, the live reply's **Stop** and
+  **💭 📃 🛠️** follow buttons, the Previews tab's **Open**, **Copy link**
+  and **Close**, the phone's header chips and the
+  question banner, the sidebar head buttons, Settings fields, selects,
+  checkboxes, radios and sliders, the repo browser's toolbar, the group
+  picker, the dialogs' **×** and **↻**, the Relays **Add**, the Sharing
+  row buttons, **Unsubscribe** and **Cancel**. Small labels and links get
+  an invisible 28 px hit area: the repo browser's Focus and crumbs, tree
+  rows, Sharing row titles, DeepSeek **Advanced**, the plan-only label, the
+  waiting pill, the agent-exchange and activity folds and the header chips.
+- **On a phone the lines under the title are one row** that scrolls
+  sideways, with short labels (`↗ title`, `👁 3`, `⏰ 04:15`, the folder's
+  last name), and the open-question banner gets a row of its own.
+- **Dialogs on a phone keep their title** with a compact **×**; the header
+  buttons no longer stretch across the width. Select Models puts its three
+  buttons under the title.
+- **A group's head.** One chevron **›** that turns down while the group is
+  open replaces ▾/▸; focus returns to it only after a keyboard toggle, with
+  a focus ring in the accent colour. A head line without a head row reads
+  "<last active> · N sessions", and its pill shows only what waits, runs or
+  failed. A long head drops its message count whole, then its date, instead
+  of cutting them. A mouse click on **ⓘ** hands focus back without a ring.
+- **Sidebar rows.** The title and the "1 open" pill share one line and only
+  the title is cut short; the title and meta line keep clear of the archive
+  and delete buttons. Archive and delete show on keyboard focus too. The
+  filter row's archive button reads **🗄️**, and the buttons close up to the
+  right when **×** or **➕** is hidden. The sidebar head follows the zoom and
+  wraps instead of cutting off **Inbox** or **Install**.
+- **The Claude usage warning above the composer is one line,** such as
+  `⚠ Claude 94 % weekly · resets Tue 04:00`; a tap shows the full sentence.
+- **A sub-agent's Stop is red and asks first** (**⏹ Stop agent**).
+- **On a phone a background task's title has its own full-width line.**
+- **Images in messages have no card around them.**
+- **Editing a chat's title on a desktop takes the whole header row** while
+  you type; the title lines, the banner and the header buttons come back
+  when you are done.
+- **Settings takes the focus when it opens, and Escape closes it.** The
+  Settings and Plan usage tab strips fade at an edge while more tabs lie
+  beyond it, and keep the selected tab in view. The Features help wraps
+  long identifiers.
+- **Pack guard ceilings.** The npm tarball may hold 610 entries and 9.5 MiB
+  unpacked (590 and 9 MiB before); 0.9.20 had used 99.3 % of the bytes.
+
+### Fixed
+
+- **The archive button on a sidebar row is visible on touch screens.** It
+  was invisible there but could still be tapped.
+- **A ︙ entry tapped on a phone no longer closes what it opened.** The tap's
+  follow-up click landed on the menu's backdrop or the new dialog and closed
+  it again: About, Kill session, Check Usage, Context, Restart relay and
+  Search, and the watch and schedule panels; Git changes did not open a
+  diff.
+- **Contrast in the light theme.** Primary buttons read at 5.19:1, red
+  buttons at 4.67:1, the sidebar's "1 open" pill at 6.47:1, Settings help
+  links at 6.85:1, the offline banner at 5.6:1 and the **☰** status tones
+  at 4.9:1 or more. A hovered accent button gets a darker fill (6.36:1)
+  instead of turning paler.
+- **Status and the Inbox, closed with nothing to go back to,** show their
+  empty state instead of a blank pane.
+- **The OpenAI, Grok and Cursor fields in Settings look like the others,**
+  and **Use a different token** and **Empty queue** are real buttons.
+- **The ⚙ popover fits its width under zoom,** the full origin title shows,
+  and focus is kept when the list or header is drawn anew.
+
+### Upgrade notes
+
+- **Every session worker is replaced once after the update.** Workers from
+  0.9.20 state no build id, so 30 seconds after the relay first hears of
+  one it counts as on an older build and is replaced once its session is
+  idle and its CLI has ended, usually some 10 minutes after its last turn.
+  About shows *M on an older build* until then. Nothing needs to be done.
+  Each replacement costs one cold start on the session's next message.
+- **No migration and no new dependency.** Going back to 0.9.20 needs no
+  database step.
+
 ## [0.9.20] — 2026-10-29
 
 Highlights: every plan card gets an "Approve plan" button that approves the

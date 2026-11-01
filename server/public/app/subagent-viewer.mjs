@@ -16,7 +16,7 @@
 
 import { apiFetch, cancelSubagentRun, loadSharedSubagentRecord } from './api-client.js';
 import { renderMarkdownPreview } from './router.js';
-import { currentConvId, getSubagentRun, IS_SHARED_VIEW, upsertSubagentRun } from './store.js';
+import { closeSummaryModal, currentConvId, getSubagentRun, IS_SHARED_VIEW, openSummaryModal, upsertSubagentRun } from './store.js';
 import { createViewerHistory } from './viewer-history.mjs';
 import { getSocket } from './socket-handlers.js';
 import { createSubagentViewerWatch } from './subagent-viewer-watch.mjs';
@@ -360,6 +360,31 @@ async function openParent() {
   await loadRun(top.runId);
 }
 
+/** Stop asks first: the agent's work so far stays, but it ends here. */
+function askBeforeStopRun() {
+  const run = viewer.run;
+  if (IS_SHARED_VIEW || !run || viewer.stopping || !runIsRunning(run)) return;
+  openSummaryModal({
+    title: 'Stop agent',
+    subtitle: run.displayName || '',
+    kind: 'subagent-stop',
+    bodyHtml: `
+      <p>Stop <strong>${escHtml(run.displayName || 'this agent')}</strong>?</p>
+      <p>It ends where it is now; what it has done so far stays.</p>
+      <div class="summary-modal-actions">
+        <button class="chat-title-action-btn danger-btn" type="button" data-subagent-stop-confirm="1">⏹ Stop agent</button>
+        <button class="chat-title-action-btn" type="button" data-subagent-stop-cancel="1">Cancel</button>
+      </div>
+    `,
+  });
+  const dialog = document.getElementById('summary-modal');
+  dialog?.querySelector('[data-subagent-stop-confirm]')?.addEventListener('click', () => {
+    closeSummaryModal();
+    void stopRun();
+  }, { once: true });
+  dialog?.querySelector('[data-subagent-stop-cancel]')?.addEventListener('click', () => closeSummaryModal(), { once: true });
+}
+
 async function stopRun() {
   const run = viewer.run;
   if (IS_SHARED_VIEW || !run || viewer.stopping || !runIsRunning(run)) return;
@@ -518,7 +543,7 @@ export function initSubagentViewer() {
     if (event.target === modal) closeSubagentViewer();
   });
   modal?.querySelector('.subagent-viewer-close')?.addEventListener('click', () => closeSubagentViewer());
-  stop?.addEventListener('click', () => void stopRun());
+  stop?.addEventListener('click', () => askBeforeStopRun());
   parent?.addEventListener('click', () => void openParent());
   jump?.addEventListener('click', () => {
     if (body) body.scrollTop = body.scrollHeight;

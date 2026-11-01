@@ -211,6 +211,9 @@ export function pageConversationRows(rows, groups = null, { limit = 40, beforeCo
  * match a filter (a group shows when any row matches: its head as context
  * with the matching members, or whole when the head or its name matches).
  *
+ * `keepVisibleId` is the open conversation: a member of a folded group with
+ * that id still shows under its head, as `{ kind: 'member', kept: true }`.
+ *
  * With `emptyGroups`, an owner's group an agent emptied (`keptEmptyAt`, no
  * row here) shows too: a head item without members (`group.empty`), placed
  * by the time it was emptied; under a filter only when its name matches.
@@ -220,8 +223,9 @@ export function arrangeConversationList(rows, groups = null, {
   matches = null,
   groupNameMatches = null,
   emptyGroups = false,
+  keepVisibleId = null,
 } = {}) {
-  const items = arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches });
+  const items = arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId: toText(keepVisibleId) });
   if (!emptyGroups || !groups) return items;
   const present = new Set((Array.isArray(rows) ? rows : []).map(rowGroupId).filter(Boolean));
   const entries = typeof groups.entries === 'function' && typeof groups.get === 'function' ? [...groups.entries()] : Object.entries(groups);
@@ -250,7 +254,7 @@ export function arrangeConversationList(rows, groups = null, {
   return out;
 }
 
-function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches }) {
+function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId = '' }) {
   const ordered = orderConversationRows(rows, groups);
   const activity = groupActivityTimes(ordered);
   const items = [];
@@ -294,6 +298,9 @@ function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches })
     items.push({ kind: 'head', conversation: headRow, group });
     if (group.open) {
       for (const member of shownMembers) items.push({ kind: 'member', conversation: member, group });
+    } else if (keepVisibleId) {
+      const kept = shownMembers.find((member) => rowId(member) === keepVisibleId);
+      if (kept) items.push({ kind: 'member', conversation: kept, group, kept: true });
     }
   }
   return items;

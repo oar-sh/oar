@@ -272,6 +272,54 @@ test('the Claude worker\'s running compaction window is persisted when it change
   assert.equal('autoCompactWindow' in fx.registry.getWorker(CONV).steering, false);
 });
 
+test('a flip of cliAlive is stored, an unchanged one is not', async () => {
+  // The worker recycle recycles a stale worker only once its CLI child is
+  // gone: the flip must reach the registry entry it reads.
+  const fx = boot();
+  seedWorker(fx);
+  const beat = (steering) => fx.post('/api/heartbeat', { steering }, fx.asWorker());
+  const idle = { turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, releasable: true };
+
+  await beat({ ...idle, cliAlive: true });
+  assert.equal(fx.upserts.length, 1);
+  assert.equal(fx.registry.getWorker(CONV).steering.cliAlive, true);
+  await beat({ ...idle, cliAlive: true });
+  assert.equal(fx.upserts.length, 1, 'unchanged: no write');
+
+  // The runner stopped its CLI child after its idle time.
+  await beat({ ...idle, cliAlive: false });
+  assert.equal(fx.upserts.length, 2, 'the child going away is a change');
+  assert.equal(fx.registry.getWorker(CONV).steering.cliAlive, false);
+
+  // An older build that does not report it.
+  await beat(idle);
+  assert.equal(fx.upserts.length, 3);
+  assert.equal(fx.registry.getWorker(CONV).steering.cliAlive ?? null, null);
+});
+
+test('the heartbeat records the worker\'s build id when it changes, and only then', async () => {
+  const fx = boot();
+  seedWorker(fx);
+  const beat = (body) => fx.post('/api/heartbeat', body, fx.asWorker());
+
+  const first = await beat({ buildId: '0.9.21+0123456789ab' });
+  assert.equal(first.status, 200);
+  assert.equal(fx.registry.getWorker(CONV).buildId, '0.9.21+0123456789ab');
+  assert.equal(fx.upserts.length, 1);
+  await beat({ buildId: '0.9.21+0123456789ab' });
+  assert.equal(fx.upserts.length, 1, 'unchanged: no write');
+
+  // A heartbeat without one, or with a malformed one, leaves the known id.
+  await beat({});
+  await beat({ buildId: 'not a build id' });
+  assert.equal(fx.upserts.length, 1);
+  assert.equal(fx.registry.getWorker(CONV).buildId, '0.9.21+0123456789ab');
+
+  await beat({ buildId: '0.9.22+ba9876543210' });
+  assert.equal(fx.upserts.length, 2);
+  assert.equal(fx.registry.getWorker(CONV).buildId, '0.9.22+ba9876543210');
+});
+
 test('a changed steering snapshot is broadcast at once; an unchanged one is not', async () => {
   // The client would otherwise only see it on its next status poll (4 s),
   // after a heartbeat that already lags the change by up to 10 s.

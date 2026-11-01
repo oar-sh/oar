@@ -178,6 +178,18 @@ export function createClaudeCloudSessionRunner({
   // Background work is over and nothing has moved for this long: ask the
   // session whether the agent is still going to say something.
   backgroundQuietMs = 45_000,
+  // Between turns, while the cloud may still be working on something no
+  // relay turn owns (its last known status was not idle, or a turn ended here
+  // without its `result`), the session is read again this often: the relay
+  // waits on that answer before it replaces this worker (releaseHold).
+  statusRecheckMs = 20_000,
+  // A session that stays not idle this long is no longer read (one warning
+  // line); the next delivery starts the reads again. The hold stays: the
+  // relay does not replace a worker whose session it last saw working.
+  statusRecheckGiveUpMs = 2 * 60 * 60_000,
+  // How often the stored binding is asked for again at start when the relay
+  // does not answer (attachOnStart); three tries in all.
+  bindingRetryMs = 5_000,
 } = {}) {
   const publisher = createClaudeTurnPublisher({ api, dbg });
   // The account's usage limit as the sandbox's Claude Code reports it: the
@@ -211,10 +223,23 @@ export function createClaudeCloudSessionRunner({
   // - `attributionRequestId`: the request whose answer is still to come.
   // - `model`: the model this process last gave the sandbox (the create's,
   //   or a later set_model); undefined while it does not know.
+  // - `workerStatus`: the session's `worker_status` at the last read of it
+  //   ('idle' when the cloud has nothing running), null while unknown.
   let session = null;
   let turn = null;
   let stream = null;
   let idleTimer = null;
+  let statusTimer = null;
+  // A read of the session between turns that may attach it (syncSession):
+  // a delivery waits for it, so the two never read the log at once.
+  let pendingSync = null;
+  // When the current run of status rechecks began (null: none runs), and
+  // whether it was given up (statusRecheckGiveUpMs).
+  let recheckSince = null;
+  let recheckGivenUp = false;
+  // A turn the session started by itself is being registered with the relay.
+  let openingStrayTurn = false;
+  let disposed = false;
   // Events are handled one at a time and in order; posting a user message
   // takes a place in the same line, so no event of the turn it starts is
   // looked at before the turn's start is known.
@@ -249,6 +274,7 @@ export function createClaudeCloudSessionRunner({
       attribution: undefined,
       attributionRequestId: null,
       model: undefined,
+      workerStatus: null,
     };
   }
 
@@ -273,6 +299,33 @@ export function createClaudeCloudSessionRunner({
 
   function isTurnActive() {
     return Boolean(turn);
+  }
+
+  /**
+   * Why the relay may not stop this worker and launch a fresh one now, or ''
+   * when it may (the hold names of the relay's STEERING_RELEASE_HOLDS):
+   * - 'turn': a turn runs here, delivered or one the session started itself
+   *   (from the moment the relay is asked for its row).
+   * - 'background': no turn runs here, but the cloud may still be working on
+   *   one: a turn that ended here without its `result` (a Stop the cloud did
+   *   not confirm, the background-hold ceiling, a turn the relay would not
+   *   register), or a session whose last known status is not idle. A worker
+   *   replaced then would lose what that work still writes: the count lives
+   *   only in this process, and a fresh one reads on from the stored cursor
+   *   as if nothing were running.
+   * A session this process has not read yet holds nothing.
+   */
+  function releaseHold() {
+    if (turn || openingStrayTurn) return 'turn';
+    if (!session) return '';
+    if (session.unfinishedTurns > 0) return 'background';
+    if (session.workerStatus && session.workerStatus !== 'idle') return 'background';
+    return '';
+  }
+
+  /** Remember what a read of the session said about the cloud's work. */
+  function noteSessionRead(workerStatus) {
+    if (session) session.workerStatus = workerStatus || null;
   }
 
   // ---------------------------------------------------------------------------
@@ -456,6 +509,7 @@ export function createClaudeCloudSessionRunner({
         let workerStatus = '';
         try {
           ({ workerStatus } = readCloudSessionUsage(await withTimeout(cloud.getSession(session.id), sessionReadTimeoutMs)));
+          noteSessionRead(workerStatus);
         } catch (error) {
           dbg('cloud session read failed', error?.message || String(error));
         }
@@ -532,6 +586,9 @@ export function createClaudeCloudSessionRunner({
     if (!response?.messageId) {
       dbg('stray cloud turn not registered; skipping it until its result');
       session.unfinishedTurns += 1;
+      // No turn here will end the wait on its `result`; the session's
+      // status will.
+      scheduleStatusRecheck();
       return null;
     }
     const message = {
@@ -569,6 +626,7 @@ export function createClaudeCloudSessionRunner({
         endTurn(t);
         if (turn === t) turn = null;
         scheduleIdleClose();
+        scheduleStatusRecheck();
       }
     })();
     return t;
@@ -592,7 +650,14 @@ export function createClaudeCloudSessionRunner({
     // continuation of its own, so the chat shows it.
     if (!t && session.attached && sequence !== null && session.unfinishedTurns === 0
       && sequence > session.cursorSeq && startsStrayTurn(event, payload, type)) {
-      t = await openStrayTurn(sequence, payload, type);
+      // The relay is asked for a row first: the turn runs already, and the
+      // release holds meanwhile as it will once the row is there.
+      openingStrayTurn = true;
+      try {
+        t = await openStrayTurn(sequence, payload, type);
+      } finally {
+        openingStrayTurn = false;
+      }
       if (!t) return;
     }
 
@@ -963,10 +1028,157 @@ export function createClaudeCloudSessionRunner({
   async function confirmUnfinishedTurns() {
     try {
       const { workerStatus } = readCloudSessionUsage(await withTimeout(cloud.getSession(session.id), sessionReadTimeoutMs));
+      noteSessionRead(workerStatus);
       if (workerStatus === 'idle') session.unfinishedTurns = 0;
     } catch (error) {
       dbg('cloud session read failed', error?.message || String(error));
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Between turns: the session's status, and the attach at start
+
+  /**
+   * The session's status, read once (bounded); null when the read failed, in
+   * which case what was known before stays.
+   */
+  async function readWorkerStatus() {
+    try {
+      const { workerStatus } = readCloudSessionUsage(await withTimeout(cloud.getSession(session.id), sessionReadTimeoutMs));
+      noteSessionRead(workerStatus);
+      return workerStatus || null;
+    } catch (error) {
+      dbg('cloud session read failed', error?.message || String(error));
+      return null;
+    }
+  }
+
+  /**
+   * Read the session again later while it holds the release with no turn
+   * here to end the wait (a turn's end schedules this itself), or while the
+   * session bound at start is not attached yet.
+   */
+  function scheduleStatusRecheck() {
+    if (statusTimer || disposed || !session || turn) return;
+    if (session.attached && !releaseHold()) {
+      recheckSince = null;
+      return;
+    }
+    if (recheckGivenUp) return;
+    if (recheckSince === null) {
+      recheckSince = now();
+    } else if (now() - recheckSince >= statusRecheckGiveUpMs) {
+      // Not forever: a session stuck in a working state would be read every
+      // statusRecheckMs for the life of the worker.
+      recheckGivenUp = true;
+      dbg(
+        `warning: the cloud session has not been idle for ${Math.round(statusRecheckGiveUpMs / 60_000)} min;`,
+        'no more status reads until the next delivery, and the relay does not replace this worker meanwhile',
+      );
+      return;
+    }
+    statusTimer = setTimeoutImpl(() => {
+      statusTimer = null;
+      void syncSession();
+    }, statusRecheckMs);
+    statusTimer?.unref?.();
+  }
+
+  function clearStatusRecheck() {
+    if (statusTimer) clearTimeoutImpl(statusTimer);
+    statusTimer = null;
+  }
+
+  /**
+   * Between turns: read the session, and act on an idle one. An idle cloud
+   * has no `result` left to send, so the turns that ended here without one
+   * are done with (as confirmUnfinishedTurns does before a send). An idle
+   * session bound at start but not attached yet is read on from the stored
+   * cursor up to now and its stream opened, so a turn the session starts by
+   * itself from here on is followed as a continuation, as the worker before
+   * this one did. A session that is working is not attached: the turn it
+   * runs may be a delivered one a dead worker left behind, which the relay
+   * delivers again and the delivery follows from the log (catchUp); taken
+   * for a turn of the session's own, it would be published twice.
+   * A delivery waits for this (pendingSync).
+   */
+  function syncSession() {
+    if (pendingSync) return pendingSync;
+    if (disposed || !session || turn || openingStrayTurn) return Promise.resolve(false);
+    const run = (async () => {
+      let attachedNow = false;
+      const status = await readWorkerStatus();
+      if (!disposed && session && !turn && status === 'idle') {
+        session.unfinishedTurns = 0;
+        if (!session.attached) {
+          await catchUp();
+          if (!disposed && session && !session.attached) {
+            session.attached = true;
+            ensureStream();
+            attachedNow = true;
+            dbg('cloud event stream opened between turns', `after=${session.lastSeq}`);
+          }
+        }
+      }
+      return attachedNow;
+    })();
+    pendingSync = run
+      .catch((error) => {
+        dbg('cloud session sync failed', error?.message || String(error));
+        return false;
+      })
+      .finally(() => {
+        pendingSync = null;
+        scheduleStatusRecheck();
+      });
+    return pendingSync;
+  }
+
+  /** The binding the relay stores for this conversation, or null. */
+  async function readStoredBinding() {
+    const routePath = `/api/claude-cloud-session?conversationId=${encodeURIComponent(sdkSessionId)}`;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await api('GET', routePath);
+      } catch (error) {
+        // A relay without the route answers 404 for good: the first delivery
+        // binds the session, as before.
+        if (Number(error?.status) === 404 || attempt >= 3 || disposed) {
+          dbg('stored cloud session not read', error?.message || String(error));
+          return null;
+        }
+        await sleep(bindingRetryMs);
+      }
+    }
+  }
+
+  /**
+   * At worker start: bind the cloud session the relay stores for this
+   * conversation and open its event stream from the stored cursor, before
+   * any delivery. The worker this one replaces kept its stream open for its
+   * whole life (idleCloseMs = 0) and so mirrored the turns the session
+   * starts by itself (a message sent on claude.ai, the agent's closing turn
+   * after background work); without this a fresh worker would see none of
+   * them until its first delivery. A conversation with no cloud session yet
+   * has nothing to attach: its first delivery creates one. A session that is
+   * working at start is read again every statusRecheckMs and attached once
+   * idle (syncSession says why not before).
+   *
+   * Resolves true when the stream was opened.
+   */
+  async function attachOnStart() {
+    if (session || turn || disposed || pendingSync) return false;
+    const run = (async () => {
+      const binding = await readStoredBinding();
+      const id = String(binding?.sessionId || '').trim();
+      if (!id || session || disposed) return false;
+      session = newSession(id, { cursor: toCloudSequence(binding.lastSequence) ?? 0 });
+      return true;
+    })();
+    // A delivery that arrives meanwhile waits until the binding is known.
+    pendingSync = run.catch(() => false).finally(() => { pendingSync = null; });
+    if (!await pendingSync) return false;
+    return syncSession();
   }
 
   /**
@@ -1173,6 +1385,7 @@ export function createClaudeCloudSessionRunner({
       dbg('cloud session read failed', error?.message || String(error));
     }
     if (usage.sessionUrl) session.url = usage.sessionUrl;
+    if (usage.workerStatus !== undefined) noteSessionRead(usage.workerStatus);
     const costUsd = usage.costUsd ?? state.result?.totalCostUsd ?? null;
     await reportSession(message, {
       ...(costUsd !== null ? { costUsd } : {}),
@@ -1318,7 +1531,19 @@ export function createClaudeCloudSessionRunner({
       dbg('turn already active; rejecting concurrent deliver', message.id);
       return false;
     }
+    // The session is being read between turns (the attach at start, or a
+    // status check): this delivery binds and reads it after that, never
+    // beside it. A turn the session started meanwhile takes precedence.
+    while (pendingSync) await pendingSync;
+    if (turn) {
+      dbg('turn already active; rejecting concurrent deliver', message.id);
+      return false;
+    }
     clearIdleClose();
+    clearStatusRecheck();
+    // A delivery starts the status reads afresh, also after they were given up.
+    recheckSince = null;
+    recheckGivenUp = false;
     const t = openTurn(message);
     const relayHoldMs = Number(pending?.settings?.backgroundTaskTimeoutMs);
     if (Number.isFinite(relayHoldMs) && relayHoldMs > 0) t.holdMs = relayHoldMs;
@@ -1337,11 +1562,14 @@ export function createClaudeCloudSessionRunner({
       endTurn(t);
       turn = null;
       scheduleIdleClose();
+      scheduleStatusRecheck();
     }
   }
 
   async function dispose() {
+    disposed = true;
     clearIdleClose();
+    clearStatusRecheck();
     if (turn) endTurn(turn);
     const entry = stream;
     stream = null;
@@ -1353,6 +1581,8 @@ export function createClaudeCloudSessionRunner({
     getActiveQueueMessageId,
     getActiveQueueAttempt,
     isTurnActive,
+    releaseHold,
+    attachOnStart,
     dispose,
   };
 }

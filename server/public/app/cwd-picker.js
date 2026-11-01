@@ -19,11 +19,13 @@ import {
   resolveCwdMenuPlacement,
   resolveTypeaheadIndex,
 } from './cwd-menu-placement.mjs';
+import { FONT_SCALE_CHANGE_EVENT, getUiScale } from './font-scaling.js';
 import {
   buildKnownCwdOptions as buildKnownCwdOptionsFromInputs,
   normalizeKnownCwdPath,
 } from './known-cwd-options.mjs';
 import { buildCloudLineModel, cloudHeaderLabel, isClaudeCloudConversation } from './claude-cloud-ui.mjs';
+import { CHAT_META_LONG_CLASS, CHAT_META_SHORT_CLASS, cwdFolderName } from './chat-header-meta.mjs';
 
 export { normalizeKnownCwdPath };
 
@@ -163,6 +165,7 @@ function positionChangeCwdMenu() {
     viewportWidth,
     viewportHeight,
     panelHeight: panel.scrollHeight,
+    scale: getUiScale(),
   });
   panel.style.left = `${Math.round(placement.left)}px`;
   panel.style.top = `${Math.round(placement.top)}px`;
@@ -176,6 +179,8 @@ function bindRepositionListeners() {
   // Capture phase so scrolling inside .summary-body (which does not bubble) counts.
   window.addEventListener('scroll', positionChangeCwdMenu, true);
   window.addEventListener('resize', positionChangeCwdMenu);
+  // A zoom moves the trigger and rescales the gap and the panel's sizes.
+  window.addEventListener(FONT_SCALE_CHANGE_EVENT, positionChangeCwdMenu);
   window.visualViewport?.addEventListener?.('resize', positionChangeCwdMenu);
   window.visualViewport?.addEventListener?.('scroll', positionChangeCwdMenu);
 }
@@ -185,6 +190,7 @@ function unbindRepositionListeners() {
   repositionBound = false;
   window.removeEventListener('scroll', positionChangeCwdMenu, true);
   window.removeEventListener('resize', positionChangeCwdMenu);
+  window.removeEventListener(FONT_SCALE_CHANGE_EVENT, positionChangeCwdMenu);
   window.visualViewport?.removeEventListener?.('resize', positionChangeCwdMenu);
   window.visualViewport?.removeEventListener?.('scroll', positionChangeCwdMenu);
 }
@@ -231,7 +237,7 @@ function openChangeCwdMenu() {
   bindRepositionListeners();
 }
 
-function closeChangeCwdMenu({ focusTrigger = false } = {}) {
+export function closeChangeCwdMenu({ focusTrigger = false } = {}) {
   const { trigger, panel, backdrop } = getPickerEls();
   menuOpen = false;
   typeaheadBuffer = '';
@@ -470,6 +476,7 @@ export function syncChatHeaderWorkspaceLabel() {
     const label = cloudHeaderLabel(conversation.cloud);
     labelEl.hidden = !label;
     labelEl.textContent = label;
+    labelEl.classList.remove('chat-title-cwd-expanded');
     if (label) labelEl.title = buildCloudLineModel(conversation.cloud)?.repoUrl || label;
     else labelEl.removeAttribute('title');
     return;
@@ -479,11 +486,34 @@ export function syncChatHeaderWorkspaceLabel() {
     labelEl.hidden = true;
     labelEl.textContent = '';
     labelEl.removeAttribute('title');
+    labelEl.classList.remove('chat-title-cwd-expanded');
     return;
   }
   labelEl.hidden = false;
-  labelEl.textContent = cwd;
   labelEl.title = cwd;
+  // The whole path, and its last folder for the phone's meta row
+  // (chat-header-meta.mjs); a tap there shows the whole path.
+  const longEl = labelEl.querySelector(`.${CHAT_META_LONG_CLASS}`);
+  const shortEl = labelEl.querySelector(`.${CHAT_META_SHORT_CLASS}`);
+  const folder = cwdFolderName(cwd) || cwd;
+  if (longEl && shortEl && longEl.textContent === cwd && shortEl.textContent === folder) return;
+  if (longEl?.textContent !== cwd) labelEl.classList.remove('chat-title-cwd-expanded');
+  const long = document.createElement('span');
+  long.className = CHAT_META_LONG_CLASS;
+  long.textContent = cwd;
+  const short = document.createElement('span');
+  short.className = CHAT_META_SHORT_CLASS;
+  short.textContent = folder;
+  labelEl.replaceChildren(long, short);
+  if (labelEl.dataset.cwdToggleBound !== '1') {
+    labelEl.dataset.cwdToggleBound = '1';
+    labelEl.addEventListener('click', () => {
+      // Only the two-label folder line toggles (not a cloud repo or the
+      // status view's text); on a desktop the class changes nothing.
+      if (!labelEl.querySelector(`.${CHAT_META_SHORT_CLASS}`)) return;
+      labelEl.classList.toggle('chat-title-cwd-expanded');
+    });
+  }
 }
 
 function getCurrentLaunchableSessionId() {
@@ -513,14 +543,14 @@ export function openChangeCwdModal() {
     subtitle: 'Select a known launch directory',
     kind: 'change-cwd',
     bodyHtml: `
-      <p style="margin-bottom:10px;color:var(--muted);line-height:1.45">
+      <p style="margin-bottom:calc(5px * var(--ui-scale));color:var(--muted);line-height:1.45">
         Pick the selected session's launch directory. An idle CLI restarts in the selected CWD; active turns must finish first.
       </p>
-      <div style="display:grid;gap:4px;margin-bottom:10px;font-size:0.78rem;color:var(--muted)">
+      <div style="display:grid;gap:calc(4px * var(--ui-scale));margin-bottom:calc(5px * var(--ui-scale));font-size:0.78rem;color:var(--muted)">
         <div><strong style="color:var(--text)">Current CWD:</strong> ${escHtml(currentCwd || 'Unknown')}</div>
         <div><strong style="color:var(--text)">Next launch:</strong> ${escHtml(nextLaunchCwd || currentCwd || 'Unknown')}</div>
       </div>
-      <div class="change-cwd-picker" style="margin-bottom:10px">
+      <div class="change-cwd-picker" style="margin-bottom:calc(5px * var(--ui-scale))">
         <label class="change-cwd-picker-label" for="change-cwd-manual-path">Manual path</label>
         <div class="cwd-browse-row">
           <input id="change-cwd-manual-path" class="change-cwd-manual-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Manual path">
@@ -539,7 +569,7 @@ export function openChangeCwdModal() {
           ${menuItemsHtml}
         </div>
       </div>
-      <div id="change-cwd-details" style="margin-top:10px;font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
+      <div id="change-cwd-details" style="margin-top:calc(5px * var(--ui-scale));font-size:0.78rem;color:var(--muted);line-height:1.45;word-break:break-word"></div>
       <div class="summary-modal-actions" id="change-cwd-actions">
         <button class="summary-btn" type="button" onclick="confirmChangeCwd()">🗂️ Save next-launch CWD</button>
         <button class="summary-btn" type="button" ${launchableSessionId ? 'onclick="confirmChangeCwdAndLaunch()"' : 'disabled data-keep-disabled="1"'} title="${escHtml(launchDisabledReason || 'Set the CWD and (re)launch the current session worker')}">🚀 Set new CWD and (re)launch</button>

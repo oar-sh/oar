@@ -7,14 +7,16 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test } from "@playwright/test";
 
+import { clickHeaderAction, expectHeaderActionReachable, isHeaderActionAvailable, waitForHeaderFit } from "./header-actions-helpers.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
- * ⋯ → About OAR, on a desktop and a phone viewport: the entry carries the
+ * ︙ → About OAR, on a desktop and a phone viewport: the entry carries the
  * running version, the modal shows its sections and the two links, the update
  * line follows the opt-in check (a local stub manifest, never oar.sh), and a
- * shared viewer has no such entry. Day/Night sits in the same menu and works
- * outside the shared view too.
+ * shared viewer has no such entry. Day/Night (a header button, or its twin in
+ * the same menu when the header is too narrow) works in the shared view too:
+ * the spec presses it there.
  */
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -105,20 +107,31 @@ for (const profile of [
       expect(about.update.checkEnabled).toBe(false);
     });
 
-    test("Day/Night is in the menu and switches the theme", async ({ page }) => {
+    test("Day/Night switches the theme, from the header or from ︙", async ({ page }) => {
       await loadApp(page);
       const before = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
-      await openMenu(page);
-      const toggle = page.locator("#chat-menu-theme-toggle");
-      await expect(toggle).toBeVisible();
-      await expect(toggle).toHaveText(before === "light" ? "🌙 Night mode" : "☀️ Day mode");
-      await press(toggle);
-      await expect(page.locator("#chat-actions-menu")).toBeHidden();
+      // A priority+ action: its header button while it fits, its ︙ twin otherwise.
+      const pressTheme = async () => {
+        await waitForHeaderFit(page);
+        const inline = page.locator("#theme-toggle-btn");
+        if (await inline.isVisible()) {
+          await press(inline);
+          return;
+        }
+        await openMenu(page);
+        await press(page.locator("#chat-menu-theme-toggle"));
+        await expect(page.locator("#chat-actions-menu")).toBeHidden();
+      };
+      // Both copies carry the label of what a press switches to.
+      await waitForHeaderFit(page);
+      await expect(page.locator("#theme-toggle-btn")).toHaveText(before === "light" ? "🌙" : "☀️");
+      await expect(page.locator("#theme-toggle-btn")).toHaveAttribute("title", before === "light" ? "Night mode" : "Day mode");
+      await expect(page.locator("#chat-menu-theme-toggle")).toHaveText(before === "light" ? "🌙 Night mode" : "☀️ Day mode");
+      await pressTheme();
       await expect.poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")))
         .toBe(before === "light" ? "dark" : "light");
       // Back as it was, for the screenshots.
-      await openMenu(page);
-      await press(page.locator("#chat-menu-theme-toggle"));
+      await pressTheme();
     });
 
     test("the modal shows its sections and links, and how to turn update checks on", async ({ page }, testInfo) => {
@@ -194,9 +207,16 @@ for (const profile of [
           const sharedPage = await context.newPage();
           await sharedPage.goto(`${relay.baseUrl}${sharePath}`);
           await sharedPage.waitForLoadState("networkidle");
-          await openMenu(sharedPage);
-          await expect(sharedPage.locator("#chat-menu-theme-toggle")).toBeVisible();
-          await expect(sharedPage.locator("#chat-menu-about")).toBeHidden();
+          // Day/Night is offered (in the header, or in ︙ when it does not
+          // fit) and reachable: the menu opens and shows it; About OAR never is.
+          expect(await isHeaderActionAvailable(sharedPage, "theme")).toBe(true);
+          await expectHeaderActionReachable(sharedPage, "theme");
+          await expect(sharedPage.locator("#chat-menu-about")).toHaveAttribute("hidden", "");
+          // A press switches the theme in the shared view too.
+          const before = await sharedPage.evaluate(() => document.documentElement.getAttribute("data-theme"));
+          await clickHeaderAction(sharedPage, "theme");
+          await expect.poll(() => sharedPage.evaluate(() => document.documentElement.getAttribute("data-theme")))
+            .toBe(before === "light" ? "dark" : "light");
           const refused = await context.request.get(api("/api/about"));
           expect(refused.status()).toBe(401);
         } finally {

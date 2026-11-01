@@ -7,7 +7,7 @@
 // and the server's `cloud` payload field), so the one sync function below is
 // idempotent and is simply called whenever the header is synced. A
 // conversation of any other provider gets every element back exactly as it was.
-// The ⋯ menu is not touched here: its entries are decided in one place
+// The ︙ menu is not touched here: its entries are decided in one place
 // (chat-actions-menu-state.mjs), which reads the cloud state through
 // isCurrentConversationClaudeCloud() and currentCloudSessionUrl().
 
@@ -57,7 +57,7 @@ export function syncClaudeCloudConversationUi() {
     line.hidden = !lineHtml;
   }
 
-  // The ⋯ menu entries (no Change CWD for a cloud chat, Open on claude.ai once
+  // The ︙ menu entries (no Change CWD for a cloud chat, Open on claude.ai once
   // there is a link) are decided with the rest of the menu in
   // chat-actions-menu-state.mjs, from `isCloud` and currentCloudSessionUrl().
 

@@ -879,3 +879,44 @@ test('recoverStale never revives a continuation row', () => {
   stmts.recoverStale.run(recoveryIsoAgo(0), recoveryIsoAgo(10 * 60_000));
   assert.equal(db.prepare(`SELECT status FROM queue WHERE id = 'q-cont-old'`).get().status, 'processing');
 });
+
+test('getOwnerLastActivityAt: the latest delivery or turn end over the rows the session owns, NULL with none', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  const insertConv = db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES (?, 'Quiet', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`);
+  insertConv.run('conv-q1');
+  insertConv.run('conv-q2');
+  const insertRow = db.prepare(`
+    INSERT INTO queue (id, conversation_id, text, status, timestamp, processing_at, owner_sdk_session_id, owner_assigned_at, owner_last_claimed_at, response_message_id)
+    VALUES (@id, @conv, 'hi', @status, @timestamp, @processingAt, @owner, @assignedAt, @claimedAt, @responseId)
+  `);
+  const row = (fields) => insertRow.run({
+    conv: 'conv-q1', status: 'done', timestamp: '2026-01-01T00:00:00.000Z', processingAt: null,
+    owner: null, assignedAt: null, claimedAt: null, responseId: null, ...fields,
+  });
+  const lastActivity = (sid) => repository.getOwnerLastActivityAt.get(sid)?.last_activity_at ?? null;
+
+  assert.equal(lastActivity('sid-quiet'), null, 'no rows at all');
+  // An owned row with no delivery time yet (its enqueue time is not a
+  // delivery) still reads as none.
+  row({ id: 'q-unclaimed', status: 'pending', owner: 'sid-quiet', timestamp: '2026-01-01T09:00:00.000Z' });
+  assert.equal(lastActivity('sid-quiet'), null);
+
+  // A finished turn: claimed at 10:00, its lease last refreshed at 10:04,
+  // its response written at 10:05 (setDone cleared processing_at).
+  db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp) VALUES ('msg-r1', 'conv-q1', 'assistant', 'done', '2026-01-01T10:05:00.000Z')`).run();
+  row({ id: 'q-done', owner: 'sid-quiet', assignedAt: '2026-01-01T10:00:00.000Z', claimedAt: '2026-01-01T10:04:00.000Z', responseId: 'msg-r1' });
+  assert.equal(lastActivity('sid-quiet'), '2026-01-01T10:05:00.000Z', 'the turn end');
+
+  // A later delivery without a response yet: its claim counts.
+  row({ id: 'q-running', status: 'processing', owner: 'sid-quiet', processingAt: '2026-01-01T11:00:00.000Z', assignedAt: '2026-01-01T10:59:00.000Z', claimedAt: '2026-01-01T11:00:30.000Z' });
+  assert.equal(lastActivity('sid-quiet'), '2026-01-01T11:00:30.000Z');
+
+  // Another session's rows, an unowned row and a blank owner never count.
+  row({ id: 'q-other', conv: 'conv-q2', owner: 'sid-other', claimedAt: '2026-01-01T12:00:00.000Z' });
+  row({ id: 'q-unowned', processingAt: '2026-01-01T13:00:00.000Z' });
+  row({ id: 'q-blank', owner: '', processingAt: '2026-01-01T14:00:00.000Z' });
+  assert.equal(lastActivity('sid-quiet'), '2026-01-01T11:00:30.000Z');
+  assert.equal(lastActivity('sid-other'), '2026-01-01T12:00:00.000Z');
+  assert.equal(lastActivity(''), null);
+});

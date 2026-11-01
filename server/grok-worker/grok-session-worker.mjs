@@ -12,10 +12,12 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { resolveBuildId } from '../../shared/build-id.mjs';
 import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
 import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+import { buildGrokSteeringState } from './grok-worker-steering.mjs';
 import { createGrokTaskPublisher } from './grok-background-tasks.mjs';
 
 // Windows console launch: the launcher names the worker log, this copies
@@ -47,6 +49,10 @@ async function main() {
 
   const configPath = String(process.env.COPILOT_WEB_RELAY_CONFIG || '').trim()
     || path.resolve(__dirname, '..', 'config.json');
+  // The code this process started on, read once from the repo root and kept
+  // for its whole life: the relay recycles a worker whose build differs from
+  // its own, and a tree that moves on under us must not change our answer.
+  const buildId = resolveBuildId(path.resolve(__dirname, '..', '..')).id;
   const serverUrl = resolveRelayServerUrl({ configPath });
   const token = loadTokenFromConfig(configPath);
   const cwd = String(process.env.COPILOT_WORKSPACE_ROOT || '').trim() || process.cwd();
@@ -96,6 +102,7 @@ async function main() {
   let heartbeatTimer = null;
   heartbeat = createHeartbeatController({
     api,
+    buildId,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
@@ -106,12 +113,16 @@ async function main() {
     getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
     onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
     onAnswered: () => turnRunner.flushKeptTaskSettles(),
+    // No steering here; the snapshot tells the relay when it may replace
+    // this worker: no turn, and no open terminal (they end with the worker).
+    getSteeringState: () => buildGrokSteeringState(turnRunner),
   });
 
   const wsLink = createWorkerWebSocketLink({
     serverUrl,
     token,
     dbg,
+    buildId,
     getSessionReady: () => true,
     // A relay that just (re)started learns of the terminals from the digest
     // on the next beat; ask for it now.
@@ -171,7 +182,7 @@ async function main() {
     getActiveQueueMessageIds: () => [turnRunner.getActiveQueueAttempt()],
   });
 
-  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);
+  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'} build=${buildId || 'unknown'}`);
   heartbeat.startHeartbeat();
   wsLink.start();
 }

@@ -43,6 +43,7 @@ import { readStoredClaudeContextUsage, resolveAutoCompactWindowStatus } from '..
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
+import { isWorkerOnOtherBuild } from '../services/worker-recycle-service.mjs';
 import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
 import { createCliInstallService } from '../services/cli-install-service.mjs';
 import { createGrokAuthService } from '../services/grok-auth-service.mjs';
@@ -69,7 +70,7 @@ import { redactPreviewTokens } from '../services/preview-registry-service.mjs';
 import { createSharePathRedactor } from '../services/share-path-redaction.mjs';
 import { createSubagentTimelineService, TIMELINE_READ_DEFAULT_LIMIT } from '../services/subagent-timeline-service.mjs';
 import { sanitizeSubagentRunId } from '../../shared/subagent-run-id.mjs';
-import { createKeyedMutex } from '../services/keyed-mutex-service.mjs';
+import { sessionLaunchMutex } from '../services/session-launch-mutex-service.mjs';
 import { createFixedWindowRateLimiter } from '../services/rate-limit-service.mjs';
 import { requestHostOf } from '../services/request-boundary.mjs';
 import { parseRemoteRelayOriginJson } from '../repositories/remote-relay-repository.mjs';
@@ -1452,11 +1453,27 @@ export function buildSessionWorkerStatusPayload({
   // What the last read of the process list did ({ at, durationMs, processes,
   // error }); a slow box shows here before it shows as 502s.
   processList = null,
+  // The relay's own build id (runtimeState.buildId): each worker's is shown
+  // next to it, so a worker still on the code before a deploy stands out.
+  relayBuildId = null,
+  // The worker recycle's status() (stale count, recycles in flight and done,
+  // who waits on what), or null while the recycle is not wired.
+  recycleStatus = null,
 } = {}) {
   const snapshot = supervisorSnapshot && typeof supervisorSnapshot === 'object'
     ? supervisorSnapshot
     : {};
-  const workers = Array.isArray(snapshot.workers) ? snapshot.workers : [];
+  const relayBuild = typeof relayBuildId === 'string' && relayBuildId.trim() ? relayBuildId.trim() : null;
+  const workers = (Array.isArray(snapshot.workers) ? snapshot.workers : []).map((worker) => (
+    worker && typeof worker === 'object'
+      ? {
+        ...worker,
+        buildId: typeof worker.buildId === 'string' && worker.buildId ? worker.buildId : null,
+        startedAt: worker.startedAt || null,
+        stale: isWorkerOnOtherBuild(worker, relayBuild),
+      }
+      : worker
+  ));
   const onlineWorkerStatuses = new Set(SESSION_WORKER_ACTIVE_STATUSES);
   const onlineCount = workers.reduce((count, worker) => {
     const status = normalizeWorkerStatusText(worker?.status, 'new');
@@ -1561,6 +1578,8 @@ export function buildSessionWorkerStatusPayload({
     onlineUnassignedProcessCount,
     counts: snapshot.counts && typeof snapshot.counts === 'object' ? snapshot.counts : {},
     workers,
+    buildId: relayBuild,
+    recycle: recycleStatus && typeof recycleStatus === 'object' ? recycleStatus : null,
     pendingStarts: toSafeNonNegativeInt(snapshot.pendingStarts, 0),
     lifecycle: Array.isArray(snapshot.lifecycle) ? snapshot.lifecycle : [],
     integrity,
@@ -2608,9 +2627,10 @@ export function registerSessionsRoutes(app, deps) {
     bucketTtlMs: 60_000,
     maxBuckets: 4_096,
   });
-  // Serializes everything that reaches the session-worker launch path, keyed by
-  // sdkSessionId, plus a coalescer so a duplicated request replays one result.
-  const sessionLaunchMutex = createKeyedMutex();
+  // Everything that reaches the session-worker launch path is serialized by
+  // the relay-wide sessionLaunchMutex (services/session-launch-mutex-service.mjs),
+  // keyed by sdkSessionId, which the worker recycle takes too; plus a
+  // coalescer so a duplicated request replays one result.
   const relaunchCoalescer = createRelaunchCoalescer({ windowMs: RELAUNCH_COALESCE_WINDOW_MS });
 
   function getDeepSeekProviderSettings() {
@@ -6099,7 +6119,7 @@ export function registerSessionsRoutes(app, deps) {
           // Kill session stops the session's worker, and the delete counts no
           // tasks for a conversation whose worker is gone.
           message: activity.unstoppableTaskCount > 0
-            ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ⋯ menu, then delete it.'
+            ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ︙ menu, then delete it.'
             : 'Background tasks are still running in this conversation. Stop them in the task panel, then delete it.',
         },
       };
@@ -6258,7 +6278,7 @@ export function registerSessionsRoutes(app, deps) {
               error: 'conversation-active',
               reason: 'background-tasks',
               message: activity.unstoppableTaskCount > 0
-                ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ⋯ menu, then archive it.'
+                ? 'Background tasks are still running in this conversation, and some have no Stop button. Use Kill session in its ︙ menu, then archive it.'
                 : 'Background tasks are still running in this conversation. Stop them in the task panel, then archive it.',
             },
           };
@@ -7129,6 +7149,18 @@ export function registerSessionsRoutes(app, deps) {
     }
   });
 
+  // The worker recycle's status, read at request time: the recycle is set on
+  // runtimeState after the routes are registered, and a status that throws
+  // must not take /api/status down with it.
+  function readWorkerRecycleStatus() {
+    if (typeof runtimeState.workerRecycle !== 'function') return null;
+    try {
+      return runtimeState.workerRecycle() || null;
+    } catch {
+      return null;
+    }
+  }
+
   // GET /api/status — overall status
   app.get('/api/status', auth, (req, res) => {
     ensureSessionId(req, res);
@@ -7146,6 +7178,8 @@ export function registerSessionsRoutes(app, deps) {
       supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
       queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
       processList: sessionWorkerProcessInspector?.getLastRead?.() || null,
+      relayBuildId: runtimeState.buildId ?? null,
+      recycleStatus: readWorkerRecycleStatus(),
     });
     const activeRuntimeSessionCount = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
       ? Number(sessionWorkerStatus?.onlineBoundProcessCount || 0)

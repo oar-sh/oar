@@ -272,3 +272,20 @@ test('a terminal that outlives the grace window appears with everything it print
   assert.equal(stub.posts('/api/background-task-settled')[0].status, 'completed');
   assert.deepEqual(stub.posts('/api/background-tasks').at(-1).tasks, []);
 });
+
+// The steering snapshot's count (grok-worker-steering.mjs): a terminal holds
+// the worker from its start, not only once the grace has made it a row.
+test('a terminal is open from its start until it exits or is released, inside the grace window too', async (t) => {
+  const { publisher, services, procs } = setup(t, { publishAfterMs: 60_000 });
+  assert.equal(publisher.openTerminalCount(), 0);
+  const first = await services.handlers['terminal/create']({ command: 'sleep 600' });
+  const second = await services.handlers['terminal/create']({ command: 'npm test' });
+  assert.deepEqual(publisher.backgroundTaskIds(), [], 'neither is a row yet');
+  assert.equal(publisher.openTerminalCount(), 2);
+  procs[1].emit('exit', 0, null);
+  await flush();
+  assert.equal(publisher.openTerminalCount(), 1, 'an exited terminal holds nothing');
+  services.handlers['terminal/release']({ terminalId: first.terminalId });
+  assert.equal(publisher.openTerminalCount(), 0, 'nor does a released one');
+  services.handlers['terminal/release']({ terminalId: second.terminalId });
+});

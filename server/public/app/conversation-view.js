@@ -155,6 +155,7 @@ import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
 import { conversationPayloadCache } from './conversation-payload-cache.mjs';
+import { noteConversationShown } from './session-history-ui.js';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
 const HISTORY_LOAD_MORE_ID = 'history-load-more';
@@ -4755,6 +4756,8 @@ export async function sendMessage() {
       const adoptNewConversation = viewingSendConversation();
       if (adoptNewConversation) {
         setCurrentConv(r.conversationId);
+        // The new chat gets its history entry, as one opened from the list does.
+        noteConversationShown(r.conversationId);
         composerConversationId = r.conversationId;
         nameOwnSendConversation(send, r.conversationId);
       }

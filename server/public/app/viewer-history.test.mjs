@@ -78,8 +78,31 @@ test('a pop that comes long after our own back() is the user\'s', () => {
   viewer.closed();
   tick(5000);
   viewer.opened();
-  history.flush(() => viewer.onPopState()); // the old pop, late
+  history.userBack();
+  // The old pop, late, then the user's: the stale mark of our own does not swallow it.
+  history.flush(() => viewer.onPopState());
   assert.equal(backs(), 1, 'treated as a real back: the viewer closes');
+});
+
+test('a pop that leaves our entry current (a dialog above the viewer closed) keeps the viewer open', () => {
+  const { history, viewer, backs } = make();
+  viewer.opened();
+  history.pushState({ oarOverlay: 'dialog' });
+  history.userBack();
+  history.flush(() => viewer.onPopState());
+  assert.equal(backs(), 0);
+  assert.equal(viewer.pushed, true);
+  assert.deepEqual(history.state, { [VIEWER_HISTORY_MARK]: true });
+  history.userBack();
+  history.flush(() => viewer.onPopState());
+  assert.equal(backs(), 1, 'the next back closes it');
+});
+
+test('the entry carries its place and the visit\'s marks of the entry below', () => {
+  const { history, viewer } = make();
+  history.pushState({ oarConv: 'conv-otter', oarPos: 4, oarApp: true, oarLaid: 'list' });
+  viewer.opened();
+  assert.deepEqual(history.state, { oarApp: true, oarLaid: 'list', [VIEWER_HISTORY_MARK]: true, oarPos: 5 });
 });
 
 test('closing when the current entry is not ours leaves history alone', () => {

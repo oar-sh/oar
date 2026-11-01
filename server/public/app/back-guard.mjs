@@ -9,7 +9,26 @@
 
 export const BACK_GUARD_FLOOR = 'oarBackGuardFloor';
 export const BACK_GUARD_APP = 'oarApp';
-const FIRST_INTERACTION_EVENTS = ['pointerdown', 'keydown', 'touchstart'];
+// Every entry the app writes carries its place in the stack, so a pop tells
+// back from forward (session-history.mjs, viewer-history.mjs).
+export const HISTORY_POSITION = 'oarPos';
+// The visit's base (the floor, the phone's session list) is laid: a reload
+// on any later entry must not lay it again.
+export const VISIT_LAID = 'oarLaid';
+// The place in the stack of the visit's lowest own entry (the phone's list,
+// else the first session): back from above it stays in the app.
+export const VISIT_BASE = 'oarBase';
+export const FIRST_INTERACTION_EVENTS = Object.freeze(['pointerdown', 'keydown', 'touchstart']);
+
+/** The marks every later entry of the visit carries over from the one below. */
+export function inheritedVisitMarks(state) {
+  const marks = {};
+  if (!state || typeof state !== 'object') return marks;
+  if (state[BACK_GUARD_APP]) marks[BACK_GUARD_APP] = true;
+  if (state[VISIT_LAID]) marks[VISIT_LAID] = state[VISIT_LAID];
+  if (Number.isFinite(state[VISIT_BASE])) marks[VISIT_BASE] = state[VISIT_BASE];
+  return marks;
+}
 
 /**
  * Lay the floor at the first touch or key, not at start-up: an entry a page
@@ -19,13 +38,13 @@ const FIRST_INTERACTION_EVENTS = ['pointerdown', 'keydown', 'touchstart'];
  * interaction nothing a page does keeps back from leaving; from then on
  * the floor holds.
  */
-export function armBackGuardOnFirstInteraction({ history, enabled = true, target, onFloor = null } = {}) {
+export function armBackGuardOnFirstInteraction({ history, enabled = true, target, onFloor = null, entryAgain = null } = {}) {
   if (!enabled || !history || !target) return null;
   const state = { guard: null };
   const arm = () => {
     for (const eventName of FIRST_INTERACTION_EVENTS) target.removeEventListener(eventName, arm, true);
     if (state.guard) return;
-    state.guard = installBackGuard({ history, enabled: true, onFloor });
+    state.guard = installBackGuard({ history, enabled: true, onFloor, entryAgain });
     target.addEventListener('popstate', () => state.guard.onPopState());
   };
   for (const eventName of FIRST_INTERACTION_EVENTS) target.addEventListener(eventName, arm, true);
@@ -38,8 +57,12 @@ export function armBackGuardOnFirstInteraction({ history, enabled = true, target
  * lets the next back leave unless the user touches the app in between:
  * one swallowed press, then the app closes — the pattern phones use, and
  * the moment to say "press back again to close".
+ *
+ * `entryAgain` names the entry pushed back above the floor: `{ state, url }`
+ * (the session list on a phone, else the session on screen). Without it a
+ * bare app entry goes back up.
  */
-export function installBackGuard({ history, enabled = true, onFloor = null } = {}) {
+export function installBackGuard({ history, enabled = true, onFloor = null, entryAgain = null } = {}) {
   if (!enabled || !history) return null;
   const current = history.state && typeof history.state === 'object' ? history.state : {};
   // After a reload on the app's entry the floor already lies beneath it.
@@ -51,7 +74,10 @@ export function installBackGuard({ history, enabled = true, onFloor = null } = {
     /** Feed every popstate here. */
     onPopState() {
       if (!history.state?.[BACK_GUARD_FLOOR]) return;
-      history.pushState({ [BACK_GUARD_APP]: true }, '');
+      const again = typeof entryAgain === 'function' ? entryAgain() : null;
+      if (again?.state && again.url) history.pushState({ ...again.state, [BACK_GUARD_APP]: true }, '', again.url);
+      else if (again?.state) history.pushState({ ...again.state, [BACK_GUARD_APP]: true }, '');
+      else history.pushState({ [BACK_GUARD_APP]: true }, '');
       onFloor?.();
     },
   };

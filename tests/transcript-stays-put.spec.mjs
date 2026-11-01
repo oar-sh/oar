@@ -660,14 +660,18 @@ for (const [name, device] of Object.entries(DEVICES)) {
         await openConversation(page, reader.conversationId);
         await expect(page.locator("#thinking-indicator")).toHaveCount(1);
         await goToEnd(page);
+        // Long enough that the block read sits well clear of the end
+        // (over 900 px on a desktop at 100 %), whatever the density; the
+        // check below asks for only 200 px.
+        const paragraphs = 26;
         let text = "";
-        for (let step = 0; step < 14; step += 1) {
+        for (let step = 0; step < paragraphs; step += 1) {
           text += step === 3 && block === "code block"
             ? `\`\`\`js\n${Array.from({ length: 9 }, (_, line) => `const fixture${line} = ${line};`).join("\n")}\n\`\`\`\n\n`
             : `Paragraph ${step}. ${FILLER.repeat(3)}\n\n`;
         }
         await reader.stream(running, text);
-        await expect(page.locator("#thinking-indicator")).toContainText("Paragraph 13.");
+        await expect(page.locator("#thinking-indicator")).toContainText(`Paragraph ${paragraphs - 1}.`);
 
         const selector = block === "code block" ? "pre" : "p";
         const starts = block === "code block" ? "const fixture0" : "Paragraph 3.";
@@ -676,7 +680,7 @@ for (const [name, device] of Object.entries(DEVICES)) {
 
         await reloadAfter(page, reader.conversationId, () => reader.answer(running, text));
         await expect(page.locator("#thinking-indicator")).toHaveCount(0);
-        await expect(page.locator("#messages .msg.assistant").last()).toContainText("Paragraph 13.");
+        await expect(page.locator("#messages .msg.assistant").last()).toContainText(`Paragraph ${paragraphs - 1}.`);
         await expectBlockAt(page, selector, starts, read);
         await page.waitForTimeout(1_200);
         await expectBlockAt(page, selector, starts, read);
@@ -707,7 +711,8 @@ for (const [name, device] of Object.entries(DEVICES)) {
       await expect(page.locator("#thinking-indicator")).toHaveCount(0);
       await expect(page.locator("#messages .msg.assistant").last()).toContainText("Short answer.");
       await expectRowStayedPut(page, position);
-      expect(await distanceFromEnd(page)).toBeGreaterThan(150);
+      // Still the 200 px above the end set above, far from the end margin.
+      expect(await distanceFromEnd(page)).toBeGreaterThan(100);
     });
 
     test("the conversation reloads with a longer message above the reader: the row they read stays", async ({ page }) => {
@@ -997,7 +1002,9 @@ test.describe("the reader moves while something of theirs is still on its way", 
     const answered = page.waitForResponse((response) => response.url().includes("/api/relay-question/") && response.url().endsWith("/answer"));
 
     await card.locator(".relay-question-choice", { hasText: "Wait" }).click();
-    await wheelUp(page, 600);
+    // Far enough up that the card leaving below still leaves twice the 300 px
+    // checked at the end.
+    await wheelUp(page, 900);
     const position = await readingPosition(page);
     release();
     await answered;
@@ -1075,9 +1082,14 @@ test.describe("the reader moves while something of theirs is still on its way", 
     await expect(page.locator("#thinking-indicator")).toHaveCount(1);
     await goToEnd(page);
     await reader.ask(running, "Ship the release today?");
-    await reader.ask(running, "And tag it?");
+    // A long second card: what is below the first stays well clear of the
+    // end margin at any density.
+    await reader.ask(running, `And tag it? ${FILLER.repeat(3)}`);
     const cards = page.locator("#messages .relay-question-container");
     await expect(cards).toHaveCount(2);
+    // The reader follows the second card to the end before scrolling up.
+    await expectAtEnd(page);
+    await expect(cards.last()).toBeInViewport();
     // The first card at the bottom edge; the second is below and waits.
     await page.evaluate(() => {
       const el = document.getElementById("messages");
@@ -1134,7 +1146,7 @@ test.describe("the reader moves while something of theirs is still on its way", 
     expect(await distanceFromEnd(page)).toBeLessThanOrEqual(48);
 
     // Then they scroll up, the selection still held, and release it there.
-    await page.evaluate(() => { document.getElementById("messages").scrollTop -= 900; });
+    await page.evaluate(() => { document.getElementById("messages").scrollTop -= 1_300; });
     await page.waitForTimeout(400);
     const position = await readingPosition(page);
     await page.evaluate(() => window.getSelection().removeAllRanges());
@@ -1250,9 +1262,14 @@ test.describe("the send setting", () => {
     await expect(page.locator("#thinking-indicator")).toHaveCount(1);
     await goToEnd(page);
     await reader.ask(running, "Ship the release today?");
-    await reader.ask(running, "And tag it?");
+    // A long second card: what is below the first stays well clear of the
+    // end margin at any density.
+    await reader.ask(running, `And tag it? ${FILLER.repeat(3)}`);
     const cards = page.locator("#messages .relay-question-container");
     await expect(cards).toHaveCount(2);
+    // The reader follows the second card to the end before scrolling up.
+    await expectAtEnd(page);
+    await expect(cards.last()).toBeInViewport();
 
     // The reader scrolls up until the first card is at the bottom edge and
     // answers it from there: the second card is below and waits.

@@ -19,6 +19,7 @@ import {
 } from './store.js';
 import { unhideAllMessagesFromShares, updateMessageShareVisibility } from './api-client.js';
 import { jumpToPinnedMessage } from './pinned-messages-view.mjs';
+import { notifyHeaderActionsChanged } from './header-priority-actions.mjs';
 
 export const HIDDEN_MESSAGES_MODAL_KIND = 'hidden-messages';
 
@@ -113,12 +114,15 @@ function syncHiddenHeaderButton() {
   const button = document.getElementById('hidden-messages-btn');
   if (!button) return;
   const count = getConversationHiddenMessages(currentConversationId).length;
+  // Available or not; the priority+ pass places it (header or ︙).
   button.hidden = IS_SHARED_VIEW || !count;
+  button.dataset.count = IS_SHARED_VIEW ? '0' : String(count);
   const countEl = button.querySelector('.header-icon-count');
   if (countEl) countEl.textContent = count ? String(count) : '';
   const label = count ? `Hidden from shared viewers (${count})` : 'Hidden from shared viewers';
   button.setAttribute('title', label);
   button.setAttribute('aria-label', label);
+  notifyHeaderActionsChanged();
 }
 
 function hiddenModalContent() {

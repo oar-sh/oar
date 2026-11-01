@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import { expect, test } from "@playwright/test";
 
+import { HEADER_ACTIONS, isHeaderActionAvailable, waitForHeaderFit } from "./header-actions-helpers.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
  * Settings with no conversation open, on a fresh install.
  *
  * This spec boots its own relay on an empty database with no provider turned
- * on, the state a first start lands in: the ⋯ menu must work there, Settings
+ * on, the state a first start lands in: the ︙ menu must work there, Settings
  * must be reachable from it, from the empty transcript and from New Chat, and
  * nothing may create a Copilot chat as if Copilot were set up. The shared
  * read-only view keeps Day/Night only. Half way through, the relay is marked
@@ -20,11 +21,12 @@ import { startRelayServer } from "./relay-server-harness.mjs";
  * the runner, which is exactly the state the first half must not see.
  */
 
+// Day/Night and Check Usage are relay-wide too, but they are priority+
+// actions now: a header button while it fits, a ︙ twin otherwise (see
+// TWIN_ENTRIES and header-actions-helpers.mjs).
 const RELAY_WIDE_ENTRIES = [
   "chat-menu-pwa-version",
   "chat-menu-queue-status",
-  "chat-menu-theme-toggle",
-  "chat-menu-usage",
   "chat-menu-select-models",
   "chat-menu-settings",
   "chat-menu-about",
@@ -45,6 +47,10 @@ const PER_CONVERSATION_ENTRIES = [
   "chat-menu-git-changes",
   "chat-menu-kill-session",
 ];
+
+// The ︙ twins of the header's priority+ actions: shown only while their
+// header button does not fit, so the width decides which ones a menu holds.
+const TWIN_ENTRIES = Object.values(HEADER_ACTIONS).map((action) => action.menu.slice(1));
 
 const SETUP_PLACEHOLDER = "Set up a provider to start chatting";
 
@@ -143,10 +149,20 @@ for (const profile of [
     }
 
     async function expectRelayWideMenu(page) {
+      await waitForHeaderFit(page);
       await openMenu(page);
-      expect(await visibleMenuEntryIds(page)).toEqual(RELAY_WIDE_ENTRIES);
+      const visible = await visibleMenuEntryIds(page);
+      expect(visible.filter((id) => !TWIN_ENTRIES.includes(id))).toEqual(RELAY_WIDE_ENTRIES);
       for (const id of PER_CONVERSATION_ENTRIES) {
         await expect(page.locator(`#${id}`)).toBeHidden();
+      }
+      // Day/Night and Check Usage stay one tap away: in the header or in ︙.
+      for (const key of ["theme", "usage"]) {
+        expect(await isHeaderActionAvailable(page, key), key).toBe(true);
+      }
+      // A twin shows only for a header button that is not there.
+      for (const [key, action] of Object.entries(HEADER_ACTIONS)) {
+        if (visible.includes(action.menu.slice(1))) await expect(page.locator(action.inline), key).toBeHidden();
       }
     }
 
@@ -300,12 +316,22 @@ for (const profile of [
           const sharedPage = await context.newPage();
           await sharedPage.goto(`${relay.baseUrl}${sharePath}`);
           await sharedPage.waitForLoadState("networkidle");
+          // Day/Night only: in the header while it fits (and then there is no
+          // ︙ at all, the menu would be empty), else as the menu's one entry.
+          await waitForHeaderFit(sharedPage);
           const trigger = sharedPage.locator("#chat-actions-menu-btn");
-          await expect(trigger).toBeVisible();
-          await expect(trigger).toBeEnabled();
-          await (profile.touch ? trigger.tap() : trigger.click());
-          await expect(sharedPage.locator("#chat-actions-menu")).toBeVisible();
-          expect(await visibleMenuEntryIds(sharedPage)).toEqual(["chat-menu-theme-toggle"]);
+          if (await sharedPage.locator("#theme-toggle-btn").isVisible()) {
+            await expect(trigger).toBeHidden();
+            for (const key of Object.keys(HEADER_ACTIONS).filter((name) => name !== "theme")) {
+              await expect(sharedPage.locator(HEADER_ACTIONS[key].inline), key).toBeHidden();
+            }
+          } else {
+            await expect(trigger).toBeVisible();
+            await expect(trigger).toBeEnabled();
+            await (profile.touch ? trigger.tap() : trigger.click());
+            await expect(sharedPage.locator("#chat-actions-menu")).toBeVisible();
+            expect(await visibleMenuEntryIds(sharedPage)).toEqual(["chat-menu-theme-toggle"]);
+          }
           await expect(sharedPage.locator("#chat-menu-settings")).toBeHidden();
           await expect(sharedPage.locator("#settings-modal")).not.toHaveClass(/visible/);
           // None of the empty-screen actions exist in the shared view.

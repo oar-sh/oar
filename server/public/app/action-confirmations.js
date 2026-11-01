@@ -107,7 +107,7 @@ export async function confirmKillCurrentSession() {
   }
 }
 
-// ⋯ → Restart web relay first shows what the restart would wait for and
+// ︙ → Restart web relay first shows what the restart would wait for and
 // leave running (relay-restart-ui.js); its buttons land in
 // confirmRestartWebRelay below or in confirmRestartRelayNow.
 export { openRestartRelayConfirmation };

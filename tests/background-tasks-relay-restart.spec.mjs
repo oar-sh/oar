@@ -222,17 +222,17 @@ test.describe.serial("background tasks across a relay restart", () => {
       id: PLACEHOLDER_ID,
       status: "running",
       placeholder: true,
-      description: "background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)",
+      description: "background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)",
     })]);
     expect(flagged.backgroundTasks.map((task) => task.taskId)).toEqual([PLACEHOLDER_ID]);
     expect((await blockers()).filter((blocker) => blocker.kind === "background")).toEqual([
-      expect.objectContaining({ conversationId, count: 1, detail: "1 background agent: background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)" }),
+      expect.objectContaining({ conversationId, count: 1, detail: "1 background agent: background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)" }),
     ]);
 
     await unfoldTasksPanel(page);
     const placeholder = page.locator(`.bg-task-row[data-task-id="${PLACEHOLDER_ID}"]`);
     await expect(placeholder).toBeVisible({ timeout: 30_000 });
-    await expect(placeholder.locator(".bg-task-desc")).toHaveText("background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)");
+    await expect(placeholder.locator(".bg-task-desc")).toHaveText("background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)");
     await expect(placeholder.locator(".bg-task-stop"), "nothing to stop: the relay does not know the task").toHaveCount(0);
 
     // The worker's next progress update is its real set: it replaces the placeholder.

@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
+import { clickHeaderAction } from "./header-actions-helpers.mjs";
 
 /**
  * Pinned messages, against the shared e2e relay.
@@ -159,7 +160,7 @@ for (const profile of [
         await expect(pinButton(page).locator(".header-icon-count")).toHaveText("2");
 
         // The list: conversation order, role and preview, a trash per row.
-        await pinButton(page).click();
+        await clickHeaderAction(page, "pins");
         await expect(pinModal(page)).toHaveClass(/visible/);
         await expect(page.locator("#summary-modal-title")).toHaveText("📍 Pinned messages");
         await expect(page.locator("#summary-modal-subtitle")).toHaveText("2 pinned");
@@ -170,8 +171,9 @@ for (const profile of [
         await expect(rows.nth(1).locator(".pinned-row-meta")).toContainText("Agent");
         await expect(rows.nth(1).locator(".pinned-row-preview")).toContainText(`Pin the build notes ${stamp} reply`);
         const unpinBox = await rows.nth(0).locator(".pinned-row-unpin").boundingBox();
-        expect(unpinBox.width).toBeGreaterThanOrEqual(44);
-        expect(unpinBox.height).toBeGreaterThanOrEqual(44);
+        // The app-wide tap floor is 28 px (it scales with the zoom).
+        expect(unpinBox.width).toBeGreaterThanOrEqual(28);
+        expect(unpinBox.height).toBeGreaterThanOrEqual(28);
         if (profile.touch) {
           // The modal is a near-full-screen card on a phone, and its title has room.
           const dialogBox = await pinModal(page).locator(".summary-dialog").boundingBox();
@@ -189,13 +191,13 @@ for (const profile of [
         await expect(bubble(page, oldestId).locator(".msg-pinned-label")).toHaveText("📍 Pinned");
 
         // Escape closes the list like every other use of this modal.
-        await pinButton(page).click();
+        await clickHeaderAction(page, "pins");
         await expect(pinModal(page)).toHaveClass(/visible/);
         await page.keyboard.press("Escape");
         await expect(pinModal(page)).not.toHaveClass(/visible/);
 
         // 🗑 unpins: the row goes, the list stays open, the bubble offers Pin again.
-        await pinButton(page).click();
+        await clickHeaderAction(page, "pins");
         const unpinning = page.waitForResponse((response) => response.url().includes(`/message/${oldestId}/pin`));
         await rows.nth(0).locator(".pinned-row-unpin").click();
         expect((await unpinning).status()).toBe(200);
@@ -207,6 +209,9 @@ for (const profile of [
         await expect(bubble(page, oldestId).locator(".msg-pinned-label")).toHaveCount(0);
         await expect(pinButton(secondPage).locator(".header-icon-count")).toHaveText("1");
         await page.locator("#summary-modal .summary-close").click();
+        // Closing the dialog steps back over its history entry; a reload
+        // before that settles would abort.
+        await page.waitForFunction(() => !history.state?.oarOverlay);
 
         // A reload finds the pin where it was.
         await page.reload();
@@ -277,7 +282,7 @@ test("a jump to a pinned message holds while a turn is running", async ({ page, 
     await expect(page.locator("#thinking-indicator")).toBeVisible();
     await expect(bubble(page, oldestId)).toHaveCount(0);
 
-    await pinButton(page).click();
+    await clickHeaderAction(page, "pins");
     await pinModal(page).locator(".pinned-row-jump").first().click();
     await expect(bubble(page, oldestId)).toBeInViewport();
 

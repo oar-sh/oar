@@ -59,11 +59,14 @@ test('on a touch screen a tap on the bubble holds the reveal, independent of the
   assert.match(source, /document\.addEventListener\('click', handleBubbleTapReveal\);/);
 });
 
-test('the pin list keeps its title on a phone, where the shared modal gives the header to its buttons', () => {
+test('the pin list keeps its title on a phone: dialog header buttons stay compact, only Select Models gets a button row', () => {
   const store = read('./store.js');
   assert.match(store, /if \(modalEl\?\.dataset\) modalEl\.dataset\.kind = summaryModalState\.kind;/);
   assert.match(store, /if \(modal\?\.dataset\) delete modal\.dataset\.kind;/);
-  assert.match(read('../index.html'), /#summary-modal\[data-kind="pinned-messages"\] \.summary-header-actions,\s*\n\s*#summary-modal\[data-kind="hidden-messages"\] \.summary-header-actions \{\s*\n\s*width: auto;/);
+  const html = read('../index.html');
+  assert.match(html, /\.summary-header-actions \{\s*\n\s*width: auto;\s*\n\s*flex: 0 0 auto;\s*\n\s*\}/);
+  assert.doesNotMatch(html, /\.summary-header-actions \{\s*\n\s*width: 100%;\s*\n\s*justify-content: stretch;/);
+  assert.match(html, /#summary-modal\[data-kind="select-models"\] \.summary-header \{\s*\n\s*flex-wrap: wrap;/);
 });
 
 test('the header buttons are in the page hidden, 📍 then 🙈 before search, and their [hidden] is honoured', () => {

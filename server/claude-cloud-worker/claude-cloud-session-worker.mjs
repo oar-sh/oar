@@ -14,6 +14,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { resolveBuildId } from '../../shared/build-id.mjs';
 import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { installWorkerCrashGuard } from '../../shared/worker-crash-guard.mjs';
@@ -21,6 +22,7 @@ import { createClaudeCloudCredentials } from '../../shared/claude-cloud/credenti
 import { createClaudeCloudClient } from '../../shared/claude-cloud/api-client.mjs';
 import { resolveClaudeCloudBaseUrl } from '../../shared/claude-cloud/base-url.mjs';
 import { createClaudeCloudSessionRunner } from './claude-cloud-session-process.mjs';
+import { buildClaudeCloudSteeringState } from './claude-cloud-worker-steering.mjs';
 
 // Windows console launch: the launcher names the worker log, this copies
 // stdout/stderr into it. A no-op wherever the launcher redirects instead.
@@ -51,6 +53,10 @@ async function main() {
 
   const configPath = String(process.env.COPILOT_WEB_RELAY_CONFIG || '').trim()
     || path.resolve(__dirname, '..', 'config.json');
+  // The code this process started on, read once from the repo root and kept
+  // for its whole life: the relay recycles a worker whose build differs from
+  // its own, and a tree that moves on under us must not change our answer.
+  const buildId = resolveBuildId(path.resolve(__dirname, '..', '..')).id;
   const serverUrl = resolveRelayServerUrl({ configPath });
   const token = loadTokenFromConfig(configPath);
   const defaultModel = String(process.env.CLAUDE_CLOUD_RELAY_MODEL || '').trim();
@@ -101,17 +107,28 @@ async function main() {
   let heartbeatTimer = null;
   const heartbeat = createHeartbeatController({
     api,
+    buildId,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
     setHeartbeatTimer: (timer) => { heartbeatTimer = timer; },
     getActiveQueueMessageId: () => runner.getActiveQueueMessageId(),
+    // No steering here; the snapshot tells the relay when it may replace
+    // this worker: between turns, with no turn that ended here without its
+    // result, and with the cloud session idle at its last read. Anything else
+    // is cloud work whose output only this process would still publish. The
+    // cloud session lives on in the cloud; the fresh worker binds it at start
+    // and re-opens its event stream from the cursor the relay stores
+    // (runner.attachOnStart below), so the turns the session starts by
+    // itself are still followed.
+    getSteeringState: () => buildClaudeCloudSteeringState(runner),
   });
 
   const wsLink = createWorkerWebSocketLink({
     serverUrl,
     token,
     dbg,
+    buildId,
     getSessionReady: () => true,
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
@@ -144,9 +161,13 @@ async function main() {
     getActiveQueueMessageIds: () => [runner.getActiveQueueAttempt()],
   });
 
-  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} model=${defaultModel || 'default'}`);
+  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} model=${defaultModel || 'default'} build=${buildId || 'unknown'}`);
   heartbeat.startHeartbeat();
   wsLink.start();
+  // Not awaited: deliveries wait for it inside the runner, and a relay that
+  // cannot say which cloud session this is leaves the binding to the first
+  // delivery, as before.
+  runner.attachOnStart().catch((error) => dbg('cloud session attach at start failed', error?.message || String(error)));
 }
 
 main().catch((error) => {

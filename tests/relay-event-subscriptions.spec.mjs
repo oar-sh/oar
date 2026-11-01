@@ -150,7 +150,7 @@ test.describe.serial("relay event subscriptions", () => {
   test("a question on the watched session becomes an event row; chip, badge and Unsubscribe", async ({ page }) => {
     await openApp(page, watcher.conversationId);
     const chip = page.locator("#chat-title-relay-events .relay-watch-chip");
-    await expect(chip).toHaveText("👁 watching 1 session");
+    await expect(chip.locator(".chat-meta-long")).toHaveText("👁 watching 1 session");
 
     // An urgent event: no 30 s wait.
     const asked = await api("/api/relay-question", {
@@ -179,9 +179,16 @@ test.describe.serial("relay event subscriptions", () => {
     await row.locator(".relay-event-summary").click();
     await expect(row.locator(".relay-event-line").first()).toBeHidden();
 
-    // The watched session carries the badge, in the sidebar and in its header.
+    // The watched session says so: in the sidebar through the row's ⓘ (its
+    // menu names the watcher, and the row stays closed), in its header with
+    // the badge.
     const sidebarItem = page.locator(`.conv-item[data-conversation-id="${watched.conversationId}"]`);
-    await expect(sidebarItem.locator(".conv-watched-badge")).toHaveText("watched");
+    const info = sidebarItem.locator(".conv-info-btn");
+    await expect(info).toHaveAttribute("aria-label", /\bwatched\b/);
+    await info.click();
+    await expect(page.locator('.context-menu [data-menu-item="watched"]')).toHaveText(/^Watched by /);
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".context-menu")).toHaveCount(0);
     await page.evaluate((id) => window.openConversation(id), watched.conversationId);
     await expect(page.locator("#chat-title-relay-events .conv-watched-badge")).toHaveText("watched");
     await expect(page.locator("#chat-title-relay-events .relay-watch-chip")).toHaveCount(0);
@@ -195,7 +202,7 @@ test.describe.serial("relay event subscriptions", () => {
     await expect(buttons).toHaveCount(1);
     await buttons.first().click();
     await expect(page.locator("#chat-title-relay-events")).toBeHidden();
-    await expect(sidebarItem.locator(".conv-watched-badge")).toHaveCount(0);
+    await expect(sidebarItem.locator(".conv-info-btn")).toHaveCount(0);
     const left = await api("/api/relay-events/subscriptions");
     expect(left.payload.subscriptions).toEqual([]);
   });

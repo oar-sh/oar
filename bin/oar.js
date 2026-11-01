@@ -1005,7 +1005,7 @@ async function restartRelay(ctx, paths, { old, viaService, answered = true, now 
     if (!restartService(ctx)) return { ok: false, reason: 'service' };
   } else if (!(await requestShutdown(ctx, old, true, { immediate: now }))) {
     if (!viaService) {
-      logger.error('[oar] The relay did not accept the restart request. Restart it from the web UI (⋯ → Restart web relay).');
+      logger.error('[oar] The relay did not accept the restart request. Restart it from the web UI (︙ → Restart web relay).');
       return { ok: false, reason: 'restart-refused' };
     }
     if (!restartService(ctx)) return { ok: false, reason: 'service' };
@@ -1428,7 +1428,7 @@ function reportPortTaken(ctx, paths, port) {
   // cannot be asked to restart: only its lock tells that it is there.
   const pid = readRelayLock(paths.lockPath)?.pid;
   if (Number.isInteger(pid) && ctx.isProcessAliveImpl(pid)) {
-    ctx.logger.error(`[oar] A relay of this install seems to run (process ${pid}). If its token is an earlier one, restart it from its web UI (⋯ → Restart web relay), or end that process and run: oar start`);
+    ctx.logger.error(`[oar] A relay of this install seems to run (process ${pid}). If its token is an earlier one, restart it from its web UI (︙ → Restart web relay), or end that process and run: oar start`);
   }
   return { code: 1, reason: 'port-taken' };
 }

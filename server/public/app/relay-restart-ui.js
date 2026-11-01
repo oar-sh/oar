@@ -313,7 +313,7 @@ let applyState = () => {};
 let inFlight = false;
 // What an open "now" button acts on: the action shown (a queued shutdown
 // stays a shutdown) and the queued request it was shown for, or null from
-// the ⋯ menu with nothing queued. The relay refuses a request that is gone.
+// the ︙ menu with nothing queued. The relay refuses a request that is gone.
 let nowTarget = { action: 'restart', requestedAt: null };
 
 function targetFrom(state) {
@@ -379,7 +379,7 @@ async function loadPictureInto({ kind, title, subtitle, render }) {
   renderSummaryModalContent({ title, subtitle, kind, bodyHtml: render(result || {}) });
 }
 
-/** ⋯ → Restart web relay: shows what the restart would wait for first. */
+/** ︙ → Restart web relay: shows what the restart would wait for first. */
 export function openRestartRelayConfirmation() {
   nowTarget = { action: 'restart', requestedAt: null };
   const title = 'Restart web relay';

@@ -23,7 +23,7 @@ function updateEmojiButton() {
   button.textContent = getLastEmoji();
 }
 
-function closeEmojiPicker() {
+export function closeEmojiPicker() {
   const popup = document.getElementById('emoji-popup');
   if (!popup) return;
   popup.classList.remove('visible');

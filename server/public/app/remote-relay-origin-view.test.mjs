@@ -5,13 +5,14 @@ import { JSDOM } from 'jsdom';
 import {
   ORIGIN_TITLE_MAX,
   ORIGIN_TITLE_MAX_SIDEBAR,
+  conversationHeaderOriginShortText,
+  conversationOriginInfo,
   isLocalAgentOrigin,
   localAgentOriginModel,
   normalizeRemoteOrigin,
   remoteOriginBadgeText,
   remoteOriginLink,
   renderConversationHeaderOriginHtml,
-  renderConversationOriginMarkerHtml,
   renderRemoteOriginBadgeHtml,
   truncateOriginTitle,
 } from './remote-relay-origin-view.mjs';
@@ -89,14 +90,18 @@ test('only http(s) relay URLs become links, and every field renders inertly', ()
   assert.equal(link.getAttribute('href'), 'https://relay-b.example.test/?conv=%22%20onclick%3D%22x');
 });
 
-test('the sidebar marker names the relay that started the conversation', () => {
-  const body = parse(renderConversationOriginMarkerHtml({ id: 'c1', title: 'report builder', origin: ORIGIN }));
-  const marker = body.querySelector('.conv-origin-marker');
-  assert.equal(marker.textContent, '↗ win-test');
-  assert.match(marker.getAttribute('title'), /win-test/);
-  assert.equal(renderConversationOriginMarkerHtml({ id: 'c2', title: 'local' }), '');
-  assert.equal(renderConversationOriginMarkerHtml(null), '');
-  assert.equal(parse(renderConversationOriginMarkerHtml({ origin: { relayName: '<i>x</i>' } })).querySelector('i'), null);
+test('the sidebar ⓘ line names the relay that started the conversation and links to its session', () => {
+  assert.deepEqual(conversationOriginInfo({ id: 'c1', title: 'report builder', origin: ORIGIN }), {
+    kind: 'remote',
+    label: 'Started by an agent on relay “win-test”',
+    href: 'https://relay-a.example.test/?conv=conv-a',
+  });
+  // No relay URL, or the shared view: the line without a link.
+  assert.equal(conversationOriginInfo({ id: 'c1', origin: { relayName: 'linux-test' } }).href, '');
+  assert.equal(conversationOriginInfo({ id: 'c1', origin: ORIGIN }, { linkable: false }).href, '');
+  assert.equal(conversationOriginInfo({ id: 'c1', origin: { ...ORIGIN, relayUrl: 'javascript:alert(1)' } }).href, '');
+  assert.equal(conversationOriginInfo({ id: 'c2', title: 'local' }), null);
+  assert.equal(conversationOriginInfo(null), null);
 });
 
 // ─── An agent on this relay (origin.local) ───────────────────────────────────
@@ -132,14 +137,11 @@ test('only `local: true` makes an origin a local one', () => {
 test('an origin without `local` renders exactly as before, whatever else is passed', () => {
   const conversation = { id: 'c1', title: 'report builder', origin: ORIGIN };
   const list = { 'conv-a': { id: 'conv-a', title: 'report builder' } };
-  assert.equal(
-    renderConversationOriginMarkerHtml(conversation, { conversations: list }),
-    renderConversationOriginMarkerHtml(conversation),
+  assert.deepEqual(
+    conversationOriginInfo(conversation, { conversations: list }),
+    conversationOriginInfo(conversation),
   );
-  assert.equal(
-    renderConversationOriginMarkerHtml(conversation),
-    '<span class="conv-origin-marker" title="Started by an agent on relay win-test">↗ win-test</span>',
-  );
+  assert.equal(conversationOriginInfo(conversation).kind, 'remote');
   assert.equal(renderRemoteOriginBadgeHtml(ORIGIN, { conversations: list }), renderRemoteOriginBadgeHtml(ORIGIN));
   assert.equal(remoteOriginBadgeText(ORIGIN, { conversations: list }), remoteOriginBadgeText(ORIGIN));
   assert.equal(renderConversationHeaderOriginHtml(conversation, { conversations: list }), '');
@@ -193,58 +195,69 @@ test('the marker shows the orchestrating conversation\'s current title', () => {
   assert.equal(long.fullTitle, 'y'.repeat(90));
 });
 
-test('the sidebar marker of a local origin opens the orchestrating conversation', () => {
-  const body = parse(renderConversationOriginMarkerHtml(CREATED, { conversations: LIST }));
-  const marker = body.querySelector('button.conv-origin-marker.conv-origin-agent');
-  assert.ok(marker, 'a button, not a link to another relay');
-  assert.equal(body.querySelector('a'), null);
-  assert.equal(marker.getAttribute('type'), 'button');
-  assert.equal(marker.textContent, 'via agent · “release checklist”');
-  assert.equal(marker.dataset.originConversationId, 'conv-lead');
-  assert.equal(marker.getAttribute('onclick'), 'openOriginConversation(event, this)');
-  assert.equal(marker.getAttribute('title'), 'Started by an agent in “release checklist”. Opens that conversation.');
-  // This relay's own name is not what the marker shows.
-  assert.doesNotMatch(marker.textContent, /win-test/);
+test('the sidebar ⓘ line of a local origin opens the orchestrating conversation', () => {
+  assert.deepEqual(conversationOriginInfo(CREATED, { conversations: LIST }), {
+    kind: 'local',
+    label: 'Started by an agent in “release checklist”',
+    conversationId: 'conv-lead',
+    linkable: true,
+  });
+  // No link to another relay, even with a relay URL in the origin.
+  assert.equal('href' in conversationOriginInfo(CREATED, { conversations: LIST }), false);
 });
 
-test('the sidebar marker is plain text once the orchestrating conversation is gone', () => {
+test('the sidebar ⓘ line is plain text once the orchestrating conversation is gone', () => {
   for (const options of [{ conversations: { 'conv-made': CREATED } }, {}, { conversations: LIST, linkable: false }]) {
-    const body = parse(renderConversationOriginMarkerHtml(CREATED, options));
-    assert.equal(body.querySelector('button'), null);
-    assert.equal(body.querySelector('a'), null);
-    const marker = body.querySelector('span.conv-origin-marker.conv-origin-agent');
-    assert.equal(marker.textContent, 'via agent · “release checklist”');
-    assert.equal(marker.getAttribute('title'), 'Started by an agent in “release checklist”.');
-    assert.equal(marker.hasAttribute('onclick'), false);
+    const info = conversationOriginInfo(CREATED, options);
+    assert.equal(info.linkable, false);
+    assert.equal(info.label, 'Started by an agent in “release checklist”');
   }
-  const untitled = parse(renderConversationOriginMarkerHtml({ id: 'c9', origin: { local: true } }));
-  assert.equal(untitled.querySelector('.conv-origin-marker').textContent, 'via agent');
-  assert.equal(untitled.querySelector('.conv-origin-marker').getAttribute('title'), 'Started by an agent in another conversation on this relay.');
+  assert.equal(conversationOriginInfo({ id: 'c9', origin: { local: true } }).label, 'Started by an agent in another conversation');
+  // Never a link to the conversation the line sits on.
+  assert.equal(conversationOriginInfo({ id: 'conv-lead', origin: LOCAL_ORIGIN }, { conversations: LIST }).linkable, false);
 });
 
-test('the sidebar cuts the title shorter than the header does', () => {
-  const title = 'a rather long conversation title that would push the date out of the row';
+test('the ⓘ line carries the whole title; the header cuts it, its tooltip does not, the phone\'s label cuts it shorter', () => {
+  const title = 'a rather long conversation title that would push the date out of the row and further';
+  assert.ok(title.length > ORIGIN_TITLE_MAX, 'long enough to be cut anywhere it is cut');
   const list = { ...LIST, 'conv-lead': { id: 'conv-lead', title } };
-  const sidebar = parse(renderConversationOriginMarkerHtml(CREATED, { conversations: list })).querySelector('button');
-  const header = parse(renderConversationHeaderOriginHtml(CREATED, { conversations: list })).querySelector('button');
-  assert.equal(sidebar.textContent, `via agent · “${truncateOriginTitle(title, ORIGIN_TITLE_MAX_SIDEBAR)}”`);
-  assert.equal(header.textContent, `via agent · “${truncateOriginTitle(title, ORIGIN_TITLE_MAX)}”`);
-  assert.ok(sidebar.textContent.length < header.textContent.length);
+  const sidebar = conversationOriginInfo(CREATED, { conversations: list }).label;
+  // The full title is reachable from the ⓘ menu: its line is not cut.
+  assert.equal(sidebar, `Started by an agent in “${title}”`);
+  const marker = parse(renderConversationHeaderOriginHtml(CREATED, { conversations: list })).querySelector('button.conv-origin-agent');
+  assert.equal(marker.querySelector('.chat-meta-long').textContent, `via agent · “${truncateOriginTitle(title, ORIGIN_TITLE_MAX)}”`);
   // The tooltip carries the whole title.
-  assert.match(sidebar.getAttribute('title'), new RegExp(title));
+  assert.equal(marker.getAttribute('title'), `Started by an agent in “${title}”. Opens that conversation.`);
+  assert.equal(marker.querySelector('.chat-meta-short').textContent, `↗ ${truncateOriginTitle(title, ORIGIN_TITLE_MAX_SIDEBAR)}`);
+  // A title stored with the origin (its conversation gone) is whole too.
+  const gone = conversationOriginInfo({ ...CREATED, origin: { ...LOCAL_ORIGIN, conversationTitle: title } }, {});
+  assert.equal(gone.label, `Started by an agent in “${title}”`);
 });
 
 test('the header marker exists for a local origin only', () => {
   const header = parse(renderConversationHeaderOriginHtml(CREATED, { conversations: LIST })).querySelector('button.conv-origin-agent');
-  assert.equal(header.textContent, 'via agent · “release checklist”');
+  // A long label (desktop) and a short one (the phone's meta row); CSS picks.
+  assert.equal(header.querySelector('.chat-meta-long').textContent, 'via agent · “release checklist”');
+  assert.equal(header.querySelector('.chat-meta-short').textContent, '↗ release checklist');
   assert.equal(header.dataset.originConversationId, 'conv-lead');
   assert.equal(header.classList.contains('conv-origin-marker'), false);
   const gone = parse(renderConversationHeaderOriginHtml(CREATED, { conversations: {} }));
   assert.equal(gone.querySelector('button'), null);
-  assert.equal(gone.querySelector('span.conv-origin-agent').textContent, 'via agent · “release checklist”');
+  assert.equal(gone.querySelector('span.conv-origin-agent .chat-meta-long').textContent, 'via agent · “release checklist”');
+  assert.equal(gone.querySelector('span.conv-origin-agent .chat-meta-short').textContent, '↗ release checklist');
   for (const conversation of [null, {}, { id: 'c1' }, { id: 'c1', origin: null }, { id: 'c1', origin: ORIGIN }]) {
     assert.equal(renderConversationHeaderOriginHtml(conversation, { conversations: LIST }), '');
   }
+});
+
+test('the short header label is "↗ title", or "↗ agent" without a title', () => {
+  assert.equal(conversationHeaderOriginShortText(localAgentOriginModel(LOCAL_ORIGIN, { conversations: LIST })), '↗ release checklist');
+  assert.equal(conversationHeaderOriginShortText(localAgentOriginModel({ local: true })), '↗ agent');
+  assert.equal(conversationHeaderOriginShortText(null), '');
+  // Escaped like the long one.
+  const html = renderConversationHeaderOriginHtml({ id: 'c2', origin: { local: true, conversationTitle: '<b>x</b>' } }, { conversations: {} });
+  assert.ok(html.includes('↗ &lt;b&gt;x&lt;/b&gt;'));
+  assert.ok(!html.includes('<b>'));
 });
 
 test('a local agent\'s message badge reads "via agent" and opens the conversation', () => {
@@ -274,11 +287,12 @@ test('every field of a local origin renders inertly', () => {
     model: '<b>m</b>',
   };
   const list = { [hostile.conversationId]: { id: hostile.conversationId, title: '<i>live</i> "title"' } };
+  // The ⓘ line is plain text (the menu sets it as text): the id stays the id.
+  assert.equal(conversationOriginInfo({ id: 'c1', origin: hostile }, { conversations: list }).conversationId, hostile.conversationId);
   for (const html of [
-    renderConversationOriginMarkerHtml({ id: 'c1', origin: hostile }, { conversations: list }),
     renderConversationHeaderOriginHtml({ id: 'c1', origin: hostile }, { conversations: list }),
     renderRemoteOriginBadgeHtml(hostile, { conversations: list }),
-    renderConversationOriginMarkerHtml({ id: 'c1', origin: hostile }),
+    renderConversationHeaderOriginHtml({ id: 'c1', origin: hostile }),
     renderRemoteOriginBadgeHtml(hostile),
   ]) {
     const body = parse(html);

@@ -20,6 +20,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { resolveBuildId } from '../../shared/build-id.mjs';
 import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import {
   createRunnerLinkBridge,
@@ -52,6 +53,10 @@ async function main() {
 
   const configPath = String(process.env.COPILOT_WEB_RELAY_CONFIG || '').trim()
     || path.resolve(__dirname, '..', 'config.json');
+  // The code this process started on, read once from the repo root and kept
+  // for its whole life: the relay recycles a worker whose build differs from
+  // its own, and a tree that moves on under us must not change our answer.
+  const buildId = resolveBuildId(path.resolve(__dirname, '..', '..')).id;
   // Two reads of the same small file. Collapsing them to one would mean
   // re-implementing `resolveRelayServerUrl`'s env override, host
   // normalisation and port defaulting inside this worker — a live contract
@@ -129,6 +134,7 @@ async function main() {
   let heartbeatTimer = null;
   heartbeat = createHeartbeatController({
     api,
+    buildId,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
@@ -158,6 +164,7 @@ async function main() {
     serverUrl,
     token,
     dbg,
+    buildId,
     getSessionReady: () => true,
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
@@ -238,7 +245,7 @@ async function main() {
     getActiveQueueMessageIds: () => turnRunner.getActiveQueueMessageIds(),
   });
 
-  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}`);
+  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'} build=${buildId || 'unknown'}`);
   heartbeat.startHeartbeat();
   wsLink.start();
 }

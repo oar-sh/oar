@@ -1,16 +1,17 @@
 // Provenance of work another relay's agent started here: the badge on a user
 // bubble ("↗ from win-test · “report builder” · claude-sonnet-5", linking back
-// to the source session) and the "↗ win-test" marker on the sidebar row of a
+// to the source session) and the line in the sidebar row's ⓘ menu of a
 // conversation such an agent created. Both read the `origin` the relay stores
 // with the message or conversation (docs/plans/2026-09-27-remote-relays.md §4).
 //
 // An agent on THIS relay can start sessions too. Such an origin carries
-// `local: true` and names the conversation the agent runs in: the marker then
-// reads "via agent · “title”" and opens that conversation inside the app
+// `local: true` and names the conversation the agent runs in: the header
+// marker then reads "via agent · “title”" and opens that conversation inside the app
 // (window.openOriginConversation, journal-view.js) instead of linking to
 // another relay. An origin without `local` renders exactly as before.
 
 import { remoteConversationUrl } from './remote-relay-shared.mjs';
+import { chatMetaLabelHtml } from './chat-header-meta.mjs';
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -81,8 +82,8 @@ export function localAgentOriginModel(origin, {
 
 // A button while the orchestrating conversation can be opened, plain text
 // otherwise. `tooltip` is a full sentence.
-function localAgentElementHtml(model, { className, text = model.text, tooltip }) {
-  const label = escapeHtml(text);
+function localAgentElementHtml(model, { className, text = model.text, tooltip, labelHtml = null }) {
+  const label = labelHtml ?? escapeHtml(text);
   if (model.linkable) {
     return `<button type="button" class="${className}" data-origin-conversation-id="${escapeHtml(model.conversationId)}" title="${escapeHtml(`${tooltip} Opens that conversation.`)}" onclick="openOriginConversation(event, this)">${label}</button>`;
   }
@@ -159,34 +160,51 @@ export function renderRemoteOriginBadgeHtml(origin, { linkable = true, conversat
 }
 
 /**
- * The sidebar marker for a conversation an agent created: "↗ win-test" for
- * another relay's agent, "via agent · “title”" for one on this relay.
+ * The line of the sidebar row's ⓘ menu for a conversation an agent created,
+ * or null. Plain text, for the menu to escape:
+ * - an agent on this relay: `{ kind: 'local', label: 'Started by an agent in
+ *   “title”', conversationId, linkable }` with the whole title, never cut;
+ *   while linkable, the line opens that conversation;
+ * - another relay's agent: `{ kind: 'remote', label: 'Started by an agent on
+ *   relay “name”', href }`; with an href, the line opens its session there.
+ * `linkable: false` (the shared view) gives lines without an action.
  */
-export function renderConversationOriginMarkerHtml(conversation, { conversations = null, linkable = true } = {}) {
-  const local = localAgentOriginModel(conversation?.origin, {
-    conversations,
-    linkable,
-    ownId: conversation?.id,
-    maxTitleLength: ORIGIN_TITLE_MAX_SIDEBAR,
-  });
+export function conversationOriginInfo(conversation, { conversations = null, linkable = true } = {}) {
+  const local = localAgentOriginModel(conversation?.origin, { conversations, linkable, ownId: conversation?.id });
   if (local) {
-    return localAgentElementHtml(local, {
-      className: 'conv-origin-marker conv-origin-agent',
-      tooltip: startedByTooltip(local),
-    });
+    return {
+      kind: 'local',
+      // The whole title: the menu wraps its lines, and nothing else in the
+      // list shows it.
+      label: local.fullTitle ? `Started by an agent in “${local.fullTitle}”` : 'Started by an agent in another conversation',
+      conversationId: local.conversationId,
+      linkable: local.linkable,
+    };
   }
   const normalized = normalizeRemoteOrigin(conversation?.origin);
-  if (!normalized) return '';
-  const name = escapeHtml(normalized.relayName);
-  return `<span class="conv-origin-marker" title="Started by an agent on relay ${name}">↗ ${name}</span>`;
+  if (!normalized) return null;
+  return {
+    kind: 'remote',
+    label: `Started by an agent on relay “${normalized.relayName}”`,
+    href: linkable !== false ? remoteOriginLink(normalized) : '',
+  };
+}
+
+/** The phone's short header label: "↗ title" (the sidebar's length), or "↗ agent". */
+export function conversationHeaderOriginShortText(model) {
+  if (!model) return '';
+  const title = truncateOriginTitle(model.fullTitle, ORIGIN_TITLE_MAX_SIDEBAR);
+  return title ? `↗ ${title}` : '↗ agent';
 }
 
 /**
  * The same marker for the conversation header, with room for more of the
- * title. Only a local origin has one; '' for everything else.
+ * title. Only a local origin has one; '' for everything else. It carries a
+ * long and a short label (chat-header-meta.mjs); CSS shows one of them.
  */
 export function renderConversationHeaderOriginHtml(conversation, { conversations = null, linkable = true } = {}) {
   const local = localAgentOriginModel(conversation?.origin, { conversations, linkable, ownId: conversation?.id });
   if (!local) return '';
-  return localAgentElementHtml(local, { className: 'conv-origin-agent', tooltip: startedByTooltip(local) });
+  const labelHtml = chatMetaLabelHtml(escapeHtml(local.text), escapeHtml(conversationHeaderOriginShortText(local)));
+  return localAgentElementHtml(local, { className: 'conv-origin-agent', tooltip: startedByTooltip(local), labelHtml });
 }

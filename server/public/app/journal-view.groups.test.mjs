@@ -112,15 +112,19 @@ test('a group lists its head first with a fold button and a pill, the members in
   const member = document.querySelector('[data-conversation-id="conv-tests"]');
   assert.ok(member.classList.contains('conv-group-member'));
   assert.equal(member.dataset.groupId, GROUP);
-  // The member's "via agent" marker is left out under its own creator's head.
-  assert.equal(member.querySelector('.conv-origin-marker'), null);
+  // The member's origin is left out under its own creator's head: no ⓘ.
+  assert.equal(member.querySelector('.conv-info-btn'), null);
   // The hand-made group has no head row in the list: a synthetic head, folded
   // (nothing runs), a plain row whose fold button is the control.
   const hand = syntheticHead(HAND);
   assert.equal(hand.getAttribute('role'), null);
   assert.equal(hand.getAttribute('aria-label'), null);
-  assert.equal(hand.querySelector('.conv-title').textContent.trim(), '▸Sample batch');
-  assert.equal(hand.querySelector('.conv-group-summary').textContent, '1 session');
+  assert.equal(hand.querySelector('.conv-title').textContent.trim(), '›Sample batch');
+  // Its meta line says when its newest row was active and how many it has; no
+  // pill while idle. The date reads in the reader's locale, so the expected
+  // text comes from the same formatter.
+  assert.equal(hand.querySelector('.conv-meta-primary').textContent, `${store.fmtDate('2031-01-05T10:00:00.000Z')} · 1 session`);
+  assert.equal(hand.querySelector('.conv-group-summary'), null);
   assert.equal(document.querySelector('[data-conversation-id="conv-hand-1"]'), null);
 });
 
@@ -166,18 +170,80 @@ test('a waiting card in a folded member shows first on the head; its pill opens 
   window.openConversation = async () => {};
 });
 
-test('the group that holds the open chat stays open and its fold button says so', async () => {
+test('a folded group still shows its open chat under the head; the fold button works; leaving the chat folds it fully', async () => {
   store.setCurrentConv('conv-tests');
   journal.renderConvList();
-  assert.deepEqual(listed(), ['conv-lead', 'conv-docs', 'conv-tests', 'conv-solo', `group:${HAND}`]);
+  assert.deepEqual(listed(), ['conv-lead', 'conv-tests', 'conv-solo', `group:${HAND}`], 'folded, the open chat kept');
+  assert.ok(document.querySelector('[data-conversation-id="conv-tests"]').classList.contains('conv-group-member'));
   const fold = foldOf(GROUP);
-  assert.equal(fold.disabled, true);
-  assert.match(fold.getAttribute('aria-label'), /its chat is open/);
+  assert.equal(fold.disabled, false);
+  assert.equal(fold.getAttribute('aria-expanded'), 'false');
+  assert.equal(fold.getAttribute('aria-label'), 'Unfold group');
   click(fold);
-  assert.deepEqual(JSON.parse(localStorage.getItem('copilot_conv_group_folds')), { [GROUP]: 'folded', [HAND]: 'folded' }, 'the choice is untouched');
+  assert.deepEqual(listed(), ['conv-lead', 'conv-docs', 'conv-tests', 'conv-solo', `group:${HAND}`]);
+  click(foldOf(GROUP));
+  assert.deepEqual(listed(), ['conv-lead', 'conv-tests', 'conv-solo', `group:${HAND}`], 'folded with its chat open');
+  assert.deepEqual(JSON.parse(localStorage.getItem('copilot_conv_group_folds')), { [GROUP]: 'folded', [HAND]: 'folded' });
+  store.setCurrentConv('conv-solo');
+  journal.renderConvList();
+  assert.deepEqual(listed(), ['conv-lead', 'conv-solo', `group:${HAND}`], 'another chat open: the group folds fully');
   store.setCurrentConv(null);
   journal.renderConvList();
+});
+
+test('the fold-all button folds every group while one is open, and unfolds them all once all are folded', async () => {
+  globalThis.toggleAllConversationGroupFolds = journal.toggleAllConversationGroupFolds;
+  const button = document.getElementById('conv-groups-fold-all');
+  assert.equal(button.hidden, false);
+  assert.equal(button.textContent, '➕');
+  assert.equal(button.getAttribute('aria-label'), 'Unfold all groups');
+  click(button);
+  assert.deepEqual(listed(), ['conv-lead', 'conv-docs', 'conv-tests', 'conv-solo', `group:${HAND}`, 'conv-hand-1']);
+  assert.deepEqual(JSON.parse(localStorage.getItem('copilot_conv_group_folds')), { [GROUP]: 'open', [HAND]: 'open' });
+  assert.equal(button.textContent, '➖');
+  assert.equal(button.getAttribute('aria-label'), 'Fold all groups');
+  // One group open is enough for ➖.
+  click(foldOf(HAND));
+  assert.equal(button.textContent, '➖');
+  click(button);
   assert.deepEqual(listed(), ['conv-lead', 'conv-solo', `group:${HAND}`]);
+  assert.deepEqual(JSON.parse(localStorage.getItem('copilot_conv_group_folds')), { [GROUP]: 'folded', [HAND]: 'folded' });
+  assert.equal(button.textContent, '➕');
+  // A filter holds every group open: the button waits.
+  journal.setConversationListFilter('tests');
+  await flush();
+  assert.equal(button.disabled, true);
+  journal.setConversationListFilter('');
+  await flush();
+  assert.equal(button.disabled, false);
+});
+
+test('the Archived view keeps its fold choices apart from the live list', () => {
+  const live = localStorage.getItem('copilot_conv_group_folds');
+  store.setConversationGroupFoldChoice(GROUP, 'open', { archived: true });
+  store.setConversationGroupFoldChoices([GROUP, HAND], 'open', { archived: true });
+  assert.deepEqual(store.readConversationGroupFoldChoices({ archived: true }), { [GROUP]: 'open', [HAND]: 'open' });
+  assert.equal(localStorage.getItem('copilot_conv_group_folds'), live, 'the live choices are untouched');
+  assert.deepEqual(store.readConversationGroupFoldChoices(), { [GROUP]: 'folded', [HAND]: 'folded' });
+  localStorage.removeItem('copilot_conv_group_folds_archived');
+});
+
+test('the group name takes its rows\' colour: waiting, working, ready, else plain', () => {
+  const toneOf = () => headRow('conv-lead').dataset.groupTone;
+  const handTone = () => syntheticHead(HAND).dataset.groupTone;
+  journal.renderConvList();
+  assert.equal(toneOf(), 'working', 'a member runs');
+  assert.equal(handTone(), 'offline', 'nothing online');
+  store.conversations['conv-hand-1'].runtimeSessionUiState = 'ready';
+  journal.renderConvList();
+  assert.equal(handTone(), 'ready', 'a member is ready');
+  store.relayQuestions.set('q-2', { id: 'q-2', conversationId: 'conv-tests', status: 'pending', prompt: 'Which tag?' });
+  journal.renderConvList();
+  assert.equal(toneOf(), 'question', 'a member waits for the user');
+  store.relayQuestions.delete('q-2');
+  delete store.conversations['conv-hand-1'].runtimeSessionUiState;
+  journal.renderConvList();
+  assert.equal(handTone(), 'offline');
 });
 
 test('a title filter shows a matching member under its head as context, and opens every listed group', async () => {
@@ -198,7 +264,7 @@ test('a name given by hand shows on the head row; the filter finds it', async ()
   groups[GROUP].displayName = 'Night batch';
   await journal.refreshConversations({ preservePagination: false });
   const head = headRow('conv-lead');
-  assert.equal(head.querySelector('.conv-title').textContent.trim(), '▸Night batch');
+  assert.equal(head.querySelector('.conv-title').textContent.trim(), '›Night batch');
   assert.equal(head.querySelector('.conv-title').getAttribute('title'), 'Night batch · Release lead');
   journal.setConversationListFilter('night');
   await flush();
@@ -208,7 +274,7 @@ test('a name given by hand shows on the head row; the filter finds it', async ()
   groups[GROUP].name = null;
   groups[GROUP].displayName = 'Release lead';
   await journal.refreshConversations({ preservePagination: false });
-  assert.equal(headRow('conv-lead').querySelector('.conv-title').textContent.trim(), '▸Release lead');
+  assert.equal(headRow('conv-lead').querySelector('.conv-title').textContent.trim(), '›Release lead');
 });
 
 test('the row menus carry the group entries: the head its actions, a member leave and move, a lone chat add', async () => {
@@ -334,7 +400,7 @@ test('a group change event is applied in place: the name, the membership, the en
     memberships: { 'conv-solo': { groupId: GROUP, role: 'member' } },
   }), 'in-place');
   assert.equal(document.querySelector('[data-conversation-id="conv-solo"]').classList.contains('conv-group-member'), true);
-  assert.equal(headRow('conv-lead').querySelector('.conv-title').textContent.trim(), '▾Night batch');
+  assert.equal(headRow('conv-lead').querySelector('.conv-title').textContent.trim(), '›Night batch');
   // The group's hand order, when the relay sends it, lands on the records.
   journal.applyConversationGroupEvent({
     groupId: GROUP,
@@ -493,7 +559,7 @@ test('an owner\'s group an agent emptied shows as an empty group with its menu, 
     assert.ok(head, 'the kept group shows');
     assert.ok(head.classList.contains('conv-group-empty'));
     assert.equal(head.querySelector('.conv-title').textContent.trim(), 'Kept batch');
-    assert.equal(head.querySelector('.conv-meta-primary').textContent.trim(), 'group · empty');
+    assert.equal(head.querySelector('.conv-meta-primary').textContent.trim(), '0 sessions');
     assert.equal(head.querySelector('[data-group-fold]'), null, 'nothing to fold');
     // In the list like a group head (its place by time is the arranger's, tested there).
     assert.ok(listed().includes(`group:${KEPT}`));

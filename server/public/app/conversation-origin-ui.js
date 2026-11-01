@@ -6,7 +6,23 @@
 // marker is all there is), and neither has one a person started.
 
 import { conversations, currentConvId, IS_SHARED_VIEW } from './store.js';
-import { renderConversationHeaderOriginHtml } from './remote-relay-origin-view.mjs';
+import { conversationOriginInfo, renderConversationHeaderOriginHtml } from './remote-relay-origin-view.mjs';
+
+/**
+ * The ︙ entry that stands in for the line where the meta line is hidden
+ * (phone landscape): `{ label: 'Started by an agent in “title”',
+ * conversationId }` while the line is a button that opens that conversation,
+ * else null.
+ */
+export function conversationOriginMenuEntry() {
+  if (IS_SHARED_VIEW) return null;
+  const id = String(currentConvId || '').trim();
+  const conversation = id ? (conversations[id] || null) : null;
+  if (!conversation) return null;
+  const info = conversationOriginInfo(conversation, { conversations, linkable: true });
+  if (!info || info.kind !== 'local' || !info.linkable || !info.conversationId) return null;
+  return { label: info.label, conversationId: info.conversationId };
+}
 
 let renderedHtml = '';
 

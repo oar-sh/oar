@@ -257,6 +257,23 @@ function backupsRow(backups, formatDateTime) {
 }
 
 /**
+ * The running workers and how many still run the code before the last deploy
+ * (the relay recycles those once idle): "14, all on this build", "14, 3 on an
+ * older build", or the bare count when the relay cannot tell. Empty when no
+ * worker runs, so the row is left out.
+ */
+export function workersBuildText(workers) {
+  const total = finite(workers?.total) || 0;
+  if (total <= 0) return '';
+  const count = formatCount(total);
+  // Number(null) is 0: an unknown count must not read as "all on this build".
+  const other = workers?.onOtherBuild === null || workers?.onOtherBuild === undefined ? null : finite(workers.onOtherBuild);
+  if (other === null) return count;
+  if (other <= 0) return total === 1 ? `${count}, on this build` : `${count}, all on this build`;
+  return `${count}, ${formatCount(other)} on an older build`;
+}
+
+/**
  * @param {object} about the GET /api/about payload
  * @param {object} [options]
  * @param {(iso: string) => string} [options.formatDateTime]
@@ -270,8 +287,10 @@ export function buildAboutModalHtml(about = {}, {
 
   const commit = String(about.commit || '').trim();
   const install = about.installMethod === 'git-checkout' ? 'git checkout' : (about.installMethod === 'npm-global' ? 'npm package' : '');
+  const workersText = workersBuildText(about.workers);
   sections.push(section('build', 'OAR', table([
     row('Version', esc(about.version || '–'), install ? { hint: install } : {}),
+    ...(workersText ? [row('Workers', esc(workersText))] : []),
     ...(commit ? [row('Commit', `<code>${esc(commit.slice(0, 7))}</code>`, { title: commit })] : []),
     row('Started', esc(about.startedAt ? formatDateTime(about.startedAt) : '–')),
     row('Uptime', esc(formatUptime(about.uptimeSeconds))),

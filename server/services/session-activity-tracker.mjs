@@ -83,7 +83,7 @@ export function resolveBootReportingWindowMs(env = process.env, log = () => {}) 
 export const UNREPORTED_BACKGROUND_TASK_ID = 'unreported-background-work';
 // It stays until the worker reports, and a worker on older code never does
 // for a task that prints nothing: the way out is the session's Kill session.
-export const UNREPORTED_BACKGROUND_TASK_DESCRIPTION = 'background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)';
+export const UNREPORTED_BACKGROUND_TASK_DESCRIPTION = 'background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)';
 // A `running` background run row that its worker's task set does not list
 // and nothing has updated for this long is not running work (see
 // `runListedByWorker`).

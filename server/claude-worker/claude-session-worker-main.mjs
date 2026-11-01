@@ -14,6 +14,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { resolveBuildId } from '../../shared/build-id.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
 import { resolveDeliveredThinking } from '../../shared/claude-thinking.mjs';
@@ -59,6 +60,10 @@ export async function runClaudeSessionWorker({
 
   const configPath = String(process.env.COPILOT_WEB_RELAY_CONFIG || '').trim()
     || path.resolve(__dirname, '..', 'config.json');
+  // The code this process started on, read once from the repo root and kept
+  // for its whole life: the relay recycles a worker whose build differs from
+  // its own, and a tree that moves on under us must not change our answer.
+  const buildId = resolveBuildId(path.resolve(__dirname, '..', '..')).id;
   const serverUrl = resolveRelayServerUrl({ configPath });
   const token = loadTokenFromConfig(configPath);
   const cwd = String(process.env.COPILOT_WORKSPACE_ROOT || '').trim() || process.cwd();
@@ -143,6 +148,7 @@ export async function runClaudeSessionWorker({
   let heartbeatTimer = null;
   heartbeat = createHeartbeatController({
     api,
+    buildId,
     // What this worker runs on: the relay hands it only rows of that billing.
     workerKind: turnRunner.workerKind,
     pollMs: HEARTBEAT_MS,
@@ -191,6 +197,7 @@ export async function runClaudeSessionWorker({
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
     workerKind: turnRunner.workerKind,
+    buildId,
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
       const deliveredTimeout = Number(pending?.settings?.backgroundTaskTimeoutMs);
@@ -263,7 +270,7 @@ export async function runClaudeSessionWorker({
     onBeforeExit: () => { try { turnRunner.shutdown({ graceful: false }); } catch {} },
   });
 
-  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}${backend ? ` backend=${backend.id}` : ''}`);
+  dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}${backend ? ` backend=${backend.id}` : ''} build=${buildId || 'unknown'}`);
   heartbeat.startHeartbeat();
   wsLink.start();
 }

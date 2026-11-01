@@ -1,0 +1,1058 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { createWorkerRecycleService, isWorkerOnOtherBuild, RECYCLE_HOLDS } from './worker-recycle-service.mjs';
+import { sweepArchivedWorkers } from './worker-recycle-service.mjs';
+import { createWorkerReplacementFence } from './worker-replacement.mjs';
+import { createKeyedMutex } from './keyed-mutex-service.mjs';
+
+const RELAY = '0.9.21+0123456789ab';
+const OLD = '0.9.20+fedcba987654';
+
+// A controllable clock: timers fire only when the test advances it.
+function createClock(start = CLOCK_START) {
+  let current = start;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => current,
+    setTimeout: (fn, ms) => {
+      const id = nextId++;
+      const timer = { id, at: current + Math.max(0, Number(ms) || 0), fn, unrefed: false, unref() { this.unrefed = true; return this; } };
+      timers.set(id, timer);
+      return timer;
+    },
+    clearTimeout: (timer) => { if (timer) timers.delete(timer.id); },
+    pending: () => Array.from(timers.values()),
+    async advance(ms) {
+      const target = current + ms;
+      for (;;) {
+        const due = Array.from(timers.values()).filter((timer) => timer.at <= target).sort((a, b) => a.at - b.at)[0];
+        if (!due) break;
+        timers.delete(due.id);
+        current = Math.max(current, due.at);
+        due.fn();
+        await flush();
+      }
+      current = target;
+      await flush();
+    },
+  };
+}
+
+async function flush() {
+  for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+const CLOCK_START = Date.parse('2026-10-30T12:00:00.000Z');
+// Started well before the clock: past the absent-build-id grace.
+const LONG_AGO = new Date(CLOCK_START - 3_600_000).toISOString();
+
+function worker(sid, extra = {}) {
+  return { sdkSessionId: sid, pid: 100, status: 'ready', kind: 'claude', buildId: OLD, startedAt: LONG_AGO, steering: { releasable: true }, ...extra };
+}
+
+function setup({
+  workers = [],
+  relayBuildId = RELAY,
+  heartbeated = () => true,
+  running = () => false,
+  archived = () => false,
+  stop = null,
+  launch = null,
+  options = {},
+} = {}) {
+  const clock = createClock();
+  const registry = new Map(workers.map((entry) => [entry.sdkSessionId, entry]));
+  const calls = [];
+  const logs = [];
+  const warns = [];
+  let nextPid = 500;
+  const defaultStop = async (sid) => { registry.delete(sid); return { ok: true }; };
+  const defaultLaunch = async (sid) => {
+    nextPid += 1;
+    registry.set(sid, worker(sid, { pid: nextPid, buildId: RELAY }));
+    return { ok: true };
+  };
+  const service = createWorkerRecycleService({
+    relayBuildId,
+    listWorkers: () => Array.from(registry.values()),
+    getWorker: (sid) => registry.get(sid) || null,
+    hasRunningTurn: (sid) => running(sid),
+    hasHeartbeated: (sid) => heartbeated(sid),
+    isArchived: (sid) => archived(sid),
+    stopWorker: async (sid, opts) => {
+      calls.push(opts ? ['stop', sid, opts] : ['stop', sid]);
+      return (stop || defaultStop)(sid, opts, { registry });
+    },
+    launchWorker: async (sid) => {
+      calls.push(['launch', sid]);
+      return (launch || defaultLaunch)(sid, { registry, defaultLaunch });
+    },
+    now: clock.now,
+    setTimeoutImpl: clock.setTimeout,
+    clearTimeoutImpl: clock.clearTimeout,
+    minStartGapMs: 0,
+    logger: { log: (line) => logs.push(line), warn: (line) => warns.push(line) },
+    ...options,
+  });
+  return { service, clock, registry, calls, logs, warns };
+}
+
+test('stale: an absent build id only once the worker heartbeated; a different id; never an equal id', () => {
+  let beat = false;
+  const app = setup({ heartbeated: () => beat });
+  const { isStale } = app.service;
+  assert.equal(isStale(worker('a', { buildId: null })), false, 'a booting worker that has not spoken is left alone');
+  beat = true;
+  assert.equal(isStale(worker('a', { buildId: null })), true);
+  assert.equal(isStale(worker('a', { buildId: OLD })), true);
+  assert.equal(isStale(worker('a', { buildId: RELAY })), false);
+  assert.equal(isStale(worker('a', { status: 'processing' })), true);
+  assert.equal(isStale(worker('a', { status: 'starting' })), false);
+  assert.equal(isStale(worker('a', { pid: null })), false);
+  assert.equal(isStale(null), false);
+});
+
+test('an absent build id counts only once the entry is nullBuildIdGraceMs old; a different id needs no grace', () => {
+  const app = setup({ heartbeated: () => true });
+  const { isStale } = app.service;
+  const ago = (ms) => new Date(CLOCK_START - ms).toISOString();
+  assert.equal(isStale(worker('a', { buildId: null, startedAt: ago(10_000) })), false, 'a fresh launch has not said hello yet');
+  assert.equal(isStale(worker('a', { buildId: null, startedAt: ago(31_000) })), true);
+  assert.equal(isStale(worker('a', { buildId: null, startedAt: CLOCK_START - 31_000 })), true, 'epoch ms read too');
+  assert.equal(isStale(worker('a', { buildId: null, startedAt: null })), false, 'no start time, no age');
+  assert.equal(isStale(worker('a', { buildId: OLD, startedAt: ago(1_000) })), true);
+  assert.equal(isStale(worker('a', { buildId: OLD, startedAt: null })), true);
+  const strict = setup({ heartbeated: () => true, options: { nullBuildIdGraceMs: 60_000 } });
+  assert.equal(strict.service.isStale(worker('a', { buildId: null, startedAt: ago(31_000) })), false);
+});
+
+test('a relay with no build id recycles nothing and says so once at start', async () => {
+  const app = setup({ relayBuildId: '', workers: [worker('sid-a'), worker('sid-b', { buildId: null })] });
+  assert.equal(app.service.isStale(worker('sid-a')), false);
+  app.service.start();
+  app.service.start();
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.warns, ['[worker-recycle] relay build id unknown; workers are not recycled']);
+  assert.equal(app.clock.pending().length, 0);
+  assert.deepEqual(app.service.status(), { relayBuildId: null, staleCount: 0, inFlight: 0, recycled: 0, waiting: [], skipped: [] });
+});
+
+test('an idle stale worker is stopped, then relaunched, with both log lines', async () => {
+  const app = setup({ workers: [worker('sid-aaaaaaaa-1', { pid: 321 }), worker('sid-bbbbbbbb-2', { buildId: RELAY })] });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-aaaaaaaa-1'], ['launch', 'sid-aaaaaaaa-1']]);
+  assert.deepEqual(app.logs, [
+    `[worker-recycle] recycling sid-aaaa kind=claude from=${OLD} to=${RELAY}`,
+    '[worker-recycle] recycled sid-aaaa pid 321→501',
+  ]);
+  assert.equal(app.service.status().recycled, 1);
+  assert.equal(app.service.status().staleCount, 0);
+});
+
+test('a worker that states no build id logs from=none, and a launch with no pid yet logs pending', async () => {
+  const app = setup({
+    workers: [worker('sid-cccccccc', { buildId: null, kind: null })],
+    launch: async () => ({ ok: true }),
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.logs, [
+    `[worker-recycle] recycling sid-cccc kind=unknown from=none to=${RELAY}`,
+    '[worker-recycle] recycled sid-cccc pid 100→pending',
+  ]);
+});
+
+test('waits while the session owns a running turn or the worker holds, logging once per interval', async () => {
+  const holds = [
+    ['sid-turn', { steering: { releasable: true } }, 'turn'],
+    ['sid-question', { steering: { releasable: false, releaseHold: 'question' } }, 'question'],
+    ['sid-compaction', { steering: { releasable: false, releaseHold: 'compaction' } }, 'compaction'],
+    ['sid-background', { steering: { releasable: false, releaseHold: 'background', backgroundTaskCount: 2 } }, 'background'],
+    ['sid-busy-old', { steering: { turnActive: true } }, 'turn'],
+    ['sid-old-question', { steering: { turnActive: true, holdReason: 'question' } }, 'question'],
+    ['sid-no-snapshot', { steering: null, status: 'processing' }, 'turn'],
+  ];
+  const app = setup({
+    workers: holds.map(([sid, extra]) => worker(sid, extra)),
+    running: (sid) => sid === 'sid-turn',
+    options: { waitLogEveryMs: 60_000 },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.service.status().waiting, holds.map(([sdkSessionId, , hold]) => ({ sdkSessionId, hold })));
+  assert.deepEqual(app.logs, holds.map(([sid, , hold]) => `[worker-recycle] waiting ${sid.slice(0, 8)}: ${hold}`));
+
+  await app.clock.advance(30_000);
+  await app.service.sweep();
+  assert.equal(app.logs.length, holds.length, 'no repeat within the interval');
+  await app.clock.advance(30_000);
+  await app.service.sweep();
+  assert.equal(app.logs.length, holds.length * 2);
+
+  // The hold ends: the next sweep recycles, and the session no longer waits.
+  app.registry.set('sid-question', worker('sid-question'));
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-question'], ['launch', 'sid-question']]);
+  assert.equal(app.service.status().waiting.some((entry) => entry.sdkSessionId === 'sid-question'), false);
+});
+
+test('an archived session\'s stale worker is stopped kill-blocked and never relaunched', async () => {
+  const app = setup({ workers: [worker('sid-archived-1', { pid: 77 })], archived: (sid) => sid === 'sid-archived-1' });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-archived-1', { keepKilled: true }]]);
+  assert.deepEqual(app.logs, ['[worker-recycle] stopped sid-arch (archived)']);
+  await app.clock.advance(120_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.service.status().recycled, 0);
+});
+
+test('an archived session waits for its hold like any other', async () => {
+  const app = setup({
+    workers: [worker('sid-archived-2', { steering: { releasable: false, releaseHold: 'background' } })],
+    archived: () => true,
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-archived-2', hold: 'background' }]);
+});
+
+test('at most maxInFlight recycles at once; the rest wait for a free slot', async () => {
+  const releases = [];
+  const app = setup({
+    workers: [worker('sid-1'), worker('sid-2'), worker('sid-3')],
+    stop: (sid, opts, { registry }) => new Promise((resolve) => {
+      releases.push(() => { registry.delete(sid); resolve({ ok: true }); });
+    }),
+    options: { maxInFlight: 2 },
+  });
+  const first = app.service.sweep();
+  await flush();
+  assert.deepEqual(app.calls, [['stop', 'sid-1'], ['stop', 'sid-2']]);
+  assert.equal(app.service.status().inFlight, 2);
+  void app.service.sweep();
+  await flush();
+  assert.equal(app.calls.length, 2, 'a sweep with both slots taken starts nothing');
+  releases.shift()();
+  await flush();
+  assert.equal(app.service.status().inFlight, 1);
+  const second = app.service.sweep();
+  await flush();
+  assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-1', 'stop:sid-2', 'launch:sid-1', 'stop:sid-3']);
+  releases.shift()();
+  releases.shift()();
+  await Promise.all([first, second]);
+  assert.equal(app.service.status().recycled, 3);
+  assert.equal(app.service.status().inFlight, 0);
+});
+
+test('one start per minStartGapMs on the relay: the next stale worker goes to a later sweep', async () => {
+  const app = setup({ workers: [worker('sid-1'), worker('sid-2'), worker('sid-3')], options: { minStartGapMs: 3_000 } });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-1'], ['launch', 'sid-1']]);
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 2);
+  await app.clock.advance(2_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(2), [['stop', 'sid-2'], ['launch', 'sid-2']]);
+});
+
+test('a launch waits for the gap after another launch even when its stop was slow', async () => {
+  let releaseSlowStop = null;
+  const app = setup({
+    workers: [worker('sid-slow'), worker('sid-fast')],
+    stop: (sid, opts, { registry }) => {
+      if (sid !== 'sid-slow') { registry.delete(sid); return { ok: true }; }
+      return new Promise((resolve) => { releaseSlowStop = () => { registry.delete(sid); resolve({ ok: true }); }; });
+    },
+    options: { minStartGapMs: 3_000 },
+  });
+  void app.service.sweep();
+  await flush();
+  await app.clock.advance(3_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-slow', 'stop:sid-fast', 'launch:sid-fast']);
+  await app.clock.advance(500);
+  releaseSlowStop();
+  await flush();
+  assert.equal(app.calls.length, 3, 'the slow one waits out the gap after the fast launch');
+  await app.clock.advance(2_499);
+  assert.equal(app.calls.length, 3);
+  await app.clock.advance(1);
+  assert.deepEqual(app.calls.at(-1), ['launch', 'sid-slow']);
+});
+
+test('a failing stop backs off, doubling to the cap, and warns once naming the session after stuckAfter failures', async () => {
+  const app = setup({
+    workers: [worker('sid-stuck-session')],
+    stop: async () => ({ ok: false, error: 'worker-survived-stop' }),
+    options: { retryBaseMs: 1_000, retryMaxMs: 4_000, stuckAfter: 3 },
+  });
+  const stops = () => app.calls.filter(([kind]) => kind === 'stop').length;
+  await app.service.sweep();
+  assert.equal(stops(), 1);
+  await app.clock.advance(999);
+  await app.service.sweep();
+  assert.equal(stops(), 1, 'in backoff');
+  await app.clock.advance(1);
+  await app.service.sweep();
+  assert.equal(stops(), 2);
+  await app.clock.advance(1_999);
+  await app.service.sweep();
+  assert.equal(stops(), 2);
+  await app.clock.advance(1);
+  await app.service.sweep();
+  assert.equal(stops(), 3);
+  assert.equal(app.warns.length, 1);
+  assert.match(app.warns[0], /^\[worker-recycle\] session sid-stuck-session is stuck: 3 recycle attempts failed \(last: stop: worker-survived-stop\)/);
+  // Capped at retryMaxMs from here on, and no further warning.
+  for (let i = 0; i < 3; i += 1) {
+    await app.clock.advance(3_999);
+    await app.service.sweep();
+    const before = stops();
+    await app.clock.advance(1);
+    await app.service.sweep();
+    assert.equal(stops(), before + 1);
+  }
+  assert.equal(app.warns.length, 1);
+  assert.equal(app.calls.some(([kind]) => kind === 'launch'), false);
+  assert.match(app.logs.find((line) => line.includes('failed')), /^\[worker-recycle\] stop failed sid-stuc \(1\): worker-survived-stop; retrying in 1s$/);
+});
+
+test('a failed launch is retried after the backoff without a second stop; success resets the failures', async () => {
+  let launchOk = false;
+  const app = setup({
+    workers: [worker('sid-launch', { pid: 42 })],
+    launch: async (sid, { defaultLaunch }) => (launchOk ? defaultLaunch(sid) : { ok: false, error: 'spawn-failed' }),
+    options: { retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-launch'], ['launch', 'sid-launch']]);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 2, 'in backoff');
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.at(-1), ['launch', 'sid-launch']);
+  launchOk = true;
+  await app.clock.advance(2_000);
+  await app.service.sweep();
+  assert.equal(app.calls.filter(([kind]) => kind === 'stop').length, 1);
+  assert.equal(app.logs.at(-1), '[worker-recycle] recycled sid-laun pid 42→501');
+  assert.equal(app.service.status().recycled, 1);
+});
+
+test('a launch owed is dropped when another path brought a new worker up meanwhile', async () => {
+  const app = setup({
+    workers: [worker('sid-primed', { pid: 42 })],
+    launch: async () => ({ ok: false, error: 'spawn-failed' }),
+    options: { retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  app.registry.set('sid-primed', worker('sid-primed', { pid: 900, buildId: RELAY }));
+  await app.clock.advance(5_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 2);
+});
+
+test('one recycle per pid: an entry the stop left behind is never stopped again; a new pid is judged by its own id', async () => {
+  const app = setup({
+    workers: [worker('sid-pid', { pid: 42 })],
+    // The stop went through but a late heartbeat re-listed the old pid, and
+    // the launch keeps failing.
+    stop: async () => ({ ok: true }),
+    launch: async () => ({ ok: false, error: 'spawn-failed' }),
+    options: { retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-pid'], ['launch', 'sid-pid']]);
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(2), [['launch', 'sid-pid']], 'pid 42 is not stopped twice; only the launch is retried');
+
+  app.registry.set('sid-pid', worker('sid-pid', { pid: 43, buildId: RELAY }));
+  await app.clock.advance(2_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 3, 'a new pid on the relay\'s build is left alone, and the launch owed is over');
+
+  app.registry.set('sid-pid', worker('sid-pid', { pid: 44, buildId: OLD }));
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(3), [['stop', 'sid-pid'], ['launch', 'sid-pid']]);
+});
+
+test('one recycle per session per relay build: a new process still on another build is named once and left alone', async () => {
+  const app = setup({
+    workers: [worker('sid-tree-1', { pid: 42 })],
+    // The relaunched worker runs from another tree: it states the old id.
+    launch: async (sid, { registry }) => {
+      registry.set(sid, worker(sid, { pid: 43, buildId: OLD }));
+      return { ok: true };
+    },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-tree-1'], ['launch', 'sid-tree-1']]);
+  assert.equal(app.service.isStale(app.registry.get('sid-tree-1')), false);
+  assert.equal(app.service.status().staleCount, 0);
+  for (let i = 0; i < 3; i += 1) {
+    await app.clock.advance(60_000);
+    await app.service.sweep();
+  }
+  assert.equal(app.calls.length, 2, 'not recycled again under this build');
+  assert.deepEqual(app.warns, [
+    `[worker-recycle] sid-tree still on ${OLD} after a recycle under ${RELAY}: the worker tree differs from the relay's; not recycled again under this build`,
+  ]);
+  assert.deepEqual(app.service.status().skipped, [{ sdkSessionId: 'sid-tree-1', buildId: OLD }]);
+  assert.equal(app.service.status().recycled, 1);
+});
+
+test('a new process that states no build id after a recycle gets the same skip and its own warning', async () => {
+  const app = setup({
+    workers: [worker('sid-tree-2', { pid: 42 })],
+    launch: async (sid, { registry }) => {
+      registry.set(sid, worker(sid, { pid: 43, buildId: null }));
+      return { ok: true };
+    },
+  });
+  await app.service.sweep();
+  await app.service.sweep();
+  await app.service.sweep();
+  assert.equal(app.calls.length, 2);
+  assert.equal(app.warns.length, 1);
+  assert.match(app.warns[0], /^\[worker-recycle\] sid-tree still states no build id after a recycle under /);
+  assert.deepEqual(app.service.status().skipped, [{ sdkSessionId: 'sid-tree-2', buildId: null }]);
+});
+
+test('a session recycled under one relay build is eligible again under the next', async () => {
+  const registry = new Map([['sid-next', worker('sid-next', { pid: 42 })]]);
+  const calls = [];
+  const build = (relayBuildId) => createWorkerRecycleService({
+    relayBuildId,
+    listWorkers: () => Array.from(registry.values()),
+    getWorker: (sid) => registry.get(sid) || null,
+    hasHeartbeated: () => true,
+    stopWorker: async (sid) => { calls.push(['stop', sid, relayBuildId]); return { ok: true }; },
+    launchWorker: async (sid) => {
+      calls.push(['launch', sid, relayBuildId]);
+      registry.set(sid, worker(sid, { pid: 100 + calls.length, buildId: OLD }));
+      return { ok: true };
+    },
+    minStartGapMs: 0,
+    logger: { log() {}, warn() {} },
+  });
+  const underA = build(RELAY);
+  await underA.sweep();
+  await underA.sweep();
+  assert.equal(calls.length, 2);
+  // The next deploy: a new relay process, a new build id.
+  const underB = build('0.9.22+aaaaaaaaaaaa');
+  assert.equal(underB.isStale(registry.get('sid-next')), true);
+  await underB.sweep();
+  assert.deepEqual(calls.slice(2).map(([kind, , id]) => `${kind}:${id}`), ['stop:0.9.22+aaaaaaaaaaaa', 'launch:0.9.22+aaaaaaaaaaaa']);
+});
+
+test('a callback that throws counts as that step\'s failure; sweep never rejects', async () => {
+  const probe = setup({
+    workers: [worker('sid-probe')],
+    running: () => { throw new Error('db locked'); },
+    options: { retryBaseMs: 1_000 },
+  });
+  await probe.service.sweep();
+  assert.deepEqual(probe.calls, [], 'never stopped on a guess');
+  assert.match(probe.logs[0], /probe failed sid-prob \(1\): db locked/);
+
+  const archivedProbe = setup({ workers: [worker('sid-arch')], archived: () => { throw new Error('db locked'); } });
+  await archivedProbe.service.sweep();
+  assert.deepEqual(archivedProbe.calls, []);
+
+  const stopThrows = setup({
+    workers: [worker('sid-throw')],
+    stop: async () => { throw new Error('boom'); },
+    options: { retryBaseMs: 1_000 },
+  });
+  await stopThrows.service.sweep();
+  assert.match(stopThrows.logs.at(-1), /stop failed sid-thro \(1\): boom/);
+  await stopThrows.clock.advance(1_000);
+  await stopThrows.service.sweep();
+  assert.equal(stopThrows.calls.length, 2);
+
+  const launchThrows = setup({ workers: [worker('sid-lthrow')], launch: async () => { throw new Error('no tmux'); } });
+  await launchThrows.service.sweep();
+  assert.match(launchThrows.logs.at(-1), /launch failed sid-lthr \(1\): no tmux/);
+
+  const heartbeatThrows = setup({ heartbeated: () => { throw new Error('x'); } });
+  assert.equal(heartbeatThrows.service.isStale(worker('sid-hb', { buildId: null })), false);
+
+  const listThrows = setup();
+  const service = createWorkerRecycleService({
+    relayBuildId: RELAY,
+    listWorkers: () => { throw new Error('registry gone'); },
+    stopWorker: async () => ({ ok: true }),
+    launchWorker: async () => ({ ok: true }),
+    logger: { log() {}, warn: (line) => listThrows.warns.push(line) },
+  });
+  await service.sweep();
+  assert.equal(service.status().staleCount, 0);
+  assert.match(listThrows.warns[0], /cannot list workers: registry gone/);
+});
+
+test('status() reports the relay id, the stale count, the recycles in flight and done, and who waits on what', async () => {
+  let releaseStop = null;
+  const app = setup({
+    workers: [
+      worker('sid-wait', { steering: { releasable: false, releaseHold: 'question' } }),
+      worker('sid-go'),
+      worker('sid-fresh', { buildId: RELAY }),
+    ],
+    stop: (sid, opts, { registry }) => new Promise((resolve) => { releaseStop = () => { registry.delete(sid); resolve({ ok: true }); }; }),
+  });
+  assert.deepEqual(app.service.status(), { relayBuildId: RELAY, staleCount: 2, inFlight: 0, recycled: 0, waiting: [], skipped: [] });
+  const swept = app.service.sweep();
+  await flush();
+  assert.deepEqual(app.service.status(), {
+    relayBuildId: RELAY,
+    staleCount: 2,
+    inFlight: 1,
+    recycled: 0,
+    waiting: [{ sdkSessionId: 'sid-wait', hold: 'question' }],
+    skipped: [],
+  });
+  releaseStop();
+  await swept;
+  assert.deepEqual(app.service.status(), {
+    relayBuildId: RELAY,
+    staleCount: 1,
+    inFlight: 0,
+    recycled: 1,
+    waiting: [{ sdkSessionId: 'sid-wait', hold: 'question' }],
+    skipped: [],
+  });
+});
+
+test('start() sweeps every interval on an unref\'d timer, and stop() ends it', async () => {
+  const app = setup({ workers: [worker('sid-timer')], options: { sweepIntervalMs: 15_000 } });
+  app.service.start();
+  const [timer] = app.clock.pending();
+  assert.equal(timer.unrefed, true);
+  await app.clock.advance(14_999);
+  assert.deepEqual(app.calls, []);
+  await app.clock.advance(1);
+  assert.deepEqual(app.calls, [['stop', 'sid-timer'], ['launch', 'sid-timer']]);
+  app.registry.set('sid-timer', worker('sid-timer', { pid: 7 }));
+  app.service.stop();
+  assert.equal(app.clock.pending().length, 0);
+  await app.clock.advance(60_000);
+  assert.equal(app.calls.length, 2);
+});
+
+test('while started, a recycle put off for the gap comes as soon as the gap ends, not a whole interval later', async () => {
+  const app = setup({
+    workers: [worker('sid-1'), worker('sid-2'), worker('sid-3')],
+    options: { sweepIntervalMs: 15_000, minStartGapMs: 3_000 },
+  });
+  app.service.start();
+  await app.clock.advance(15_000);
+  assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-1', 'launch:sid-1']);
+  await app.clock.advance(3_000);
+  assert.deepEqual(app.calls.slice(2).map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-2', 'launch:sid-2']);
+  await app.clock.advance(3_000);
+  assert.deepEqual(app.calls.slice(4).map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-3', 'launch:sid-3']);
+  app.service.stop();
+  assert.equal(app.clock.pending().length, 0);
+});
+
+// The replacement fence: from the moment a recycle passes its holds until
+// its launch is done, no delivery reaches the old process.
+test('the fence is up for the old pid from the hold check through the launch, and only for that pid', async () => {
+  const fence = createWorkerReplacementFence();
+  let releaseStop = null;
+  const app = setup({
+    workers: [worker('sid-fence', { pid: 321 })],
+    stop: (sid, opts, { registry }) => new Promise((resolve) => { releaseStop = () => { registry.delete(sid); resolve({ ok: true }); }; }),
+    options: { fence },
+  });
+  const swept = app.service.sweep();
+  // Raised synchronously by the sweep, before any await: nothing can slip in
+  // between the hold check and the stop.
+  assert.equal(fence.isHeld('sid-fence', 321), true);
+  await flush();
+  assert.deepEqual(app.calls, [['stop', 'sid-fence']]);
+  assert.equal(fence.isHeld('sid-fence', 321), true, 'held while the stop runs');
+  assert.equal(fence.isHeld('sid-fence', 999), false, 'another pid of the session is never fenced');
+  assert.equal(fence.isHeld('sid-other', 321), false);
+  releaseStop();
+  await swept;
+  assert.deepEqual(app.calls, [['stop', 'sid-fence'], ['launch', 'sid-fence']]);
+  assert.equal(fence.isHeld('sid-fence', 321), false, 'released once the launch is done');
+  assert.deepEqual(fence.list(), []);
+});
+
+test('a stop that fails lowers the fence: the old worker keeps serving its session', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-fence-stop', { pid: 322 })],
+    stop: async () => ({ ok: false, error: 'worker-survived-stop' }),
+    options: { fence },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-fence-stop', 322), false);
+});
+
+test('a failed launch keeps the fence up through the backoff; the retry\'s launch lowers it', async () => {
+  const fence = createWorkerReplacementFence();
+  let launchOk = false;
+  const app = setup({
+    workers: [worker('sid-fence-launch', { pid: 323 })],
+    launch: async (sid, { defaultLaunch }) => (launchOk ? defaultLaunch(sid) : { ok: false, error: 'spawn-failed' }),
+    options: { fence, retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-fence-launch', 323), true, 'the old pid is gone; the fence waits for the retry');
+  launchOk = true;
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.map(([kind]) => kind), ['stop', 'launch', 'launch']);
+  assert.equal(fence.isHeld('sid-fence-launch', 323), false);
+});
+
+test('a launch owed that another path ended lowers the fence too', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-fence-primed', { pid: 324 })],
+    launch: async () => ({ ok: false, error: 'spawn-failed' }),
+    options: { fence, retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-fence-primed', 324), true);
+  app.registry.set('sid-fence-primed', worker('sid-fence-primed', { pid: 901, buildId: RELAY }));
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-fence-primed', 324), false);
+});
+
+// The launch must not kill a worker another path brought up meanwhile.
+test('a new pid in the registry between the stop and the launch ends the job: no launch, counted as recycled', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-raced-1', { pid: 42 })],
+    // The stop goes through; the primer (a delivery) starts a worker before
+    // the recycle's launch slot comes.
+    stop: async (sid, opts, { registry }) => {
+      registry.delete(sid);
+      registry.set(sid, worker(sid, { pid: 900, buildId: RELAY }));
+      return { ok: true };
+    },
+    options: { fence },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-raced-1']], 'launchWorker is not called');
+  assert.equal(app.service.status().recycled, 1);
+  assert.equal(fence.isHeld('sid-raced-1', 42), false);
+  assert.equal(app.logs.at(-1), '[worker-recycle] recycled sid-race pid 42→900 (started elsewhere)');
+  // Recycled under this build: the session is not touched again.
+  app.registry.set('sid-raced-1', worker('sid-raced-1', { pid: 901, buildId: OLD }));
+  await app.service.sweep();
+  assert.equal(app.calls.length, 1);
+});
+
+test('a new pid that comes up while the launch waits for its slot is kept, not killed', async () => {
+  let releaseSlowStop = null;
+  const app = setup({
+    workers: [worker('sid-slow', { pid: 43 }), worker('sid-fast')],
+    stop: (sid, opts, { registry }) => {
+      if (sid !== 'sid-slow') { registry.delete(sid); return { ok: true }; }
+      return new Promise((resolve) => { releaseSlowStop = () => { registry.delete(sid); resolve({ ok: true }); }; });
+    },
+    options: { minStartGapMs: 3_000 },
+  });
+  void app.service.sweep();
+  await flush();
+  await app.clock.advance(3_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-slow', 'stop:sid-fast', 'launch:sid-fast']);
+  // The slow stop ends; its launch waits out the gap after the fast launch.
+  await app.clock.advance(500);
+  releaseSlowStop();
+  await flush();
+  // Meanwhile the primer brings sid-slow's new worker up.
+  await app.clock.advance(1_000);
+  app.registry.set('sid-slow', worker('sid-slow', { pid: 902, buildId: RELAY }));
+  await app.clock.advance(1_500);
+  assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-slow', 'stop:sid-fast', 'launch:sid-fast'], 'pid 902 is not killed by a second launch');
+  assert.equal(app.service.status().recycled, 2);
+  assert.equal(app.service.status().inFlight, 0);
+});
+
+// The launch re-checks the archive, and the stop and the launch run under the
+// relay's launch mutex.
+test('a session archived between the stop and the launch is not relaunched and stays killed', async () => {
+  let archivedNow = false;
+  const app = setup({
+    workers: [worker('sid-late-archive', { pid: 55 })],
+    archived: () => archivedNow,
+    stop: async (sid, opts, { registry }) => { registry.delete(sid); archivedNow = true; return { ok: true }; },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-late-archive']], 'no launch: the stop\'s killed marker is left in place');
+  assert.equal(app.logs.at(-1), '[worker-recycle] stopped sid-late (archived)');
+  assert.equal(app.service.status().recycled, 0);
+  await app.clock.advance(120_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 1, 'and no launch owed is retried');
+});
+
+test('the stop and the launch run under the launch mutex, one exclusive section per recycle', async () => {
+  const order = [];
+  const app = setup({
+    workers: [worker('sid-mutex')],
+    stop: async (sid, opts, { registry }) => { order.push('stop'); registry.delete(sid); return { ok: true }; },
+    launch: async (sid, { defaultLaunch }) => { order.push('launch'); return defaultLaunch(sid); },
+    options: {
+      runExclusive: async (sid, fn) => {
+        order.push(`lock:${sid}`);
+        try { return await fn(); } finally { order.push(`unlock:${sid}`); }
+      },
+    },
+  });
+  await app.service.sweep();
+  assert.deepEqual(order, ['lock:sid-mutex', 'stop', 'launch', 'unlock:sid-mutex']);
+});
+
+test('a recycle waits for a Change CWD relaunch holding the mutex, and leaves the worker that relaunch started alone', async () => {
+  const mutex = createKeyedMutex({ warn() {} });
+  const fence = createWorkerReplacementFence();
+  const order = [];
+  const app = setup({
+    workers: [worker('sid-cwd', { pid: 60 })],
+    options: { fence, runExclusive: (sid, fn) => mutex.runExclusive(sid, fn) },
+  });
+  let finishRelaunch = null;
+  const relaunch = mutex.runExclusive('sid-cwd', () => new Promise((resolve) => {
+    finishRelaunch = () => {
+      // The relaunch replaced the worker under the mutex.
+      app.registry.set('sid-cwd', worker('sid-cwd', { pid: 61, buildId: RELAY }));
+      order.push('relaunched');
+      resolve();
+    };
+  }));
+  const swept = app.service.sweep();
+  await flush();
+  assert.deepEqual(app.calls, [], 'nothing stopped while the relaunch holds the mutex');
+  assert.equal(fence.isHeld('sid-cwd', 60), true);
+  finishRelaunch();
+  await relaunch;
+  await swept;
+  assert.deepEqual(order, ['relaunched']);
+  assert.deepEqual(app.calls, [], 'the fresh worker is not the one judged stale: not stopped');
+  assert.equal(fence.isHeld('sid-cwd', 60), false);
+});
+
+test('the launch retry after a failed launch runs under the mutex too', async () => {
+  const locks = [];
+  let launchOk = false;
+  const app = setup({
+    workers: [worker('sid-retry-lock', { pid: 70 })],
+    launch: async (sid, { defaultLaunch }) => (launchOk ? defaultLaunch(sid) : { ok: false, error: 'spawn-failed' }),
+    options: {
+      retryBaseMs: 1_000,
+      runExclusive: async (sid, fn) => { locks.push(sid); return fn(); },
+    },
+  });
+  await app.service.sweep();
+  launchOk = true;
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(locks, ['sid-retry-lock', 'sid-retry-lock']);
+  assert.equal(app.service.status().recycled, 1);
+});
+
+// A stale worker is recycled only once its CLI child is gone; a worker that
+// does not say waits out quietMs since the session's last delivery.
+test('cliAlive true holds the worker (cli); cliAlive false lets it go', async () => {
+  const app = setup({
+    workers: [
+      worker('sid-cli-alive', { steering: { releasable: true, cliAlive: true } }),
+      worker('sid-cli-gone', { steering: { releasable: true, cliAlive: false } }),
+    ],
+    // Recent activity counts for nothing once the worker reports its child.
+    options: { quietSince: () => CLOCK_START - 1_000 },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-cli-gone'], ['launch', 'sid-cli-gone']]);
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-cli-alive', hold: 'cli' }]);
+  assert.ok(app.logs.includes('[worker-recycle] waiting sid-cli-: cli'));
+});
+
+test('a worker that does not report cliAlive waits for quietMs since the last delivery (quiet)', async () => {
+  const lastDelivery = new Map([
+    ['sid-quiet-5', CLOCK_START - 5 * 60_000],
+    ['sid-quiet-11', CLOCK_START - 11 * 60_000],
+  ]);
+  const app = setup({
+    workers: [worker('sid-quiet-5'), worker('sid-quiet-11')],
+    options: { quietSince: (sid) => lastDelivery.get(sid) ?? null },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-quiet-11'], ['launch', 'sid-quiet-11']]);
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-quiet-5', hold: 'quiet' }]);
+  assert.ok(app.logs.includes('[worker-recycle] waiting sid-quie: quiet'));
+  // Ten minutes after the delivery, the quiet one goes too.
+  await app.clock.advance(5 * 60_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(2), [['stop', 'sid-quiet-5'], ['launch', 'sid-quiet-5']]);
+});
+
+test('no queue rows: the quiet window starts at the worker\'s start, else when the service first saw it', async () => {
+  const ago = (ms) => new Date(CLOCK_START - ms).toISOString();
+  const app = setup({
+    workers: [
+      worker('sid-new-start', { startedAt: ago(5 * 60_000) }),
+      worker('sid-old-start', { startedAt: ago(11 * 60_000) }),
+      worker('sid-no-start', { startedAt: null }),
+    ],
+    options: { quietSince: () => null },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-old-start'], ['launch', 'sid-old-start']]);
+  assert.deepEqual(app.service.status().waiting.map(({ hold }) => hold), ['quiet', 'quiet']);
+  await app.clock.advance(10 * 60_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(2).map(([kind, sid]) => `${kind}:${sid}`).sort(), [
+    'launch:sid-new-start', 'launch:sid-no-start', 'stop:sid-new-start', 'stop:sid-no-start',
+  ]);
+});
+
+test('a quietSince that throws is a probe failure: nothing is stopped on a guess', async () => {
+  const app = setup({
+    workers: [worker('sid-quiet-throws')],
+    options: { quietSince: () => { throw new Error('db locked'); } },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.match(app.logs[0], /probe failed sid-quie \(1\): db locked/);
+});
+
+test('the hold names include cli and quiet', () => {
+  assert.deepEqual(RECYCLE_HOLDS, ['turn', 'question', 'compaction', 'background', 'cli', 'quiet']);
+});
+
+test('isWorkerOnOtherBuild: a different or absent build id is another build; an equal one is not; an unknown relay id compares nothing', () => {
+  assert.equal(isWorkerOnOtherBuild({ buildId: OLD }, RELAY), true);
+  assert.equal(isWorkerOnOtherBuild({ buildId: null }, RELAY), true);
+  assert.equal(isWorkerOnOtherBuild({}, RELAY), true);
+  assert.equal(isWorkerOnOtherBuild({ buildId: ` ${RELAY} ` }, RELAY), false);
+  assert.equal(isWorkerOnOtherBuild({ buildId: OLD }, null), false);
+  assert.equal(isWorkerOnOtherBuild({ buildId: null }, ''), false);
+  assert.equal(isWorkerOnOtherBuild(null, RELAY), false);
+});
+
+// The archived sweep at relay start, over fakes: which sessions are archived,
+// which have a live process, and the stop.
+function archivedSweepSetup({ archivedIds = [], live = [], stillArchived = () => true, stop = null, options = {} } = {}) {
+  const calls = [];
+  const logs = [];
+  const warns = [];
+  const liveSet = new Set(live);
+  return {
+    calls,
+    logs,
+    warns,
+    run: () => sweepArchivedWorkers({
+      listArchivedSessionIds: () => archivedIds,
+      hasLiveProcess: async (sid) => { calls.push(['probe', sid]); return liveSet.has(sid); },
+      isArchived: stillArchived,
+      stopWorker: async (sid, opts) => {
+        calls.push(['stop', sid, opts]);
+        return stop ? stop(sid, opts) : { ok: true };
+      },
+      logger: { log: (line) => logs.push(line), warn: (line) => warns.push(line) },
+      ...options,
+    }),
+  };
+}
+
+test('archived sweep: an archived session\'s live worker is stopped for good; one with no process is left alone', async () => {
+  const app = archivedSweepSetup({ archivedIds: ['sid-archived-live', 'sid-archived-gone'], live: ['sid-archived-live', 'sid-in-use'] });
+  const result = await app.run();
+  assert.deepEqual(result, { stopped: ['sid-archived-live'], failed: [] });
+  assert.deepEqual(app.calls, [
+    ['probe', 'sid-archived-live'],
+    ['stop', 'sid-archived-live', { keepKilled: true }],
+    ['probe', 'sid-archived-gone'],
+  ]);
+  // The live worker of a session not on the list is never looked at.
+  assert.equal(app.calls.some(([, sid]) => sid === 'sid-in-use'), false);
+  assert.deepEqual(app.logs, ['[worker-recycle] stopped sid-arch (archived at start)']);
+  assert.deepEqual(app.warns, []);
+});
+
+test('archived sweep: one session at a time, each id once, blanks dropped', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-1', ' sid-2 ', 'sid-1', '', null],
+    live: ['sid-1', 'sid-2'],
+    stop: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return { ok: true };
+    },
+  });
+  const result = await app.run();
+  assert.deepEqual(result.stopped, ['sid-1', 'sid-2']);
+  assert.equal(maxActive, 1);
+});
+
+test('archived sweep: a session unarchived since the list was read keeps its worker', async () => {
+  const app = archivedSweepSetup({ archivedIds: ['sid-back'], live: ['sid-back'], stillArchived: () => false });
+  assert.deepEqual(await app.run(), { stopped: [], failed: [] });
+  assert.deepEqual(app.calls, [['probe', 'sid-back']]);
+});
+
+test('archived sweep: a failed or throwing stop is warned and the sweep goes on; it never rejects', async () => {
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-fail', 'sid-throw', 'sid-ok'],
+    live: ['sid-fail', 'sid-throw', 'sid-ok'],
+    stop: (sid) => {
+      if (sid === 'sid-fail') return { ok: false, error: 'worker-survived-stop' };
+      if (sid === 'sid-throw') throw new Error('boom');
+      return { ok: true };
+    },
+  });
+  const result = await app.run();
+  assert.deepEqual(result, { stopped: ['sid-ok'], failed: ['sid-fail', 'sid-throw'] });
+  assert.deepEqual(app.warns, [
+    '[worker-recycle] could not stop sid-fail (archived at start): worker-survived-stop',
+    '[worker-recycle] could not stop sid-thro (archived at start): boom',
+  ]);
+  assert.deepEqual(app.logs, ['[worker-recycle] stopped sid-ok (archived at start)']);
+});
+
+test('archived sweep: a list or a probe that throws is warned, and nothing is stopped on a guess', async () => {
+  const warns = [];
+  const logger = { log() {}, warn: (line) => warns.push(line) };
+  const stops = [];
+  const stopWorker = async (sid) => { stops.push(sid); return { ok: true }; };
+  const listFails = await sweepArchivedWorkers({
+    listArchivedSessionIds: () => { throw new Error('db closed'); },
+    stopWorker,
+    logger,
+  });
+  assert.deepEqual(listFails, { stopped: [], failed: [] });
+  assert.match(warns[0], /cannot list archived sessions: db closed/);
+
+  const probeFails = await sweepArchivedWorkers({
+    listArchivedSessionIds: async () => ['sid-unknown', 'sid-live'],
+    hasLiveProcess: async (sid) => {
+      if (sid === 'sid-unknown') throw new Error('process list unreadable');
+      return true;
+    },
+    stopWorker,
+    logger,
+  });
+  assert.deepEqual(probeFails, { stopped: ['sid-live'], failed: ['sid-unknown'] });
+  assert.deepEqual(stops, ['sid-live']);
+  assert.match(warns[1], /archived sweep skipped sid-unkn: process list unreadable/);
+
+  assert.deepEqual(await sweepArchivedWorkers({ listArchivedSessionIds: () => ['sid-x'], logger }), { stopped: [], failed: [] });
+  assert.match(warns[2], /archived sweep skipped: no stopWorker/);
+});
+
+test('archived sweep: each stop runs under the launch mutex', async () => {
+  const order = [];
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-lock-1', 'sid-lock-2'],
+    live: ['sid-lock-1', 'sid-lock-2'],
+    stillArchived: (sid) => { order.push(`archived?:${sid}`); return true; },
+    stop: (sid) => { order.push(`stop:${sid}`); return { ok: true }; },
+    options: {
+      runExclusive: async (sid, fn) => {
+        order.push(`lock:${sid}`);
+        try { return await fn(); } finally { order.push(`unlock:${sid}`); }
+      },
+    },
+  });
+  assert.deepEqual((await app.run()).stopped, ['sid-lock-1', 'sid-lock-2']);
+  assert.deepEqual(order, [
+    'lock:sid-lock-1', 'archived?:sid-lock-1', 'stop:sid-lock-1', 'unlock:sid-lock-1',
+    'lock:sid-lock-2', 'archived?:sid-lock-2', 'stop:sid-lock-2', 'unlock:sid-lock-2',
+  ]);
+});
+
+test('archived sweep: the fence is up for the stopped pid during the stop and down after it, whether the stop went through or not', async () => {
+  const fence = createWorkerReplacementFence();
+  const seen = [];
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-fence-ok', 'sid-fence-fail', 'sid-fence-throw'],
+    live: ['sid-fence-ok', 'sid-fence-fail', 'sid-fence-throw'],
+    stop: (sid) => {
+      seen.push([sid, fence.isHeld(sid, 4100), fence.isHeld(sid, 4200)]);
+      if (sid === 'sid-fence-fail') return { ok: false, error: 'worker-survived-stop' };
+      if (sid === 'sid-fence-throw') throw new Error('boom');
+      return { ok: true };
+    },
+    options: { fence, workerPid: async () => 4100 },
+  });
+  const result = await app.run();
+  assert.deepEqual(result, { stopped: ['sid-fence-ok'], failed: ['sid-fence-fail', 'sid-fence-throw'] });
+  // Up for the pid being stopped only; another pid of the session is not fenced.
+  assert.deepEqual(seen, [
+    ['sid-fence-ok', true, false],
+    ['sid-fence-fail', true, false],
+    ['sid-fence-throw', true, false],
+  ]);
+  assert.deepEqual(fence.list(), [], 'lowered after every stop: a failed stop leaves the old worker serving');
+});
+
+test('archived sweep: with no known pid the fence refuses every process of the session during the stop', async () => {
+  const fence = createWorkerReplacementFence();
+  let heldDuringStop = null;
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-fence-nopid'],
+    live: ['sid-fence-nopid'],
+    stop: (sid) => { heldDuringStop = [fence.isHeld(sid, 4100), fence.isHeld(sid, null)]; return { ok: true }; },
+    options: { fence, workerPid: () => null },
+  });
+  await app.run();
+  assert.deepEqual(heldDuringStop, [true, true]);
+  assert.deepEqual(fence.list(), []);
+});
+
+test('archived sweep: a fence another replacement holds for the process is left up after the stop', async () => {
+  const fence = createWorkerReplacementFence();
+  fence.hold('sid-fence-owned', 4100);
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-fence-owned'],
+    live: ['sid-fence-owned'],
+    options: { fence, workerPid: () => 4100 },
+  });
+  await app.run();
+  assert.equal(fence.isHeld('sid-fence-owned', 4100), true, 'its owner lowers it');
+});
+
+test('archived sweep: a session unarchived while the sweep waits for the launch mutex is not stopped', async () => {
+  const mutex = createKeyedMutex({ warn() {} });
+  const fence = createWorkerReplacementFence();
+  let archived = true;
+  const app = archivedSweepSetup({
+    archivedIds: ['sid-unarchived-1'],
+    live: ['sid-unarchived-1'],
+    stillArchived: () => archived,
+    options: { fence, workerPid: () => 4100, runExclusive: (sid, fn) => mutex.runExclusive(sid, fn) },
+  });
+  let release = null;
+  const holder = mutex.runExclusive('sid-unarchived-1', () => new Promise((resolve) => { release = resolve; }));
+  const swept = app.run();
+  await flush();
+  assert.deepEqual(app.calls, [['probe', 'sid-unarchived-1']], 'nothing stopped while another holds the mutex');
+  // A message arrives meanwhile: the conversation route unarchives the session.
+  archived = false;
+  release();
+  await holder;
+  assert.deepEqual(await swept, { stopped: [], failed: [] });
+  assert.deepEqual(app.calls, [['probe', 'sid-unarchived-1']], 'the worker that serves the message is kept');
+  assert.deepEqual(app.logs, ['[worker-recycle] kept sid-unar: no longer archived']);
+  assert.deepEqual(fence.list(), [], 'never fenced');
+});

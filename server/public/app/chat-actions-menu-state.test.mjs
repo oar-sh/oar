@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   CHAT_ACTIONS_MENU_ENTRY_IDS,
+  CHAT_ACTIONS_MENU_META_CHIP_IDS,
+  CHAT_ACTIONS_MENU_TWIN_IDS,
+  chatActionsMenuMetaChipLabels,
+  resolveChatActionsMenuPlacement,
   resolveChatActionsMenuState,
   visibleChatActionsMenuEntryIds,
 } from './chat-actions-menu-state.mjs';
@@ -152,4 +157,152 @@ test('Stop sharing shows only for an open conversation with an active share', ()
   assert.equal(shared.entries['chat-menu-share-conversation'].hidden, false);
   assert.equal(resolveChatActionsMenuState({ conversationId: null, hasActiveShare: true }).entries['chat-menu-stop-sharing'].hidden, true);
   assert.equal(resolveChatActionsMenuState({ sharedMode: true, ...localConversation, hasActiveShare: true }).entries['chat-menu-stop-sharing'].hidden, true);
+});
+
+// The header's priority+ actions: a twin shows only while its header button
+// does not fit (header-priority-actions.mjs hands in which ones that is).
+
+test('before the header was measured the menu keeps Day/Night and Check Usage, and no other twin', () => {
+  for (const input of [{}, localConversation]) {
+    const state = resolveChatActionsMenuState(input);
+    for (const id of CHAT_ACTIONS_MENU_TWIN_IDS) {
+      const expected = id === 'chat-menu-theme-toggle' || id === 'chat-menu-usage';
+      assert.equal(state.entries[id].hidden, !expected, id);
+    }
+  }
+});
+
+test('a measured header shows exactly the twins that did not fit', () => {
+  const allInline = resolveChatActionsMenuState({ ...localConversation, headerMenuIds: [] });
+  for (const id of CHAT_ACTIONS_MENU_TWIN_IDS) assert.equal(allInline.entries[id].hidden, true, id);
+  // Every other entry is untouched by the fit.
+  for (const id of PER_CONVERSATION) assert.equal(allInline.entries[id].hidden, false, id);
+  assert.equal(allInline.entries['chat-menu-settings'].hidden, false);
+
+  const narrow = resolveChatActionsMenuState({
+    ...localConversation,
+    headerMenuIds: ['chat-menu-context', 'chat-menu-usage', 'chat-menu-theme-toggle', 'chat-menu-fullscreen'],
+  });
+  const twinsShown = visibleChatActionsMenuEntryIds(narrow).filter((id) => CHAT_ACTIONS_MENU_TWIN_IDS.includes(id));
+  // Menu order, not the order handed in.
+  assert.deepEqual(twinsShown, ['chat-menu-context', 'chat-menu-theme-toggle', 'chat-menu-usage', 'chat-menu-fullscreen']);
+  assert.deepEqual(narrow.entries['chat-menu-context'], { hidden: false, disabled: false });
+  assert.deepEqual(narrow.entries['chat-menu-pins'], { hidden: true, disabled: true });
+});
+
+test('twins are relay-wide: they follow the fit with no conversation open too', () => {
+  const state = resolveChatActionsMenuState({ conversationId: null, headerMenuIds: ['chat-menu-search'] });
+  assert.equal(state.entries['chat-menu-search'].hidden, false);
+  assert.equal(state.entries['chat-menu-usage'].hidden, true);
+});
+
+test('the shared view: Day/Night in ︙ only while it does not fit, and no trigger with an empty menu', () => {
+  const inMenu = resolveChatActionsMenuState({ sharedMode: true, headerMenuIds: ['chat-menu-theme-toggle', 'chat-menu-search'] });
+  // A twin the shared view never offers stays hidden whatever the fit says.
+  assert.deepEqual(visibleChatActionsMenuEntryIds(inMenu), ['chat-menu-theme-toggle']);
+  assert.deepEqual(inMenu.trigger, { hidden: false, disabled: false });
+  const inline = resolveChatActionsMenuState({ sharedMode: true, ...localConversation, headerMenuIds: [] });
+  assert.deepEqual(visibleChatActionsMenuEntryIds(inline), []);
+  assert.deepEqual(inline.trigger, { hidden: true, disabled: false });
+});
+
+test('the fullscreen twin is disabled where the browser cannot go fullscreen, as its header button', () => {
+  const inMenu = { ...localConversation, headerMenuIds: ['chat-menu-fullscreen'] };
+  assert.deepEqual(resolveChatActionsMenuState(inMenu).entries['chat-menu-fullscreen'], { hidden: false, disabled: false });
+  assert.deepEqual(resolveChatActionsMenuState({ ...inMenu, fullscreenSupported: false }).entries['chat-menu-fullscreen'], { hidden: false, disabled: true });
+  // Not in the menu: hidden, whatever the support.
+  assert.deepEqual(resolveChatActionsMenuState({ ...localConversation, headerMenuIds: [], fullscreenSupported: false }).entries['chat-menu-fullscreen'], { hidden: true, disabled: true });
+});
+
+const META_CHIP_ENTRY_IDS = ['chat-menu-watching', 'chat-menu-schedules', 'chat-menu-origin'];
+const ALL_CHIPS = { watching: true, schedules: true, origin: true };
+
+test('phone landscape: the meta line\'s chips get ︙ entries, each only while the chip exists', () => {
+  assert.deepEqual(Object.values(CHAT_ACTIONS_MENU_META_CHIP_IDS), META_CHIP_ENTRY_IDS);
+  for (const id of META_CHIP_ENTRY_IDS) assert.ok(CHAT_ACTIONS_MENU_ENTRY_IDS.includes(id), id);
+  const all = resolveChatActionsMenuState({ ...localConversation, phoneLandscape: true, metaChips: ALL_CHIPS });
+  assert.deepEqual(visibleChatActionsMenuEntryIds(all).filter((id) => META_CHIP_ENTRY_IDS.includes(id)), META_CHIP_ENTRY_IDS);
+  for (const id of META_CHIP_ENTRY_IDS) assert.deepEqual(all.entries[id], { hidden: false, disabled: false });
+  const onlySchedules = resolveChatActionsMenuState({ ...localConversation, phoneLandscape: true, metaChips: { schedules: true } });
+  assert.deepEqual(visibleChatActionsMenuEntryIds(onlySchedules).filter((id) => META_CHIP_ENTRY_IDS.includes(id)), ['chat-menu-schedules']);
+});
+
+test('the chip entries stay hidden where the meta line shows, with nothing open, and in the shared view', () => {
+  const hiddenEntry = { hidden: true, disabled: true };
+  const portrait = resolveChatActionsMenuState({ ...localConversation, phoneLandscape: false, metaChips: ALL_CHIPS });
+  const nothingOpen = resolveChatActionsMenuState({ conversationId: null, phoneLandscape: true, metaChips: ALL_CHIPS });
+  const shared = resolveChatActionsMenuState({ sharedMode: true, ...localConversation, phoneLandscape: true, metaChips: ALL_CHIPS });
+  const noChips = resolveChatActionsMenuState({ ...localConversation, phoneLandscape: true });
+  for (const state of [portrait, nothingOpen, shared, noChips]) {
+    for (const id of META_CHIP_ENTRY_IDS) assert.deepEqual(state.entries[id], hiddenEntry, id);
+  }
+});
+
+test('the chip entries\' labels', () => {
+  assert.deepEqual(chatActionsMenuMetaChipLabels({ watching: 'watching 2 sessions', origin: 'Started by an agent in “Fern survey lead”' }), {
+    watching: '👁 Watching 2 sessions…',
+    schedules: '⏰ Schedules…',
+    origin: '↗ Started by an agent in “Fern survey lead”',
+  });
+  assert.deepEqual(chatActionsMenuMetaChipLabels({}), { watching: '', schedules: '⏰ Schedules…', origin: '' });
+});
+
+test('the markup has the chip entries in ︙, hidden until decided', () => {
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const start = html.indexOf('<div id="chat-actions-menu" role="menu"');
+  const end = html.indexOf('</div>\n        </div>', start);
+  for (const id of META_CHIP_ENTRY_IDS) {
+    const at = html.indexOf(`<button id="${id}" class="chat-actions-menu-item`, start);
+    assert.ok(at > start && at < end, id);
+    assert.match(html.slice(at, html.indexOf('</button>', at)), / hidden>/, id);
+  }
+});
+
+test('menu placement: hanging from ︙ inside the bounds, it stays where CSS put it', () => {
+  const placement = resolveChatActionsMenuPlacement({
+    rect: { left: 900, right: 1200, top: 60 },
+    bounds: { left: 300, right: 1280, bottom: 800 },
+    margin: 8,
+  });
+  assert.deepEqual(placement, { right: 0, maxWidth: null, maxHeight: 800 - 8 - 60 });
+});
+
+test('menu placement: a menu that would leave the screen on the left moves right (390px phone with a question)', () => {
+  // As measured before the fix: x = -87 to 113 on a 390px screen.
+  const placement = resolveChatActionsMenuPlacement({
+    rect: { left: -87, right: 113, top: 70 },
+    bounds: { left: 0, right: 390, bottom: 844 },
+    margin: 8,
+  });
+  // Its left edge lands on 8: the right edge moves 95px to the right.
+  assert.equal(placement.right, -95);
+  assert.equal(placement.maxWidth, null);
+  assert.equal(placement.maxHeight, 844 - 8 - 70);
+});
+
+test('menu placement: never under the sidebar (desktop at 150 %)', () => {
+  // #main starts at 530; the menu hung from ︙ at 402 to 732.
+  const placement = resolveChatActionsMenuPlacement({
+    rect: { left: 402, right: 732, top: 132 },
+    bounds: { left: 530, right: 1280, bottom: 800 },
+    margin: 12,
+  });
+  const left = 732 - placement.right - 330;
+  assert.equal(left, 542);
+  assert.equal(placement.maxHeight, 800 - 12 - 132);
+});
+
+test('menu placement: off the right edge it moves left; wider than the room it narrows', () => {
+  const pushed = resolveChatActionsMenuPlacement({ rect: { left: 300, right: 420, top: 10 }, bounds: { left: 0, right: 400, bottom: 300 }, margin: 8 });
+  assert.equal(pushed.right, 28);
+  const narrowed = resolveChatActionsMenuPlacement({ rect: { left: 0, right: 500, top: 10 }, bounds: { left: 100, right: 400, bottom: 300 }, margin: 10 });
+  assert.equal(narrowed.maxWidth, 280);
+  // Its right edge at 390, its left at 110.
+  assert.equal(500 - narrowed.right, 390);
+});
+
+test('menu placement: the height is what is left below its top, with a floor', () => {
+  // Phone landscape: 390px tall, the menu starts at 38.
+  assert.equal(resolveChatActionsMenuPlacement({ rect: { left: 400, right: 620, top: 38 }, bounds: { left: 360, right: 844, bottom: 390 }, margin: 8 }).maxHeight, 344);
+  assert.equal(resolveChatActionsMenuPlacement({ rect: { left: 0, right: 100, top: 380 }, bounds: { left: 0, right: 400, bottom: 390 }, margin: 8, minHeight: 120 }).maxHeight, 120);
 });

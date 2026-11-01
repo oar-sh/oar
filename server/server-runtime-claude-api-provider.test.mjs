@@ -130,18 +130,23 @@ test('the billing switch: the delivery fences by the worker\'s kind and fails a 
 });
 
 test('the billing swap stops the old worker with launches blocked, then launches without reusing a process', () => {
+  // The stop and the launch are services/worker-replacement.mjs's (the order,
+  // the killed marker on a failed stop and the no-reuse launch are tested
+  // there); the runtime builds the swap's instance on the runtime's own
+  // registry, supervisor and process tools, its warnings tagged BILLING SWAP.
   const swap = sliceBetween('const claudeBillingSwapService = createClaudeBillingSwapService({', '\n});');
-  const stop = swap.slice(swap.indexOf('stopWorker:'), swap.indexOf('launchWorker:'));
-  assert.ok(stop.indexOf('markKilled') < stop.indexOf('stopSessionWorkerProcesses'), 'launches are blocked before the stop');
-  assert.match(stop, /if \(!stopped\.ok\) return backOff\(/);
-  // A failed stop, thrown or reported, clears the killed marker and says so.
-  assert.match(stop, /catch \(error\) \{\n      return backOff\(/);
-  assert.match(stop, /clearRestartSchedule\?\.\(sid, \{ resetKilledMarker: true \}\);\n      console\.warn\(`\$\{runtimeLogPrefix\(\)\}BILLING SWAP STOP FAILED/);
+  assert.match(swap, /stopWorker: billingSwapWorkerReplacement\.stopWorker,/);
+  assert.match(swap, /launchWorker: billingSwapWorkerReplacement\.launchWorker,/);
+  assert.match(runtimeSource, /const billingSwapWorkerReplacement = createRuntimeWorkerReplacement\('BILLING SWAP'\);/);
+  const factory = sliceBetween('function createRuntimeWorkerReplacement(tag) {', '\n}\n');
+  assert.match(factory, /registry: sessionWorkerRegistry,/);
+  assert.match(factory, /supervisor: sessionWorkerSupervisor,/);
+  assert.match(factory, /processInspector: sessionWorkerProcessInspector,/);
+  assert.match(factory, /stopSessionWorkerProcesses,/);
+  assert.match(factory, /killTmuxSession,/);
+  assert.match(factory, /logPrefix: \(\) => `\$\{runtimeLogPrefix\(\)\}\$\{tag\} `,/);
   // The relay's own record of a claimed turn comes before the snapshot.
   assert.match(swap, /hasRunningTurn: \(sid\) => \(stmts\.listProcessingRowsForOwner\?\.all\?\.\(sid\) \|\| \[\]\)\.length > 0,/);
-  const launch = swap.slice(swap.indexOf('launchWorker:'), swap.indexOf('onStuck:'));
-  assert.match(launch, /clearRestartSchedule\?\.\(sid, \{ resetKilledMarker: true \}\)/);
-  assert.match(launch, /ensureWorker\?\.\(sid, \{ allowProcessReuse: false \}\)/);
 });
 
 test('a compacted Claude chat keeps its billing; the key removal counts live workers on the key', () => {

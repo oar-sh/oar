@@ -1,5 +1,5 @@
 // Settings → Sharing: every conversation with a public link, its access log,
-// and the actions on a link (copy, renew, stop). The ⋯ menu's "Stop sharing"
+// and the actions on a link (copy, renew, stop). The ︙ menu's "Stop sharing"
 // uses the same confirmation. The list lives in share-state.js; the socket's
 // share events keep it current while the modal is open.
 
@@ -461,7 +461,7 @@ export function openRenewShareConfirmation(conversationId, title = '') {
   }));
 }
 
-/** ⋯ → Share conversation: the link, made if there is none, to the clipboard. */
+/** ︙ → Share conversation: the link, made if there is none, to the clipboard. */
 export async function shareConversationFromMenu(conversationId) {
   const result = await createConversationShareLink(conversationId);
   const shareUrl = String(result?.shareUrl || '').trim();

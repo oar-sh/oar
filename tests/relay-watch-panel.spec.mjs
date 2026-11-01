@@ -92,7 +92,9 @@ test.describe.serial("the watching list opens unclipped", () => {
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
     await page.waitForFunction(() => typeof window.openConversation === "function");
     const chip = page.locator("#chat-title-relay-events .relay-watch-chip");
-    await expect(chip).toHaveText("👁 watching 1 session");
+    // The long label (desktop) and the short one (the phone's meta row); CSS shows one.
+    await expect(chip.locator(".chat-meta-long")).toHaveText("👁 watching 1 session");
+    await expect(chip.locator(".chat-meta-short")).toHaveText("👁 1");
     return chip;
   }
 

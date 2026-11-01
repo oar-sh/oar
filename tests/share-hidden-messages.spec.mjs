@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
+import { clickHeaderAction } from "./header-actions-helpers.mjs";
 
 /**
  * The 🙈 list of messages hidden from shared viewers, against the shared e2e
@@ -132,7 +133,7 @@ for (const profile of [
         await expect(hiddenCount(secondPage)).toHaveText("2");
 
         // The list: conversation order, role and preview, Unhide per row.
-        await hiddenButton(page).click();
+        await clickHeaderAction(page, "hidden");
         await expect(modal(page)).toHaveClass(/visible/);
         await expect(page.locator("#summary-modal-title")).toHaveText("🙈 Hidden messages");
         await expect(page.locator("#summary-modal-subtitle")).toHaveText("2 hidden from shared viewers");
@@ -143,7 +144,9 @@ for (const profile of [
         await expect(rows.nth(1).locator(".pinned-row-meta")).toContainText("Agent");
         await expect(rows.nth(1).locator(".pinned-row-preview")).toContainText(`Hide the staging notes ${stamp} reply`);
         const unhideBox = await rows.nth(0).locator(".hidden-row-unhide").boundingBox();
-        expect(unhideBox.height).toBeGreaterThanOrEqual(44);
+        // The app-wide tap floor is 28 px (it scales with the zoom).
+        expect(unhideBox.width).toBeGreaterThanOrEqual(28);
+        expect(unhideBox.height).toBeGreaterThanOrEqual(28);
         if (profile.touch) {
           const titleBox = await page.locator("#summary-modal-title").boundingBox();
           expect(titleBox.width).toBeGreaterThan(100);
@@ -158,7 +161,7 @@ for (const profile of [
 
         // Unhide in the list: the row goes, the list stays open, the count drops,
         // the bubble offers Hide again, the other device follows.
-        await hiddenButton(page).click();
+        await clickHeaderAction(page, "hidden");
         const unhiding = page.waitForResponse((response) => response.url().includes(`/message/${oldestId}/share-visibility`));
         await rows.nth(0).locator(".hidden-row-unhide").click();
         expect((await unhiding).status()).toBe(200);
@@ -194,7 +197,7 @@ for (const profile of [
         // Unhide all asks first; Cancel changes nothing.
         await setHidden(request, headers, conversationId, olderIds[1], true);
         await expect(hiddenCount(page)).toHaveText("2");
-        await hiddenButton(page).click();
+        await clickHeaderAction(page, "hidden");
         await modal(page).locator("[data-hidden-unhide-all]").click();
         await expect(modal(page).locator(".hidden-unhide-all-confirm")).toContainText("Show all 2 messages to shared viewers again?");
         await modal(page).locator("[data-hidden-unhide-all-cancel]").click();

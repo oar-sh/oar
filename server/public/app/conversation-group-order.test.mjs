@@ -207,3 +207,22 @@ test('an owner\'s group an agent emptied shows as an empty head, placed by when 
   });
   assert.deepEqual(filtered.map((item) => item.group?.id), ['grp_kept']);
 });
+
+test('a folded group keeps the open conversation under its head, and only that row', () => {
+  const rows = [
+    row('lead-a', 10, 'grp_a'),
+    row('child-a1', 30, 'grp_a'),
+    row('child-a2', 20, 'grp_a'),
+    row('solo', 25),
+  ];
+  const shape = (items) => items.map((item) => `${item.kind}:${item.conversation?.id || '-'}${item.kept ? ':kept' : ''}`);
+  const folded = (keepVisibleId) => arrangeConversationList(rows, GROUPS, { isOpen: () => false, keepVisibleId });
+  assert.deepEqual(shape(folded('child-a2')), ['head:lead-a', 'member:child-a2:kept', 'row:solo']);
+  // The head is shown anyway; a loose row or an unknown id keeps nothing.
+  assert.deepEqual(shape(folded('lead-a')), ['head:lead-a', 'row:solo']);
+  assert.deepEqual(shape(folded('solo')), ['head:lead-a', 'row:solo']);
+  assert.deepEqual(shape(folded(null)), ['head:lead-a', 'row:solo']);
+  // An open group is unchanged.
+  assert.deepEqual(shape(arrangeConversationList(rows, GROUPS, { keepVisibleId: 'child-a2' })),
+    ['head:lead-a', 'member:child-a1', 'member:child-a2', 'row:solo']);
+});

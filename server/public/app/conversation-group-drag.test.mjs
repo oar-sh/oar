@@ -230,3 +230,25 @@ test('the announcement names the row and where it went', () => {
   assert.equal(dropAnnouncement('leave', { title: '  ' }), 'Removed “Untitled” from its group');
   assert.equal(dropAnnouncement('none', { title: 'Parser fix' }), '');
 });
+
+test('the open conversation kept under a folded head: a drop on it is a drop on the head; it can leave or join elsewhere', () => {
+  const kept = [
+    ...items.slice(0, 9),
+    { key: 'c-g1', kind: 'member', conversationId: 'c-g1', groupId: 'g-gamma', kept: true },
+    items[9],
+  ];
+  const over = (draggedId, key, y) => brief(resolveDropTarget({ items: kept, draggedId, hover: { key, y } }));
+  for (const y of [0.1, 0.9]) {
+    assert.deepEqual(over('c-solo-b', 'c-g1', y), ['join', 'g-gamma', null, 'c-folded:inside'], `onto the kept row at ${y}`);
+  }
+  // Its own head over it: nothing to do.
+  assert.deepEqual(over('c-folded', 'c-g1', 0.5), ['none', null, null, null]);
+  // The kept row itself moves like any member.
+  assert.deepEqual(over('c-g1', 'c-solo-a', 0.5), ['leave', null, null, 'c-solo-a:after']);
+  assert.deepEqual(over('c-g1', 'c-m1', 0.2), ['join', 'g-alpha', 'c-m1', 'c-m1:before']);
+  const arranged = arrangeConversationList([
+    { id: 'c-lead', updatedAt: '2031-05-01T10:00:00Z', groupId: 'g-alpha' },
+    { id: 'c-m1', updatedAt: '2031-05-03T10:00:00Z', groupId: 'g-alpha' },
+  ], { 'g-alpha': { id: 'g-alpha', parentConversationId: 'c-lead' } }, { isOpen: () => false, keepVisibleId: 'c-m1' });
+  assert.deepEqual(describeDragItems(arranged)[1], { key: 'c-m1', kind: 'member', conversationId: 'c-m1', groupId: 'g-alpha', kept: true });
+});

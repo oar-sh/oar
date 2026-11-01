@@ -386,3 +386,28 @@ test('About carries one line on the database backups: the last result and how ma
   assert.equal((await aboutService({ db }).service.describe()).backups, null);
   db.close();
 });
+
+test('About counts the running workers on the relay\'s build and on another one', async () => {
+  const relayBuildId = '1.2.3+a1b2c3d4e5f6';
+  const listWorkers = () => [
+    { conversationId: 'conv-fixture-report', status: 'ready', pid: 101, buildId: relayBuildId },
+    { conversationId: 'conv-fixture-report', status: 'processing', pid: 104, buildId: '1.2.2+0123456789ab' },
+    // Too old to state a build id at all: another build too.
+    { conversationId: null, status: 'starting', pid: 103, buildId: null },
+    // Gone or exited workers are not running, whatever their build.
+    { conversationId: 'conv-fixture-export', status: 'processing', pid: 999, buildId: '1.2.2+0123456789ab' },
+    { conversationId: 'conv-fixture-export', status: 'exited', pid: 105, buildId: null },
+  ];
+  const { service } = aboutService({ buildId: relayBuildId, listWorkers });
+  assert.deepEqual((await service.describe()).workers, { total: 3, onThisBuild: 1, onOtherBuild: 2 });
+
+  const unknown = aboutService({ listWorkers });
+  assert.deepEqual(
+    (await unknown.service.describe()).workers,
+    { total: 3, onThisBuild: null, onOtherBuild: null },
+    'a relay that does not know its own build id does not guess',
+  );
+
+  const none = aboutService({ buildId: relayBuildId, listWorkers: () => [] });
+  assert.deepEqual((await none.service.describe()).workers, { total: 0, onThisBuild: 0, onOtherBuild: 0 });
+});

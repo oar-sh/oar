@@ -16,6 +16,9 @@ globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.localStorage = dom.window.localStorage;
 globalThis.sessionStorage = dom.window.sessionStorage;
 Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true, writable: true });
+// Left with nothing to go back to, the empty screen asks for the layout.
+window.matchMedia ??= () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+globalThis.requestAnimationFrame ??= (fn) => setTimeout(fn, 0);
 
 // The relay: an Inbox with nothing in it, every other request empty.
 globalThis.fetch = async (rawUrl) => {
@@ -42,6 +45,10 @@ test('left and opened again, the Inbox comes back where it was scrolled', async 
   messages.scrollTop = 240;
   await toggleInboxView();
   assert.equal(isInboxViewActive(), false);
+  // Opened with nothing open: closing it leaves the empty screen, not the list.
+  assert.deepEqual(opened, []);
+  assert.equal(document.getElementById('chat-title').textContent, 'Select or start a conversation');
+  assert.equal(messages.querySelector('.inbox-view'), null);
   // The transcript is back and scrolled on its own; that height is not the Inbox's.
   messages.scrollTop = 5000;
   await toggleInboxView();

@@ -92,13 +92,73 @@ test('a pause that waits for the user stays after the reset', () => {
   assert.deepEqual(buttons(), ['Resume now', 'Cancel']);
 });
 
-test('a warning before the limit shows in a Claude conversation', () => {
+test('a warning before the limit shows in a Claude conversation, on one line', () => {
   const state = warning();
   ui.setUsageLimitConversation(CONV, { pause: null, providerType: 'claude' });
   ui.applyClaudeUsageLimit(state);
+  const full = `Claude usage at 96 % of the 5-hour limit — resets ${ui.formatUsageLimitTime(state.resetsAt)}`;
   assert.equal(banner().dataset.state, 'warning');
-  assert.equal(bannerText(), `Claude usage at 96 % of the 5-hour limit — resets ${ui.formatUsageLimitTime(state.resetsAt)}`);
-  assert.deepEqual(buttons(), ['Hide']);
+  assert.equal(banner().classList.contains('usage-limit-compact'), true);
+  assert.equal(bannerText(), `⚠ Claude 96 % 5-hour · resets ${ui.formatUsageLimitShortTime(state.resetsAt)}`);
+  assert.equal(banner().querySelector('.usage-limit-text').title, full);
+  assert.deepEqual(buttons(), ['✕']);
+  assert.equal(banner().querySelector('.usage-limit-dismiss').getAttribute('aria-label'), 'Hide');
+});
+
+test('a tap on the one-line warning opens the full sentence, and another closes it', () => {
+  const state = warning();
+  ui.setUsageLimitConversation(CONV, { pause: null, providerType: 'claude' });
+  ui.applyClaudeUsageLimit(state);
+  const full = `Claude usage at 96 % of the 5-hour limit — resets ${ui.formatUsageLimitTime(state.resetsAt)}`;
+  banner().querySelector('.usage-limit-text').click();
+  assert.equal(bannerText(), full);
+  assert.equal(banner().classList.contains('usage-limit-expanded'), true);
+  assert.equal(banner().querySelector('.usage-limit-text').getAttribute('aria-expanded'), 'true');
+  // A new report of the same window keeps it open; a new window closes it.
+  ui.applyClaudeUsageLimit({ ...state });
+  assert.equal(bannerText(), full);
+  banner().querySelector('.usage-limit-text').click();
+  assert.match(bannerText(), /^⚠ Claude 96 % 5-hour · resets /);
+  assert.equal(banner().classList.contains('usage-limit-expanded'), false);
+  banner().querySelector('.usage-limit-text').click();
+  ui.applyClaudeUsageLimit(warning({ rateLimitType: 'seven_day', label: 'weekly limit', resetsAt: inMinutes(3 * 24 * 60) }));
+  assert.match(bannerText(), /^⚠ Claude 96 % weekly · resets /);
+});
+
+test('the one-line toggle keeps the keyboard focus when the banner is drawn anew', () => {
+  ui.setUsageLimitConversation(CONV, { pause: null, providerType: 'claude' });
+  ui.applyClaudeUsageLimit(warning());
+  const toggle = banner().querySelector('.usage-limit-text');
+  toggle.focus();
+  toggle.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  const redrawn = banner().querySelector('.usage-limit-text');
+  assert.notEqual(redrawn, toggle, 'a new node');
+  assert.equal(redrawn.getAttribute('aria-expanded'), 'true');
+  assert.equal(document.activeElement, redrawn);
+  // A report coming in while it has the focus keeps it there too.
+  ui.applyClaudeUsageLimit(warning());
+  assert.equal(document.activeElement, banner().querySelector('.usage-limit-text'));
+});
+
+test('the paused form is not the one-line form', () => {
+  ui.setUsageLimitConversation(CONV, { pause: pauseFor(CONV), providerType: 'claude' });
+  assert.equal(banner().classList.contains('usage-limit-compact'), false);
+});
+
+test('the short line names the window, the percentage and the reset', () => {
+  const now = new Date(2026, 8, 28, 21, 0, 0).getTime();
+  const tomorrow = new Date(2026, 8, 29, 4, 0, 0).toISOString();
+  const clock = new Date(tomorrow).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const day = new Date(tomorrow).toLocaleDateString([], { weekday: 'short' });
+  const weekly = { ...warning(), rateLimitType: 'seven_day', label: 'weekly limit', utilization: 0.94, resetsAt: tomorrow };
+  assert.equal(ui.usageLimitAccountShortText(weekly, now), `⚠ Claude 94 % weekly · resets ${day} ${clock}`);
+  assert.equal(
+    ui.usageLimitAccountShortText({ ...weekly, status: 'rejected', utilization: 1 }, now),
+    `⚠ Claude weekly limit reached · resets ${day} ${clock}`,
+  );
+  assert.equal(ui.usageLimitAccountShortText({ ...weekly, utilization: 0.5 }, now), '');
+  const today = new Date(2026, 8, 28, 22, 1, 0).toISOString();
+  assert.equal(ui.formatUsageLimitShortTime(today, now), new Date(today).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
 });
 
 test('a warning does not show in a conversation of another provider', () => {
@@ -117,7 +177,8 @@ test('a hidden warning stays hidden until the report changes', () => {
   assert.equal(banner().hidden, true, 'the same window, still a warning');
   ui.applyClaudeUsageLimit({ ...state, status: 'rejected', utilization: 1 });
   assert.equal(banner().dataset.state, 'reached');
-  assert.match(bannerText(), /^Claude 5-hour limit reached — resets .+\. A turn sent before that is paused until then\.$/);
+  assert.match(bannerText(), /^⚠ Claude 5-hour limit reached · resets .+$/);
+  assert.match(banner().querySelector('.usage-limit-text').title, /^Claude 5-hour limit reached — resets .+\. A turn sent before that is paused until then\.$/);
 });
 
 test('an allowed report, one past its reset or one covered by extra usage says nothing', () => {

@@ -52,7 +52,7 @@ import { syncFontScaleSelect } from './font-scaling.js';
 import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
 import { normalizeKnownCwdPath } from './cwd-picker.js';
 import { refreshPushSettingsSection } from './push-settings.js';
-import { selectSettingsTab } from './settings-tabs.js';
+import { revealSettingsTabs, selectSettingsTab } from './settings-tabs.js';
 import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
 import { syncDeepSeekSettingsInputs } from './deepseek-settings-ui.js';
@@ -1697,9 +1697,7 @@ function syncFeatureFlagsSection() {
   const flags = Array.isArray(featureFlagsState?.flags) ? featureFlagsState.flags : [];
   for (const flag of flags) {
     const row = document.createElement('div');
-    row.className = 'settings-row';
-    row.style.marginTop = '12px';
-    row.style.marginBottom = '0';
+    row.className = 'settings-row settings-gap';
 
     const label = document.createElement('label');
     label.htmlFor = featureToggleId(flag.name);
@@ -1719,8 +1717,7 @@ function syncFeatureFlagsSection() {
     list.appendChild(row);
 
     const help = document.createElement('div');
-    help.className = 'settings-help';
-    help.style.marginTop = '6px';
+    help.className = 'settings-help settings-gap-xs';
     let text = String(flag.description || '');
     if (flag.envOverride !== null) {
       text += ` Pinned ${flag.envOverride ? 'on' : 'off'} by COPILOT_REMOTE_${flag.name} in the relay's environment; the toggle is locked while that variable is set.`;
@@ -1994,12 +1991,70 @@ export function openSettingsModal(tab, providerTab) {
   void refreshAgentSessionsSection();
   void refreshFeatureFlagsSection();
   void refreshUpdateSection();
+  const wasOpen = !!modal?.classList.contains('visible');
   modal?.classList.add('visible');
   modal?.setAttribute('aria-hidden', 'false');
+  // Laid out now: the selected tabs scroll into view, clear of the fades.
+  revealSettingsTabs();
+  if (modal && !wasOpen) focusSettingsOnOpen(modal);
 }
 
 export function closeSettingsModal() {
   const modal = document.getElementById('settings-modal');
+  const wasOpen = !!modal?.classList.contains('visible');
+  const focusWasInside = !!modal?.contains(document.activeElement);
   modal?.classList.remove('visible');
   modal?.setAttribute('aria-hidden', 'true');
+  const back = settingsFocusBefore;
+  settingsFocusBefore = null;
+  // Focus goes back where it was (︙, the gear) when it was in the dialog;
+  // elsewhere (Back, an action that moved on) it stays where it is.
+  if (wasOpen && focusWasInside && back?.isConnected && !modal?.contains(back)) {
+    try { back.focus({ preventScroll: true }); } catch {}
+  }
+}
+
+// What had the focus when Settings opened, to give it back on close.
+let settingsFocusBefore = null;
+let settingsEscapeBound = false;
+
+// The dialog takes the focus: its selected tab, so the arrows walk the tabs
+// and Escape reaches the dialog from the first key on.
+function focusSettingsOnOpen(modal) {
+  ensureSettingsEscape();
+  let active = document.activeElement;
+  // An entry of ︙ closes with its menu: the focus goes back to ︙.
+  if (active?.closest?.('#chat-actions-menu')) active = document.getElementById('chat-actions-menu-btn');
+  settingsFocusBefore = active && active !== document.body && !modal.contains(active) ? active : null;
+  const target = modal.querySelector('[data-settings-tab][aria-selected="true"]')
+    || modal.querySelector('[role="dialog"]');
+  if (!target) return;
+  if (target.getAttribute('role') === 'dialog' && !target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+  try { target.focus({ preventScroll: true }); } catch {}
+}
+
+// True while nothing is drawn over the Settings dialog: a confirmation, the
+// explorer or a preview opened from it takes Escape first.
+function settingsDialogOnTop(modal) {
+  const dialog = modal.querySelector('[role="dialog"]') || modal;
+  const rect = dialog.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + Math.min(rect.height / 2, 24));
+  return !top || modal.contains(top);
+}
+
+// Escape closes Settings wherever the focus is, and only Settings: window,
+// capture phase, so the document's Escape handlers for what lies underneath
+// (the ︙ menu, the chips' lists, the composer's panel) never see that key.
+function ensureSettingsEscape() {
+  if (settingsEscapeBound) return;
+  settingsEscapeBound = true;
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+    const modal = document.getElementById('settings-modal');
+    if (!modal?.classList.contains('visible') || !settingsDialogOnTop(modal)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeSettingsModal();
+  }, true);
 }

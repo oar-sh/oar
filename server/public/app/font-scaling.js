@@ -8,6 +8,9 @@ const FONT_SCALE_WHEEL_STEP_MIN = 0.01;
 const FONT_SCALE_WHEEL_STEP_MAX = 0.2;
 const FONT_SCALE_PILL_VISIBLE_MS = 900;
 
+/** Fired on window after --font-scale changed; detail: { scale }. */
+export const FONT_SCALE_CHANGE_EVENT = 'oar:font-scale-change';
+
 let fontScaleValue = FONT_SCALE_DEFAULT;
 let fontScaleIndicatorTimer = null;
 let fontScalePinchState = {
@@ -44,6 +47,25 @@ function clampFontScale(value) {
 
 function readStoredFontScale() {
   return clampFontScale(readLocalStorage(FONT_SCALE_STORAGE_KEY));
+}
+
+/**
+ * The factor the stylesheet multiplies its px sizes by (--ui-scale, which
+ * follows --font-scale). JS that places popovers with px gaps and margins
+ * of its own multiplies them by this, so they match the scaled CSS. Read
+ * per call: the inline value (set before first paint and on every change),
+ * else the computed one; 1 outside a browser.
+ */
+export function getUiScale() {
+  if (typeof document === 'undefined' || !document.documentElement) return FONT_SCALE_DEFAULT;
+  let raw = '';
+  try { raw = document.documentElement.style.getPropertyValue('--font-scale'); } catch {}
+  if (!String(raw || '').trim() && typeof getComputedStyle === 'function') {
+    try { raw = getComputedStyle(document.documentElement).getPropertyValue('--font-scale'); } catch {}
+  }
+  const numeric = Number(String(raw || '').trim());
+  if (!Number.isFinite(numeric) || numeric <= 0) return FONT_SCALE_DEFAULT;
+  return clampFontScale(numeric);
 }
 
 function normalizeFontScaleSelectValue(raw = '') {
@@ -90,6 +112,10 @@ export function setFontScale(nextScale, { persist = true, preserveMessageAnchor 
   document.documentElement.style.setProperty('--font-scale-percent', `${Math.round(normalized * 100)}%`);
   if (persist) writeLocalStorage(FONT_SCALE_STORAGE_KEY, String(normalized));
   syncFontScaleSelect();
+  // Layout that measures itself (the header's priority+ actions) re-runs.
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent(FONT_SCALE_CHANGE_EVENT, { detail: { scale: normalized } }));
+  }
   if (anchor) {
     requestAnimationFrame(() => {
       restoreTranscriptAnchor(document.getElementById('messages'), anchor);

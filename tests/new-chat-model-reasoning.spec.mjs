@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import Database from "better-sqlite3";
 import { relayDbPath, relayToken } from "./e2e-env.mjs";
+import { composerControl, selectComposerOption } from "./composer-settings-helpers.mjs";
 
 // Golden regression for the reported bug: New Chat -> Cursor -> grok-4.5 ->
 // reasoning "high" came back as a composer showing Opus 5 / low.
@@ -188,7 +189,7 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   test("a new chat keeps the relay mode the composer is in", async ({ page, request }) => {
     convertWorkerFailureToSuccess = true;
     const firstConversationId = await startConversation(page, { provider: "github", model: "auto" });
-    await page.locator("#mode-select").selectOption("plan");
+    await selectComposerOption(page, "#mode-select", "plan");
     // The composer polls the conversation, so a GET that started before the
     // preference PATCH landed can still show the previous mode. Wait for the
     // server to have it before moving on.
@@ -400,8 +401,14 @@ test.describe("New Chat starts a Claude API chat, and its composer switches bill
     await expect(page.locator("#model-select")).toHaveValue("claude-opus-5");
     await expect(page.locator("#reasoning-effort-select")).toHaveValue("high");
 
-    // The billing toggle: on the key, the subscription one press away.
-    const toggle = page.locator("#claude-billing-toggle");
+    // The billing pill beside the composer's label, in the key's colour.
+    const pill = page.locator("#composer-billing-pill");
+    await expect(pill).toHaveText("API key");
+    await expect(pill).toHaveAttribute("data-billing", "claude-api");
+    await expect(page.locator("#composer-settings-label")).toContainText("🔒");
+
+    // The billing toggle (in the ⚙ panel): on the key, the subscription one press away.
+    const toggle = await composerControl(page, "#claude-billing-toggle");
     await expect(toggle).toBeVisible();
     await expect(toggle.locator('[data-billing="claude-api"]')).toHaveAttribute("aria-pressed", "true");
     await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "false");
@@ -410,6 +417,7 @@ test.describe("New Chat starts a Claude API chat, and its composer switches bill
     // To the subscription: the chat, its note, its pill and its toggle follow.
     await toggle.locator('[data-billing="claude"]').click();
     await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "true");
+    await expect(pill).toHaveText("Subscription");
     await expect(page.locator("#model-lock-note")).toHaveText("🔒 Session locked to Claude SDK models.");
     await expect(page.locator("#model-lock-note")).toHaveAttribute("data-provider", "claude");
     await expect(item.locator('.conv-provider-indicator[data-provider="claude"]')).toHaveText("Claude");
@@ -431,7 +439,9 @@ test.describe("New Chat starts a Claude API chat, and its composer switches bill
     await page.locator("#new-conversation-model-confirm").click();
     await expect.poll(() => bootstrapResponse !== null).toBe(true);
     expect(bootstrapResponse?.selectedProviderType).toBe("claude");
-    const toggle = page.locator("#claude-billing-toggle");
+    const pill = page.locator("#composer-billing-pill");
+    await expect(pill).toHaveText("Subscription");
+    const toggle = await composerControl(page, "#claude-billing-toggle");
     await expect(toggle).toBeVisible();
     await expect(toggle.locator('[data-billing="claude"]')).toHaveAttribute("aria-pressed", "true");
 
@@ -440,10 +450,12 @@ test.describe("New Chat starts a Claude API chat, and its composer switches bill
     try {
       expect((await request.post("/api/settings/claude-api", { headers, data: { enabled: false } })).ok()).toBe(true);
       await expect(toggle).toBeHidden();
+      await expect(pill).toBeHidden();
     } finally {
       // On again; its model discovery goes to the harness's dead loopback port.
       await request.post("/api/settings/claude-api", { headers, data: { enabled: true } });
     }
     await expect(toggle).toBeVisible();
+    await expect(pill).toBeVisible();
   });
 });

@@ -55,6 +55,61 @@ test('only one menu is open; Escape and a pointer-down outside close it, one ins
   assert.equal(menu(), null);
 });
 
+test('a note is a line of text the arrow keys skip; Escape tells the opener', async () => {
+  let escaped = 0;
+  openContextMenu(10, 20, [
+    { id: 'seen', label: 'Watched by <b>a session</b>', note: true },
+    { id: 'go', label: 'Go there', onSelect() {} },
+    { id: 'when', label: 'Scheduled · next 04:15', note: true },
+  ], { onEscape: () => { escaped += 1; } });
+  const note = document.querySelector('[data-menu-item="seen"]');
+  assert.equal(note.tagName, 'DIV');
+  assert.equal(note.className, 'context-menu-note');
+  assert.equal(note.getAttribute('aria-disabled'), 'true');
+  assert.equal(note.textContent, 'Watched by <b>a session</b>', 'text, not markup');
+  assert.equal(note.querySelector('b'), null);
+  await tick();
+  assert.equal(document.activeElement, document.querySelector('[data-menu-item="go"]'), 'the first button has focus, not the note');
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  assert.equal(document.activeElement, document.querySelector('[data-menu-item="go"]'), 'the only button stays focused');
+  assert.equal(escaped, 0);
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(menu(), null);
+  assert.equal(escaped, 1);
+});
+
+test('a menu of text lines only takes the focus itself and is named by them', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  opener.focus();
+  let escaped = 0;
+  openContextMenu(10, 20, [
+    { id: 'seen', label: 'Watched by 2 sessions: Moss garden, Tide tables', note: true },
+    { id: 'when', label: 'Scheduled · next 04:15', note: true },
+  ], { onEscape: () => { escaped += 1; opener.focus(); } });
+  assert.equal(menu().getAttribute('tabindex'), '-1');
+  assert.equal(menu().getAttribute('aria-label'), 'Watched by 2 sessions: Moss garden, Tide tables. Scheduled · next 04:15');
+  await tick();
+  assert.equal(document.activeElement, menu(), 'the menu has the focus, not the ⓘ');
+  // The arrow keys have nothing to move to; Escape gives the focus back.
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  assert.equal(document.activeElement, menu());
+  document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(menu(), null);
+  assert.equal(escaped, 1);
+  assert.equal(document.activeElement, opener);
+
+  // A name from the opener wins; a menu with a button keeps no tabindex.
+  openContextMenu(10, 20, [{ label: 'Only a line', note: true }], { label: 'Details of a row' });
+  assert.equal(menu().getAttribute('aria-label'), 'Details of a row');
+  closeContextMenu();
+  openContextMenu(10, 20, [{ label: 'A line', note: true }, { label: 'Act', onSelect() {} }]);
+  assert.equal(menu().hasAttribute('tabindex'), false);
+  assert.equal(menu().hasAttribute('aria-label'), false);
+  closeContextMenu();
+  opener.remove();
+});
+
 test('a menu near the edge is kept on screen', () => {
   const node = openContextMenu(395, 795, [{ label: 'Edge', onSelect() {} }]);
   // JSDOM measures nothing, so the box is 0×0: the menu sits at the margin.

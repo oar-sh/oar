@@ -98,7 +98,13 @@ for (const profile of [
         // The injected state is written here, in the same turn as the
         // measurement, so a re-render in between cannot swap it out.
         if (injected?.pill) {
-          const summary = node.querySelector(".conv-group-summary");
+          // An idle head line has no pill (it shows only what waits, runs or
+          // failed): the injected one goes where the list would draw it.
+          let summary = node.querySelector(".conv-group-summary");
+          if (!summary) {
+            summary = document.createElement("span");
+            node.querySelector(".conv-meta").append(summary);
+          }
           summary.textContent = injected.pill;
           summary.className = `conv-group-summary conv-group-summary-${/waiting/.test(injected.pill) ? "waiting" : "running"}`;
         }
@@ -313,9 +319,9 @@ for (const profile of [
       // Its tap opens the member the card sits in.
       await pill.click();
       await expect(page.locator("#chat-title")).toHaveText("Docs pass");
-      // The open conversation's group is shown open, whatever the fold.
+      // The group stays folded; the open conversation shows under its head.
       await openSidebar(page);
-      await expect.poll(() => listedIds(page)).toEqual([seeded.solo, seeded.lead, seeded.tests, seeded.docs]);
+      await expect.poll(() => listedIds(page)).toEqual([seeded.solo, seeded.lead, seeded.docs]);
 
       // The answer, so the card is gone for the next tests.
       const answered = await api(`/api/relay-question/${encodeURIComponent(asked.payload.question.id)}/answer`, { method: "POST", body: { answer: "main" } });
@@ -400,7 +406,9 @@ for (const profile of [
       const synthetic = page.locator('#conv-list .conv-group-synthetic');
       await expect(synthetic).toHaveCount(1);
       await expect(synthetic.locator(".conv-title")).toContainText("Sample batch");
-      await expect(synthetic.locator(".conv-group-summary")).toHaveText("1 session");
+      // The meta line says when it was last active and how many sessions it holds; no pill while idle.
+      await expect(synthetic.locator(".conv-meta-primary")).toHaveText(/ · 1 session$/);
+      await expect(synthetic.locator(".conv-group-summary")).toHaveCount(0);
       const listed = await api("/api/conversations");
       const soloRow = listed.payload.conversations.find((entry) => entry.id === seeded.solo);
       expect(soloRow.groupRole).toBe("member");

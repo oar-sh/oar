@@ -1,5 +1,6 @@
 import { BASE, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
 import { loadPwaAppNameSetting, updatePwaAppNameSetting } from './api-client.js';
+import { notifyHeaderActionsChanged } from './header-priority-actions.mjs';
 
 const THEME_COLOR_BASE = '#0d1117';
 const THEME_COLOR_IMMERSIVE = '#161b22';
@@ -265,31 +266,51 @@ export function updateFullscreenButton() {
   const btn = document.getElementById('fullscreen-btn');
   if (!btn) return;
   syncInstalledAppUiState();
+  // The header's priority+ pass (header-priority-actions.mjs) places the
+  // button or its ︙ twin; this only says whether fullscreen is offered at
+  // all (data-header-available) and keeps both labels current.
+  const twin = document.getElementById('chat-menu-fullscreen');
+  const offer = (available) => {
+    const next = available ? '1' : '0';
+    btn.style.display = '';
+    if (!available) btn.hidden = true;
+    if (btn.dataset.headerAvailable !== next) {
+      btn.dataset.headerAvailable = next;
+      notifyHeaderActionsChanged();
+    }
+  };
   if (isInstalledAppMode() || isDisplayModeFullscreen()) {
-    btn.style.display = 'none';
+    offer(false);
     return;
   }
 
   const mobile = window.matchMedia('(max-width: 680px)').matches;
   if (!mobile) {
-    btn.style.display = 'none';
+    offer(false);
     return;
   }
 
   const full = !!document.fullscreenElement;
   const supported = canToggleFullscreen();
-  btn.style.display = 'inline-flex';
+  const wasDisabled = btn.disabled;
   btn.disabled = !supported;
+  // The ︙ twin is disabled with the button (chat-actions-menu-state.mjs reads
+  // btn.disabled) and says why.
+  if (twin) twin.title = supported ? '' : 'Fullscreen not supported on this browser';
+  if (wasDisabled !== btn.disabled) notifyHeaderActionsChanged();
 
   if (full) {
     btn.textContent = '⤢';
     btn.title = 'Exit fullscreen';
+    if (twin) twin.textContent = '⤢ Exit fullscreen';
   } else {
     btn.textContent = '⛶';
     btn.title = isInstalledAppMode()
       ? (supported ? 'Enter fullscreen (recommended for installed app)' : 'Fullscreen not supported on this browser')
       : (supported ? 'Enter fullscreen' : 'Fullscreen not supported on this browser');
+    if (twin) twin.textContent = '⛶ Fullscreen';
   }
+  offer(true);
 }
 
 export function initFullscreenButton() {

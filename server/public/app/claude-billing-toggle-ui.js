@@ -1,5 +1,6 @@
 // The composer's billing toggle (claude-billing-toggle.mjs) on the page: a
-// row above the composer, under the lock note, in Claude SDK chats. A press
+// field of the ⚙ panel, under Model, in Claude SDK chats; the label row's
+// billing pill (composer-settings-ui.js) shows its selected side. A press
 // moves the open chat between the subscription and the saved API key through
 // the relay's billing route; the relay's answer and its `conversation_billing`
 // events (usage-limit-ui.js keeps them per chat) redraw it.

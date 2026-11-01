@@ -3,6 +3,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { normalizeBuildId, readGitCommit, resolveBuildCommit } from '../../shared/build-id.mjs';
+import { isWorkerOnOtherBuild } from './worker-recycle-service.mjs';
+
+// The commit readers moved to shared/ so the workers can state their build id
+// too; they are re-exported here so the routes and tests importing them keep
+// their import.
+export { readGitCommit, resolveBuildCommit };
+
 // What the About OAR modal shows: the running build, the providers that are
 // on, what this relay has stored over its life, and how it is doing now.
 //
@@ -59,58 +67,6 @@ function normalizeProviderId(value) {
 function readFileText(fsImpl, filePath) {
   try {
     return String(fsImpl.readFileSync(filePath, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
-
-/**
- * The commit a git checkout has checked out, read from its .git files rather
- * than from a `git` process: HEAD, then the loose ref, then packed-refs. A
- * linked worktree's .git is a file naming its git dir, whose refs live in the
- * common dir. Anything unexpected reads as null. `pathImpl` is the host's path
- * module; tests pass path.posix and path.win32.
- */
-export function readGitCommit(root, { fsImpl = fs, pathImpl = path } = {}) {
-  if (!root) return null;
-  const dotGit = pathImpl.join(root, '.git');
-  let gitDir = dotGit;
-  const pointer = readFileText(fsImpl, dotGit);
-  if (pointer !== null) {
-    const match = pointer.match(/^gitdir:\s*(.+)$/m);
-    if (!match) return null;
-    gitDir = pathImpl.resolve(root, match[1].trim());
-  }
-  const head = readFileText(fsImpl, pathImpl.join(gitDir, 'HEAD'));
-  if (head === null) return null;
-  const headText = head.trim();
-  if (COMMIT_PATTERN.test(headText)) return headText.toLowerCase();
-  const refMatch = headText.match(/^ref:\s*(\S+)$/);
-  if (!refMatch) return null;
-  const ref = refMatch[1];
-  const commonDirText = readFileText(fsImpl, pathImpl.join(gitDir, 'commondir'));
-  const commonDir = commonDirText ? pathImpl.resolve(gitDir, commonDirText.trim()) : gitDir;
-  for (const dir of new Set([gitDir, commonDir])) {
-    const loose = readFileText(fsImpl, pathImpl.join(dir, ...ref.split('/')));
-    if (loose && COMMIT_PATTERN.test(loose.trim())) return loose.trim().toLowerCase();
-  }
-  const packed = readFileText(fsImpl, pathImpl.join(commonDir, 'packed-refs')) || '';
-  for (const line of packed.split(/\r?\n/)) {
-    const [hash, name] = line.trim().split(/\s+/);
-    if (name === ref && COMMIT_PATTERN.test(hash || '')) return hash.toLowerCase();
-  }
-  return null;
-}
-
-/** The commit this build came from: the checkout's HEAD, else a `gitHead` stamp in package.json. */
-export function resolveBuildCommit(packageRoot, { fsImpl = fs, pathImpl = path } = {}) {
-  const fromGit = readGitCommit(packageRoot, { fsImpl, pathImpl });
-  if (fromGit) return fromGit;
-  try {
-    const stamp = String(JSON.parse(readFileText(fsImpl, pathImpl.join(packageRoot, 'package.json')) || '{}')?.gitHead || '').trim();
-    return COMMIT_PATTERN.test(stamp) ? stamp.toLowerCase() : null;
   } catch {
     return null;
   }
@@ -338,6 +294,7 @@ async function fileSize(fsImpl, filePath) {
  * @param {string|null} [deps.dbPath] the database file; its -wal file is counted too
  * @param {string} deps.version
  * @param {string|null} [deps.commit]
+ * @param {string|null} [deps.buildId] the relay's build id (shared/build-id.mjs), to tell the workers on other code
  * @param {string} [deps.installMethod]
  * @param {string} deps.startedAt ISO time this relay process started
  * @param {() => object} [deps.getProviderSettings] `{ github: { enabled, engine }, claude: { enabled }, … }`
@@ -354,6 +311,7 @@ export function createAboutService({
   describeBackups = null,
   version = '0.0.0',
   commit = null,
+  buildId = null,
   installMethod = null,
   startedAt,
   packageRoot = null,
@@ -397,20 +355,30 @@ export function createAboutService({
     return totalsInFlight;
   }
 
+  // The running workers, by provider and by build: after a deploy the
+  // workers keep the code they started with until the recycle replaces them,
+  // and About shows how many still do. A relay that does not know its own
+  // build id cannot tell, so both build counts are null then.
   function runningWorkersByProvider() {
     const counts = new Map();
     let total = 0;
+    const relayBuildId = normalizeBuildId(buildId);
+    let onOtherBuild = 0;
     for (const worker of listWorkers() || []) {
       const status = String(worker?.status || '').trim().toLowerCase();
       if (!ACTIVE_WORKER_STATUSES.has(status) || !isPidAlive(worker?.pid)) continue;
       total += 1;
+      if (isWorkerOnOtherBuild(worker, relayBuildId)) onOtherBuild += 1;
       const conversationId = String(worker?.conversationId || '').trim();
       const provider = conversationId
         ? normalizeProviderId(providerForConversation.get(conversationId)?.provider_type)
         : 'unassigned';
       counts.set(provider, (counts.get(provider) || 0) + 1);
     }
-    return { total, counts };
+    const builds = relayBuildId
+      ? { total, onThisBuild: total - onOtherBuild, onOtherBuild }
+      : { total, onThisBuild: null, onOtherBuild: null };
+    return { total, counts, builds };
   }
 
   function describeProviders(workerCounts) {
@@ -474,6 +442,7 @@ export function createAboutService({
       startedAt: startedAt || null,
       uptimeSeconds,
       providers: describeProviders(workers.counts),
+      workers: workers.builds,
       stats: {
         conversations: totals.conversations.total,
         archivedConversations: totals.conversations.archived,

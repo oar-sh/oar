@@ -12,9 +12,11 @@ import {
   describeScheduleInterval,
   describeScheduleWhen,
   nextScheduledAt,
-  renderScheduledBadgeHtml,
+  renderScheduleChipHtml,
   renderSchedulePanelHtml,
+  scheduleChipShortText,
   scheduleChipText,
+  scheduledInfoText,
   schedulesInto,
   schedulesOf,
 } from './relay-schedule-view.mjs';
@@ -56,11 +58,11 @@ test('when a schedule fires, in words', () => {
   assert.equal(describeScheduleWhen({ once: true, everyMinutes: 30, nextFireAt: '2026-03-02T10:30:00.000Z' }, { formatTime }), 'once · 10:30');
 });
 
-test('the sidebar marker shows only on a conversation a schedule fires into', () => {
-  const badge = renderScheduledBadgeHtml(SCHEDULES, WORKER, { formatTime });
-  assert.equal(badge, '<span class="conv-scheduled-badge" title="2 schedules · next 12:00">scheduled</span>');
-  assert.match(renderScheduledBadgeHtml(SCHEDULES, AGENT, { formatTime }), /title="1 schedule · next 10:30"/);
-  assert.equal(renderScheduledBadgeHtml(SCHEDULES, 'conv-fixture-none', { formatTime }), '');
+test('the sidebar ⓘ line shows only on a conversation a schedule fires into', () => {
+  assert.equal(scheduledInfoText(SCHEDULES, WORKER, { formatTime }), '2 schedules · next 12:00');
+  assert.equal(scheduledInfoText(SCHEDULES, AGENT, { formatTime }), 'Scheduled · next 10:30');
+  assert.equal(scheduledInfoText([{ id: 'sch_e', session: { id: AGENT }, once: true }], AGENT, { formatTime }), 'Scheduled');
+  assert.equal(scheduledInfoText(SCHEDULES, 'conv-fixture-none', { formatTime }), '');
 });
 
 test('the list names each schedule, where it goes or who set it, and has a Cancel each; text is escaped', () => {
@@ -78,4 +80,24 @@ test('the list names each schedule, where it goes or who set it, and has a Cance
 test('a held firing says it waits for the user to write in the conversation that set it', () => {
   const held = [{ ...SCHEDULES[1], heldForApproval: true, heldSince: '2026-03-03T02:00:00.000Z' }];
   assert.match(renderSchedulePanelHtml(held, WORKER, { formatTime }), /waiting until you write in Coordinator · set by Coordinator/);
+});
+
+test('the header chip carries the long label with the next time and the phone\'s short one', () => {
+  const mine = schedulesOf(SCHEDULES, AGENT);
+  const html = renderScheduleChipHtml(mine, { nextText: '04:15', panelOpen: false });
+  assert.match(html, /^<button type="button" class="relay-watch-chip relay-schedule-chip" aria-expanded="false" aria-controls="relay-schedule-panel" title="[^"]+">/);
+  assert.match(html, /<span class="chat-meta-long">⏰ 2 scheduled <span class="relay-watch-hint">next 04:15<\/span><\/span><span class="chat-meta-short">⏰ 04:15<\/span><\/button>$/);
+  assert.match(renderScheduleChipHtml(mine, { panelOpen: true }), /aria-expanded="true"/);
+  assert.equal(renderScheduleChipHtml([], { nextText: '04:15' }), '');
+  // Escaped like the rest of the chip.
+  assert.match(renderScheduleChipHtml(mine, { nextText: '<4>' }), /⏰ &lt;4&gt;<\/span><\/button>$/);
+});
+
+test('the short chip text: the next time, else the count', () => {
+  const mine = schedulesOf(SCHEDULES, WORKER);
+  assert.equal(scheduleChipShortText(mine, { nextText: '02:00' }), '02:00');
+  assert.equal(scheduleChipShortText(mine), '2');
+  assert.equal(scheduleChipShortText(mine, { nextText: '  ' }), '2');
+  assert.equal(scheduleChipShortText([], { nextText: '02:00' }), '');
+  assert.match(renderScheduleChipHtml(mine), /<span class="chat-meta-long">⏰ 2 scheduled<\/span><span class="chat-meta-short">⏰ 2<\/span>/);
 });

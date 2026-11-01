@@ -26,3 +26,41 @@ test('the screen short side is set before first paint', () => {
   assert.match(html, /applyScreenShortSideEarly[\s\S]*?setProperty\('--screen-short-side'/);
   assert.match(html, /toggleAttribute\('data-phone-screen', shortSide <= 500\)/);
 });
+
+// The zoom scales the whole UI: the stylesheet's px sizes are written as
+// calc(Npx * var(--ui-scale)), and --ui-scale follows --font-scale.
+test('the stylesheet derives --ui-scale from --font-scale and sizes with it', () => {
+  assert.match(html, /--ui-scale:\s*var\(--font-scale,\s*1\)/);
+  const styleStart = html.indexOf('<style>\n  * { box-sizing');
+  const css = html.slice(styleStart, html.indexOf('</style>', styleStart));
+  const scaled = (css.match(/calc\(-?\d+(?:\.\d+)?px \* var\(--ui-scale\)\)/g) || []).length;
+  assert.ok(scaled > 1000, `px sizes scale with --ui-scale (${scaled})`);
+  // Breakpoints cannot use var(): none of them was rewritten.
+  assert.doesNotMatch(css, /@media[^{]*var\(--ui-scale\)/);
+  // The iOS focus-zoom floor keeps its literal 16px.
+  assert.match(css, /max\(16px, 1rem\)/);
+});
+
+test('getUiScale reads the inline --font-scale and falls back to 1', async () => {
+  const { getUiScale } = await import('./font-scaling.js');
+  assert.equal(getUiScale(), 1, 'no document: 1');
+  const values = {};
+  globalThis.document = {
+    documentElement: {
+      style: { getPropertyValue: (name) => values[name] ?? '' },
+    },
+  };
+  try {
+    assert.equal(getUiScale(), 1, 'nothing set yet: 1');
+    values['--font-scale'] = '1.3';
+    assert.equal(getUiScale(), 1.3);
+    values['--font-scale'] = '0.7500';
+    assert.equal(getUiScale(), 0.75);
+    values['--font-scale'] = 'abc';
+    assert.equal(getUiScale(), 1, 'garbage: 1');
+    values['--font-scale'] = '9';
+    assert.equal(getUiScale(), 1.5, 'clamped to the zoom range');
+  } finally {
+    delete globalThis.document;
+  }
+});

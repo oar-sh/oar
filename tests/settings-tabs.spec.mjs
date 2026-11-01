@@ -302,6 +302,32 @@ test.describe("tabbed settings modal", () => {
     await expectActiveProviderTab(page, "grok");
   });
 
+  test("Settings takes the focus on open; Escape closes it and reaches nothing under it", async ({ page }) => {
+    await loadApp(page);
+    await page.locator("#new-conv-btn").focus();
+    await openSettings(page, "general");
+    // The selected tab has the focus, so the arrows and Escape work at once.
+    await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("settings-tab-general");
+    await page.keyboard.press("ArrowRight");
+    await expectActiveTab(page, "providers");
+
+    // What lies underneath listens on the document; none of it hears this Escape.
+    await page.evaluate(() => {
+      window.__escapesBelow = 0;
+      const count = (event) => { if (event.key === "Escape") window.__escapesBelow += 1; };
+      document.addEventListener("keydown", count, true);
+      document.addEventListener("keydown", count);
+    });
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#settings-modal")).not.toHaveClass(/visible/);
+    expect(await page.evaluate(() => window.__escapesBelow)).toBe(0);
+    // The focus goes back where it was.
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe("new-conv-btn");
+    // Closed, Settings leaves Escape alone.
+    await page.keyboard.press("Escape");
+    expect(await page.evaluate(() => window.__escapesBelow)).toBe(2);
+  });
+
   test("deep-linking lands on the Claude provider panel", async ({ page }) => {
     await loadApp(page);
     // Park the persisted selection somewhere else so the deep link is what
@@ -383,5 +409,140 @@ test.describe("tabbed settings modal", () => {
     } finally {
       await writeLimit(120);
     }
+  });
+});
+
+// The strip scrolls sideways on a phone, with no scrollbar: the side with
+// more tabs fades (tab-strip-fade.mjs marks it as data-fade), and the
+// selected tab is scrolled whole into view, clear of the fade.
+test.describe("the tab strip on a phone", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  const TOP_STRIP = "#settings-modal .settings-tab-strip:not(.settings-subtab-strip)";
+
+  // The strip's state, and where `tabId` sits in it.
+  function readStrip(page, selector, tabId) {
+    return page.evaluate(([stripSelector, id]) => {
+      const strip = document.querySelector(stripSelector);
+      const tab = document.getElementById(id);
+      const box = strip.getBoundingClientRect();
+      const tabBox = tab.getBoundingClientRect();
+      const style = getComputedStyle(strip);
+      return {
+        fade: strip.getAttribute("data-fade"),
+        mask: style.maskImage || style.webkitMaskImage || "none",
+        fadeWidth: parseFloat(style.scrollPaddingLeft) || 0,
+        scrollLeft: strip.scrollLeft,
+        room: strip.scrollWidth - strip.clientWidth,
+        tabLeft: tabBox.left - box.left,
+        tabRight: box.right - tabBox.right,
+      };
+    }, [selector, tabId]);
+  }
+
+  // Whole, and clear of a fade on either side that has one.
+  function expectClear(state) {
+    const leftFade = state.fade === "left" || state.fade === "both";
+    const rightFade = state.fade === "right" || state.fade === "both";
+    expect(state.tabLeft).toBeGreaterThanOrEqual((leftFade ? state.fadeWidth : 0) - 1);
+    expect(state.tabRight).toBeGreaterThanOrEqual((rightFade ? state.fadeWidth : 0) - 1);
+  }
+
+  async function scrollStrip(page, selector, where) {
+    await page.evaluate(([stripSelector, to]) => {
+      const strip = document.querySelector(stripSelector);
+      const room = strip.scrollWidth - strip.clientWidth;
+      strip.scrollLeft = to === "end" ? room : to === "middle" ? Math.round(room / 2) : 0;
+    }, [selector, where]);
+  }
+
+  test("Features shows whole when chosen, and the strip's end has no fade", async ({ page }) => {
+    await loadApp(page);
+    await openSettings(page, "general");
+
+    // At the start: more to the right, so the right edge fades.
+    let state = await readStrip(page, TOP_STRIP, "settings-tab-general");
+    expect(state.room).toBeGreaterThan(0);
+    expect(state.scrollLeft).toBe(0);
+    expect(state.fade).toBe("right");
+    expect(state.mask).not.toBe("none");
+    expect(state.fadeWidth).toBeGreaterThan(0);
+
+    // In the middle both edges fade; at the end only the left.
+    await scrollStrip(page, TOP_STRIP, "middle");
+    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-general")).fade).toBe("both");
+    await scrollStrip(page, TOP_STRIP, "end");
+    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-general")).fade).toBe("left");
+    await scrollStrip(page, TOP_STRIP, "start");
+    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-general")).fade).toBe("right");
+
+    // Features, the last tab: the strip goes to its end, where nothing fades
+    // on the right. Clicked without Playwright's own scroll into view: the
+    // app has to bring it in.
+    await page.locator("#settings-tab-features").dispatchEvent("click");
+    await expectActiveTab(page, "features");
+    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-features")).fade).toBe("left");
+    state = await readStrip(page, TOP_STRIP, "settings-tab-features");
+    expect(state.scrollLeft).toBeGreaterThanOrEqual(state.room - 1);
+    expect(state.mask).toContain("to right");
+    expectClear(state);
+
+    // Opened again on Features (from the start): scrolled to it at once.
+    await page.evaluate(() => window.closeSettingsModal());
+    await scrollStrip(page, TOP_STRIP, "start");
+    await openSettings(page);
+    state = await readStrip(page, TOP_STRIP, "settings-tab-features");
+    expect(state.fade).toBe("left");
+    expectClear(state);
+
+    // A tab in the middle, chosen: whole and clear of both fades.
+    await page.locator("#settings-tab-previews").dispatchEvent("click");
+    state = await readStrip(page, TOP_STRIP, "settings-tab-previews");
+    expectClear(state);
+  });
+
+  test("the provider tabs do the same", async ({ page }) => {
+    await loadApp(page);
+    await openSettings(page, "providers", "copilot");
+    const SUB_STRIP = "#settings-modal .settings-subtab-strip";
+    let state = await readStrip(page, SUB_STRIP, "settings-provider-tab-copilot");
+    expect(state.room).toBeGreaterThan(0);
+    expect(state.fade).toBe("right");
+
+    await page.locator("#settings-provider-tab-deepseek").dispatchEvent("click");
+    await expectActiveProviderTab(page, "deepseek");
+    state = await readStrip(page, SUB_STRIP, "settings-provider-tab-deepseek");
+    expect(state.fade).toBe("left");
+    expect(state.scrollLeft).toBeGreaterThanOrEqual(state.room - 1);
+    expectClear(state);
+  });
+
+  test("Plan usage's provider strip fades the same way", async ({ page }) => {
+    // Every provider with a card and two more, so the strip runs past 390.
+    const report = {
+      providers: ["github", "claude", "claude-cloud", "cursor", "grok", "deepseek", "openai", "claude-api"].map((provider) => ({
+        provider,
+        label: { openai: "OpenAI", "claude-api": "Claude API" }[provider],
+        meters: [],
+        notes: ["Nothing used this period."],
+      })),
+    };
+    await page.route("**/api/usage**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(report) }));
+    await loadApp(page);
+    await page.waitForFunction(() => typeof window.showUsage === "function");
+    await page.evaluate(() => { void window.showUsage(); });
+    const STRIP = ".plan-usage-tab-strip";
+    await expect(page.locator(`${STRIP} [data-usage-tab]`)).toHaveCount(8);
+
+    const fade = async () => (await readStrip(page, STRIP, "plan-usage-tab-github")).fade;
+    await scrollStrip(page, STRIP, "start");
+    await expect.poll(fade).toBe("right");
+    await scrollStrip(page, STRIP, "middle");
+    await expect.poll(fade).toBe("both");
+    await scrollStrip(page, STRIP, "end");
+    await expect.poll(fade).toBe("left");
+    const state = await readStrip(page, STRIP, "plan-usage-tab-github");
+    expect(state.room).toBeGreaterThan(0);
+    expect(state.mask).not.toBe("none");
   });
 });

@@ -124,7 +124,7 @@ test.describe.serial("woken when the relay runs again", () => {
     expect(subscribed.status, JSON.stringify(subscribed.payload)).toBe(200);
     await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, conversationId);
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
-    await expect(page.locator("#chat-title-relay-events .relay-watch-chip")).toHaveText("👁 waiting for a relay restart");
+    await expect(page.locator("#chat-title-relay-events .relay-watch-chip .chat-meta-long")).toHaveText("👁 waiting for a relay restart");
 
     const state = relay.state;
     const { port, token } = relay;

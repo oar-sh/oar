@@ -37,6 +37,10 @@ export function createHeartbeatController({
   // relay hands a Claude chat's row only to a worker of the row's billing,
   // and knows a worker's kind from what it says here and in its hello.
   workerKind = null,
+  // Optional: the build id of the code this worker started on
+  // (shared/build-id.mjs). A worker whose websocket is down still beats, so
+  // the relay learns the build here as well as from the hello.
+  buildId = null,
   // requestPulse's window: one turn transition can flip the steering
   // snapshot several times in quick succession, and each flip only needs to
   // reach the relay once.
@@ -71,6 +75,7 @@ export function createHeartbeatController({
         ...(settleFailed.length ? { settleFailed } : {}),
         ...(Array.isArray(backgroundTaskIds) ? { backgroundTasks: backgroundTaskDigest(backgroundTaskIds) } : {}),
         ...(workerKind ? { workerKind: String(workerKind) } : {}),
+        ...(typeof buildId === "string" && buildId.trim() ? { buildId: buildId.trim() } : {}),
       };
       const response = await api("POST", "/api/heartbeat", body);
       // Failed by the relay, or skipped because this worker has no claim on

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { clickHeaderAction } from "./header-actions-helpers.mjs";
 
 // A compaction shows as a break line above the turn while it runs
 // ("Compacting context…", with the live bubble saying so too), and the same
@@ -134,7 +135,7 @@ test("a running compaction is one line that turns into the final one; the window
       await route.fulfill({ json: { ok: true, autoCompactWindow: body.autoCompactWindow ?? null } });
     });
 
-    await page.click("#context-btn");
+    await clickHeaderAction(page, "context");
     const modal = page.locator("#summary-modal");
     const slider = page.locator("#ctx-autocompact-slider");
     await expect(slider).toBeVisible();
@@ -156,7 +157,7 @@ test("a running compaction is one line that turns into the final one; the window
     expect(patches).toEqual([]);
 
     // A real change is saved once, when the modal is closed (the × button).
-    await page.click("#context-btn");
+    await clickHeaderAction(page, "context");
     await expect(slider).toBeVisible();
     await slider.fill("3");
     await expect(page.locator("#ctx-autocompact-value")).toHaveText("200k");
@@ -167,7 +168,7 @@ test("a running compaction is one line that turns into the final one; the window
     await expect.poll(() => patches).toEqual([200000]);
 
     // The backdrop is a way out too.
-    await page.click("#context-btn");
+    await clickHeaderAction(page, "context");
     await expect(slider).toBeVisible();
     await slider.fill("2");
     await page.mouse.click(5, 5);
@@ -175,7 +176,7 @@ test("a running compaction is one line that turns into the final one; the window
     await expect.poll(() => patches).toEqual([200000, 150000]);
 
     // So is closing the page with the modal still open (a reload here).
-    await page.click("#context-btn");
+    await clickHeaderAction(page, "context");
     await expect(slider).toBeVisible();
     await slider.fill("4");
     // The request leaves while the page unloads, where the page-level route

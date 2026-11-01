@@ -45,8 +45,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // CLI pins it shares with DeepSeek) took it to 564, and the rest of the
 // Claude API work (the billing switch and its swap, the subscription key
 // check, the usage service and spend card, four migrations) to 573. 590
-// leaves room for the fixes that follow.
-const MAX_ENTRIES = 590;
+// until 2026-10-30; the worker recycle (the shared build id, the simple
+// steering state, the worker replacement and the recycle service) took it
+// to 597. 610 leaves room for the fixes that follow.
+const MAX_ENTRIES = 610;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -60,8 +62,12 @@ const MAX_ENTRIES = 590;
 // over 7.75 MiB (8,126,967 bytes). 8 MiB until 2026-10-24; the DeepSeek
 // provider's settings, discovery and catalogue took it to 8,401,377 bytes.
 // The Claude API provider took it to 8,819,122 bytes, the rest of the Claude
-// API work to 8,971,493 (8.56 MiB): about 0.44 MiB left under 9 MiB.
-const MAX_UNPACKED_BYTES = 9 * 1024 * 1024;
+// API work to 8,971,493 (8.56 MiB): about 0.44 MiB left under 9 MiB. 9 MiB
+// until 2026-10-30; 0.9.20 released at 9,372,499 bytes (99.31 % of it), the
+// worker recycle took it to 9,427,816 (99.9 %), and its fix round would have
+// gone over. 9.5 MiB
+// leaves room for the fixes that follow.
+const MAX_UNPACKED_BYTES = 9.5 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },

@@ -29,6 +29,8 @@ let currentConversationId = '';
 let currentProviderType = '';
 let actionInFlight = false;
 let wakeTimer = null;
+// The report whose one-line warning was tapped open (its dismissedKey).
+let expandedKey = '';
 
 function notifyBilling(conversationId) {
   const id = String(conversationId || '').trim();
@@ -86,6 +88,30 @@ export function usageLimitAccountText(state, nowMs = Date.now()) {
   const utilization = Number(state.utilization);
   if (state.status !== 'allowed_warning' || !Number.isFinite(utilization) || utilization < WARNING_FROM) return '';
   return `Claude usage at ${Math.round(utilization * 100)} % of the ${label} — resets ${resets}`;
+}
+
+/** "04:00" today, "Tue 04:00" on another day: the one-line banner's time. */
+export function formatUsageLimitShortTime(iso, nowMs = Date.now()) {
+  const at = new Date(String(iso || ''));
+  if (Number.isNaN(at.getTime())) return '';
+  const clock = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (new Date(nowMs).toDateString() === at.toDateString()) return clock;
+  return `${at.toLocaleDateString([], { weekday: 'short' })} ${clock}`;
+}
+
+/**
+ * The account's line in one short line, for the compact banner:
+ * "⚠ Claude 94 % weekly · resets Tue 04:00", or at the limit
+ * "⚠ Claude weekly limit reached · resets Tue 04:00". '' when
+ * usageLimitAccountText says nothing.
+ */
+export function usageLimitAccountShortText(state, nowMs = Date.now()) {
+  if (!usageLimitAccountText(state, nowMs)) return '';
+  const label = String(state.label || 'usage limit');
+  const resets = formatUsageLimitShortTime(state.resetsAt, nowMs);
+  if (state.status === 'rejected') return `⚠ Claude ${label} reached · resets ${resets}`;
+  const limitWindow = label.replace(/\s*limit$/i, '').trim() || label;
+  return `⚠ Claude ${Math.round(Number(state.utilization) * 100)} % ${limitWindow} · resets ${resets}`;
 }
 
 /**
@@ -201,6 +227,8 @@ export function renderUsageLimitBanner(nowMs = Date.now()) {
   const banner = document.getElementById(BANNER_ID);
   if (!banner) return;
   const children = [];
+  let compact = false;
+  let expanded = false;
   const pause = activeUsageLimitPause(currentConversationId, nowMs);
   if (pause) {
     const text = document.createElement('span');
@@ -225,14 +253,46 @@ export function renderUsageLimitBanner(nowMs = Date.now()) {
       ? usageLimitAccountText(account, nowMs)
       : '';
     if (line) {
+      // One line with the full sentence in the title; a tap on it opens the
+      // full sentence until the report changes.
+      if (expandedKey && expandedKey !== dismissedKey(account)) expandedKey = '';
+      expanded = expandedKey !== '' && expandedKey === dismissedKey(account);
       const text = document.createElement('span');
       text.className = 'usage-limit-text';
-      text.textContent = line;
-      children.push(text, button('Hide', 'usage-limit-dismiss', async () => dismissWarning()));
+      text.textContent = expanded ? line : (usageLimitAccountShortText(account, nowMs) || line);
+      text.title = line;
+      text.setAttribute('role', 'button');
+      text.tabIndex = 0;
+      text.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      const toggle = (event) => {
+        event.preventDefault();
+        expandedKey = expanded ? '' : dismissedKey(account);
+        renderUsageLimitBanner();
+      };
+      text.addEventListener('click', toggle);
+      text.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') toggle(event);
+      });
+      const hide = button('✕', 'usage-limit-dismiss', async () => dismissWarning());
+      hide.title = 'Hide';
+      hide.setAttribute('aria-label', 'Hide');
+      children.push(text, hide);
       banner.dataset.state = account.status === 'rejected' ? 'reached' : 'warning';
+      compact = true;
     }
   }
+  banner.classList.toggle('usage-limit-compact', compact);
+  banner.classList.toggle('usage-limit-expanded', compact && expanded);
+  // The banner is drawn anew: the control that had the focus (the line's
+  // toggle, a button) gets it back in its new node, found by its class.
+  const focused = typeof document.activeElement?.className === 'string' && banner.contains(document.activeElement)
+    ? document.activeElement.className
+    : '';
   banner.replaceChildren(...children);
+  if (focused) {
+    const again = children.find((child) => child.className === focused);
+    try { again?.focus({ preventScroll: true }); } catch {}
+  }
   banner.classList.toggle('visible', children.length > 0);
   banner.hidden = children.length === 0;
   if (!children.length) delete banner.dataset.state;
@@ -350,6 +410,7 @@ export function __resetUsageLimitUiForTests() {
   currentConversationId = '';
   currentProviderType = '';
   actionInFlight = false;
+  expandedKey = '';
   if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
   try { localStorage.removeItem(DISMISSED_KEY); } catch {}
   renderUsageLimitBanner();

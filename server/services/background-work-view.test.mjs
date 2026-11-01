@@ -150,7 +150,7 @@ test('background work a live worker reports without a set is a placeholder and a
   assert.deepEqual(t.view.panelTasks(BUILDER), [{
     taskId: UNREPORTED_BACKGROUND_TASK_ID,
     taskType: 'unreported',
-    description: 'background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)',
+    description: 'background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)',
     startedAt: null,
     stoppable: false,
     placeholder: true,
@@ -161,7 +161,7 @@ test('background work a live worker reports without a set is a placeholder and a
     conversationId: BUILDER,
     title: 'Orbit camera',
     count: 1,
-    detail: '1 background agent: background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)',
+    detail: '1 background agent: background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)',
   }]);
 
   // The flag goes false: gone, with nothing to say about an end.
@@ -235,7 +235,7 @@ test('a worker whose session id is not the conversation id: the placeholder show
     conversationId: RENDER,
     title: 'Render queue',
     count: 1,
-    detail: '1 background agent: background work, details not reported since the relay restarted (Kill session in its ⋯ menu ends it)',
+    detail: '1 background agent: background work, details not reported since the relay restarted (Kill session in its ︙ menu ends it)',
   }]);
   // Its set, posted under the session id, replaces it under the same conversation.
   t.store.replace(RENDER_SESSION, [shell()]);

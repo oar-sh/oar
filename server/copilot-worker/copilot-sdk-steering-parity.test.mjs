@@ -11,6 +11,7 @@ import {
   baseMessage,
   createFakeCopilotClient,
   makeApiStub,
+  makeContinuationApiStub,
   makeFakeQuestionBridge,
   makeRunner,
   tick,
@@ -703,4 +704,189 @@ test('the worker is told at once when a message becomes, and stops being, cancel
   client.session.emit({ type: 'assistant.idle', data: {} });
   assert.equal(await first, true);
   assert.equal(await second, true);
+});
+
+// ------------------------------------------------------------ releasable --
+// Whether the relay may replace the worker now (its recycle after a deploy):
+// the same `releasable` / `releaseHold` / `backgroundTaskCount` fields the
+// Claude worker sends, from the runner's idle gates.
+
+const releaseFields = (state) => ({
+  releasable: state.releasable,
+  releaseHold: state.releaseHold,
+  backgroundTaskCount: state.backgroundTaskCount,
+});
+
+test('an idle worker is releasable, before its first turn and after a turn has settled', async () => {
+  const { stub, client, runner, first } = await openLiveTurn();
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: false, releaseHold: 'turn', backgroundTaskCount: 0 });
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'released after the turn' });
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: true, releaseHold: null, backgroundTaskCount: 0 });
+  assert.equal(stub.bodiesFor('/api/response').length, 1);
+
+  const fresh = makeRunner({ stub: makeApiStub(), client: createFakeCopilotClient() }).runner;
+  assert.deepEqual(releaseFields(fresh.steeringState()), { releasable: true, releaseHold: null, backgroundTaskCount: 0 });
+});
+
+test('a turn holds the release from the delivery on, and so does an open question card', async () => {
+  let releaseSend = () => {};
+  const gate = new Promise((resolve) => { releaseSend = resolve; });
+  const client = createFakeCopilotClient();
+  const createSession = client.createSession.bind(client);
+  client.createSession = async (config) => {
+    const session = await createSession(config);
+    const send = session.send.bind(session);
+    session.send = async (options) => { await gate; return send(options); };
+    return session;
+  };
+  const { runner } = makeRunner({ stub: makeApiStub(), client });
+  const first = runner.handlePendingPayload({ message: baseMessage });
+  // The prompt is not even sent yet: the delivery is a turn all the same.
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: false, releaseHold: 'turn', backgroundTaskCount: 0 });
+  releaseSend();
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'send resolved' });
+  assert.equal(runner.steeringState().releaseHold, 'turn');
+  client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await first, true);
+  assert.equal(runner.steeringState().releasable, true);
+
+  let answer = () => {};
+  const card = new Promise((resolve) => { answer = resolve; });
+  const questionBridge = makeFakeQuestionBridge({ userInputAnswer: 'staging', onAsk: () => card });
+  const live = await openLiveTurn({ questionBridge });
+  const asked = live.client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] });
+  await waitFor(() => live.runner.steeringState().releaseHold === 'question', { label: 'card holds the release' });
+  assert.equal(live.runner.steeringState().releasable, false);
+  answer();
+  await asked;
+  await waitFor(() => live.runner.steeringState().releaseHold === 'turn', { label: 'the turn holds it after the answer' });
+  live.client.session.emit({ type: 'assistant.idle', data: {} });
+  assert.equal(await live.first, true);
+  assert.equal(live.runner.steeringState().releasable, true);
+});
+
+test('a live background agent holds the release after its turn settled, and is counted', async () => {
+  const agent = {
+    type: 'agent', id: 'agent-1', toolCallId: 'call_1_0', displayName: 'bg-probe', description: 'background probe',
+    status: 'running', agentType: 'general-purpose', executionMode: 'background', startedAt: new Date().toISOString(),
+  };
+  const client = createFakeCopilotClient({
+    tasksRpc: true,
+    taskList: [agent],
+    onSend: (session, _options, messageId) => {
+      if (session.sends.length !== 1) return;
+      session.replay([
+        userMessage(messageId, 'idle', 'hello'),
+        assistantText('m1', 'Main: spawned.'),
+        { type: 'session.background_tasks_changed', data: {} },
+        { type: 'assistant.idle', data: {} },
+      ]);
+    },
+  });
+  const { runner } = makeRunner({
+    stub: makeContinuationApiStub(),
+    client,
+    taskRefreshMs: 1,
+    taskPublishThrottleMs: 1,
+    continuationRetryDelayMs: 1,
+  });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => runner.steeringState().releaseHold === 'background', { label: 'the agent holds the release' });
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: false, releaseHold: 'background', backgroundTaskCount: 1 });
+  assert.equal(runner.steeringState().turnActive, false);
+
+  // The agent finishes: nothing holds the worker any more.
+  client.session.taskList[0].status = 'completed';
+  client.session.emit({ type: 'session.background_tasks_changed', data: {} });
+  await tick(5);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'released after the agent' });
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: true, releaseHold: null, backgroundTaskCount: 0 });
+  await runner.dispose();
+});
+
+/** A client whose first send runs a whole turn: the prompt, a reply, idle. */
+function oneTurnClient(clientOptions = {}) {
+  return createFakeCopilotClient({
+    ...clientOptions,
+    onSend: (session, _options, messageId) => {
+      if (session.sends.length !== 1) return;
+      session.replay([userMessage(messageId, 'idle', 'hello'), assistantText('m1', 'ok'), { type: 'assistant.idle', data: {} }]);
+    },
+  });
+}
+
+test('a registry read that is due or on its way holds the release: whether a task lives is not known', async () => {
+  const client = oneTurnClient({ tasksRpc: true, taskList: [] });
+  const { runner } = makeRunner({
+    stub: makeApiStub(),
+    client,
+    // Long enough to see the debounced read before it asks the runtime.
+    taskRefreshMs: 40,
+    taskPublishThrottleMs: 1,
+  });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  await runner.whenTasksRefreshed();
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'idle after the turn' });
+
+  // The next read answers only when the test says so.
+  let answer = () => {};
+  const listed = new Promise((resolve) => { answer = resolve; });
+  const tasksRpc = client.session.rpc.tasks;
+  const list = tasksRpc.list.bind(tasksRpc);
+  let asked = 0;
+  tasksRpc.list = async () => { asked += 1; await listed; return list(); };
+
+  client.session.emit({ type: 'session.background_tasks_changed', data: {} });
+  await waitFor(() => runner.steeringState().releasable === false, { label: 'the due read holds' });
+  assert.equal(asked, 0, 'the read is still debounced');
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: false, releaseHold: 'background', backgroundTaskCount: 0 });
+  assert.equal(runner.steeringState().turnActive, false);
+
+  await waitFor(() => asked === 1, { label: 'the read asks the runtime' });
+  assert.deepEqual(releaseFields(runner.steeringState()), { releasable: false, releaseHold: 'background', backgroundTaskCount: 0 });
+
+  answer();
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'released once the read answered' });
+  assert.equal(runner.steeringState().releaseHold, null);
+  await runner.dispose();
+});
+
+// `cliAlive` is the second half of what the relay's recycle reads: it
+// replaces a stale worker only when it is releasable AND its runtime process
+// is gone. Releasable with the runtime up is the idle window (a scheduled job
+// may still wake the session), so the relay waits for the idle shutdown.
+test('cliAlive: no runtime before the first turn; up between turns while releasable, the pair the relay waits on', async () => {
+  const fresh = makeRunner({ stub: makeApiStub(), client: createFakeCopilotClient() }).runner;
+  assert.equal(fresh.steeringState().cliAlive, false);
+
+  const client = oneTurnClient();
+  // Far beyond the test: the runtime stays in its idle window throughout.
+  const { runner } = makeRunner({ stub: makeApiStub(), client, idleShutdownMs: 60_000, lifecyclePollMs: 5 });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  // The turn settled, the runtime is up, and nothing new arrives: a session
+  // whose scheduled job is due inside the idle window looks exactly so.
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'releasable after the turn' });
+  await tick(30);
+  const between = runner.steeringState();
+  assert.equal(between.releasable, true);
+  assert.equal(between.releaseHold, null);
+  assert.equal(between.cliAlive, true);
+  assert.equal(client.stopped, 0, 'the runtime has not idled out');
+  await runner.dispose();
+});
+
+test('cliAlive turns false once the runtime idles out', async () => {
+  const client = oneTurnClient();
+  const { runner } = makeRunner({ stub: makeApiStub(), client, idleShutdownMs: 20, lifecyclePollMs: 5 });
+  assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
+  assert.equal(runner.steeringState().cliAlive, true);
+  await waitFor(() => runner._getState().hasClient === false, { label: 'idle shutdown' });
+  const gone = runner.steeringState();
+  assert.equal(gone.cliAlive, false);
+  assert.equal(gone.releasable, true);
+  await runner.dispose();
 });

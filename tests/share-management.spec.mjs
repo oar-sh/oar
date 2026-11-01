@@ -8,7 +8,7 @@ import { relayToken } from "./e2e-env.mjs";
  * log; Renew link gives it a new link (an open shared page stops, the old link
  * is a 404, the log carries over); the IP setting keeps the address out of new
  * entries and offers to remove the ones stored before (No keeps them, Yes
- * removes them and keeps the viewer counts); Stop sharing ends it. The ⋯ menu shows "Stop sharing" only while
+ * removes them and keeps the viewer counts); Stop sharing ends it. The ︙ menu shows "Stop sharing" only while
  * the open conversation has a link, and asks before it stops it.
  *
  * Other specs share conversations on the same relay, so the list is only
@@ -217,7 +217,7 @@ test.describe("share management", () => {
     { name: "desktop", use: { viewport: { width: 1280, height: 800 } }, touch: false },
     { name: "phone", use: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true }, touch: true },
   ]) {
-    test.describe(`the ⋯ menu on a ${profile.name} viewport`, () => {
+    test.describe(`the ︙ menu on a ${profile.name} viewport`, () => {
       test.use(profile.use);
 
       test("Stop sharing shows only for a shared conversation and asks first", async ({ page, request, browser }) => {

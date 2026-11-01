@@ -975,3 +975,127 @@ test("a worker's kind rides its hello and its ready", async () => {
   assert.deepEqual(sent.map((payload) => [payload.type, payload.kind]), [["worker.hello", "claude-api"], ["worker.ready", "claude-api"]]);
   link.stop();
 });
+
+test("a worker's build id rides its hello and its ready next to its kind", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-1",
+    getPid: () => 4242,
+    workerKind: "claude",
+    buildId: "0.9.21+0123456789ab",
+    onDeliver: async () => {},
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = socket.sent.map((payload) => JSON.parse(payload));
+  assert.deepEqual(sent.map((payload) => [payload.type, payload.kind, payload.buildId]), [
+    ["worker.hello", "claude", "0.9.21+0123456789ab"],
+    ["worker.ready", "claude", "0.9.21+0123456789ab"],
+  ]);
+  link.stop();
+});
+
+test("a worker without a build id sends no buildId key", async () => {
+  FakeWebSocket.instances = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-1",
+    getPid: () => 4242,
+    workerKind: "claude",
+    onDeliver: async () => {},
+    WebSocketImpl: FakeWebSocket,
+    jitterMs: 0,
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = socket.sent.map((payload) => JSON.parse(payload));
+  assert.deepEqual(sent.map((payload) => payload.type), ["worker.hello", "worker.ready"]);
+  for (const payload of sent) assert.equal("buildId" in payload, false);
+  link.stop();
+});
+
+function buildMismatchLines(logs) {
+  return logs.filter((line) => line.includes("the relay will recycle this worker when idle"));
+}
+
+test("a relay on another build is logged once per connection and its id shows in status", async () => {
+  FakeWebSocket.instances = [];
+  const logs = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-build",
+    buildId: "0.9.20+aaaaaaaaaaaa",
+    dbg: (...args) => logs.push(args.join(" ")),
+    WebSocketImpl: FakeWebSocket,
+    connectTimeoutMs: 0,
+    jitterMs: 0,
+    setTimeoutImpl: (fn) => { fn(); return {}; },
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  assert.equal(link.status().relayBuildId, null, "no relay seen yet");
+  const first = FakeWebSocket.instances[0];
+  first.open();
+  first.receive({ type: "server.hello", reason: "connected", buildId: "0.9.21+bbbbbbbbbbbb" });
+  // The relay acks every worker.hello with another server.hello.
+  first.receive({ type: "server.hello", reason: "ack", buildId: "0.9.21+bbbbbbbbbbbb" });
+  assert.deepEqual(buildMismatchLines(logs), [
+    "relay build 0.9.21+bbbbbbbbbbbb, mine 0.9.20+aaaaaaaaaaaa: the relay will recycle this worker when idle",
+  ]);
+  assert.equal(link.status().relayBuildId, "0.9.21+bbbbbbbbbbbb");
+
+  // A new connection logs it again.
+  first.close();
+  const second = FakeWebSocket.instances[1];
+  assert.ok(second, "the link reconnected");
+  second.open();
+  second.receive({ type: "server.hello", reason: "connected", buildId: "0.9.21+bbbbbbbbbbbb" });
+  second.receive({ type: "server.hello", reason: "ack", buildId: "0.9.21+bbbbbbbbbbbb" });
+  assert.equal(buildMismatchLines(logs).length, 2);
+  link.stop();
+});
+
+test("a relay on the same build, or one that names none, is never logged", async () => {
+  FakeWebSocket.instances = [];
+  const logs = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-build-same",
+    buildId: "0.9.21+bbbbbbbbbbbb",
+    dbg: (...args) => logs.push(args.join(" ")),
+    WebSocketImpl: FakeWebSocket,
+    connectTimeoutMs: 0,
+    jitterMs: 0,
+    setTimeoutImpl: (fn) => { fn(); return {}; },
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  const first = FakeWebSocket.instances[0];
+  first.open();
+  first.receive({ type: "server.hello", reason: "connected", buildId: "0.9.21+bbbbbbbbbbbb" });
+  first.receive({ type: "server.hello", reason: "ack", buildId: "0.9.21+bbbbbbbbbbbb" });
+  assert.equal(link.status().relayBuildId, "0.9.21+bbbbbbbbbbbb");
+  first.close();
+  // An older relay states no build id: no evidence of a change.
+  const second = FakeWebSocket.instances[1];
+  second.open();
+  second.receive({ type: "server.hello", reason: "connected" });
+  assert.equal(link.status().relayBuildId, null);
+  assert.deepEqual(buildMismatchLines(logs), []);
+  link.stop();
+});

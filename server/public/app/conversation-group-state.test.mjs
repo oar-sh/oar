@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   groupIsActive,
   groupSummaryText,
+  groupTitleTone,
   memberStateClass,
+  memberTone,
   parseGroupFoldChoices,
   pruneGroupFoldChoices,
   resolveGroupFold,
@@ -37,12 +39,11 @@ test('the summary counts the classes and names the strongest', () => {
   assert.equal(groupIsActive(summarizeGroupMembers(['waiting'])), true);
 });
 
-test('the fold: folded once finished, open while active, the user\'s choice wins, the open chat and a filter force open', () => {
+test('the fold: folded once finished, open while active, the user\'s choice wins, a filter forces open', () => {
   assert.equal(resolveGroupFold({ active: false }), false);
   assert.equal(resolveGroupFold({ active: true }), true);
   assert.equal(resolveGroupFold({ active: true, choice: 'folded' }), false);
   assert.equal(resolveGroupFold({ active: false, choice: 'open' }), true);
-  assert.equal(resolveGroupFold({ active: false, choice: 'folded', holdsOpenConversation: true }), true);
   assert.equal(resolveGroupFold({ active: false, choice: 'folded', filterActive: true }), true);
   assert.equal(toggledGroupFoldChoice(true), 'folded');
   assert.equal(toggledGroupFoldChoice(false), 'open');
@@ -54,4 +55,17 @@ test('fold choices in storage: parsed strictly and pruned to the groups still li
   assert.deepEqual(parseGroupFoldChoices('[1,2]'), {});
   assert.deepEqual(parseGroupFoldChoices(''), {});
   assert.deepEqual(pruneGroupFoldChoices({ grp_a: 'open', grp_b: 'folded' }, ['grp_b']), { grp_b: 'folded' });
+});
+
+test('the group name\'s tone: waiting before working before ready, else plain; a failed member does not colour it', () => {
+  assert.equal(memberTone({ memberState: 'waiting', visualState: 'question' }), 'waiting');
+  assert.equal(memberTone({ memberState: 'running', visualState: 'ready' }), 'running');
+  assert.equal(memberTone({ memberState: 'idle', visualState: 'ready' }), 'ready');
+  assert.equal(memberTone({ memberState: 'idle', visualState: 'offline' }), 'offline');
+  assert.equal(memberTone({ memberState: 'error', visualState: 'error' }), 'offline');
+  assert.equal(groupTitleTone(['ready', 'running', 'waiting']), 'question');
+  assert.equal(groupTitleTone(['offline', 'running', 'ready']), 'working');
+  assert.equal(groupTitleTone(['offline', 'ready']), 'ready');
+  assert.equal(groupTitleTone(['offline', 'offline']), 'offline');
+  assert.equal(groupTitleTone([]), 'offline');
 });

@@ -42,12 +42,24 @@ export function summarizeGroupMembers(states = []) {
 export function groupSummaryText(summary) {
   const count = Number(summary?.count || 0);
   if (!count) return '';
+  const activity = groupActivityText(summary);
+  if (!activity) return groupSessionCountText(count);
+  return `${count} · ${activity}`;
+}
+
+/** "1 waiting for you, 2 running", or "" while nothing waits, runs or failed. */
+export function groupActivityText(summary) {
   const parts = [];
-  if (summary.waiting > 0) parts.push(`${summary.waiting} waiting for you`);
-  if (summary.running > 0) parts.push(`${summary.running} running`);
-  if (summary.error > 0) parts.push(`${summary.error} failed`);
-  if (!parts.length) return `${count} session${count === 1 ? '' : 's'}`;
-  return `${count} · ${parts.join(', ')}`;
+  if (Number(summary?.waiting) > 0) parts.push(`${summary.waiting} waiting for you`);
+  if (Number(summary?.running) > 0) parts.push(`${summary.running} running`);
+  if (Number(summary?.error) > 0) parts.push(`${summary.error} failed`);
+  return parts.join(', ');
+}
+
+/** "1 session", "4 sessions". */
+export function groupSessionCountText(count) {
+  const n = Number(count) || 0;
+  return `${n} session${n === 1 ? '' : 's'}`;
 }
 
 /** Whether a group has something going on: a member runs or waits. */
@@ -56,13 +68,38 @@ export function groupIsActive(summary) {
 }
 
 /**
- * Open or folded. The user's choice ('open' | 'folded') wins; otherwise a
- * group is open while active and folded once everything is finished. The
- * group that holds the open conversation, and every group under a title
- * filter, is always open.
+ * A member's colour in its group's name: 'waiting', 'running', 'ready' (idle
+ * with a live worker, the darker green) or 'offline'. A failed member does
+ * not colour the name; the pill says so.
  */
-export function resolveGroupFold({ choice = null, active = false, holdsOpenConversation = false, filterActive = false } = {}) {
-  if (holdsOpenConversation || filterActive) return true;
+export function memberTone({ memberState = 'idle', visualState = '' } = {}) {
+  if (memberState === 'waiting' || memberState === 'running') return memberState;
+  return String(visualState || '').trim().toLowerCase() === 'ready' ? 'ready' : 'offline';
+}
+
+/**
+ * The colour of a group's name from its members' tones: red while one waits
+ * for the user, bright green while one works, the darker green while one is
+ * ready, else the plain title colour. Returns 'question' | 'working' |
+ * 'ready' | 'offline'.
+ */
+export function groupTitleTone(tones = []) {
+  const list = Array.isArray(tones) ? tones : [];
+  if (list.includes('waiting')) return 'question';
+  if (list.includes('running')) return 'working';
+  if (list.includes('ready')) return 'ready';
+  return 'offline';
+}
+
+/**
+ * Open or folded. The user's choice ('open' | 'folded') wins; otherwise a
+ * group is open while active and folded once everything is finished. Every
+ * group under a title filter is always open. A folded group that holds the
+ * open conversation still shows that row (arrangeConversationList's
+ * keepVisibleId).
+ */
+export function resolveGroupFold({ choice = null, active = false, filterActive = false } = {}) {
+  if (filterActive) return true;
   if (choice === 'open') return true;
   if (choice === 'folded') return false;
   return active === true;

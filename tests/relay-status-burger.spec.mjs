@@ -88,6 +88,40 @@ test.describe("relay status on the mobile burger", () => {
     expect(new Set([OFFLINE, TUNNELLED, ONLINE]).size).toBe(3);
   });
 
+  test("on the light theme every tone reads at 4.5:1 on the header", async ({ page }) => {
+    const token = relayToken();
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+
+    // The light theme steps the tones down: the dark theme's green was 2.2:1.
+    const LIGHT = {
+      online: "rgb(24, 119, 51)", // #187733
+      tunnelled: "rgb(138, 92, 0)", // #8a5c00
+      offline: "rgb(92, 101, 112)", // #5c6570
+    };
+    for (const [tone, colour] of Object.entries(LIGHT)) {
+      await settledColor(page, tone).toBe(colour);
+      const { ratio, colour: drawn, bg } = await burger(page).evaluate((el) => {
+        const rgb = (s) => s.match(/[\d.]+/g).slice(0, 4).map(Number);
+        let bg = null;
+        for (let node = el; node && !bg; node = node.parentElement) {
+          const c = rgb(getComputedStyle(node).backgroundColor);
+          if (c.length < 4 || c[3] > 0) bg = c;
+        }
+        bg = bg || [255, 255, 255];
+        const lum = ([r, g, b]) => {
+          const lin = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+          return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+        };
+        const colour = getComputedStyle(el).color;
+        const [hi, lo] = [lum(rgb(colour)), lum(bg)].sort((a, b) => b - a);
+        return { ratio: (hi + 0.05) / (lo + 0.05), colour, bg: bg.join(",") };
+      });
+      expect(ratio, `${tone} glyph ${drawn} on ${bg}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   test("the desktop burger keeps its plain glyph colour", async ({ page }) => {
     const token = relayToken();
     await page.goto(`/?token=${encodeURIComponent(token)}`);

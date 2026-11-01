@@ -1896,7 +1896,7 @@ test('steeringState reports the composer-facing snapshot', async () => {
   // `releasable`: a billing swap may replace the worker (no CLI here).
   assert.deepEqual(runner.steeringState(), {
     turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: null,
-    releasable: true, releaseHold: null, backgroundTaskCount: 0,
+    releasable: true, releaseHold: null, backgroundTaskCount: 0, cliAlive: false,
   });
 
   const first = runner.handlePendingPayload({ message: { ...baseMessage } });
@@ -1908,7 +1908,7 @@ test('steeringState reports the composer-facing snapshot', async () => {
   const runningWindow = { active: null, backgroundWork: false };
   assert.deepEqual(runner.steeringState(), {
     turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
-    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0,
+    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0, cliAlive: true,
   });
 
   // Steered entries in flight do not hold steering (unbounded), and the
@@ -1917,7 +1917,7 @@ test('steeringState reports the composer-facing snapshot', async () => {
   await waitFor(() => runner._getProcess().pendingDelivered.length === 1, { label: 'steer pending' });
   assert.deepEqual(runner.steeringState(), {
     turnActive: true, canSteer: true, holdReason: null, messageId: 'q-1', supported: true, autoCompactWindow: runningWindow,
-    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0,
+    releasable: false, releaseHold: 'turn', backgroundTaskCount: 0, cliAlive: true,
   });
 
   turn.emit(resultMessage('done', 'native-1'));
@@ -4430,6 +4430,71 @@ test('the process idles out after idleShutdownMs with no work', async () => {
   assert.equal(await pending, true);
   await waitFor(() => turn.endInputCalls >= 1, { label: 'idle release' });
   await settled(runner);
+});
+
+// `cliAlive` is the second half of what the relay's recycle reads: it
+// replaces a stale worker only when it is releasable AND its CLI is gone.
+// Releasable with the CLI up is the idle window, where a scheduled job (a
+// /loop, a cron the CLI runs) may still wake the session, so the relay waits
+// for the idle-out instead of cutting it short.
+test('between turns the CLI is up: releasable and cliAlive together, the pair the relay waits on', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    // Far beyond the test: the CLI stays in its idle window throughout.
+    idleShutdownMs: 60_000,
+    lifecyclePollMs: 10,
+  });
+  assert.equal(runner.steeringState().cliAlive, false, 'no CLI before the first delivery');
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => runner.steeringState().turnActive === true, { label: 'a turn is live' });
+  assert.equal(runner.steeringState().cliAlive, true, 'the CLI runs the turn');
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  // The turn ended, the CLI is still up, and nothing new arrives: a session
+  // whose scheduled job is due inside the idle window looks exactly so.
+  await waitFor(() => runner.steeringState().releasable === true, { label: 'releasable after the turn' });
+  await tick(50);
+  const between = runner.steeringState();
+  assert.equal(between.releasable, true);
+  assert.equal(between.releaseHold, null);
+  assert.equal(between.cliAlive, true);
+  assert.equal(turn.endInputCalls, 0, 'the CLI has not idled out');
+  turn.endInput();
+  await settled(runner);
+});
+
+test('cliAlive turns false once the CLI idles out, and stays true while it is closing', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  // The stream stays open after the idle release asks the CLI to end, as a
+  // real CLI winds down for a moment: the process is closing, not gone.
+  const endInput = turn.endInput.bind(turn);
+  turn.endInput = () => { turn.endInputCalls += 1; };
+  const runner = makeRunner({
+    stub,
+    startImpl: () => turn,
+    idleShutdownMs: 40,
+    lifecyclePollMs: 10,
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('done', 'native-1'));
+  assert.equal(await pending, true);
+  assert.equal(runner.steeringState().cliAlive, true);
+  await waitFor(() => turn.endInputCalls >= 1, { label: 'idle release' });
+  const closing = runner.steeringState();
+  assert.equal(closing.cliAlive, true, 'a closing CLI is not gone yet');
+  assert.equal(closing.releasable, true);
+  endInput();
+  await settled(runner);
+  const gone = runner.steeringState();
+  assert.equal(gone.cliAlive, false);
+  assert.equal(gone.releasable, true);
 });
 
 test('live background tasks defer the idle shutdown', async () => {

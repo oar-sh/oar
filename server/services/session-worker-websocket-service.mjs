@@ -1,6 +1,7 @@
 'use strict';
 
 import { URL } from 'url';
+import { normalizeBuildId } from '../../shared/build-id.mjs';
 
 function normalizeText(value) {
   const text = String(value || '').trim();
@@ -111,6 +112,13 @@ export function createSessionWorkerWebSocketService({
   // A worker stated its kind ("claude", "claude-api", ...) in a hello or a
   // ready: (sessionId, kind, pid). The registry keeps it.
   onWorkerKind = () => {},
+  // A worker stated the build id of the code it started on, in a hello or a
+  // ready: (sessionId, buildId, pid). The registry keeps it, so the relay can
+  // tell a worker on older code from one that runs what the relay runs.
+  onWorkerBuildId = () => {},
+  // The relay's own build id, sent in every server.hello so a worker can log
+  // that it runs other code; null leaves the key out.
+  buildId = null,
   // Liveness probe for a socket's worker process. A killed worker's socket
   // survives its process by an event-loop turn (the kill path blocks the loop,
   // so this service's timer runs before the socket close lands), and asking for
@@ -135,6 +143,8 @@ export function createSessionWorkerWebSocketService({
   const noop = () => {};
   const logDebug = typeof logger?.debug === 'function' ? logger.debug.bind(logger) : noop;
   const logWarn = typeof logger?.warn === 'function' ? logger.warn.bind(logger) : noop;
+
+  const relayBuildId = normalizeBuildId(buildId);
 
   let interval = null;
   let lastSnapshot = null;
@@ -243,6 +253,32 @@ export function createSessionWorkerWebSocketService({
     if (!/^[a-z][a-z0-9-]{0,31}$/.test(kind) || meta.workerKind === kind) return;
     meta.workerKind = kind;
     try { onWorkerKind(meta.sessionId, kind, meta.pid); } catch {}
+  }
+
+  // The build id a hello or ready states, kept and reported like the kind. A
+  // value that is malformed or too long is ignored rather than stored, since
+  // the worker side is not trusted to bound what it sends.
+  function noteWorkerBuildId(meta, payload) {
+    const workerBuildId = normalizeBuildId(payload?.buildId);
+    if (!workerBuildId || meta.workerBuildId === workerBuildId) return;
+    meta.workerBuildId = workerBuildId;
+    try { onWorkerBuildId(meta.sessionId, workerBuildId, meta.pid); } catch {}
+  }
+
+  // Both server.hello frames (on connection and the ack of worker.hello) carry
+  // the same fields; an unknown relay build id leaves its key out rather than
+  // sending null.
+  function serverHello(reason, sessionId) {
+    const event = {
+      type: 'server.hello',
+      reason,
+      capabilities: WORKER_PROTOCOL_CAPABILITIES,
+      queue: normalizeQueueSnapshot(queueCounts()),
+      sessionId,
+      timestamp: nowIso(),
+    };
+    if (relayBuildId) event.buildId = relayBuildId;
+    return event;
   }
 
   function noteHeartbeat(meta, reason = 'worker-message') {
@@ -397,14 +433,7 @@ export function createSessionWorkerWebSocketService({
     });
     if (identity.sessionId) supersedePriorSockets(ws, identity.sessionId);
     touchCli();
-    emitEvent(ws, {
-      type: 'server.hello',
-      reason: 'connected',
-      capabilities: WORKER_PROTOCOL_CAPABILITIES,
-      queue: normalizeQueueSnapshot(queueCounts()),
-      sessionId: identity.sessionId,
-      timestamp: nowIso(),
-    });
+    emitEvent(ws, serverHello('connected', identity.sessionId));
 
     ws.on('message', (raw) => {
       touchCli();
@@ -420,19 +449,13 @@ export function createSessionWorkerWebSocketService({
         if (!bindSocketIdentity(ws, meta, payload)) return;
         meta.lastSeenAtMs = nowMsSafe();
         noteWorkerKind(meta, payload);
+        noteWorkerBuildId(meta, payload);
         // A worker holding deliveries (open question card, compaction) binds
         // its identity with hello but must not be handed work.
         meta.ready = payload.ready !== false;
         meta.lastHelloAt = nowIso();
         noteHeartbeat(meta, 'worker-hello');
-        emitEvent(ws, {
-          type: 'server.hello',
-          reason: 'ack',
-          capabilities: WORKER_PROTOCOL_CAPABILITIES,
-          queue: normalizeQueueSnapshot(queueCounts()),
-          sessionId: meta.sessionId,
-          timestamp: nowIso(),
-        });
+        emitEvent(ws, serverHello('ack', meta.sessionId));
         void maybeDeliverToSocket(ws, 'worker-hello');
         return;
       }
@@ -440,6 +463,7 @@ export function createSessionWorkerWebSocketService({
         if (!bindSocketIdentity(ws, meta, payload)) return;
         meta.lastSeenAtMs = nowMsSafe();
         noteWorkerKind(meta, payload);
+        noteWorkerBuildId(meta, payload);
         meta.ready = true;
         meta.lastReadyAt = nowIso();
         noteHeartbeat(meta, String(payload.reason || 'worker-ready'));

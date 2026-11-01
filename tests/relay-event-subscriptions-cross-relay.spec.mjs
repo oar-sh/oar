@@ -336,7 +336,7 @@ test.describe.serial("relay event subscriptions across relays", () => {
     await expect(shown).toBeVisible({ timeout: 20_000 });
     await expect(shown.locator(".relay-event-replayed")).toHaveText("replayed");
     await expect(shown.locator(".relay-event-line").first()).toContainText("linux-test · link_lost");
-    await expect(page.locator("#chat-title-relay-events .relay-watch-chip")).toHaveText("👁 watching 2 sessions");
+    await expect(page.locator("#chat-title-relay-events .relay-watch-chip .chat-meta-long")).toHaveText("👁 watching 2 sessions");
   });
 
   test("B restarts: its subscriptions stay, and an unsubscribe made while it was down reaches it", async () => {

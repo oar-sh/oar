@@ -1,14 +1,19 @@
 // Relay event subscriptions on the page: the header's "watching N sessions"
-// chip with its list and Unsubscribe buttons (on the watcher), and the
-// "watched" badge (on a watched session, in the header and the sidebar).
+// chip with its list and Unsubscribe buttons (on the watcher), the "watched"
+// badge in a watched session's header, and the "Watched by" line in its
+// sidebar row's ⓘ menu.
 // The relay sends the whole active list on every change (socket
 // `relay_event_subscriptions`); the page loads it once at start.
 
 import { apiFetch } from './api-client.js';
+import { FONT_SCALE_CHANGE_EVENT, getUiScale } from './font-scaling.js';
+import { isOpeningGestureClick } from './tap-actions.js';
 import { conversations, currentConvId, escHtml, IS_SHARED_VIEW, showTransientRelayNotice } from './store.js';
 import {
   renderWatchedBadgeHtml,
+  renderWatchingChipHtml,
   renderWatchingPanelHtml,
+  watchedInfoText,
   watchersOf,
   watchingChipHint,
   watchingChipText,
@@ -19,10 +24,38 @@ let subscriptions = [];
 let renderedChipKey = '';
 let panelOpen = false;
 let panelConversationId = '';
+// What the open list hangs from when the chip has no box (phone landscape
+// hides the meta line): the ︙ button its menu entry was picked from.
+let panelAnchor = null;
+// When the list last opened: the touch that opened it from ︙ still has its
+// click to come.
+let panelOpenedAt = 0;
 const changeListeners = new Set();
 
 export function getRelayEventSubscriptions() {
   return subscriptions;
+}
+
+/** The watching chip's text for a conversation ("watching 2 sessions"), or '' when it has none. */
+export function relayWatchingChipText(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (IS_SHARED_VIEW || !id) return '';
+  return watchingChipText(watchingSummary(subscriptions, id));
+}
+
+/**
+ * Opens the watching chip's list, as a tap on the chip does, from elsewhere
+ * (the ︙ entry in phone landscape). `anchor` places it while the chip is
+ * not drawn.
+ */
+export function openRelayWatchPanel({ anchor = null } = {}) {
+  ensurePanel();
+  setPanelOpen(true, { anchor });
+}
+
+/** Closes the watching chip's list (back closes it before anything else). */
+export function closeRelayWatchPanel() {
+  if (panelOpen) setPanelOpen(false);
 }
 
 /** Runs after every change of the list (the sidebar re-renders its badges). */
@@ -45,10 +78,10 @@ export async function loadRelayEventSubscriptions() {
   if (response && Array.isArray(response.subscriptions)) applyRelayEventSubscriptions(response.subscriptions);
 }
 
-/** The sidebar's badge for one conversation: listed sessions only. */
-export function relayEventWatchedMarkerHtml(conversationId) {
+/** The line of the sidebar row's ⓘ menu for one conversation, or '': listed sessions only. */
+export function relayEventWatchedInfoText(conversationId) {
   if (IS_SHARED_VIEW) return '';
-  return renderWatchedBadgeHtml(watchersOf(subscriptions, conversationId, { includeAll: false }), { conversations, subscriptions, escHtml });
+  return watchedInfoText(watchersOf(subscriptions, conversationId, { includeAll: false }), { conversations, subscriptions });
 }
 
 async function unsubscribe(subscriptionId, button) {
@@ -66,7 +99,8 @@ async function unsubscribe(subscriptionId, button) {
 
 // The list opens as a fixed popover on <body>, placed under the chip: the
 // title slot clips its overflow (that keeps the title's ellipsis), so a panel
-// inside it would be cut off.
+// inside it would be cut off. Opened from ︙ (phone landscape, no chip
+// drawn), it hangs from ︙ instead.
 function ensurePanel() {
   let panel = document.getElementById('relay-watch-panel');
   if (panel) return panel;
@@ -82,50 +116,68 @@ function ensurePanel() {
     void unsubscribe(unsubscribeButton.getAttribute('data-subscription-id'), unsubscribeButton);
   });
   document.addEventListener('click', (event) => {
-    if (!panelOpen) return;
+    if (!panelOpen || isOpeningGestureClick(event, panelOpenedAt)) return;
     // composedPath: an Unsubscribe click may have re-rendered the panel already.
     const path = event.composedPath();
-    if (path.includes(panel) || path.some((node) => node instanceof Element && node.classList.contains('relay-watch-chip'))) return;
+    if (path.includes(panel) || (panelAnchor && path.includes(panelAnchor)) || path.some((node) => node instanceof Element && node.classList.contains('relay-watch-chip'))) return;
     setPanelOpen(false);
   });
   document.addEventListener('keydown', (event) => {
     if (!panelOpen || event.key !== 'Escape') return;
     event.stopPropagation();
+    const anchor = panelAnchor;
     setPanelOpen(false);
-    document.querySelector('#chat-title-relay-events .relay-watch-chip')?.focus?.();
+    const chip = document.querySelector('#chat-title-relay-events .relay-watch-chip');
+    (chip?.getClientRects?.().length ? chip : anchor || chip)?.focus?.();
   }, true);
   window.addEventListener('resize', () => { if (panelOpen) placePanel(); });
+  window.addEventListener(FONT_SCALE_CHANGE_EVENT, () => { if (panelOpen) placePanel(); });
   return panel;
 }
 
-function setPanelOpen(open) {
+function setPanelOpen(open, { anchor = null } = {}) {
+  if (open && !panelOpen) panelOpenedAt = Date.now();
   panelOpen = Boolean(open);
+  panelAnchor = panelOpen ? anchor : null;
   renderedChipKey = '';
   syncRelayEventHeader();
+}
+
+// A box to place against, or null: an element that is not drawn has none.
+function drawnRect(element) {
+  const rect = element?.getBoundingClientRect?.();
+  return rect && (rect.width || rect.height) ? rect : null;
 }
 
 function placePanel() {
   const panel = document.getElementById('relay-watch-panel');
   const chip = document.querySelector('#chat-title-relay-events .relay-watch-chip');
   if (!panel || panel.hidden) return;
-  const rect = chip?.getBoundingClientRect?.();
-  if (!rect || (!rect.width && !rect.height)) {
+  // Under the chip; with no chip drawn, under the anchor, right edges lined up.
+  const chipRect = drawnRect(chip);
+  const rect = chipRect || drawnRect(panelAnchor);
+  if (!rect) {
     panel.hidden = true;
     return;
   }
-  const margin = 8;
+  // 8px edge, 4px gap and a 120px floor at 100 %, scaled with the zoom.
+  const scale = getUiScale();
+  const margin = 8 * scale;
   const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
-  const top = Math.round(rect.bottom + 4);
+  const top = Math.round(rect.bottom + 4 * scale);
   panel.style.top = `${top}px`;
-  panel.style.maxHeight = `${Math.max(120, window.innerHeight - top - margin)}px`;
+  panel.style.maxHeight = `${Math.round(Math.max(120 * scale, window.innerHeight - top - margin))}px`;
   panel.style.left = '0px';
   const width = panel.offsetWidth;
-  const left = Math.max(margin, Math.min(rect.left, viewportWidth - width - margin));
+  const preferred = chipRect ? rect.left : rect.right - width;
+  const left = Math.max(margin, Math.min(preferred, viewportWidth - width - margin));
   panel.style.left = `${Math.round(left)}px`;
 }
 
 function ensureHeaderElements() {
-  const slot = document.getElementById('chat-title-slot');
+  // The meta lines under the title live in #chat-title-meta (one sideways
+  // scrolling row on a phone); the slot itself is the fallback.
+  const slot = document.getElementById('chat-title-meta') || document.getElementById('chat-title-slot');
   if (!slot) return null;
   let line = document.getElementById('chat-title-relay-events');
   if (!line) {
@@ -133,7 +185,7 @@ function ensureHeaderElements() {
     line.id = 'chat-title-relay-events';
     line.hidden = true;
     const origin = document.getElementById('chat-title-origin');
-    if (origin?.nextSibling) slot.insertBefore(line, origin.nextSibling);
+    if (origin?.parentNode === slot && origin.nextSibling) slot.insertBefore(line, origin.nextSibling);
     else slot.appendChild(line);
     line.addEventListener('click', (event) => {
       const target = event.target instanceof Element ? event.target : null;
@@ -172,10 +224,7 @@ export function syncRelayEventHeader() {
   if (key === renderedChipKey) return;
   renderedChipKey = key;
   const parts = [];
-  if (chipText) {
-    const where = summary.relays.length ? ` (also on ${summary.relays.join(', ')})` : '';
-    parts.push(`<button type="button" class="relay-watch-chip" aria-expanded="${panelOpen ? 'true' : 'false'}" aria-controls="relay-watch-panel" title="${escHtml(`Event subscriptions of this conversation${where}`)}">👁 ${escHtml(chipText)}${chipHint ? ` <span class="relay-watch-hint">${escHtml(chipHint)}</span>` : ''}</button>`);
-  }
+  if (chipText) parts.push(renderWatchingChipHtml(summary, { panelOpen, escHtml }));
   const badge = renderWatchedBadgeHtml(watchers, { conversations, subscriptions, escHtml });
   if (badge) parts.push(badge);
   line.innerHTML = parts.join('');

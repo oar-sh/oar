@@ -22,6 +22,7 @@ import {
   fakeCloudTrailerReplyFor,
   startFakeClaudeCloudApi,
 } from "./fake-claude-cloud-api.mjs";
+import { clickHeaderAction } from "./header-actions-helpers.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
@@ -604,8 +605,7 @@ for (const profile of PROFILES) {
 
     test("Check Usage has a Claude Cloud tab with the account's credit", async ({ page }) => {
       await openConversation(page, conversationId);
-      await page.locator("#chat-actions-menu-btn").click();
-      await page.locator("#chat-menu-usage").click();
+      await clickHeaderAction(page, "usage");
       await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
       await expect(page.locator("#summary-modal-title")).toHaveText("Plan usage");
 

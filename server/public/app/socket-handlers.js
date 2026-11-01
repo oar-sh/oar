@@ -105,6 +105,7 @@ import { isLikelyLiveDuplicateMessage } from './live-message-dedupe.mjs';
 import { mergeRelayThoughts } from './relay-thoughts.mjs';
 import { conversationPayloadCache } from './conversation-payload-cache.mjs';
 import { planOnlyAfterBroadcast } from './plan-board-shared.mjs';
+import { noteConversationGone } from './session-history-ui.js';
 
 // A live row of the conversation on screen joins its kept window, so a
 // switch away and back still shows it. Rows of other conversations do not:
@@ -720,7 +721,7 @@ export async function connectSocket(overrideDeps) {
     setPreviews(previews);
   });
   // Public shares: the events name the conversation only; the list (Settings
-  // → Sharing, the ⋯ menu's Stop sharing) is read again.
+  // → Sharing, the ︙ menu's Stop sharing) is read again.
   for (const event of ['share_created', 'share_renewed', 'share_revoked']) {
     socket.on(event, () => {
       void refreshShares().catch(() => {});
@@ -842,7 +843,8 @@ export async function connectSocket(overrideDeps) {
     conversationPayloadCache.forget(targetConversationId);
     await refreshConversations();
     if (currentConvId === sourceConversationId) {
-      await openConversation(targetConversationId);
+      // The successor takes the compacted one's history entry: no step back into it.
+      await openConversation(targetConversationId, { history: 'replace' });
     } else {
       updateCompactButton();
     }
@@ -1010,6 +1012,7 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('conversation_deleted', ({ conversationId }) => {
     delete conversations[conversationId];
+    noteConversationGone(conversationId);
     conversationPayloadCache.forget(conversationId);
     for (const [id, question] of relayQuestions.entries()) {
       if (question?.conversationId === conversationId) relayQuestions.delete(id);

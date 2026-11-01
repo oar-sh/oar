@@ -4250,11 +4250,17 @@ export function createClaudeSessionRunner({
     // `releasable`: the relay may replace this worker now (a billing swap):
     // no CLI process and no delivery on its way in, or a process
     // canReleaseForRespawn would let go of.
+    // `cliAlive`: the CLI child is still up. The relay's recycle replaces a
+    // stale worker only once it is releasable AND its CLI is gone; a
+    // releasable worker whose CLI is up sits in the idle window, where a
+    // scheduled job may still wake it, and is left to its own idle-out. A
+    // closing process is not gone yet, so it still counts as alive.
     if (!proc || proc.closing || proc.aborted) {
       const admitting = admittingDeliveries > 0;
       return {
         turnActive: false, canSteer: false, holdReason: null, messageId: null, supported: true, autoCompactWindow: null,
         releasable: !admitting, releaseHold: admitting ? 'turn' : null, backgroundTaskCount: 0,
+        cliAlive: Boolean(proc),
       };
     }
     const ctx = proc.activeCtx || null;
@@ -4293,6 +4299,7 @@ export function createClaudeSessionRunner({
       releasable: !hold,
       releaseHold: hold || null,
       backgroundTaskCount: proc.liveTasks.size,
+      cliAlive: true,
     };
   }
 

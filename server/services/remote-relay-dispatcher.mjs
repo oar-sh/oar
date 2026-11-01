@@ -147,6 +147,9 @@ const CATALOG_PROVIDER_LABELS = Object.freeze({
 });
 // Worker statuses that mean "working on something right now" (scope active).
 const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);
+// A worker process that is up; the one a session's `worker` field names when
+// the registry holds more than one entry for its conversation.
+const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
 // Terminal turn failures are stored as ordinary assistant rows; these are the
 // texts the relay writes for them (buildTerminalFailureTextForChat and the two
 // recovery-limit paths in messages-routes / server-runtime). Each is the whole
@@ -192,6 +195,11 @@ function isBusyState(state) {
 
 function shortId(value) {
   return toText(value).slice(0, 8) || '-';
+}
+
+/** A session item's `worker` field, left out when the relay has no worker registered for it. */
+function workerField(worker) {
+  return worker ? { worker: { ...worker } } : {};
 }
 
 function nonNegativeInt(value) {
@@ -1494,17 +1502,42 @@ export function createRemoteRelayDispatcher({
     };
   }
 
-  async function liveWorkerConversationIds(ctx) {
+  /**
+   * The target relay's session workers, from its /api/status: `working`, the
+   * conversations whose worker is starting or running a turn, and
+   * `workerFor(conversationId)`, that conversation's `worker` field (kind,
+   * build id, and whether it runs other code than that relay, which the relay
+   * judges against its own build id and recycles once idle), or null. A relay
+   * that predates build ids gives null build ids and never `stale`; one that
+   * cannot be read gives nothing.
+   */
+  async function sessionWorkers(ctx) {
+    const working = new Set();
+    const byConversation = new Map();
     try {
       const status = await call(ctx, 'GET', '/api/status');
       const workers = Array.isArray(status?.sessionWorker?.workers) ? status.sessionWorker.workers : [];
-      return new Set(workers
-        .filter((worker) => WORKING_WORKER_STATUSES.has(toText(worker?.status).toLowerCase()))
-        .map((worker) => toText(worker?.conversationId))
-        .filter(Boolean));
-    } catch {
-      return new Set();
-    }
+      for (const worker of workers) {
+        const conversationId = toText(worker?.conversationId);
+        if (!conversationId) continue;
+        const workerStatus = toText(worker?.status).toLowerCase();
+        if (WORKING_WORKER_STATUSES.has(workerStatus)) working.add(conversationId);
+        const known = byConversation.get(conversationId);
+        if (known && (known.live || !LIVE_WORKER_STATUSES.has(workerStatus))) continue;
+        byConversation.set(conversationId, {
+          live: LIVE_WORKER_STATUSES.has(workerStatus),
+          field: {
+            kind: toText(worker?.kind) || null,
+            buildId: toText(worker?.buildId) || null,
+            stale: worker?.stale === true,
+          },
+        });
+      }
+    } catch {}
+    return {
+      working,
+      workerFor: (conversationId) => byConversation.get(toText(conversationId))?.field || null,
+    };
   }
 
   /** The session group of a listed row: id, display name and the row's role. */
@@ -1521,7 +1554,7 @@ export function createRemoteRelayDispatcher({
     };
   }
 
-  function mapSession(row, workerIds, ctx = null, groups = null) {
+  function mapSession(row, workers, ctx = null, groups = null) {
     const id = toText(row?.id);
     const via = toText(row?.origin?.relayName);
     // A session an agent of that relay created there, and from which session.
@@ -1531,7 +1564,7 @@ export function createRemoteRelayDispatcher({
       title: toText(row?.title),
       provider: toText(row?.runtimeProviderType) || 'github',
       model: toText(row?.runtimeProviderModel) || toText(row?.runtimeModel) || toText(row?.preferredModel) || null,
-      active: row?.activeTurn === true || !!workerIds?.has(id) || isBusyState(row?.sessionState),
+      active: row?.activeTurn === true || !!workers?.working.has(id) || isBusyState(row?.sessionState),
       ...sessionActivityFields(row),
       updatedAt: row?.updatedAt || null,
       messageCount: nonNegativeInt(row?.messageCount),
@@ -1623,10 +1656,12 @@ export function createRemoteRelayDispatcher({
       cursor = decodeCursor(args.cursor, ['beforeConversationId', 'beforeUpdatedAt', 'beforeGroupId']);
       if (!cursor) throw invalidInput('cursor is not a nextCursor from list_sessions');
     }
-    const workerIds = scope === 'active' ? await liveWorkerConversationIds(ctx) : null;
+    // The active scope filters on the workers, so it reads them first; the
+    // others read them once the list is known, for the `worker` fields only.
+    const workers = scope === 'active' ? await sessionWorkers(ctx) : null;
     const filtering = !!query || scope === 'active';
     const keep = (row) => (!query || toText(row?.title).toLowerCase().includes(query))
-      && (scope !== 'active' || row?.activeTurn === true || workerIds.has(toText(row?.id)) || isBusyState(row?.sessionState));
+      && (scope !== 'active' || row?.activeTurn === true || workers.working.has(toText(row?.id)) || isBusyState(row?.sessionState));
 
     const sessions = [];
     const seen = new Set();
@@ -1649,7 +1684,7 @@ export function createRemoteRelayDispatcher({
         // A group served again whole (its cursor row vanished) repeats rows.
         if (seen.has(toText(row?.id))) continue;
         seen.add(toText(row?.id));
-        if (keep(row)) sessions.push(mapSession(row, workerIds, ctx, groups));
+        if (keep(row)) sessions.push(mapSession(row, workers, ctx, groups));
         if (sessions.length >= limit) break;
       }
       scanned += consumed;
@@ -1666,6 +1701,12 @@ export function createRemoteRelayDispatcher({
       }
       hasMore = consumed < rows.length || response?.pageInfo?.hasMore === true;
       if (sessions.length >= limit || !hasMore || !rows.length) break;
+    }
+    // Each session's worker process, while the relay has one registered for it.
+    const workerInfo = workers || (sessions.length ? await sessionWorkers(ctx) : null);
+    for (let index = 0; index < sessions.length; index += 1) {
+      const worker = workerInfo?.workerFor(sessions[index].id);
+      if (worker) sessions[index] = { ...sessions[index], ...workerField(worker) };
     }
 
     const nextCursor = scope === 'all' && hasMore && cursor ? encodeCursor(cursor) : null;
@@ -1749,7 +1790,12 @@ export function createRemoteRelayDispatcher({
       query: { limit: args.last, beforeMessageId: before?.beforeMessageId, beforeTimestamp: before?.beforeTimestamp, groupMembers: 1 },
     });
     const conversationId = toText(conversation?.id) || args.session;
-    const pendingQuestions = await loadPendingQuestions(ctx, conversationId, { includeAsks: true });
+    // Neither read rejects: a relay that cannot say leaves the fields out.
+    const [pendingQuestions, workers] = await Promise.all([
+      loadPendingQuestions(ctx, conversationId, { includeAsks: true }),
+      sessionWorkers(ctx),
+    ]);
+    const worker = workers.workerFor(conversationId);
     const { messages, omitted } = shapeMessages(conversation?.messages, {
       maxChars: args.max_chars,
       includeActivity: args.include_activity,
@@ -1798,6 +1844,7 @@ export function createRemoteRelayDispatcher({
         ...(via ? { via } : {}),
         ...(conversation?.mayCreateSessions === true ? { mayCreateSessions: true } : {}),
         ...(conversation?.planOnly === true ? { planOnly: true } : {}),
+        ...workerField(worker),
         ...(group ? { group } : {}),
         openUrl: remoteConversationUrl(ctx.relay.url, conversationId) || null,
       },

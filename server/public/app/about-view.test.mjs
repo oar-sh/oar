@@ -9,6 +9,7 @@ import {
   formatAmount,
   formatBytes,
   formatUptime,
+  workersBuildText,
 } from './about-view.mjs';
 
 const fixedDates = {
@@ -175,4 +176,19 @@ test('the usage section names every provider\'s tokens of all time, "—" where 
   assert.match(usage, /Grok<\/div>.*cache w — · cache r —<\/span><\/div><\/td><td class="plan-usage-detail-value"><span class="plan-usage-detail-part">—<\/span><\/td>/s);
   assert.doesNotMatch(usage, /keep no usage here|where the provider does not report one/);
   assert.match(usage, /"—" where no turn reported one\. On Claude API and DeepSeek the days from before the upgrade have cache writes inside input\./);
+});
+
+test('the Workers line under the version says how many run this build, and is left out with no worker', () => {
+  assert.equal(workersBuildText({ total: 14, onThisBuild: 14, onOtherBuild: 0 }), '14, all on this build');
+  assert.equal(workersBuildText({ total: 14, onThisBuild: 11, onOtherBuild: 3 }), '14, 3 on an older build');
+  assert.equal(workersBuildText({ total: 1, onThisBuild: 1, onOtherBuild: 0 }), '1, on this build');
+  assert.equal(workersBuildText({ total: 14, onThisBuild: null, onOtherBuild: null }), '14', 'a relay that cannot tell shows the count alone');
+  assert.equal(workersBuildText({ total: 0, onThisBuild: 0, onOtherBuild: 0 }), '');
+  assert.equal(workersBuildText(undefined), '');
+
+  const html = buildAboutModalHtml(aboutPayload({ workers: { total: 14, onThisBuild: 11, onOtherBuild: 3 } }), fixedDates);
+  assert.match(html, />Workers<\/span>.*?>14, 3 on an older build<\/td>/);
+  assert.ok(html.indexOf('>Version<') < html.indexOf('>Workers<') && html.indexOf('>Workers<') < html.indexOf('>Commit<'), 'right under the version');
+  assert.doesNotMatch(buildAboutModalHtml(aboutPayload({ workers: { total: 0, onThisBuild: 0, onOtherBuild: 0 } }), fixedDates), />Workers</);
+  assert.doesNotMatch(buildAboutModalHtml(aboutPayload(), fixedDates), />Workers</, 'an older relay without the field shows nothing');
 });

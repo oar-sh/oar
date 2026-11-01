@@ -1,4 +1,4 @@
-// ⋯ → About OAR: the menu entry's label and the modal (about-view.mjs builds
+// ︙ → About OAR: the menu entry's label and the modal (about-view.mjs builds
 // its HTML from GET /api/about).
 
 import {

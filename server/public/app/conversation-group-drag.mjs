@@ -43,8 +43,9 @@ export function dragItemKey({ conversationId = null, groupId = null } = {}) {
 
 /**
  * Plain items from arrangeConversationList(): `{ key, kind, conversationId,
- * groupId }`, and on heads `open` and `memberIds` (the group's rows after
- * the head, in list order).
+ * groupId }`, on heads `open` and `memberIds` (the group's rows after the
+ * head, in list order), and `kept` on the open conversation's row under a
+ * folded head.
  */
 export function describeDragItems(arranged) {
   const items = [];
@@ -54,6 +55,8 @@ export function describeDragItems(arranged) {
     const groupId = item.kind === 'row' ? null : (toText(item.group?.id) || null);
     if (!conversationId && !groupId) continue;
     const described = { key: dragItemKey({ conversationId, groupId }), kind: item.kind, conversationId, groupId };
+    // The open conversation, shown under its folded group's head.
+    if (item.kind === 'member' && item.kept === true) described.kept = true;
     if (item.kind === 'head') {
       described.open = item.group?.open !== false;
       described.memberIds = (Array.isArray(item.group?.members) ? item.group.members : [])
@@ -103,6 +106,13 @@ export function resolveDropTarget({ items = [], draggedId = '', hover = null } =
   if (target.conversationId && target.conversationId === id) return NO_DROP;
   const y = Math.min(1, Math.max(0, Number(hover.y) || 0));
   const half = y < 0.5 ? 'before' : 'after';
+
+  // A kept row stands alone under a folded head: a drop on it is a drop on
+  // the head, not a place among members the user cannot see.
+  if (target.kind === 'member' && target.kept === true) {
+    const head = headOf(target.groupId);
+    if (head) return resolveDropTarget({ items: list, draggedId: id, hover: { key: head.key, y: 0.5 } });
+  }
 
   if (target.kind === 'member') {
     const groupId = target.groupId;

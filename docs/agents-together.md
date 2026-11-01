@@ -140,7 +140,8 @@ names the arguments it did not take in `ignored: [...]`.
 
 When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
 sending relay, session and model on the message, and marks sessions an agent created in the
-conversation list. The remote agent sees a one-line header saying that another agent is talking
+conversation list with an **ⓘ** whose menu reads *Started by an agent on relay “…”* and opens the
+agent's session there. The remote agent sees a one-line header saying that another agent is talking
 to it. In the transcript, a message from another agent (on a paired relay or on this one) folds
 into one row ("note from … · answered below") that opens to the full text; the session's reply
 always shows, like a reply to you. A turn that an agent started, from a paired relay or from
@@ -203,8 +204,9 @@ the conversation it was started from. Sessions an agent starts use this relay's 
 count against their usage.
 
 **In the conversation list.** A session an agent on this relay started carries **via agent ·
-“title”** in the sidebar and under the title in the header, with the title of the conversation
-the agent runs in; clicking it opens that conversation while it is still in the list. The
+“title”** under the title in the header, with the title of the conversation the agent runs in,
+and an **ⓘ** in its sidebar row whose menu reads *Started by an agent in “title”*; clicking either
+opens that conversation while it is still in the list. The
 agent's prompts carry the same marker, with its model, as a badge on the message. The session
 sits in a [group](web-ui.md#session-groups) under the conversation that started it, or in the
 group the agent named. The relay
@@ -314,7 +316,9 @@ of an old watcher to a new one, always asks.
 **Where you see it.** The watcher's header shows **watching N sessions** (**waiting for a relay
 restart** when it only asked for `relay_restarted`), with a small **digest N min** or **quiet
 HH:MM–HH:MM** beside it where a subscription has one; the chip opens the list of its
-subscriptions with an **Unsubscribe** button each. A watched session shows a **watched** badge.
+subscriptions with an **Unsubscribe** button each. A watched session shows a **watched** badge in
+its header and, when it is watched by id, an **ⓘ** in its sidebar row whose menu names the watcher
+(*Watched by …*).
 
 **Lifetime.** Subscriptions survive a restart and end on unsubscribe, when the watcher or the
 watched session is archived, after firing once (`once`), or, for a paired relay, when the pairing
@@ -351,8 +355,9 @@ mode of the session that set it. It keeps where the prompt behind it came from, 
 never lets a chain of agents across relays go further than a direct prompt could.
 
 A conversation that has schedules, or set them, shows **⏰ N scheduled** in its header; the chip
-lists them with a **Cancel** button each. A session a schedule fires into shows **scheduled** in
-the sidebar. An agent lists its schedules with `list_schedules` and ends one with `unschedule`.
+lists them with a **Cancel** button each. A session a schedule fires into has an **ⓘ** in its
+sidebar row whose menu reads *Scheduled · next …* (or *N schedules · next …*). An agent lists its
+schedules with `list_schedules` and ends one with `unschedule`.
 Archiving a session ends the schedules that fire into it and the ones it set; compacting it moves
 them to the new conversation. A conversation holds at most 20. Schedules live on the relay that runs the session; a paired relay keeps its own.
 

@@ -281,3 +281,83 @@ test('a worker\'s kind is its own word: kept across upserts that do not state it
   );
   assert.equal('releasable' in normalizeWorkerSteeringSnapshot({ turnActive: true }), false);
 });
+
+test('a worker\'s build id is kept across upserts that do not state it, dropped with its process, and bounded', () => {
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sid-b', pid: 20, status: 'ready', buildId: ' 0.9.21+0123456789ab ' });
+  assert.equal(registry.getWorker('sid-b').buildId, '0.9.21+0123456789ab');
+  registry.upsertWorker({ sdkSessionId: 'sid-b', pid: 20, status: 'processing' });
+  assert.equal(registry.getWorker('sid-b').buildId, '0.9.21+0123456789ab');
+  // The spread convention restates it, and a later change replaces it.
+  registry.upsertWorker({ ...registry.getWorker('sid-b'), status: 'ready' });
+  assert.equal(registry.getWorker('sid-b').buildId, '0.9.21+0123456789ab');
+  assert.equal(registry.listWorkers()[0].buildId, '0.9.21+0123456789ab');
+  // Another process for the session: the old one's build id goes with it.
+  registry.upsertWorker({ sdkSessionId: 'sid-b', pid: 21, status: 'ready' });
+  assert.equal(registry.getWorker('sid-b').buildId, null);
+  // A malformed value is stored as unknown, never as given.
+  registry.upsertWorker({ sdkSessionId: 'sid-b', pid: 21, status: 'ready', buildId: 'has spaces in it' });
+  assert.equal(registry.getWorker('sid-b').buildId, null);
+  registry.upsertWorker({ sdkSessionId: 'sid-b', pid: 21, status: 'ready', buildId: 'x'.repeat(81) });
+  assert.equal(registry.getWorker('sid-b').buildId, null);
+});
+
+test('a new pid does not inherit the old process\'s build id through the spread convention', () => {
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sid-p', pid: 1, status: 'ready', buildId: '0.9.20+aaaaaaaaaaaa' });
+  const entry = registry.getWorker('sid-p');
+  // The old entry spread into the upsert that brings pid 2 restates the old
+  // build id; it is pid 1's, so pid 2 has none until it speaks.
+  registry.upsertWorker({ ...entry, pid: 2 });
+  assert.equal(registry.getWorker('sid-p').buildId, null);
+  // A build id that differs from the old entry's was stated for the new pid.
+  registry.upsertWorker({ ...entry, pid: 3, buildId: '0.9.21+bbbbbbbbbbbb' });
+  assert.equal(registry.getWorker('sid-p').buildId, '0.9.21+bbbbbbbbbbbb');
+  // Same pid: the spread keeps it, as before.
+  registry.upsertWorker({ ...registry.getWorker('sid-p'), status: 'processing' });
+  assert.equal(registry.getWorker('sid-p').buildId, '0.9.21+bbbbbbbbbbbb');
+  // A pid-less entry that still carries a gone process's build id hands it to
+  // no pid that follows.
+  registry.upsertWorker({ ...registry.getWorker('sid-p'), pid: null, status: 'stopped' });
+  assert.equal(registry.getWorker('sid-p').buildId, '0.9.21+bbbbbbbbbbbb');
+  registry.upsertWorker({ ...registry.getWorker('sid-p'), pid: 4, status: 'starting' });
+  assert.equal(registry.getWorker('sid-p').buildId, null);
+});
+
+test('the steering snapshot carries cliAlive only when the worker reports it as a boolean', async () => {
+  const { normalizeWorkerSteeringSnapshot } = await import('./session-worker-registry-service.mjs');
+  assert.equal(normalizeWorkerSteeringSnapshot({ turnActive: false, cliAlive: true }).cliAlive, true);
+  assert.equal(normalizeWorkerSteeringSnapshot({ turnActive: false, cliAlive: false }).cliAlive, false);
+  // Absent or not a boolean: the worker cannot say, and the key stays out.
+  assert.equal('cliAlive' in normalizeWorkerSteeringSnapshot({ turnActive: false }), false);
+  assert.equal('cliAlive' in normalizeWorkerSteeringSnapshot({ turnActive: false, cliAlive: 'yes' }), false);
+  assert.equal('cliAlive' in normalizeWorkerSteeringSnapshot({ turnActive: false, cliAlive: 1 }), false);
+  // It survives the registry's own normalization of a stored snapshot.
+  const registry = createSessionWorkerRegistry();
+  registry.upsertWorker({ sdkSessionId: 'sid-c', pid: 5, status: 'ready', steering: { releasable: true, cliAlive: false } });
+  assert.equal(registry.getWorker('sid-c').steering.cliAlive, false);
+});
+
+test('a worker\'s startedAt is the first time the relay hears of its pid', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-30T08:00:00.000Z') });
+  const registry = createSessionWorkerRegistry();
+  // No pid yet: no start time.
+  registry.upsertWorker({ sdkSessionId: 'sid-s', status: 'starting' });
+  assert.equal(registry.getWorker('sid-s').startedAt, null);
+  t.mock.timers.tick(1_000);
+  registry.upsertWorker({ ...registry.getWorker('sid-s'), pid: 30, status: 'ready' });
+  assert.equal(registry.getWorker('sid-s').startedAt, '2026-10-30T08:00:01.000Z');
+  // Later upserts for the same pid keep it, spread or not.
+  t.mock.timers.tick(60_000);
+  registry.upsertWorker({ ...registry.getWorker('sid-s'), status: 'processing' });
+  registry.upsertWorker({ sdkSessionId: 'sid-s', pid: 30, status: 'ready', buildId: '0.9.21' });
+  assert.equal(registry.getWorker('sid-s').startedAt, '2026-10-30T08:00:01.000Z');
+  assert.equal(registry.listWorkers()[0].startedAt, '2026-10-30T08:00:01.000Z');
+  // A new pid starts the clock again, even when the old entry is spread in.
+  t.mock.timers.tick(5_000);
+  registry.upsertWorker({ ...registry.getWorker('sid-s'), pid: 31 });
+  assert.equal(registry.getWorker('sid-s').startedAt, '2026-10-30T08:01:06.000Z');
+  // An entry first heard of with its pid gets the time at once.
+  registry.upsertWorker({ sdkSessionId: 'sid-t', pid: 40, status: 'ready' });
+  assert.equal(registry.getWorker('sid-t').startedAt, '2026-10-30T08:01:06.000Z');
+});

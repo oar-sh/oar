@@ -83,6 +83,35 @@ test('clamps left against both viewport edges', () => {
   assert.equal(offRight.left, 1200 - 260 - 8);
 });
 
+test('scale multiplies the gap, the edge, the height bounds and the fallback width', () => {
+  const zoomed = resolveCwdMenuPlacement({
+    triggerRect: TRIGGER,
+    viewportWidth: 1200,
+    viewportHeight: 2000,
+    panelHeight: 5000,
+    scale: 1.5,
+  });
+  assert.equal(zoomed.placement, 'below');
+  assert.equal(zoomed.top, 200 + 44 + 6 * 1.5);
+  assert.equal(zoomed.maxHeight, 300 * 1.5);
+
+  const edge = resolveCwdMenuPlacement({
+    triggerRect: { ...TRIGGER, left: -50, width: 0 },
+    viewportWidth: 1200,
+    viewportHeight: 900,
+    scale: 1.5,
+  });
+  assert.equal(edge.left, 8 * 1.5);
+  assert.equal(edge.width, 260 * 1.5);
+
+  // The trigger rect and the viewport are measurements: never scaled.
+  const unit = resolveCwdMenuPlacement({ triggerRect: TRIGGER, viewportWidth: 1200, viewportHeight: 900, scale: 1 });
+  const same = resolveCwdMenuPlacement({ triggerRect: TRIGGER, viewportWidth: 1200, viewportHeight: 900 });
+  assert.deepEqual(unit, same);
+  const bad = resolveCwdMenuPlacement({ triggerRect: TRIGGER, viewportWidth: 1200, viewportHeight: 900, scale: 'x' });
+  assert.deepEqual(bad, same);
+});
+
 test('resolveActiveOptionIndex clamps at both ends and handles an empty list', () => {
   assert.equal(resolveActiveOptionIndex(-1, 1, 5), 0);
   assert.equal(resolveActiveOptionIndex(-1, -1, 5), 4);

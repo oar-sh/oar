@@ -2445,7 +2445,7 @@ test('read_session strips the prompt header, trims text and keeps the newest wit
   assert.ok(tight.body.messages[0].text.length <= 500);
   assert.match(tight.body.note, /3 older messages left out/);
   const older = await run('read_session', { relay: 'linux-test', session: 'conv-1', before: tight.body.olderCursor, last: 2 });
-  assert.equal(remote.calls.at(-2).query.beforeMessageId, 'm-long');
+  assert.equal(remote.callsTo('GET', '/api/conversation/conv-1').at(-1).query.beforeMessageId, 'm-long');
   assert.deepEqual(older.body.messages.map((row) => row.id), ['m-old-reply', 'm-agent']);
   assert.equal(typeof older.body.olderCursor, 'string', 'the remote still has older rows');
 
@@ -2697,7 +2697,8 @@ test('through the real outbound client: query, path encoding, hop header and a 4
   const missing = await dispatcher.dispatch({ conversationId: 'c-1', action: 'read_session', args: { relay: 'linux-test', session: 'conv/../x' } });
   assert.equal(missing.status, 404);
   assert.equal(missing.body.code, CODES.notFound);
-  assert.equal(requests[1].url, 'https://relay-b.example.test/api/conversation/conv%2F..%2Fx?limit=10&groupMembers=1');
+  // list_sessions also read the relay's workers (/api/status) for the `worker` fields.
+  assert.equal(requests.at(-1).url, 'https://relay-b.example.test/api/conversation/conv%2F..%2Fx?limit=10&groupMembers=1');
   assert.ok(!JSON.stringify(missing.body).includes(token));
 });
 
@@ -4600,6 +4601,101 @@ test('list_sessions and read_session show planOnly like mayCreateSessions', asyn
   assert.equal(list.body.sessions.find((entry) => entry.id === 'conv-2').planOnly, undefined);
   const read = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
   assert.equal(read.body.session.planOnly, true);
+});
+
+test('list_sessions and read_session name the session\'s worker: its kind, its build and whether the relay will recycle it', async () => {
+  const { run, remote } = setup();
+  withSession(remote);
+  remote.addConversation({ id: 'conv-2', title: 'old worker' });
+  remote.addConversation({ id: 'conv-3', title: 'no worker' });
+  remote.addConversation({ id: 'conv-4', title: 'older relay' });
+  remote.status.sessionWorker.buildId = '0.9.21+0123456789ab';
+  remote.status.sessionWorker.workers = [
+    { sdkSessionId: 's-1', conversationId: 'conv-1', status: 'ready', kind: 'claude', buildId: '0.9.21+0123456789ab', stale: false },
+    // An exited entry next to a live one: the live one is the session's worker.
+    { sdkSessionId: 's-2-old', conversationId: 'conv-2', status: 'exited', kind: 'copilot', buildId: '0.9.21+0123456789ab', stale: false },
+    { sdkSessionId: 's-2', conversationId: 'conv-2', status: 'processing', kind: 'cursor', buildId: '0.9.20+fedcba987654', stale: true },
+    // A relay before build ids sends neither field.
+    { sdkSessionId: 's-4', conversationId: 'conv-4', status: 'ready', kind: 'grok' },
+  ];
+  const list = await run('list_sessions', { relay: 'linux-test' });
+  assert.equal(list.status, 200, JSON.stringify(list.body));
+  const byId = new Map(list.body.sessions.map((entry) => [entry.id, entry]));
+  assert.deepEqual(byId.get('conv-1').worker, { kind: 'claude', buildId: '0.9.21+0123456789ab', stale: false });
+  assert.deepEqual(byId.get('conv-2').worker, { kind: 'cursor', buildId: '0.9.20+fedcba987654', stale: true });
+  assert.equal('worker' in byId.get('conv-3'), false, 'no registry entry, no field');
+  assert.deepEqual(byId.get('conv-4').worker, { kind: 'grok', buildId: null, stale: false });
+
+  const read = await run('read_session', { relay: 'linux-test', session: 'conv-2' });
+  assert.deepEqual(read.body.session.worker, { kind: 'cursor', buildId: '0.9.20+fedcba987654', stale: true });
+  const none = await run('read_session', { relay: 'linux-test', session: 'conv-3' });
+  assert.equal('worker' in none.body.session, false);
+
+  // A relay whose status cannot be read still lists and reads its sessions.
+  remote.fail('GET', '/api/status', remoteError(`${CODES.httpPrefix}500`, 'Relay "linux-test" answered HTTP 500', 500));
+  const blind = await run('list_sessions', { relay: 'linux-test' });
+  assert.equal(blind.status, 200);
+  assert.ok(blind.body.sessions.every((entry) => !('worker' in entry)));
+  const blindRead = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
+  assert.equal(blindRead.status, 200);
+  assert.equal('worker' in blindRead.body.session, false);
+});
+
+test('the worker field fails soft against an older relay: no status, no sessionWorker, entries without build fields', async () => {
+  const { run, remote } = setup();
+  withSession(remote, { activeTurn: true });
+  remote.addConversation({ id: 'conv-2', title: 'second' });
+  const listAndRead = async (label) => {
+    const results = {};
+    for (const scope of [undefined, 'active', 'all']) {
+      const list = await run('list_sessions', { relay: 'linux-test', ...(scope ? { scope } : {}) });
+      assert.equal(list.status, 200, `${label}, scope ${scope || 'default'}: ${JSON.stringify(list.body)}`);
+      assert.ok(list.body.sessions.length > 0, `${label}, scope ${scope || 'default'}: the sessions are still listed`);
+      results[scope || 'default'] = list.body.sessions;
+    }
+    const read = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
+    assert.equal(read.status, 200, `${label}: ${JSON.stringify(read.body)}`);
+    results.read = read.body.session;
+    return results;
+  };
+  const noWorkerAnywhere = (label, results) => {
+    for (const [key, sessions] of Object.entries(results)) {
+      if (key === 'read') assert.equal('worker' in sessions, false, `${label}: read_session`);
+      else assert.ok(sessions.every((entry) => !('worker' in entry)), `${label}: list_sessions ${key}`);
+    }
+  };
+
+  // The status request rejects below HTTP (a refused connection, a timeout).
+  remote.fail('GET', '/api/status', Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' }));
+  noWorkerAnywhere('status rejects', await listAndRead('status rejects'));
+  remote.failures.delete('GET /api/status');
+
+  // A relay whose status has no sessionWorker at all, or no workers list in it.
+  delete remote.status.sessionWorker;
+  noWorkerAnywhere('no sessionWorker', await listAndRead('no sessionWorker'));
+  remote.status.sessionWorker = { workers: 'not a list' };
+  noWorkerAnywhere('workers not a list', await listAndRead('workers not a list'));
+  remote.status = null;
+  noWorkerAnywhere('empty status', await listAndRead('empty status'));
+
+  // A relay before build ids: its entries carry the kind but neither buildId
+  // nor stale, which read as an unknown build the relay does not recycle.
+  remote.status = { sessionWorker: { workers: [
+    { sdkSessionId: 's-1', conversationId: 'conv-1', status: 'processing', kind: 'claude' },
+    { sdkSessionId: 's-2', conversationId: 'conv-2', status: 'ready', kind: 'copilot', buildId: null, stale: 'yes' },
+    // Junk next to them changes nothing.
+    null,
+    { status: 'ready', kind: 'grok' },
+  ] } };
+  const old = await listAndRead('older relay');
+  for (const key of ['default', 'all']) {
+    const byId = new Map(old[key].map((entry) => [entry.id, entry]));
+    assert.deepEqual(byId.get('conv-1').worker, { kind: 'claude', buildId: null, stale: false }, key);
+    assert.deepEqual(byId.get('conv-2').worker, { kind: 'copilot', buildId: null, stale: false }, key);
+  }
+  assert.deepEqual(old.active.map((entry) => entry.id), ['conv-1'], 'the active scope still reads the working worker');
+  assert.deepEqual(old.active[0].worker, { kind: 'claude', buildId: null, stale: false });
+  assert.deepEqual(old.read.worker, { kind: 'claude', buildId: null, stale: false });
 });
 
 test('a plan-only target\'s refusal of a send reads as a clear error', async () => {

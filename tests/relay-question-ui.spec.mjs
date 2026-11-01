@@ -3,6 +3,7 @@ import path from "path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayBaseUrl, relayDataDir, relayDbPath } from "./e2e-env.mjs";
+import { clickHeaderAction, expectHeaderActionUnavailable } from "./header-actions-helpers.mjs";
 
 function relayOrigin() {
   return new URL(relayBaseUrl()).origin;
@@ -1179,15 +1180,15 @@ test("shows Copilot usage from the usage modal", async ({ page, request }) => {
       if (id) await window.openConversation(id);
     }, conversationId);
 
-    await expect(page.locator("#chat-actions-menu-btn")).toBeEnabled();
-    await page.click("#chat-actions-menu-btn");
-    await expect(page.locator("#chat-actions-menu")).toBeVisible();
-    await page.click("#chat-menu-usage");
+    // 📊 in the header, or Check Usage in ︙ when the header is too narrow.
+    await clickHeaderAction(page, "usage");
     await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
     await expect(page.locator("#summary-modal-title")).toHaveText("Copilot Usage");
     await expect(page.locator("#summary-modal-subtitle")).toHaveText("Resets 2026-06-01");
     await expect(page.locator("#summary-modal-body")).toContainText("12 remaining");
+    // Both copies are back from the wait.
     await expect(page.locator("#chat-menu-usage")).toContainText("Check Usage");
+    await expect(page.locator("#usage-btn")).toHaveText("📊");
     expect(usageRequests).toBe(1);
   } finally {
     if (conversationId) {
@@ -1400,7 +1401,7 @@ test("shows current context from the context button", async ({ page, request }) 
       if (id) await window.openConversation(id);
     }, conversationId);
 
-    await page.click("#context-btn");
+    await clickHeaderAction(page, "context");
     await expect(page.locator("#summary-modal")).toHaveClass(/visible/);
     await expect(page.locator("#summary-modal-title")).toHaveText("Context usage");
     await expect(page.locator("#summary-modal-subtitle")).toHaveText("Copilot session context-");
@@ -1554,44 +1555,65 @@ test("hides install/fullscreen controls in installed app mode", async ({ page })
   await page.waitForLoadState("networkidle");
 
   await expect(page.locator("#install-btn")).toBeHidden();
-  await expect(page.locator("#fullscreen-btn")).toBeHidden();
+  // Not offered in an installed app: no header button and no ︙ twin.
+  await expectHeaderActionUnavailable(page, "fullscreen");
 
   await page.click("#chat-title");
   await page.waitForTimeout(200);
   expect(await page.evaluate(() => Number(window.__fullscreenCalls || 0))).toBe(0);
 });
 
-test("uses integrated mobile explorer/upload controls beside mode/model rows", async ({ page }) => {
+test("uses integrated mobile explorer/upload controls in the composer's label row", async ({ page }) => {
   const token = relayToken();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/?token=${encodeURIComponent(token)}`);
   await page.waitForLoadState("networkidle");
 
+  const settingsBtn = page.locator("#composer-settings-btn");
+  const settingsLabel = page.locator("#composer-settings-label");
   const explorerBtn = page.locator("#repo-browser-input-btn");
-  const modeSelect = page.locator("#mode-select");
   const uploadBtn = page.locator("#attach-btn");
-  const modelSelect = page.locator("#model-select");
+  const input = page.locator("#msg-input");
+  const sendBtn = page.locator("#send-btn");
   const attachmentPreview = page.locator("#attachment-preview");
 
   await expect(explorerBtn).toBeVisible();
+  await expect(settingsBtn).toBeVisible();
   await expect(page.locator("#repo-browser-fab")).toBeHidden();
   await expect(attachmentPreview).toBeHidden();
+  // The selects wait in the closed ⚙ sheet.
+  await expect(page.locator("#mode-select")).toBeHidden();
+  await expect(page.locator("#model-select")).toBeHidden();
 
+  const settingsBox = await settingsBtn.boundingBox();
+  const labelBox = await settingsLabel.boundingBox();
   const explorerBox = await explorerBtn.boundingBox();
-  const modeBox = await modeSelect.boundingBox();
   const uploadBox = await uploadBtn.boundingBox();
-  const modelBox = await modelSelect.boundingBox();
-  expect(explorerBox).toBeTruthy();
-  expect(modeBox).toBeTruthy();
-  expect(uploadBox).toBeTruthy();
-  expect(modelBox).toBeTruthy();
+  const inputBox = await input.boundingBox();
+  const sendBox = await sendBtn.boundingBox();
+  for (const box of [settingsBox, labelBox, explorerBox, uploadBox, inputBox, sendBox]) expect(box).toBeTruthy();
 
-  // Since d93c089 ("Compact composer controls") the mobile order is
-  // mode(1) · model(2) · explorer(3) · upload(4) on the same flex row.
-  expect(Math.abs(explorerBox.y - modeBox.y)).toBeLessThan(6);
-  expect(explorerBox.x).toBeGreaterThan(modelBox.x);
-  expect(Math.abs(uploadBox.y - explorerBox.y)).toBeLessThan(6);
+  // One label row: ⚙ · label · explorer · upload; tap targets of 28px or more.
+  for (const box of [labelBox, explorerBox, uploadBox]) expect(Math.abs(box.y - settingsBox.y)).toBeLessThan(6);
+  expect(labelBox.x).toBeGreaterThan(settingsBox.x);
+  expect(explorerBox.x).toBeGreaterThan(labelBox.x);
   expect(uploadBox.x).toBeGreaterThan(explorerBox.x);
+  for (const box of [settingsBox, explorerBox, uploadBox]) expect(box.height).toBeGreaterThanOrEqual(28);
+  // Under it, the message box with Send to its right.
+  expect(inputBox.y).toBeGreaterThanOrEqual(settingsBox.y + settingsBox.height);
+  expect(sendBox.x).toBeGreaterThan(inputBox.x);
+  expect(sendBox.y).toBeGreaterThanOrEqual(settingsBox.y + settingsBox.height);
+
+  // The ⚙ opens a bottom sheet with the selects; Escape closes it.
+  await settingsBtn.click();
+  const sheet = page.locator("#composer-settings");
+  await expect(sheet).toBeVisible();
+  await expect(page.locator("#mode-select")).toBeVisible();
+  await expect(page.locator("#model-select")).toBeVisible();
+  const sheetBox = await sheet.boundingBox();
+  expect(sheetBox.y + sheetBox.height).toBeLessThanOrEqual(844);
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
 
   await explorerBtn.click();
   await expect(page.locator("#repo-browser-modal")).toHaveClass(/visible/);

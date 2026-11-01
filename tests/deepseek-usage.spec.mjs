@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 
+import { isDeepSeekPeakTime } from "../shared/deepseek-pricing.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
 
 /**
@@ -75,6 +76,30 @@ async function liftHeightCaps(page, locator, viewport, whole = locator) {
     height = Math.max(height, Math.ceil(height + 2 * short));
     await page.setViewportSize({ width: viewport.width, height });
   }
+}
+
+/** A UTC calendar month: its first day, and the instant the next one starts. */
+function utcMonthOf(date) {
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+  const nextStart = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1));
+  return { start: start.toISOString().slice(0, 10), startMs: start.getTime(), nextStart: nextStart.toISOString() };
+}
+
+/** `day` (YYYY-MM-DD) moved by `count` days. */
+function addDays(day, count) {
+  return new Date(Date.parse(`${day}T00:00:00.000Z`) + count * 86_400_000).toISOString().slice(0, 10);
+}
+
+/**
+ * A fixture export file with its days moved so its first day is `firstDay`:
+ * the files are dated 2026-10-24 and 2026-10-25 (UTC+01:00), and a test
+ * dated by them would hold only in their month.
+ */
+function exportFile(name, firstDay) {
+  const text = fs.readFileSync(path.join(FIXTURES, name), "utf8");
+  const shift = (Date.parse(`${firstDay}T00:00:00.000Z`) - Date.parse("2026-10-24T00:00:00.000Z")) / 86_400_000;
+  const moved = text.replace(/\b(\d{4}-\d{2}-\d{2})(?=T\d{2}:\d{2})/g, (day) => addDays(day, shift));
+  return { name, mimeType: "text/csv", buffer: Buffer.from(moved) };
 }
 
 async function restoreHeightCaps(page, locator, viewport) {
@@ -216,13 +241,19 @@ test.describe("DeepSeek usage card", () => {
     // The first balance read is the reference: nothing spent against it yet.
     const meters = Object.fromEntries(card.meters.map((meter) => [meter.id, meter]));
     expect(meters["deepseek-balance-cny"]).toMatchObject({ unit: "cny", used: 0, allowance: 110, remaining: 110, utilization: 0, emphasis: "primary" });
-    expect(meters["deepseek-monthly-budget"]).toMatchObject({ unit: "cny", allowance: 20, estimated: true });
-    expect(meters["deepseek-monthly-budget"].used).toBeGreaterThan(0);
+    // The budget counts this UTC month only: the turn of 2026-10-21 only in
+    // its own month, the hour-old one (under a fen) rounds to nothing. The
+    // last test of this block books a turn of this month against it.
+    const month = utcMonthOf(new Date());
+    expect(meters["deepseek-monthly-budget"]).toMatchObject({ unit: "cny", allowance: 20, estimated: true, resetAt: month.nextStart });
+    expect(meters["deepseek-monthly-budget"].used).toBe(month.start === "2026-10-01" ? 10.04 : 0);
     const charts = Object.fromEntries(card.charts.map((chart) => [chart.id, chart]));
     expect(charts["deepseek-daily-spend"]).toMatchObject({ kind: "columns", unit: "cny", series: [{ key: "deepseek-flash", label: "DeepSeek Flash" }] });
     expect(charts["deepseek-daily-spend"].items.length).toBe(30);
     expect(charts["deepseek-daily-spend"].items.some((item) => item.values["deepseek-flash"] > 0)).toBe(true);
-    expect(charts["deepseek-daily-spend"].note).toMatch(/^Daily history on this relay starts /);
+    // The history's first day (2026-10-21) is named while it is inside the 30 days.
+    const chartStart = addDays(new Date().toISOString().slice(0, 10), -29);
+    expect(charts["deepseek-daily-spend"].note).toMatch("2026-10-21" > chartStart ? /^Daily history on this relay starts Oct 21; / : /^Estimated, by UTC day, from the turns of this relay\.$/);
     // 1M hits at the miss price would be ¥2.00; they cost ¥0.04.
     expect(charts["deepseek-spend-shares"]).toMatchObject({ kind: "bars", unit: "cny", summary: "Cache saved about ¥1.96" });
     expect(charts["deepseek-spend-shares"].series.map((entry) => entry.key)).toEqual(["hit", "miss", "output"]);
@@ -298,6 +329,18 @@ test.describe("DeepSeek usage card", () => {
       },
     });
     expect(searched.status()).toBe(200);
+    // The hour-old session of the test above, so the daily chart (the last
+    // 30 days) is there on a fresh relay too, whatever today's date.
+    const recent = await request.post(`${relay.baseUrl}/api/deepseek-plan-usage`, {
+      headers: headers(),
+      data: {
+        conversationId,
+        claudeNativeSessionId: "native-2",
+        at: new Date(Date.now() - 3_600_000).toISOString(),
+        totals: [{ model: "deepseek-flash", missTokens: 1_000 }],
+      },
+    });
+    expect(recent.status()).toBe(200);
     const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim() || testInfo.outputPath();
     const viewports = [
       { name: "phone-small", width: 320, height: 640 },
@@ -753,6 +796,42 @@ test.describe("DeepSeek usage card", () => {
     expect(card.meters.some((meter) => meter.id.startsWith("deepseek-balance-"))).toBe(false);
   });
 
+  test("the monthly budget counts a turn of this UTC month and not one half an hour before it", async ({ request }) => {
+    // Last in this block: its turns would change the sums of the tests above.
+    // Dated by the clock, so it holds on the 1st of a month as on any other day.
+    const saved = await request.post(`${relay.baseUrl}/api/settings/deepseek`, {
+      headers: headers(),
+      data: { apiKey: TEST_KEY, baseUrl: fake.url, monthlyBudget: 20, monthlyBudgetCurrency: "CNY" },
+    });
+    expect(saved.status()).toBe(200);
+    const budgetMeter = async () => {
+      const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=deepseek`, { headers: headers() })).json();
+      return usage.providers.find((entry) => entry.provider === "deepseek").meters.find((meter) => meter.id === "deepseek-monthly-budget");
+    };
+    const before = await budgetMeter();
+    const now = new Date();
+    const month = utcMonthOf(now);
+    // A million misses: ¥1 off-peak, ¥2 at peak; the month's turn at the
+    // relay's clock, the other at 23:30 UTC on the last day of last month.
+    const turns = [
+      { session: "native-this-month", at: now.toISOString() },
+      { session: "native-last-month", at: new Date(month.startMs - 30 * 60_000).toISOString() },
+    ];
+    for (const turn of turns) {
+      const reported = await request.post(`${relay.baseUrl}/api/deepseek-plan-usage`, {
+        headers: headers(),
+        data: { conversationId, claudeNativeSessionId: turn.session, at: turn.at, totals: [{ model: "deepseek-flash", missTokens: 1_000_000 }] },
+      });
+      expect(reported.status()).toBe(200);
+    }
+    const peak = isDeepSeekPeakTime(turns[0].at);
+    const after = await budgetMeter();
+    expect(after).toMatchObject({ unit: "cny", allowance: 20, estimated: true, resetAt: month.nextStart });
+    // Both sums are rounded to the fen: within one of the turn's price.
+    expect(Math.abs(after.used - before.used - (peak ? 2 : 1))).toBeLessThanOrEqual(0.011);
+    expect(after.note).toContain(`since ${new Date(month.startMs).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })} (UTC)`);
+  });
+
 });
 
 // A relay of its own: the import's turn and key would change the sums of the
@@ -779,7 +858,17 @@ test.describe("DeepSeek usage export import", () => {
     // The key the export belongs to, a turn the day before the export (the
     // first day of the daily history is never replaced: its earlier turns
     // may be in the totals only), then a turn on the export's day, so the
-    // card has an estimate for the export to replace.
+    // card has an estimate for the export to replace. The export's two days
+    // are the day before yesterday and yesterday (UTC+01:00, both over by
+    // now; the saved key has rows on the first only, other keys cover the
+    // second), so the test holds on any date; on the 1st of a month both
+    // are in the month before, and this month's budget is all estimate.
+    const today = new Date().toISOString().slice(0, 10);
+    const exportDay = addDays(today, -2);
+    const month = utcMonthOf(new Date());
+    const exportInMonth = addDays(exportDay, 1) >= month.start;
+    const amountFile = exportFile("amount.csv", exportDay);
+    const costFile = exportFile("cost.csv", exportDay);
     const saved = await request.post(`${relay.baseUrl}/api/settings/deepseek`, {
       headers: headers(),
       data: { apiKey: IMPORT_KEY, baseUrl: fake.url, monthlyBudget: 20 },
@@ -790,7 +879,7 @@ test.describe("DeepSeek usage export import", () => {
       data: {
         conversationId,
         claudeNativeSessionId: "native-history",
-        at: "2026-10-23T09:00:00.000Z",
+        at: `${addDays(exportDay, -1)}T09:00:00.000Z`,
         totals: [{ model: "deepseek-flash", missTokens: 100_000, outputTokens: 10_000 }],
       },
     });
@@ -800,7 +889,7 @@ test.describe("DeepSeek usage export import", () => {
       data: {
         conversationId,
         claudeNativeSessionId: "native-import",
-        at: "2026-10-24T09:00:00.000Z",
+        at: `${exportDay}T09:00:00.000Z`,
         totals: [{ model: "deepseek-flash", missTokens: 1_000_000, outputTokens: 1_000_000 }],
       },
     });
@@ -828,31 +917,31 @@ test.describe("DeepSeek usage export import", () => {
     const status = page.locator("#deepseek-usage-import-status");
 
     // One file only: refused before anything is sent.
-    await page.locator("#deepseek-usage-amount-input").setInputFiles(path.join(FIXTURES, "amount.csv"));
+    await page.locator("#deepseek-usage-amount-input").setInputFiles(amountFile);
     await page.locator("#deepseek-usage-import-btn").click();
     await expect(status).toHaveText("Choose both files of the export: the amount file and the cost file.");
     await expect(status).toHaveAttribute("data-state", "error");
     // Swapped files: the relay's reason, inline.
-    await page.locator("#deepseek-usage-amount-input").setInputFiles(path.join(FIXTURES, "cost.csv"));
-    await page.locator("#deepseek-usage-cost-input").setInputFiles(path.join(FIXTURES, "amount.csv"));
+    await page.locator("#deepseek-usage-amount-input").setInputFiles(costFile);
+    await page.locator("#deepseek-usage-cost-input").setInputFiles(amountFile);
     await page.locator("#deepseek-usage-import-btn").click();
     await expect(status).toContainText("The amount file is not a DeepSeek usage export");
     await expect(status).toHaveAttribute("data-state", "error");
     // A cost file of another range: the files do not match, nothing is stored.
-    const costText = fs.readFileSync(path.join(FIXTURES, "cost.csv"), "utf8");
+    const costText = costFile.buffer.toString("utf8");
     const otherCost = costText.replace(/,0\.50868424\d*,/, ",0.6,");
     expect(otherCost).not.toBe(costText);
-    await page.locator("#deepseek-usage-amount-input").setInputFiles(path.join(FIXTURES, "amount.csv"));
-    await page.locator("#deepseek-usage-cost-input").setInputFiles({ name: "cost.csv", mimeType: "text/csv", buffer: Buffer.from(otherCost) });
+    await page.locator("#deepseek-usage-amount-input").setInputFiles(amountFile);
+    await page.locator("#deepseek-usage-cost-input").setInputFiles({ ...costFile, buffer: Buffer.from(otherCost) });
     await page.locator("#deepseek-usage-import-btn").click();
     await expect(status).toContainText("The files do not match for deepseek-flash");
     await expect(status).toHaveAttribute("data-state", "error");
     await control.screenshot({ path: path.join(shotDir, "deepseek-import-settings-error-desktop-dark.png") });
     // The right files.
-    await page.locator("#deepseek-usage-amount-input").setInputFiles(path.join(FIXTURES, "amount.csv"));
-    await page.locator("#deepseek-usage-cost-input").setInputFiles(path.join(FIXTURES, "cost.csv"));
+    await page.locator("#deepseek-usage-amount-input").setInputFiles(amountFile);
+    await page.locator("#deepseek-usage-cost-input").setInputFiles(costFile);
     await page.locator("#deepseek-usage-import-btn").click();
-    await expect(status).toContainText(/^Imported \d+ rows for 2026-10-24/);
+    await expect(status).toContainText(new RegExp(`^Imported \\d+ rows for ${exportDay}`));
     await expect(status).toContainText("The usage card shows the saved key's figures (CNY) on the export's days through");
     await expect(status).toHaveAttribute("data-state", "active");
     for (const viewport of [{ name: "desktop", width: 1280, height: 900 }, { name: "phone", width: 390, height: 844 }]) {
@@ -873,13 +962,15 @@ test.describe("DeepSeek usage export import", () => {
     const usage = await (await request.get(`${relay.baseUrl}/api/usage?providers=deepseek`, { headers: headers() })).json();
     const card = usage.providers.find((entry) => entry.provider === "deepseek");
     const notes = Object.fromEntries(card.notes.map((note) => [note.id, note.text]));
-    expect(notes["deepseek-actual"]).toMatch(/^Actual figures from the DeepSeek export on the days it covers \(the last through 2026-10-2[56] 00:00 UTC\+01:00\), estimated on the others\. On export days the export's cost includes the web searches\./);
+    expect(notes["deepseek-actual"]).toMatch(new RegExp(`^Actual figures from the DeepSeek export on the days it covers \\(the last through ${addDays(exportDay, 1)} 00:00 UTC\\+01:00\\), estimated on the others\\. On export days the export's cost includes the web searches\\.`));
     expect(notes["deepseek-spend"]).toMatch(/^Spend, actual and estimated: ¥/);
     expect(card.charts.find((chart) => chart.id === "deepseek-daily-spend").note).toMatch(/^Actual from the DeepSeek export on the days it covers, by its days; estimated on the others/);
-    // The budget bar of a month with export days is not flagged "estimated".
+    // The budget bar of a month with export days is not flagged "estimated";
+    // on the 1st the export is all last month's, and this month's bar is.
     const budget = card.meters.find((meter) => meter.id === "deepseek-monthly-budget");
-    expect(budget.estimated).toBe(false);
-    expect(budget.note).toMatch(/actual on the days of the DeepSeek export/);
+    expect(budget.estimated).toBe(!exportInMonth);
+    expect(budget.resetAt).toBe(month.nextStart);
+    expect(budget.note).toMatch(exportInMonth ? /actual on the days of the DeepSeek export/ : /^This relay's estimated spend since /);
     const byModel = card.details.find((section) => section.id === "deepseek-spend-by-model");
     expect(byModel.rows.map((row) => row.label)).toEqual(expect.arrayContaining(["DeepSeek Flash", "DeepSeek V4 Pro"]));
 
@@ -888,7 +979,7 @@ test.describe("DeepSeek usage export import", () => {
     await page.locator('[data-usage-tab="deepseek"]').click();
     const panel = page.locator('[data-usage-panel="deepseek"]');
     await expect(panel.locator('[data-note-id="deepseek-actual"]')).toContainText("Actual figures from the DeepSeek export on the days it covers");
-    await expect(panel.locator('[data-meter-id="deepseek-monthly-budget"] .plan-usage-flag')).toHaveCount(0);
+    await expect(panel.locator('[data-meter-id="deepseek-monthly-budget"] .plan-usage-flag')).toHaveCount(exportInMonth ? 0 : 1);
     await expect(panel.locator('[data-note-id="deepseek-spend"]')).toContainText("Spend, actual and estimated");
     for (const viewport of [{ name: "desktop", width: 1280, height: 900 }, { name: "phone", width: 390, height: 844 }]) {
       await page.setViewportSize({ width: viewport.width, height: viewport.height });
