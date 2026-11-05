@@ -24,6 +24,14 @@ test('the folded header counts the steps and shows the latest', () => {
   );
 });
 
+test('a bubble holding as many lines as the live cap says "N+ steps"; below it, or without a cap, the plain count', () => {
+  const lines = Array.from({ length: 50 }, (_, index) => `Tool (grep): widget-${index + 1}`);
+  assert.equal(subagentFoldSummary({ activities: lines, cap: 50 }), '50+ steps · Tool (grep): widget-50');
+  assert.equal(subagentFoldSummary({ activities: lines.slice(0, 49), cap: 50 }), '49 steps · Tool (grep): widget-49');
+  assert.equal(subagentFoldSummary({ activities: lines, cap: 0 }), '50 steps · Tool (grep): widget-50');
+  assert.equal(subagentFoldSummary({ activities: lines }), '50 steps · Tool (grep): widget-50');
+});
+
 test('a run that has taken no step yet shows the end of what it wrote', () => {
   assert.equal(subagentFoldSummary({ streamText: 'Reading the routes.\n\nThree call sites so far. ' }), 'Three call sites so far.');
   assert.equal(subagentFoldSummary({}), '');

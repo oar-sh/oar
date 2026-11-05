@@ -209,3 +209,35 @@ test('question source and rationale default to the Claude wire payload and are o
   assert.equal(cursorPost.body.context.source, 'ask_user');
   assert.equal(cursorPost.body.context.rationale, 'Cursor requested clarification to continue this turn.');
 });
+
+test('one ask may carry its own source and rationale without changing the bridge default', async () => {
+  const stub = makeApiStub({ answers: ['A', 'A'] });
+  const bridge = createAskUserBridge({
+    api: stub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+  const question = { questions: [{ question: 'Go ahead?', options: [{ label: 'A' }, { label: 'B' }] }] };
+  await bridge.handleAskUserQuestion(question, { source: 'SampleCheck', rationale: 'A sample check needs you.' });
+  await bridge.handleAskUserQuestion(question);
+  const posts = stub.calls.filter((call) => call.routePath === '/api/relay-question');
+  assert.equal(posts[0].body.context.source, 'SampleCheck');
+  assert.equal(posts[0].body.context.rationale, 'A sample check needs you.');
+  assert.equal(posts[1].body.context.source, 'AskUserQuestion');
+  assert.match(posts[1].body.context.rationale, /Claude requested clarification/);
+});
+
+test('one ask may take no typed reply; every other ask still does', async () => {
+  const stub = makeApiStub({ answers: ['A', 'A'] });
+  const bridge = createAskUserBridge({
+    api: stub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+  const question = { questions: [{ question: 'Go ahead?', options: [{ label: 'A' }, { label: 'B' }] }] };
+  await bridge.handleAskUserQuestion(question, { allowFreeform: false });
+  await bridge.handleAskUserQuestion(question);
+  const posts = stub.calls.filter((call) => call.routePath === '/api/relay-question');
+  assert.equal(posts[0].body.allowFreeform, false);
+  assert.equal(posts[1].body.allowFreeform, true);
+});

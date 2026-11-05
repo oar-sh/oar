@@ -77,8 +77,18 @@ async function loadBoardHistory(conversationId) {
 
 /** Where a board is shown: its turn's reply, the live bubble of its turn, or nowhere yet. */
 function findBoardHost(el, board) {
-  const source = String(board?.messageId || board?.queueId || '').trim();
-  if (!source) return null;
+  return findTurnBubble(el, board?.messageId || board?.queueId);
+}
+
+/**
+ * The bubble of the turn that answers queue row `queueId`: its reply
+ * (`{ bubble, live: false }`), else the live bubble while it runs
+ * (`live: true`), else null (not loaded, or not there). Plan boards and 📓
+ * stubs both live there.
+ */
+export function findTurnBubble(el, queueId) {
+  const source = String(queueId || '').trim();
+  if (!el || !source) return null;
   const replies = el.querySelectorAll(`.msg.assistant[data-source-message-id="${CSS.escape(source)}"]`);
   // The turn's own reply is the last row that answers the message; a steer's
   // marker above it is not a reply.

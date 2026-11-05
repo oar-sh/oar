@@ -72,6 +72,8 @@ test('the pin list keeps its title on a phone: dialog header buttons stay compac
 test('the header buttons are in the page hidden, 📍 then 🙈 before search, and their [hidden] is honoured', () => {
   const source = read('../index.html');
 
+  // 📓 comes first, then 📍 and 🙈.
+  assert.match(source, /<div id="chat-header-actions">\s*\n\s*<button id="questions-btn" class="header-icon-btn has-count" type="button"[^>]* aria-haspopup="dialog" aria-expanded="false" aria-controls="questions-panel" hidden>📓<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="pinned-messages-btn"/);
   assert.match(source, /<button id="pinned-messages-btn" class="header-icon-btn has-count" type="button"[^>]* hidden>📍<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="hidden-messages-btn" class="header-icon-btn has-count" type="button"[^>]* hidden>🙈<span class="header-icon-count"><\/span><\/button>\s*\n\s*<button id="message-search-btn"/);
-  assert.match(source, /#pinned-messages-btn\[hidden\],\s*\n\s*#hidden-messages-btn\[hidden\] \{ display: none; \}/);
+  assert.match(source, /#questions-btn\[hidden\],\s*\n\s*#pinned-messages-btn\[hidden\],\s*\n\s*#hidden-messages-btn\[hidden\] \{ display: none; \}/);
 });

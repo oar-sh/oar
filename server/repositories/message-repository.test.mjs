@@ -920,3 +920,40 @@ test('getOwnerLastActivityAt: the latest delivery or turn end over the rows the 
   assert.equal(lastActivity('sid-other'), '2026-01-01T12:00:00.000Z');
   assert.equal(lastActivity(''), null);
 });
+
+test('hasProcessingRow finds a processing row and nothing else', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES ('conv-1', 'Demo', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  const insert = db.prepare(`
+    INSERT INTO queue (id, conversation_id, is_new_conversation, text, status, timestamp, retry_count)
+    VALUES (?, 'conv-1', 0, 'hello', ?, '2026-01-01T00:00:00.000Z', 0)
+  `);
+  assert.equal(repository.hasProcessingRow.get(), undefined, 'empty queue');
+  insert.run('q-pending', 'pending');
+  insert.run('q-done', 'done');
+  insert.run('q-parked', 'parked');
+  assert.equal(repository.hasProcessingRow.get(), undefined, 'pending, done and parked rows are not processing');
+  insert.run('q-processing', 'processing');
+  assert.deepEqual({ ...repository.hasProcessingRow.get() }, { present: 1 });
+});
+
+test('nextPendingAttemptAt names the earliest future retry of a pending row, never a hold until resumed', () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  db.prepare(`INSERT INTO conversations (id, title, status, created_at, updated_at) VALUES ('conv-1', 'Demo', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  const insert = db.prepare(`
+    INSERT INTO queue (id, conversation_id, is_new_conversation, text, status, timestamp, retry_count, next_attempt_at)
+    VALUES (?, 'conv-1', 0, 'hello', ?, '2026-01-01T00:00:00.000Z', 0, ?)
+  `);
+  const now = '2026-05-01T12:00:00.000Z';
+  assert.equal(repository.nextPendingAttemptAt.get(now).due, null, 'empty queue');
+  insert.run('q-due-already', 'pending', '2026-05-01T11:59:59.000Z');
+  insert.run('q-no-retry', 'pending', null);
+  insert.run('q-held-until-resumed', 'pending', '9999-12-31T23:59:59.000Z');
+  insert.run('q-processing', 'processing', '2026-05-01T12:00:01.000Z');
+  assert.equal(repository.nextPendingAttemptAt.get(now).due, null, 'nothing pending lies ahead');
+  insert.run('q-later', 'pending', '2026-05-01T12:05:00.000Z');
+  insert.run('q-sooner', 'pending', '2026-05-01T12:00:02.000Z');
+  assert.equal(repository.nextPendingAttemptAt.get(now).due, '2026-05-01T12:00:02.000Z');
+});

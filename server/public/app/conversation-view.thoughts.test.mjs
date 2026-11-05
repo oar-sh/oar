@@ -32,6 +32,8 @@ globalThis.marked = {
   },
 };
 
+// The live rows' open/fold rules run against a real DOM in
+// conversation-view.live-thoughts.test.mjs.
 const { renderThoughtsMarkup, setLiveThinkingThoughtState } = await import('./conversation-view.js');
 
 test('renders each final thought as markdown content under one collapsed thoughts panel', () => {
@@ -48,11 +50,11 @@ test('renders each final thought as markdown content under one collapsed thought
   assert.match(markup, /<strong>rendered<\/strong> - one/);
 });
 
-test('keeps live thought rows expanded until the active turn is replaced', () => {
+test('a chunk updates the row state and leaves its fold alone', () => {
   const row = { dataset: {}, open: false };
 
   setLiveThinkingThoughtState(row, true);
 
   assert.equal(row.dataset.done, '1');
-  assert.equal(row.open, true);
+  assert.equal(row.open, false);
 });

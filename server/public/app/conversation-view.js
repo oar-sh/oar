@@ -94,6 +94,11 @@ import {
 } from './composer-attachment-cache.mjs';
 import { renderRelayQuestions } from './ask-user-view.js';
 import { renderRelayBoards } from './relay-board-view.js';
+import { renderQuestionStubs } from './questions-panel-ui.js';
+import { isThoughtsExpanded, rememberThoughtFoldChoice, thoughtFoldOpen } from './thoughts-preference.mjs';
+import { liveActivityCap } from './live-activity-cap.mjs';
+import { isStreamViewEnabled } from './stream-view-preference.mjs';
+import { isProgressActivityText, renderTurnStreamMarkup, turnStreamEntries } from './turn-stream-view.mjs';
 import { getMessageThreadAnchor, sortConversationMessages } from './thread-order.mjs';
 import {
   normalizeStreamSeq,
@@ -102,11 +107,13 @@ import {
   computeNextRelayStreamState,
 } from './stream-state.mjs';
 import {
-  capRelayActivityEntries,
+  capFinishedActivityEntries,
   compactBoundaryFromActivities,
+  isOmittedActivityMarker,
   isCompactBoundaryActivityEntry,
   mergeRelayActivityTexts,
   normalizeRelayActivityEntry,
+  normalizeTurnSeq,
   promotedCompactBoundaryEntry,
   relayActivityEntryText,
   visibleActivityEntries,
@@ -154,7 +161,7 @@ import { createHeldBackLiveRows, newerPageReachesEnd } from './transcript-island
 import { buildInFlightSnapshotKey } from './in-flight-snapshot.mjs';
 import { computeStablePrefixLength, planListPatch } from './streaming-dom-patch.mjs';
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
-import { conversationPayloadCache } from './conversation-payload-cache.mjs';
+import { conversationPayloadCache, windowPageInfo } from './conversation-payload-cache.mjs';
 import { noteConversationShown } from './session-history-ui.js';
 
 const CONVERSATION_HISTORY_PAGE_SIZE = 20;
@@ -1613,9 +1620,10 @@ function createMessageNode(msg, msgId = null, force = false) {
   const content = renderMarkdownPreview(msg.text || '', false);
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   // capRelayActivityEntries, not slice: a boundary past the cap would take
-  // the break row with it.
+  // the break row with it. The relay's cap of a finished turn (newest rows
+  // per thread), so an older relay's longer list reads the same.
   const activities = Array.isArray(msg.activities)
-    ? capRelayActivityEntries(msg.activities.filter(Boolean), 48)
+    ? capFinishedActivityEntries(msg.activities.filter(Boolean))
     : [];
   // A compaction that happened during this turn is rendered as a full-width
   // break row immediately above this message (syncTranscriptSeparators reads
@@ -1634,8 +1642,27 @@ function createMessageNode(msg, msgId = null, force = false) {
   const subagentRuns = Array.isArray(msg.subagentRuns) ? msg.subagentRuns.filter(Boolean) : [];
   const mainActivities = activities.filter((item) => !(normalizeRelayActivityEntry(item)?.subagentRunId));
   const mainThoughts = thoughts.filter((t) => !t?.subagentRunId);
-  const activityHtml = mainActivities.length ? renderActivityMarkup(mainActivities, promotedBoundaryEntry) : '';
-  const thoughtsHtml = mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
+  // Stream view: the turn's thoughts, tool lines and reply as one list in
+  // the order they happened, when the turn's rows carry their order (null:
+  // the grouped layout below, unchanged). Progress lines ('● ') stay where
+  // the grouped layout puts them.
+  const streamEntries = msg.role === 'assistant' && isStreamViewEnabled()
+    ? turnStreamEntries({
+      thoughts: mainThoughts,
+      activities: visibleActivityEntries(mainActivities, promotedBoundaryEntry),
+      text: msg.text || '',
+    })
+    : null;
+  const activityHtml = streamEntries
+    ? renderActivityMarkup(mainActivities.filter((item) => isProgressActivityText(relayActivityEntryText(item))), promotedBoundaryEntry)
+    : (mainActivities.length ? renderActivityMarkup(mainActivities, promotedBoundaryEntry) : '');
+  const thoughtsHtml = !streamEntries && mainThoughts.length ? renderThoughtsMarkup(mainThoughts) : '';
+  const replyHtml = streamEntries
+    ? renderTurnStreamMarkup(streamEntries, {
+      renderMarkdown: (text) => renderMarkdownPreview(text, false),
+      decorate: decorateActivityText,
+    })
+    : content;
   // One row per sub-agent the turn spawned, as in the composer's task panel;
   // its title opens the agent's whole record. The store's copy wins: status
   // events keep it current after the bubble was built.
@@ -1720,7 +1747,7 @@ function createMessageNode(msg, msgId = null, force = false) {
     : '';
 
   div.innerHTML = `
-    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${originBadgeHtml}${content}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}${workerLaunchActionsHtml}</div>
+    <div class="${bubbleClass}">${shareVisibilityActionHtml}${thoughtsHtml}${originBadgeHtml}${replyHtml}${relayErrorCtaHtml}${attachmentHtml}${activityHtml}${subagentHtml}${workflowRunsHtml}${previewCardsHtml}${userBubbleActionsHtml}${stoppedSteerActionsHtml}${workerLaunchActionsHtml}</div>
     <div class="msg-label">${label}${modelTag}${reasoningTag}${modeTag}${autoTag}${continuationTag}${crossProviderTag}${usageTurnTag}${usageRemainingTag}${usageStaleTag} · ${fmtDate(msg.timestamp)}</div>`;
 
   const bubble = div.querySelector('.msg-bubble');
@@ -1915,10 +1942,12 @@ export function renderActivityMarkup(activities, promotedBoundaryEntry = undefin
   const progressHtml = progress.length
     ? `<div class="msg-activity-list">${progress.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(relayActivityEntryText(item)))}</div>`).join('')}</div>`
     : '';
+  // The "… N earlier tool lines omitted" row is listed but is no tool line.
+  const toolCount = tools.filter((item) => !isOmittedActivityMarker(item)).length;
   const toolsHtml = tools.length
     ? `
       <details class="msg-activity">
-        <summary>🔧 Tool activity (${tools.length})</summary>
+        <summary>🔧 Tool activity (${toolCount})</summary>
         <div class="msg-activity-list">${tools.map((item) => `<div class="msg-activity-item">${escHtml(decorateActivityText(relayActivityEntryText(item)))}</div>`).join('')}</div>
       </details>`
     : '';
@@ -2012,6 +2041,7 @@ export function showThinking(messageId = null, autoScroll = true) {
         <summary>💭 Thoughts</summary>
         <div class="thinking-thoughts-list"></div>
       </details>
+      ${isStreamViewEnabled() ? '<div id="thinking-stream-list" class="thinking-stream-list"></div>' : ''}
       <div id="thinking-stream" class="thinking-stream" hidden></div>
       <div class="thinking-compacting-note" hidden>Compacting the conversation…</div>
       <div class="dots"><span></span><span></span><span></span></div>
@@ -2022,8 +2052,10 @@ export function showThinking(messageId = null, autoScroll = true) {
   syncThinkingCompaction(div);
   renderThinkingThoughts();
   renderThinkingStream();
-  // A board the turn has posted already lives in its live bubble.
+  // A board the turn has posted already lives in its live bubble, and so
+  // does the 📓 stub of an ask it made.
   renderRelayBoards();
+  renderQuestionStubs();
   observeThinkingBubble(div);
   if (getThinkingFollowMode()) applyThinkingFollow();
   else if (autoScroll) scrollBottom();
@@ -2158,7 +2190,7 @@ export function collapseThinkingThoughts() {
   if (!(panel instanceof HTMLDetailsElement)) return;
   panel.open = false;
   panel.querySelectorAll('.thinking-thought').forEach((row) => {
-    if (row instanceof HTMLDetailsElement) row.open = false;
+    if (row instanceof HTMLDetailsElement) showLiveThoughtRow(row, false);
   });
 }
 
@@ -2252,6 +2284,7 @@ export function renderThinkingActivities() {
   // clear-and-replay (or the append path's last-row-only dedupe) would either
   // wipe selections or duplicate rows on every changed payload.
   const mainExpected = [];
+  const mainEntries = [];
   const bySubagentRun = new Map();
   for (const item of items) {
     const entry = normalizeRelayActivityEntry(item);
@@ -2261,15 +2294,22 @@ export function renderThinkingActivities() {
     // would otherwise flip presentation the moment the turn lands.
     if (isCompactBoundaryActivityEntry(entry)) continue;
     const decorated = decorateActivityText(entry.text);
+    // A numbered row is its own line even when the same tool line came just
+    // before (the same call twice); an unnumbered repeat is one line.
+    const numbered = entry.turnSeq !== undefined;
     if (entry.subagentRunId) {
       const list = bySubagentRun.get(entry.subagentRunId) || [];
-      if (list[list.length - 1] !== decorated) list.push(decorated);
+      if (numbered || list[list.length - 1] !== decorated) list.push(decorated);
       bySubagentRun.set(entry.subagentRunId, list);
-    } else if (mainExpected[mainExpected.length - 1] !== decorated) {
+    } else if (numbered || mainExpected[mainExpected.length - 1] !== decorated) {
       mainExpected.push(decorated);
+      mainEntries.push({ text: decorated, turnSeq: entry.turnSeq ?? null });
     }
   }
-  if (!selectionIntersectsNode(box)) {
+  const streamList = liveStreamList();
+  if (streamList) {
+    if (!selectionIntersectsNode(streamList)) patchStreamListActivities(streamList, mainEntries);
+  } else if (!selectionIntersectsNode(box)) {
     patchActivityList(box, mainExpected, 'thinking-activity-item');
   }
   syncThinkingCompaction();
@@ -2297,7 +2337,9 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   // live poll would otherwise churn the DOM (and the user's selection) with
   // identical content. The indicator must belong to this turn's message —
   // skipping on a foreign bubble would let a misplaced one stick around.
-  const snapshotKey = buildInFlightSnapshotKey(inFlight);
+  // The cap is part of it: a changed "Tool lines shown" refills or trims the
+  // bubble on the next poll even when the payload is the same.
+  const snapshotKey = `${liveActivityCap()}|${buildInFlightSnapshotKey(inFlight)}`;
   const liveIndicator = document.getElementById('thinking-indicator');
   if (snapshotKey === lastInFlightSnapshotKey
     && liveIndicator
@@ -2313,6 +2355,7 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
   const activities = mergeRelayActivityTexts(
     relayActivities.get(messageId) || [],
     Array.isArray(inFlight.activities) ? inFlight.activities : [],
+    liveActivityCap(),
   );
   relayActivities.set(messageId, activities);
   const inFlightThoughts = Array.isArray(inFlight.thoughts) ? inFlight.thoughts : [];
@@ -2320,7 +2363,15 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
     const thoughtMap = relayThoughts.get(messageId) || new Map();
     for (const entry of inFlightThoughts) {
       const key = String(entry?.reasoningId || `seq-${entry?.seq || thoughtMap.size}`);
-      thoughtMap.set(key, { reasoningId: key, text: String(entry?.text || ''), done: !!entry?.done, subagentRunId: entry?.subagentRunId || null });
+      // A thought keeps the place of its first chunk.
+      const turnSeq = thoughtMap.get(key)?.turnSeq ?? normalizeTurnSeq(entry?.turnSeq);
+      thoughtMap.set(key, {
+        reasoningId: key,
+        text: String(entry?.text || ''),
+        done: !!entry?.done,
+        subagentRunId: entry?.subagentRunId || null,
+        ...(turnSeq != null ? { turnSeq } : {}),
+      });
     }
     relayThoughts.set(messageId, thoughtMap);
   }
@@ -2405,6 +2456,7 @@ export function appendThinkingActivity(item, subagentRunId = null, autoScroll = 
           row.className = 'subagent-activity-item';
           row.textContent = decorated;
           activityBox.appendChild(row);
+          trimLiveActivityRows(activityBox, 'subagent-activity-item');
           refreshSubagentSummary(subagentBubble);
         }
       }
@@ -2415,16 +2467,103 @@ export function appendThinkingActivity(item, subagentRunId = null, autoScroll = 
     return;
   }
 
-  const box = document.getElementById('thinking-activity');
+  // Stream view: the main agent's tool lines share one list with its
+  // thoughts, in the turn's order.
+  const streamList = liveStreamList();
+  const box = streamList || document.getElementById('thinking-activity');
   if (!box) return;
-  const last = box.lastElementChild?.textContent || '';
-  if (last === decorated) return;
+  const numbered = entry.turnSeq !== undefined;
+  if (numbered) {
+    // A numbered line is known by its number: the same call twice is two.
+    if (box.querySelector(`.thinking-activity-item[data-turn-seq="${entry.turnSeq}"]`)) return;
+  } else if (streamList) {
+    const rows = streamList.querySelectorAll(':scope > .thinking-activity-item');
+    if ((rows[rows.length - 1]?.textContent || '') === decorated) return;
+  } else if ((box.lastElementChild?.textContent || '') === decorated) {
+    return;
+  }
   const row = document.createElement('div');
   row.className = 'thinking-activity-item';
-  if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
+  if (numbered) row.dataset.turnSeq = String(entry.turnSeq);
   row.textContent = decorated;
-  box.appendChild(row);
+  if (streamList) placeByTurnSeq(streamList, row);
+  else box.appendChild(row);
+  trimLiveActivityRows(box, 'thinking-activity-item');
   if (autoScroll) scrollBottom();
+}
+
+// The live bubble's single list of thoughts and tool lines, while the stream
+// view is on (the bubble is rebuilt when it is switched).
+function liveStreamList() {
+  return isStreamViewEnabled() ? document.getElementById('thinking-stream-list') : null;
+}
+
+// The stream list keeps its rows in the turn's order: a numbered row goes
+// before the first row with a higher number, an unnumbered one (an older
+// relay, a thought not yet numbered) at the end.
+function placeByTurnSeq(list, row) {
+  const seq = Number(row.dataset.turnSeq);
+  if (!list.id || list.id !== 'thinking-stream-list' || !Number.isFinite(seq)) {
+    if (row.parentNode !== list) list.appendChild(row);
+    return;
+  }
+  for (const child of list.children) {
+    if (child === row) continue;
+    const childSeq = Number(child.dataset.turnSeq);
+    if (Number.isFinite(childSeq) && childSeq > seq) {
+      if (row.nextSibling !== child) list.insertBefore(row, child);
+      return;
+    }
+  }
+  if (row.parentNode !== list || list.lastElementChild !== row) list.appendChild(row);
+}
+
+/**
+ * The poll replay of the stream list's tool lines: `expected` is the main
+ * agent's lines as the turn holds them now ({ text, turnSeq }, already
+ * capped). Rows no longer expected go, missing ones are placed by number;
+ * thoughts are left where they are.
+ */
+function patchStreamListActivities(list, expected) {
+  const rows = [...list.querySelectorAll(':scope > .thinking-activity-item')];
+  if (expected.every((entry) => entry.turnSeq !== null)) {
+    const wanted = new Map(expected.map((entry) => [String(entry.turnSeq), entry]));
+    for (const row of rows) {
+      if (!wanted.has(row.dataset.turnSeq || '')) row.remove();
+    }
+    for (const entry of expected) {
+      const key = String(entry.turnSeq);
+      let row = list.querySelector(`:scope > .thinking-activity-item[data-turn-seq="${key}"]`);
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'thinking-activity-item';
+        row.dataset.turnSeq = key;
+      }
+      if (row.textContent !== entry.text) row.textContent = entry.text;
+      placeByTurnSeq(list, row);
+    }
+    return;
+  }
+  // Unnumbered lines (an older relay): in arrival order after the rest.
+  if (rows.length === expected.length && rows.every((row, index) => row.textContent === expected[index].text)) return;
+  for (const row of rows) row.remove();
+  for (const entry of expected) {
+    const row = document.createElement('div');
+    row.className = 'thinking-activity-item';
+    if (entry.turnSeq !== null) row.dataset.turnSeq = String(entry.turnSeq);
+    row.textContent = entry.text;
+    list.appendChild(row);
+  }
+}
+
+// A line that arrives between two poll replays is appended at once; the
+// thread's oldest lines beyond the "Tool lines shown" setting go with it, as
+// the next replay would drop them (each box holds one thread's lines).
+function trimLiveActivityRows(box, className) {
+  const cap = liveActivityCap();
+  if (!box || !(cap > 0) || selectionIntersectsNode(box)) return;
+  const rows = box.querySelectorAll(`:scope > .${className}`);
+  for (let index = 0; index < rows.length - cap; index += 1) rows[index].remove();
 }
 
 function getSubagentDisplayName(subagentRunId) {
@@ -2568,7 +2707,11 @@ function ensureSubagentBubble(subagentRunId, depth = 0) {
     }
   }
   if (entry?.activities?.length) {
-    for (const item of entry.activities) {
+    // The run's newest lines only, as many as the "Tool lines shown" setting
+    // keeps per agent.
+    const cap = liveActivityCap();
+    const replayed = cap > 0 ? entry.activities.slice(-cap) : entry.activities;
+    for (const item of replayed) {
       const text = typeof item === 'string' ? item : String(item?.text || '').trim();
       if (!text) continue;
       const decorated = decorateActivityText(text);
@@ -2595,6 +2738,7 @@ function refreshSubagentSummary(bubble) {
   const text = subagentFoldSummary({
     activities: Array.from(bubble.querySelectorAll(':scope > .subagent-activity > .subagent-activity-item'), (row) => row.textContent || ''),
     streamText: bubble.querySelector(':scope > .subagent-stream')?.textContent || '',
+    cap: liveActivityCap(),
   });
   if (summary.textContent !== text) summary.textContent = text;
 }
@@ -2717,17 +2861,95 @@ function thoughtSummaryText(text) {
   return value.length > 80 ? `${value.slice(0, 80)}…` : value;
 }
 
+/**
+ * A chunk only updates the row's state: whether it shows open was decided
+ * when the row was made (the "Expand thoughts" setting or the reader's own
+ * fold), so a thought folded by hand stays folded as more text streams in.
+ */
 export function setLiveThinkingThoughtState(row, done = false) {
   if (!row) return;
   row.dataset.done = done ? '1' : '0';
-  // The temporary panel represents an active turn, so every thought remains visible
-  // until the completed assistant message replaces it with collapsed history.
-  row.open = true;
 }
 
-export function appendThinkingThought(reasoningId, text, done = false, subagentRunId = null, autoScroll = true) {
+// What the reader chose by hand for a live thought ('open' | 'folded'), by
+// turn, sub-agent run and reasoning id. Kept outside the DOM: the live bubble
+// is rebuilt on a conversation switch and on a poll replay, and the choice
+// must survive it. Main-thread reasoning ids are positional within a turn
+// (the first thought of every turn has the same id), so the turn is part of
+// the key; a sub-agent run id is unique already and its rows are keyed
+// without a turn, so a row rebuilt from the store finds its choice.
+const liveThoughtFoldChoices = new Map();
+
+/** The turn part of a live thought's key: the queue message, '' for a sub-agent row. */
+function liveThoughtTurnId(messageId, subagentRunId = null) {
+  return subagentRunId ? '' : String(messageId || '');
+}
+
+function liveThoughtFoldKey(turnId, reasoningId, subagentRunId = null) {
+  return `${String(turnId || '')}\u0000${String(subagentRunId || '')}\u0000${String(reasoningId || '')}`;
+}
+
+/** Open or folded for a live thought row being made (exported for tests). */
+export function liveThoughtStartsOpen(reasoningId, subagentRunId = null, turnId = '') {
+  return thoughtFoldOpen({
+    choice: liveThoughtFoldChoices.get(liveThoughtFoldKey(turnId, reasoningId, subagentRunId)) || null,
+    expanded: isThoughtsExpanded(),
+  });
+}
+
+/**
+ * Show a live thought row open or folded without that counting as the
+ * reader's choice. `dataset.shownOpen` is what the page last set (or saw the
+ * reader set); a toggle event that disagrees with it came from the reader.
+ */
+export function showLiveThoughtRow(row, open) {
+  if (!row) return;
+  row.dataset.shownOpen = open ? '1' : '0';
+  if (row.open !== !!open) row.open = !!open;
+}
+
+/** The toggle listener of a live thought row (exported for tests). */
+export function noteLiveThoughtToggle(row) {
+  if (!row?.dataset) return;
+  const open = !!row.open;
+  if (row.dataset.shownOpen === (open ? '1' : '0')) return;
+  row.dataset.shownOpen = open ? '1' : '0';
+  rememberThoughtFoldChoice(
+    liveThoughtFoldChoices,
+    liveThoughtFoldKey(row.dataset.turnId || '', row.dataset.reasoningId, row.dataset.subagentRunId || null),
+    open,
+  );
+}
+
+/**
+ * A live thought row, shown open or folded as the reader's choice or the
+ * setting says. `turnId` comes from the caller (the frame's message id), never
+ * from the live bubble's state, so a rebuilt row gets the same key.
+ */
+export function createLiveThoughtRow(key, subagentRunId = null, turnId = '') {
+  const row = document.createElement('details');
+  row.className = 'thinking-thought';
+  row.dataset.reasoningId = key;
+  row.dataset.turnId = String(turnId || '');
+  if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
+  showLiveThoughtRow(row, liveThoughtStartsOpen(key, subagentRunId, row.dataset.turnId));
+  row.addEventListener('toggle', () => noteLiveThoughtToggle(row));
+  const summary = document.createElement('summary');
+  const body = document.createElement('div');
+  body.className = 'thinking-thought-body';
+  row.appendChild(summary);
+  row.appendChild(body);
+  return row;
+}
+
+/**
+ * Add or update a live thought. `messageId` is the turn the frame belongs to
+ * (the key of the reader's fold choice for a main-thread thought).
+ */
+export function appendThinkingThought(reasoningId, text, done = false, subagentRunId = null, autoScroll = true, messageId = null) {
   const key = String(reasoningId || 'reasoning');
   const value = String(text || '');
+  const turnId = liveThoughtTurnId(messageId, subagentRunId);
 
   if (subagentRunId) {
     const subagentBubble = ensureSubagentBubble(subagentRunId);
@@ -2742,16 +2964,7 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
       }
       let row = thoughtsBox.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
       if (!row) {
-        row = document.createElement('details');
-        row.className = 'thinking-thought';
-        row.open = !done;
-        row.dataset.reasoningId = key;
-        row.dataset.subagentRunId = subagentRunId;
-        const summary = document.createElement('summary');
-        const body = document.createElement('div');
-        body.className = 'thinking-thought-body';
-        row.appendChild(summary);
-        row.appendChild(body);
+        row = createLiveThoughtRow(key, subagentRunId, turnId);
         thoughtsBox.appendChild(row);
       }
       const summaryEl = row.querySelector('summary');
@@ -2766,21 +2979,22 @@ export function appendThinkingThought(reasoningId, text, done = false, subagentR
     return;
   }
 
-  const box = document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
+  // Stream view: the main agent's thoughts share one list with its tool
+  // lines, in the turn's order (the number the store keeps for the thought).
+  const streamList = liveStreamList();
+  const box = streamList || document.querySelector('#thinking-thoughts > .thinking-thoughts-list');
   if (!box) return;
   let row = box.querySelector(`.thinking-thought[data-reasoning-id="${CSS.escape(key)}"]`);
   if (!row) {
-    row = document.createElement('details');
-    row.className = 'thinking-thought';
-    row.open = !done;
-    row.dataset.reasoningId = key;
-    if (subagentRunId) row.dataset.subagentRunId = subagentRunId;
-    const summary = document.createElement('summary');
-    const body = document.createElement('div');
-    body.className = 'thinking-thought-body';
-    row.appendChild(summary);
-    row.appendChild(body);
+    row = createLiveThoughtRow(key, subagentRunId, turnId);
     box.appendChild(row);
+  }
+  if (streamList) {
+    const turnSeq = relayThoughts.get(String(messageId || thinkingMessageId || ''))?.get(key)?.turnSeq;
+    if (turnSeq != null && row.dataset.turnSeq !== String(turnSeq)) {
+      row.dataset.turnSeq = String(turnSeq);
+      placeByTurnSeq(streamList, row);
+    }
   }
   const summaryEl = row.querySelector('summary');
   const bodyEl = row.querySelector('.thinking-thought-body');
@@ -2796,7 +3010,7 @@ export function renderThinkingThoughts() {
   const thoughtMap = thinkingMessageId ? relayThoughts.get(thinkingMessageId) : null;
   if (!thoughtMap || !thoughtMap.size) return;
   for (const entry of thoughtMap.values()) {
-    appendThinkingThought(entry.reasoningId, entry.text, entry.done, entry.subagentRunId || null, false);
+    appendThinkingThought(entry.reasoningId, entry.text, entry.done, entry.subagentRunId || null, false, thinkingMessageId);
   }
 }
 
@@ -3736,8 +3950,12 @@ export function appendMessage(msg, scroll = true, msgId = null, force = false, i
     }
   }
   if (isNewNode && insertedNode) {
-    // A reply takes over the board its turn posted (relay-board-view).
-    if (msg?.role === 'assistant') renderRelayBoards();
+    // A reply takes over the board its turn posted (relay-board-view), and
+    // the 📓 stubs of its asks.
+    if (msg?.role === 'assistant') {
+      renderRelayBoards();
+      renderQuestionStubs();
+    }
     syncSeparatorsNow();
     if (scroll) scrollBottom();
   }
@@ -3771,6 +3989,8 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
     conversationId,
     hasMoreOlder: !!hasMoreOlder,
     hasMoreNewer: !!hasMoreNewer,
+    // The stream view lays the same payload out differently.
+    streamView: isStreamViewEnabled(),
     messages: (Array.isArray(messages) ? messages : []).map((item) => ({
       id: String(item?.id || '').trim(),
       role: String(item?.role || '').trim(),
@@ -3798,7 +4018,11 @@ function buildMessageSnapshotKey(messages = [], meta = {}) {
         done: !!thought?.done,
         timestamp: String(thought?.timestamp || '').trim(),
         subagentRunId: String(thought?.subagentRunId || '').trim(),
+        turnSeq: normalizeTurnSeq(thought?.turnSeq),
       })),
+      // The stream view orders by these: the count and the numbers.
+      activityOrder: (Array.isArray(item?.activities) ? item.activities : [])
+        .map((activity) => normalizeTurnSeq(activity?.turnSeq) ?? '-').join(','),
       // Cheap signature only — runs are immutable once persisted, so runId +
       // status is enough to catch a payload that differs only in its runs
       // (without one, such a payload would short-circuit and the card would
@@ -3910,9 +4134,41 @@ export function renderNoConversationState() {
   return true;
 }
 
+// The last payload renderMessages (or a window merge) was given: the
+// fallback for a change of layout when no window is kept (the shared view).
+let lastRenderMessagesArgs = null;
+
+/**
+ * The stream view was switched: the transcript's assistant bubbles and the
+ * live bubble take the other layout now. The messages are the kept window of
+ * the conversation on screen (conversation-payload-cache.mjs), which the live
+ * rows from the socket and every merge keep current; the last rendered
+ * payload only when there is none.
+ */
+export function refreshStreamViewLayout() {
+  const conversationId = String(currentConvId || '').trim();
+  const kept = conversationId ? conversationPayloadCache.peekWindow(conversationId) : null;
+  // In place: the reader keeps the text they are at.
+  if (kept?.messages?.length) {
+    const flags = { hasMoreOlder: kept.hasMoreOlder, hasMoreNewer: kept.hasMoreNewer };
+    renderMessagesInPlace(kept.messages, { conversationId, ...flags, pageInfo: windowPageInfo(kept.messages, flags) });
+  } else if (lastRenderMessagesArgs) {
+    const { msgs, meta } = lastRenderMessagesArgs;
+    renderMessagesInPlace(msgs, meta);
+  }
+  const messageId = thinkingMessageId;
+  if (messageId && document.getElementById('thinking-indicator')) {
+    takeThinkingBubbleOff();
+    showThinking(messageId, false);
+    renderThinkingActivities();
+    renderRestoredSubagentBubbles(messageId);
+  }
+}
+
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
   if (!el) return false;
+  lastRenderMessagesArgs = { msgs, meta };
   const ordered = sortConversationMessages(msgs || []);
   const snapshotKey = buildMessageSnapshotKey(ordered, meta);
   const statusViewMounted = !!el.querySelector('.status-view');
@@ -4437,6 +4693,7 @@ export function mergeMessagesIntoTranscript(previousMessages, msgs, meta = {}) {
   renderRelayQuestions();
   renderRelayBoards();
   lastRenderedMessageSnapshotKey = snapshotKey;
+  lastRenderMessagesArgs = { msgs, meta };
   return true;
 }
 

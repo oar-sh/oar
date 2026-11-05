@@ -56,6 +56,7 @@ ui.initSessionHistory({
   closeTmuxInspector: hide('tmux-inspector-modal'),
   closeAnnotateEditor: hide('image-annotate-modal'),
   closeRelayWatchPanel: unshow('relay-watch-panel'),
+  closeQuestionsPanel: unshow('questions-panel'),
   closeRelaySchedulePanel: unshow('relay-schedule-panel'),
   closeEmojiPicker: hide('emoji-popup'),
 });
@@ -139,7 +140,7 @@ test('one view opened from the other: back tells its closer the session history 
 
 test('overlays built on first use (the chip panels, a row\'s menu) are watched once they exist', async () => {
   const length = window.history.length;
-  for (const id of ['relay-watch-panel', 'relay-schedule-panel']) {
+  for (const id of ['relay-watch-panel', 'relay-schedule-panel', 'questions-panel']) {
     // Built hidden on <body>, as the chips' modules do, then opened.
     const panel = document.createElement('div');
     panel.id = id;

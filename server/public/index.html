@@ -671,8 +671,11 @@
   .header-icon-count:empty { display: none; }
   /* The display rule above outranks the UA [hidden] rule, same trap as the
      other [hidden] overrides in this file. */
+  #questions-btn[hidden],
   #pinned-messages-btn[hidden],
   #hidden-messages-btn[hidden] { display: none; }
+  /* 📓 with an urgent question waiting: the urgent count, in red. */
+  .header-icon-count.is-urgent { color: var(--danger); font-weight: 600; }
   /* Same trap: without this the ︙ trigger stays drawn as a dead button. */
   #chat-actions-menu-btn[hidden] { display: none; }
   #cli-dot {
@@ -885,6 +888,7 @@
     text-align: center;
   }
   .inbox-count:empty { display: none; }
+  .inbox-count.is-urgent { background: var(--danger); color: #fff; }
   body.inbox-view-active #input-area { display: none; }
   body.inbox-view-active #pending-question-banner { display: none; }
   .inbox-view { display: grid; gap: calc(7px * var(--ui-scale)); padding: calc(4px * var(--ui-scale)) 0 calc(12px * var(--ui-scale)); }
@@ -941,7 +945,11 @@
   .inbox-item-header { font-weight: 600; font-size: var(--fs-meta-sm); }
   .inbox-item-question, .inbox-item-recommendation { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .inbox-item-recommendation { color: var(--muted); font-size: var(--fs-meta-sm); }
-  .inbox-item-detail summary { cursor: pointer; color: var(--muted); font-size: var(--fs-meta-sm); }
+  /* A 28px tap row however small its text (the Inbox, 📓). */
+  .inbox-item-detail summary {
+    cursor: pointer; color: var(--muted); font-size: var(--fs-meta-sm);
+    min-height: calc(28px * var(--ui-scale)); line-height: calc(28px * var(--ui-scale)); width: fit-content;
+  }
   .inbox-item-detail-text {
     margin: calc(3px * var(--ui-scale)) 0 0;
     padding: calc(4px * var(--ui-scale)) calc(6px * var(--ui-scale));
@@ -989,8 +997,21 @@
   .inbox-recommended-tag { color: var(--accent); font-size: var(--fs-meta-xs); }
   .inbox-answer { border-color: var(--accent); color: var(--accent); }
   .inbox-dismiss { color: var(--muted); }
-  .inbox-view button:disabled, .relay-ask-container button:disabled { opacity: 0.5; cursor: wait; }
-  .relay-ask-container { max-width: calc(760px * var(--ui-scale)); }
+  .inbox-view button:disabled { opacity: 0.5; cursor: wait; }
+  /* 📓 An ask's one-line stub in the bubble of the turn that asked it (or
+     standing alone at the transcript's end); a tap opens 📓 at it. */
+  .msg-ask-stubs { display: grid; justify-items: start; gap: calc(2px * var(--ui-scale)); margin-top: calc(4px * var(--ui-scale)); }
+  .msg-ask-stub {
+    min-height: calc(28px * var(--ui-scale)); padding: calc(2px * var(--ui-scale)) calc(8px * var(--ui-scale));
+    border: 1px solid var(--border); border-radius: calc(8px * var(--ui-scale)); background: var(--bg2);
+    color: var(--text); font: inherit; font-size: var(--fs-meta-sm); text-align: left; cursor: pointer;
+    max-width: 100%; overflow-wrap: anywhere;
+  }
+  .msg-ask-stub:hover { border-color: var(--accent); }
+  .msg-ask-stub-urgent { color: var(--danger); font-weight: 600; }
+  .msg-ask-stub.is-closed { color: var(--muted); }
+  .relay-ask-stub-container { align-self: flex-start; max-width: 82%; }
+  .relay-ask-stub-container > .msg-ask-stubs { margin-top: 0; }
   /* The phone: one column, buttons the full width. */
   @media (max-width: 680px) {
     #inbox-btn { min-width: calc(64px * var(--ui-scale)); padding: calc(5px * var(--ui-scale)) calc(6px * var(--ui-scale)); }
@@ -1906,6 +1927,21 @@
   .settings-gap-md { margin-top: calc(5px * var(--ui-scale)); margin-bottom: 0; }
   .settings-gap-sm { margin-top: calc(4px * var(--ui-scale)); margin-bottom: 0; }
   .settings-gap-xs { margin-top: calc(3px * var(--ui-scale)); margin-bottom: 0; }
+  /* Settings → General in headed groups: a title row per section and a thin
+     rule above every section after the first. The first row under a title
+     drops its own gap; the title's margin already spaces it. */
+  .settings-section + .settings-section {
+    border-top: 1px solid var(--border);
+    margin-top: calc(10px * var(--ui-scale));
+  }
+  .settings-section-title {
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+    color: var(--muted);
+    margin: calc(14px * var(--ui-scale)) 0 calc(6px * var(--ui-scale));
+  }
+  .settings-section:first-child .settings-section-title { margin-top: 0; }
+  .settings-section-title + .settings-row { margin-top: 0; }
   /* A row inside a column block: the block's full width; the lead row (the
      provider's on/off toggle) keeps a small gap to the fields below. */
   .settings-row-full { width: 100%; }
@@ -2845,15 +2881,25 @@
     opacity: 0.92;
     font-size: var(--fs-meta-md);
   }
+  /* The browser's own disclosure marker, the glyph of the Thoughts panel
+     above the rows. */
   .thinking-thought > summary {
     cursor: pointer;
-    list-style: none;
+    display: list-item;
+    list-style: disclosure-closed inside;
     white-space: normal;
     overflow-wrap: anywhere;
     word-break: break-word;
   }
-  .thinking-thought > summary::-webkit-details-marker { display: none; }
-  .thinking-thought[open] > summary { display: none; }
+  /* Open, the summary stays as a one-line fold header so the reader can fold
+     the thought by hand ("Expand thoughts" opens them). */
+  .thinking-thought[open] > summary {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.75;
+    list-style-type: disclosure-open;
+  }
   .thinking-thought-body {
     margin: calc(4px * var(--ui-scale)) 0 calc(3px * var(--ui-scale)) calc(11px * var(--ui-scale));
     font-style: normal;
@@ -2887,6 +2933,36 @@
     gap: calc(3px * var(--ui-scale));
     min-width: 0;
   }
+  /* Stream view (turn-stream-view.mjs): a finished turn's thoughts, tool
+     lines and reply as one list in the order they happened; in the live
+     bubble, #thinking-stream-list holds the thoughts and tool lines. */
+  .msg-turn-stream,
+  .thinking-stream-list {
+    display: flex;
+    flex-direction: column;
+    gap: calc(4px * var(--ui-scale));
+    min-width: 0;
+  }
+  .thinking-stream-list { margin-bottom: calc(4px * var(--ui-scale)); font-size: var(--fs-meta-md); color: var(--muted); }
+  .thinking-stream-list:empty { display: none; }
+  .msg-stream-thought { min-width: 0; color: var(--muted); font-size: var(--fs-meta-sm); }
+  .msg-stream-thought > summary {
+    cursor: pointer;
+    font-style: italic;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .msg-stream-thought-body {
+    margin: calc(3px * var(--ui-scale)) 0 calc(2px * var(--ui-scale)) calc(11px * var(--ui-scale));
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg-stream-thought-body > :first-child { margin-top: 0; }
+  .msg-stream-thought-body > :last-child { margin-bottom: 0; }
+  .msg-stream-omitted { color: var(--muted); font-size: var(--fs-meta-sm); font-style: italic; }
+  .msg-stream-reply { min-width: 0; margin-top: calc(2px * var(--ui-scale)); }
+  .msg-stream-reply > :first-child { margin-top: 0; }
   .msg-thought-item {
     color: var(--muted);
     font-size: var(--fs-meta-sm);
@@ -3154,7 +3230,9 @@
     font-size: 0.85rem;
   }
   .ctx-thinking-group { display: inline-flex; gap: 0; }
-  .ctx-thinking-btn {
+  /* The 💭 Thoughts row (a setting of this browser) has the same look. */
+  .ctx-thinking-btn,
+  .ctx-thoughts-btn {
     font-size: 0.78rem;
     padding: calc(4px * var(--ui-scale)) calc(6px * var(--ui-scale));
     border: 1px solid var(--border);
@@ -3162,10 +3240,14 @@
     color: var(--muted);
     cursor: pointer;
   }
-  .ctx-thinking-btn:first-child { border-radius: calc(6px * var(--ui-scale)) 0 0 calc(6px * var(--ui-scale)); }
-  .ctx-thinking-btn:last-child { border-radius: 0 calc(6px * var(--ui-scale)) calc(6px * var(--ui-scale)) 0; }
-  .ctx-thinking-btn + .ctx-thinking-btn { border-left: none; }
-  .ctx-thinking-btn.is-active {
+  .ctx-thinking-btn:first-child,
+  .ctx-thoughts-btn:first-child { border-radius: calc(6px * var(--ui-scale)) 0 0 calc(6px * var(--ui-scale)); }
+  .ctx-thinking-btn:last-child,
+  .ctx-thoughts-btn:last-child { border-radius: 0 calc(6px * var(--ui-scale)) calc(6px * var(--ui-scale)) 0; }
+  .ctx-thinking-btn + .ctx-thinking-btn,
+  .ctx-thoughts-btn + .ctx-thoughts-btn { border-left: none; }
+  .ctx-thinking-btn.is-active,
+  .ctx-thoughts-btn.is-active {
     background: var(--accent);
     color: #fff;
     border-color: var(--accent);
@@ -4811,6 +4893,47 @@
   }
   #chat-title-relay-schedules[hidden] { display: none; }
   .relay-watch-panel[hidden] { display: none; }
+  /* 📓 Questions: the conversation's asks, dropped down under 📓 (or ︙),
+     placed by questions-panel-ui.js; on a phone a sheet under the header. */
+  .questions-panel {
+    position: fixed; top: 0; left: 0; z-index: 60; overflow-y: auto; overscroll-behavior: contain; box-sizing: border-box;
+    width: min(calc(420px * var(--ui-scale)), calc(100vw - calc(16px * var(--ui-scale))));
+    background: var(--bg2); border: 1px solid var(--border); border-radius: calc(8px * var(--ui-scale));
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25); padding: calc(4px * var(--ui-scale)) calc(6px * var(--ui-scale)) calc(6px * var(--ui-scale));
+    color: var(--text);
+  }
+  .questions-panel[hidden] { display: none; }
+  .questions-panel-head {
+    display: flex; align-items: center; justify-content: space-between; gap: calc(6px * var(--ui-scale));
+    font-size: var(--fs-meta-md); font-weight: 600; padding: 0 0 calc(4px * var(--ui-scale));
+  }
+  .questions-panel-close {
+    min-width: calc(28px * var(--ui-scale)); min-height: calc(28px * var(--ui-scale));
+    font: inherit; color: var(--muted); background: transparent; border: 1px solid var(--border);
+    border-radius: calc(6px * var(--ui-scale)); cursor: pointer;
+  }
+  .questions-panel-body { display: grid; gap: calc(6px * var(--ui-scale)); }
+  .questions-panel-empty { margin: 0; color: var(--muted); font-size: var(--fs-meta-sm); }
+  .questions-panel .inbox-item { background: var(--bg); }
+  .questions-panel .inbox-item.questions-card-focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .questions-panel button:disabled { opacity: 0.5; cursor: wait; }
+  #questions-panel-backdrop { display: none; }
+  /* A phone, upright or sideways: full width under the header over a dimmed
+     page; every button of a card half the width, one per row, left aligned,
+     so the right half stays free to scroll. */
+  .questions-panel.is-sheet {
+    left: calc(8px * var(--ui-scale)); right: calc(8px * var(--ui-scale)); width: auto; z-index: 1200;
+  }
+  #questions-panel-backdrop:not([hidden]) {
+    display: block; position: fixed; inset: 0; z-index: 1190; background: rgba(0, 0, 0, 0.42);
+  }
+  .questions-panel.is-sheet .inbox-item-options,
+  .questions-panel.is-sheet .inbox-item-actions { flex-direction: column; align-items: flex-start; }
+  .questions-panel.is-sheet .inbox-choice,
+  .questions-panel.is-sheet .inbox-answer,
+  .questions-panel.is-sheet .inbox-dismiss {
+    width: 50%; min-width: calc(140px * var(--ui-scale)); justify-content: flex-start;
+  }
   .relay-watch-chip {
     font: inherit; color: var(--accent); background: transparent; cursor: pointer;
     border: 1px solid var(--border); border-radius: calc(10px * var(--ui-scale)); padding: calc(2px * var(--ui-scale)) calc(5px * var(--ui-scale));
@@ -8070,6 +8193,7 @@
       </div>
       <button id="pending-question-banner" onclick="openPendingQuestionFromBanner()" title="Open pending question"></button>
       <div id="chat-header-actions">
+        <button id="questions-btn" class="header-icon-btn has-count" type="button" title="Questions" aria-label="Questions" aria-haspopup="dialog" aria-expanded="false" aria-controls="questions-panel" hidden>📓<span class="header-icon-count"></span></button>
         <button id="pinned-messages-btn" class="header-icon-btn has-count" type="button" title="Pinned messages" aria-label="Pinned messages" hidden>📍<span class="header-icon-count"></span></button>
         <button id="hidden-messages-btn" class="header-icon-btn has-count" type="button" title="Hidden from shared viewers" aria-label="Hidden from shared viewers" hidden>🙈<span class="header-icon-count"></span></button>
         <button id="message-search-btn" class="header-icon-btn" onclick="openMessageSearchModal()" title="Search messages" aria-label="Search messages">🔍</button>
@@ -8086,6 +8210,7 @@
             <button id="chat-menu-schedules" class="chat-actions-menu-item chat-menu-meta-chip" type="button" role="menuitem" hidden>⏰ Schedules…</button>
             <button id="chat-menu-origin" class="chat-actions-menu-item chat-menu-meta-chip" type="button" role="menuitem" hidden>↗ Started by an agent</button>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
+            <button id="chat-menu-questions" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>📓 Questions</button>
             <button id="chat-menu-pins" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>📍 Pinned messages</button>
             <button id="chat-menu-hidden" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>🙈 Hidden from shared viewers</button>
             <button id="chat-menu-search" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>🔍 Search messages</button>
@@ -8387,215 +8512,267 @@
         aria-labelledby="settings-tab-general"
         data-settings-panel="general"
       >
-        <div class="settings-row">
-          <label for="theme-select">Theme</label>
-          <select id="theme-select" onchange="updateTheme(this.value)">
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-          </select>
-        </div>
-        <div class="settings-row" style="margin-bottom: 0;">
-          <label for="font-scale-select">Text scaling</label>
-          <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
-        </div>
-        <div class="settings-row settings-gap">
-          <label for="show-suspend-host-toggle">Show Suspend host action</label>
-          <input
-            id="show-suspend-host-toggle"
-            type="checkbox"
-            onchange="updateShowSuspendHostSetting(this.checked)"
-            aria-label="Show Suspend host action"
-            checked
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">Shows or hides the menu action in this browser only. Suspend works only when the relay runs on Windows; a queued suspend still shows its banner here either way.</div>
-        <div class="settings-row settings-gap">
-          <label for="scroll-on-send-toggle">Jump to the end when I send a message</label>
-          <input
-            id="scroll-on-send-toggle"
-            type="checkbox"
-            onchange="updateScrollOnSendSetting(this.checked)"
-            aria-label="Jump to the end when I send a message"
-            checked
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">A conversation only scrolls by itself while you are at its end. Anywhere else it stays where you are reading, and the round button above the composer shows that something new or a question is waiting below. Your own message is the exception: sending one takes you to the end. Switch this off to stay put then too. Saved in this browser.</div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="conversation-window-retention-slider">Messages kept per conversation for switching back <span id="conversation-window-retention-value">200 messages</span></label>
-          <input
-            id="conversation-window-retention-slider"
-            type="range"
-            min="100"
-            max="1100"
-            step="100"
-            value="200"
-            aria-label="Messages kept per conversation for switching back"
-            aria-valuetext="200 messages"
-            oninput="previewConversationWindowRetention(this.value)"
-            onchange="updateConversationWindowRetention(this.value)"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">A conversation you switch away from and back to opens where you were reading, with the older messages you had loaded. This many are kept around that place for each of the last eight conversations; No limit keeps them all, at the cost of memory. Saved in this browser.</div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
-          <input
-            id="turn-ceiling-slider"
-            type="range"
-            min="0"
-            max="600"
-            step="5"
-            value="60"
-            aria-label="Maximum turn duration in minutes"
-            oninput="previewTurnCeilingSetting(this.value)"
-            onchange="updateTurnCeilingSetting(this.value)"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">A hard cap on how long one turn may run before the relay requeues it, counted from the start of the turn or from your last answer to one of its questions. Turns are already kept alive by worker heartbeats, and the relay never cuts off a turn waiting on your answer to a question — so this only catches a worker that has hung. Grok also enforces the limit itself, counted from the start of the prompt and without pausing for questions (remote relay approvals). Set to 0 for no limit.</div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">4 h</span></label>
-          <input
-            id="background-task-timeout-slider"
-            type="range"
-            min="0"
-            max="600"
-            step="5"
-            value="240"
-            aria-label="Background task timeout in minutes"
-            oninput="previewBackgroundTaskTimeoutSetting(this.value)"
-            onchange="updateBackgroundTaskTimeoutSetting(this.value)"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot's SDK engine. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel.</div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="task-stall-minutes-slider">Mark a background task as quiet after <span id="task-stall-minutes-value">10 min</span></label>
-          <input
-            id="task-stall-minutes-slider"
-            type="range"
-            min="1"
-            max="120"
-            step="1"
-            value="10"
-            aria-label="Minutes without output before a background task is marked as quiet"
-            oninput="previewTaskStallMinutesSetting(this.value)"
-            onchange="updateTaskStallMinutesSetting(this.value)"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">A shell or Monitor task that has written no output for this long gets an amber "no output for N min" note in the composer panel and its console.</div>
-        <div class="settings-row settings-gap">
-          <label for="restart-resume-toggle">After a relay restart, tell interrupted sessions to carry on</label>
-          <input
-            id="restart-resume-toggle"
-            type="checkbox"
-            onchange="updateRestartResumeSettingFromToggle(this.checked)"
-            aria-label="After a relay restart, tell interrupted sessions to carry on"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">Most turns a restart interrupts run again by themselves. A turn that cannot (the agent had already taken the message, or had started on its own after a background task) just stops. With this on, such a session gets one relay note once the relay is back, saying when it restarted and asking the agent to check what it was doing and carry on. Your message is never sent again; idle, archived and usage-limit-paused sessions get nothing. Off by default; a setting of this relay.</div>
-        <div class="settings-row settings-gap">
-          <label for="relay-restart-max-wait-select">Ask after a queued relay restart has waited</label>
-          <select id="relay-restart-max-wait-select" onchange="updateRelayRestartMaxWaitSetting(this.value)" aria-label="Ask after a queued relay restart has waited">
-            <option value="5">5 min</option>
-            <option value="10">10 min</option>
-            <option value="15">15 min</option>
-            <option value="30" selected>30 min</option>
-            <option value="60">1 h</option>
-            <option value="120">2 h</option>
-            <option value="240">4 h</option>
-            <option value="0">No limit</option>
-          </select>
-        </div>
-        <div class="settings-help settings-gap-xs">A queued relay restart waits for the running turns, and new messages wait for the restart. After this long the banner asks whether to restart now, keep waiting or cancel; it never restarts while the turns run, and still restarts as soon as they end. No limit waits until the turns end.</div>
-        <div class="settings-row settings-gap">
-          <label for="subagent-record-retention-select">Keep sub-agent tool output</label>
-          <select id="subagent-record-retention-select" onchange="updateSubagentRecordRetentionSetting(this.value)" aria-label="Keep sub-agent tool output">
-            <option value="7">7 days</option>
-            <option value="14">14 days</option>
-            <option value="30">30 days</option>
-            <option value="90" selected>90 days</option>
-            <option value="0">Always</option>
-          </select>
-        </div>
-        <div class="settings-help settings-gap-xs">A sub-agent's record keeps every tool call's full input and the first 4 KB of each result. After this many days the relay removes them from finished agents, once a day; the thoughts, the reply, notes and the one-line summary of each call stay. Always keeps everything.</div>
-        <div id="windows-autostart-setting" hidden>
+        <section class="settings-section" id="settings-section-appearance" aria-labelledby="settings-section-appearance-title">
+          <h3 class="settings-section-title" id="settings-section-appearance-title">Appearance</h3>
+          <div class="settings-row">
+            <label for="theme-select">Theme</label>
+            <select id="theme-select" onchange="updateTheme(this.value)">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </div>
+          <div class="settings-row" style="margin-bottom: 0;">
+            <label for="font-scale-select">Text scaling</label>
+            <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
+          </div>
+          <div class="settings-row settings-gap">
+            <label for="thoughts-expanded-toggle">Expand thoughts while an agent works</label>
+            <input
+              id="thoughts-expanded-toggle"
+              type="checkbox"
+              onchange="updateThoughtsExpandedSetting(this.checked)"
+              aria-label="Expand thoughts while an agent works"
+              checked
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Open thoughts in the live turn, in sub-agent bubbles and in the sub-agent viewer. Saved in this browser.</div>
           <div class="settings-row settings-row-column settings-gap">
-            <label>Autostart (Windows)</label>
-            <div role="radiogroup" aria-label="Windows autostart mode" class="settings-radio-stack">
-              <label style="font-weight: normal;">
-                <input type="radio" name="windows-autostart-mode" value="off" onchange="updateWindowsAutostartMode('off')"> Off
-              </label>
-              <label style="font-weight: normal;">
-                <input type="radio" name="windows-autostart-mode" value="signin" onchange="updateWindowsAutostartMode('signin')"> At sign-in — visible terminal after you log on
-              </label>
-              <label style="font-weight: normal;">
-                <input type="radio" name="windows-autostart-mode" value="boot" onchange="updateWindowsAutostartMode('boot')"> At system startup — headless, no logon needed
-              </label>
+            <label for="live-activity-cap-slider">Tool lines shown while an agent works <span id="live-activity-cap-value">50 lines</span></label>
+            <input
+              id="live-activity-cap-slider"
+              type="range"
+              min="10"
+              max="510"
+              step="10"
+              value="50"
+              aria-label="Tool lines shown while an agent works"
+              aria-valuetext="50 lines"
+              oninput="previewLiveActivityCap(this.value)"
+              onchange="updateLiveActivityCap(this.value)"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Per agent: the main agent and each sub-agent keep this many of their newest tool lines in the live bubble. The relay keeps up to 500 per agent. Saved in this browser.</div>
+          <div class="settings-row settings-gap">
+            <label for="stream-view-toggle">Stream view: thoughts, tool calls and the reply in order</label>
+            <input
+              id="stream-view-toggle"
+              type="checkbox"
+              onchange="updateStreamViewSetting(this.checked)"
+              aria-label="Stream view: thoughts, tool calls and the reply in order"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Turns recorded before this version keep the grouped layout. Saved in this browser.</div>
+          <div class="settings-row settings-gap">
+            <label for="show-suspend-host-toggle">Show Suspend host action</label>
+            <input
+              id="show-suspend-host-toggle"
+              type="checkbox"
+              onchange="updateShowSuspendHostSetting(this.checked)"
+              aria-label="Show Suspend host action"
+              checked
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Shows or hides the menu action in this browser only. Suspend works only when the relay runs on Windows; a queued suspend still shows its banner here either way.</div>
+        </section>
+        <section class="settings-section" id="settings-section-reading" aria-labelledby="settings-section-reading-title">
+          <h3 class="settings-section-title" id="settings-section-reading-title">Reading</h3>
+          <div class="settings-row settings-gap">
+            <label for="scroll-on-send-toggle">Jump to the end when I send a message</label>
+            <input
+              id="scroll-on-send-toggle"
+              type="checkbox"
+              onchange="updateScrollOnSendSetting(this.checked)"
+              aria-label="Jump to the end when I send a message"
+              checked
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">A conversation only scrolls by itself while you are at its end. Anywhere else it stays where you are reading, and the round button above the composer shows that something new or a question is waiting below. Your own message is the exception: sending one takes you to the end. Switch this off to stay put then too. Saved in this browser.</div>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="conversation-window-retention-slider">Messages kept per conversation for switching back <span id="conversation-window-retention-value">200 messages</span></label>
+            <input
+              id="conversation-window-retention-slider"
+              type="range"
+              min="100"
+              max="1100"
+              step="100"
+              value="200"
+              aria-label="Messages kept per conversation for switching back"
+              aria-valuetext="200 messages"
+              oninput="previewConversationWindowRetention(this.value)"
+              onchange="updateConversationWindowRetention(this.value)"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">A conversation you switch away from and back to opens where you were reading, with the older messages you had loaded. This many are kept around that place for each of the last eight conversations; No limit keeps them all, at the cost of memory. Saved in this browser.</div>
+        </section>
+        <section class="settings-section" id="settings-section-turns" aria-labelledby="settings-section-turns-title">
+          <h3 class="settings-section-title" id="settings-section-turns-title">Turns and tasks</h3>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="turn-ceiling-slider">Max turn duration <span id="turn-ceiling-value">No limit</span></label>
+            <input
+              id="turn-ceiling-slider"
+              type="range"
+              min="0"
+              max="600"
+              step="5"
+              value="60"
+              aria-label="Maximum turn duration in minutes"
+              oninput="previewTurnCeilingSetting(this.value)"
+              onchange="updateTurnCeilingSetting(this.value)"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">A hard cap on how long one turn may run before the relay requeues it, counted from the start of the turn or from your last answer to one of its questions. Turns are already kept alive by worker heartbeats, and the relay never cuts off a turn waiting on your answer to a question — so this only catches a worker that has hung. Grok also enforces the limit itself, counted from the start of the prompt and without pausing for questions (remote relay approvals). Set to 0 for no limit. A setting of this relay.</div>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="background-task-timeout-slider">Background task timeout <span id="background-task-timeout-value">4 h</span></label>
+            <input
+              id="background-task-timeout-slider"
+              type="range"
+              min="0"
+              max="600"
+              step="5"
+              value="240"
+              aria-label="Background task timeout in minutes"
+              oninput="previewBackgroundTaskTimeoutSetting(this.value)"
+              onchange="updateBackgroundTaskTimeoutSetting(this.value)"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot's SDK engine. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel. A setting of this relay.</div>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="task-stall-minutes-slider">Mark a background task as quiet after <span id="task-stall-minutes-value">10 min</span></label>
+            <input
+              id="task-stall-minutes-slider"
+              type="range"
+              min="1"
+              max="120"
+              step="1"
+              value="10"
+              aria-label="Minutes without output before a background task is marked as quiet"
+              oninput="previewTaskStallMinutesSetting(this.value)"
+              onchange="updateTaskStallMinutesSetting(this.value)"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">A shell or Monitor task that has written no output for this long gets an amber "no output for N min" note in the composer panel and its console. A setting of this relay.</div>
+          <div class="settings-row settings-gap">
+            <label for="subagent-record-retention-select">Keep sub-agent tool output</label>
+            <select id="subagent-record-retention-select" onchange="updateSubagentRecordRetentionSetting(this.value)" aria-label="Keep sub-agent tool output">
+              <option value="7">7 days</option>
+              <option value="14">14 days</option>
+              <option value="30">30 days</option>
+              <option value="90" selected>90 days</option>
+              <option value="0">Always</option>
+            </select>
+          </div>
+          <div class="settings-help settings-gap-xs">A sub-agent's record keeps every tool call's full input and the first 4 KB of each result. After this many days the relay removes them from finished agents, once a day; the thoughts, the reply, notes and the one-line summary of each call stay. Always keeps everything. A setting of this relay.</div>
+        </section>
+        <section class="settings-section" id="settings-section-relay" aria-labelledby="settings-section-relay-title">
+          <h3 class="settings-section-title" id="settings-section-relay-title">This relay</h3>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="pwa-app-name-input">Relay name</label>
+            <input
+              id="pwa-app-name-input"
+              type="text"
+              maxlength="60"
+              placeholder="OAR"
+              aria-label="Relay name"
+              onchange="updatePwaAppName(this.value)"
+            >
+            <div class="settings-help">Shown to other relays and used as the installed app's name. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name. A setting of this relay.</div>
+          </div>
+          <div class="settings-row settings-gap">
+            <label for="restart-resume-toggle">After a relay restart, tell interrupted sessions to carry on</label>
+            <input
+              id="restart-resume-toggle"
+              type="checkbox"
+              onchange="updateRestartResumeSettingFromToggle(this.checked)"
+              aria-label="After a relay restart, tell interrupted sessions to carry on"
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Most turns a restart interrupts run again by themselves. A turn that cannot (the agent had already taken the message, or had started on its own after a background task) just stops. With this on, such a session gets one relay note once the relay is back, saying when it restarted and asking the agent to check what it was doing and carry on. Your message is never sent again; idle, archived and usage-limit-paused sessions get nothing. Off by default; a setting of this relay.</div>
+          <div class="settings-row settings-gap">
+            <label for="relay-restart-max-wait-select">Ask after a queued relay restart has waited</label>
+            <select id="relay-restart-max-wait-select" onchange="updateRelayRestartMaxWaitSetting(this.value)" aria-label="Ask after a queued relay restart has waited">
+              <option value="5">5 min</option>
+              <option value="10">10 min</option>
+              <option value="15">15 min</option>
+              <option value="30" selected>30 min</option>
+              <option value="60">1 h</option>
+              <option value="120">2 h</option>
+              <option value="240">4 h</option>
+              <option value="0">No limit</option>
+            </select>
+          </div>
+          <div class="settings-help settings-gap-xs">A queued relay restart waits for the running turns, and new messages wait for the restart. After this long the banner asks whether to restart now, keep waiting or cancel; it never restarts while the turns run, and still restarts as soon as they end. No limit waits until the turns end. A setting of this relay.</div>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
+            <input
+              id="default-session-workspace-root-input"
+              type="text"
+              placeholder="Leave empty to use relay workspace root"
+              aria-label="Default CWD for new sessions"
+              onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
+            >
+            <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root. A setting of this relay.</div>
+          </div>
+          <div id="windows-autostart-setting" hidden>
+            <div class="settings-row settings-row-column settings-gap">
+              <label>Autostart (Windows)</label>
+              <div role="radiogroup" aria-label="Windows autostart mode" class="settings-radio-stack">
+                <label style="font-weight: normal;">
+                  <input type="radio" name="windows-autostart-mode" value="off" onchange="updateWindowsAutostartMode('off')"> Off
+                </label>
+                <label style="font-weight: normal;">
+                  <input type="radio" name="windows-autostart-mode" value="signin" onchange="updateWindowsAutostartMode('signin')"> At sign-in — visible terminal after you log on
+                </label>
+                <label style="font-weight: normal;">
+                  <input type="radio" name="windows-autostart-mode" value="boot" onchange="updateWindowsAutostartMode('boot')"> At system startup — headless, no logon needed
+                </label>
+              </div>
+            </div>
+            <div class="settings-help settings-gap-xs">System startup runs the relay as your user via a scheduled task (no password stored), reachable ~60&nbsp;s after boot before anyone signs in. Switching modes asks for one admin confirmation on the PC itself. The task's identity has no network-share credentials — local files and the tunnel are unaffected.</div>
+            <div id="windows-autostart-status" class="settings-help settings-gap-xs" hidden></div>
+            <div id="windows-autostart-manual" class="settings-help settings-gap-xs" hidden>
+              Run this from an elevated PowerShell instead:
+              <code id="windows-autostart-manual-command" style="display: block; margin-top: calc(4px * var(--ui-scale)); user-select: all;"></code>
             </div>
           </div>
-          <div class="settings-help settings-gap-xs">System startup runs the relay as your user via a scheduled task (no password stored), reachable ~60&nbsp;s after boot before anyone signs in. Switching modes asks for one admin confirmation on the PC itself. The task's identity has no network-share credentials — local files and the tunnel are unaffected.</div>
-          <div id="windows-autostart-status" class="settings-help settings-gap-xs" hidden></div>
-          <div id="windows-autostart-manual" class="settings-help settings-gap-xs" hidden>
-            Run this from an elevated PowerShell instead:
-            <code id="windows-autostart-manual-command" style="display: block; margin-top: calc(4px * var(--ui-scale)); user-select: all;"></code>
+        </section>
+        <section class="settings-section" id="settings-section-updates" aria-labelledby="settings-section-updates-title">
+          <h3 class="settings-section-title" id="settings-section-updates-title">Updates</h3>
+          <div class="settings-row settings-gap">
+            <label for="update-auto-check-toggle">Check for updates automatically</label>
+            <input
+              id="update-auto-check-toggle"
+              type="checkbox"
+              onchange="updateAutoCheckSetting(this.checked)"
+              aria-label="Check for updates automatically"
+            >
           </div>
-        </div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="pwa-app-name-input">Relay name</label>
-          <input
-            id="pwa-app-name-input"
-            type="text"
-            maxlength="60"
-            placeholder="OAR"
-            aria-label="Relay name"
-            onchange="updatePwaAppName(this.value)"
-          >
-          <div class="settings-help">Shown to other relays and used as the installed app's name. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name.</div>
-        </div>
-        <div class="settings-row settings-gap">
-          <label for="update-auto-check-toggle">Check for updates automatically</label>
-          <input
-            id="update-auto-check-toggle"
-            type="checkbox"
-            onchange="updateAutoCheckSetting(this.checked)"
-            aria-label="Check for updates automatically"
-          >
-        </div>
-        <div class="settings-help settings-gap-xs">Off by default — OAR sends no traffic anywhere unless you opt in. When enabled, the relay asks oar.sh for the latest version about twice a day. Manual checks below work regardless.</div>
-        <div id="update-check-killed-help" class="settings-help settings-gap-xs" hidden>Update checks are disabled by OAR_NO_UPDATE_CHECK in this relay's environment.</div>
-        <div class="settings-row settings-gap-xs">
-          <button id="update-check-now-btn" class="chat-title-action-btn" type="button" onclick="checkForUpdatesNow()">Check for updates</button>
-          <span id="update-last-checked" class="settings-help"></span>
-        </div>
-        <div id="update-available-card" class="settings-help settings-gap-xs" hidden>
-          <span id="update-available-text"></span>
-          <a id="update-notes-link" target="_blank" rel="noopener" hidden>release notes</a>
+          <div class="settings-help settings-gap-xs">Off by default — OAR sends no traffic anywhere unless you opt in. When enabled, the relay asks oar.sh for the latest version about twice a day. Manual checks below work regardless. A setting of this relay.</div>
+          <div id="update-check-killed-help" class="settings-help settings-gap-xs" hidden>Update checks are disabled by OAR_NO_UPDATE_CHECK in this relay's environment.</div>
           <div class="settings-row settings-gap-xs">
-            <button id="update-apply-btn" class="chat-title-action-btn" type="button" onclick="applyAvailableUpdate()">Update</button>
-            <button id="update-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissAvailableUpdate()">Dismiss</button>
+            <button id="update-check-now-btn" class="chat-title-action-btn" type="button" onclick="checkForUpdatesNow()">Check for updates</button>
+            <span id="update-last-checked" class="settings-help"></span>
           </div>
-          <div id="update-git-hint" class="settings-gap-sm" hidden>This relay runs from a git checkout — pull and restart to update.</div>
-        </div>
-        <div id="update-install-status" class="settings-help settings-gap-xs" hidden></div>
-        <button id="update-cancel-btn" class="chat-title-action-btn settings-gap-sm" type="button" onclick="cancelRunningUpdate()" hidden>Cancel update</button>
-        <details id="update-install-log" class="cli-install-log" hidden>
-          <summary>Update log</summary>
-          <pre id="update-install-log-pre"></pre>
-        </details>
-        <div id="update-outcome" class="settings-help settings-gap-xs" hidden>
-          <span id="update-outcome-text"></span>
-          <pre id="update-outcome-log" hidden></pre>
-          <button id="update-outcome-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissUpdateOutcome()">Dismiss</button>
-        </div>
-        <div class="settings-row settings-row-column settings-gap">
-          <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
-          <input
-            id="default-session-workspace-root-input"
-            type="text"
-            placeholder="Leave empty to use relay workspace root"
-            aria-label="Default CWD for new sessions"
-            onchange="updateDefaultSessionWorkspaceRootSetting(this.value)"
-          >
-          <div class="settings-help">Applies to newly created sessions. Leave blank to fallback to the relay workspace root.</div>
-        </div>
+          <div id="update-available-card" class="settings-help settings-gap-xs" hidden>
+            <span id="update-available-text"></span>
+            <a id="update-notes-link" target="_blank" rel="noopener" hidden>release notes</a>
+            <div class="settings-row settings-gap-xs">
+              <button id="update-apply-btn" class="chat-title-action-btn" type="button" onclick="applyAvailableUpdate()">Update</button>
+              <button id="update-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissAvailableUpdate()">Dismiss</button>
+            </div>
+            <div id="update-git-hint" class="settings-gap-sm" hidden>This relay runs from a git checkout — pull and restart to update.</div>
+          </div>
+          <div id="update-install-status" class="settings-help settings-gap-xs" hidden></div>
+          <button id="update-cancel-btn" class="chat-title-action-btn settings-gap-sm" type="button" onclick="cancelRunningUpdate()" hidden>Cancel update</button>
+          <details id="update-install-log" class="cli-install-log" hidden>
+            <summary>Update log</summary>
+            <pre id="update-install-log-pre"></pre>
+          </details>
+          <div id="update-outcome" class="settings-help settings-gap-xs" hidden>
+            <span id="update-outcome-text"></span>
+            <pre id="update-outcome-log" hidden></pre>
+            <button id="update-outcome-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissUpdateOutcome()">Dismiss</button>
+          </div>
+        </section>
       </div>
       <div
         id="settings-panel-providers"

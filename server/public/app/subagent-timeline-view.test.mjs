@@ -56,10 +56,43 @@ test('a tool result says its size, its cut and whether it failed, folded', () =>
   assert.doesNotMatch(html, /<details class="sav-fold" open>/);
 });
 
-test('a thought is folded once done and open while it streams', () => {
-  assert.doesNotMatch(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done thinking', done: true }), /<details class="sav-fold" open>/);
-  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Still', done: false }), /<details class="sav-fold" open>/);
-  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done', done: true }, { openDetails: true }), /<details class="sav-fold" open>/);
+test('a streaming thought follows the setting (on → open, off → closed)', () => {
+  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Still', done: false }, { thoughtsExpanded: true }), /<details class="sav-fold" open>/);
+  assert.doesNotMatch(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Still', done: false }, { thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+});
+
+test('a hand-opened streaming thought stays open across chunk re-renders with the setting off', () => {
+  // The viewer re-renders an open entry on every chunk with its fold map.
+  const folds = new Map([[1, 'open']]);
+  for (const text of ['Still', 'Still thinking', 'Still thinking about the widget cache']) {
+    assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text, done: false }, { openDetails: folds, thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+  }
+  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done thinking.', done: true }, { openDetails: folds, thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+});
+
+test('a done thought follows the "Expand thoughts" setting', () => {
+  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done thinking', done: true }, { thoughtsExpanded: true }), /<details class="sav-fold" open>/);
+  assert.doesNotMatch(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done thinking', done: true }, { thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+  // Without the option it reads the browser's setting: on when never set.
+  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done thinking', done: true }), /<details class="sav-fold" open>/);
+});
+
+test('the reader\'s own fold wins over the setting and over streaming', () => {
+  const folds = new Map([[1, 'open'], [2, 'folded']]);
+  assert.match(timelineEntryHtml({ seq: 1, kind: 'thought', text: 'Done', done: true }, { openDetails: folds, thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+  assert.doesNotMatch(timelineEntryHtml({ seq: 2, kind: 'thought', text: 'Done', done: true }, { openDetails: folds, thoughtsExpanded: true }), /<details class="sav-fold" open>/);
+  assert.doesNotMatch(timelineEntryHtml({ seq: 2, kind: 'thought', text: 'Still', done: false }, { openDetails: folds }), /<details class="sav-fold" open>/);
+  // A function from seq to a choice works too, and `true` still means open.
+  assert.doesNotMatch(timelineEntryHtml({ seq: 3, kind: 'thought', text: 'Done', done: true }, { openDetails: () => 'folded', thoughtsExpanded: true }), /<details class="sav-fold" open>/);
+  assert.match(timelineEntryHtml({ seq: 3, kind: 'thought', text: 'Done', done: true }, { openDetails: true, thoughtsExpanded: false }), /<details class="sav-fold" open>/);
+});
+
+test('a tool fold opens only on the reader\'s choice, never by the thoughts setting', () => {
+  const text = JSON.stringify({ command: 'ls -la', description: 'List the fixture folder', timeout: 5 });
+  const entry = { seq: 4, kind: 'tool_call', toolName: 'Bash', text };
+  assert.doesNotMatch(timelineEntryHtml(entry, { thoughtsExpanded: true }), /<details class="sav-fold" open>/);
+  assert.match(timelineEntryHtml(entry, { openDetails: new Map([[4, 'open']]) }), /<details class="sav-fold" open>/);
+  assert.doesNotMatch(timelineEntryHtml(entry, { openDetails: new Map([[4, 'folded']]) }), /<details class="sav-fold" open>/);
 });
 
 test('reply text goes through the markdown renderer, escaped by default', () => {

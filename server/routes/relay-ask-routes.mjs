@@ -151,6 +151,16 @@ export function inboxItemOfPlanBoard(board, session, { forRemote = false } = {})
   };
 }
 
+/**
+ * An ask as a paired relay gets it: without `queueId`, the queue row of the
+ * turn that asked here, which means nothing there.
+ */
+export function askForPairedRelay(ask) {
+  if (!ask || typeof ask !== 'object') return ask;
+  const { queueId, ...rest } = ask;
+  return rest;
+}
+
 /** One Inbox item of an ask (relay-ask-service.mjs shape). */
 export function inboxItemOfAsk(ask) {
   const {
@@ -322,7 +332,7 @@ export function registerRelayAskRoutes(app, deps) {
     if (!relayAskService?.isAvailable?.()) return res.json({ available: false, asks: [], pending: 0 });
     const conversationId = toText(req.query.conversationId);
     const asks = conversationId
-      ? relayAskService.listOf(conversationId).filter((ask) => !ask.relayId && ask.conversationId === conversationId)
+      ? relayAskService.listIn(conversationId).filter((ask) => !ask.relayId && ask.conversationId === conversationId)
       : relayAskService.listHere();
     res.json({ available: true, asks, pending: relayAskService.pendingCount() });
   });
@@ -411,7 +421,7 @@ export function registerRelayAskRoutes(app, deps) {
         detail: body.detail,
         urgency: body.urgency,
       });
-      res.json({ ok: true, ask });
+      res.json({ ok: true, ask: askForPairedRelay(ask) });
     } catch (error) {
       sendRelayAskError(res, error, 'The ask');
     }
@@ -433,7 +443,7 @@ export function registerRelayAskRoutes(app, deps) {
     const caller = admitPairedRelay(req, res);
     if (!caller || !available(res)) return;
     try {
-      res.json({ ok: true, ask: relayAskService.withdraw(toText(asObject(req.body).id), { byRelayId: caller.relayId }) });
+      res.json({ ok: true, ask: askForPairedRelay(relayAskService.withdraw(toText(asObject(req.body).id), { byRelayId: caller.relayId })) });
     } catch (error) {
       sendRelayAskError(res, error, 'The withdrawal');
     }
@@ -447,7 +457,7 @@ export function registerRelayAskRoutes(app, deps) {
     const caller = admitPairedRelay(req, res, body.via);
     if (!caller || !available(res)) return;
     try {
-      res.json({ ok: true, ask: relayAskService.answer(toText(body.id), { answer: String(body.answer ?? ''), choice: String(body.choice ?? ''), via: caller.name }) });
+      res.json({ ok: true, ask: askForPairedRelay(relayAskService.answer(toText(body.id), { answer: String(body.answer ?? ''), choice: String(body.choice ?? ''), via: caller.name })) });
     } catch (error) {
       sendRelayAskError(res, error, 'The answer');
     }
@@ -458,7 +468,7 @@ export function registerRelayAskRoutes(app, deps) {
     const caller = admitPairedRelay(req, res, body.via);
     if (!caller || !available(res)) return;
     try {
-      res.json({ ok: true, ask: relayAskService.dismiss(toText(body.id), { via: caller.name }) });
+      res.json({ ok: true, ask: askForPairedRelay(relayAskService.dismiss(toText(body.id), { via: caller.name })) });
     } catch (error) {
       sendRelayAskError(res, error, 'The dismissal');
     }

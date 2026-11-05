@@ -12,6 +12,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { createWorkerKeepalive } from '../../shared/worker-runtime/worker-keepalive.mjs';
 import { resolveBuildId } from '../../shared/build-id.mjs';
 import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
@@ -113,13 +114,19 @@ async function main() {
     getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
     onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
     onAnswered: () => turnRunner.flushKeptTaskSettles(),
+    getKeptPostCount: () => turnRunner.keptTaskSettleCount?.() || 0,
     // No steering here; the snapshot tells the relay when it may replace
     // this worker: no turn, and no open terminal (they end with the worker).
     getSteeringState: () => buildGrokSteeringState(turnRunner),
   });
 
+  // One timer for the heartbeat and the socket's readiness refresh: 10 s
+  // while working, 30 s while idle on a relay that allows it.
+  let keepalive = null;
   const wsLink = createWorkerWebSocketLink({
     serverUrl,
+    readyRefreshMs: 0,
+    onRelayFrame: () => keepalive?.nudge(),
     token,
     dbg,
     buildId,
@@ -154,10 +161,12 @@ async function main() {
       dbg('unknown worker control ignored', type || '(none)');
     },
   });
+  keepalive = createWorkerKeepalive({ heartbeat, link: wsLink, busyMs: HEARTBEAT_MS });
 
   const shutdown = async (signal) => {
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
+    try { keepalive.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
     try { taskPublisher.close(); } catch {}
@@ -183,7 +192,7 @@ async function main() {
   });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'} build=${buildId || 'unknown'}`);
-  heartbeat.startHeartbeat();
+  keepalive.start();
   wsLink.start();
 }
 

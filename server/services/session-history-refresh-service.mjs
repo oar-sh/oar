@@ -367,6 +367,9 @@ export function createSessionHistoryRefreshService({
           timestamp,
           activity.subagentRunId,
           activity.metadata ? JSON.stringify(activity.metadata) : null,
+          // turn_seq: an imported turn has no order of its own; it keeps the
+          // grouped layout.
+          null,
         );
       }
       const thoughts = ensureArray(message?.thoughts)
@@ -386,6 +389,7 @@ export function createSessionHistoryRefreshService({
           thought.done ? 1 : 0,
           timestamp,
           thought.subagentRunId,
+          null, // turn_seq, as for the activity rows above
         );
       }
     }

@@ -36,6 +36,7 @@ import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
 import { createMessageRepository } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
+import { mapRelayActivityRow, mapRelayThoughtRow, sanitizeActivityText } from './repositories/relay-turn-rows.mjs';
 import { createImageConversationRepository } from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
 import { buildDequeuedRelayMessage, claudeApiRemedyText, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
@@ -233,6 +234,9 @@ import {
 import { createRestartPictureCollector, detectRelayHosting } from './services/relay-restart-picture.mjs';
 import { createWorkerScope } from './services/worker-scope.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
+import { createArmableInterval, createCliPresence } from './services/idle-timers.mjs';
+import { installQueueWakeHook } from './services/queue-wake-hook.mjs';
+import { createPendingWorkerPrimer, createQueueWaker } from './services/queue-waker.mjs';
 import { createStaleTurnRecovery } from './services/stale-turn-recovery.mjs';
 import {
   STALE_SUBAGENT_RUN_BOOT_DELAY_MS,
@@ -270,7 +274,11 @@ import {
   readTaskStallMinutesSetting,
 } from '../shared/task-output-text.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
-import { capRelayActivityEntries } from './public/app/activity-replay-state.mjs';
+import {
+  capFinishedActivityEntries,
+  capRelayActivityEntries,
+  inFlightActivityCap,
+} from './public/app/activity-replay-state.mjs';
 import {
   isOpenAIModelId,
   isSafeClaudeModelId,
@@ -2005,12 +2013,9 @@ let runtimeShutdownStarted = false;
 // Set once the database is open (see the retention sweep near the other sweeps).
 let subagentRecordRetention = null;
 const runtimeTimers = {
-  cliStatus: null,
   ownerWatchdog: null,
   staleRecovery: null,
   questionExpiry: null,
-  pendingWorkerPrime: null,
-  sharedViewerPrune: null,
   restoredTaskSettle: null,
   claudeApiCapClock: null,
   memoryLog: null,
@@ -2018,6 +2023,25 @@ const runtimeTimers = {
   // Once, 30 s after the relay listens: archived sessions' workers stopped.
   archivedWorkerSweep: null,
 };
+
+// The worker prime and the detached-worker sweep, every 5 s while a pending
+// row waits for its worker (rows in retry backoff included, so the worker is
+// warm when the backoff matures). Armed at startup, by every prime that finds
+// a row and by every queue snapshot with a row pending; a pass that leaves no
+// such row disarms it. Declared up here so a prime early in the boot can arm
+// it; its tick runs only after the boot.
+const pendingWorkerPrimeTimer = createArmableInterval({
+  intervalMs: 5_000,
+  tick: async () => {
+    await Promise.allSettled([
+      primePendingSessionWorkers('maintenance'),
+      detachedWorkerWatch.sweep().catch((error) => {
+        console.warn(`${runtimeLogPrefix()}WORKER DETACHED sweep failed: ${error?.message || error}`);
+      }),
+    ]);
+    return hasPendingWorkerOwnerRows();
+  },
+});
 
 function normalizeRemotePath(value) {
   if (typeof value !== 'string') return '';
@@ -2861,6 +2885,16 @@ const stmts = {
   ...createQuestionRepository(db),
   ...createImageConversationRepository(db),
 };
+// Every queue write that can make a row deliverable wakes the delivery
+// (services/queue-wake-hook.mjs): installed before any route or startup
+// write. The waker exists once the worker socket service does; a write
+// before that is covered by the startup prime and the service's start.
+// Without the hook (it could not be installed) the queue is polled.
+let queueWaker = null;
+const queueWakeHook = installQueueWakeHook(db, {
+  onWake: (reason) => { queueWaker?.wake(reason, { prime: false }); },
+  log: (line) => console.warn(`[queue-wake] ${line}`),
+});
 const statusEventService = createStatusEventService(db);
 // Public shares and their access log (migration 0016).
 const shareRepository = createShareRepository(db);
@@ -3422,6 +3456,8 @@ const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
   onLaunchState: (event) => workerLaunchNoteService.handle(event),
+  // A kill's grace ended: the session's rows may go to its next worker.
+  onKillBlockLifted: () => { wakeSessionWorkerQueue('kill-block-lifted'); },
 });
 // Feature flags moved from config.json into app_settings; adopt any legacy
 // `features` key once, then resolve the boot snapshot (defaults < stored rows
@@ -3822,7 +3858,11 @@ function relayShutdownStatePayload() {
 
 function cancelRelayShutdown({ requestedBy = 'localhost-api' } = {}) {
   const result = relayRestartQueue.cancel({ requestedBy });
-  if (result?.cancelled) relayEventService?.noteRestartCancelled();
+  if (result?.cancelled) {
+    relayEventService?.noteRestartCancelled();
+    // The queued restart held deliveries back: they go out now.
+    wakeSessionWorkerQueue('restart-cancelled');
+  }
   return result;
 }
 
@@ -5391,52 +5431,28 @@ function createCompactedConversation(sourceConversationId) {
   };
 }
 
-function sanitizeActivityText(value) {
-  const text = String(value || '').trim();
-  if (!text) return '';
-  return text.slice(0, 200);
-}
-
-function mapRelayActivityRow(row) {
-  const text = sanitizeActivityText(row?.text);
-  if (!text) return null;
-  const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
-  // Structured rows (compaction boundaries) carry their payload alongside the
-  // prose so the transcript can promote them to a break row; junk JSON is
-  // simply dropped back to a prose-only entry.
-  let metadata = null;
-  if (row?.metadata_json) {
-    try {
-      const parsed = JSON.parse(String(row.metadata_json));
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed;
-    } catch { metadata = null; }
-  }
-  return {
-    text,
-    subagentRunId: subagentRunId || null,
-    ...(metadata ? { metadata } : {}),
-  };
-}
-
-const RELAY_ACTIVITY_ROW_LIMIT = 48;
-
+// Per thread (the main agent, each sub-agent), the newest rows; structured
+// rows are always kept (activity-replay-state.mjs). A finished turn: the main
+// agent's 200, each sub-agent's 50, and a turn whose main agent ran more says
+// how many it left out.
 function relayActivityForResponse(responseMessageId) {
-  return capRelayActivityEntries(
+  return capFinishedActivityEntries(
     stmts.listActivityByResponse
       .all(responseMessageId)
       .map(mapRelayActivityRow)
       .filter(Boolean),
-    RELAY_ACTIVITY_ROW_LIMIT,
   );
 }
 
-function relayActivityForQueueMessage(queueMessageId) {
+// A running turn: as many per thread as the browser shows (`activityCap`, the
+// request's param; 50 when it sends none, 500 at most).
+function relayActivityForQueueMessage(queueMessageId, activityCap = undefined) {
   return capRelayActivityEntries(
     stmts.listActivityByQueueMessage
       .all(queueMessageId)
       .map(mapRelayActivityRow)
       .filter(Boolean),
-    RELAY_ACTIVITY_ROW_LIMIT,
+    inFlightActivityCap(activityCap),
   );
 }
 
@@ -5456,19 +5472,6 @@ function relayStreamEventsForQueueMessage(queueMessageId) {
     })
     .filter((row) => Number.isFinite(row.seq))
     .slice(0, 5000);
-}
-
-function mapRelayThoughtRow(row) {
-  const seq = Math.max(0, Math.trunc(Number(row?.seq || 0)));
-  const subagentRunId = row?.subagent_run_id ? String(row.subagent_run_id).trim() : null;
-  return {
-    reasoningId: row?.reasoning_id ? String(row.reasoning_id) : null,
-    seq,
-    text: String(row?.text || ''),
-    done: Number(row?.done || 0) === 1,
-    timestamp: row?.created_at || null,
-    subagentRunId: subagentRunId || null,
-  };
 }
 
 function relayThoughtsForResponse(responseMessageId) {
@@ -5654,7 +5657,7 @@ const usageLimitPauseService = createUsageLimitPauseService({
   stmts,
   emit: (event, payload) => io.emit(event, payload),
   // A follow-up resumed by hand is due at once: wake its worker.
-  onQueueChanged: (reason) => { void primePendingSessionWorkers(reason); },
+  onQueueChanged: (reason) => { wakeSessionWorkerQueue(reason); },
   logger: console,
 });
 
@@ -5686,8 +5689,7 @@ const claudeBillingSwitchService = createClaudeBillingSwitchService({
   // What the swap waits for: a turn, a question, a compaction, background tasks.
   getPending: (runtime) => claudeBillingSwapService.pendingFor(runtime?.sdk_session_id || runtime?.conversation_id),
   onQueueChanged: (reason) => {
-    void primePendingSessionWorkers(reason);
-    sessionWorkerWebSocketService?.emitQueueChanged?.(reason);
+    wakeSessionWorkerQueue(reason);
   },
   logger: console,
 });
@@ -5735,8 +5737,7 @@ const restartResumeService = createRestartResumeService({
   // The note is an ordinary pending message: the primer starts a stopped
   // worker, the socket service hands it to a running one.
   wake: () => {
-    void primePendingSessionWorkers('restart-resume');
-    sessionWorkerWebSocketService?.emitQueueChanged?.('restart-resume');
+    wakeSessionWorkerQueue('restart-resume');
   },
   logger: console,
 });
@@ -5766,8 +5767,7 @@ relayEventService = createRelayEventService({
   // The event row is an ordinary pending message: the primer starts a
   // stopped worker, the socket service hands it to a running one.
   wakeWatcher: () => {
-    void primePendingSessionWorkers('relay-event');
-    sessionWorkerWebSocketService?.emitQueueChanged?.('relay-event');
+    wakeSessionWorkerQueue('relay-event');
   },
   relayName: () => remoteRelayRegistry?.selfName?.() || getPwaAppName?.() || '',
   onRemoteChange: (relayId) => { void relayEventLinkService?.fetchNow(relayId); },
@@ -5783,8 +5783,7 @@ const relayScheduleService = createRelayScheduleService({
   emit: (event, payload) => io.emit(event, payload),
   // The scheduled message is an ordinary pending one, like a relay event's.
   wake: () => {
-    void primePendingSessionWorkers('relay-schedule');
-    sessionWorkerWebSocketService?.emitQueueChanged?.('relay-schedule');
+    wakeSessionWorkerQueue('relay-schedule');
   },
   // A firing into another session is a prompt of the conversation that set
   // it: the agents' loop guard counts it (and holds it once it wants the user).
@@ -5847,7 +5846,9 @@ function resolveLiveTurnQueueRow(conversationId) {
   return byId.get(liveId) || rows[0];
 }
 
-function inFlightStateForConversation(conversationId) {
+// `activityCap`: the tool lines per thread the asking page shows (the
+// conversation route passes its `activityCap` param; others get the default).
+function inFlightStateForConversation(conversationId, { activityCap = undefined } = {}) {
   const row = resolveLiveTurnQueueRow(conversationId);
   if (!row) return null;
   const streamEvents = relayStreamEventsForQueueMessage(row.id);
@@ -5859,7 +5860,7 @@ function inFlightStateForConversation(conversationId) {
     mode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
     timestamp: row.timestamp || null,
     processingAt: row.processing_at || null,
-    activities: relayActivityForQueueMessage(row.id),
+    activities: relayActivityForQueueMessage(row.id, activityCap),
     thoughts: relayThoughtsForQueueMessage(row.id),
     streamEvents,
     streamDone: !!lastStreamEvent?.done,
@@ -6392,6 +6393,15 @@ const SHARED_VIEWER_MAX_GLOBAL = Number.isFinite(Number(config.sharedPresenceMax
   ? Math.max(SHARED_VIEWER_MAX_PER_CONVERSATION, Math.trunc(Number(config.sharedPresenceMaxGlobal)))
   : 5_000;
 const sharedViewersByConversation = new Map();
+// Armed when the first share viewer arrives, disarmed by the prune that
+// leaves none: a relay nobody watches through a share link has no timer.
+const sharedViewerPruneTimer = createArmableInterval({
+  intervalMs: 5_000,
+  tick: () => {
+    pruneSharedViewerPresence();
+    return sharedViewersByConversation.size > 0;
+  },
+});
 
 function sanitizeSharedViewerId(value) {
   const id = String(value || '').trim().replace(/[^a-zA-Z0-9:_-]+/g, '');
@@ -6532,6 +6542,7 @@ function markSharedViewerPresence({ conversationId, token, viewerId } = {}) {
   }
   const before = viewers.size;
   viewers.set(key, { lastSeenAt: now });
+  sharedViewerPruneTimer.arm();
   const watcherCount = viewers.size;
   if (before !== watcherCount) {
     emitConversationWatcherCount(convId);
@@ -6808,7 +6819,7 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
   console.warn(`${runtimeLogPrefix()}WS REQUEUE ${messageId.slice(0, 8)} session=${requesterSessionId ? requesterSessionId.slice(0, 8) : 'unknown'} retry=${retryCount} reason=${String(reason || 'ws-send-failed')}`);
   io.emit('message_status', { messageId, conversationId: row.conversation_id, status: 'pending' });
   io.emit('queue_updated', { recovered: 1, reason: 'worker-ws-send-failed' });
-  sessionWorkerWebSocketService?.emitQueueChanged?.('worker-ws-send-failed');
+  wakeSessionWorkerQueue('worker-ws-send-failed');
   return true;
 }
 
@@ -6898,11 +6909,10 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
   }
   if (recovered > 0) {
     io.emit('queue_updated', { recovered, reason: `worker-died:${reason}` });
-    sessionWorkerWebSocketService?.emitQueueChanged?.(`worker-died:${reason}`);
   }
   sessionWorkerSupervisor?.markError?.(sid, `worker-died:${reason}`);
   // The rows stay owned, so the primer is what respawns their worker.
-  void primePendingSessionWorkers(`worker-died:${reason}`);
+  wakeSessionWorkerQueue(`worker-died:${reason}`);
   return recovered;
 }
 
@@ -6981,7 +6991,19 @@ async function sweepDeadWorkerProcessingRowsOnce() {
 // work. The worker recycle raises it; the billing swap does not, since its
 // own delivery fence already keeps the other billing's rows from the old
 // worker.
-const workerReplacementFence = createWorkerReplacementFence();
+// A lifted fence (the replacement launched, or its stop failed and the old
+// worker serves again) hands out what waited behind it.
+const workerReplacementFence = (() => {
+  const fence = createWorkerReplacementFence();
+  return {
+    ...fence,
+    release(sid, pid) {
+      const released = fence.release(sid, pid);
+      if (released) wakeSessionWorkerQueue('replacement-fence-lifted');
+      return released;
+    },
+  };
+})();
 function createRuntimeWorkerReplacement(tag) {
   return createWorkerReplacement({
     registry: sessionWorkerRegistry,
@@ -7288,6 +7310,21 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   },
   onDeliverySendFailed: recoverUndeliveredSessionWorkerMessage,
   onWorkerSocketClosed: handleWorkerSocketClosed,
+  // The CLI presence window is wider while a worker socket is open.
+  onSocketCountChange: (count) => cliPresence.noteWorkerSocketCount(count),
+  // A row pending (in backoff too) keeps the worker prime armed, and the
+  // poll primes now and then while rows wait.
+  onQueueSnapshot: (snapshot) => {
+    if (snapshot.pendingCount > 0) queueWaker?.primeFromBackstop('backstop');
+  },
+  // A retry time or a usage-limit hold coming due wakes the queue on time.
+  nextDueAtMs: () => {
+    if (runtimeShutdownStarted) return null;
+    const due = stmts.nextPendingAttemptAt?.get?.(new Date().toISOString())?.due;
+    const dueMs = due ? Date.parse(due) : NaN;
+    return Number.isFinite(dueMs) ? dueMs : null;
+  },
+  onDue: (reason) => { wakeSessionWorkerQueue(reason); },
   requestWork: requestSessionWorkerSocketDelivery,
   // What a worker says it is ("claude", "claude-api", ...): the registry
   // keeps it for the billing fence and for what a response ran on.
@@ -7309,8 +7346,22 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   buildId: BUILD_ID,
   isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
   pathPrefix: remotePath,
-  pollIntervalMs: 500,
+  // A backstop under the queue's own wakes; the poll every 500 ms it was
+  // when those cannot be installed.
+  pollIntervalMs: queueWakeHook.installed ? 10_000 : 500,
   logger: console,
+});
+let queueWakeStarted = false;
+queueWaker = createQueueWaker({
+  prime: (reason) => primePendingSessionWorkers(reason),
+  notify: (reason) => {
+    sessionWorkerWebSocketService.notifyQueueChanged(reason).catch((error) => {
+      console.warn(`${runtimeLogPrefix()}QUEUE WAKE failed reason=${reason} err=${error?.message || error}`);
+    });
+  },
+  armPrime: () => pendingWorkerPrimeTimer.arm(),
+  isReady: () => queueWakeStarted && !runtimeShutdownStarted,
+  warn: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
 });
 runtimeTimers.deadWorkerSweep = setInterval(() => {
   sweepDeadWorkerProcessingRows().catch((error) => {
@@ -7338,40 +7389,39 @@ const tmuxInspectorSocketService = createTmuxInspectorSocketService({
   logger: console,
 });
 
-async function primePendingSessionWorkers(reason = 'pending-worker-prime') {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
-  if (runtimeShutdownStarted) return 0;
-  if (typeof sessionWorkerSupervisor?.ensureWorker !== 'function') return 0;
-  if (typeof stmts.listPendingWorkerOwnerSessionIds?.all !== 'function') return 0;
+// No next_attempt_at filter in the listing: rows sitting in retry backoff
+// still need their worker warm, otherwise the poll wins the race the moment
+// the backoff matures and the turn executes on the wrong provider.
+const pendingWorkerPrimer = createPendingWorkerPrimer({
+  isEnabled: () => featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
+    && !runtimeShutdownStarted
+    && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
+    && typeof stmts.listPendingWorkerOwnerSessionIds?.all === 'function',
+  listPendingOwnerSessionIds: (limit) => stmts.listPendingWorkerOwnerSessionIds.all(limit),
+  isKillBlocked: (sid) => sessionWorkerSupervisor?.isKillBlocked?.(sid) === true,
+  failRowsWithoutLaunch: (sid) => failClaudeApiRowsWithoutLaunch(sid),
+  ensureWorker: (sid) => sessionWorkerSupervisor.ensureWorker(sid),
+  // Rows waiting for their worker: the maintenance pass retries until none is.
+  onRowsWaiting: () => pendingWorkerPrimeTimer.arm(),
+  warn: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
+});
 
-  // No next_attempt_at filter here: rows sitting in retry backoff still need
-  // their worker warm, otherwise the 2s relay poll wins the race the moment
-  // the backoff matures and the turn executes on the wrong provider.
-  const rows = stmts.listPendingWorkerOwnerSessionIds.all(25);
-  let requested = 0;
-  for (const row of rows) {
-    const sdkSessionId = String(row?.sdk_session_id || '').trim();
-    if (!sdkSessionId) continue;
-    if (sessionWorkerSupervisor?.isKillBlocked?.(sdkSessionId) === true) continue;
-    try {
-      // Per session: a throw here costs this session its launch, never the
-      // rest of the pass.
-      if (failClaudeApiRowsWithoutLaunch(sdkSessionId)) continue;
-    } catch (error) {
-      console.warn(`${runtimeLogPrefix()}WORKER PRIME skipped session=${sdkSessionId.slice(0, 8)} err=${error?.message || error}`);
-      continue;
-    }
-    requested += 1;
-    try {
-      const result = await sessionWorkerSupervisor.ensureWorker(sdkSessionId);
-      if (!result?.ok) {
-        console.warn(`${runtimeLogPrefix()}WORKER PRIME blocked session=${sdkSessionId.slice(0, 8)} reason=${String(result?.error || reason || 'pending-worker-prime')}`);
-      }
-    } catch (error) {
-      console.warn(`${runtimeLogPrefix()}WORKER PRIME failed session=${sdkSessionId.slice(0, 8)} reason=${String(reason || 'pending-worker-prime')} err=${error?.message || error}`);
-    }
-  }
-  return requested;
+function primePendingSessionWorkers(reason = 'pending-worker-prime') {
+  return pendingWorkerPrimer(reason);
+}
+
+/**
+ * The queue may hold work for a worker now (a row written, a gate lifted, a
+ * retry come due): hand rows to the ready workers, prime the sessions with
+ * pending rows, keep the maintenance pass armed.
+ */
+function wakeSessionWorkerQueue(reason = 'queue-wake') {
+  return queueWaker?.wake(reason) === true;
+}
+
+function hasPendingWorkerOwnerRows() {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true || runtimeShutdownStarted) return false;
+  return (stmts.listPendingWorkerOwnerSessionIds?.all?.(1) || []).length > 0;
 }
 
 // Guard first, so a tunnelled request to a worker path is rejected before any
@@ -7475,7 +7525,14 @@ app.get(['/share-preview/:conversationId', '/share-preview/:conversationId/'], (
 app.use(express.static(PUBLIC_DIR, { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
 
 // ─── CLI Status Tracking ──────────────────────────────────────────────────────
-let cliLastSeen = null;
+// When the workers were last heard from, without a polling timer: the window
+// is 45 s while a worker socket is open (an idle worker beats every 30 s) and
+// 10 s once none is (services/idle-timers.mjs).
+const cliPresence = createCliPresence({
+  onExpired: () => {
+    if (cliOnline) markCliOffline('heartbeat-timeout');
+  },
+});
 let cliOnline   = false;
 let relayPaused = false;
 const relayBridgeOwnerService = createRelayBridgeOwnerService();
@@ -7491,7 +7548,12 @@ const runtimeState = {
   get cliOnline() { return cliOnline; },
   set cliOnline(value) { cliOnline = value; },
   get relayPaused() { return relayPaused; },
-  set relayPaused(value) { relayPaused = value; },
+  set relayPaused(value) {
+    const wasPaused = relayPaused;
+    relayPaused = value;
+    // Resumed: what was queued while paused goes out now.
+    if (wasPaused && !relayPaused) wakeSessionWorkerQueue('relay-resumed');
+  },
   get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return relayRestartQueue.getState(); },
   // A shutdown or restart waits for the processing turns: no pending row
@@ -8015,7 +8077,7 @@ registerAboutRoutes(app, {
   }),
 });
 function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
-  cliLastSeen = null;
+  cliPresence.clear();
   const wasOnline = cliOnline;
   cliOnline = false;
   if (clearOwner) {
@@ -8028,20 +8090,6 @@ function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
     void pushDispatchService.notifyCliOffline();
   }
 }
-
-function checkCliStatus() {
-  const wasOnline = cliOnline;
-  cliOnline = cliLastSeen !== null && (Date.now() - cliLastSeen) < 10_000;
-  if (wasOnline !== cliOnline) {
-    if (!cliOnline) {
-      markCliOffline('heartbeat-timeout');
-      return;
-    }
-    console.log(`${runtimeLogPrefix()}CLI ONLINE`);
-    io.emit('cli_status', { online: true });
-  }
-}
-runtimeTimers.cliStatus = setInterval(checkCliStatus, 2000);
 
 if (managedOwnerPid) {
   runtimeTimers.ownerWatchdog = setInterval(() => {
@@ -8072,6 +8120,10 @@ const staleRecoveryClockGuard = createStaleRecoveryClockGuard({
 });
 function recoverStaleMessages() {
   if (staleRecoveryClockGuard.tick().skip) return;
+  // The tick itself stays: the guard reads the gaps between ticks, and a timer
+  // that slept while nothing ran would look like a clock jump. Only the work
+  // is skipped while no row is processing and no restart outcome is open.
+  if (!stmts.hasProcessingRow.get() && !restartResumeService.pending().length) return;
   const staleWindowMs = cliOnline
     ? processingTimeoutMs
     : Math.min(processingTimeoutMs, OFFLINE_STALE_RECOVER_MS);
@@ -8111,8 +8163,6 @@ function expirePendingQuestions() {
 }
 runtimeTimers.questionExpiry = setInterval(expirePendingQuestions, 10_000);
 expirePendingQuestions();
-runtimeTimers.sharedViewerPrune = setInterval(pruneSharedViewerPresence, 5_000);
-if (typeof runtimeTimers.sharedViewerPrune.unref === 'function') runtimeTimers.sharedViewerPrune.unref();
 // Memory in the status log: now, every 10 minutes, and once per crossing of
 // 80 % of the heap limit (relay-heap-guard.mjs).
 {
@@ -8344,7 +8394,7 @@ function emitToClientsExceptSessionId(event, payload, sessionId) {
 // ─── CLI Routes ───────────────────────────────────────────────────────────────
 
 function touchCli() {
-  cliLastSeen = Date.now();
+  cliPresence.touch();
   relayRestartOrchestrator.noteCliOnline();
   if (!cliOnline) {
     cliOnline = true;
@@ -8353,6 +8403,7 @@ function touchCli() {
   }
 }
 sessionWorkerWebSocketService.start();
+queueWakeStarted = true;
 void primePendingSessionWorkers('startup');
 // Undelivered events get their timers back; stalled, all_idle and the
 // heartbeat are swept from here on.
@@ -8365,13 +8416,7 @@ relayScheduleService.start();
 relayAskLinkService.start();
 // Paired relays' Inboxes, every ~20 s.
 remoteInboxWatchService.start();
-runtimeTimers.pendingWorkerPrime = setInterval(() => {
-  void primePendingSessionWorkers('maintenance');
-  detachedWorkerWatch.sweep().catch((error) => {
-    console.warn(`${runtimeLogPrefix()}WORKER DETACHED sweep failed: ${error?.message || error}`);
-  });
-}, 5_000);
-if (typeof runtimeTimers.pendingWorkerPrime.unref === 'function') runtimeTimers.pendingWorkerPrime.unref();
+pendingWorkerPrimeTimer.arm();
 
 // POST /api/heartbeat — CLI sends a ping every poll interval
 
@@ -8500,6 +8545,7 @@ const sshTunnelManager = createSshTunnelManager({
   logger: console,
   runtimeShutdownRef: () => runtimeShutdownStarted,
   configBaseDir: __dirname,
+  onBlockingLifted: () => { wakeSessionWorkerQueue('ssh-tunnel-connected'); },
 });
 const tunnelState = sshTunnelManager.state;
 runtimeState.tunnelState = tunnelState;
@@ -8513,6 +8559,7 @@ const cloudflaredTunnelManager = createCloudflaredTunnelManager({
   logger: console,
   runtimeShutdownRef: () => runtimeShutdownStarted,
   configBaseDir: __dirname,
+  onBlockingLifted: () => { wakeSessionWorkerQueue('cloudflared-tunnel-connected'); },
 });
 runtimeState.cloudflaredTunnelState = cloudflaredTunnelManager.state;
 
@@ -8633,15 +8680,15 @@ function clearRuntimeTimers() {
   try { workerRecycleService.stop(); } catch {}
   try { taskHealthPoller.stop(); } catch {}
   try { taskOutputRooms.stop(); } catch {}
-  runtimeTimers.cliStatus = null;
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
-  runtimeTimers.pendingWorkerPrime = null;
-  runtimeTimers.sharedViewerPrune = null;
+  pendingWorkerPrimeTimer.stop();
+  sharedViewerPruneTimer.stop();
   runtimeTimers.restoredTaskSettle = null;
   runtimeTimers.archivedWorkerSweep = null;
   try { relayRestartQueue.dispose(); } catch {}
+  try { cliPresence.clear(); } catch {}
 }
 
 let runtimeShutdownPromise = null;

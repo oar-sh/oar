@@ -39,12 +39,12 @@ function makeStmts(db) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     insertActivity: db.prepare(`
-      INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json, turn_seq)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     insertThought: db.prepare(`
-      INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id, turn_seq)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     deleteConvActivity: db.prepare(`DELETE FROM relay_activity WHERE conversation_id = ?`),
     deleteConvThoughts: db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`),

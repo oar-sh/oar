@@ -162,8 +162,10 @@ test.describe("sub-agent viewer", () => {
       await expect(modal).toHaveClass(/visible/);
       const entries = modal.locator(".sav-entry");
       await expect(entries).toHaveCount(29);
-      // Thoughts and tool output are folded; reply text is shown.
-      await expect(modal.locator(".sav-entry-thought details[open]")).toHaveCount(0);
+      // Thoughts are open ("Expand thoughts" is on by default), tool output is
+      // folded; reply text is shown.
+      await expect(modal.locator(".sav-entry-thought details:not([open])")).toHaveCount(0);
+      await expect(modal.locator(".sav-entry-thought details[open]")).toHaveCount(7);
       await expect(modal.locator(".sav-entry-tool_result details[open]")).toHaveCount(0);
       await expect(modal.locator(".sav-entry-text").first()).toContainText("Part 3 checked.");
       await expect(modal.locator(".sav-entry-tool_call").first()).toContainText("grep -rn widget src/part-1");

@@ -5133,6 +5133,7 @@ export function createCopilotSdkSessionRunner({
     resyncBackgroundTasks,
     // The relay answered a heartbeat: settle notices kept for it go out.
     flushKeptTaskSettles: () => keptTaskSettles.flush(),
+    keptTaskSettleCount: () => keptTaskSettles.size(),
     cancelPushedMessage,
     // The task panel's per-card Stop (`rpc.tasks.cancel`); also what a
     // subagent lane's Stop tries — the runtime tracks sync agents in the same

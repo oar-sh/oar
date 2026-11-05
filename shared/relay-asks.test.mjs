@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 
 import {
   RELAY_ASK_LIMITS,
+  PERSON_ONLY_QUESTION_SOURCE,
   REMOTE_RELAY_APPROVAL_SOURCE,
+  isPersonOnlyQuestion,
   isRelayAskId,
   normalizeRelayAskAnswer,
   normalizeRelayAskInput,
@@ -66,4 +68,13 @@ test('ask ids and the kinds of question cards', () => {
   assert.equal(relayQuestionKind({ context: { source: 'relay_tool' } }), 'ask_user');
   assert.equal(relayQuestionKind({ context: null }), 'ask_user');
   assert.equal(relayQuestionKind(null), 'ask_user');
+});
+
+test('isPersonOnlyQuestion knows a Safety check card by its context source alone', () => {
+  assert.equal(PERSON_ONLY_QUESTION_SOURCE, 'ClaudeSafetyCheck');
+  assert.equal(isPersonOnlyQuestion({ source: 'ClaudeSafetyCheck', header: 'Safety check' }), true);
+  assert.equal(isPersonOnlyQuestion({ source: ' ClaudeSafetyCheck ' }), true);
+  for (const context of [{ source: 'AskUserQuestion' }, { source: REMOTE_RELAY_APPROVAL_SOURCE }, { header: 'Safety check' }, {}, null, undefined, 'ClaudeSafetyCheck']) {
+    assert.equal(isPersonOnlyQuestion(context), false, JSON.stringify(context));
+  }
 });

@@ -240,3 +240,48 @@ test('a worker that states its build id says it in every beat next to its kind; 
   await blank.pulseHeartbeat();
   assert.equal('buildId' in calls.at(-1).body, false);
 });
+
+test('hasWork: a claimed row, a background task, a settle failure or a running turn', () => {
+  const state = { id: '', ids: [], tasks: [], failed: [], steering: null };
+  const controller = createHeartbeatController({
+    api: async () => ({}),
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => null,
+    setHeartbeatTimer: () => {},
+    getActiveQueueMessageId: () => state.id,
+    getActiveQueueMessageIds: () => state.ids,
+    getBackgroundTaskIds: () => state.tasks,
+    getSettleFailed: () => state.failed,
+    getSteeringState: () => state.steering,
+  });
+  assert.equal(controller.hasWork(), false, 'idle');
+  state.steering = { turnActive: false, canSteer: false };
+  assert.equal(controller.hasWork(), false, 'a snapshot with no turn is idle');
+  for (const [key, value] of [['id', 'q-1'], ['ids', ['q-2']], ['tasks', ['t-1']], ['failed', [{ id: 'q-3' }]], ['steering', { turnActive: true }]]) {
+    const before = state[key];
+    state[key] = value;
+    assert.equal(controller.hasWork(), true, key);
+    state[key] = before;
+  }
+});
+
+test('hasWork without optional getters is false, and a throwing getter counts as work', () => {
+  const bare = createHeartbeatController({
+    api: async () => ({}),
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => null,
+    setHeartbeatTimer: () => {},
+  });
+  assert.equal(bare.hasWork(), false);
+  const throwing = createHeartbeatController({
+    api: async () => ({}),
+    pollMs: 60_000,
+    getSessionReady: () => true,
+    getHeartbeatTimer: () => null,
+    setHeartbeatTimer: () => {},
+    getActiveQueueMessageIds: () => { throw new Error('boom'); },
+  });
+  assert.equal(throwing.hasWork(), true);
+});

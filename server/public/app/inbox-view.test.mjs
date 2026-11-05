@@ -19,8 +19,8 @@ import {
   pruneInboxFolds,
   restoreInboxFolds,
   formatInboxAge,
-  sessionAsksFromInbox,
   inboxFilterMatches,
+  inboxBadge,
   inboxPendingCount,
   inboxSections,
   inboxSessionUrl,
@@ -174,16 +174,6 @@ test('a refresh asked for while one runs runs once more after it, never twice at
   assert.equal(await fourth, 3);
 });
 
-test('the session cards are built anew from each load: a withdrawn ask drops out', () => {
-  const load = (items) => [{ ...SELF, items }, { ...LAB, items: [ask('there')] }];
-  const before = sessionAsksFromInbox(load([ask('a1'), ask('a2'), { id: 'card-1', kind: 'ask_user', status: 'pending' }]));
-  assert.deepEqual([...before.keys()], ['a1', 'a2'], 'this relay\'s asks only');
-  assert.equal(before.get('a1').conversationId, 'conv-a1');
-  const after = sessionAsksFromInbox(load([ask('a2')]));
-  assert.deepEqual([...after.keys()], ['a2']);
-  assert.equal(sessionAsksFromInbox(null).size, 0);
-});
-
 test('ages and session links', () => {
   assert.equal(formatInboxAge(minutesAgo(0), NOW), 'just now');
   assert.equal(formatInboxAge(minutesAgo(7), NOW), '7 min');
@@ -256,6 +246,46 @@ test('plan cards sort into the sections and count in the badge; an acted one is 
   assert.equal(inboxPendingCount(relays), 2);
   const root = renderInbox(doc, { relays, now: NOW });
   assert.equal(root.querySelectorAll('.inbox-plan').length, 2);
+});
+
+test('the badge: the urgent count while an urgent ask waits, else every pending item', () => {
+  assert.deepEqual(inboxBadge([]), { text: '', urgent: false, pending: 0, urgentCount: 0 });
+  assert.deepEqual(inboxBadge(null), { text: '', urgent: false, pending: 0, urgentCount: 0 });
+  const mixed = [
+    { ...SELF, items: [ask('a1'), plan('p1'), { id: 'card-1', kind: 'ask_user', status: 'pending', urgency: 'now' }, ask('a2', { status: 'answered' })] },
+    { ...LAB, items: [ask('a3')] },
+  ];
+  // A card a turn waits on is never urgent, whatever it carries.
+  assert.deepEqual(inboxBadge(mixed), { text: '4', urgent: false, pending: 4, urgentCount: 0 });
+  mixed[1].items.push(ask('a4', { urgency: 'now' }));
+  mixed[0].items.push(ask('a5', { urgency: 'now', status: 'dismissed' }));
+  assert.deepEqual(inboxBadge(mixed), { text: '1', urgent: true, pending: 5, urgentCount: 1 });
+  assert.equal(inboxPendingCount(mixed), 5);
+});
+
+test('in the 📓 panel a card says it is for you, opens its Details and says how it closed', () => {
+  const pending = buildAskCard(doc, ask('a1', { detail: 'Two lines\nof context', urgency: 'now', options: ['Left', 'Right'] }), { relay: { id: 'self', self: true }, mode: 'panel', now: NOW });
+  assert.equal(pending.querySelector('.inbox-item-kind').textContent, 'Question for you');
+  assert.equal(pending.querySelector('.inbox-item-urgent').textContent, 'urgent');
+  assert.equal(pending.querySelector('details.inbox-item-detail').open, true);
+  assert.equal(pending.querySelector('.inbox-item-session'), null);
+  assert.equal(pending.querySelectorAll('.inbox-choice').length, 2);
+  assert.ok(pending.querySelector('.inbox-answer') && pending.querySelector('.inbox-dismiss'));
+  const outcome = (extra) => {
+    const card = buildAskCard(doc, ask('a2', extra), { relay: { id: 'self', self: true }, mode: 'panel', now: NOW });
+    assert.equal(card.querySelector('button'), null, 'a closed card has no buttons');
+    return card.querySelector('.inbox-item-outcome')?.textContent;
+  };
+  assert.equal(outcome({ status: 'answered', choice: 'Right', answer: 'Right' }), 'Answered: Right');
+  assert.equal(outcome({ status: 'answered', answer: '\nFirst line\nsecond line' }), 'Answered: First line');
+  assert.equal(outcome({ status: 'dismissed' }), 'Dismissed');
+  assert.equal(outcome({ status: 'withdrawn' }), 'Withdrawn');
+  assert.equal(outcome({ status: 'cancelled' }), 'Cancelled');
+  // The Inbox and the session card keep their wording.
+  const inbox = buildAskCard(doc, ask('a3', { detail: 'x' }), { relay: SELF, now: NOW });
+  assert.equal(inbox.querySelector('.inbox-item-kind').textContent, 'Question');
+  assert.equal(inbox.querySelector('details.inbox-item-detail').open, false);
+  assert.equal(buildAskCard(doc, ask('a4', { status: 'cancelled' }), { relay: SELF, now: NOW }).querySelector('.inbox-item-outcome'), null);
 });
 
 // ─── Folds across re-renders ──────────────────────────────────────────────────

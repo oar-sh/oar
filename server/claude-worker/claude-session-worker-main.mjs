@@ -14,6 +14,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { createWorkerKeepalive } from '../../shared/worker-runtime/worker-keepalive.mjs';
 import { resolveBuildId } from '../../shared/build-id.mjs';
 import { createControlPoller } from '../../shared/control-poller.mjs';
 import { resolveDeliveredAutoCompactWindow } from '../../shared/auto-compact-window.mjs';
@@ -174,10 +175,16 @@ export async function runClaudeSessionWorker({
     getBackgroundTaskIds: () => turnRunner.backgroundTaskIds(),
     onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
     onAnswered: () => turnRunner.flushKeptTaskSettles(),
+    getKeptPostCount: () => turnRunner.keptTaskSettleCount?.() || 0,
   });
 
+  // One timer for the heartbeat and the socket's readiness refresh: 10 s
+  // while working, 30 s while idle on a relay that allows it.
+  let keepalive = null;
   const wsLink = createWorkerWebSocketLink({
     serverUrl,
+    readyRefreshMs: 0,
+    onRelayFrame: () => keepalive?.nudge(),
     token,
     dbg,
     getSessionReady: () => true,
@@ -239,6 +246,7 @@ export async function runClaudeSessionWorker({
       dbg('unknown worker control ignored', type || '(none)');
     },
   });
+  keepalive = createWorkerKeepalive({ heartbeat, link: wsLink, busyMs: HEARTBEAT_MS });
   linkBridge.attach(wsLink);
 
   let shuttingDown = false;
@@ -247,6 +255,7 @@ export async function runClaudeSessionWorker({
     shuttingDown = true;
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
+    try { keepalive.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
     // Consumed steers still settling must fail, not be left for dead-worker
@@ -271,6 +280,6 @@ export async function runClaudeSessionWorker({
   });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'}${backend ? ` backend=${backend.id}` : ''} build=${buildId || 'unknown'}`);
-  heartbeat.startHeartbeat();
+  keepalive.start();
   wsLink.start();
 }

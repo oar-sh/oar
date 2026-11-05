@@ -2407,6 +2407,25 @@ test('list_sessions scope all pages with an opaque cursor', async () => {
   assert.equal(bad.body.code, CODES.invalidInput);
 });
 
+test('read_session lists the newest 20 tool lines of a reply', async () => {
+  const { run, remote } = setup();
+  withSession(remote, {});
+  remote.addMessage('conv-1', { id: 'm-ask', role: 'user', text: 'Map the widget code' });
+  remote.addMessage('conv-1', {
+    id: 'm-busy',
+    role: 'assistant',
+    text: 'Mapped.',
+    sourceMessageId: 'm-ask',
+    activities: Array.from({ length: 30 }, (_, index) => ({ text: `Tool (view): widget-${index + 1}.js` })),
+  });
+  const result = await run('read_session', { relay: 'linux-test', session: 'conv-1', include_activity: true });
+  assert.equal(result.status, 200);
+  const busy = result.body.messages.find((row) => row.id === 'm-busy');
+  assert.equal(busy.activities.length, 20);
+  assert.equal(busy.activities[0], 'Tool (view): widget-11.js');
+  assert.equal(busy.activities.at(-1), 'Tool (view): widget-30.js');
+});
+
 test('read_session strips the prompt header, trims text and keeps the newest within max_chars', async () => {
   const { run, remote } = setup();
   withSession(remote, { origin: { relayName: 'win-test' } });
@@ -4733,4 +4752,35 @@ test('update_session passes planOnly on as a setting', async () => {
   const calls = remote.callsTo('PATCH', '/api/conversation/conv-1/settings');
   assert.ok(calls.length >= 1);
   assert.deepEqual(calls[0].body.settings, { mode: 'agent', planOnly: false });
+});
+test('a Safety check card is never offered to an agent or answered by one, on a paired relay or this one', async () => {
+  const safetyCard = (conversationId) => ({
+    id: 'question-safety',
+    conversationId,
+    prompt: 'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?',
+    choices: ['Allow once', 'Deny'],
+    allowFreeform: false,
+    context: { source: 'ClaudeSafetyCheck', header: 'Safety check' },
+  });
+  const { run, remote } = setup();
+  withSession(remote);
+  remote.addQuestion(safetyCard('conv-1'));
+  remote.addQuestion({ id: 'question-2', conversationId: 'conv-1', prompt: 'Keep going?', choices: ['Yes', 'No'] });
+  const read = await run('read_session', { relay: 'linux-test', session: 'conv-1' });
+  assert.deepEqual(read.body.pendingQuestions.map((question) => question.id), ['question-2']);
+  const answered = await run('answer_question', { relay: 'linux-test', question_id: 'question-safety', choices: ['Allow once'] });
+  assert.equal(answered.status, 403);
+  assert.equal(answered.body.code, CODES.forbidden);
+  assert.match(answered.body.error, /this card is the user's to answer/);
+  assert.equal(remote.callsTo('POST', '/api/relay-question/question-safety/answer').length, 0);
+  assert.equal(remote.questions.get('question-safety').status, 'pending');
+
+  // Another session's card on this relay: refused all the same.
+  const here = setupLocal();
+  here.local.addConversation({ id: 'conv-2', title: 'sample cleanup' });
+  here.local.addQuestion(safetyCard('conv-2'));
+  const local = await here.run('answer_question', { relay: 'this', question_id: 'question-safety', choices: ['Allow once'] });
+  assert.equal(local.status, 403);
+  assert.match(local.body.error, /this card is the user's to answer/);
+  assert.equal(here.local.questions.get('question-safety').status, 'pending');
 });

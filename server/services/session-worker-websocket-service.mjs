@@ -86,18 +86,21 @@ function queueSnapshotChanged(left, right) {
     || left.parkedCount !== right.parkedCount;
 }
 
-// The worker link heartbeats every ~10s (readyRefreshMs in
-// worker-websocket-link.mjs) and itself abandons a connection after 30s of
-// server silence (staleConnectionMs). Mirror that on this side: three missed
-// heartbeats and a retained socket no longer proves the worker is alive.
-const WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS = 30_000;
+// The worker keepalive beats every 30 s while the worker is idle and every
+// 10 s while it works (shared/worker-runtime/worker-keepalive.mjs; an older
+// worker always every 10 s), and the link itself abandons a connection after
+// 90 s of server silence (staleConnectionMs). Mirror that on this side: three
+// missed idle beats and a retained socket no longer proves the worker is
+// alive.
+export const WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS = 90_000;
 
 // Protocol features this relay understands, advertised in server.hello. A
 // worker that updated on disk before the relay restarted must not rely on
 // them otherwise: an older relay ignores worker.unready / hello ready:false
 // and treats a `steering-held` requeue as a failure (retry, backoff,
-// worker marked errored).
-export const WORKER_PROTOCOL_CAPABILITIES = Object.freeze(['worker-unready', 'steering-held']);
+// worker marked errored). `idle-keepalive`: an idle worker may beat every
+// 30 s; an older relay's liveness and CLI windows expect a beat every 10 s.
+export const WORKER_PROTOCOL_CAPABILITIES = Object.freeze(['worker-unready', 'steering-held', 'idle-keepalive']);
 
 export function createSessionWorkerWebSocketService({
   WebSocketServerImpl,
@@ -108,6 +111,19 @@ export function createSessionWorkerWebSocketService({
   noteWorkerHeartbeat = () => {},
   onDeliverySendFailed = async () => {},
   onWorkerSocketClosed = async () => {},
+  // The number of open worker sockets changed: (count). The CLI presence
+  // window is wider while a worker socket is open.
+  onSocketCountChange = () => {},
+  // Every queue snapshot the poll takes: ({pendingCount, processingCount,
+  // parkedCount}). The relay arms its worker prime while rows are pending.
+  onQueueSnapshot = () => {},
+  // The earliest future retry time of a pending row, in ms (null: none). A
+  // one-shot timer fires then, so a backoff or a usage-limit hold ends on
+  // time rather than at the next poll.
+  nextDueAtMs = () => null,
+  // That timer fired with a row due: the relay wakes its queue (prime, hand
+  // out, arm), since a row whose hold ended may have no worker yet.
+  onDue = () => {},
   requestWork = async () => null,
   // A worker stated its kind ("claude", "claude-api", ...) in a hello or a
   // ready: (sessionId, kind, pid). The registry keeps it.
@@ -147,6 +163,10 @@ export function createSessionWorkerWebSocketService({
   const relayBuildId = normalizeBuildId(buildId);
 
   let interval = null;
+  let dueTimer = null;
+  // The retry time the armed due timer stands for.
+  let dueTimerForMs = null;
+  let stopped = false;
   let lastSnapshot = null;
   let attached = false;
 
@@ -155,10 +175,15 @@ export function createSessionWorkerWebSocketService({
     return Number.isFinite(value) ? value : Date.now();
   }
 
+  function noteSocketCount() {
+    try { onSocketCountChange(clients.size); } catch {}
+  }
+
   function removeSocket(socket, reason) {
     const meta = clientState.get(socket);
-    clients.delete(socket);
+    const removed = clients.delete(socket);
     clientState.delete(socket);
+    if (removed) noteSocketCount();
     // Death-detection hook: a worker socket closing while its session owns
     // an in-flight processing row used to be silently forgotten, leaving
     // the row to the 600s stale sweep. The handler PID-probes and recovers.
@@ -222,11 +247,12 @@ export function createSessionWorkerWebSocketService({
     };
   }
 
-  function emitQueueChanged(reason = 'queue-update') {
+  function emitQueueChanged(reason = 'queue-update', { skip = null } = {}) {
     const event = toQueueChangedEvent(reason);
     const payload = JSON.stringify(event);
     for (const socket of clients) {
       if (socket.readyState !== socket.OPEN) continue;
+      if (skip?.has(socket)) continue;
       try {
         socket.send(payload);
       } catch {
@@ -364,25 +390,115 @@ export function createSessionWorkerWebSocketService({
     }
   }
 
+  /** Hands a row to every ready socket; resolves to the sockets that got one. */
   async function maybeDeliverToReadyClients(reason = 'queue-update') {
+    const sockets = [];
     const deliveries = [];
     for (const socket of clients) {
       const meta = clientState.get(socket);
       if (!meta?.ready || meta.delivering) continue;
+      sockets.push(socket);
       deliveries.push(maybeDeliverToSocket(socket, reason));
     }
-    if (!deliveries.length) return;
-    await Promise.allSettled(deliveries);
+    const handed = new Set();
+    if (!deliveries.length) return handed;
+    const results = await Promise.allSettled(deliveries);
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value === true) handed.add(sockets[index]);
+    });
+    return handed;
   }
 
+  // Ready sockets get their rows first; then every other socket hears that
+  // the queue changed (a worker the relay does not count as ready, a steering
+  // one mid-turn, answers with a ready of its own). A socket just handed a
+  // row is busy with it and is not told.
+  async function deliverThenAnnounce(reason, { announce = true } = {}) {
+    const handed = await maybeDeliverToReadyClients(reason);
+    if (announce) emitQueueChanged(reason, { skip: handed });
+    return handed;
+  }
+
+  /**
+   * The queue may have work: a write, a gate that lifted, a retry come due.
+   * Hands rows out now instead of at the next poll.
+   */
+  async function notifyQueueChanged(reason = 'queue-update') {
+    if (stopped) return new Set();
+    lastSnapshot = normalizeQueueSnapshot(queueCounts());
+    // A turn that ended with nothing behind it: no row to hand out, so no
+    // dequeue attempt per ready socket and no announcement.
+    const handed = lastSnapshot.pendingCount > 0 ? await deliverThenAnnounce(reason) : new Set();
+    armDueTimer();
+    return handed;
+  }
+
+  // The backstop. With nothing pending nothing can be handed out: no dequeue
+  // attempt, only the count change announced. With rows pending (a retry in
+  // backoff, a gate, a worker not yet up) every tick tries the ready sockets,
+  // as a net under the event-driven wakes.
   function monitorQueue() {
     const snapshot = normalizeQueueSnapshot(queueCounts());
+    try { onQueueSnapshot(snapshot); } catch {}
     const changed = queueSnapshotChanged(snapshot, lastSnapshot);
     lastSnapshot = snapshot;
-    if (changed) {
+    if (snapshot.pendingCount > 0) {
+      void deliverThenAnnounce(changed ? 'queue-count-changed' : 'ready-check', { announce: changed });
+    } else if (changed) {
       emitQueueChanged('queue-count-changed');
     }
-    void maybeDeliverToReadyClients(changed ? 'queue-count-changed' : 'ready-check');
+    armDueTimer();
+  }
+
+  const DUE_TIMER_MIN_MS = 50;
+  const DUE_TIMER_MAX_MS = 60_000;
+
+  function clearDueTimer() {
+    dueTimerForMs = null;
+    if (!dueTimer) return;
+    clearTimeout(dueTimer);
+    dueTimer = null;
+  }
+
+  /**
+   * One timer for the earliest future retry time. An armed timer for the same
+   * time is kept; any other arm clears the one before. A time further than a
+   * minute away is re-read after a minute.
+   */
+  function armDueTimer() {
+    if (stopped) {
+      clearDueTimer();
+      return;
+    }
+    // A timer whose time has come fires and re-arms itself: a poll in the
+    // same instant (its row no longer "future") must not clear it unfired.
+    if (dueTimer && dueTimerForMs !== null && dueTimerForMs <= nowMsSafe()) return;
+    let dueAt = null;
+    try { dueAt = nextDueAtMs(); } catch { dueAt = null; }
+    const dueMs = Number(dueAt);
+    if (dueAt === null || dueAt === undefined || !Number.isFinite(dueMs)) {
+      clearDueTimer();
+      return;
+    }
+    if (dueTimer && dueTimerForMs === dueMs) return;
+    clearDueTimer();
+    const untilDueMs = dueMs - nowMsSafe();
+    const delayMs = Math.min(DUE_TIMER_MAX_MS, Math.max(DUE_TIMER_MIN_MS, untilDueMs));
+    // A time further than the cap: this firing only re-reads.
+    const reachesDue = untilDueMs <= DUE_TIMER_MAX_MS;
+    dueTimerForMs = dueMs;
+    dueTimer = setTimeout(() => {
+      dueTimer = null;
+      dueTimerForMs = null;
+      if (stopped) return;
+      if (reachesDue) {
+        // Whatever came due may go now; a row that was claimed or cancelled
+        // meanwhile makes this a wake with nothing to do.
+        try { onDue('retry-due'); } catch {}
+      }
+      armDueTimer();
+    }, delayMs);
+    if (typeof dueTimer.unref === 'function') dueTimer.unref();
   }
 
   function rejectUpgrade(socket) {
@@ -432,6 +548,7 @@ export function createSessionWorkerWebSocketService({
       deliveryFailures: 0,
     });
     if (identity.sessionId) supersedePriorSockets(ws, identity.sessionId);
+    noteSocketCount();
     touchCli();
     emitEvent(ws, serverHello('connected', identity.sessionId));
 
@@ -466,8 +583,13 @@ export function createSessionWorkerWebSocketService({
         noteWorkerBuildId(meta, payload);
         meta.ready = true;
         meta.lastReadyAt = nowIso();
-        noteHeartbeat(meta, String(payload.reason || 'worker-ready'));
-        void maybeDeliverToSocket(ws, String(payload.reason || 'worker-ready'));
+        const readyReason = String(payload.reason || 'worker-ready');
+        noteHeartbeat(meta, readyReason);
+        // A keepalive's ready with nothing pending has nothing to draw: one
+        // count instead of a dequeue attempt. Any row that appears wakes the
+        // queue, and this socket stays ready for it.
+        if (readyReason === 'readiness-refresh' && normalizeQueueSnapshot(queueCounts()).pendingCount === 0) return;
+        void maybeDeliverToSocket(ws, readyReason);
         return;
       }
       if (payload.type === 'worker.unready') {
@@ -526,6 +648,7 @@ export function createSessionWorkerWebSocketService({
   }
 
   function start() {
+    stopped = false;
     if (!attached) {
       httpServer.on('upgrade', onUpgrade);
       wss.on('connection', onConnection);
@@ -537,10 +660,13 @@ export function createSessionWorkerWebSocketService({
     }
     lastSnapshot = normalizeQueueSnapshot(queueCounts());
     emitQueueChanged('started');
+    armDueTimer();
     logDebug(`[worker-ws] listening on ${wsPath}`);
   }
 
   function stop() {
+    stopped = true;
+    clearDueTimer();
     if (interval) {
       clearInterval(interval);
       interval = null;
@@ -554,6 +680,7 @@ export function createSessionWorkerWebSocketService({
     }
     clients.clear();
     clientState.clear();
+    noteSocketCount();
     try { wss.close(); } catch (error) {
       logWarn(`[worker-ws] close failed: ${error?.message || error}`);
     }
@@ -610,6 +737,7 @@ export function createSessionWorkerWebSocketService({
     stop,
     status,
     emitQueueChanged,
+    notifyQueueChanged,
     emitDraining,
     handleUpgrade,
     sendControlToSession,

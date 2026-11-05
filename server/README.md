@@ -1509,6 +1509,9 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
   which finds ask ids only: a card's id is not found there, and B's question routes refuse every
   approval card from another relay as before. `GET /api/relay-asks/remote/inbox` gives A's Inbox
   B's asks and cards, an approval card by its header alone and nothing that routes an answer.
+- **Turn.** An ask remembers the queue row of the turn that asked it (`queue_id`, migration 0037;
+  null for an ask on behalf, a paired relay's agent's and older asks), so the browser can show it
+  in that turn's bubble.
 - **Ends.** Archiving or deleting the session cancels its pending asks (nobody told) and the
   mirrors it asked; a compaction moves them (`carryToCompacted`); a removed pairing cancels its
   mirrors. Closed rows are pruned after a week.
@@ -2703,7 +2706,7 @@ There is no migration runner and no record of applied migrations. At every start
 `applySchema(db)` (`server/db-schema.mjs`, the same code the tests build their databases with) runs
 `SCHEMA_SQL` (`CREATE TABLE IF NOT EXISTS` for a fresh database), then the upgrade sequence:
 guarded `ALTER TABLE … ADD COLUMN` statements (each runs only when `PRAGMA table_info` lacks the
-column) and, among them, the functions of `server/migrations/0002-…` to `0022-…` in order. Each of those checks the
+column) and, among them, the functions of `server/migrations/0002-…` to `0037-…` in order. Each of those checks the
 schema itself and does nothing when its change is already there, so all of them run on every boot.
 From 0004 on a failure is logged (`migration 00NN failed; retrying on next boot`) and the boot goes
 on. Every file can also be run by hand against a database: `node server/migrations/<file>.mjs
@@ -2796,6 +2799,11 @@ four indexes (one unique on `relay_id`, `remote_id`): see
 [Questions that don't block](#questions-that-dont-block). Additive and idempotent; a failure is
 logged and retried on the next boot, and the ask actions answer that they are not available
 meanwhile. An older build ignores the table.
+`0037-relay-asks-queue-id.mjs` adds `relay_asks.queue_id` (TEXT, no index): the queue row of the
+turn that asked, NULL for an ask on behalf of another session, one a paired relay's agent made, a
+mirror and every older ask. Not part of 0023's column check: the ask service works without it and
+then stores none. Additive and idempotent, nothing to do without the table; a failure is logged
+and retried on the next boot. An older build ignores the column.
 `0024-deepseek-usage-totals.mjs` adds `deepseek_usage_totals` (`model` as the key, `hit_tokens`,
 `miss_tokens`, `output_tokens`, `turn_count`, `cost_usd` and `cost_cny` (NULL while no turn of the
 model could be priced), `first_seen_at`, `last_seen_at`, `updated_at`): what

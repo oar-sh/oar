@@ -5040,6 +5040,61 @@ test('an AskUserQuestion between turns attaches to a fresh continuation turn ins
   await settled(runner);
 });
 
+test('a person-only safety ask between turns gets its card on a fresh continuation turn', async () => {
+  const calls = [];
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/continuation-turn') return { messageId: 'cont-1' };
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      return { question: { id: 'rq-1', status: 'answered', answer: 'Allow once' } };
+    }
+    return { ok: true };
+  };
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: osModule.tmpdir(),
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeSessionImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+    continuationRetryDelayMs: 10,
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'agent', description: 'background agent' }]));
+  turn.emit(resultMessage('spawned', 'native-1'));
+  assert.equal(await first, true);
+
+  const input = { command: 'rm -rf /srv/sample-app/work' };
+  const decision = await capturedCanUseTool('Bash', input, {
+    decisionReason: 'Dangerous rm operation on working directory or its ancestor: /srv/sample-app/work',
+    decisionReasonType: 'safetyCheck',
+    suppressAlwaysAllowRule: true,
+    toolUseID: 'toolu_sample_1',
+  });
+  assert.deepEqual(decision, { behavior: 'allow', updatedInput: input });
+  const questionPost = calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal(questionPost.body.queueId, 'cont-1', 'the card must ride the registered continuation turn');
+  assert.equal(questionPost.body.context.source, 'ClaudeSafetyCheck');
+  assert.deepEqual(questionPost.body.choices, ['Allow once', 'Deny']);
+  assert.equal(questionPost.body.allowFreeform, false);
+
+  turn.emit(resultMessage('removed', 'native-1'));
+  await waitFor(
+    () => calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
 test('a session-scoped refusal fallback is recorded truthfully and the pinned model is repinned next turn', async () => {
   // Live incident (conv 3366b9d3): a security-audit session pinned to
   // claude-fable-5[1m] tripped Fable's safeguards; the CLI switched the whole

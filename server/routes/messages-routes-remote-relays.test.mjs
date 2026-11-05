@@ -556,6 +556,53 @@ test('an approval card takes no typed text: anything but Allow or Deny is refuse
   assert.deepEqual(await decision, { approved: true });
 });
 
+test('no agent, of this relay or another, may list or answer a Safety check card; the user may, by its choices alone', async () => {
+  const fx = boot();
+  const turn = await fx.send('clean up the sample build folder');
+  const row = deliver(fx);
+  assert.equal(row.id, turn.body.messageId);
+  const asked = await fx.post('/api/relay-question', { queueId: row.id, prompt: 'Which theme?', choices: ['Light', 'Dark'] });
+  const ordinaryId = asked.body.question.id;
+  const now = new Date().toISOString();
+  fx.stmts.insertQuestion.run(
+    'safety-1', row.id, CONV, row.id, 'agent',
+    'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?\n\nBash command:\n│ rm -rf /srv/sample-app/work',
+    JSON.stringify(['Allow once', 'Deny']),
+    JSON.stringify({ request: null, context: { source: 'ClaudeSafetyCheck', header: 'Safety check' }, allowFreeform: false }),
+    null, null, null, null, null, now, questionExpiresAt(now, 120000), row.attemptId || null,
+  );
+  const pending = { query: { conversationId: CONV, status: 'pending' } };
+  // The loopback client of this relay's own dispatcher sends the origin
+  // header too, so this covers this relay's agents as well as others'.
+  const asAgent = { headers: agentHeaders };
+
+  const userList = await fx.get('/api/relay-questions', pending);
+  assert.deepEqual(userList.body.questions.map((question) => question.id).sort(), ['safety-1', ordinaryId].sort());
+  const agentList = await fx.get('/api/relay-questions', { ...pending, ...asAgent });
+  assert.deepEqual(agentList.body.questions.map((question) => question.id), [ordinaryId], 'the card is hidden from agents');
+  // Readable by id, so answer_question can say whose card it is.
+  const agentRead = await fx.get('/api/relay-question/:id', { ...asAgent, params: { id: 'safety-1' } });
+  assert.equal(agentRead.status, 200);
+  assert.equal(agentRead.body.question.id, 'safety-1');
+
+  const agentAnswer = await fx.post('/api/relay-question/:id/answer', { answer: 'Allow once' }, { ...asAgent, params: { id: 'safety-1' } });
+  assert.equal(agentAnswer.status, 403);
+  assert.match(agentAnswer.body.error, /the user's to answer/);
+  const bodyOrigin = await fx.post('/api/relay-question/:id/answer', { answer: 'Allow once', origin: ORIGIN }, { params: { id: 'safety-1' } });
+  assert.equal(bodyOrigin.status, 403, 'a body origin marks the caller too');
+  const agentTimeout = await fx.post('/api/relay-question/:id/timeout', {}, { ...asAgent, params: { id: 'safety-1' } });
+  assert.equal(agentTimeout.status, 403);
+  assert.equal(fx.stmts.getQuestion.get('safety-1').status, 'pending', 'the refused calls leave the card open');
+
+  // The user answers by its choices alone.
+  const typed = await fx.post('/api/relay-question/:id/answer', { answer: 'yes, go ahead' }, { params: { id: 'safety-1' } });
+  assert.equal(typed.status, 400);
+  assert.equal(fx.stmts.getQuestion.get('safety-1').status, 'pending');
+  const userAnswer = await fx.post('/api/relay-question/:id/answer', { answer: 'Allow once' }, { params: { id: 'safety-1' } });
+  assert.equal(userAnswer.status, 200, JSON.stringify(userAnswer.body));
+  assert.equal(fx.stmts.getQuestion.get('safety-1').answer, 'Allow once');
+});
+
 test('a card with choices and no stored flag takes only its choices, as the card view reads it', async () => {
   const fx = boot();
   const turn = await fx.send('pick a theme');

@@ -350,6 +350,74 @@ ${renderThinkingButtons('display', THINKING_DISPLAY_CHOICES, displayKey)}
   `;
 }
 
+const THOUGHTS_EXPANDED_CHOICES = Object.freeze([
+  { key: 'on', label: 'Expanded' },
+  { key: 'off', label: 'Collapsed' },
+]);
+
+/**
+ * The mirror of Settings › General "Expand thoughts while an agent works", for
+ * every provider. A setting of this browser, so nothing goes to the relay:
+ * the buttons write thoughts-preference.mjs and both places follow it.
+ *
+ * @returns {string} HTML
+ */
+export function renderThoughtsPreferenceHtml({ expanded = true } = {}) {
+  const activeKey = expanded === false ? 'off' : 'on';
+  const buttons = THOUGHTS_EXPANDED_CHOICES.map(({ key, label }) => `
+          <button
+            type="button"
+            class="ctx-thoughts-btn${key === activeKey ? ' is-active' : ''}"
+            data-thoughts-expanded="${key}"
+            aria-pressed="${key === activeKey ? 'true' : 'false'}"
+          >${escapeHtml(label)}</button>`).join('');
+  return `
+    <div class="ctx-thinking ctx-thoughts">
+      <div class="ctx-thinking-row">
+        <span class="ctx-thinking-label">💭 Thoughts</span>
+        <div class="ctx-thinking-group" role="group" aria-label="Thoughts while an agent works">
+${buttons}
+        </div>
+      </div>
+      <div class="ctx-thinking-note">Whether thoughts open while an agent works, in sub-agent bubbles and in the sub-agent viewer. A thought you fold or open by hand stays that way. Saved in this browser.</div>
+    </div>
+  `;
+}
+
+const STREAM_VIEW_CHOICES = Object.freeze([
+  { key: 'on', label: 'On' },
+  { key: 'off', label: 'Off' },
+]);
+
+/**
+ * The mirror of Settings › General "Stream view", for every provider. A
+ * setting of this browser (stream-view-preference.mjs); nothing goes to the
+ * relay.
+ *
+ * @returns {string} HTML
+ */
+export function renderStreamViewPreferenceHtml({ on = false } = {}) {
+  const activeKey = on === true ? 'on' : 'off';
+  const buttons = STREAM_VIEW_CHOICES.map(({ key, label }) => `
+          <button
+            type="button"
+            class="ctx-thoughts-btn ctx-stream-view-btn${key === activeKey ? ' is-active' : ''}"
+            data-stream-view="${key}"
+            aria-pressed="${key === activeKey ? 'true' : 'false'}"
+          >${escapeHtml(label)}</button>`).join('');
+  return `
+    <div class="ctx-thinking ctx-stream-view">
+      <div class="ctx-thinking-row">
+        <span class="ctx-thinking-label">🧵 Stream view</span>
+        <div class="ctx-thinking-group" role="group" aria-label="Stream view">
+${buttons}
+        </div>
+      </div>
+      <div class="ctx-thinking-note">Thoughts, tool calls and the reply of a turn as one list in the order they happened. Turns recorded before this version keep the grouped layout. Saved in this browser.</div>
+    </div>
+  `;
+}
+
 /**
  * The owner's switch for a session an agent started: may its agents start
  * sessions themselves (the relay_tool's one-level rule lifted for it)?

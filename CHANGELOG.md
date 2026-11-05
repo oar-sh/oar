@@ -3,6 +3,119 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.22] — 2026-11-05
+
+Highlights: questions that don't block move into the chat header. A **📓**
+icon with a count opens them, urgent ones first, and the turn that asked
+keeps one line, "📓 Question for you", in place of the card. Settings →
+General reads as five headed sections, with three new choices: whether
+thoughts start open while an agent works, how many tool lines a working
+agent shows, counted per agent so a busy sub-agent no longer pushes out the
+main agent's lines, and a stream view that shows a turn's thoughts and tool
+calls in the order they happened. While a turn runs, the page's poll leaves
+out what it already holds, and an idle relay and its workers wake far less
+often. Claude sessions now ask you in a **Safety check** card, which only
+you can answer, before removals and other asks Claude Code marks as
+person-only.
+
+### Changed
+
+- **📓 Questions in the chat header.** A conversation's questions that don't
+  block sit behind a 📓 icon with a count, first among the header icons (in
+  ︙ when the header runs out of room). It opens a list under it with the
+  full cards, urgent ones first with their details open, and what was
+  answered in the last day below; answering keeps the list open. On a phone
+  the list spans the width over a dimmed page, with half-width buttons. While
+  an urgent question waits, 📓 and the Inbox show the urgent count in red.
+  The Inbox's link to a session opens it with 📓 at that question. Each ask
+  now remembers the turn that asked it (migration 0037).
+- **A question leaves one line in the turn that asked it.** The cards of
+  questions that don't block no longer sit at the end of the conversation;
+  the reply of the turn that asked shows a one-line "📓 Question for you"
+  instead (live while it runs, "Answered: …" once answered), and a tap opens
+  📓 at that question. A question asked for another session, carried over by
+  a compaction or from before this version stands as one line at the end
+  while it waits.
+- **Settings → General in headed sections.** The tab reads as five groups,
+  Appearance, Reading, Turns and tasks, This relay and Updates, instead of
+  one long column. Each relay-wide row now says it is a setting of this
+  relay; the per-browser rows keep "Saved in this browser."
+- **Thoughts open or closed by your choice.** Settings → General →
+  Appearance has "Expand thoughts while an agent works" (on by default), with
+  a 💭 Thoughts mirror in the 🧠 modal. It decides whether thoughts start open
+  in the live turn, in live sub-agent bubbles and in the sub-agent viewer,
+  finished thoughts there included. An open live thought keeps a one-line
+  header to fold it by; a thought you fold or open by hand stays that way
+  while more text streams in. A finished reply's 💭 fold stays closed as
+  before.
+- **The main agent's tool lines stay while sub-agents work.** The live
+  bubble's tool list is capped per agent now, the main agent and each
+  sub-agent apart, so a busy sub-agent no longer pushes the main agent's
+  lines out. Settings → General → Appearance has "Tool lines shown while an
+  agent works": 50 by default, 10 to 500 or no limit. The relay sends the
+  running turn's newest lines per agent as the page's setting asks (50 when
+  it does not say, 500 at most), and for a finished turn the main agent's
+  newest 200 and each sub-agent's newest 50 (it sent the first 48 of the
+  whole turn). A sub-agent bubble that holds as many lines as the setting
+  shows "50+ steps".
+- **Stream view: a turn in the order it happened.** Settings → General →
+  Appearance has "Stream view" (off by default), with a 🧵 mirror in the 🧠
+  modal. When it is on, an agent turn's thoughts and tool calls show as one
+  list in the order they happened, live and in the finished message, with
+  the reply last. For Copilot, Cursor and Grok, tools and thoughts stream in
+  arrival order and the reply comes after them. The relay now numbers a
+  turn's thoughts and tool lines in one sequence (migration 0038); turns
+  recorded before that keep the grouped layout. A finished turn whose main
+  agent ran more than 200 tool lines says how many earlier ones it left out.
+- **The live poll leaves out what the page already has.** While a turn
+  runs, the page asks for its conversation about once a second. It now
+  names the finished replies whose tool lines and thoughts it already holds,
+  and the relay leaves those out unless they changed since (a busy window:
+  about 6 KB per poll instead of over 200 KB). Opening a conversation,
+  paging back and every other load still get everything.
+- **An idle relay and its workers wake far less often.** The relay no
+  longer polls its queue twice a second: a write that makes a message
+  deliverable wakes delivery at once, through triggers on the queue table.
+  A retry or a usage-limit hold gets a timer for the moment it ends, and a
+  10 s poll stays as a backstop. A gate lifting (relay resumed, restart
+  cancelled, tunnel connected, a kill's grace over, a worker replacement
+  done) wakes delivery too. The CLI status, the share-viewer prune and the
+  worker prime run only while there is something for them to do. Each
+  worker has one keepalive instead of two 10 s timers, and it beats every
+  30 s while idle, on a relay that supports it. A silent worker now counts
+  as gone after 90 s instead of 30 s. Workers and relays of older versions
+  keep working with the new ones.
+- **Claude sessions ask you before removals and other asks Claude Code
+  marks as person-only, instead of allowing them.** Such an ask, for
+  example an `rm -rf` of the working folder, used to be approved by the
+  relay like every other ask. Now a **Safety check** card, in the session
+  and in the Inbox, shows Claude Code's reason
+  and then the whole command, each line behind `│`, with hidden or
+  reordering characters shown as `\u{…}`. It offers **Allow once** and
+  **Deny**, takes no typed reply, and only you can answer it: no agent,
+  of this relay or another, sees it among a session's questions or may
+  answer it. It allows only that one call and adds no rule. A denial, no
+  answer within the question timeout, a stopped turn or a relay that
+  cannot show the card all leave the command unrun, and a command too long
+  to show is refused without a card. Other asks are still allowed as
+  before.
+
+### Upgrade notes
+
+- **Two small migrations.** 0037 adds the asking turn to each ask and 0038
+  the sequence number to a turn's thoughts and tool lines, with an index;
+  neither rewrites the rows already there. As before, the relay copies its
+  database to the backups folder before the first start of a new version.
+- **Every session worker is replaced once after the update,** as in
+  0.9.21: once its session is idle and its CLI has ended, usually some 10
+  minutes after its last turn. A Claude session shows the **Safety check**
+  card once its worker runs 0.9.22. Nothing needs to be done.
+- **Mixed versions work together.** A 0.9.21 worker on a 0.9.22 relay keeps
+  its 10 s beat, and a 0.9.22 worker on a 0.9.21 relay beats every 10 s.
+  Paired relays of both versions keep working with each other.
+- **No new dependency.** Going back to 0.9.21 needs no database step: it
+  leaves the new columns and the index alone.
+
 ## [0.9.21] — 2026-11-01
 
 Highlights: the chat screen is more compact. The mode, model, effort,

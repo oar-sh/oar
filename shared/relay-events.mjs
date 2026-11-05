@@ -560,6 +560,7 @@ export function formatRelayEventLine(event) {
       const parts = [`${head} ${quote(detail.prompt, RELAY_EVENT_LIMITS.questionChars)}`];
       if (options.length) parts.push(`options: ${options.map((option) => `[${option}]`).join(' ')}`);
       if (detail.approvalCard) parts.push('(an approval card: only the user can answer it)');
+      else if (detail.personOnly) parts.push('(a Safety check: the user\'s to answer)');
       else if (oneLine(detail.questionId, 80)) parts.push(`(question_id ${oneLine(detail.questionId, 80)})`);
       if (detail.kind === 'ask') parts.push('(asked with ask: it does not block that session)');
       return parts.join(' ');

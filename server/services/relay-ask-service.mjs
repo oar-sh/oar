@@ -108,6 +108,15 @@ export function createRelayAskService({
     }
   })();
   const available = !problem;
+  // The turn an ask was made in (migration 0037); without the column asks
+  // still work and store none.
+  const hasQueueId = available && (() => {
+    try {
+      return db.prepare(`PRAGMA table_info(relay_asks)`).all().some((column) => column.name === 'queue_id');
+    } catch {
+      return false;
+    }
+  })();
 
   const sql = available ? {
     insert: db.prepare(`
@@ -116,6 +125,12 @@ export function createRelayAskService({
          question, options_json, recommendation, detail, urgency, status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     `),
+    insertWithQueue: hasQueueId ? db.prepare(`
+      INSERT INTO relay_asks
+        (id, relay_id, remote_id, conversation_id, conversation_title, created_by, creator_json,
+         question, options_json, recommendation, detail, urgency, status, created_at, updated_at, queue_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `) : null,
     get: db.prepare(`SELECT * FROM relay_asks WHERE id = ?`),
     getMirror: db.prepare(`SELECT * FROM relay_asks WHERE relay_id = ? AND remote_id = ?`),
     // The Inbox: this relay's asks, pending and closed since.
@@ -131,6 +146,17 @@ export function createRelayAskService({
         AND (status = 'pending' OR (status <> 'pending' AND updated_at >= ?))
       ORDER BY created_at DESC, rowid DESC LIMIT ?
     `),
+    // A session's own cards: the asks in it kept here, none it only asked
+    // elsewhere and no mirrors.
+    listIn: db.prepare(`
+      SELECT * FROM relay_asks
+      WHERE conversation_id = ? AND relay_id = 'self'
+        AND (status = 'pending' OR (status <> 'pending' AND updated_at >= ?))
+      ORDER BY created_at DESC, rowid DESC LIMIT ?
+    `),
+    // What carryIn and carryBy are about to move.
+    listCarryIn: db.prepare(`SELECT id FROM relay_asks WHERE relay_id = 'self' AND conversation_id = ? AND status = 'pending'`),
+    listCarryBy: db.prepare(`SELECT id FROM relay_asks WHERE created_by = ? AND status = 'pending'`),
     countPendingHere: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE relay_id = 'self' AND status = 'pending'`),
     countPendingIn: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE relay_id = 'self' AND conversation_id = ? AND status = 'pending'`),
     countPendingBy: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE created_by = ? AND status = 'pending'`),
@@ -228,6 +254,9 @@ export function createRelayAskService({
         ? { relay: creator.relayName || null, conversationId: creator.conversationId || null, title: creator.conversationTitle || null }
         : (toText(row.created_by) ? { conversationId: row.created_by, title: toText(asker?.title) || null } : null),
       onBehalf: creator ? true : (!!toText(row.created_by) && row.created_by !== row.conversation_id),
+      // The queue row of the turn that asked (null: on behalf, a paired
+      // relay's agent, or older); a mirror has none.
+      ...(mirror ? {} : { queueId: row.queue_id || null }),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -259,9 +288,10 @@ export function createRelayAskService({
   /**
    * Stores an ask about `conversationId` (a session of this relay). The asker
    * is `createdBy` (a conversation here: the same one, or a lead asking for
-   * another) or `creator` (a paired relay's agent). Returns the ask.
+   * another) or `creator` (a paired relay's agent). `queueId`: the queue row
+   * of the turn that asked, when it ran in this session. Returns the ask.
    */
-  function create({ conversationId, createdBy = null, creator = null, ...input } = {}) {
+  function create({ conversationId, createdBy = null, creator = null, queueId = null, ...input } = {}) {
     requireAvailable();
     const session = conversation(conversationId);
     if (!isLive(session)) {
@@ -281,7 +311,7 @@ export function createRelayAskService({
     const { question, options, recommendation, detail, urgency } = checked.value;
     const id = newId();
     const at = isoNow();
-    sql.insert.run(
+    const values = [
       id,
       SELF,
       null,
@@ -296,7 +326,9 @@ export function createRelayAskService({
       urgency,
       at,
       at,
-    );
+    ];
+    if (sql.insertWithQueue) sql.insertWithQueue.run(...values, clip(queueId, 200) || null);
+    else sql.insert.run(...values);
     const row = sql.get.get(id);
     const ask = shape(row);
     log(`${id} in ${shortId(session.id)} by ${remoteCreator ? `relay ${shortId(remoteCreator.relayId)}` : shortId(asker)}${urgency === 'now' ? ' (now)' : ''}`);
@@ -332,6 +364,20 @@ export function createRelayAskService({
     const id = toText(conversationId);
     const since = new Date(now() - RELAY_ASK_LIMITS.answeredKeepMs).toISOString();
     const rows = sql.listOf.all(id, id, since, RELAY_ASK_LIMITS.listMax);
+    return [...rows.filter((row) => row.status === 'pending'), ...rows.filter((row) => row.status !== 'pending')].map(shape);
+  }
+
+  /**
+   * A session's cards: the asks in it kept on this relay (not those it only
+   * asked elsewhere, no mirrors), pending first, then those closed in the
+   * last answeredKeepMs.
+   */
+  function listIn(conversationId) {
+    if (!available) return [];
+    const id = toText(conversationId);
+    if (!id) return [];
+    const since = new Date(now() - RELAY_ASK_LIMITS.answeredKeepMs).toISOString();
+    const rows = sql.listIn.all(id, since, RELAY_ASK_LIMITS.listMax);
     return [...rows.filter((row) => row.status === 'pending'), ...rows.filter((row) => row.status !== 'pending')].map(shape);
   }
 
@@ -429,7 +475,19 @@ export function createRelayAskService({
     const from = toText(sourceId);
     const to = toText(targetId);
     if (!from || !to || from === to) return 0;
-    const moved = db.transaction(() => sql.carryIn.run(to, from).changes + sql.carryBy.run(to, from).changes)();
+    // The rows both updates touch, each once (a self-ask in and by the
+    // source is in both), so their cards follow to the successor.
+    const touched = new Set();
+    const moved = db.transaction(() => {
+      for (const row of sql.listCarryIn.all(from)) touched.add(row.id);
+      for (const row of sql.listCarryBy.all(from)) touched.add(row.id);
+      return sql.carryIn.run(to, from).changes + sql.carryBy.run(to, from).changes;
+    })();
+    for (const id of touched) {
+      const row = sql.get.get(id);
+      // A mirror's card lives on the paired relay: nothing to show here.
+      if (row && row.relay_id === SELF) changed(row);
+    }
     if (moved) log(`conv=${shortId(from)} compacted into ${shortId(to)}: ${moved} question${moved === 1 ? '' : 's'} moved`);
     return moved;
   }
@@ -586,6 +644,7 @@ export function createRelayAskService({
     get,
     listHere,
     listOf,
+    listIn,
     pendingCount,
     answer,
     dismiss,

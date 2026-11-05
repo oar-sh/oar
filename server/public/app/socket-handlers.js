@@ -33,7 +33,8 @@ import {
   IS_SHARED_VIEW,
 } from './store.js';
 import { scheduleContextUsageRefresh } from './api-client.js';
-import { capLiveActivityEntries } from './activity-replay-state.mjs';
+import { capFinishedActivityEntries, capLiveActivityEntries, normalizeTurnSeq } from './activity-replay-state.mjs';
+import { liveActivityCap } from './live-activity-cap.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
 import { clearOpenConversation, renderConvList, refreshConversations, scheduleLoadedConversationsRefresh, applyConversationGroupEvent, openConversation } from './journal-view.js';
 import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
@@ -50,6 +51,7 @@ import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-bo
 import { setConversationBackgroundTasks, setConversationTaskHealth } from './background-tasks-view.mjs';
 import { handleTaskConsoleReconnect, handleTaskOutputChunk } from './task-console.mjs';
 import { setConversationPins } from './pinned-messages-view.mjs';
+import { noteQuestionAskUpdated, refreshQuestions } from './questions-panel-ui.js';
 import { setConversationHiddenMessages } from './hidden-messages-view.mjs';
 import { setPreviews } from './preview-cards.mjs';
 import { applyShareSettings, hasActiveShare, refreshShares } from './share-state.js';
@@ -377,8 +379,10 @@ export async function connectSocket(overrideDeps) {
     void loadRelayEventSubscriptions();
     // Schedules that changed or fired while away.
     void loadRelaySchedules();
-    // Questions asked or answered while away.
+    // Questions asked or answered while away: the Inbox and the open
+    // conversation's 📓.
     void refreshInbox();
+    void refreshQuestions();
     // Shares made or stopped while away.
     void refreshShares().catch(() => {});
   });
@@ -600,7 +604,8 @@ export async function connectSocket(overrideDeps) {
     }
     if ((!message?.activities || !message.activities.length) && sourceMessageId) {
       const cached = relayActivities.get(sourceMessageId) || [];
-      if (cached.length) message.activities = cached.slice(0, 48);
+      // The finished turn's cap (newest rows per thread), as the relay sends it.
+      if (cached.length) message.activities = capFinishedActivityEntries(cached);
     }
     if (sourceMessageId) {
       const persistedThoughts = Array.isArray(message?.thoughts) ? message.thoughts : [];
@@ -669,7 +674,10 @@ export async function connectSocket(overrideDeps) {
   // A paired relay's pending cards changed (this relay checks them every ~20 s).
   socket.on(INBOX_REMOTE_CHANGED_EVENT, () => noteInboxQuestionsChanged());
   // Questions that don't block: one ask, after every change of it.
-  socket.on(RELAY_ASK_SOCKET_EVENT, (payload) => noteRelayAskUpdated(payload));
+  socket.on(RELAY_ASK_SOCKET_EVENT, (payload) => {
+    noteRelayAskUpdated(payload);
+    noteQuestionAskUpdated(payload?.ask);
+  });
   socket.on('relay_board', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_updated', ({ board }) => upsertRelayBoard(board));
   socket.on('relay_board_changed', () => {
@@ -752,21 +760,36 @@ export async function connectSocket(overrideDeps) {
     if (payload && typeof payload === 'object') applyAgentSessionsSettingsState(payload);
     else void refreshAgentSessionsSection();
   });
-  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata }) => {
+  socket.on('relay_activity', ({ conversationId, messageId, text, subagentRunId, metadata, turnSeq }) => {
     if (!messageId || !text) return;
+    const numbered = normalizeTurnSeq(turnSeq);
     const entry = {
       text: String(text || '').trim(),
       subagentRunId: subagentRunId ? String(subagentRunId).trim() : null,
       metadata: (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : null,
+      ...(numbered !== null ? { turnSeq: numbered } : {}),
     };
     if (!entry.text) return;
     const items = relayActivities.get(messageId) || [];
     const last = items[items.length - 1];
     const lastText = typeof last === 'string' ? last : String(last?.text || '');
     const lastSubagentRunId = typeof last === 'object' && last ? (last.subagentRunId || null) : null;
-    // The same line again (a repeated event) adds nothing.
-    const added = lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId;
-    if (added) relayActivities.set(messageId, capLiveActivityEntries(items.concat(entry)));
+    // The same event again (a replay after a reconnect) adds nothing. A
+    // numbered row is known by its number, so the same tool line run twice
+    // is two rows; an unnumbered one (an older relay) by being the last line.
+    const added = numbered !== null
+      ? !items.some((item) => item?.turnSeq === numbered)
+      : (lastText !== entry.text || lastSubagentRunId !== entry.subagentRunId);
+    if (numbered !== null && !added) return;
+    if (added) {
+      // A numbered list stays in the turn's order, so a row replayed after
+      // the cap trimmed it sorts to the front and is trimmed again.
+      let next = items.concat(entry);
+      if (numbered !== null && next.every((item) => item?.turnSeq != null)) next = next.sort((a, b) => a.turnSeq - b.turnSeq);
+      const kept = capLiveActivityEntries(next, liveActivityCap());
+      relayActivities.set(messageId, kept);
+      if (numbered !== null && !kept.includes(entry)) return;
+    }
     if (entry.subagentRunId) {
       upsertSubagentRun({ subagentRunId: entry.subagentRunId, messageId, conversationId });
       addSubagentActivity(entry.subagentRunId, entry.text);
@@ -795,14 +818,22 @@ export async function connectSocket(overrideDeps) {
     // A frame that was dropped (out of order, a finished turn) is no news.
     if (accepted && !autoScroll) noteTranscriptNews();
   });
-  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId }) => {
+  socket.on('relay_thought', ({ conversationId, messageId, reasoningId, text, done, subagentRunId, turnSeq }) => {
     if (!messageId) return;
     const key = String(reasoningId || 'reasoning');
     const thoughtMap = relayThoughts.get(messageId) || new Map();
     const known = thoughtMap.get(key);
     // The same thought again (a repeated event) adds nothing.
     const added = !known || known.text !== String(text || '') || known.done !== !!done;
-    thoughtMap.set(key, { reasoningId: key, text: String(text || ''), done: !!done, subagentRunId: subagentRunId || null });
+    // A thought keeps the place of its first chunk.
+    const keptTurnSeq = known?.turnSeq ?? normalizeTurnSeq(turnSeq);
+    thoughtMap.set(key, {
+      reasoningId: key,
+      text: String(text || ''),
+      done: !!done,
+      subagentRunId: subagentRunId || null,
+      ...(keptTurnSeq != null ? { turnSeq: keptTurnSeq } : {}),
+    });
     relayThoughts.set(messageId, thoughtMap);
     if (subagentRunId) {
       upsertSubagentRun({ subagentRunId, messageId, conversationId });
@@ -810,7 +841,7 @@ export async function connectSocket(overrideDeps) {
     }
     if (conversationId === currentConvId) {
       const autoScroll = followsTranscriptEnd();
-      appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll);
+      appendThinkingThought(key, String(text || ''), !!done, subagentRunId, autoScroll, messageId);
       if (added && !autoScroll) noteTranscriptNews();
     }
   });

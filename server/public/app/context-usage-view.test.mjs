@@ -10,6 +10,8 @@ import {
   renderAgentSessionsControlHtml,
   renderPlanOnlyControlHtml,
   renderThinkingControlHtml,
+  renderThoughtsPreferenceHtml,
+  renderStreamViewPreferenceHtml,
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
   renderContextUsageHtml,
@@ -321,6 +323,34 @@ test('the thinking control renders both axes with the stored state active', () =
   assert.match(html, /data-thinking-axis="display"[^>]*data-thinking-value="omitted"[^>]*aria-pressed="true"/s);
   // Exactly one active button per axis.
   assert.equal((html.match(/is-active/g) || []).length, 2);
+});
+
+test('the 💭 Thoughts row renders Expanded and Collapsed with the setting pressed', () => {
+  const on = renderThoughtsPreferenceHtml({ expanded: true });
+  assert.match(on, /💭 Thoughts/);
+  assert.match(on, /class="ctx-thoughts-btn is-active"[^>]*data-thoughts-expanded="on"[^>]*aria-pressed="true"[^>]*>Expanded</s);
+  assert.match(on, /class="ctx-thoughts-btn"[^>]*data-thoughts-expanded="off"[^>]*aria-pressed="false"[^>]*>Collapsed</s);
+  assert.equal((on.match(/is-active/g) || []).length, 1);
+  // Its own class: the relay-bound thinking buttons' sync never touches it.
+  assert.doesNotMatch(on, /ctx-thinking-btn/);
+  assert.match(on, /Saved in this browser\./);
+
+  const off = renderThoughtsPreferenceHtml({ expanded: false });
+  assert.match(off, /data-thoughts-expanded="off"[^>]*aria-pressed="true"/s);
+  assert.match(off, /data-thoughts-expanded="on"[^>]*aria-pressed="false"/s);
+  assert.match(renderThoughtsPreferenceHtml(), /data-thoughts-expanded="on"[^>]*aria-pressed="true"/s);
+});
+
+test('the 🧵 Stream view row renders On and Off with the setting pressed, off by default', () => {
+  const off = renderStreamViewPreferenceHtml();
+  assert.match(off, /🧵 Stream view/);
+  assert.match(off, /data-stream-view="off"[^>]*aria-pressed="true"/s);
+  assert.match(off, /data-stream-view="on"[^>]*aria-pressed="false"/s);
+  const on = renderStreamViewPreferenceHtml({ on: true });
+  assert.match(on, /class="ctx-thoughts-btn ctx-stream-view-btn is-active"[^>]*data-stream-view="on"/s);
+  assert.equal((on.match(/is-active/g) || []).length, 1);
+  assert.doesNotMatch(on, /data-thoughts-expanded/, 'never mistaken for the thoughts buttons');
+  assert.match(on, /Saved in this browser\./);
 });
 
 test('the thinking control defaults to On + Summarized', () => {

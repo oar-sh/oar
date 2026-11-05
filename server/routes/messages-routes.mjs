@@ -113,7 +113,9 @@ const OPAQUE_RESPONSE_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-
 const OPAQUE_RESPONSE_RECOVERY_WAIT_MS = 600_000;
 const OPAQUE_RESPONSE_RECOVERY_POLL_MS = 250;
 const STRANDED_SESSION_PRIME_COOLDOWN_MS = 10_000;
-const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 15_000;
+// An idle worker beats every 30 s (shared/worker-runtime/worker-keepalive.mjs):
+// its last beat may be that old and still prove it alive.
+export const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 45_000;
 // Hold finalization after a relay question is answered so the SDK has time to fire the next
 // onUserInputRequest (multi-step ask_user). Without this, the transcript is used prematurely and
 // the queue row is marked done while additional questions are still pending.
@@ -9179,16 +9181,28 @@ export function registerMessagesRoutes(app, deps) {
     const responseMessageId = q?.response_message_id || null;
     const normalizedSubagentRunId = subagentRunId ? String(subagentRunId).trim() : null;
     const normalizedMetadata = sanitizeActivityMetadata(metadata);
-    const activityRow = stmts.insertActivity.run(
-      messageId,
-      responseMessageId,
-      conversationId,
-      normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
-      activityText,
-      new Date().toISOString(),
-      normalizedSubagentRunId,
-      normalizedMetadata ? JSON.stringify(normalizedMetadata) : null,
-    );
+    // The row's place in the turn's order (thoughts and tool lines share
+    // it): numbered and written in one IMMEDIATE transaction, so two writers
+    // on the same turn never get the same number.
+    let turnSeq = null;
+    const insertActivityRow = () => {
+      turnSeq = stmts.nextTurnSeq?.(messageId) ?? null;
+      return stmts.insertActivity.run(
+        messageId,
+        responseMessageId,
+        conversationId,
+        normalizeRelayMode(mode) || DEFAULT_RELAY_MODE,
+        activityText,
+        new Date().toISOString(),
+        normalizedSubagentRunId,
+        normalizedMetadata ? JSON.stringify(normalizedMetadata) : null,
+        turnSeq,
+      );
+    };
+    const insertActivityTx = typeof db?.transaction === 'function' ? db.transaction(insertActivityRow) : null;
+    const activityRow = typeof insertActivityTx?.immediate === 'function'
+      ? insertActivityTx.immediate()
+      : insertActivityRow();
     if (normalizedSubagentRunId) {
       // The lane keeps the capped line; the timeline copy keeps what came in.
       mirrorSubagentFrame({
@@ -9206,6 +9220,7 @@ export function registerMessagesRoutes(app, deps) {
       timestamp: new Date().toISOString(),
       subagentRunId: normalizedSubagentRunId || undefined,
       ...(normalizedMetadata ? { metadata: normalizedMetadata } : {}),
+      ...(turnSeq !== null ? { turnSeq } : {}),
     });
     res.json({ ok: true });
   });
@@ -9363,6 +9378,9 @@ export function registerMessagesRoutes(app, deps) {
     const relayMode = normalizeRelayMode(mode) || DEFAULT_RELAY_MODE;
     const normalizedReasoningId = String(reasoningId || '').trim() || null;
     let seq = null;
+    // The thought's place in the turn's order: given on its first write and
+    // kept by every update, so a thought sits where its first chunk arrived.
+    let turnSeq = null;
     const shouldPersistThought = !!done || !!normalizedReasoningId;
     if (shouldPersistThought) {
       const isThoughtSeqConstraintError = (error) => {
@@ -9397,12 +9415,13 @@ export function registerMessagesRoutes(app, deps) {
                 messageId,
                 normalizedReasoningId,
               );
-              return existingSeq;
+              return { seq: existingSeq, turnSeq: existingThought.turn_seq == null ? null : Number(existingThought.turn_seq) };
             }
           }
           const row = stmts.getLastThoughtSeqByQueueMessage?.get(messageId);
           const maxSeq = Math.max(0, Number(row?.max_seq || 0));
           const nextSeq = maxSeq + 1;
+          const nextTurn = stmts.nextTurnSeq?.(messageId) ?? null;
           stmts.insertThought?.run(
             messageId,
             responseMessageId,
@@ -9414,8 +9433,9 @@ export function registerMessagesRoutes(app, deps) {
             done ? 1 : 0,
             now,
             normalizedSubagentRunId,
+            nextTurn,
           );
-          return nextSeq;
+          return { seq: nextSeq, turnSeq: nextTurn };
         });
         const runInsertThought = typeof insertThoughtTx?.immediate === 'function'
           ? insertThoughtTx.immediate.bind(insertThoughtTx)
@@ -9423,7 +9443,7 @@ export function registerMessagesRoutes(app, deps) {
         const maxRetries = 4;
         for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
           try {
-            seq = runInsertThought();
+            ({ seq, turnSeq } = runInsertThought());
             break;
           } catch (error) {
             if (error?.code === 'THOUGHT_CONVERSATION_MISMATCH') {
@@ -9458,6 +9478,7 @@ export function registerMessagesRoutes(app, deps) {
       seq,
       timestamp: now,
       subagentRunId: normalizedSubagentRunId || undefined,
+      ...(turnSeq !== null ? { turnSeq } : {}),
     });
     res.json({ ok: true, seq });
   });

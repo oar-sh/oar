@@ -78,6 +78,7 @@ import { createShareRepository } from '../repositories/share-repository.mjs';
 import { createShareAccessLog, readShareRequestViewer } from '../services/share-access-log-service.mjs';
 import { GROUP_NAME_MAX, resolveGroupDisplayName } from '../repositories/conversation-group-repository.mjs';
 import { conversationGroupPosition, conversationGroupRole, groupActivityTimes, pageConversationRows } from '../public/app/conversation-group-order.mjs';
+import { detailsVersion, parseHeldDetailsParam, thoughtFingerprint } from '../public/app/held-details.mjs';
 import { admitRemoteRelayRequest, publicRemoteRelayOrigin, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import {
   RELAUNCH_COALESCE_WINDOW_MS,
@@ -4706,6 +4707,59 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   // GET /api/conversation/:id — get paginated conversation history
+  // The details version of each finished reply (held-details.mjs), one query
+  // per table for the whole window (the ids go in as one JSON parameter).
+  // Tool rows are only inserted: their count and highest row id. Thought rows
+  // are updated in place as they stream and when done: their rows are read
+  // (id, done, text) and fingerprinted, so any change shows.
+  let detailsVersionStatements = null;
+  function relayDetailsVersions(messageIds) {
+    const ids = [...new Set(messageIds.filter(Boolean))];
+    const versions = new Map();
+    if (!ids.length || typeof db?.prepare !== 'function') return versions;
+    try {
+      detailsVersionStatements ||= {
+        activity: db.prepare(`
+          SELECT response_message_id AS id, COUNT(*) AS n, MAX(rowid) AS max_rowid
+          FROM relay_activity
+          WHERE response_message_id IN (SELECT value FROM json_each(?))
+          GROUP BY response_message_id
+        `),
+        thought: db.prepare(`
+          SELECT response_message_id AS response_id, rowid AS row_id, done, text
+          FROM relay_thought
+          WHERE response_message_id IN (SELECT value FROM json_each(?))
+        `),
+      };
+      const idsJson = JSON.stringify(ids);
+      const activity = new Map();
+      for (const row of detailsVersionStatements.activity.all(idsJson) || []) {
+        activity.set(String(row?.id || ''), { n: Number(row.n) || 0, max: Number(row.max_rowid) || 0 });
+      }
+      const thoughtRows = new Map();
+      for (const row of detailsVersionStatements.thought.all(idsJson) || []) {
+        const id = String(row?.response_id || '');
+        if (!thoughtRows.has(id)) thoughtRows.set(id, []);
+        thoughtRows.get(id).push({ rowid: row.row_id, done: row.done, text: row.text });
+      }
+      for (const id of ids) {
+        const tools = activity.get(id) || { n: 0, max: 0 };
+        const thoughts = thoughtRows.get(id) || [];
+        versions.set(id, detailsVersion({
+          activityCount: tools.n,
+          activityMaxRowId: tools.max,
+          thoughtCount: thoughts.length,
+          thoughtMaxRowId: thoughts.reduce((max, row) => Math.max(max, Number(row.rowid) || 0), 0),
+          thoughtHash: thoughtFingerprint(thoughts),
+        }));
+      }
+    } catch {
+      // No versions: nothing is held, everything goes out in full.
+      return new Map();
+    }
+    return versions;
+  }
+
   app.get('/api/conversation/:id', auth, (req, res) => {
     const requestedId = String(req.params.id || '').trim();
     const limit = normalizeConversationHistoryLimit(req.query.limit, 20);
@@ -4729,7 +4783,9 @@ export function registerSessionsRoutes(app, deps) {
       supportedRelayModes: SUPPORTED_RELAY_MODES,
       defaultRelayMode: DEFAULT_RELAY_MODE,
     });
-    const inFlight = inFlightStateForConversation(resolvedConversationId);
+    // The running turn's tool lines: as many per thread as this page shows
+    // (its "Tool lines shown" setting); none given, the relay's default.
+    const inFlight = inFlightStateForConversation(resolvedConversationId, { activityCap: req.query.activityCap });
     const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
     const sessionUsageSummary = resolveSessionUsageSummaryForSdkSession({
       sdkSessionId,
@@ -4768,14 +4824,23 @@ export function registerSessionsRoutes(app, deps) {
         .map((row) => [String(row?.response_message_id || '').trim(), String(row?.id || '').trim()])
         .filter(([responseMessageId, sourceMessageId]) => !!responseMessageId && !!sourceMessageId),
     );
+    // The live poll names the finished replies whose tool lines and thoughts
+    // it holds (`heldDetails`, held-details.mjs); those whose details have
+    // not changed since (the same `detailsVersion`) go out without them.
+    const assistantIds = dbMessages.filter((m) => m.role === 'assistant').map((m) => String(m.id));
+    const detailsVersions = relayDetailsVersions(assistantIds);
+    const heldParam = parseHeldDetailsParam(req.query.heldDetails);
+    const heldNow = new Set(heldParam
+      ? assistantIds.filter((id) => heldParam.get(id) === detailsVersions.get(id))
+      : []);
     const relayActivitiesByMessageId = new Map(
       dbMessages
-        .filter((m) => m.role === 'assistant')
+        .filter((m) => m.role === 'assistant' && !heldNow.has(String(m.id)))
         .map((m) => [m.id, relayActivityForResponse(m.id)]),
     );
     const relayThoughtsByMessageId = new Map(
       dbMessages
-        .filter((m) => m.role === 'assistant')
+        .filter((m) => m.role === 'assistant' && !heldNow.has(String(m.id)))
         .map((m) => [m.id, relayThoughtsForResponse ? relayThoughtsForResponse(m.id) : []]),
     );
     const subagentRunsByMessageId = new Map(
@@ -4816,8 +4881,14 @@ export function registerSessionsRoutes(app, deps) {
     });
     messages = messages.map((message) => {
       if (message.role !== 'assistant') return message;
-      const sourceMessageId = responseMessageToSourceId.get(String(message.id || '').trim()) || message.sourceMessageId || undefined;
-      return sourceMessageId ? { ...message, sourceMessageId } : message;
+      const id = String(message.id || '').trim();
+      const sourceMessageId = responseMessageToSourceId.get(id) || message.sourceMessageId || undefined;
+      // Held: the page fills these from what it has. Otherwise the version
+      // the page keeps with them.
+      const details = heldNow.has(id)
+        ? { activities: [], thoughts: [], detailsHeld: true }
+        : (detailsVersions.has(id) ? { detailsVersion: detailsVersions.get(id) } : {});
+      return { ...message, ...(sourceMessageId ? { sourceMessageId } : {}), ...details };
     });
     const history = sqlPage
       ? { messages, pageInfo: sqlPage.pageInfo }

@@ -673,6 +673,7 @@ export function createGrokTurnRunner({
     resyncBackgroundTasks: () => terminalTasks?.resync(),
     stopBackgroundTask: (taskId) => terminalTasks?.stop(taskId) || false,
     flushKeptTaskSettles: () => terminalTasks?.flushKeptSettles(),
+    keptTaskSettleCount: () => terminalTasks?.keptSettleCount?.() || 0,
     setTurnCeilingMs(value) {
       const ms = Number(value);
       turnCeilingMs = Number.isFinite(ms) && ms >= 0 ? ms : null;

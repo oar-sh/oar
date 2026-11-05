@@ -379,3 +379,37 @@ test('successful reclaims stop fast-retrying after the cap', async () => {
   assert.deepEqual(delays.slice(0, 3), [1_000, 1_000, 1_000]);
   assert.ok(delays[3] >= 5_000, `expected backoff after the cap, got ${delays[3]}ms`);
 });
+
+test('the end of a block is reported when the required tunnel connects', () => {
+  const children = [];
+  const fakeTimers = createFakeTimers();
+  let lifted = 0;
+  const manager = createSshTunnelManager({
+    tunnelConfig: {
+      mode: 'managed',
+      user: 'ubuntu',
+      host: 'relay.example.com',
+      remotePort: 4444,
+      required: true,
+    },
+    spawnImpl() {
+      const child = createFakeChild();
+      children.push(child);
+      return child;
+    },
+    setTimeoutImpl: fakeTimers.setTimeoutImpl,
+    clearTimeoutImpl: fakeTimers.clearTimeoutImpl,
+    logger: { log() {}, warn() {} },
+    onBlockingLifted: () => { lifted += 1; },
+  });
+  manager.start();
+  children[0].emit('spawn');
+  assert.equal(lifted, 0);
+  fakeTimers.timers.find((timer) => timer.ms === 1200).fn();
+  assert.equal(manager.state.blocking, false);
+  assert.equal(lifted, 1);
+  children[0].exitCode = 255;
+  children[0].emit('close', 255);
+  assert.equal(manager.state.blocking, true);
+  assert.equal(lifted, 1, 'blocking again reports nothing');
+});

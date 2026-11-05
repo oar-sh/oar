@@ -20,10 +20,10 @@ import { CHAT_ACTIONS_MENU_ENTRY_IDS, CHAT_ACTIONS_MENU_TWIN_IDS } from './chat-
 const ALL = Object.fromEntries(HEADER_PRIORITY_ACTION_KEYS.map((key) => [key, true]));
 const WIDTHS = Object.fromEntries(HEADER_PRIORITY_ACTION_KEYS.map((key) => [key, 30]));
 
-test('the priority order is pins, hidden, search, context, usage, theme, fullscreen', () => {
-  assert.deepEqual(HEADER_PRIORITY_ACTION_KEYS, ['pins', 'hidden', 'search', 'context', 'usage', 'theme', 'fullscreen']);
+test('the priority order is questions, pins, hidden, search, context, usage, theme, fullscreen', () => {
+  assert.deepEqual(HEADER_PRIORITY_ACTION_KEYS, ['questions', 'pins', 'hidden', 'search', 'context', 'usage', 'theme', 'fullscreen']);
   assert.deepEqual(HEADER_PRIORITY_ACTIONS.map((action) => action.inlineId), [
-    'pinned-messages-btn', 'hidden-messages-btn', 'message-search-btn', 'context-btn', 'usage-btn', 'theme-toggle-btn', 'fullscreen-btn',
+    'questions-btn', 'pinned-messages-btn', 'hidden-messages-btn', 'message-search-btn', 'context-btn', 'usage-btn', 'theme-toggle-btn', 'fullscreen-btn',
   ]);
 });
 
@@ -34,24 +34,24 @@ test('the twins are the ︙ menu resolver\'s twins, and entries it decides', () 
 
 test('everything fits: every available action sits inline', () => {
   const fit = fitHeaderPriorityActions({ widths: WIDTHS, gap: 6, available: 1000, availability: ALL });
-  assert.deepEqual(fit, { inline: HEADER_PRIORITY_ACTION_KEYS, menu: [], unavailable: [], used: 7 * 36 });
+  assert.deepEqual(fit, { inline: HEADER_PRIORITY_ACTION_KEYS, menu: [], unavailable: [], used: 8 * 36 });
 });
 
 test('the lowest priorities overflow first, and nothing after an overflow comes back', () => {
   // Three buttons of 30 + 6 fit in 108; the fourth does not.
   const fit = fitHeaderPriorityActions({ widths: WIDTHS, gap: 6, available: 108, availability: ALL });
-  assert.deepEqual(fit.inline, ['pins', 'hidden', 'search']);
-  assert.deepEqual(fit.menu, ['context', 'usage', 'theme', 'fullscreen']);
+  assert.deepEqual(fit.inline, ['questions', 'pins', 'hidden']);
+  assert.deepEqual(fit.menu, ['search', 'context', 'usage', 'theme', 'fullscreen']);
   // A narrow later action that would fit still goes to the menu after the first overflow.
-  const widths = { ...WIDTHS, context: 80, usage: 1 };
+  const widths = { ...WIDTHS, search: 80, context: 1 };
   const strict = fitHeaderPriorityActions({ widths, gap: 0, available: 100, availability: ALL });
-  assert.deepEqual(strict.inline, ['pins', 'hidden', 'search']);
-  assert.deepEqual(strict.menu, ['context', 'usage', 'theme', 'fullscreen']);
+  assert.deepEqual(strict.inline, ['questions', 'pins', 'hidden']);
+  assert.deepEqual(strict.menu, ['search', 'context', 'usage', 'theme', 'fullscreen']);
 });
 
 test('an action that exactly fills the room still fits', () => {
   const fit = fitHeaderPriorityActions({ widths: WIDTHS, gap: 0, available: 60, availability: ALL });
-  assert.deepEqual(fit.inline, ['pins', 'hidden']);
+  assert.deepEqual(fit.inline, ['questions', 'pins']);
 });
 
 test('no room: every available action goes into the menu', () => {
@@ -71,17 +71,17 @@ test('an unmeasurable header puts every available action into the menu', () => {
 });
 
 test('an unavailable action takes no room and never shows in the menu', () => {
-  const availability = { ...ALL, pins: false, hidden: false, fullscreen: false };
+  const availability = { ...ALL, questions: false, pins: false, hidden: false, fullscreen: false };
   const fit = fitHeaderPriorityActions({ widths: WIDTHS, gap: 0, available: 90, availability });
   assert.deepEqual(fit.inline, ['search', 'context', 'usage']);
   assert.deepEqual(fit.menu, ['theme']);
-  assert.deepEqual(fit.unavailable, ['pins', 'hidden', 'fullscreen']);
+  assert.deepEqual(fit.unavailable, ['questions', 'pins', 'hidden', 'fullscreen']);
 });
 
 test('a wider pins button (with its count) is measured as it is', () => {
   const fit = fitHeaderPriorityActions({ widths: { ...WIDTHS, pins: 52 }, gap: 4, available: 100, availability: ALL });
-  // 56 + 34 = 90 fits; + 34 = 124 does not.
-  assert.deepEqual(fit.inline, ['pins', 'hidden']);
+  // 34 + 56 = 90 fits; + 34 = 124 does not.
+  assert.deepEqual(fit.inline, ['questions', 'pins']);
 });
 
 test('a missing or bad width counts as zero', () => {
@@ -89,19 +89,21 @@ test('a missing or bad width counts as zero', () => {
   assert.deepEqual(fit.inline, ['pins', 'hidden']);
 });
 
-test('availability: counts decide pins and hidden, pwa-install decides fullscreen', () => {
+test('availability: counts decide questions, pins and hidden, pwa-install decides fullscreen', () => {
   assert.deepEqual(resolveHeaderActionAvailability({}), {
-    pins: false, hidden: false, search: true, context: true, usage: true, theme: true, fullscreen: false,
+    questions: false, pins: false, hidden: false, search: true, context: true, usage: true, theme: true, fullscreen: false,
   });
   const busy = resolveHeaderActionAvailability({ pinCount: 3, hiddenCount: 1, fullscreenAvailable: true });
   assert.equal(busy.pins, true);
   assert.equal(busy.hidden, true);
   assert.equal(busy.fullscreen, true);
   assert.equal(resolveHeaderActionAvailability({ pinCount: '0' }).pins, false);
+  assert.equal(resolveHeaderActionAvailability({ questionCount: 2 }).questions, true);
+  assert.equal(resolveHeaderActionAvailability({ questionCount: '0' }).questions, false);
 });
 
 test('availability: the shared view offers Day/Night only', () => {
-  const shared = resolveHeaderActionAvailability({ sharedMode: true, pinCount: 4, hiddenCount: 2, fullscreenAvailable: true });
+  const shared = resolveHeaderActionAvailability({ sharedMode: true, questionCount: 3, pinCount: 4, hiddenCount: 2, fullscreenAvailable: true });
   assert.deepEqual(Object.keys(shared).filter((key) => shared[key]), ['theme']);
 });
 

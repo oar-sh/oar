@@ -67,6 +67,7 @@ function createManager(overrides = {}) {
     setTimeoutImpl: timers.setTimeoutImpl,
     clearTimeoutImpl: timers.clearTimeoutImpl,
     logger: { log() {}, warn() {} },
+    ...(overrides.onBlockingLifted ? { onBlockingLifted: overrides.onBlockingLifted } : {}),
   });
   return { manager, spawns, children, emitted, timers, setNow: (v) => { now = v; }, get now() { return now; } };
 }
@@ -569,4 +570,19 @@ test('manager survives a locator that throws', () => {
   ctx.manager.start();
   assert.equal(ctx.spawns.length, 0);
   assert.equal(ctx.manager.state.binaryMissing, true);
+});
+
+test('the end of a block is reported once per connect, so the relay hands out what waited', () => {
+  let lifted = 0;
+  const ctx = createManager({ tunnelConfig: { required: true }, onBlockingLifted: () => { lifted += 1; } });
+  ctx.manager.start();
+  ctx.children[0].emit('spawn');
+  assert.equal(lifted, 0, 'still blocking');
+  ctx.children[0].stderr.emit('data', Buffer.from('Registered tunnel connection'));
+  assert.equal(lifted, 1);
+  ctx.children[0].stderr.emit('data', Buffer.from('Registered tunnel connection'));
+  assert.equal(lifted, 1, 'a second connection line lifts nothing new');
+  ctx.children[0].emit('close', 1);
+  assert.equal(ctx.manager.state.blocking, true);
+  assert.equal(lifted, 1);
 });

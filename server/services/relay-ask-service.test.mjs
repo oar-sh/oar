@@ -207,3 +207,67 @@ test('a mirror of an ask on a paired relay is closed by that relay\'s status, an
   assert.equal(service.getMirror('relay-lab', 'ask_there02').status, 'cancelled');
   assert.equal(answered.length, 1);
 });
+
+test('an ask remembers the queue row of the turn that asked; none when not given, a mirror has no queueId', () => {
+  const { db, service } = setup();
+  const own = service.create({ conversationId: LEAD, createdBy: LEAD, question: 'Mine?', queueId: 'queue-fixture-07' });
+  assert.equal(own.queueId, 'queue-fixture-07');
+  assert.equal(db.prepare(`SELECT queue_id FROM relay_asks WHERE id = ?`).get(own.id).queue_id, 'queue-fixture-07');
+  assert.equal(service.get(own.id).queueId, 'queue-fixture-07');
+  const plain = service.create({ conversationId: WORKER, createdBy: LEAD, question: 'For the worker?' });
+  assert.equal(plain.queueId, null);
+  assert.equal(db.prepare(`SELECT queue_id FROM relay_asks WHERE id = ?`).get(plain.id).queue_id, null);
+  const mirror = service.addMirror({ relayId: 'relay-lab', createdBy: LEAD, remote: { id: 'ask_there01', question: 'Deploy?', session: { id: 'conv-there' } } });
+  assert.ok(!('queueId' in mirror), 'a mirror shape carries no queueId');
+  assert.ok(!('queueId' in service.getMirror('relay-lab', 'ask_there01')));
+});
+
+test('without the queue_id column asks still work and store none', () => {
+  const db = new Database(':memory:');
+  applySchema(db);
+  db.exec(`ALTER TABLE relay_asks DROP COLUMN queue_id`);
+  seed(db, LEAD, 'Lead');
+  const service = createRelayAskService({ db, now: () => T0, newId: () => 'ask_fixture99', logger: { log() {}, warn() {} } });
+  assert.equal(service.isAvailable(), true);
+  const ask = service.create({ conversationId: LEAD, createdBy: LEAD, question: 'Still fine?', queueId: 'queue-fixture-01' });
+  assert.equal(ask.queueId, null);
+  assert.equal(service.listIn(LEAD).length, 1);
+});
+
+test('a session\'s cards (listIn): the asks in it here, pending first; none it only asked elsewhere, no mirrors', () => {
+  const { service } = setup();
+  const own = service.create({ conversationId: LEAD, createdBy: LEAD, question: 'Mine?' });
+  service.create({ conversationId: LEAD, createdBy: LEAD, question: 'Mine too?' });
+  service.create({ conversationId: WORKER, createdBy: LEAD, question: 'For the worker?' });
+  service.addMirror({ relayId: 'relay-lab', createdBy: LEAD, remote: { id: 'ask_there01', question: 'Deploy?', session: { id: LEAD } } });
+  service.answer(own.id, { answer: 'yes' });
+  assert.deepEqual(service.listIn(LEAD).map((ask) => ask.question), ['Mine too?', 'Mine?']);
+  assert.deepEqual(service.listIn(WORKER).map((ask) => ask.question), ['For the worker?']);
+  assert.deepEqual(service.listIn(''), []);
+});
+
+test('a compaction emits each moved ask of this relay once, with its new conversation; a mirror never', () => {
+  const { db, service, emitted } = setup();
+  const NEXT = 'conv-fixture-next';
+  seed(db, NEXT, 'Lead (compacted)');
+  const inAndBy = service.create({ conversationId: LEAD, createdBy: LEAD, question: 'Mine?' });
+  const forWorker = service.create({ conversationId: WORKER, createdBy: LEAD, question: 'For the worker?' });
+  const fromWorker = service.create({ conversationId: LEAD, createdBy: WORKER, question: 'From the worker?' });
+  service.create({ conversationId: WORKER, createdBy: WORKER, question: 'Untouched?' });
+  service.addMirror({ relayId: 'relay-lab', createdBy: LEAD, remote: { id: 'ask_there01', question: 'Deploy?', session: { id: 'conv-there' } } });
+  emitted.length = 0;
+  assert.equal(service.carryToCompacted(LEAD, NEXT), 5, 'two in, three by (the mirror included)');
+  const asks = emitted.map((entry) => entry.payload.ask);
+  assert.ok(emitted.every((entry) => entry.event === RELAY_ASK_SOCKET_EVENT));
+  assert.deepEqual(asks.map((ask) => ask.id).sort(), [inAndBy.id, forWorker.id, fromWorker.id].sort());
+  const byId = Object.fromEntries(asks.map((ask) => [ask.id, ask]));
+  assert.equal(byId[inAndBy.id].conversationId, NEXT);
+  assert.equal(byId[inAndBy.id].askedBy.conversationId, NEXT);
+  assert.equal(byId[fromWorker.id].conversationId, NEXT);
+  assert.equal(byId[forWorker.id].conversationId, WORKER);
+  assert.equal(byId[forWorker.id].askedBy.conversationId, NEXT);
+  assert.ok(asks.every((ask) => !ask.relayId), 'no mirror emitted');
+  emitted.length = 0;
+  assert.equal(service.carryToCompacted(LEAD, NEXT), 0);
+  assert.equal(emitted.length, 0, 'nothing moved, nothing emitted');
+});

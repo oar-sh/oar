@@ -107,7 +107,9 @@ test('the socket delivery refuses work to a process the recycle is replacing, pa
 });
 
 test('one replacement fence: both replacements, the recycle and /api/pending share it', () => {
-  assert.match(runtimeSource, /\nconst workerReplacementFence = createWorkerReplacementFence\(\);\n/);
+  // One fence, wrapped so that its release wakes the queue.
+  assert.match(runtimeSource, /\nconst workerReplacementFence = \(\(\) => \{\n  const fence = createWorkerReplacementFence\(\);\n/);
+  assert.equal((runtimeSource.match(/createWorkerReplacementFence\(\)/g) || []).length, 1);
   const factory = sliceBetween('function createRuntimeWorkerReplacement(tag) {', '\n}\n');
   assert.match(factory, /fence: workerReplacementFence,/);
   const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');

@@ -18,6 +18,7 @@ import { createClaudeSessionRootResolver } from '../services/claude-session-root
 import {
   startClaudeSession,
   createCanUseTool,
+  isPersonOnlyAsk,
   readContextUsage,
   readPlanUsage,
   normalizeClaudeEffort,
@@ -2354,9 +2355,10 @@ export function createClaudeSessionRunner({
     // nothing else is left: the cap exists to bound a retry storm's chatter,
     // while a structured entry carries transcript geometry no later line can
     // restore (a compaction boundary buffered between turns, then 50 task
-    // notifications, used to lose its break row silently). The client's
-    // capRelayActivityEntries protects structured rows too, but head-caps the
-    // prose it keeps; here the newest lines are the informative ones.
+    // notifications, used to lose its break row silently). The relay's
+    // capRelayActivityEntries protects structured rows too and keeps the
+    // newest prose of each thread; here too the newest lines are the
+    // informative ones.
     while (proc.pendingActivities.length > MAX_PENDING_ACTIVITIES) {
       const proseIndex = proc.pendingActivities.findIndex((carried) => typeof carried === 'string');
       proc.pendingActivities.splice(proseIndex === -1 ? 0 : proseIndex, 1);
@@ -3806,8 +3808,9 @@ export function createClaudeSessionRunner({
         // denied. Register a continuation turn first: it is born processing,
         // gives the card a real queue row, and the flow's eventual top-level
         // result (or stream end) closes it like any other continuation.
+        // A person-only safety ask is a question card too.
         if (
-          toolName === 'AskUserQuestion'
+          (toolName === 'AskUserQuestion' || isPersonOnlyAsk(options))
           && proc === processRef
           && !processRef.activeCtx
           && !processRef.pendingDelivered.length
@@ -4582,6 +4585,8 @@ export function createClaudeSessionRunner({
     backgroundTaskIds,
     resyncBackgroundTasks,
     flushKeptTaskSettles,
+    // Settle notices still kept for the relay: the keepalive stays busy.
+    keptTaskSettleCount: () => keptTaskSettles.size(),
     shutdown,
     // Test seams / observability.
     _getProcess: () => proc,

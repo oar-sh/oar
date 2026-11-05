@@ -188,6 +188,13 @@ test('a measured header shows exactly the twins that did not fit', () => {
   assert.deepEqual(twinsShown, ['chat-menu-context', 'chat-menu-theme-toggle', 'chat-menu-usage', 'chat-menu-fullscreen']);
   assert.deepEqual(narrow.entries['chat-menu-context'], { hidden: false, disabled: false });
   assert.deepEqual(narrow.entries['chat-menu-pins'], { hidden: true, disabled: true });
+  // 📓 is the first twin, ahead of 📍, in the menu as in the header.
+  assert.equal(CHAT_ACTIONS_MENU_TWIN_IDS[0], 'chat-menu-questions');
+  const questions = resolveChatActionsMenuState({ ...localConversation, headerMenuIds: ['chat-menu-pins', 'chat-menu-questions'] });
+  assert.deepEqual(
+    visibleChatActionsMenuEntryIds(questions).filter((id) => CHAT_ACTIONS_MENU_TWIN_IDS.includes(id)),
+    ['chat-menu-questions', 'chat-menu-pins'],
+  );
 });
 
 test('twins are relay-wide: they follow the fit with no conversation open too', () => {

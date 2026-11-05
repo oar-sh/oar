@@ -100,6 +100,7 @@ import {
   setConversationTaskStallMinutes,
 } from './background-tasks-view.mjs';
 import { setConversationPins, setPinsConversation } from './pinned-messages-view.mjs';
+import { setQuestionsConversation } from './questions-panel-ui.js';
 import { setConversationHiddenMessages, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { setUsageLimitConversation } from './usage-limit-ui.js';
 import { mergeConversationPreviews } from './preview-cards.mjs';
@@ -109,6 +110,11 @@ import { clearAttachments, setRepoBrowserSessionInfo, loadRepoBrowserTree, getRe
 import { buildKnownCwdOptions, normalizeKnownCwdPath } from './known-cwd-options.mjs';
 import { shouldApplyConversationLoad } from './activity-replay-state.mjs';
 import { conversationPayloadCache, payloadHasMoreOlder, windowPageInfo } from './conversation-payload-cache.mjs';
+import { createHeldDetailsStore } from './held-details.mjs';
+
+// The finished replies' details this page holds of the open conversation
+// (the live poll's `heldDetails`, held-details.mjs).
+export const heldDetailsStore = createHeldDetailsStore();
 import { loadKeepingLiveRows, shouldKeepTranscriptOnReload } from './transcript-reload-freshness.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import {
@@ -993,7 +999,15 @@ export function applyLoadedConversationState(id, response, {
   mergeFrom = null,
   windowPayload = null,
   backgroundTasksAsOf = null,
+  fromPoll = false,
 } = {}) {
+  // What the page holds of the finished replies, for the live poll's
+  // `heldDetails`: a full load replaces it, a poll or an older page adds to
+  // it, and a poll trims it to the rows on screen.
+  if (response && !IS_SHARED_VIEW) {
+    const shown = fromPoll ? (response.messages || []).map((message) => message?.id) : null;
+    heldDetailsStore.noteApplied(id, response, { full: !fromPoll && !keepTranscript && !mergeFrom, shownIds: shown });
+  }
   if (!response) {
     if (!IS_SHARED_VIEW) conversationPayloadCache.forget(id);
     setRepoBrowserSessionInfo('', '');
@@ -1089,6 +1103,8 @@ export function applyLoadedConversationState(id, response, {
       ? mergeMessagesIntoTranscript(mergeFrom, response.messages, response)
       : renderMessages(response.messages, !restoreScroll, response);
   }
+  // 📓: a newly opened conversation loads its questions (a no-op on the poll).
+  setQuestionsConversation(id);
   hydrateConversationDraft(id, {
     draftText: response.draftText,
     draftAttachments: response.draftAttachments,
@@ -1178,6 +1194,7 @@ function applyCachedConversationState(id, response, { viewAnchor = null } = {}) 
   if ('hiddenMessages' in response) setConversationHiddenMessages(id, response.hiddenMessages, response.hiddenMessagesRevision);
   setHiddenMessagesConversation(id);
   const didRenderMessages = renderMessages(response.messages, false, response);
+  setQuestionsConversation(id);
   // The panel shows this conversation's tasks as the socket keeps them.
   setBackgroundTasksConversation(id);
   window.syncChatTitleControls?.();

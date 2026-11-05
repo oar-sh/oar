@@ -248,6 +248,7 @@ export function createGrokTaskPublisher({
     resync: () => publish({ resync: true }),
     /** The relay answered a heartbeat: settle notices kept for it go out. */
     flushKeptSettles: () => keptSettles.flush(),
+    keptSettleCount: () => keptSettles.size(),
     sweep,
     close() {
       clearInterval(sweepTimer);

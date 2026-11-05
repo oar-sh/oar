@@ -20,6 +20,7 @@ import {
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
 import { createWorkerWebSocketLink } from '../../shared/worker-runtime/worker-websocket-link.mjs';
 import { createHeartbeatController } from '../../shared/worker-runtime/heartbeat.mjs';
+import { createWorkerKeepalive } from '../../shared/worker-runtime/worker-keepalive.mjs';
 import { resolveBuildId } from '../../shared/build-id.mjs';
 import { installWorkerLogFile } from '../../shared/worker-runtime/worker-log-file.mjs';
 import {
@@ -158,10 +159,16 @@ async function main() {
     onResyncBackgroundTasks: () => turnRunner.resyncBackgroundTasks(),
     // The relay answered: settle notices it missed go out.
     onAnswered: () => turnRunner.flushKeptTaskSettles?.(),
+    getKeptPostCount: () => turnRunner.keptTaskSettleCount?.() || 0,
   });
 
+  // One timer for the heartbeat and the socket's readiness refresh: 10 s
+  // while working, 30 s while idle on a relay that allows it.
+  let keepalive = null;
   const wsLink = createWorkerWebSocketLink({
     serverUrl,
+    readyRefreshMs: 0,
+    onRelayFrame: () => keepalive?.nudge(),
     token,
     dbg,
     buildId,
@@ -213,11 +220,13 @@ async function main() {
       dbg('worker control ignored (unsupported by the SDK worker)', type || '(none)');
     },
   });
+  keepalive = createWorkerKeepalive({ heartbeat, link: wsLink, busyMs: HEARTBEAT_MS });
   linkBridge.attach(wsLink);
 
   const shutdown = async (signal) => {
     dbg(`shutting down (${signal})`);
     try { wsLink.stop(); } catch {}
+    try { keepalive.stop(); } catch {}
     try { heartbeat.stopHeartbeat(); } catch {}
     try { controlPoller.stop(); } catch {}
     // Rows whose prompt the runtime consumed and whose settle marker has not
@@ -246,7 +255,7 @@ async function main() {
   });
 
   dbg(`starting session=${sdkSessionId.slice(0, 8)} server=${serverUrl} cwd=${cwd} model=${defaultModel || 'default'} build=${buildId || 'unknown'}`);
-  heartbeat.startHeartbeat();
+  keepalive.start();
   wsLink.start();
 }
 

@@ -228,6 +228,22 @@ test('/api/relay-questions names each card\'s kind, and lists asks only when ask
   assert.equal(asAgent.body.questions.find((question) => question.id === ask.id).detail, QUESTION.detail, 'agent text goes out as data');
 });
 
+test('a paired relay\'s read of the questions never carries the asking turn\'s queue id; this relay\'s does', async () => {
+  const fx = boot();
+  const ask = fx.asks.create({ conversationId: SESSION, createdBy: SESSION, queueId: 'q-tern-7', ...QUESTION });
+  const own = await fx.call('GET', '/api/relay-questions', { query: { conversationId: SESSION, includeAsks: '1' } });
+  assert.equal(own.body.questions.find((question) => question.id === ask.id).queueId, 'q-tern-7');
+  const paired = await fx.call('GET', '/api/relay-questions', { headers: FROM_PAIRED, query: { conversationId: SESSION, includeAsks: '1' } });
+  const seen = paired.body.questions.find((question) => question.id === ask.id);
+  assert.ok(seen, 'the ask is listed');
+  assert.equal('queueId' in seen, false);
+  const one = await fx.call('GET', '/api/relay-question/:id', { headers: FROM_PAIRED, params: { id: ask.id } });
+  assert.equal(one.status, 200);
+  assert.equal('queueId' in one.body.question, false);
+  const oneHere = await fx.call('GET', '/api/relay-question/:id', { params: { id: ask.id } });
+  assert.equal(oneHere.body.question.queueId, 'q-tern-7');
+});
+
 test('a session\'s card list is the browser\'s, not an agent\'s', async () => {
   const fx = boot();
   fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
@@ -495,4 +511,42 @@ test('a read whose pending cards fail to load keeps the claims, and claims nothi
   fx.stmts.listQuestions = listQuestions;
   assert.deepEqual(await read(FROM_OTHER), { 'card-approval': ['other', undefined], 'card-ask-user': ['other', undefined] }, 'the claims survived the failed read');
   assert.deepEqual(await read(FROM_PAIRED), { 'card-approval': ['you', 'before'], 'card-ask-user': ['you', 'before'] });
+});
+
+test('a session\'s card list reads the asks in it (listIn): none it asked elsewhere, no mirrors; each with its turn', async () => {
+  const fx = boot();
+  const own = fx.asks.create({ conversationId: SESSION, createdBy: SESSION, question: 'Own?', queueId: 'q-turn' });
+  fx.asks.create({ conversationId: LEAD, createdBy: SESSION, question: 'For the lead?' });
+  fx.asks.addMirror({ relayId: PAIRED.id, createdBy: SESSION, remote: { id: 'ask_there01', question: 'Far?', session: { id: SESSION } } });
+  fx.asks.listOf = () => { throw new Error('the card list reads listIn'); };
+  const listed = await fx.call('GET', '/api/relay-asks', { query: { conversationId: SESSION } });
+  assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  assert.deepEqual(listed.body.asks.map((ask) => [ask.id, ask.queueId]), [[own.id, 'q-turn']]);
+  assert.deepEqual((await fx.call('GET', '/api/relay-asks', { query: { conversationId: LEAD } })).body.asks.map((ask) => ask.question), ['For the lead?']);
+});
+
+test('a paired relay never gets an ask\'s queueId: ask, answer, dismiss, withdraw, status and its Inbox', async () => {
+  const fx = boot();
+  fx.asks.create({ conversationId: SESSION, createdBy: SESSION, question: 'Own?', queueId: 'q-turn' });
+  const noQueue = (value, what) => assert.equal(JSON.stringify(value).includes('queueId'), false, what);
+  const asked = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, body: { session: SESSION, ...QUESTION } });
+  assert.equal(asked.status, 200, JSON.stringify(asked.body));
+  noQueue(asked.body, 'ask');
+  assert.equal(fx.db.prepare(`SELECT queue_id FROM relay_asks WHERE id = ?`).get(asked.body.ask.id).queue_id, null, 'a paired relay\'s ask stores none');
+  const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id: asked.body.ask.id, choice: 'SQLite' } });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  noQueue(answered.body, 'answer');
+  const second = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, body: { session: SESSION, question: 'Rename it?' } });
+  const dismissed = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.dismiss, { headers: FROM_PAIRED, body: { id: second.body.ask.id } });
+  assert.equal(dismissed.status, 200, JSON.stringify(dismissed.body));
+  assert.equal(dismissed.body.ask.status, 'dismissed');
+  noQueue(dismissed.body, 'dismiss');
+  const third = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, body: { session: SESSION, question: 'Later?' } });
+  const withdrawn = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.withdraw, { headers: FROM_PAIRED, body: { id: third.body.ask.id } });
+  assert.equal(withdrawn.body.ask.status, 'withdrawn');
+  noQueue(withdrawn.body, 'withdraw');
+  noQueue((await fx.call('POST', RELAY_ASK_REMOTE_PATHS.status, { headers: FROM_PAIRED, body: { ids: [asked.body.ask.id] } })).body, 'status');
+  const inbox = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
+  assert.ok(inbox.body.items.some((item) => item.kind === 'ask' && item.question === 'Own?'));
+  for (const item of inbox.body.items.filter((entry) => entry.kind === 'ask')) assert.equal('queueId' in item, false, 'Inbox');
 });

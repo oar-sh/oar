@@ -67,7 +67,10 @@ export function createAskUserBridge({
     });
   }
 
-  async function askSingleQuestion(entry, { signal } = {}) {
+  // `source` / `rationale` override the bridge-wide card identity for one ask
+  // (the Claude worker's safety-check approvals are not clarifications), and
+  // `allowFreeform: false` makes a card answered by its choices alone.
+  async function askSingleQuestion(entry, { signal, source, rationale, allowFreeform } = {}) {
     const activeMsg = typeof getActiveMessage === 'function' ? getActiveMessage() : null;
     const choices = entry.options.map((option) => option.label);
     const promptParts = [entry.question];
@@ -82,7 +85,7 @@ export function createAskUserBridge({
       mode: activeMsg?.relayMode || 'agent',
       prompt: promptParts.join('\n\n'),
       choices,
-      allowFreeform: true,
+      allowFreeform: allowFreeform !== false,
       // Top-level, as the create route reads it (elicitation parity; absent
       // for the flat question shape every existing caller sends).
       ...(entry.requestedSchema ? { requestedSchema: entry.requestedSchema } : {}),
@@ -92,8 +95,8 @@ export function createAskUserBridge({
       attemptId: activeMsg?.attemptId || undefined,
       timeout_ms: questionTimeoutMs,
       context: {
-        source: questionSource,
-        rationale: questionRationale,
+        source: source || questionSource,
+        rationale: rationale || questionRationale,
         queueMessageId: activeMsg?.id || null,
         conversationId: activeMsg?.conversationId || null,
         relayMode: activeMsg?.relayMode || 'agent',
@@ -106,7 +109,7 @@ export function createAskUserBridge({
     return waitForRelayQuestionAnswer(questionId, { signal });
   }
 
-  async function handleAskUserQuestion(input, { signal } = {}) {
+  async function handleAskUserQuestion(input, { signal, source, rationale, allowFreeform } = {}) {
     const questions = normalizeQuestions(input);
     if (!questions.length) {
       return { answers: {}, structuredAnswers: {}, timedOut: false };
@@ -118,7 +121,7 @@ export function createAskUserBridge({
     const structuredAnswers = {};
     let timedOut = false;
     for (const entry of questions) {
-      const result = await askSingleQuestion(entry, { signal });
+      const result = await askSingleQuestion(entry, { signal, source, rationale, allowFreeform });
       answers[entry.question] = result.answer;
       if (result.structuredAnswer) structuredAnswers[entry.question] = result.structuredAnswer;
       if (entry.rawQuestion && entry.rawQuestion !== entry.question) {

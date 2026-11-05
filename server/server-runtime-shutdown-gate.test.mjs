@@ -41,7 +41,7 @@ test('relay_restarted is wired: the loop guard before the request, the end on th
   assert.ok(guard < request.indexOf('relayRestartQueue.request('), 'noted first: an immediate request exits inside the call');
   assert.match(request, /if \(!relayRestartQueue\.isQueued\(\) && !runtimeShutdownStarted\) relayEventService\?\.noteRestartCancelled\(\);/);
   const cancel = sliceBetween(runtimeSource, 'function cancelRelayShutdown(', '\n}\n');
-  assert.match(cancel, /if \(result\?\.cancelled\) relayEventService\?\.noteRestartCancelled\(\);/);
+  assert.match(cancel, /if \(result\?\.cancelled\) \{\n    relayEventService\?\.noteRestartCancelled\(\);/);
   const startShutdown = sliceBetween(runtimeSource, 'startShutdown: ({ action, reason, requestedBy, requestedAt }) => {', 'void shutdownRuntime(');
   assert.match(startShutdown, /relayEventService\?\.noteRelayExit\(\{ action, reason, requestedBy, requestedAt \}\)/);
   const shutdown = sliceBetween(runtimeSource, 'function shutdownRuntime(', 'runtimeShutdownPromise = new Promise(');

@@ -96,6 +96,7 @@ function overlayDescriptors(closers) {
     { name: 'tmux-inspector-modal', find: byId('tmux-inspector-modal'), isOpen: isVisible, close: closers.closeTmuxInspector },
     { name: 'image-annotate-modal', find: byId('image-annotate-modal'), isOpen: isVisible, close: closers.closeAnnotateEditor },
     { name: 'relay-watch-panel', find: byId('relay-watch-panel'), isOpen: isShown, close: closers.closeRelayWatchPanel },
+    { name: 'questions-panel', find: byId('questions-panel'), isOpen: isShown, close: closers.closeQuestionsPanel },
     { name: 'relay-schedule-panel', find: byId('relay-schedule-panel'), isOpen: isShown, close: closers.closeRelaySchedulePanel },
     { name: 'emoji-popup', find: byId('emoji-popup'), isOpen: isVisible, close: closers.closeEmojiPicker },
     // A row's menu (right-click, long press, ⓘ): on <body> while open.

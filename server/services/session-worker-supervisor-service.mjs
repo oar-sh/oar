@@ -88,6 +88,12 @@ export function createSessionWorkerSupervisor({
   // short enough that stopping a turn and immediately sending a new message
   // does not add 30s in front of the worker's boot.
   killBlockGraceMs = 3_000,
+  // A kill's block on new launches and deliveries for the session ended (its
+  // grace ran out, or the marker was cleared): (sessionId). The relay hands
+  // out what waited for it.
+  onKillBlockLifted = null,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
   isPidAlive = defaultIsPidAlive,
   diagnosticPlanReference = null,
   log = null,
@@ -98,6 +104,8 @@ export function createSessionWorkerSupervisor({
 
   const pendingStarts = new Map();
   const lifecycleBySession = new Map();
+  // sessionId → the timer that reports the end of its kill block.
+  const killBlockTimers = new Map();
   const retryLimit = Math.max(0, clampInt(maxRestartRetries, 5));
   const backoffBaseMs = Math.max(1, clampInt(restartBackoffBaseMs, 1_000));
   const backoffMaxMs = Math.max(backoffBaseMs, clampInt(restartBackoffMaxMs, 30_000));
@@ -301,9 +309,35 @@ export function createSessionWorkerSupervisor({
     });
   }
 
+  function reportKillBlockLifted(sessionId) {
+    if (typeof onKillBlockLifted !== 'function') return;
+    try { onKillBlockLifted(sessionId); } catch {}
+  }
+
+  function clearKillBlockTimer(sessionId) {
+    const timer = killBlockTimers.get(sessionId);
+    if (!timer) return false;
+    clearTimeoutImpl(timer);
+    killBlockTimers.delete(sessionId);
+    return true;
+  }
+
   function markKilled(sessionId) {
     if (!normalizeSessionId(sessionId)) return null;
     const killed = setLifecycle(sessionId, { killedAtMs: nowMs() });
+    // The block itself is read off the clock (isKillBlocked); this timer only
+    // says when it ends, so the rows that waited go out then.
+    if (killGraceMs > 0 && typeof onKillBlockLifted === 'function') {
+      clearKillBlockTimer(sessionId);
+      const timer = setTimeoutImpl(() => {
+        killBlockTimers.delete(sessionId);
+        if (!isKillBlocked(sessionId)) reportKillBlockLifted(sessionId);
+        // A few ms past the grace: the timer's clock and nowMs() may differ
+        // by a tick.
+      }, killGraceMs + 5);
+      timer?.unref?.();
+      killBlockTimers.set(sessionId, timer);
+    }
     return toLifecycleSnapshot(sessionId, killed);
   }
 
@@ -489,10 +523,12 @@ export function createSessionWorkerSupervisor({
       patch.degradedAtMs = null;
       patch.uiState = 'white';
     }
+    const liftsKillBlock = resetKilledMarker && clearKillBlockTimer(sessionId);
     if (resetKilledMarker) {
       patch.killedAtMs = null;
     }
     const cleared = setLifecycle(sessionId, patch);
+    if (liftsKillBlock) reportKillBlockLifted(sessionId);
     return toLifecycleSnapshot(sessionId, cleared);
   }
 

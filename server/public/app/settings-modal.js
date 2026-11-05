@@ -82,6 +82,9 @@ import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
 import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
 import { refreshSharedConversationsSection } from './shared-conversations-settings.js';
 import { syncScrollOnSendToggle } from './transcript-jump-bottom.mjs';
+import { syncThoughtsExpandedToggle } from './thoughts-preference.mjs';
+import { syncLiveActivityCapSlider } from './live-activity-cap.mjs';
+import { syncStreamViewToggle } from './stream-view-preference.mjs';
 import { syncWindowRetentionSlider } from './conversation-window-retention.mjs';
 import {
   getPreviews,
@@ -1942,6 +1945,9 @@ export function openSettingsModal(tab, providerTab) {
   }
   syncSuspendHostVisibility();
   syncScrollOnSendToggle();
+  syncThoughtsExpandedToggle();
+  syncLiveActivityCapSlider();
+  syncStreamViewToggle();
   syncWindowRetentionSlider();
   syncFontScaleSelect();
   syncPwaAppNameInput();

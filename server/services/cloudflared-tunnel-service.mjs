@@ -211,6 +211,9 @@ export function createCloudflaredTunnelManager({
   io = null,
   logger = console,
   runtimeShutdownRef = () => false,
+  // The tunnel stopped blocking queue delivery (it connected): the relay
+  // hands out what waited for it.
+  onBlockingLifted = () => {},
   platform = process.platform,
   spawnImpl = spawn,
   nowIso = () => new Date().toISOString(),
@@ -267,7 +270,11 @@ export function createCloudflaredTunnelManager({
   };
 
   const updateBlockingState = () => {
+    const wasBlocking = state.blocking;
     state.blocking = state.required && state.mode === 'managed' && !state.connected;
+    if (wasBlocking && !state.blocking) {
+      try { onBlockingLifted(); } catch {}
+    }
   };
 
   const scheduleReconnect = (spawnTunnel, { slowest = false } = {}) => {

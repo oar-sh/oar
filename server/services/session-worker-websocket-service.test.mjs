@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
-import { createSessionWorkerWebSocketService } from './session-worker-websocket-service.mjs';
+import {
+  WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS,
+  createSessionWorkerWebSocketService,
+} from './session-worker-websocket-service.mjs';
 
 let lastWss = null;
 
@@ -408,7 +411,7 @@ test('worker.unready withdraws a standing readiness so a hold draws no work', as
   // Both server.hello frames advertise the protocol a new worker relies on.
   const hellos = socket.sent.map((payload) => JSON.parse(payload)).filter((frame) => frame.type === 'server.hello');
   assert.ok(hellos.length >= 1);
-  for (const hello of hellos) assert.deepEqual(hello.capabilities, ['worker-unready', 'steering-held']);
+  for (const hello of hellos) assert.deepEqual(hello.capabilities, ['worker-unready', 'steering-held', 'idle-keepalive']);
 
   // A held worker's hello binds identity without re-arming readiness.
   socket.emit('message', JSON.stringify({ type: 'worker.hello', reason: 'ws-open', ready: false }));
@@ -552,8 +555,11 @@ test('a stale socket no longer counts as live without a fresh heartbeat or live 
 
   assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'fresh heartbeat counts as live');
 
-  // Three missed 10s heartbeats: retention alone must stop counting as life.
-  currentMs += 30_001;
+  // An idle worker beats every 30 s: a socket heard from 89 s ago is live.
+  currentMs += 89_000;
+  assert.equal(service.hasLiveWorkerSocket('sdk-stale'), true, 'inside the 90 s window');
+  // Three missed 30 s idle beats: retention alone must stop counting as life.
+  currentMs += 1_001;
   assert.equal(service.hasLiveWorkerSocket('sdk-stale'), false, 'stale socket with a dead pid is not live');
   assert.equal(service.hasWorkerSocket('sdk-stale'), true, 'the socket itself is still retained');
 
@@ -669,5 +675,247 @@ test('a worker\'s stated build id is reported once per change, and a malformed o
   quiet.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-old', pid: 92 }));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(reports.length, 2);
+  service.stop();
+});
+
+test('the liveness window is 90 s, three missed idle beats', () => {
+  assert.equal(WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS, 90_000);
+});
+
+test('the socket count is reported on connect, close and stop', () => {
+  const httpServer = new EventEmitter();
+  const counts = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    onSocketCountChange: (count) => counts.push(count),
+  });
+  service.start();
+  for (const sid of ['sdk-a', 'sdk-b']) {
+    httpServer.emit('upgrade',
+      { url: `/api/session-worker/ws?token=secret-token&sessionId=${sid}&pid=7`, headers: { host: 'localhost:3333' } },
+      {},
+      Buffer.alloc(0),
+    );
+  }
+  assert.deepEqual(counts, [1, 2]);
+  lastWss.sockets[0].emit('close');
+  assert.deepEqual(counts, [1, 2, 1]);
+  lastWss.sockets[0].emit('error');
+  assert.deepEqual(counts, [1, 2, 1], 'a socket already gone is not counted twice');
+  service.stop();
+  assert.deepEqual(counts, [1, 2, 1, 0]);
+});
+
+function connectWorker(httpServer, sessionId) {
+  httpServer.emit('upgrade',
+    { url: `/api/session-worker/ws?token=secret-token&sessionId=${sessionId}&pid=7`, headers: { host: 'localhost:3333' } },
+    {},
+    Buffer.alloc(0),
+  );
+  return lastWss.sockets.at(-1);
+}
+
+const sentTypes = (socket) => socket.sent.map((frame) => JSON.parse(frame).type);
+const flushMicrotasks = async () => { for (let i = 0; i < 5; i += 1) await Promise.resolve(); };
+
+test('notifyQueueChanged hands a row to a ready socket at once and tells only the others', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  let pendingCount = 0;
+  const offers = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ sessionId }) => {
+      if (sessionId !== 'sdk-ready') return null;
+      const message = offers.shift();
+      return message ? { message } : null;
+    },
+    pollIntervalMs: 10_000,
+  });
+  service.start();
+  const ready = connectWorker(httpServer, 'sdk-ready');
+  const busy = connectWorker(httpServer, 'sdk-busy');
+  ready.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  ready.sent.length = 0;
+  busy.sent.length = 0;
+
+  offers.push({ id: 'q-1' });
+  pendingCount = 1;
+  await service.notifyQueueChanged('insert');
+  assert.deepEqual(sentTypes(ready), ['queue.deliver'], 'the ready socket gets the row, no announcement');
+  assert.deepEqual(sentTypes(busy), ['queue.changed'], 'the other socket is told');
+  service.stop();
+});
+
+test('the backstop tries no dequeue while nothing is pending', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  let pendingCount = 0;
+  let requests = 0;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount, processingCount: 0, parkedCount: 0 }),
+    requestWork: async () => { requests += 1; return null; },
+    pollIntervalMs: 10_000,
+  });
+  service.start();
+  const socket = connectWorker(httpServer, 'sdk-idle');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  const afterReady = requests;
+  t.mock.timers.tick(60_000);
+  await flushMicrotasks();
+  assert.equal(requests, afterReady, 'six idle polls, no dequeue');
+  pendingCount = 1;
+  t.mock.timers.tick(10_000);
+  await flushMicrotasks();
+  assert.equal(requests, afterReady + 1, 'a pending row: the poll tries the ready socket');
+  service.stop();
+});
+
+test('a keepalive ready with nothing pending draws no dequeue; with a row pending it does', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  let pendingCount = 0;
+  const reasons = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount, processingCount: 0, parkedCount: 0 }),
+    requestWork: async ({ reason }) => { reasons.push(reason); return null; },
+    pollIntervalMs: 10_000,
+  });
+  service.start();
+  const socket = connectWorker(httpServer, 'sdk-refresh');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'readiness-refresh' }));
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'delivery-complete' }));
+  await flushMicrotasks();
+  assert.deepEqual(reasons, ['delivery-complete']);
+  pendingCount = 2;
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'readiness-refresh' }));
+  await flushMicrotasks();
+  assert.deepEqual(reasons, ['delivery-complete', 'readiness-refresh']);
+  service.stop();
+});
+
+function dueSetup(t, { dueAtMs = () => null } = {}) {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  const dues = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    nextDueAtMs: () => dueAtMs(),
+    onDue: (reason) => dues.push({ reason, at: Date.now() }),
+    pollIntervalMs: 10_000,
+  });
+  return { service, dues };
+}
+
+test('the due timer fires at the retry time, once', async (t) => {
+  let due = 1_000_000 + 2_000;
+  const { service, dues } = dueSetup(t, { dueAtMs: () => (due > Date.now() ? due : null) });
+  service.start();
+  // Arming again (a wake, a notify) keeps one timer.
+  await service.notifyQueueChanged('insert');
+  await service.notifyQueueChanged('insert');
+  t.mock.timers.tick(1_999);
+  assert.deepEqual(dues, []);
+  t.mock.timers.tick(1);
+  assert.deepEqual(dues, [{ reason: 'retry-due', at: 1_002_000 }]);
+  t.mock.timers.tick(60_000);
+  assert.equal(dues.length, 1, 'nothing further due, no timer');
+  due = Date.now() + 500;
+  await service.notifyQueueChanged('requeue');
+  t.mock.timers.tick(500);
+  assert.equal(dues.length, 2);
+  service.stop();
+});
+
+test('a retry far away is re-read every minute, and fires on time', async (t) => {
+  const due = 1_000_000 + 150_000;
+  const { service, dues } = dueSetup(t, { dueAtMs: () => (due > Date.now() ? due : null) });
+  service.start();
+  t.mock.timers.tick(60_000);
+  t.mock.timers.tick(60_000);
+  assert.deepEqual(dues, [], 'the minute re-reads do not wake');
+  t.mock.timers.tick(29_999);
+  assert.deepEqual(dues, []);
+  t.mock.timers.tick(1);
+  assert.equal(dues.length, 1);
+  service.stop();
+});
+
+test('stop clears the due timer and nothing re-arms it', async (t) => {
+  const due = 1_000_000 + 5_000;
+  const { service, dues } = dueSetup(t, { dueAtMs: () => due });
+  service.start();
+  service.stop();
+  await service.notifyQueueChanged('late');
+  t.mock.timers.tick(120_000);
+  assert.deepEqual(dues, []);
+});
+
+test('with the due timer lost, the backstop still hands out a matured retry', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  const retryAt = 1_000_000 + 3_000;
+  const delivered = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    // The row is claimable only from its retry time on.
+    requestWork: async () => (Date.now() >= retryAt && !delivered.length ? { message: { id: 'q-retry' } } : null),
+    nextDueAtMs: () => { throw new Error('the due query broke'); },
+    pollIntervalMs: 10_000,
+  });
+  service.start();
+  const socket = connectWorker(httpServer, 'sdk-retry');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  t.mock.timers.tick(9_999);
+  await flushMicrotasks();
+  assert.equal(sentTypes(socket).includes('queue.deliver'), false);
+  t.mock.timers.tick(1);
+  await flushMicrotasks();
+  assert.equal(sentTypes(socket).filter((type) => type === 'queue.deliver').length, 1);
+  service.stop();
+});
+
+test('notifyQueueChanged with nothing pending tries no dequeue and tells nobody', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const httpServer = new EventEmitter();
+  let requests = 0;
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    requestWork: async () => { requests += 1; return null; },
+    pollIntervalMs: 10_000,
+  });
+  service.start();
+  const socket = connectWorker(httpServer, 'sdk-idle');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  const before = requests;
+  socket.sent.length = 0;
+  await service.notifyQueueChanged('settle');
+  assert.equal(requests, before);
+  assert.deepEqual(socket.sent, []);
   service.stop();
 });

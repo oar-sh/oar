@@ -18,7 +18,8 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *   or the agents'.
  * - Agent text is plain text: HTML in an ask's detail shows as written.
  * - The asking session gets question_answered as a relay event.
- * - The ask's card in its session does not block it and answers in place.
+ * - In its session an ask is a 📓 stub that opens 📓 at it, where it is
+ *   answered in place; the session is not blocked.
  * - On a phone the Inbox is one column with full-width buttons.
  * - An ask about a session on B, from A's agent: listed in A's Inbox under B,
  *   answered there through the pairing; B's session and A's asker are told.
@@ -244,18 +245,30 @@ test.describe.serial("the Inbox", () => {
     await expect.poll(() => messages.evaluate((node) => node.scrollTop)).toBe(kept);
   });
 
-  test("the ask's card in its session does not block it and answers in place", async ({ page }) => {
+  test("in its session an ask is a 📓 stub; 📓 answers it in place and the session is not blocked", async ({ page }) => {
     const asked = await toolA(sessions.worker, "ask", { question: "Keep the old API for a release?", options: ["Yes", "No"] });
     expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
     await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, sessions.worker);
     await openApp(page, DESKTOP);
-    const card = page.locator(`.relay-ask-container[data-ask-id="${asked.payload.question_id}"]`);
-    await expect(card).toBeVisible();
-    await expect(card.locator(".inbox-item-kind")).toHaveText("Question for you · does not block this session");
+    // Its stub: in the live bubble when the session's message was handed out
+    // already (a turn ran when it asked), else standing alone at the end.
+    const listed = await apiA(`/api/relay-asks?conversationId=${encodeURIComponent(sessions.worker)}`);
+    const queueId = listed.payload?.asks?.find((entry) => entry.id === asked.payload.question_id)?.queueId || null;
+    const stub = page.locator(`${queueId ? `:is(#thinking-indicator[data-message-id="${queueId}"], .msg.assistant[data-source-message-id="${queueId}"])` : ".relay-ask-stub-container"} .msg-ask-stub[data-ask-id="${asked.payload.question_id}"]`);
+    await expect(stub).toHaveText("📓 Question for you");
+    await expect(page.locator(".msg-ask-stub")).toHaveCount(1);
+    await expect(page.locator(".relay-ask-container")).toHaveCount(0);
     await expect(page.locator("#input-area")).toBeVisible();
+    await stub.click();
+    const card = page.locator(`#questions-panel .inbox-item[data-item-id="${asked.payload.question_id}"]`);
+    await expect(card).toBeVisible();
+    await expect(card.locator(".inbox-item-kind")).toHaveText("Question for you");
     await card.locator(".inbox-answer-text").fill("Yes, until 2.0");
     await card.locator(".inbox-answer").click();
-    await expect(card).toHaveCount(0);
+    await expect(card.locator(".inbox-item-outcome")).toHaveText("Answered: Yes, until 2.0");
+    // Closed: in its turn's bubble the stub says so; a standalone line goes.
+    if (queueId) await expect(stub).toHaveText("📓 Answered: Yes, until 2.0");
+    else await expect(stub).toHaveCount(0);
     // Typed text that is no option carries none.
     await expectEvent(apiA, sessions.worker, /"Keep the old API for a release\?" → the user answered "Yes, until 2\.0" \(via relay "win-test"\)$/m);
   });
@@ -267,17 +280,47 @@ test.describe.serial("the Inbox", () => {
     await openInbox(page);
     const item = page.locator(`.inbox-item[data-item-id="${asked.payload.question_id}"]`);
     await expect(item.locator(".inbox-item-urgent")).toHaveText("urgent");
-    const itemBox = await item.boundingBox();
+    // Measured in one go: the Inbox draws its list anew when the load it
+    // started on opening comes back, and a card found before that redraw has
+    // no box any more (boundingBox() is null for a node no longer in the page).
+    const measure = () => page.evaluate((id) => {
+      const card = document.querySelector(`.inbox-view .inbox-item[data-item-id="${id}"]`);
+      if (!card?.checkVisibility()) return null;
+      const box = (node) => {
+        const rect = node.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      };
+      const part = (selector) => card.querySelector(selector);
+      if (!part('.inbox-choice[data-choice="Yes"]') || !part('.inbox-choice[data-choice="No"]') || !part(".inbox-answer")) return null;
+      return {
+        card: box(card),
+        yes: box(part('.inbox-choice[data-choice="Yes"]')),
+        no: box(part('.inbox-choice[data-choice="No"]')),
+        answer: box(part(".inbox-answer")),
+      };
+    }, asked.payload.question_id);
+    let boxes = null;
+    await expect.poll(async () => (boxes = await measure())).not.toBeNull();
+    const { card: itemBox, yes, no, answer } = boxes;
     expect(itemBox.x).toBeGreaterThanOrEqual(0);
     expect(itemBox.x + itemBox.width).toBeLessThanOrEqual(PHONE.width);
-    const yes = await item.locator('.inbox-choice[data-choice="Yes"]').boundingBox();
-    const no = await item.locator('.inbox-choice[data-choice="No"]').boundingBox();
-    const answer = await item.locator(".inbox-answer").boundingBox();
     // Stacked, each as wide as the others and nearly the card's width.
     expect(no.y).toBeGreaterThan(yes.y);
     expect(Math.abs(yes.width - no.width)).toBeLessThanOrEqual(1);
     expect(Math.abs(yes.width - answer.width)).toBeLessThanOrEqual(1);
     expect(yes.width).toBeGreaterThan(itemBox.width * 0.8);
+    const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim();
+    if (shotDir) {
+      // The drawer slides shut once the Inbox opens: shot when it is gone.
+      await expect.poll(() => page.evaluate(() => document.getElementById("sidebar").getBoundingClientRect().right <= 0)).toBe(true);
+      for (const theme of ["dark", "light"]) {
+        await page.evaluate((wanted) => window.updateTheme(wanted), theme);
+        // The theme repaints (as questions-panel.spec's shots wait).
+        await page.waitForTimeout(150);
+        await page.screenshot({ path: `${shotDir}/inbox-phone-${theme}.png` });
+      }
+      await page.evaluate(() => window.updateTheme("dark"));
+    }
     await item.locator('.inbox-choice[data-choice="No"]').click();
     await expect(item.locator(".inbox-item-outcome")).toHaveText("Answered: No");
   });

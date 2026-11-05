@@ -459,6 +459,38 @@ test.describe.serial("tap targets keep the 28px floor", () => {
       }
     });
 
+    test(`${layout} at 100 %: 📓's list (every button, a card's Details, ✕) and an ask's stub`, async ({ browser }) => {
+      const queued = await api("/api/message", { method: "POST", body: { text: `Culvert inspection ${layout} ${suffix}`, relayMode: "agent", model: "gpt-5.4-mini" } });
+      expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
+      const { conversationId } = queued.payload;
+      const asked = await api("/api/remote-relays/tool", {
+        method: "POST",
+        body: { conversationId, action: "ask", args: { question: "Clear the culvert grate first?", options: ["Clear it", "Leave it"], detail: "Leaves have piled up since the last sweep." } },
+      });
+      expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
+      const { context, page } = await openApp(browser, layout, { conversation: conversationId });
+      const touch = !!LAYOUTS[layout].hasTouch;
+      const press = (locator) => (touch ? locator.tap() : locator.click());
+      try {
+        await expect(page.locator(".msg-ask-stub")).toHaveCount(1);
+        await expectTargets(page, "#messages .msg-ask-stub", { label: "📓 stub" });
+        await expect(page.locator("#questions-btn")).toHaveAttribute("data-count", "1");
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        if (await page.locator("#questions-btn").isVisible()) await press(page.locator("#questions-btn"));
+        else {
+          await press(page.locator("#chat-actions-menu-btn"));
+          await press(page.locator("#chat-menu-questions"));
+        }
+        await expect(page.locator("#questions-panel")).toBeVisible();
+        await expectTargets(page, "#questions-panel button", { minWidth: FLOOR, label: "📓 buttons" });
+        await expectTargets(page, "#questions-panel details.inbox-item-detail > summary", { label: "📓 Details" });
+        await page.keyboard.press("Escape");
+        await expect(page.locator("#questions-panel")).toBeHidden();
+      } finally {
+        await context.close();
+      }
+    });
+
     test(`${layout} at 100 %: the live bubble's Stop and its 💭 📃 🛠️ follow buttons`, async ({ browser }) => {
       // A turn of its own: the fixture's ones change state while the suite runs.
       const live = await runningTurn(`Sluice gauge reading ${layout} ${suffix}`);

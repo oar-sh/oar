@@ -44,7 +44,7 @@ import {
   isMissingRelayEventRoute,
   relayWithoutCrossRelayEventsText,
 } from './relay-event-link-service.mjs';
-import { RELAY_ASK_KIND, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { RELAY_ASK_KIND, isPersonOnlyQuestion, relayQuestionKind } from '../../shared/relay-asks.mjs';
 import { RELAY_ASK_REMOTE_PATHS, isMissingRelayAskRoute, relayWithoutAsksText } from './relay-ask-link-service.mjs';
 
 // The one place a `relay_tool` tool call is decided and carried out (plan
@@ -465,11 +465,13 @@ function relayTarget(relay) {
 /**
  * The question card's view of a relay question: what the agent needs to answer
  * it. Null for the remote's own remote-relay approval cards, which only its
- * user may answer (the remote hides them from us as well).
+ * user may answer (the remote hides them from us as well), and for a Claude
+ * session's Safety check card, which only the user may answer.
  */
 function mapPendingQuestion(question) {
   if (!isPlainObject(question) || !toText(question.id)) return null;
   if (isRemoteRelayApprovalQuestion(question)) return null;
+  if (isPersonOnlyQuestion(question.context)) return null;
   const kind = relayQuestionKind(question);
   if (kind === RELAY_ASK_KIND) {
     // A question that does not block: the user's to answer, the session works on.
@@ -1757,7 +1759,9 @@ export function createRemoteRelayDispatcher({
       budget -= text.length;
       const role = toText(row.role) || 'assistant';
       const via = toText(row?.origin?.relayName);
-      const activities = includeActivity && role === 'assistant' ? activityTexts(row.activities) : [];
+      // The newest lines, as the progress path reads them: the relay keeps the
+      // newest per thread now, so the first ones are not the start anyway.
+      const activities = includeActivity && role === 'assistant' ? activityTexts(row.activities, { fromEnd: true }) : [];
       out.unshift({
         id: toText(row.id),
         role,
@@ -2594,6 +2598,11 @@ export function createRemoteRelayDispatcher({
         `Question ${args.question_id} was not found on relay "${ctx.relay.name}".`);
     }
     const session = toText(question.conversationId) || null;
+    if (isPersonOnlyQuestion(question.context)) {
+      throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
+        `Question ${args.question_id} is a Safety check: Claude Code marks the call as person-only, so this card is the user's to answer, never an agent's. Leave it to the user.`,
+        { session });
+    }
     if (ctx.relay.local && session && isOwnConversation(ctx, session)) {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.ownSession,
         `Question ${args.question_id} belongs to this conversation itself; an agent cannot answer its own question. It is the user's to answer.`,
@@ -3462,7 +3471,17 @@ export function createRemoteRelayDispatcher({
       };
     }
     const session = askSession(ctx, args);
-    const ask = relayAskCall(() => service.create({ conversationId: session, createdBy: ctx.conversationId, ...askInput(args) }));
+    const ask = relayAskCall(() => service.create({
+      conversationId: session,
+      createdBy: ctx.conversationId,
+      ...askInput(args),
+      // The queue id means "the turn that was live when the ask was made": a
+      // background sub-agent asking after its parent turn ended may record
+      // the user's next, unrelated turn (accepted; there is no worker
+      // attribution). An ask on behalf of another session stores null: the
+      // asking turn lives in another conversation.
+      queueId: session === ctx.conversationId ? (ctx.caller?.processingRowId || null) : null,
+    }));
     const forOther = session !== ctx.conversationId;
     return {
       summary: `ask → ${ctx.relay.name}${forOther ? ` session ${shortId(session)}` : ''}: question ${ask.id} pending${ask.urgency === 'now' ? ' (now)' : ''}`,

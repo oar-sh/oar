@@ -361,6 +361,16 @@ export function createMessageRepository(db) {
           LIMIT ?
         `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') ${notHeldForUsageLimit()} GROUP BY status`),
+        // Stale recovery has nothing to look at while no row is processing.
+        hasProcessingRow: db.prepare(`SELECT 1 AS present FROM queue WHERE status = 'processing' LIMIT 1`),
+        // The earliest future retry time of a pending row (a backoff, a
+        // usage-limit hold): the relay wakes its queue then. A hold until the
+        // user resumes (year 9999) is no time.
+        nextPendingAttemptAt: db.prepare(`
+          SELECT MIN(next_attempt_at) AS due FROM queue
+          WHERE status = 'pending' AND next_attempt_at IS NOT NULL
+            AND next_attempt_at > ? AND next_attempt_at < '9999'
+        `),
         // Deferred host suspend: which conversations still hold live turns.
         listActiveQueueCountsByConversation: db.prepare(`
           SELECT q.conversation_id, COUNT(*) AS cnt, MAX(c.title) AS title

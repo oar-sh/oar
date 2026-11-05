@@ -1,12 +1,48 @@
 'use strict';
 
 import { createSubagentTimelineStatements } from './subagent-timeline-statements.mjs';
+import { hasTurnSeqColumn } from '../migrations/0038-turn-seq.mjs';
+
+const nextTurnSeqStatements = new WeakMap();
+
+/**
+ * The next number of a turn's shared order (migration 0038): one more than
+ * the highest turn_seq of its thoughts and tool lines together, 1 for a turn
+ * that has none. Call it inside the write transaction that inserts the row
+ * (BEGIN IMMEDIATE takes the write lock before this read), so two writers
+ * never get the same number.
+ */
+export function nextTurnSeq(db, queueMessageId) {
+    let statement = nextTurnSeqStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(`
+          SELECT MAX(
+            COALESCE((SELECT MAX(turn_seq) FROM relay_activity WHERE queue_message_id = @id AND turn_seq IS NOT NULL), 0),
+            COALESCE((SELECT MAX(turn_seq) FROM relay_thought WHERE queue_message_id = @id AND turn_seq IS NOT NULL), 0)
+          ) AS max_seq
+        `);
+        nextTurnSeqStatements.set(db, statement);
+    }
+    return Math.max(0, Number(statement.get({ id: String(queueMessageId) })?.max_seq || 0)) + 1;
+}
 
 export function createQuestionRepository(db) {
     const subagentTimeline = createSubagentTimelineStatements(db);
     const runColumns = subagentTimeline.subagentRunSelectColumns;
     const runColumnsAs = (alias) => runColumns.split(', ').map((column) => `${alias}.${column}`).join(', ');
+    // Migration 0038 may have failed (it is retried next boot): without the
+    // column, rows are written without a number and read back without one,
+    // and every turn keeps the grouped layout.
+    const turnSeq = hasTurnSeqColumn(db, 'relay_activity') && hasTurnSeqColumn(db, 'relay_thought');
+    // The insert statements take turn_seq as their last value, which a caller
+    // may leave out (null); a database without the column drops it.
+    const fitValues = (statement, count) => ({
+        run: (...values) => statement.run(...values.slice(0, count), ...Array(Math.max(0, count - values.length)).fill(null)),
+    });
     return {
+        hasTurnSeq: turnSeq,
+        // The next turn_seq of a queue message, or null without the column.
+        nextTurnSeq: (queueMessageId) => (turnSeq ? nextTurnSeq(db, queueMessageId) : null),
         ...subagentTimeline,
         // relay questions
         insertQuestion: db.prepare(`INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, request_schema, status, answer, structured_answer, sdk_session_id, owner_worker_id, continuation_id, continuation_question_id, created_at, answered_at, expires_at, attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?)`),
@@ -27,10 +63,14 @@ export function createQuestionRepository(db) {
         expireQuestions: db.prepare(`UPDATE relay_questions SET status = 'timed_out' WHERE status = 'pending' AND expires_at < ? RETURNING id, created_at`),
 
         // relay activity
-        insertActivity: db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        // (queue_message_id, response_message_id, conversation_id, relay_mode,
+        // text, created_at, subagent_run_id, metadata_json, turn_seq)
+        insertActivity: turnSeq
+            ? fitValues(db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json, turn_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`), 9)
+            : fitValues(db.prepare(`INSERT INTO relay_activity (queue_message_id, response_message_id, conversation_id, relay_mode, text, created_at, subagent_run_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`), 8),
         linkActivityToResponse: db.prepare(`UPDATE relay_activity SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-        listActivityByResponse: db.prepare(`SELECT text, subagent_run_id, metadata_json FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
-        listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id, metadata_json FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
+        listActivityByResponse: db.prepare(`SELECT text, subagent_run_id, metadata_json${turnSeq ? ', turn_seq' : ''} FROM relay_activity WHERE response_message_id = ? ORDER BY id ASC`),
+        listActivityByQueueMessage: db.prepare(`SELECT text, subagent_run_id, metadata_json${turnSeq ? ', turn_seq' : ''} FROM relay_activity WHERE queue_message_id = ? ORDER BY id ASC`),
         // When a queue row last produced output — its newest stream snapshot
         // (rows are rewritten in place and re-stamped per update) or activity
         // line. The live-turn picker compares rows by this, never by the
@@ -73,8 +113,12 @@ export function createQuestionRepository(db) {
 
         // relay thoughts (agent reasoning)
         getLastThoughtSeqByQueueMessage: db.prepare(`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM relay_thought WHERE queue_message_id = ?`),
-        getThoughtByQueueAndReasoning: db.prepare(`SELECT seq FROM relay_thought WHERE queue_message_id = ? AND reasoning_id = ? LIMIT 1`),
-        insertThought: db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        getThoughtByQueueAndReasoning: db.prepare(`SELECT seq${turnSeq ? ', turn_seq' : ''} FROM relay_thought WHERE queue_message_id = ? AND reasoning_id = ? LIMIT 1`),
+        // (queue_message_id, response_message_id, conversation_id, relay_mode,
+        // reasoning_id, seq, text, done, created_at, subagent_run_id, turn_seq)
+        insertThought: turnSeq
+            ? fitValues(db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id, turn_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`), 11)
+            : fitValues(db.prepare(`INSERT INTO relay_thought (queue_message_id, response_message_id, conversation_id, relay_mode, reasoning_id, seq, text, done, created_at, subagent_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`), 10),
         updateThoughtByQueueAndReasoning: db.prepare(`
           UPDATE relay_thought
           SET response_message_id = COALESCE(response_message_id, ?),
@@ -88,8 +132,8 @@ export function createQuestionRepository(db) {
             AND reasoning_id = ?
         `),
         linkThoughtsToResponse: db.prepare(`UPDATE relay_thought SET response_message_id = ? WHERE queue_message_id = ? AND response_message_id IS NULL`),
-        listThoughtsByResponse: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id FROM relay_thought WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
-        listThoughtsByQueueMessage: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id FROM relay_thought WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
+        listThoughtsByResponse: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id${turnSeq ? ', turn_seq' : ''} FROM relay_thought WHERE response_message_id = ? ORDER BY seq ASC, id ASC`),
+        listThoughtsByQueueMessage: db.prepare(`SELECT reasoning_id, seq, text, done, created_at, subagent_run_id${turnSeq ? ', turn_seq' : ''} FROM relay_thought WHERE queue_message_id = ? ORDER BY seq ASC, id ASC`),
         deleteConvThoughts: db.prepare(`DELETE FROM relay_thought WHERE conversation_id = ?`),
 
         // subagent runs

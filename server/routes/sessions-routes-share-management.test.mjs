@@ -242,6 +242,10 @@ test('a renewed link keeps the access log, and the old token is a 404 everywhere
   const fx = setup();
   fx.insertConversation('conv-a', 'Report builder');
   const { token: oldToken } = await fx.share('conv-a');
+  // Shared a day before the renew: a renew in the same millisecond as the
+  // share would read as not renewed (renewedAt compares the two dates).
+  fx.db.prepare(`UPDATE conversation_shares SET created_at = ? WHERE token = ?`)
+    .run(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(), oldToken);
   await fx.read(oldToken, { query: { open: '1' } });
   await fx.read(oldToken, { query: { open: '1' }, userAgent: BROWSER_B });
 
@@ -328,7 +332,9 @@ test('with IP storage off new log rows and status events carry no address', asyn
   assert.equal(new Set(rows.map((row) => row.viewer_key)).size, 3);
   assert.equal((await fx.list()).shares[0].viewerCount, 3);
 
-  const events = fx.db.prepare(`SELECT payload_json FROM status_events WHERE type = 'shared-access-opened' ORDER BY timestamp`).all()
+  // Two reads in the same millisecond share a timestamp; rowid is the order
+  // they were written in.
+  const events = fx.db.prepare(`SELECT payload_json FROM status_events WHERE type = 'shared-access-opened' ORDER BY timestamp, rowid`).all()
     .map((row) => JSON.parse(row.payload_json));
   assert.equal(events.length, 3, 'one event per viewer, not one for all address-less reads');
   assert.equal(events[0].viewerIp, '203.0.113.10');

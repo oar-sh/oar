@@ -63,6 +63,9 @@ import {
 } from './transcript-viewport-anchor.mjs';
 import { initTranscriptJumpToBottom, onTranscriptEndLeft } from './transcript-jump-bottom-view.mjs';
 import { syncScrollOnSendToggle, updateScrollOnSendSetting } from './transcript-jump-bottom.mjs';
+import { isThoughtsExpanded, syncThoughtsExpandedToggle, updateThoughtsExpandedSetting } from './thoughts-preference.mjs';
+import { previewLiveActivityCap, syncLiveActivityCapSlider, updateLiveActivityCap } from './live-activity-cap.mjs';
+import { STREAM_VIEW_CHANGE_EVENT, isStreamViewEnabled, syncStreamViewToggle, updateStreamViewSetting } from './stream-view-preference.mjs';
 import { previewWindowRetention, syncWindowRetentionSlider, updateWindowRetention } from './conversation-window-retention.mjs';
 import { conversationPayloadCache, mergeReloadIntoWindow } from './conversation-payload-cache.mjs';
 import {
@@ -93,7 +96,7 @@ import {
   reportSharedViewerPresence,
   setNetworkRequestsEnabled,
 } from './api-client.js';
-import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, initConversationListLazyLoading, initConversationFilter } from './journal-view.js';
+import { loadConversations, refreshConversations, openConversation, renderConvList, applyLoadedConversationState, heldDetailsStore, initConversationListLazyLoading, initConversationFilter } from './journal-view.js';
 import {
   newConversation,
   confirmNewConversationModel,
@@ -150,6 +153,7 @@ import {
   getHeldBackLiveRowIds,
   captureConversationReadingAnchor,
   canMergeIntoTranscript,
+  refreshStreamViewLayout,
 } from './conversation-view.js';
 import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
 import { backgroundTasksSnapshotMark } from './background-tasks-view.mjs';
@@ -250,6 +254,8 @@ import { closeAnnotateEditor } from './annotate-editor.js';
 import { closeEmojiPicker } from './emoji-view.js';
 import { closeChangeCwdMenu } from './cwd-picker.js';
 import { closeRelayWatchPanel } from './relay-event-subscriptions-ui.js';
+import { closeQuestionsPanel, initQuestionsPanel, openQuestionsPanel, setQuestionsConversation } from './questions-panel-ui.js';
+import { questionsTwinLabel } from './questions-view.mjs';
 import { closeRelaySchedulePanel } from './relay-schedules-ui.js';
 import { isInboxViewActive } from './inbox-ui.js';
 import { initScrollbarHover } from './scrollbar-hover.mjs';
@@ -261,6 +267,8 @@ import {
   renderAutoCompactNotesHtml,
   renderContextUsageHtml,
   renderThinkingControlHtml,
+  renderThoughtsPreferenceHtml,
+  renderStreamViewPreferenceHtml,
   thinkingEnabledFromKey,
   thinkingEnabledToKey,
 } from './context-usage-view.mjs';
@@ -3702,6 +3710,18 @@ function initThinkingControl() {
   if (!body || body.dataset.thinkingBound === '1') return;
   body.dataset.thinkingBound = '1';
   body.addEventListener('click', (event) => {
+    // 🧵 Stream view and 💭 Thoughts: settings of this browser, nothing goes
+    // to the relay. (The stream view's buttons share the thoughts' look.)
+    const streamViewBtn = event.target?.closest?.('.ctx-stream-view-btn');
+    if (streamViewBtn && body.contains(streamViewBtn)) {
+      updateStreamViewSetting(streamViewBtn.dataset.streamView === 'on');
+      return;
+    }
+    const thoughtsBtn = event.target?.closest?.('.ctx-thoughts-btn[data-thoughts-expanded]');
+    if (thoughtsBtn && body.contains(thoughtsBtn)) {
+      updateThoughtsExpandedSetting(thoughtsBtn.dataset.thoughtsExpanded !== 'off');
+      return;
+    }
     const btn = event.target?.closest?.('.ctx-thinking-btn');
     if (!btn || !body.contains(btn)) return;
     void applyThinkingSelection(btn.dataset.thinkingAxis, btn.dataset.thinkingValue);
@@ -3861,6 +3881,10 @@ async function loadContextSummaryAndRender(convId) {
       thinkingDisplay: payload.thinkingDisplay ?? null,
     })
     : '';
+  // Every provider streams thoughts somewhere; the row mirrors the Settings
+  // toggle and is this browser's own.
+  const thoughtsHtml = renderThoughtsPreferenceHtml({ expanded: isThoughtsExpanded() })
+    + renderStreamViewPreferenceHtml({ on: isStreamViewEnabled() });
   // What this folder's commits say, with the folder override: Claude (on
   // either billing), and a Claude Cloud chat that was started from a folder
   // (no path, no row).
@@ -3885,10 +3909,10 @@ async function loadContextSummaryAndRender(convId) {
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
   const bodyHtml = usageHtml
-    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${attributionHtml}${agentSessionsHtml}${detailText
+    ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${thoughtsHtml}${attributionHtml}${agentSessionsHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
-    : `${autoCompactHtml}${thinkingHtml}${attributionHtml}${agentSessionsHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+    : `${autoCompactHtml}${thinkingHtml}${thoughtsHtml}${attributionHtml}${agentSessionsHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -4130,12 +4154,17 @@ async function pollAuthenticatedCurrentConversationLive() {
     const requestLimit = Math.max(20, getConversationLoadedMessageCount() || 0, savedLoadedCount || 0);
     const tasksMark = backgroundTasksSnapshotMark(currentId);
     const jumpEpoch = getTranscriptJumpEpoch();
+    // The finished replies this page already holds go out without their
+    // tool lines and thoughts (held-details.mjs); the answer gets them back
+    // from the store, or is dropped if it names one the store lacks.
+    const heldDetails = heldDetailsStore.param(currentId);
     const { response, stale } = await loadKeepingLiveRows(
-      () => loadConversation(currentId, { limit: requestLimit }),
+      () => loadConversation(currentId, { limit: requestLimit, heldDetails }),
       getTranscriptLiveRowEpoch,
     );
     if (!response) return;
     if (String(currentConvId || '').trim() !== currentId) return;
+    if (!heldDetailsStore.restore(currentId, response)) return;
     // The user jumped into the history while this request was on its way: the
     // answer is the end of the conversation as it was asked for before that,
     // and would overwrite the window they jumped to. The next round asks again.
@@ -4155,6 +4184,7 @@ async function pollAuthenticatedCurrentConversationLive() {
       followLiveUpdates: preserveBottom,
       mergeFrom: merge?.mergeFrom || null,
       backgroundTasksAsOf: tasksMark,
+      fromPoll: true,
     });
     // A merge does not scroll as the full render does: a reader at the end
     // is taken to the new end here.
@@ -4600,6 +4630,7 @@ function headerPriorityActionAvailability() {
   const fullscreen = document.getElementById('fullscreen-btn');
   return resolveHeaderActionAvailability({
     sharedMode: isSharedReaderMode(),
+    questionCount: Number(document.getElementById('questions-btn')?.dataset.count || 0),
     pinCount: Number(pins?.dataset.count || 0),
     hiddenCount: Number(hiddenBtn?.dataset.count || 0),
     fullscreenAvailable: fullscreen?.dataset.headerAvailable === '1',
@@ -4676,6 +4707,8 @@ function headerFitSignature(header, availability) {
     banner?.className, banner?.hidden, banner?.textContent,
     document.getElementById('sidebar-toggle')?.hidden,
     document.getElementById('chat-actions-menu-btn')?.hidden,
+    document.getElementById('questions-btn')?.dataset.count,
+    document.getElementById('questions-btn')?.dataset.urgent,
     document.getElementById('pinned-messages-btn')?.dataset.count,
     document.getElementById('hidden-messages-btn')?.dataset.count,
     document.getElementById('fullscreen-btn')?.textContent,
@@ -4782,6 +4815,14 @@ function syncHeaderPriorityTwinLabels() {
     const count = Number(document.getElementById(buttonId)?.dataset.count || 0);
     twin.textContent = count ? `${icon} ${text} (${count})` : `${icon} ${text}`;
   };
+  const questions = document.getElementById('questions-btn');
+  const questionsTwin = document.getElementById('chat-menu-questions');
+  if (questionsTwin) {
+    questionsTwin.textContent = questionsTwinLabel({
+      pending: Number(questions?.dataset.count || 0),
+      urgent: Number(questions?.dataset.urgent || 0),
+    });
+  }
   label('pinned-messages-btn', 'chat-menu-pins', 'Pinned messages', '📍');
   label('hidden-messages-btn', 'chat-menu-hidden', 'Hidden from shared viewers', '🙈');
 }
@@ -4812,6 +4853,11 @@ function scheduleHeaderPrioritySync({ force = false } = {}) {
 // syncChatTitleControls.
 function initHeaderPriorityActions({ sharedMode = false } = {}) {
   if (!sharedMode) {
+    // 📓's own button toggles the list under it (questions-panel-ui.js); the
+    // twin opens it under ︙.
+    bindHeaderPriorityAction('questions', () => {
+      openQuestionsPanel({ anchor: document.getElementById('chat-actions-menu-btn') });
+    }, { inline: false });
     bindHeaderPriorityAction('pins', () => openPinnedMessagesModal(), { inline: false });
     bindHeaderPriorityAction('hidden', () => openHiddenMessagesModal(), { inline: false });
     bindHeaderPriorityAction('search', () => openMessageSearchModal(), { inline: false });
@@ -5052,6 +5098,7 @@ function syncChatTitleControls() {
   if (!convId) {
     setPinsConversation(null);
     setHiddenMessagesConversation(null);
+    setQuestionsConversation(null);
   }
   const conversation = convId ? (conversations[convId] || null) : null;
   const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
@@ -5333,6 +5380,9 @@ async function initApp() {
   if (!sharedMode) {
     syncSuspendHostVisibility();
     syncScrollOnSendToggle();
+    syncThoughtsExpandedToggle();
+    syncLiveActivityCapSlider();
+    syncStreamViewToggle();
     syncWindowRetentionSlider();
     initHostSuspendUi();
     initUsageLimitUi();
@@ -5734,6 +5784,7 @@ async function initApp() {
   void loadRelaySchedules();
   // The Inbox's count, and the cards of questions that don't block.
   startInbox();
+  initQuestionsPanel();
   if (pushConversationId) {
     await openConversation(pushConversationId, { history: 'replace' }).catch(() => {});
   }
@@ -5812,6 +5863,7 @@ async function bootstrap() {
     closeTmuxInspector: closeTmuxInspectorView,
     closeAnnotateEditor,
     closeRelayWatchPanel,
+    closeQuestionsPanel,
     closeRelaySchedulePanel,
     closeEmojiPicker,
   });
@@ -5900,6 +5952,12 @@ window.resetGrokAllowanceAccounting = resetGrokAllowanceAccounting;
 window.toggleCursorProvider = toggleCursorProvider;
 window.updateShowSuspendHostSetting = updateShowSuspendHostSetting;
 window.updateScrollOnSendSetting = (enabled) => updateScrollOnSendSetting(enabled);
+window.updateThoughtsExpandedSetting = (expanded) => updateThoughtsExpandedSetting(expanded);
+window.updateStreamViewSetting = (on) => updateStreamViewSetting(on);
+// The transcript and the live bubble take the other layout at once.
+window.addEventListener(STREAM_VIEW_CHANGE_EVENT, () => refreshStreamViewLayout());
+window.previewLiveActivityCap = (position) => previewLiveActivityCap(position);
+window.updateLiveActivityCap = (position) => updateLiveActivityCap(position);
 window.previewConversationWindowRetention = (position) => previewWindowRetention(position);
 // A lower cap cuts the kept windows down now; the open conversation's is cut
 // when it is left.

@@ -15,10 +15,17 @@ import {
   claudeThinkingFlagSettings,
   claudeUltracodeFlagSettings,
   createCanUseTool,
+  isPersonOnlyAsk,
   longCommandInstructionText,
   mergeSpawnSettings,
   normalizeClaudeEffort,
   permissionModeForRelayMode,
+  personOnlyQuestionText,
+  PERSON_ONLY_ALLOW_CHOICE,
+  PERSON_ONLY_COMMAND_MAX,
+  PERSON_ONLY_DENY_CHOICE,
+  PERSON_ONLY_QUESTION_SOURCE,
+  PERSON_ONLY_TOO_LONG_MESSAGE,
   startClaudeSession,
   systemPromptForRelayMode,
 } from './claude-sdk-adapter.mjs';
@@ -235,6 +242,266 @@ test('canUseTool denies when the bridge fails', async () => {
   const result = await canUseTool('AskUserQuestion', { questions: [] }, {});
   assert.equal(result.behavior, 'deny');
   assert.match(result.message, /relay down/);
+});
+
+// The option shapes Claude Code 2.1.304 sends canUseTool (SDK 0.3.304), as
+// probed on a scratch folder; paths and ids invented.
+const PERSON_ONLY_RM_COMMAND = 'rm -rf /srv/sample-app/work';
+const PERSON_ONLY_RM_REASON = 'Dangerous rm operation on working directory or its ancestor: /srv/sample-app/work';
+const ASK_SHAPES = {
+  rmWorkspace: {
+    suggestions: [],
+    decisionReason: PERSON_ONLY_RM_REASON,
+    decisionReasonType: 'safetyCheck',
+    displayName: 'Bash',
+    suppressAlwaysAllowRule: true,
+    toolUseID: 'toolu_sample_1',
+    requestId: 'req-sample-1',
+  },
+  rmCompound: {
+    suggestions: [{
+      type: 'addRules',
+      rules: [{ toolName: 'Bash', ruleContent: PERSON_ONLY_RM_COMMAND }],
+      behavior: 'allow',
+      destination: 'localSettings',
+    }],
+    decisionReason: PERSON_ONLY_RM_REASON,
+    decisionReasonType: 'subcommandResults',
+    displayName: 'Bash',
+    suppressAlwaysAllowRule: true,
+    toolUseID: 'toolu_sample_2',
+    requestId: 'req-sample-2',
+  },
+  ordinary: {
+    suggestions: [{
+      type: 'addRules',
+      rules: [{ toolName: 'Bash', ruleContent: 'touch /srv/sample-app/work/new.txt' }],
+      behavior: 'allow',
+      destination: 'localSettings',
+    }],
+    blockedPath: '/srv/sample-app/work/new.txt',
+    displayName: 'Bash',
+    toolUseID: 'toolu_sample_3',
+    requestId: 'req-sample-3',
+  },
+  sensitiveRcFile: {
+    suggestions: [],
+    blockedPath: '/srv/sample-app/work/.bashrc',
+    decisionReason: 'Claude requested permissions to edit /srv/sample-app/work/.bashrc which is a sensitive file.',
+    decisionReasonType: 'safetyCheck',
+    displayName: 'Bash',
+    toolUseID: 'toolu_sample_4',
+    requestId: 'req-sample-4',
+  },
+  claudeSettingsFile: {
+    suggestions: [],
+    decisionReason: 'Claude requested permissions to write to /srv/sample-app/work/.claude/settings.local.json, but you haven\'t granted it yet.',
+    decisionReasonType: 'safetyCheck',
+    displayName: 'Bash',
+    toolUseID: 'toolu_sample_5',
+    requestId: 'req-sample-5',
+  },
+  defaultToNo: {
+    decisionReason: 'Auto mode classifier blocked action: removes a shared sample folder',
+    decisionReasonType: 'classifier',
+    defaultToNo: true,
+    suppressAlwaysAllowRule: true,
+    toolUseID: 'toolu_sample_6',
+    requestId: 'req-sample-6',
+  },
+};
+
+function recordingBridge(reply) {
+  const calls = [];
+  return {
+    calls,
+    handleAskUserQuestion: async (input, opts) => {
+      calls.push({ input, opts });
+      const question = input.questions[0].question;
+      const result = typeof reply === 'function' ? await reply(question, opts) : reply;
+      return { answers: { [question]: result?.answer ?? '' }, timedOut: result?.timedOut === true };
+    },
+  };
+}
+
+const SAMPLE_ASK_RULE = { source: 'userSettings', toolName: 'Bash', ruleContent: 'rm:*' };
+
+test('isPersonOnlyAsk takes the person-only rm shapes and defaultToNo, whatever ask rule matched', () => {
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.rmWorkspace), true);
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.rmCompound), true);
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.defaultToNo), true);
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.ordinary), false);
+  // Sensitive-file safety checks carry no suppressAlwaysAllowRule.
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.sensitiveRcFile), false);
+  assert.equal(isPersonOnlyAsk(ASK_SHAPES.claudeSettingsFile), false);
+  // A matched ask rule changes nothing: the flags decide.
+  assert.equal(isPersonOnlyAsk({ ...ASK_SHAPES.rmWorkspace, matchedAskRule: SAMPLE_ASK_RULE }), true);
+  assert.equal(isPersonOnlyAsk({ ...ASK_SHAPES.defaultToNo, matchedAskRule: SAMPLE_ASK_RULE }), true);
+  assert.equal(isPersonOnlyAsk({ ...ASK_SHAPES.ordinary, matchedAskRule: SAMPLE_ASK_RULE }), false);
+  // An unknown reason kind, or an older CLI without the kind, needs defaultToNo.
+  assert.equal(isPersonOnlyAsk({ ...ASK_SHAPES.rmWorkspace, decisionReasonType: 'workingDir' }), false);
+  assert.equal(isPersonOnlyAsk({ decisionReason: PERSON_ONLY_RM_REASON, suppressAlwaysAllowRule: true }), false);
+  assert.equal(isPersonOnlyAsk({ defaultToNo: true }), true);
+  assert.equal(isPersonOnlyAsk(undefined), false);
+  assert.equal(isPersonOnlyAsk(null), false);
+});
+
+test('a person-only ask becomes an Allow/Deny card and "Allow once" allows without updatedPermissions', async () => {
+  const bridge = recordingBridge({ answer: PERSON_ONLY_ALLOW_CHOICE });
+  const canUseTool = createCanUseTool({ askUserBridge: bridge });
+  const input = { command: PERSON_ONLY_RM_COMMAND, description: 'Remove the work folder' };
+  const shapes = {
+    ...ASK_SHAPES,
+    ruleAndFlags: { ...ASK_SHAPES.rmWorkspace, matchedAskRule: SAMPLE_ASK_RULE },
+    ruleAndDefaultToNo: { ...ASK_SHAPES.defaultToNo, matchedAskRule: SAMPLE_ASK_RULE },
+  };
+  const carded = ['rmWorkspace', 'rmCompound', 'defaultToNo', 'ruleAndFlags', 'ruleAndDefaultToNo'];
+  for (const shape of carded) {
+    const result = await canUseTool('Bash', input, { signal: new AbortController().signal, ...shapes[shape] });
+    assert.deepEqual(result, { behavior: 'allow', updatedInput: input }, shape);
+    assert.equal('updatedPermissions' in result, false, shape);
+  }
+  assert.equal(bridge.calls.length, carded.length);
+  const { input: card, opts } = bridge.calls[0];
+  assert.equal(card.questions.length, 1);
+  assert.equal(card.questions[0].header, 'Safety check');
+  assert.deepEqual(card.questions[0].options.map((option) => option.label), [PERSON_ONLY_ALLOW_CHOICE, PERSON_ONLY_DENY_CHOICE]);
+  assert.equal(card.questions[0].question, [
+    'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?',
+    `Reason: ${PERSON_ONLY_RM_REASON}`,
+    `Bash command:\n│ ${PERSON_ONLY_RM_COMMAND}`,
+  ].join('\n\n'));
+  assert.equal(opts.source, PERSON_ONLY_QUESTION_SOURCE);
+  assert.equal(opts.source, 'ClaudeSafetyCheck');
+  assert.match(opts.rationale, /person to approve/);
+  assert.equal(opts.allowFreeform, false, 'the card takes no typed reply');
+  assert.ok(opts.signal, 'the turn signal reaches the bridge');
+});
+
+test('only the exact "Allow once" allows', async () => {
+  for (const answer of ['allow once', 'ALLOW ONCE', 'Allow', 'yes', 'Allow once please']) {
+    const result = await createCanUseTool({ askUserBridge: recordingBridge({ answer }) })('Bash', { command: PERSON_ONLY_RM_COMMAND }, ASK_SHAPES.rmWorkspace);
+    assert.equal(result.behavior, 'deny', answer);
+  }
+  const padded = await createCanUseTool({ askUserBridge: recordingBridge({ answer: '  Allow once \n' }) })('Bash', { command: PERSON_ONLY_RM_COMMAND }, ASK_SHAPES.rmWorkspace);
+  assert.equal(padded.behavior, 'allow');
+});
+
+test('the card puts the reason first and fences every command line, so a command cannot pass for card text', () => {
+  const spoof = 'rm -rf /srv/sample-app/work\nReason: Routine cleanup, safe to allow.';
+  const text = personOnlyQuestionText('Bash', { command: spoof }, PERSON_ONLY_RM_REASON);
+  assert.equal(text, [
+    'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?',
+    `Reason: ${PERSON_ONLY_RM_REASON}`,
+    'Bash command, 2 lines:\n│ rm -rf /srv/sample-app/work ⏎\n│ Reason: Routine cleanup, safe to allow.',
+  ].join('\n\n'));
+  // Only the CLI's reason starts a line with "Reason:".
+  assert.deepEqual(text.split('\n').filter((line) => line.startsWith('Reason:')), [`Reason: ${PERSON_ONLY_RM_REASON}`]);
+  // The command stays out of the first 60 characters (the relay's log line).
+  assert.equal(text.slice(0, 60).includes('rm -rf'), false);
+});
+
+test('controls, bidi, zero-width and line-separator characters show as visible escapes', () => {
+  // U+202E turns "rm -rf /srv/sample-app/krow" into what reads as a harmless name.
+  const bidi = personOnlyQuestionText('Bash', { command: 'rm -rf /srv/sample-app/\u202ekrow\u202c' }, PERSON_ONLY_RM_REASON);
+  assert.ok(bidi.includes('│ rm -rf /srv/sample-app/\\u{202E}krow\\u{202C}'));
+  const hidden = ['\u0000', '\u0007', '\r', '\t', '\u001b', '\u007f', '\u0085', '\u009b', '\u061c', '\u200b', '\u200c', '\u200d',
+    '\u200e', '\u200f', '\u2028', '\u2029', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff'];
+  const text = personOnlyQuestionText('Bash', { command: `echo ${hidden.join('')}` }, `Sample${hidden.join('')}reason\nReason: fake`);
+  for (const char of hidden) assert.equal(text.includes(char), false, `U+${char.codePointAt(0).toString(16)}`);
+  assert.ok(text.includes('│ echo \\u{0000}\\u{0007}\\u{000D}\\u{0009}\\u{001B}\\u{007F}\\u{0085}\\u{009B}\\u{061C}\\u{200B}'));
+  // The reason is one line: its own newline is escaped too.
+  assert.ok(text.includes('\\u{000A}Reason: fake'));
+  // Well-formed ANSI colour in the CLI's reason is dropped, not escaped.
+  assert.ok(personOnlyQuestionText('Bash', { command: 'rm -rf /srv/sample-app/work' }, '\u001b[31mDangerous rm\u001b[0m operation on a sample path')
+    .includes('Reason: Dangerous rm operation on a sample path\n'));
+  // Non-shell tools show their path, or the input as JSON.
+  assert.ok(personOnlyQuestionText('Write', { file_path: '/srv/sample-app/notes.md', content: 'x' }, '').includes('Write path:\n│ /srv/sample-app/notes.md'));
+  assert.ok(personOnlyQuestionText('SampleTool', { target: 'x' }, '').includes('SampleTool input:\n│ {"target":"x"}'));
+});
+
+test('the card shows the whole command up to the limit, and a longer one is denied without a card', async () => {
+  const prefix = 'rm -rf /srv/sample-app/';
+  const atLimit = `${prefix}${'a'.repeat(PERSON_ONLY_COMMAND_MAX - prefix.length)}`;
+  assert.equal(atLimit.length, PERSON_ONLY_COMMAND_MAX);
+  const bridge = recordingBridge({ answer: PERSON_ONLY_ALLOW_CHOICE });
+  const canUseTool = createCanUseTool({ askUserBridge: bridge });
+  const shown = await canUseTool('Bash', { command: atLimit }, ASK_SHAPES.rmWorkspace);
+  assert.equal(shown.behavior, 'allow');
+  assert.ok(bridge.calls[0].input.questions[0].question.endsWith(`│ ${atLimit}`), 'shown whole, not cut');
+
+  const tooLong = await canUseTool('Bash', { command: `${atLimit}b` }, ASK_SHAPES.rmWorkspace);
+  assert.deepEqual(tooLong, { behavior: 'deny', message: PERSON_ONLY_TOO_LONG_MESSAGE });
+  assert.equal(PERSON_ONLY_TOO_LONG_MESSAGE, 'Not run: too long to show for approval; issue the removal as a short command of its own.');
+  assert.equal(bridge.calls.length, 1, 'no card for a command too long to show');
+});
+
+test('a person-only ask is denied on Deny, other text, timeout, abort, a failed bridge and no bridge', async () => {
+  const input = { command: PERSON_ONLY_RM_COMMAND };
+  const options = (extra = {}) => ({ ...ASK_SHAPES.rmWorkspace, signal: new AbortController().signal, ...extra });
+  const cases = [
+    ['Deny', { askUserBridge: recordingBridge({ answer: PERSON_ONLY_DENY_CHOICE }) }, options(), /the user denied it\./],
+    ['other text', { askUserBridge: recordingBridge({ answer: 'no, move it to the sample archive' }) }, options(), /the user denied it: no, move it to the sample archive\./],
+    ['empty', { askUserBridge: recordingBridge({ answer: '' }) }, options(), /the user denied it\./],
+    ['timeout', { askUserBridge: recordingBridge({ answer: 'Allow once', timedOut: true }) }, options(), /no answer came before the timeout/],
+    ['no bridge', {}, options(), /the relay could not show the question/],
+    ['bridge failed', { askUserBridge: { handleAskUserQuestion: async () => { throw new Error('relay down'); } } }, options(), /the relay could not show the question/],
+  ];
+  for (const [label, deps, opts, pattern] of cases) {
+    const result = await createCanUseTool(deps)('Bash', input, opts);
+    assert.equal(result.behavior, 'deny', label);
+    assert.match(result.message, pattern, label);
+    assert.ok(result.message.startsWith(`Not run: Claude Code marks this as person-only (${PERSON_ONLY_RM_REASON})`), label);
+    assert.match(result.message, /Do not work around it/, label);
+    assert.equal('updatedPermissions' in result, false, label);
+  }
+
+  // Stopping the turn while the card waits: the bridge resolves with the
+  // continuation text (or throws), and either way the ask is denied.
+  for (const mode of ['resolves', 'throws']) {
+    const controller = new AbortController();
+    const bridge = recordingBridge(async () => {
+      controller.abort();
+      if (mode === 'throws') throw new Error('aborted');
+      return { answer: PERSON_ONLY_ALLOW_CHOICE, timedOut: true };
+    });
+    const result = await createCanUseTool({ askUserBridge: bridge })('Bash', input, options({ signal: controller.signal }));
+    assert.equal(result.behavior, 'deny', mode);
+    assert.match(result.message, /the turn was stopped/, mode);
+  }
+});
+
+test('a turn already stopped denies a person-only ask without creating a card', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const bridge = recordingBridge({ answer: PERSON_ONLY_ALLOW_CHOICE });
+  const result = await createCanUseTool({ askUserBridge: bridge })('Bash', { command: PERSON_ONLY_RM_COMMAND }, { ...ASK_SHAPES.rmWorkspace, signal: controller.signal });
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.message, /the turn was stopped/);
+  assert.equal(bridge.calls.length, 0);
+});
+
+test('every other ask stays auto-allowed without a card, and logs carry no command or reason', async () => {
+  const bridge = recordingBridge({ answer: PERSON_ONLY_DENY_CHOICE });
+  const logged = [];
+  const canUseTool = createCanUseTool({ askUserBridge: bridge, dbg: (...args) => logged.push(args.join(' ')) });
+  const input = { command: PERSON_ONLY_RM_COMMAND };
+  // An ask a user's rule forced, without the person-only flags.
+  const ruleOnly = { ...ASK_SHAPES.ordinary, matchedAskRule: SAMPLE_ASK_RULE };
+  for (const opts of [ASK_SHAPES.ordinary, ASK_SHAPES.sensitiveRcFile, ASK_SHAPES.claudeSettingsFile, ruleOnly, {}]) {
+    const result = await canUseTool('Bash', input, opts);
+    assert.deepEqual(result, { behavior: 'allow', updatedInput: input });
+  }
+  assert.equal(bridge.calls.length, 0);
+
+  await canUseTool('Bash', input, ASK_SHAPES.rmWorkspace);
+  await canUseTool('Bash', { command: `${PERSON_ONLY_RM_COMMAND} ${'x'.repeat(PERSON_ONLY_COMMAND_MAX)}` }, ASK_SHAPES.rmWorkspace);
+  assert.equal(bridge.calls.length, 1);
+  assert.ok(logged.length >= 2);
+  for (const line of logged) {
+    assert.equal(line.includes('rm -rf'), false);
+    assert.equal(line.includes('/srv/sample-app'), false);
+  }
 });
 
 test('reasoning effort maps onto the SDK effort option per turn', () => {

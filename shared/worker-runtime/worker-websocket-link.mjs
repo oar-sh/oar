@@ -63,9 +63,13 @@ export function createWorkerWebSocketLink({
   getDeliveryHeld = null,
   // Called with the hello's reason once per connection, on the relay's first
   // server.hello: from then on the relay (possibly a restarted one that knows
-  // nothing of this worker) has the socket. Later hellos only ack the
-  // worker.hello every idle readiness refresh re-sends, and are not reported.
+  // nothing of this worker) has the socket. Later hellos only ack a later
+  // worker.hello, and are not reported.
   onServerHello = () => {},
+  // Called with "server-hello" on every server.hello and with "deliver" on
+  // every queue.deliver: the keepalive keeps its busy cadence for a while
+  // after either (worker-keepalive.mjs).
+  onRelayFrame = () => {},
   getSessionId = () => null,
   getPid = () => null,
   // The kind of worker this is ("claude", "claude-api", ...), stated in
@@ -88,8 +92,12 @@ export function createWorkerWebSocketLink({
   // Failed attempts after the first few are logged at most once per this
   // interval, with a count of the ones in between.
   failureLogIntervalMs = 60_000,
+  // The link's own readiness refresh; 0 leaves it to the caller, which then
+  // calls refreshReadiness itself (worker-keepalive.mjs does, on its beat).
   readyRefreshMs = 10_000,
-  staleConnectionMs = 30_000,
+  // Three missed idle beats (30 s each) without any word from the relay: the
+  // connection is given up and made again.
+  staleConnectionMs = 90_000,
   WebSocketImpl = globalThis.WebSocket,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -309,19 +317,17 @@ export function createWorkerWebSocketLink({
       notifyUnready(reason);
       return true;
     }
-    if (deliveriesInFlight.size) {
-      // notifyReady gates itself: it only goes through mid-delivery when the
-      // worker is steering-ready. Hello stays an idle-only affair.
-      void notifyReady(reason);
-      return true;
-    }
-    notifyHello(reason);
+    // notifyReady gates itself: mid-delivery it only goes through when the
+    // worker is steering-ready. No hello: the socket's identity, kind and
+    // build were bound by the hello at open, and a ready carries them again;
+    // a hello would only draw a second server.hello and a second ready.
     void notifyReady(reason);
     return true;
   }
 
   function startReadyRefreshTimer() {
     clearReadyRefreshTimer();
+    if (Number(readyRefreshMs) === 0) return;
     const intervalMs = Math.max(1000, Number(readyRefreshMs) || 10_000);
     readyRefreshTimer = setIntervalImpl(() => {
       refreshReadiness("readiness-refresh");
@@ -449,11 +455,13 @@ export function createWorkerWebSocketLink({
         return;
       }
       if (payload?.type === "queue.deliver") {
+        try { onRelayFrame("deliver"); } catch {}
         void deliverPending(payload.pending || null, String(payload.reason || "queue-deliver"))
           .finally(() => notifyReady("delivery-complete"));
         return;
       }
       if (payload?.type === "server.hello") {
+        try { onRelayFrame("server-hello"); } catch {}
         serverCapabilities = new Set(Array.isArray(payload.capabilities) ? payload.capabilities.map(String) : []);
         relayBuildId = normalizeText(payload.buildId);
         // Only a line in the log: the relay decides when to replace this
@@ -565,6 +573,9 @@ export function createWorkerWebSocketLink({
   return {
     notifyReady,
     notifyUnready,
+    refreshReadiness,
+    // A delivery in flight or a hold: the keepalive beats at its busy cadence.
+    isBusy: () => deliveriesInFlight.size > 0 || deliveryHeld(),
     serverSupports: (capability) => serverCapabilities.has(String(capability || "")),
     start,
     stop,

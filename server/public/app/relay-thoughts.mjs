@@ -11,6 +11,13 @@ function normalizeTimestampMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+// A thought's place in its turn's order (migration 0038), or null.
+function normalizeTurnSeq(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  return Number.isInteger(num) && num > 0 ? num : null;
+}
+
 function toThoughtEntry(value, order) {
   const text = String(value?.text || '');
   if (!text.trim()) return null;
@@ -19,6 +26,7 @@ function toThoughtEntry(value, order) {
   const subagentRunId = String(value?.subagentRunId || '').trim() || null;
   return {
     reasoningId,
+    turnSeq: normalizeTurnSeq(value?.turnSeq),
     seq: normalizeSeq(value?.seq),
     text,
     done: !!value?.done,
@@ -75,7 +83,12 @@ export function normalizeRelayThoughtList(thoughts = []) {
     }
     const existing = byReasoningId.get(entry.reasoningId);
     if (!existing || isCandidateNewer(entry, existing)) {
-      byReasoningId.set(entry.reasoningId, entry);
+      // The text goes to the newer copy; the turn order stays the first one
+      // known (a thought sits where its first chunk arrived).
+      const turnSeq = existing?.turnSeq ?? entry.turnSeq;
+      byReasoningId.set(entry.reasoningId, { ...entry, turnSeq });
+    } else if (existing.turnSeq === null && entry.turnSeq !== null) {
+      existing.turnSeq = entry.turnSeq;
     }
   }
 
@@ -87,6 +100,7 @@ export function normalizeRelayThoughtList(thoughts = []) {
     done: !!entry.done,
     timestamp: entry.timestamp || null,
     subagentRunId: entry.subagentRunId || null,
+    ...(entry.turnSeq !== null ? { turnSeq: entry.turnSeq } : {}),
   }));
 }
 

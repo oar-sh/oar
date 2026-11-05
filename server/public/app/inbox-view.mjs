@@ -153,20 +153,6 @@ export function createCoalescedRefresh(load) {
   return refresh;
 }
 
-/**
- * This relay's asks out of an Inbox load (GET /api/inbox), by id: what the
- * session cards show. Built anew from each load, so an ask that was
- * withdrawn or cancelled (no longer listed) drops out.
- */
-export function sessionAsksFromInbox(relays) {
-  const own = (Array.isArray(relays) ? relays : []).find((relay) => relay?.self === true);
-  const asks = new Map();
-  for (const item of Array.isArray(own?.items) ? own.items : []) {
-    if (item?.kind === 'ask' && toText(item.id)) asks.set(item.id, { ...item, conversationId: item.session?.id });
-  }
-  return asks;
-}
-
 // The folds a card has: an ask's `Details` and a plan card's `The plan`.
 export const INBOX_FOLD_SELECTOR = 'details.inbox-item-detail, details.inbox-plan-body';
 
@@ -226,6 +212,25 @@ export function inboxPendingCount(relays) {
     .reduce((sum, relay) => sum + (Array.isArray(relay?.items) ? relay.items : []).filter((item) => toText(item?.status) === 'pending').length, 0);
 }
 
+/**
+ * The sidebar badge: the urgent count, marked, while an urgent item waits;
+ * else every pending item. Only asks can be urgent (`urgency: 'now'`); a
+ * card a turn waits on or a plan card counts as a normal one.
+ */
+export function inboxBadge(relays) {
+  let pending = 0;
+  let urgent = 0;
+  for (const relay of Array.isArray(relays) ? relays : []) {
+    for (const item of Array.isArray(relay?.items) ? relay.items : []) {
+      if (toText(item?.status) !== 'pending') continue;
+      pending += 1;
+      if (toText(item.kind) === 'ask' && item.urgency === 'now') urgent += 1;
+    }
+  }
+  if (urgent > 0) return { text: String(urgent), urgent: true, pending, urgentCount: urgent };
+  return { text: pending ? String(pending) : '', urgent: false, pending, urgentCount: 0 };
+}
+
 function headLine(doc, item, { relay, now, label }) {
   const head = el(doc, 'div', 'inbox-item-head');
   head.append(el(doc, 'span', 'inbox-item-kind', label));
@@ -263,9 +268,17 @@ function sessionLine(doc, item, relay, { withLink = true } = {}) {
   return line;
 }
 
-function outcomeLine(doc, item) {
+function outcomeLine(doc, item, mode = 'inbox') {
   if (item.status === 'dismissed') return el(doc, 'div', 'inbox-item-outcome', 'Dismissed');
+  // The 📓 panel lists every close of the last day; the Inbox only these two.
+  if (mode === 'panel' && item.status === 'withdrawn') return el(doc, 'div', 'inbox-item-outcome', 'Withdrawn');
+  if (mode === 'panel' && item.status === 'cancelled') return el(doc, 'div', 'inbox-item-outcome', 'Cancelled');
   if (item.status !== 'answered') return null;
+  if (mode === 'panel') {
+    // The choice, or the answer's first line.
+    const short = toText(item.choice) || toText(String(item.answer || '').split(/\r?\n/).find((line) => line.trim()) || '');
+    return el(doc, 'div', 'inbox-item-outcome', `Answered: ${short}`);
+  }
   const answer = toText(item.answer) || toText(item.choice);
   const via = toText(item.answeredVia);
   return el(doc, 'div', 'inbox-item-outcome', `Answered: ${answer}${via ? ` (from ${via})` : ''}`);
@@ -273,8 +286,9 @@ function outcomeLine(doc, item) {
 
 /**
  * A question that does not block, as a card: in the Inbox (`mode` "inbox",
- * with its session and relay) or in its session ("session"). `answerable`:
- * the buttons answer it (this relay's, or a paired relay's ask).
+ * with its session and relay), in its session ("session") or in the
+ * session's 📓 panel ("panel": its Details open). `answerable`: the buttons
+ * answer it (this relay's, or a paired relay's ask).
  */
 export function buildAskCard(doc, item, { relay = null, mode = 'inbox', now = Date.now(), answerable = true } = {}) {
   const card = el(doc, 'article', `inbox-item inbox-ask${mode === 'session' ? ' relay-ask-card' : ''}`);
@@ -282,7 +296,8 @@ export function buildAskCard(doc, item, { relay = null, mode = 'inbox', now = Da
   card.dataset.kind = 'ask';
   if (relay?.id) card.dataset.relayId = relay.id;
   card.dataset.status = toText(item.status) || 'pending';
-  card.append(headLine(doc, item, { relay, now, label: mode === 'session' ? 'Question for you · does not block this session' : 'Question' }));
+  const label = mode === 'session' ? 'Question for you · does not block this session' : (mode === 'panel' ? 'Question for you' : 'Question');
+  card.append(headLine(doc, item, { relay, now, label }));
   if (mode === 'inbox') card.append(sessionLine(doc, item, relay));
   else if (item.onBehalf && item.askedBy) card.append(sessionLine(doc, item, relay, { withLink: false }));
   card.append(el(doc, 'p', 'inbox-item-question', item.question || item.prompt || ''));
@@ -295,9 +310,10 @@ export function buildAskCard(doc, item, { relay = null, mode = 'inbox', now = Da
     details.append(el(doc, 'summary', '', 'Details'));
     // Plain text, line breaks kept: never parsed as markup.
     details.append(el(doc, 'pre', 'inbox-item-detail-text', item.detail));
+    if (mode === 'panel') details.open = true;
     card.append(details);
   }
-  const outcome = outcomeLine(doc, item);
+  const outcome = outcomeLine(doc, item, mode);
   if (outcome) card.append(outcome);
   if (item.status === 'pending' && answerable) {
     const data = { relayId: relay?.id || 'self', itemId: item.id };

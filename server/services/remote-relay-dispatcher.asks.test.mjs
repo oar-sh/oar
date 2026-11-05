@@ -276,3 +276,32 @@ test('read_session lists the pending asks of a session with their kind', async (
   });
   assert.equal(remoteCalls.find((entry) => entry.path === '/api/relay-questions').query.includeAsks, 1);
 });
+
+test('an own ask records the live turn\'s queue row; one on behalf and a mirror record none', async () => {
+  const queueOf = (db, id) => db.prepare(`SELECT queue_id FROM relay_asks WHERE id = ?`).get(id)?.queue_id;
+  // Own ask, through the free path (no agent sessions setting) and the full one.
+  for (const agentSessions of [false, true]) {
+    const { db, run } = setup({ agentSessions });
+    const asked = await run('ask', QUESTION);
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    assert.equal(asked.body.question.queueId, 'q-1');
+    assert.equal(queueOf(db, asked.body.question_id), 'q-1');
+  }
+
+  const { db, run, asks } = setup({
+    remote: (_relay, _method, path, { body }) => (path === RELAY_ASK_REMOTE_PATHS.ask
+      ? { ok: true, ask: { id: 'ask_there0002', question: body.question, session: { id: body.session, title: 'Far worker' }, status: 'pending' } }
+      : {}),
+  });
+  const behalf = await run('ask', { session: WORKER, ...QUESTION });
+  assert.equal(behalf.status, 200, JSON.stringify(behalf.body));
+  assert.equal(behalf.body.question.queueId, null);
+  assert.equal(queueOf(db, behalf.body.question_id), null);
+
+  const far = await run('ask', { relay: 'prompter-test', session: 'conv-there', question: 'Ship it?' });
+  assert.equal(far.status, 200, JSON.stringify(far.body));
+  assert.ok(!('queueId' in far.body.question), 'a mirror carries none');
+  const row = db.prepare(`SELECT queue_id FROM relay_asks WHERE relay_id = ? AND remote_id = 'ask_there0002'`).get(PROMPTER.id);
+  assert.equal(row.queue_id, null);
+  assert.equal(asks.getMirror(PROMPTER.id, 'ask_there0002').status, 'pending');
+});

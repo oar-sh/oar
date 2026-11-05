@@ -150,7 +150,7 @@ test('the billing swap stops the old worker with launches blocked, then launches
 });
 
 test('a compacted Claude chat keeps its billing; the key removal counts live workers on the key', () => {
-  const compact = sliceBetween('function createCompactedConversation(sourceConversationId) {', '\nfunction sanitizeActivityText');
+  const compact = sliceBetween('function createCompactedConversation(sourceConversationId) {', '\nfunction relayActivityForResponse');
   assert.match(compact, /const sourceBilling = normalizeClaudeBilling\(sourceRuntime\?\.provider_type\);/);
   assert.match(compact, /providerType: sourceBilling,/);
   const settings = sliceBetween('const claudeApiSettingsService = createClaudeApiSettingsService({', '\n});');
@@ -160,10 +160,14 @@ test('a compacted Claude chat keeps its billing; the key removal counts live wor
 });
 
 test('the primer launches no Claude API worker while Claude API cannot run a turn; its rows fail closed', () => {
-  const primer = sliceBetween('async function primePendingSessionWorkers(', '\n}');
-  assert.ok(primer.indexOf('failClaudeApiRowsWithoutLaunch(sdkSessionId)') < primer.indexOf('ensureWorker(sdkSessionId)'), 'checked before the launch');
-  // A throw costs only that session its launch: the pass goes on.
-  assert.match(primer, /try \{\n[^]*?if \(failClaudeApiRowsWithoutLaunch\(sdkSessionId\)\) continue;\n    \} catch \(error\) \{\n[^]*?continue;\n    \}/);
+  // The primer's loop is services/queue-waker.mjs (its test covers a throw
+  // costing only that session its launch); the runtime hands it the check.
+  const wiring = sliceBetween('const pendingWorkerPrimer = createPendingWorkerPrimer({', '\n});');
+  assert.match(wiring, /failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid\),/);
+  const primerSource = fs.readFileSync(path.join(__dirname, 'services', 'queue-waker.mjs'), 'utf8');
+  const loop = primerSource.slice(primerSource.indexOf('export function createPendingWorkerPrimer('), primerSource.indexOf('export function createQueueWaker('));
+  assert.ok(loop.indexOf('failRowsWithoutLaunch(sdkSessionId)') < loop.indexOf('ensureWorker(sdkSessionId)'), 'checked before the launch');
+  assert.match(loop, /try \{\n[^]*?if \(failRowsWithoutLaunch\(sdkSessionId\)\) continue;\n {6}\} catch \(error\) \{\n[^]*?continue;\n {6}\}/);
   const skip = sliceBetween('function failClaudeApiRowsWithoutLaunch(sdkSessionId) {', '\n}');
   assert.match(skip, /normalizeClaudeBilling\(runtime\?\.provider_type\) !== 'claude-api'/);
   // A check that throws fails this session's key rows closed.

@@ -50,7 +50,9 @@ const viewer = {
   stopTimer: null,
   tickTimer: null,
   sharedPollTimer: null,
-  openFolds: new Set(),
+  // The reader's folds by seq ('open' | 'folded'); a thought without one
+  // follows the "Expand thoughts" setting.
+  openFolds: new Map(),
 };
 
 let viewerHistory = null;
@@ -151,7 +153,7 @@ function buildEntryNode(entry) {
   holder.innerHTML = timelineEntryHtml(entry, {
     renderMarkdown,
     children: viewer.children,
-    openDetails: viewer.openFolds.has(entry.seq),
+    openDetails: viewer.openFolds,
     clickable: true,
   });
   return holder.firstElementChild;
@@ -283,7 +285,7 @@ async function loadRun(runId) {
   if (!id) return;
   viewer.state = createTimelineState(id);
   viewer.children = new Map();
-  viewer.openFolds = new Set();
+  viewer.openFolds = new Map();
   viewer.error = '';
   viewer.stopping = false;
   clearTimeout(viewer.stopTimer);
@@ -552,7 +554,8 @@ export function initSubagentViewer() {
   body?.addEventListener('scroll', () => {
     if (jump && !jump.hidden && isAtBottom(body)) jump.hidden = true;
   }, { passive: true });
-  // A fold the reader opened stays open while the entry keeps changing.
+  // A fold the reader opened or closed stays that way while the entry keeps
+  // changing.
   timeline?.addEventListener('click', (event) => {
     const summary = event.target?.closest?.('summary');
     const entry = summary?.closest?.('.sav-entry');
@@ -560,8 +563,7 @@ export function initSubagentViewer() {
     const seq = Number(entry.dataset.seq);
     setTimeout(() => {
       const details = summary.parentElement;
-      if (details?.open) viewer.openFolds.add(seq);
-      else viewer.openFolds.delete(seq);
+      viewer.openFolds.set(seq, details?.open ? 'open' : 'folded');
     }, 0);
   });
   document.addEventListener('keydown', (event) => {

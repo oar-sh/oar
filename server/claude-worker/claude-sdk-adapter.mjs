@@ -2,6 +2,7 @@ import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
 
 import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
+import { PERSON_ONLY_QUESTION_SOURCE } from '../../shared/relay-asks.mjs';
 import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
@@ -631,11 +632,151 @@ export async function readPlanUsage(turn, dbg = () => {}, { timeoutMs = 10000 } 
   }
 }
 
+// Asks Claude Code marks as person-only: a removal of a workspace or system
+// directory, a target it cannot resolve. No rule, mode or automatic approval
+// may answer them, so allow-all parity stops here. The SDK does not forward
+// the wire's `classifier_approvable`, so the safety-check kinds count only
+// together with `suppressAlwaysAllowRule`; a sensitive-file safety check
+// (an edit under .git/ or .claude/) carries no such flag and stays allowed.
+// A user's `permissions.ask` rule (`matchedAskRule`) changes nothing: the
+// flags decide, and an ask that rule forced without them stays allowed.
+const PERSON_ONLY_REASON_TYPES = new Set(['safetyCheck', 'subcommandResults']);
+export const PERSON_ONLY_ALLOW_CHOICE = 'Allow once';
+export const PERSON_ONLY_DENY_CHOICE = 'Deny';
+export { PERSON_ONLY_QUESTION_SOURCE };
+// The card's first line is fixed text: the relay's console log prints the
+// first 60 characters of a question, and the command must not reach it.
+const PERSON_ONLY_QUESTION_LEAD = 'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?';
+const PERSON_ONLY_RATIONALE = 'Claude Code needs a person to approve this before it runs. Nothing runs until you choose.';
+// The card shows the whole command or nothing: a cut could hide the removal.
+export const PERSON_ONLY_COMMAND_MAX = 8000;
+export const PERSON_ONLY_TOO_LONG_MESSAGE = 'Not run: too long to show for approval; issue the removal as a short command of its own.';
+const PERSON_ONLY_REASON_MAX = 400;
+const PERSON_ONLY_TYPED_ANSWER_MAX = 500;
+
+export function isPersonOnlyAsk(options) {
+  if (!options || typeof options !== 'object') return false;
+  if (options.defaultToNo === true) return true;
+  return PERSON_ONLY_REASON_TYPES.has(options.decisionReasonType)
+    && options.suppressAlwaysAllowRule === true;
+}
+
+// Characters that hide or reorder text: C0 and C1 controls, bidi controls,
+// zero-width characters and the Unicode line separators. On the card each
+// one shows as a visible \u{XXXX} escape (the body is pre-wrap plain text).
+const INVISIBLE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+function escapeInvisible(text) {
+  return String(text ?? '').replace(INVISIBLE_CHARACTERS, (char) => (
+    `\\u{${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}}`
+  ));
+}
+
+// The CLI's reason may carry ANSI colour (sdk.d.ts): drop well-formed
+// sequences, then escape what is left, newlines included (one line).
+function reasonLine(value) {
+  const text = String(value ?? '')
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .trim();
+  return capText(escapeInvisible(text), PERSON_ONLY_REASON_MAX);
+}
+
+function capText(text, max) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}… (${text.length - max} more characters)`;
+}
+
+function personOnlySubject(input) {
+  if (typeof input?.command === 'string') return { label: 'command', text: input.command };
+  for (const key of ['file_path', 'notebook_path', 'path']) {
+    if (typeof input?.[key] === 'string') return { label: 'path', text: input[key] };
+  }
+  let json = '';
+  try { json = JSON.stringify(input ?? {}); } catch { json = ''; }
+  return { label: 'input', text: json };
+}
+
+// Each line escaped and behind "│ ", each line break marked "⏎", so no line
+// of the command can pass for the card's own text.
+function subjectLines(text) {
+  return String(text ?? '').split('\n').map(escapeInvisible);
+}
+
+function subjectTooLong(input) {
+  return subjectLines(personOnlySubject(input).text).join('\n').length > PERSON_ONLY_COMMAND_MAX;
+}
+
+export function personOnlyQuestionText(toolName, input, decisionReason) {
+  const subject = personOnlySubject(input);
+  const lines = subjectLines(subject.text);
+  const parts = [PERSON_ONLY_QUESTION_LEAD];
+  const reason = reasonLine(decisionReason);
+  if (reason) parts.push(`Reason: ${reason}`);
+  const count = lines.length > 1 ? `, ${lines.length} lines` : '';
+  parts.push(`${toolName || 'Tool'} ${subject.label}${count}:\n│ ${lines.join(' ⏎\n│ ')}`);
+  return parts.join('\n\n');
+}
+
+function personOnlyDenyMessage(decisionReason, why) {
+  const reason = reasonLine(decisionReason);
+  return `Not run: Claude Code marks this as person-only${reason ? ` (${reason})` : ''}, and ${why}. `
+    + 'Do not work around it by splitting, scripting or re-issuing it through another tool.';
+}
+
+// Allow/Deny card over the question bridge, no typed replies. Only the exact
+// "Allow once" allows, and never with `updatedPermissions`: the next such ask
+// asks again.
+async function askPersonOnly({ askUserBridge, toolName, input, options, signal, dbg }) {
+  const reason = options?.decisionReason;
+  const kind = options?.decisionReasonType || 'defaultToNo';
+  const deny = (why, outcome) => {
+    dbg('person-only ask', toolName, kind, outcome);
+    return { behavior: 'deny', message: personOnlyDenyMessage(reason, why) };
+  };
+  if (signal?.aborted) return deny('the turn was stopped', 'aborted');
+  if (subjectTooLong(input)) {
+    dbg('person-only ask', toolName, kind, 'too-long');
+    return { behavior: 'deny', message: PERSON_ONLY_TOO_LONG_MESSAGE };
+  }
+  if (!askUserBridge) return deny('the relay could not show the question', 'no-bridge');
+  const question = personOnlyQuestionText(toolName, input, reason);
+  let result;
+  try {
+    result = await askUserBridge.handleAskUserQuestion({
+      questions: [{
+        question,
+        header: 'Safety check',
+        options: [{ label: PERSON_ONLY_ALLOW_CHOICE }, { label: PERSON_ONLY_DENY_CHOICE }],
+      }],
+    }, {
+      signal,
+      source: PERSON_ONLY_QUESTION_SOURCE,
+      rationale: PERSON_ONLY_RATIONALE,
+      allowFreeform: false,
+    });
+  } catch (error) {
+    if (signal?.aborted) return deny('the turn was stopped', 'aborted');
+    dbg('person-only ask bridge failed', error?.message || String(error));
+    return deny('the relay could not show the question', 'bridge-failed');
+  }
+  if (signal?.aborted) return deny('the turn was stopped', 'aborted');
+  if (result?.timedOut) return deny('no answer came before the timeout', 'timed-out');
+  const answer = String(result?.answers?.[question] ?? '').trim();
+  if (answer === PERSON_ONLY_ALLOW_CHOICE) {
+    dbg('person-only ask', toolName, kind, 'allowed');
+    return { behavior: 'allow', updatedInput: input };
+  }
+  if (!answer || answer === PERSON_ONLY_DENY_CHOICE) return deny('the user denied it', 'denied');
+  return deny(`the user denied it: ${capText(escapeInvisible(answer), PERSON_ONLY_TYPED_ANSWER_MAX)}`, 'denied-other');
+}
+
 /**
  * Build the `canUseTool` callback for one turn. Everything is auto-allowed
- * (parity with the Copilot workers' `--allow-all` posture); the only
- * interceptions are AskUserQuestion (bridged to relay question cards) and
- * ExitPlanMode (surfaces the plan_ready board).
+ * (parity with the Copilot workers' `--allow-all` posture) except the asks
+ * Claude Code marks as person-only (an Allow/Deny relay card, see
+ * isPersonOnlyAsk); the other interceptions are AskUserQuestion (bridged to
+ * relay question cards) and ExitPlanMode (surfaces the plan_ready board).
  *
  * ExitPlanMode is DENIED after the board is posted: allowing it tells the CLI
  * the user approved the plan, and the same turn rolls straight into
@@ -658,8 +799,12 @@ export function createCanUseTool({
   onExitPlanMode,
   dbg = () => {},
 } = {}) {
-  return async function canUseTool(toolName, input, { signal } = {}) {
+  return async function canUseTool(toolName, input, options = {}) {
+    const signal = options?.signal;
     const normalizedToolName = String(toolName || '').trim();
+    if (isPersonOnlyAsk(options)) {
+      return askPersonOnly({ askUserBridge, toolName: normalizedToolName, input, options, signal, dbg });
+    }
     try {
       if (normalizedToolName === 'AskUserQuestion' && askUserBridge) {
         const { answers } = await askUserBridge.handleAskUserQuestion(input, { signal });

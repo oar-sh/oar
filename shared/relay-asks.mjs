@@ -25,6 +25,11 @@ export const RELAY_QUESTION_KINDS = Object.freeze(['ask', 'ask_user', 'approval'
 // Stored and sent between relays, so it kept the tool's name from before
 // 0.9.18.
 export const REMOTE_RELAY_APPROVAL_SOURCE = 'remote_relay';
+// The `context.source` of a Claude session's Safety check card: an ask Claude
+// Code marks as person-only (claude-sdk-adapter.mjs). Like the approval card,
+// it is the user's to answer: never listed to an agent, never answered by
+// one, from this relay or another.
+export const PERSON_ONLY_QUESTION_SOURCE = 'ClaudeSafetyCheck';
 export const RELAY_ASK_KIND = 'ask';
 
 export const RELAY_ASK_URGENCIES = Object.freeze(['normal', 'now']);
@@ -143,6 +148,11 @@ export function normalizeRelayAskAnswer(ask, { answer = '', choice = '' } = {}) 
   // A typed text that is an option counts as that choice.
   if (!picked) picked = options.find((option) => option.toLowerCase() === oneLine(text).toLowerCase()) || '';
   return { ok: true, value: { answer: text || picked, choice: picked } };
+}
+
+/** True for a Safety check card's context (a formatted question's or a stored request envelope's). */
+export function isPersonOnlyQuestion(context) {
+  return !!context && typeof context === 'object' && toText(context.source) === PERSON_ONLY_QUESTION_SOURCE;
 }
 
 /** The kind of a formatted question card (a row of /api/relay-questions). */

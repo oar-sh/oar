@@ -1,7 +1,8 @@
-// The Inbox in the page: the sidebar's "Inbox" button with its count, the
-// view it opens in place of a transcript (like Status), and the card a
-// question that does not block shows in its own session. inbox-view.mjs
-// builds the DOM; this module loads, keeps and answers.
+// The Inbox in the page: the sidebar's "Inbox" button with its count and
+// the view it opens in place of a transcript (like Status). A session's own
+// questions that don't block are in its 📓 (questions-panel-ui.js), which
+// answers through here. inbox-view.mjs builds the DOM; this module loads,
+// keeps and answers.
 //
 // The list comes from GET /api/inbox (this relay and every paired relay that
 // answers), again on every change of a question here (socket) and every
@@ -15,17 +16,15 @@ import { currentConvId, IS_SHARED_VIEW, setCurrentConv, showTransientRelayNotice
 import { isStatusViewActive, leaveStatusView } from './status-view.mjs';
 import { actOnRelayBoard } from './relay-board-view.js';
 import {
-  buildAskCard,
   captureInboxFolds,
   createCoalescedRefresh,
-  inboxPendingCount,
+  inboxBadge,
   INBOX_FILTERS,
   INBOX_FOLD_SELECTOR,
   noteInboxFold,
   pruneInboxFolds,
   renderInbox,
   restoreInboxFolds,
-  sessionAsksFromInbox,
 } from './inbox-view.mjs';
 
 const FILTER_STORAGE_KEY = 'oar_inbox_filter';
@@ -47,14 +46,18 @@ const drafts = new Map();
 // re-renders the same way: every socket change and the minute's poll draw
 // the cards anew, closed. Forgotten when the item leaves the list.
 const openFolds = new Set();
-// This relay's asks for the session cards: id → ask (each Inbox load
-// replaces it; the socket updates single asks in between).
-let sessionAsks = new Map();
-let sessionCardKey = '';
 // Where the Inbox was scrolled when it was last left; the next opening
 // starts there (the first one at the top). The transcript's own scroll
 // height is the transcript's, never the Inbox's.
 let inboxScrollTop = 0;
+// The 📓 panel's side (questions-panel-ui.js), handed in so the two modules
+// do not import each other: an ask the answer routes returned, "open" on an
+// ask's session, and that open having run (or failed).
+let askHooks = { onAskUpdated: null, onOpenAsk: null, onOpenSettled: null };
+
+export function setInboxAskHooks(hooks = {}) {
+  askHooks = { ...askHooks, ...hooks };
+}
 
 function readFilter() {
   try {
@@ -69,15 +72,24 @@ export function isInboxViewActive() {
   return inboxActive;
 }
 
-/** The sidebar button's count: everything pending, here and on paired relays. */
+/**
+ * The sidebar button's count: everything pending, here and on paired relays;
+ * while an urgent ask waits, the urgent count in red.
+ */
 function syncInboxBadge() {
-  const count = inboxPendingCount(relays);
+  const { text, urgent, pending: count, urgentCount } = inboxBadge(relays);
   const badge = document.getElementById('inbox-count');
   const buttonEl = document.getElementById('inbox-btn');
-  if (badge) badge.textContent = count ? String(count) : '';
+  if (badge) {
+    badge.textContent = text;
+    badge.classList.toggle('is-urgent', urgent);
+  }
   if (buttonEl) {
     buttonEl.classList.toggle('has-pending', count > 0);
-    buttonEl.setAttribute('aria-label', count ? `Inbox, ${count} question${count === 1 ? '' : 's'} waiting` : 'Inbox');
+    const label = urgent
+      ? `Inbox, ${urgentCount} urgent of ${count} waiting`
+      : (count ? `Inbox, ${count} question${count === 1 ? '' : 's'} waiting` : 'Inbox');
+    buttonEl.setAttribute('aria-label', label);
     buttonEl.setAttribute('aria-pressed', inboxActive ? 'true' : 'false');
   }
 }
@@ -87,16 +99,18 @@ function draftKey(node) {
   return card ? `${card.dataset.relayId || 'self'}:${card.dataset.itemId || ''}` : '';
 }
 
-function captureDrafts(host) {
+export function captureDrafts(host) {
+  // Only fields typed into: the same ask can be drawn twice (its session's
+  // card and the 📓 panel), and the untouched copy must not wipe the draft.
   for (const field of host.querySelectorAll('.inbox-answer-text')) {
     const key = draftKey(field);
-    if (key) drafts.set(key, field.value);
+    if (key && field.dataset.draftTouched === '1') drafts.set(key, field.value);
   }
   const active = document.activeElement;
   return active?.classList?.contains('inbox-answer-text') && host.contains(active) ? draftKey(active) : '';
 }
 
-function restoreDrafts(host, focusedKey) {
+export function restoreDrafts(host, focusedKey) {
   for (const field of host.querySelectorAll('.inbox-answer-text')) {
     const key = draftKey(field);
     if (drafts.has(key)) field.value = drafts.get(key);
@@ -122,8 +136,8 @@ function renderInboxNow({ opening = false } = {}) {
   host.scrollTop = top;
   const title = document.getElementById('chat-title');
   if (title) {
-    const count = inboxPendingCount(relays);
-    title.textContent = count ? `Inbox · ${count} waiting` : 'Inbox';
+    const { pending: count, urgentCount } = inboxBadge(relays);
+    title.textContent = count ? `Inbox · ${urgentCount ? `${urgentCount} urgent · ` : ''}${count} waiting` : 'Inbox';
   }
 }
 
@@ -132,13 +146,10 @@ async function loadInbox() {
   if (response && Array.isArray(response.relays)) {
     relays = response.relays;
     loaded = true;
-    // Built anew from each load: an ask withdrawn or cancelled meanwhile goes.
-    sessionAsks = sessionAsksFromInbox(relays);
     pruneInboxFolds(openFolds, relays);
   }
   syncInboxBadge();
   renderInboxNow();
-  renderSessionAskCards();
   return response;
 }
 
@@ -160,10 +171,7 @@ function scheduleRefresh() {
 }
 
 /** Socket: an ask of this relay changed (created, answered, dismissed, withdrawn). */
-export function noteRelayAskUpdated(payload = {}) {
-  const ask = payload?.ask;
-  if (ask?.id) sessionAsks.set(ask.id, ask);
-  renderSessionAskCards();
+export function noteRelayAskUpdated() {
   scheduleRefresh();
 }
 
@@ -271,7 +279,9 @@ async function answerAsk(card, data, { choice = '', dismiss = false } = {}) {
     return false;
   }
   drafts.delete(`${relayId}:${id}`);
-  if (relayId === 'self' && result.response?.question?.id) sessionAsks.set(result.response.question.id, result.response.question);
+  if (relayId === 'self' && result.response?.question?.id) {
+    try { askHooks.onAskUpdated?.(result.response.question); } catch {}
+  }
   return true;
 }
 
@@ -318,9 +328,17 @@ async function handleAction(target) {
   if (data.inboxAction === 'open') {
     const id = String(data.sessionId || '').trim();
     if (!id) return;
+    // An ask's session opens with 📓 open at that ask.
+    const askId = card?.dataset.kind === 'ask' && (card.dataset.relayId || 'self') === 'self' ? String(card.dataset.itemId || '') : '';
+    if (askId) askHooks.onOpenAsk?.(id, askId);
     leaveInboxView();
     previousConversationId = '';
-    await window.openConversation?.(id);
+    try {
+      await window.openConversation?.(id);
+    } finally {
+      // Failed, or landed elsewhere: the request to open 📓 there is dropped.
+      if (askId) askHooks.onOpenSettled?.(id);
+    }
     return;
   }
   const buttons = card ? [...card.querySelectorAll('button')] : [target];
@@ -336,73 +354,46 @@ async function handleAction(target) {
   } finally {
     if (!done) for (const node of buttons) node.disabled = false;
   }
-  if (done) {
-    renderSessionAskCards();
-    await refreshInbox();
-  }
+  if (done) await refreshInbox();
 }
 
-function bindClicks() {
-  if (clickBound) return;
-  clickBound = true;
-  const host = document.getElementById('messages');
-  host?.addEventListener('click', (event) => {
+/**
+ * The Inbox's buttons, typed answers and folds inside `host`: the transcript
+ * (the Inbox view) or another host that draws the
+ * same cards (the 📓 panel). `scope`: the selector a click must be inside.
+ */
+export function bindInboxActionHost(host, { scope = '.inbox-view' } = {}) {
+  if (!host || host.dataset.inboxActionsBound === '1') return;
+  host.dataset.inboxActionsBound = '1';
+  host.addEventListener('click', (event) => {
     const target = event.target instanceof Element ? event.target.closest('[data-inbox-action], [data-inbox-filter]') : null;
-    if (!target || !target.closest('.inbox-view, .relay-ask-container')) return;
+    if (!target || !target.closest(scope)) return;
     event.preventDefault();
     void handleAction(target);
   });
-  host?.addEventListener('input', (event) => {
+  host.addEventListener('input', (event) => {
     const field = event.target instanceof Element && event.target.classList.contains('inbox-answer-text') ? event.target : null;
     const key = field ? draftKey(field) : '';
-    if (key) drafts.set(key, field.value);
+    if (key) {
+      field.dataset.draftTouched = '1';
+      drafts.set(key, field.value);
+    }
   });
   // A fold opened or closed by hand. `toggle` does not bubble: caught on the
-  // way down. Also covers a session's card that a transcript render dropped
-  // before renderSessionAskCards drew it again.
-  host?.addEventListener('toggle', (event) => {
+  // way down.
+  host.addEventListener('toggle', (event) => {
     const details = event.target instanceof Element && event.target.matches(INBOX_FOLD_SELECTOR) ? event.target : null;
     if (details && details.isConnected) noteInboxFold(openFolds, details);
   }, true);
 }
 
-// ─── The card in the session ──────────────────────────────────────────────────
-
-/**
- * The pending asks of the conversation on screen, as cards at the end of its
- * transcript (before the cards it waits on). Called with every render of the
- * question cards; a no-op while nothing changed.
- */
-export function renderSessionAskCards() {
-  const host = document.getElementById('messages');
-  if (!host || IS_SHARED_VIEW) return;
-  const id = String(currentConvId || '').trim();
-  const shown = inboxActive || isStatusViewActive() || !id
-    ? []
-    : [...sessionAsks.values()]
-      .filter((ask) => ask && (ask.conversationId || ask.session?.id) === id && ask.status === 'pending')
-      .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
-  const key = JSON.stringify([id, shown.map((ask) => [ask.id, ask.status])]);
-  const existing = host.querySelectorAll('.relay-ask-container');
-  if (key === sessionCardKey && existing.length === shown.length && [...existing].every((node) => node.isConnected)) return;
-  sessionCardKey = key;
-  const focused = captureDrafts(host);
-  existing.forEach((node) => captureInboxFolds(openFolds, node));
-  existing.forEach((node) => node.remove());
-  const firstQuestion = host.querySelector('.relay-question-container');
-  for (const ask of shown) {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'msg relay-ask-container';
-    wrapper.dataset.askId = ask.id;
-    wrapper.append(buildAskCard(document, { ...ask, session: ask.session || { id } }, { relay: { id: 'self', self: true }, mode: 'session', now: Date.now() }));
-    if (firstQuestion) host.insertBefore(wrapper, firstQuestion);
-    else host.append(wrapper);
-    restoreInboxFolds(openFolds, wrapper);
-  }
-  restoreDrafts(host, focused);
+function bindClicks() {
+  if (clickBound) return;
+  clickBound = true;
+  bindInboxActionHost(document.getElementById('messages'));
 }
 
-/** Boot: the count, the session cards, a refresh every minute (paired relays). */
+/** Boot: the count and a refresh every minute (paired relays). */
 export function startInbox() {
   if (started || IS_SHARED_VIEW) return;
   started = true;

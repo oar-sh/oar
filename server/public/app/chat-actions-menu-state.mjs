@@ -47,6 +47,7 @@ export const CHAT_ACTIONS_MENU_ENTRY_IDS = Object.freeze([
   'chat-menu-schedules',
   'chat-menu-origin',
   'chat-menu-edit-title',
+  'chat-menu-questions',
   'chat-menu-pins',
   'chat-menu-hidden',
   'chat-menu-search',
@@ -82,6 +83,7 @@ const ALWAYS_HIDDEN_IDS = new Set(['chat-menu-compact', 'chat-menu-refresh-histo
  * with HEADER_PRIORITY_MENU_IDS by the tests.
  */
 export const CHAT_ACTIONS_MENU_TWIN_IDS = Object.freeze([
+  'chat-menu-questions',
   'chat-menu-pins',
   'chat-menu-hidden',
   'chat-menu-search',

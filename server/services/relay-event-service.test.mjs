@@ -235,6 +235,25 @@ test('an approval card is named as one only the user can answer', () => {
   assert.match(eventMessages(db)[0].text, /only the user can answer it/);
 });
 
+test('a Safety check card is marked personOnly and named as the user\'s to answer, without its question id', () => {
+  const { db, service, clock } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  service.noteQuestion({
+    id: 'q-safety',
+    conversationId: BUILDER,
+    prompt: 'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?',
+    choices: ['Allow once', 'Deny'],
+    context: { source: 'ClaudeSafetyCheck' },
+  });
+  clock.advance(0);
+  const [message] = eventMessages(db);
+  assert.match(message.text, /\(a Safety check: the user's to answer\)/);
+  assert.doesNotMatch(message.text, /q-safety/);
+  const stored = db.prepare(`SELECT payload_json FROM relay_events WHERE type = 'question_asked'`).all();
+  assert.equal(stored.length, 1);
+  assert.equal(JSON.parse(stored[0].payload_json).detail.personOnly, true);
+});
+
 test('a one-shot subscription with match fires on the matching reply only, then ends', () => {
   const { db, service, clock } = setup();
   const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['turn_end'], once: true, match: 'tests? pass' });

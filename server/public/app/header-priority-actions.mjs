@@ -12,6 +12,7 @@
 // action never "jumps" a higher one back into the header.
 
 export const HEADER_PRIORITY_ACTIONS = Object.freeze([
+  Object.freeze({ key: 'questions', inlineId: 'questions-btn', menuId: 'chat-menu-questions' }),
   Object.freeze({ key: 'pins', inlineId: 'pinned-messages-btn', menuId: 'chat-menu-pins' }),
   Object.freeze({ key: 'hidden', inlineId: 'hidden-messages-btn', menuId: 'chat-menu-hidden' }),
   Object.freeze({ key: 'search', inlineId: 'message-search-btn', menuId: 'chat-menu-search' }),
@@ -140,6 +141,7 @@ export function resolveQuestionBannerMode({
  *
  * @param {object} input
  * @param {boolean} [input.sharedMode] the shared read-only view: Day/Night only
+ * @param {number} [input.questionCount] pending questions (📓) of the open conversation
  * @param {number} [input.pinCount] pins of the open conversation
  * @param {number} [input.hiddenCount] messages hidden from shared viewers
  * @param {boolean} [input.fullscreenAvailable] pwa-install.js's verdict (a phone, not installed)
@@ -147,14 +149,16 @@ export function resolveQuestionBannerMode({
  */
 export function resolveHeaderActionAvailability({
   sharedMode = false,
+  questionCount = 0,
   pinCount = 0,
   hiddenCount = 0,
   fullscreenAvailable = false,
 } = {}) {
   if (sharedMode) {
-    return { pins: false, hidden: false, search: false, context: false, usage: false, theme: true, fullscreen: false };
+    return { questions: false, pins: false, hidden: false, search: false, context: false, usage: false, theme: true, fullscreen: false };
   }
   return {
+    questions: Number(questionCount) > 0,
     pins: Number(pinCount) > 0,
     hidden: Number(hiddenCount) > 0,
     search: true,

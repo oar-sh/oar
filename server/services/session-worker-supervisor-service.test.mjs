@@ -591,3 +591,41 @@ test('restartExhaustedRetryAfterMs 0 keeps an exhausted session exhausted', asyn
   assert.equal((await supervisor.ensureWorker('exhausted-2')).error, 'restart-exhausted');
   assert.equal(spawns, 1);
 });
+
+test('the end of a kill block is reported: when its grace runs out, or when the marker is cleared', () => {
+  let nowMs = 1_000;
+  const timers = new Map();
+  let nextId = 1;
+  const lifted = [];
+  const supervisor = createSessionWorkerSupervisor({
+    registry: createSessionWorkerRegistry(),
+    now: () => nowMs,
+    killBlockGraceMs: 3_000,
+    spawnWorker: async () => ({ workerId: 'w', pid: null }),
+    onKillBlockLifted: (sid) => lifted.push(sid),
+    setTimeoutImpl: (fn, ms) => { const id = nextId++; timers.set(id, { fn, ms }); return id; },
+    clearTimeoutImpl: (id) => { timers.delete(id); },
+  });
+
+  supervisor.markKilled('sess-a');
+  assert.equal(supervisor.isKillBlocked('sess-a'), true);
+  assert.equal(timers.size, 1);
+  const [[id, timer]] = [...timers.entries()];
+  assert.ok(timer.ms >= 3_000, 'fires once the grace is over');
+  nowMs += timer.ms;
+  timers.delete(id);
+  timer.fn();
+  assert.equal(supervisor.isKillBlocked('sess-a'), false);
+  assert.deepEqual(lifted, ['sess-a']);
+
+  supervisor.markKilled('sess-b');
+  supervisor.markKilled('sess-b');
+  assert.equal(timers.size, 1, 'a second kill re-arms the one timer');
+  supervisor.clearRestartSchedule('sess-b', { resetKilledMarker: true });
+  assert.equal(timers.size, 0);
+  assert.equal(supervisor.isKillBlocked('sess-b'), false);
+  assert.deepEqual(lifted, ['sess-a', 'sess-b'], 'a cleared marker lifts the block at once');
+
+  supervisor.clearRestartSchedule('sess-c', { resetKilledMarker: true });
+  assert.deepEqual(lifted, ['sess-a', 'sess-b'], 'no block, nothing to report');
+});

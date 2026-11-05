@@ -33,6 +33,10 @@ export function createHeartbeatController({
   // Optional: called after every beat the relay answered, for work that
   // waits for a reachable relay (posts kept after a failure).
   onAnswered = () => {},
+  // Optional: how many posts are kept for a reachable relay (flushed by
+  // onAnswered). While any is, the worker counts as busy, so the next beat,
+  // which flushes them, is not an idle wait away.
+  getKeptPostCount = null,
   // Optional: the kind of worker this is ("claude", "claude-api", ...). The
   // relay hands a Claude chat's row only to a worker of the row's billing,
   // and knows a worker's kind from what it says here and in its hello.
@@ -100,6 +104,27 @@ export function createHeartbeatController({
   }
 
   /**
+   * Whether the worker has work the relay follows by its beats: a row it
+   * owns, a live background task, a running turn, a settle failure to report,
+   * a kept post to flush.
+   * The keepalive beats at its busy cadence while this holds
+   * (worker-keepalive.mjs). A getter that throws counts as work.
+   */
+  function hasWork() {
+    try {
+      if (typeof getActiveQueueMessageId === "function" && String(getActiveQueueMessageId() || "").trim()) return true;
+      if (typeof getActiveQueueMessageIds === "function" && (getActiveQueueMessageIds() || []).length) return true;
+      if (typeof getBackgroundTaskIds === "function" && (getBackgroundTaskIds() || []).length) return true;
+      if (typeof getSettleFailed === "function" && (getSettleFailed() || []).length) return true;
+      if (typeof getKeptPostCount === "function" && Number(getKeptPostCount()) > 0) return true;
+      if (typeof getSteeringState === "function" && getSteeringState()?.turnActive === true) return true;
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
    * An out-of-cycle pulse for state the relay should see before the next
    * periodic one (the composer's steering snapshot, a relay that just came
    * up). Requests inside one window share a single pulse, sent at its end so
@@ -135,6 +160,7 @@ export function createHeartbeatController({
   }
 
   return {
+    hasWork,
     pulseHeartbeat,
     requestPulse,
     startHeartbeat,

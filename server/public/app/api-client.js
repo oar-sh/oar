@@ -1,4 +1,5 @@
 import { BASE, TOKEN, CLIENT_ID, IS_SHARE_PREVIEW, SHARE_PREVIEW_CONVERSATION_ID, SHARED_CONVERSATION_TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
+import { liveActivityCap } from './live-activity-cap.mjs';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
 // being backgrounded can hang indefinitely on a half-open mobile connection and
@@ -981,6 +982,12 @@ export async function loadConversation(id, options = {}) {
   if (afterTimestamp) params.set('afterTimestamp', afterTimestamp);
   const aroundMessageId = String(options.aroundMessageId || '').trim();
   if (aroundMessageId) params.set('aroundMessageId', aroundMessageId);
+  // The running turn's tool lines per agent this page shows ("Tool lines
+  // shown"; 0 = no limit): the relay sends no more of them.
+  params.set('activityCap', String(liveActivityCap()));
+  // The live poll's finished replies it already holds (held-details.mjs).
+  const heldDetails = String(options.heldDetails || '');
+  if (heldDetails) params.set('heldDetails', heldDetails);
   const query = params.toString();
   // `onErrorResponse` tells a conversation the relay does not know (404) from a failed load.
   const onErrorResponse = typeof options.onErrorResponse === 'function' ? options.onErrorResponse : undefined;

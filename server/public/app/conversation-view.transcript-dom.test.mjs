@@ -1253,3 +1253,240 @@ test('the summary modal runs its leave handler on close and on a different kind,
   store.closeSummaryModal();
   assert.deepEqual(calls, ['left', 'replaced']);
 });
+
+// ---------------------------------------------------------------------------
+// The order of a turn (turnSeq) and the stream view.
+// ---------------------------------------------------------------------------
+
+const STREAM_KEY = 'copilot_stream_view';
+
+function assistantMessage(id, sourceId, { numbered = true } = {}) {
+  const n = (value) => (numbered ? { turnSeq: value } : {});
+  return {
+    id,
+    sourceMessageId: sourceId,
+    role: 'assistant',
+    text: 'The cache evicts the oldest widget.',
+    timestamp: at(20),
+    thoughts: [
+      { reasoningId: 'claude-thought-main-0-0', seq: 1, text: 'Find the widget cache.', done: true, ...n(1) },
+      { reasoningId: 'claude-thought-main-1-0', seq: 2, text: 'Now the eviction.', done: true, ...n(3) },
+    ],
+    activities: [
+      { text: 'Tool (Read): src/cache.js', subagentRunId: null, ...n(2) },
+      { text: 'Tool (Grep): evict', subagentRunId: null, ...n(4) },
+    ],
+  };
+}
+
+function bubbleHtmlOf(conv, msg) {
+  resetView();
+  view.renderMessages([{ id: uid('u'), role: 'user', text: 'Plan the widget cache', timestamp: at(0) }, msg], false, { conversationId: conv });
+  return messagesEl.querySelector('.msg.assistant .msg-bubble').innerHTML;
+}
+
+test('stream view off: a numbered turn renders exactly as an unnumbered one (the grouped layout)', () => {
+  localStorage.removeItem(STREAM_KEY);
+  const conv = openConversation();
+  const numbered = bubbleHtmlOf(conv, assistantMessage('a-off-1', 'u-off-1'));
+  const plain = bubbleHtmlOf(conv, assistantMessage('a-off-1', 'u-off-1', { numbered: false }));
+  assert.equal(numbered, plain);
+  assert.match(numbered, /class="msg-thoughts"/);
+  assert.doesNotMatch(numbered, /msg-turn-stream/);
+});
+
+test('stream view on: thought, Read, thought, Grep, then the reply; an old turn keeps the grouped layout', () => {
+  const conv = openConversation();
+  localStorage.removeItem(STREAM_KEY);
+  const grouped = bubbleHtmlOf(conv, assistantMessage('a-on-1', 'u-on-1', { numbered: false }));
+  localStorage.setItem(STREAM_KEY, '1');
+  try {
+    bubbleHtmlOf(conv, assistantMessage('a-on-1', 'u-on-1'));
+    const list = messagesEl.querySelector('.msg.assistant .msg-turn-stream');
+    assert.ok(list, 'the stream list');
+    assert.deepEqual([...list.children].map((el) => el.className.split(' ').pop() + ':' + (el.dataset.turnSeq || '')),
+      ['msg-stream-thought:1', 'msg-stream-tool:2', 'msg-stream-thought:3', 'msg-stream-tool:4', 'msg-stream-reply:']);
+    assert.equal(messagesEl.querySelector('.msg.assistant .msg-thoughts'), null);
+    assert.equal(messagesEl.querySelector('.msg.assistant details.msg-activity'), null);
+    assert.equal(bubbleHtmlOf(conv, assistantMessage('a-on-1', 'u-on-1', { numbered: false })), grouped, 'old turn: as with the view off');
+  } finally {
+    localStorage.removeItem(STREAM_KEY);
+  }
+});
+
+test('a thought frame of turn B makes its row with B\'s turn id: a hand fold in turn A does not carry over', async () => {
+  localStorage.removeItem(STREAM_KEY);
+  resetView();
+  const conv = openConversation();
+  const turnA = uid('u');
+  liveTurn(conv, turnA);
+  fire('relay_thought', { conversationId: conv, messageId: turnA, reasoningId: 'claude-thought-main-0-0', text: 'Reading the cache' });
+  const rowA = liveBubble().querySelector('.thinking-thought[data-reasoning-id="claude-thought-main-0-0"]');
+  assert.equal(rowA.dataset.turnId, turnA);
+  await settle();
+  rowA.open = false;
+  rowA.dispatchEvent(new window.Event('toggle'));
+  await settle();
+  fire('message_status', { conversationId: conv, messageId: turnA, status: 'done' });
+
+  const turnB = uid('u');
+  liveTurn(conv, turnB);
+  fire('relay_thought', { conversationId: conv, messageId: turnB, reasoningId: 'claude-thought-main-0-0', text: 'Reading the registry' });
+  const rowB = liveBubble().querySelector('.thinking-thought[data-reasoning-id="claude-thought-main-0-0"]');
+  assert.equal(rowB.dataset.turnId, turnB);
+  assert.equal(rowB.open, true, 'turn B follows the setting');
+  fire('message_status', { conversationId: conv, messageId: turnB, status: 'done' });
+});
+
+test('a numbered tool line run twice shows twice live; a replayed event does not add a row', () => {
+  localStorage.removeItem(STREAM_KEY);
+  resetView();
+  const conv = openConversation();
+  const messageId = uid('u');
+  liveTurn(conv, messageId);
+  const line = { conversationId: conv, messageId, text: 'Tool (view): src/cache.js' };
+  fire('relay_activity', { ...line, turnSeq: 2 });
+  fire('relay_activity', { ...line, turnSeq: 3 });
+  fire('relay_activity', { ...line, turnSeq: 2 });
+  assert.equal(liveBubble().querySelectorAll('#thinking-activity > .thinking-activity-item').length, 2);
+  assert.deepEqual(store.relayActivities.get(messageId).map((row) => row.turnSeq), [2, 3]);
+  // An older relay (no numbers): the repeat is one line, as before.
+  fire('relay_activity', { ...line, text: 'Tool (grep): evict' });
+  fire('relay_activity', { ...line, text: 'Tool (grep): evict' });
+  assert.equal(liveBubble().querySelectorAll('#thinking-activity > .thinking-activity-item').length, 3);
+  fire('message_status', { conversationId: conv, messageId, status: 'done' });
+});
+
+test('stream view live: thoughts and tool lines share one list in the turn\'s order, the text below', () => {
+  localStorage.setItem(STREAM_KEY, '1');
+  try {
+    resetView();
+    const conv = openConversation();
+    const messageId = uid('u');
+    liveTurn(conv, messageId);
+    const list = () => liveBubble().querySelector('#thinking-stream-list');
+    assert.ok(list(), 'the live bubble has the stream list');
+    fire('relay_thought', { conversationId: conv, messageId, reasoningId: 'r-1', text: 'Find the widget cache.', turnSeq: 1 });
+    fire('relay_activity', { conversationId: conv, messageId, text: 'Tool (Read): src/cache.js', turnSeq: 2 });
+    fire('relay_activity', { conversationId: conv, messageId, text: 'Tool (Grep): evict', turnSeq: 4 });
+    // A frame that arrives late still lands in its place.
+    fire('relay_thought', { conversationId: conv, messageId, reasoningId: 'r-2', text: 'Now the eviction.', turnSeq: 3 });
+    // The next chunk of a thought keeps its place.
+    fire('relay_thought', { conversationId: conv, messageId, reasoningId: 'r-1', text: 'Find the widget cache first.', turnSeq: 1 });
+    fire('relay_activity', { conversationId: conv, messageId, text: 'Tool (Glob): tests/**', subagentRunId: 'toolu_fixture_sub', turnSeq: 5 });
+    assert.deepEqual([...list().children].map((el) => `${el.className.split(' ')[0]}:${el.dataset.turnSeq}`),
+      ['thinking-thought:1', 'thinking-activity-item:2', 'thinking-thought:3', 'thinking-activity-item:4']);
+    assert.equal(liveBubble().querySelectorAll('#thinking-thoughts .thinking-thought').length, 0, 'the grouped boxes stay empty');
+    assert.equal(liveBubble().querySelectorAll('#thinking-activity > .thinking-activity-item').length, 0);
+    assert.ok(list().compareDocumentPosition(liveBubble().querySelector('#thinking-stream')) & window.Node.DOCUMENT_POSITION_FOLLOWING, 'the streaming text below');
+    // A poll replay keeps the same rows in the same order.
+    view.renderThinkingActivities();
+    assert.equal(list().querySelectorAll('.thinking-activity-item').length, 2);
+    fire('message_status', { conversationId: conv, messageId, status: 'done' });
+  } finally {
+    localStorage.removeItem(STREAM_KEY);
+  }
+});
+
+test('toggling the stream view keeps a reply that arrived live (the kept window, not the last render)', async () => {
+  const { conversationPayloadCache } = await import('./conversation-payload-cache.mjs');
+  localStorage.removeItem(STREAM_KEY);
+  resetView();
+  const conv = openConversation();
+  const payload = { messages: [{ id: 'u-live-1', role: 'user', text: 'Plan the widget cache', timestamp: at(0) }, assistantMessage('a-live-1', 'u-live-1')] };
+  conversationPayloadCache.remember(conv, payload);
+  view.renderMessages(payload.messages, false, { conversationId: conv });
+  fire('assistant_message', {
+    conversationId: conv,
+    messageId: 'a-live-2',
+    sourceMessageId: 'u-live-1',
+    message: { role: 'assistant', text: 'A reply that came live.', timestamp: at(30) },
+  });
+  assert.ok(messagesEl.querySelector('.msg[data-message-id="a-live-2"]'), 'precondition: the live reply is on the page');
+  localStorage.setItem(STREAM_KEY, '1');
+  try {
+    view.refreshStreamViewLayout();
+    assert.ok(messagesEl.querySelector('.msg[data-message-id="a-live-2"]'), 'still there after the toggle');
+    assert.ok(messagesEl.querySelector('.msg[data-message-id="a-live-1"] .msg-turn-stream'), 'and the numbered turn takes the stream layout');
+  } finally {
+    localStorage.removeItem(STREAM_KEY);
+    conversationPayloadCache.forget(conv);
+  }
+});
+
+test('toggling the stream view after a window merge draws the merged rows', async () => {
+  const { conversationPayloadCache } = await import('./conversation-payload-cache.mjs');
+  localStorage.removeItem(STREAM_KEY);
+  resetView();
+  const conv = openConversation();
+  conversationPayloadCache.forget(conv);
+  const first = [{ id: 'u-merge-1', role: 'user', text: 'Plan the widget cache', timestamp: at(0) }, assistantMessage('a-merge-1', 'u-merge-1')];
+  view.renderMessages(first, false, { conversationId: conv });
+  const merged = [...first, { id: 'u-merge-2', role: 'user', text: 'And the eviction?', timestamp: at(40) }, { id: 'a-merge-2', role: 'assistant', text: 'Oldest first.', timestamp: at(50), sourceMessageId: 'u-merge-2' }];
+  view.mergeMessagesIntoTranscript(first, merged, { conversationId: conv });
+  assert.ok(messagesEl.querySelector('.msg[data-message-id="a-merge-2"]'), 'precondition: merged in');
+  localStorage.setItem(STREAM_KEY, '1');
+  try {
+    view.refreshStreamViewLayout();
+    assert.ok(messagesEl.querySelector('.msg[data-message-id="a-merge-2"]'), 'still there after the toggle');
+  } finally {
+    localStorage.removeItem(STREAM_KEY);
+  }
+});
+
+test('a numbered tool line the cap already trimmed does not come back on a replay', () => {
+  localStorage.removeItem(STREAM_KEY);
+  localStorage.setItem('copilot_live_activity_cap', '10');
+  try {
+    resetView();
+    const conv = openConversation();
+    const messageId = uid('u');
+    liveTurn(conv, messageId);
+    for (let n = 1; n <= 15; n += 1) fire('relay_activity', { conversationId: conv, messageId, text: `Tool (view): widget-${n}.js`, turnSeq: n });
+    const rows = () => [...liveBubble().querySelectorAll('#thinking-activity > .thinking-activity-item')].map((row) => row.textContent);
+    assert.equal(rows().length, 10);
+    // A socket.io recovery replays an old event.
+    fire('relay_activity', { conversationId: conv, messageId, text: 'Tool (view): widget-3.js', turnSeq: 3 });
+    assert.equal(rows().length, 10);
+    assert.ok(!rows().some((text) => text.includes('widget-3.js')), 'the trimmed line stays out');
+    assert.deepEqual(store.relayActivities.get(messageId).map((row) => row.turnSeq), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    fire('message_status', { conversationId: conv, messageId, status: 'done' });
+  } finally {
+    localStorage.removeItem('copilot_live_activity_cap');
+  }
+});
+
+test('the grouped tool count leaves out the "earlier lines omitted" row', () => {
+  const rows = [
+    { text: '… 30 earlier tool lines omitted', subagentRunId: null, metadata: { kind: 'activity_omitted', count: 30, fromTurnSeq: 2 } },
+    ...Array.from({ length: 5 }, (_, i) => ({ text: `Tool (view): widget-${i}.js`, subagentRunId: null, turnSeq: 40 + i })),
+  ];
+  const html = view.renderActivityMarkup(rows);
+  assert.match(html, /🔧 Tool activity \(5\)/);
+  assert.match(html, /… 30 earlier tool lines omitted/, 'the row itself is still listed');
+});
+
+test('toggling the stream view keeps the reader where they were', async () => {
+  const { conversationPayloadCache } = await import('./conversation-payload-cache.mjs');
+  localStorage.removeItem(STREAM_KEY);
+  resetView();
+  const conv = openConversation();
+  const payload = { messages: [{ id: 'u-scroll-1', role: 'user', text: 'Plan the widget cache', timestamp: at(0) }, assistantMessage('a-scroll-1', 'u-scroll-1')] };
+  conversationPayloadCache.remember(conv, payload);
+  view.renderMessages(payload.messages, false, { conversationId: conv });
+  // JSDOM lays nothing out: record what the toggle writes to scrollTop.
+  const writes = [];
+  let top = 240;
+  Object.defineProperty(messagesEl, 'scrollTop', { configurable: true, get: () => top, set: (value) => { writes.push(value); top = value; } });
+  localStorage.setItem(STREAM_KEY, '1');
+  try {
+    view.refreshStreamViewLayout();
+    assert.ok(messagesEl.querySelector('.msg[data-message-id="a-scroll-1"] .msg-turn-stream'), 'redrawn in the stream layout');
+    assert.equal(top, 240);
+    assert.ok(writes.includes(240), 'the place read before the redraw is put back');
+  } finally {
+    delete messagesEl.scrollTop;
+    localStorage.removeItem(STREAM_KEY);
+    conversationPayloadCache.forget(conv);
+  }
+});

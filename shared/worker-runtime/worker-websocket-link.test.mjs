@@ -188,9 +188,11 @@ test("worker websocket link refreshes readiness and reconnects stale sockets", a
   assert.equal(intervals[0]?.delay, 1000);
 
   nowMs = 2000;
+  const before = socket.sent.length;
   intervals[0].fn();
-  assert.match(socket.sent.at(-3), /"type":"worker.ping"/);
-  assert.match(socket.sent.at(-2), /"type":"worker.hello"/);
+  // A refresh is ping + ready; the hello went out once, at open.
+  assert.equal(socket.sent.length, before + 2);
+  assert.match(socket.sent.at(-2), /"type":"worker.ping"/);
   assert.match(socket.sent.at(-1), /"type":"worker.ready"/);
 
   nowMs = 8001;
@@ -1098,4 +1100,112 @@ test("a relay on the same build, or one that names none, is never logged", async
   assert.equal(link.status().relayBuildId, null);
   assert.deepEqual(buildMismatchLines(logs), []);
   link.stop();
+});
+
+test("readyRefreshMs 0 arms no refresh timer; refreshReadiness is the caller's", async () => {
+  FakeWebSocket.instances = [];
+  const intervals = [];
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-driven",
+    getPid: () => 3003,
+    WebSocketImpl: FakeWebSocket,
+    readyRefreshMs: 0,
+    connectTimeoutMs: 0,
+    jitterMs: 0,
+    setIntervalImpl: (fn, delay) => {
+      intervals.push({ fn, delay });
+      return { delay };
+    },
+    clearIntervalImpl: () => {},
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  assert.equal(intervals.length, 0);
+  const before = socket.sent.length;
+  assert.equal(link.refreshReadiness("keepalive"), true);
+  assert.deepEqual(socket.sent.slice(before).map((frame) => JSON.parse(frame).type), ["worker.ping", "worker.ready"]);
+  link.stop();
+  assert.equal(link.refreshReadiness("keepalive"), false, "no socket, no refresh");
+});
+
+test("a silent relay is given up after 90 s by default, not after 30 s", () => {
+  FakeWebSocket.instances = [];
+  let nowMs = 1000;
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-silent",
+    getPid: () => 3004,
+    WebSocketImpl: FakeWebSocket,
+    readyRefreshMs: 0,
+    connectTimeoutMs: 0,
+    jitterMs: 0,
+    now: () => nowMs,
+    setTimeoutImpl: () => ({}),
+    clearTimeoutImpl: () => {},
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  nowMs += 60_000;
+  link.refreshReadiness("keepalive");
+  assert.equal(socket.readyState, socket.OPEN, "two idle beats of silence are fine");
+  nowMs += 30_001;
+  link.refreshReadiness("keepalive");
+  assert.equal(socket.readyState, socket.CLOSED);
+  link.stop();
+});
+
+test("every server.hello and every delivery is reported; a delivery makes the link busy until it settles", async () => {
+  FakeWebSocket.instances = [];
+  const frames = [];
+  let finish = null;
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    token: "tok",
+    getSessionReady: () => true,
+    getSessionId: () => "sdk-busy",
+    getPid: () => 3005,
+    onDeliver: () => new Promise((resolve) => { finish = resolve; }),
+    onRelayFrame: (kind) => frames.push(kind),
+    WebSocketImpl: FakeWebSocket,
+    readyRefreshMs: 0,
+    connectTimeoutMs: 0,
+    jitterMs: 0,
+  });
+  link.start();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive({ type: "server.hello", reason: "connected", capabilities: [] });
+  socket.receive({ type: "server.hello", reason: "ack", capabilities: [] });
+  assert.deepEqual(frames, ["server-hello", "server-hello"]);
+  assert.equal(link.isBusy(), false);
+  socket.receive({ type: "queue.deliver", reason: "test", pending: { message: { id: "m-busy" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(frames, ["server-hello", "server-hello", "deliver"]);
+  assert.equal(link.isBusy(), true);
+  finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(link.isBusy(), false);
+  link.stop();
+});
+
+test("a held link counts as busy", () => {
+  let held = true;
+  const link = createWorkerWebSocketLink({
+    serverUrl: "http://localhost:3333",
+    getSessionReady: () => true,
+    getSteeringReady: () => false,
+    getDeliveryHeld: () => held,
+    WebSocketImpl: FakeWebSocket,
+  });
+  assert.equal(link.isBusy(), true);
+  held = false;
+  assert.equal(link.isBusy(), false);
 });

@@ -47,8 +47,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // check, the usage service and spend card, four migrations) to 573. 590
 // until 2026-10-30; the worker recycle (the shared build id, the simple
 // steering state, the worker replacement and the recycle service) took it
-// to 597. 610 leaves room for the fixes that follow.
-const MAX_ENTRIES = 610;
+// to 597. 610 until 2026-11-04; the 0.9.21 round took it to 607, and an
+// idle relay that wakes less (its idle timers, the worker keepalive, the
+// queue wake hook) to 610. 640 leaves room for the 0.9.22 work.
+const MAX_ENTRIES = 640;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and

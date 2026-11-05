@@ -4,6 +4,7 @@
 
 import { prefixToolActivityEmoji } from './tool-activity-emoji.mjs';
 import { subagentRowHtml } from './subagent-row.mjs';
+import { isThoughtsExpanded, thoughtFoldOpen } from './thoughts-preference.mjs';
 
 function escHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -100,20 +101,26 @@ function firstLine(text, max = 140) {
 /**
  * One entry's markup. `renderMarkdown(text)` renders reply text (and
  * thoughts); `children` maps a child run id to its header so a child entry
- * renders as a clickable row; `openDetails` keeps a fold the reader opened
- * open across re-renders.
+ * renders as a clickable row; `openDetails` keeps the reader's folds across
+ * re-renders: a Map or a function from seq to 'open' | 'folded' | undefined
+ * (`true` still means "open"). A thought without a choice, streaming or
+ * done, opens as `thoughtsExpanded` (the "Expand thoughts" setting) says.
  */
-export function timelineEntryHtml(entry, { renderMarkdown = (text) => `<p>${escHtml(text)}</p>`, children = new Map(), openDetails = false, clickable = true, now = Date.now() } = {}) {
+export function timelineEntryHtml(entry, { renderMarkdown = (text) => `<p>${escHtml(text)}</p>`, children = new Map(), openDetails = false, thoughtsExpanded = isThoughtsExpanded(), clickable = true, now = Date.now() } = {}) {
   const kind = String(entry?.kind || '');
   const seq = Number(entry?.seq) || 0;
   const open = entry?.done === false;
   const text = String(entry?.text || '');
   const wrap = (inner, extraClass = '') => `<div class="sav-entry sav-entry-${escHtml(kind)}${open ? ' is-open' : ''}${extraClass}" data-seq="${seq}">${inner}</div>`;
-  const openAttr = openDetails ? ' open' : '';
+  const choice = typeof openDetails === 'function'
+    ? openDetails(seq)
+    : (openDetails instanceof Map ? openDetails.get(seq) : (openDetails === true ? 'open' : undefined));
+  const openAttr = choice === 'open' ? ' open' : '';
 
   if (kind === 'thought') {
     const label = open && !text.trim() ? 'Thinking…' : (firstLine(text, 110) || 'Thought');
-    return wrap(`<details class="sav-fold"${open || openDetails ? ' open' : ''}><summary><span class="sav-kind">💭</span> <span class="sav-summary-text">${escHtml(label)}</span></summary><div class="sav-thought-body markdown-body">${renderMarkdown(text)}</div></details>`);
+    const thoughtOpen = thoughtFoldOpen({ choice: choice || null, expanded: thoughtsExpanded });
+    return wrap(`<details class="sav-fold"${thoughtOpen ? ' open' : ''}><summary><span class="sav-kind">💭</span> <span class="sav-summary-text">${escHtml(label)}</span></summary><div class="sav-thought-body markdown-body">${renderMarkdown(text)}</div></details>`);
   }
 
   if (kind === 'text') {

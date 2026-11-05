@@ -35,13 +35,16 @@ function oneLine(text) {
 /**
  * The line a folded header shows: the number of steps (activity lines) and
  * the latest one, or the end of what the run has written when it has taken
- * no step yet. Empty when there is nothing to say.
+ * no step yet. Empty when there is nothing to say. `cap` is how many lines
+ * the bubble keeps (the "Tool lines shown" setting, 0 = all): a bubble that
+ * holds that many has likely dropped older ones, so the count reads "50+".
  */
-export function subagentFoldSummary({ activities = [], streamText = '' } = {}) {
+export function subagentFoldSummary({ activities = [], streamText = '', cap = 0 } = {}) {
   const steps = (Array.isArray(activities) ? activities : []).map(oneLine).filter(Boolean);
   if (steps.length) {
     const latest = steps[steps.length - 1];
-    const count = steps.length === 1 ? '1 step' : `${steps.length} steps`;
+    const atCap = Number(cap) > 0 && steps.length >= Number(cap);
+    const count = atCap ? `${steps.length}+ steps` : (steps.length === 1 ? '1 step' : `${steps.length} steps`);
     return `${count} · ${latest}`.slice(0, SUMMARY_MAX_CHARS);
   }
   const lines = String(streamText || '').split(/\r?\n/).map(oneLine).filter(Boolean);

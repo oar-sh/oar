@@ -42,6 +42,8 @@ import { migrateClaudeApiUsageCheckpoints } from './migrations/0033-claude-api-u
 import { migrateClaudeApiUsageTotals } from './migrations/0034-claude-api-usage-totals.mjs';
 import { migrateConversationPlanOnly } from './migrations/0035-conversation-plan-only.mjs';
 import { migrateTokenUsage } from './migrations/0036-token-usage.mjs';
+import { migrateRelayAsksQueueId } from './migrations/0037-relay-asks-queue-id.mjs';
+import { migrateTurnSeq } from './migrations/0038-turn-seq.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1075,6 +1077,23 @@ try {
   migrateTokenUsage(db);
 } catch (error) {
   console.warn(`[token-usage] migration 0036 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The turn an ask was made in: one column on 0023's table. The ask service
+// works without it, so a failure is logged and retried next boot like 0023.
+try {
+  migrateRelayAsksQueueId(db);
+} catch (error) {
+  console.warn(`[relay-asks] migration 0037 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// One order across a turn's thoughts and tool lines (the stream view). The
+// repository checks for the column and works without it (no numbers, the
+// grouped layout), so a failure is logged and retried next boot.
+try {
+  migrateTurnSeq(db);
+} catch (error) {
+  console.warn(`[turn-seq] migration 0038 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

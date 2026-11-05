@@ -3,8 +3,8 @@
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { REMOTE_RELAY_ERROR_CODES, isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
-import { isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
-import { sendRelayAskError } from './relay-ask-routes.mjs';
+import { isPersonOnlyQuestion, isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { askForPairedRelay, sendRelayAskError } from './relay-ask-routes.mjs';
 import { closedQuestionAnswer, questionAcceptsFreeText } from '../../shared/question-answer-rule.mjs';
 import {
   extractRequestedSchema,
@@ -54,6 +54,23 @@ function parseRowJson(value) {
 function isRemoteRelayApprovalRow(row) {
   const envelope = parseRowJson(row?.request);
   return envelope ? isRemoteRelayApprovalQuestion(envelope) : false;
+}
+
+/**
+ * A stored question row that is a Claude session's Safety check card: an
+ * ask Claude Code marks as person-only. Only the user answers it, never an
+ * agent of this relay (the loopback client counts as remote) or another.
+ */
+function isPersonOnlyRow(row) {
+  const envelope = parseRowJson(row?.request);
+  return envelope ? isPersonOnlyQuestion(envelope.context) : false;
+}
+
+const PERSON_ONLY_ANSWER_REFUSAL = 'This card is the user\'s to answer: Claude Code marks the call as person-only, so no agent may answer it.';
+
+/** A card no agent may list or answer. */
+function isUserOnlyRow(row) {
+  return isRemoteRelayApprovalRow(row) || isPersonOnlyRow(row);
 }
 
 /**
@@ -167,13 +184,17 @@ export function registerAskUserRoutes(app, deps) {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
     const status = String(req.query.status || 'pending').trim() || 'pending';
     let rows = stmts.listQuestions.all(status, conversationId, conversationId);
-    if (fromRemoteRelay(req)) rows = rows.filter((row) => !isRemoteRelayApprovalRow(row));
+    if (fromRemoteRelay(req)) rows = rows.filter((row) => !isUserOnlyRow(row));
     const questions = rows.map(formatQuestionRow).map((question) => ({ ...question, kind: relayQuestionKind(question) }));
     // Questions that don't block, on request (read_session's pendingQuestions):
     // the cards' own readers take only what a turn waits on.
     if (String(req.query.includeAsks || '') === '1' && relayAskService?.isAvailable?.() && status === 'pending') {
       const asks = conversationId ? relayAskService.listOf(conversationId) : relayAskService.listHere();
-      questions.push(...asks.filter((ask) => !ask.relayId && ask.status === 'pending' && (!conversationId || ask.conversationId === conversationId)));
+      // A paired relay's read_session never learns the asking turn's queue id.
+      const shown = fromRemoteRelay(req) ? askForPairedRelay : (ask) => ask;
+      questions.push(...asks
+        .filter((ask) => !ask.relayId && ask.status === 'pending' && (!conversationId || ask.conversationId === conversationId))
+        .map(shown));
     }
     res.json({ questions });
   });
@@ -181,7 +202,8 @@ export function registerAskUserRoutes(app, deps) {
   app.get('/api/relay-question/:id', auth, (req, res) => {
     if (isRelayAskId(req.params.id)) {
       const ask = relayAskService?.get?.(req.params.id) || null;
-      return ask ? res.json({ question: ask }) : res.status(404).json({ error: 'Not found' });
+      if (!ask) return res.status(404).json({ error: 'Not found' });
+      return res.json({ question: fromRemoteRelay(req) ? askForPairedRelay(ask) : ask });
     }
     const row = stmts.getQuestion.get(req.params.id);
     if (!row || (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req))) {
@@ -343,6 +365,10 @@ export function registerAskUserRoutes(app, deps) {
       console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=remote-relay-approval-from-remote`);
       return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
     }
+    if (isPersonOnlyRow(row) && fromRemoteRelay(req)) {
+      console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=person-only-from-agent`);
+      return res.status(403).json({ error: PERSON_ONLY_ANSWER_REFUSAL, code: REMOTE_RELAY_ERROR_CODES.forbidden });
+    }
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
 
     const schema = parseQuestionRequest(row.request_schema);
@@ -417,6 +443,9 @@ export function registerAskUserRoutes(app, deps) {
     if (!row) return res.status(404).json({ error: 'Not found' });
     if (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req)) {
       return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
+    }
+    if (isPersonOnlyRow(row) && fromRemoteRelay(req)) {
+      return res.status(403).json({ error: PERSON_ONLY_ANSWER_REFUSAL, code: REMOTE_RELAY_ERROR_CODES.forbidden });
     }
     if (row.status !== 'pending') return res.json({ ok: true, question: formatQuestionRow(row) });
 

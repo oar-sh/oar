@@ -107,7 +107,7 @@ import {
   relayEventQuietWindowEnd,
   relayEventTypesTake,
 } from '../../shared/relay-events.mjs';
-import { REMOTE_RELAY_APPROVAL_SOURCE } from '../../shared/relay-asks.mjs';
+import { REMOTE_RELAY_APPROVAL_SOURCE, isPersonOnlyQuestion } from '../../shared/relay-asks.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
 export const RELAY_EVENT_SELF_RELAY_ID = 'self';
@@ -1770,6 +1770,7 @@ export function createRelayEventService({
     prompt: 'text',
     questionId: 'text',
     approvalCard: 'bool',
+    personOnly: 'bool',
     // question_answered
     answer: 'text',
     choice: 'text',
@@ -2316,6 +2317,8 @@ export function createRelayEventService({
       options,
       questionId: toText(question.id),
       ...(toText(context?.source) === REMOTE_RELAY_APPROVAL_SOURCE ? { approvalCard: true } : {}),
+      // A Claude session's Safety check: the user's to answer.
+      ...(isPersonOnlyQuestion(context) ? { personOnly: true } : {}),
       // A question that does not block (relay_tool ask).
       ...(toText(question.kind) === 'ask' ? { kind: 'ask' } : {}),
     });

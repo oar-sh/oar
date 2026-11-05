@@ -16,7 +16,7 @@ import { isChatInteractionHeld } from './selection-guard.mjs';
 import { questionCardHeadLabel } from './conversation-provider-indicator.mjs';
 import { questionAcceptsFreeText } from './question-answer-rule.mjs';
 import { beginOwnSend, followsTranscriptEnd, refreshJumpButton, scrollAfterOwnSend } from './transcript-jump-bottom-view.mjs';
-import { renderSessionAskCards } from './inbox-ui.js';
+import { renderQuestionStubs } from './questions-panel-ui.js';
 import { isConversationAutoOpenHeld } from './session-history-ui.js';
 
 let relayQuestionRenderHash = '';
@@ -230,8 +230,9 @@ function scrollQuestionCardIntoMessages(el, target) {
 export function renderRelayQuestions() {
   const el = document.getElementById('messages');
   if (!el) return;
-  // The questions that don't block go first: the cards a turn waits on stay last.
-  renderSessionAskCards();
+  // The questions that don't block: their 📓 stubs, in their turns' bubbles
+  // or standing alone before the cards a turn waits on.
+  renderQuestionStubs();
   const previousScrollTop = el.scrollTop;
   // A card is shown to a reader who is at the end. Anyone further up stays
   // where they are; the jump-to-bottom button says that a question waits.

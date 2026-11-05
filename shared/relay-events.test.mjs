@@ -198,6 +198,9 @@ test('each event type reads as one line naming the session and its id', () => {
   const question = formatRelayEventLine(event('question_asked', { prompt: 'Ship it?', options: ['Yes', 'No'], questionId: 'q-fixture-1' }));
   assert.equal(question, '[relay event] session "Orbit camera" (conv-fixture-orbit): question_asked "Ship it?" options: [Yes] [No] (question_id q-fixture-1)');
   assert.match(formatRelayEventLine(event('question_asked', { prompt: 'Allow?', options: ['Allow', 'Deny'], approvalCard: true })), /only the user can answer it/);
+  const safety = formatRelayEventLine(event('question_asked', { prompt: 'Allow it once?', options: ['Allow once', 'Deny'], questionId: 'q-fixture-2', personOnly: true }));
+  assert.match(safety, /\(a Safety check: the user's to answer\)$/);
+  assert.doesNotMatch(safety, /q-fixture-2/);
   assert.equal(
     formatRelayEventLine(event('turn_end', { status: 'done', preview: 'All green.\nDone.' })),
     '[relay event] session "Orbit camera" (conv-fixture-orbit): turn_end (done) "All green. Done."',

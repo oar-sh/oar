@@ -72,13 +72,13 @@ test('the live poll leaves a window in the middle of the history alone, also whe
   );
   assert.ok(
     poll.indexOf('if (transcriptIsInHistory(currentId)) return;') >= 0
-      && poll.indexOf('if (transcriptIsInHistory(currentId)) return;') < poll.indexOf('loadConversation(currentId, { limit: requestLimit })'),
+      && poll.indexOf('if (transcriptIsInHistory(currentId)) return;') < poll.indexOf('loadConversation(currentId, { limit: requestLimit, heldDetails })'),
     'no request is made for a window that will not be replaced',
   );
   // An answer that was on its way during the jump is dropped.
   assert.match(
     poll,
-    /const jumpEpoch = getTranscriptJumpEpoch\(\);\s*\n\s*const \{ response, stale \} = await loadKeepingLiveRows\(\s*\n\s*\(\) => loadConversation\(currentId, \{ limit: requestLimit \}\),\s*\n\s*getTranscriptLiveRowEpoch,\s*\n\s*\);[\s\S]*?if \(getTranscriptJumpEpoch\(\) !== jumpEpoch\) return;[\s\S]*?if \(stale\) return;[\s\S]*?applyLoadedConversationState\(/,
+    /const jumpEpoch = getTranscriptJumpEpoch\(\);[\s\S]*?const \{ response, stale \} = await loadKeepingLiveRows\(\s*\n\s*\(\) => loadConversation\(currentId, \{ limit: requestLimit, heldDetails \}\),\s*\n\s*getTranscriptLiveRowEpoch,\s*\n\s*\);[\s\S]*?if \(getTranscriptJumpEpoch\(\) !== jumpEpoch\) return;[\s\S]*?if \(stale\) return;[\s\S]*?applyLoadedConversationState\(/,
   );
   // Only a jump counts, and it counts when its window is put on the page: an
   // ordinary reload must still be able to correct another one.
