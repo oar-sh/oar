@@ -1,5 +1,5 @@
-// The environment for any process a test starts: every folder a relay, the
-// preinstall or npm could write the user's state to lies inside `root`.
+// The environment for any process a test starts: every folder a relay or npm
+// could write the user's state to lies inside `root`.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';

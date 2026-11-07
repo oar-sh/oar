@@ -22,7 +22,7 @@
  * SSL_CERT_FILE and SSL_CERT_DIR: '' empties OpenSSL's and Node's system
  * store, so those two are pinned only when the worker sets them.
  *
- * Source: the names Claude Code 2.1.304 (the bundled CLI) reads, by a grep
+ * Source: the names Claude Code 2.1.319 (the bundled CLI) reads, by a grep
  * of the binary; the CLI's own lists of endpoints (with their selection
  * switches and companions) and credentials are in it as they are there. A
  * deny-list, because a settings layer can only pin names known in advance.
@@ -82,6 +82,7 @@ export const CLAUDE_CLI_PINNED_ENV = Object.freeze([
   'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
   'CLAUDE_CODE_OAUTH_SCOPES',
   'CLAUDE_CODE_OAUTH_CLIENT_ID',
+  'CLAUDE_CODE_SESSIONS_OAUTH_TOKEN',
   'ANTHROPIC_PROFILE',
   'ANTHROPIC_IDENTITY_TOKEN',
   'ANTHROPIC_IDENTITY_TOKEN_FILE',
@@ -106,6 +107,8 @@ export const CLAUDE_CLI_PINNED_ENV = Object.freeze([
   'NODE_TLS_REJECT_UNAUTHORIZED',
   'NODE_EXTRA_CA_CERTS',
   'CLAUDE_CODE_CERT_STORE',
+  'CLAUDE_CODE_DISABLE_LOOPED_CROSS_CERT_DROP',
+  'CLAUDE_CODE_DISABLE_SELF_NAMED_CERT_DROP',
   'CLAUDE_CODE_CLIENT_CERT',
   'CLAUDE_CODE_CLIENT_KEY',
   'CLAUDE_CODE_CLIENT_KEY_PASSPHRASE',

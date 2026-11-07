@@ -61,6 +61,19 @@ export function withFileVersion(url, version) {
 }
 
 /**
+ * One of the relay's own files (sw.js, the socket.io client) through
+ * res.sendFile, rooted at its folder. Given a bare absolute path, express 5's
+ * send refuses any path with a dot folder in it (dotfiles 'ignore' looks at
+ * every segment without a root): a 404 for an install under ~/.oar, nvm or
+ * ~/.npm-global. With the folder as root only the file name is looked at.
+ */
+export function sendOwnFile(res, absolutePath, next) {
+  res.sendFile(path.basename(absolutePath), { root: path.dirname(absolutePath) }, (error) => {
+    if (error) next(error);
+  });
+}
+
+/**
  * `cacheControl` replaces the no-store default for content whose URL names
  * its bytes (an upload addressed by its hash): such an answer may be kept.
  */

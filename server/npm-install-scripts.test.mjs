@@ -18,9 +18,19 @@ test('every shipped dependency with an install script is on the allow list', () 
     .filter(([key, entry]) => key && entry.hasInstallScript && !entry.dev)
     .map(([key]) => key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length))
     .sort();
-  // The package's own install scripts (the preinstall rescue) need it listed too.
-  const own = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-  const ownScripts = ['preinstall', 'install', 'postinstall'].some((hook) => own.scripts?.[hook]);
-  assert.deepEqual([...new Set([...withScripts, ...(ownScripts ? [own.name] : [])])].sort(), [...NPM_INSTALL_SCRIPT_PACKAGES].sort());
+  assert.deepEqual(withScripts, [...NPM_INSTALL_SCRIPT_PACKAGES].sort());
   assert.equal(NPM_ALLOW_SCRIPTS_ARG, `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`);
+});
+
+// better-sqlite3 13 ships a binding.gyp beside its prebuilt binaries and says
+// "gypfile": false, so npm does not run node-gyp for it. npm installing from
+// this lock reads the lock entry as the package, which then has no gypfile:
+// `npm ci` would run node-gyp rebuild, and that needs make and a compiler
+// even where the prebuilt binary is used. npm drops the key whenever it
+// writes the lock again; put it back.
+test('the lock keeps "gypfile": false on better-sqlite3', () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+  const entry = lock.packages['node_modules/better-sqlite3'];
+  assert.ok(entry, 'better-sqlite3 is in the lock');
+  assert.equal(entry.gypfile, false, 'add "gypfile": false to the node_modules/better-sqlite3 entry of package-lock.json');
 });

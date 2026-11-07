@@ -11,6 +11,7 @@ import {
   stripTerminalEscapes,
   tailOf,
 } from './cli-process-runner.mjs';
+import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from './native-addon-build-service.mjs';
 import { NPM_ALLOW_SCRIPTS_ARG, resolveNpmInvocation } from './oar-cli-helpers.mjs';
 import { compareSemverIsh, parseSemverIsh } from '../../shared/update-semver.mjs';
 
@@ -107,6 +108,8 @@ export function createUpdateInstallService({
   spawnImpl = defaultSpawn,
   env = process.env,
   platform = process.platform,
+  arch = process.arch,
+  buildNativeAddons = buildBetterSqlite3,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
   nowImpl = Date.now,
@@ -242,14 +245,42 @@ export function createUpdateInstallService({
     );
     activeChild = null;
     flushLogNow();
-    finishedAt = new Date(nowImpl()).toISOString();
 
     if (!result.ok) {
+      finishedAt = new Date(nowImpl()).toISOString();
       state = UPDATE_INSTALL_STATES.ERROR;
       lastError = result.error || `npm exited with code ${result.code}`;
       broadcast();
       return { ok: false, statusCode: 500, error: lastError };
     }
+
+    // No prebuilt SQLite binding here: build it before the restart, which
+    // would start on none (native-addon-build-service.mjs). A failed build
+    // keeps this relay running on the binding it has loaded.
+    if (needsSourceBuild({ platform, arch })) {
+      const toLog = (line) => appendLog(`${line}\n`);
+      const build = await buildNativeAddons({
+        packageRoot,
+        platform,
+        arch,
+        execPath,
+        env: npm.env,
+        spawnImpl,
+        onOutput: (text) => appendLog(text),
+        onChild: (child) => { activeChild = child; },
+        logger: { log: toLog, error: toLog },
+      });
+      activeChild = null;
+      flushLogNow();
+      if (!build.ok) {
+        finishedAt = new Date(nowImpl()).toISOString();
+        state = UPDATE_INSTALL_STATES.ERROR;
+        lastError = `${UPDATE_PACKAGE_NAME}@${target} is installed, but its SQLite binding did not build (${build.error}). Run ${NATIVE_BUILD_COMMAND}, then restart the relay.`;
+        broadcast();
+        return { ok: false, statusCode: 500, error: lastError };
+      }
+    }
+    finishedAt = new Date(nowImpl()).toISOString();
 
     // Persist the attempt BEFORE the restart request: the next boot compares
     // the running version against it and turns "nothing changed" into a

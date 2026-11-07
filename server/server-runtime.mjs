@@ -4,7 +4,7 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import { WebSocketServer } from 'ws';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID as uuidv4 } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFile, execFileSync, spawn } from 'child_process';
@@ -25,7 +25,7 @@ import {
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { createDetachedWorkerWatch } from './services/detached-worker-watch-service.mjs';
-import { applyCdnNoStoreHeaders } from './services/file-serving.mjs';
+import { applyCdnNoStoreHeaders, sendOwnFile } from './services/file-serving.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
 import { PLAN_BOARD_APPROVE_ONLY, planBoardShownActions } from '../shared/plan-board-actions.mjs';
@@ -196,8 +196,8 @@ import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
   resolveLaunchWorkspaceRootPath,
 } from './services/workspace-root-defaults-service.mjs';
-import { maybeStartTtyConsole } from './tty-console-bootstrap.mjs';
 import { installRelayConsoleLog, resolveRelayConsoleLogPath } from './services/relay-console-log.mjs';
+import { isMissingSqliteBindingError, missingSqliteBindingLines } from './services/native-addon-build-service.mjs';
 import {
   computeFeatureFlagState,
   FEATURE_REGISTRY,
@@ -327,13 +327,15 @@ const PWA_VERSION_PLACEHOLDER = /const __PWA_VERSION = '[^']*';/;
 // after a restart or an incident.
 const relayConsoleLogPath = resolveRelayConsoleLogPath({ env: process.env, serverDir: __dirname });
 const relayConsoleLog = installRelayConsoleLog({ logPath: relayConsoleLogPath });
-const ttyConsoleRuntime = await maybeStartTtyConsole({
-  serverDir: __dirname,
-  logsDir: path.join(__dirname, 'logs'),
-  logger: console,
-});
-// The terminal console takes the console's methods over when it starts.
-relayConsoleLog?.rewrap();
+// Where better-sqlite3 ships no binary (Termux, 32-bit ARM) the binding is
+// built by `oar build-native`; until then say so instead of a stack trace.
+try {
+  new Database(':memory:').close();
+} catch (error) {
+  if (!isMissingSqliteBindingError(error)) throw error;
+  for (const line of missingSqliteBindingLines({ error })) console.error(`[startup] ${line}`);
+  process.exit(1);
+}
 // TEMP and TMP for this relay and everything it starts (normalizeTempEnv).
 for (const change of normalizeTempEnv()) console.log(`[startup] ${change} (quotes taken off, or the folder is not there)`);
 
@@ -2112,7 +2114,6 @@ function workspaceRootPayload() {
 }
 
 const ACTIVE_SESSION_CWD_STATUSES = new Set(['starting', 'ready', 'processing']);
-const ACTIVE_TTY_CLI_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
 
 function normalizeConversationWorkspaceRootPath(candidatePath) {
   const normalized = normalizeWorkspaceRootPath(candidatePath);
@@ -3759,27 +3760,6 @@ function queueCounts() {
   const map = Object.fromEntries(rows.map(r => [r.status, r.cnt]));
   return { pendingCount: map.pending || 0, processingCount: map.processing || 0, parkedCount: map.parked || 0 };
 }
-
-function countActiveCliWorkers() {
-  const workers = sessionWorkerRegistry?.listWorkers?.() || [];
-  return workers.reduce((acc, worker) => {
-    const status = String(worker?.status || '').trim().toLowerCase();
-    return ACTIVE_TTY_CLI_WORKER_STATUSES.has(status) ? acc + 1 : acc;
-  }, 0);
-}
-
-function attachTtyConsoleRuntimeTitle(runtime) {
-  const addConsoleTitle = runtime?.tty?.addConsoleTitle;
-  if (typeof addConsoleTitle !== 'function') return;
-  addConsoleTitle(() => {
-    const counts = queueCounts();
-    const connectedClients = Number(io?.sockets?.sockets?.size || 0);
-    const activeCliWorkers = countActiveCliWorkers();
-    const cliState = cliOnline ? 'online' : 'offline';
-    return `Clients: ${connectedClients} :: Pen: ${counts.pendingCount} :: Proc: ${counts.processingCount} :: parked: ${counts.parkedCount} :: CLIs: ${activeCliWorkers} :: CLI: ${cliState}`;
-  });
-}
-attachTtyConsoleRuntimeTitle(ttyConsoleRuntime);
 
 // ─── Queued relay restart / shutdown ─────────────────────────────────────────
 // A request waits until no turn is processing and holds new turns meanwhile
@@ -7430,6 +7410,12 @@ app.use(tunnelWorkerPathGuard.requestMiddleware);
 // Uploads travel as raw bodies on POST /api/upload (express.raw, capped by
 // MAX_UPLOAD_BYTES), so the JSON limit only bounds inline image data URLs.
 app.use(express.json({ limit: '20mb' }));
+// Express 5 leaves req.body undefined when no parser read a body (a GET, a
+// POST without a JSON body); the routes read it as express 4 gave it, {}.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 app.use((req, _res, next) => {
   stripRequestPathPrefix(req, remotePath);
   next();
@@ -7461,9 +7447,7 @@ app.use((req, res, next) => {
 });
 app.get('/socket.io/socket.io.js', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.sendFile(SOCKET_IO_CLIENT_JS_PATH, (error) => {
-    if (error) next(error);
-  });
+  sendOwnFile(res, SOCKET_IO_CLIENT_JS_PATH, next);
 });
 app.get('/manifest.webmanifest', (req, res, next) => {
   try {
@@ -7477,9 +7461,7 @@ app.get('/manifest.webmanifest', (req, res, next) => {
 });
 app.get('/sw.js', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.sendFile(PWA_SW_PATH, (error) => {
-    if (error) next(error);
-  });
+  sendOwnFile(res, PWA_SW_PATH, next);
 });
 app.get(['/', '/index.html'], (req, res, next) => {
   try {
@@ -7554,7 +7536,6 @@ const runtimeState = {
     // Resumed: what was queued while paused goes out now.
     if (wasPaused && !relayPaused) wakeSessionWorkerQueue('relay-resumed');
   },
-  get ttyConsoleActive() { return Boolean(ttyConsoleRuntime?.tty); },
   get relayShutdown() { return relayRestartQueue.getState(); },
   // A shutdown or restart waits for the processing turns: no pending row
   // goes out meanwhile (services/relay-restart-queue.mjs).
@@ -8219,7 +8200,7 @@ if (runtimeBindingsBootstrapped > 0) {
 
 function ts() { return new Date().toISOString().slice(11, 23); }
 function runtimeLogPrefix() {
-  return ttyConsoleRuntime?.tty ? '' : `[${ts()}] `;
+  return `[${ts()}] `;
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────

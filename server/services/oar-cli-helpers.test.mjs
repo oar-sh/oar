@@ -449,7 +449,7 @@ test('an unknown command or option is an error, never a launch', () => {
 
 test('the usage names every command', () => {
   const usage = usageText();
-  for (const command of ['start', 'stop', 'restart', 'status', 'url', 'setup', 'service install | remove | status', 'copilot', 'doctor', 'update', 'help', '--version']) {
+  for (const command of ['start', 'stop', 'restart', 'status', 'url', 'setup', 'service install | remove | status', 'copilot', 'doctor', 'update', 'build-native', 'help', '--version']) {
     assert.ok(usage.includes(`oar ${command}`), `usage lacks oar ${command}`);
   }
   for (const flag of ['--port', '--lan', '--local', '--new-token', '--defaults', '--start']) assert.ok(usage.includes(flag), flag);

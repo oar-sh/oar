@@ -24,11 +24,6 @@ If you run `gh copilot` and the web-relay extension is loaded (project-local or 
 the extension auto-starts `server.js` when needed and keeps the relay listener singleton
 while letting session-affine CLI workers run in parallel.
 
-If `tty-console` is installed as an optional dependency, the server starts it on an interactive
-terminal and stores its config/history files under `server/logs/`.
-When active, worker loop telemetry is summarized in the title bar (`Clients`, `Pen`, `Proc`,
-`parked`, running `CLIs`) and routine worker dequeue events are not printed as repeating logs.
-
 On Linux/macOS, session-affine worker launches prefer detached `tmux` sessions when `tmux`
 is available, using the worker SDK session id as the tmux session name so you can attach
 for debugging without changing the Windows launch path. Worker processes now launch from the

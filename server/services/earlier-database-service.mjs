@@ -12,7 +12,7 @@ import { resolveStateLayout } from './oar-state-layout.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processStartedAt as defaultProcessStartedAt } from './relay-singleton-guard.mjs';
 
 const SHA256_NAME = /^[a-f0-9]{64}$/;
-// The install-time rescue's copies (package-data-rescue.mjs), in the data folder.
+// The copies the install-time rescue of 0.9.14 to 0.9.22 made, in the data folder.
 export const RESCUE_DIR_NAME = 'rescued-package-data';
 // What was looked at already: never offered again unless it changed.
 export const CHECKED_FILE = 'earlier-databases.json';

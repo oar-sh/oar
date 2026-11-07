@@ -18,6 +18,16 @@ A conversation that has no message and nothing queued yet is moved back to Copil
 | **Grok (CLI ACP)** | ⚙️ Settings → Providers → Grok | the relay host's Grok CLI login, **sign in and out from the panel** | Drives the Grok CLI's `grok agent stdio` over ACP. The CLI can be installed and updated from the panel |
 | **DeepSeek** | ⚙️ Settings → Providers → DeepSeek | your DeepSeek API key, stored in the relay database | Runs Claude Code (bundled with the Agent SDK) on the relay host against DeepSeek's Anthropic-compatible API; billed to the DeepSeek account |
 
+## What the agent SDKs contact
+
+OAR itself sends nothing anywhere but the update check, which is off until you enable it (see [Security notes](security.md)). The three agent SDKs it ships, and the CLIs they bundle, talk to their own services from the relay host whenever a chat of theirs runs:
+
+- **Copilot** (`@github/copilot-sdk`, which brings the Copilot CLI): GitHub's Copilot service, on the host's Copilot CLI login. OpenAI (BYOK) chats run the same runtime against the OpenAI-compatible endpoint you configured.
+- **Claude, Claude API and DeepSeek** (`@anthropic-ai/claude-agent-sdk`, which brings Claude Code): Anthropic's API, on the host's Claude login or on the Claude API key; DeepSeek chats on DeepSeek's endpoint instead. In Claude and Claude API chats Claude Code also makes its own calls to Anthropic (update checks, telemetry, error reports) as it does anywhere; a DeepSeek chat switches those off (see [DeepSeek](#deepseek)).
+- **Cursor** (`@cursor/sdk`): Cursor's backend (`api2.cursor.sh`), on your Cursor API key; the agent runs there, and its tools run on the relay host through the SDK. The SDK carries Statsig's JavaScript client, a dependency it pins, to read feature flags; in the version OAR ships, that client starts with its event logging off and its own network traffic blocked, and takes its flags from Cursor's backend. Package scanners still list it as telemetry. There is no setting to leave it out short of not installing the SDK.
+
+All three are installed with OAR whether you use the provider or not.
+
 ## GitHub Copilot — engine choice
 
 *On oar.sh: [GitHub Copilot](https://oar.sh/docs/providers/github-copilot/)*

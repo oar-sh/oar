@@ -3,6 +3,99 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.23] — 2026-11-07
+
+Highlights: a dependency round. The Copilot, Claude and Cursor SDKs, zod,
+express, socket.io, ws and better-sqlite3 move to newer releases:
+the tree holds one zod, without CVE-2023-54404, and one express, and
+prebuild-install, which is no longer maintained, is gone. OAR's package has
+no install script any more, which package scanners flag. On Termux, 32-bit
+ARM and FreeBSD, run **`oar build-native`** once after updating to this
+version: it builds the SQLite binding, and later updates build it
+themselves.
+
+### Added
+
+- **`oar build-native`.** better-sqlite3 13 ships its SQLite binding for
+  Linux, macOS and Windows on x64 and arm64. On Android under Termux, 32-bit
+  ARM and FreeBSD, `oar build-native` compiles it in the installed package
+  (Python 3, make and a C++ compiler; on Termux `pkg install python clang
+  make`). The **Update** button and `oar update` run it there themselves
+  before the relay restarts; a build that fails ends the update in an error
+  and leaves the running relay alone. Elsewhere it has nothing to do, so an
+  installer may run it everywhere. A relay started without the binding says
+  which command to run and exits instead of printing a stack trace.
+- **What the agent SDKs contact.** docs/providers.md lists the services the
+  Copilot, Claude and Cursor SDKs and their CLIs talk to, and what the
+  Statsig client inside the Cursor SDK does.
+
+### Changed
+
+- **No install script.** OAR's package has no `preinstall` any more. From
+  0.9.14 to 0.9.22 it copied the data a relay before 0.9.14 kept inside the
+  package out before npm deleted it. npm 12 never ran it without
+  `--allow-scripts`, and package scanners flag every package that has one.
+  A copy those versions made is still taken over at the next start.
+- **`--allow-scripts=koffi`.** better-sqlite3 13 has no install script, so
+  a manual install with npm 12 is now
+  `npm install -g --allow-scripts=koffi @oar-sh/oar`; the installers, the
+  **Update** button and `oar update` pass it themselves.
+- **No terminal console.** The optional `tty-console` dependency is gone,
+  and neo-blessed with it. A relay started in a terminal prints its log
+  lines, each with its time, as under a service; routine worker lines are
+  no longer held back.
+- **Express 5.** The file routes take express 5's syntax and serve the
+  same paths. Static JavaScript is served as `text/javascript`.
+- `better-sqlite3` 13.0.3 (was 12.11.1); `prebuild-install`, which is no
+  longer maintained, and its subtree are gone. New in the tree:
+  `node-addon-api` 8.9.2, the headers of the source build.
+- `express` 5.3.0 (was 4.22.3), the major the MCP SDK already used: one
+  express instead of two, and array-flatten, mime 1 and the rest of express
+  4's subtree are gone.
+- `@anthropic-ai/claude-agent-sdk` 0.3.319 (was 0.3.304; bundled Claude
+  Code 2.1.319). The key chats (DeepSeek, Claude API) also pin the
+  cloud-sessions token and the two new switches that would let a folder's
+  settings widen which certificates Claude Code trusts.
+- `@cursor/sdk` 1.3.1 (was 1.0.38). Its context-compaction summaries are
+  not shown yet.
+- `@github/copilot-sdk` 1.0.29 (was 1.0.23; bundled Copilot CLI 1.0.107)
+  and `zod` 4.6.7 (was 4.4.3): one zod in the tree, without
+  CVE-2023-54404 (GHSA-mrhx-c7xc-m3w5).
+- `socket.io` 4.8.4 (was 4.8.3) and `ws` 8.22.1 (was 8.21.3). `uuid` is
+  gone: Node's `crypto.randomUUID()` makes the same ids.
+- package.json names its author and its bug tracker.
+
+### Upgrade notes
+
+- **From 0.9.13 or older, copy the data out of the package first.** A relay
+  before 0.9.14 could keep its database, uploads and config inside the
+  package folder, which `npm install -g` deletes, and this version no longer
+  copies them out. Copy `data/`, `uploads/` and `config.json` from the
+  installed package's `server` folder into a new folder under
+  `rescued-package-data` in the data folder (for example
+  `~/.oar/data/rescued-package-data/before-update/`); the first start takes
+  them over. From 0.9.14 on there is nothing to do.
+- **Termux, 32-bit ARM, FreeBSD: the update from 0.9.22 needs
+  `oar build-native` once.** The Update button and `oar update` of 0.9.22
+  install 0.9.23 but do not build the binding, so the relay stops at its
+  first start on 0.9.23: its log names the command, and the page cannot
+  reach the relay. In Termux run:
+
+  ```sh
+  pkg install python clang make
+  oar build-native
+  oar start
+  ```
+
+  Later updates build the binding themselves, before the relay restarts.
+- **Linux needs glibc 2.34 or newer,** for example Debian 12, Ubuntu 22.04
+  or RHEL 9. The SQLite binding better-sqlite3 13 ships for Linux on x64
+  and arm64 needs it, and a binding built with `oar build-native` would not
+  be used there. On an older system a relay that updates to 0.9.23 stays
+  down at its first start and says to update the operating system; stay on
+  0.9.22 until the system is updated.
+- **No migration.** Going back to 0.9.22 needs no database step.
+
 ## [0.9.22] — 2026-11-05
 
 Highlights: questions that don't block move into the chat header. A **📓**

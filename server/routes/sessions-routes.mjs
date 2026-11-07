@@ -161,7 +161,7 @@ export { mapUsageSnapshotRow };
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_WORKER_STATUS_QUEUE_STATES = Object.freeze(['pending', 'processing', 'parked']);
 // Registry statuses that mean "this worker is currently running" (same triple
-// as countActiveCliWorkers in server-runtime.mjs).
+// as ACTIVE_SESSION_CWD_STATUSES in server-runtime.mjs).
 const SESSION_WORKER_ACTIVE_STATUSES = Object.freeze(['starting', 'ready', 'processing']);
 // A shared attachment's URL names its bytes (sha256 or a fixed generated-image
 // path), so a kept answer stays right.

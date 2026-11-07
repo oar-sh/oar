@@ -86,24 +86,6 @@ const FORBIDDEN = [
   { name: 'secret-shaped file', pattern: /(token|secret|credential|apikey|api-key)[^/]*\.(json|txt|pem|key)$/i },
 ];
 
-// A module and the modules its static and dynamic relative imports reach,
-// repo-relative with forward slashes, as the pack list names them.
-function importClosure(entry) {
-  const seen = new Set();
-  const pending = [entry];
-  while (pending.length) {
-    const file = pending.pop();
-    if (seen.has(file)) continue;
-    seen.add(file);
-    let text = '';
-    try { text = fs.readFileSync(path.join(repoRoot, file), 'utf8'); } catch { continue; }
-    for (const match of text.matchAll(/(?:^import\s[^'"]*|\bimport\()['"](\.{1,2}\/[^'"]+)['"]/gm)) {
-      pending.push(path.posix.normalize(path.posix.join(path.posix.dirname(file), match[1])));
-    }
-  }
-  return [...seen];
-}
-
 function readPackList() {
   // On win32 npm is npm.cmd, which execFileSync only resolves through a shell;
   // the arguments are static strings, so shell interpolation has nothing to bite.
@@ -145,15 +127,13 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
   for (const absent of ['server/README.md', '.github/extensions/web-relay/README.md']) {
     assert.ok(!paths.includes(absent), `tarball ships ${absent}, which belongs on GitHub only`);
   }
-  // An install script must run a packed file, and every module that file
-  // reaches (static or dynamic relative imports) must be packed too.
+  // No install script of OAR's own: npm 12 skips one the user did not
+  // allow, and package scanners flag every package that has one. The SQLite
+  // binding of a platform without a prebuilt one is built by OAR itself
+  // (native-addon-build-service.mjs).
   const { scripts = {} } = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-  for (const hook of ['preinstall', 'install', 'postinstall']) {
-    if (!scripts[hook]) continue;
-    const file = String(scripts[hook]).match(/^node (\S+)$/)?.[1];
-    assert.ok(file, `the ${hook} script (${scripts[hook]}) must be \`node <file>\``);
-    const unpacked = importClosure(file).filter((module) => !paths.includes(module));
-    assert.deepEqual(unpacked, [], `the ${hook} script reaches modules the tarball lacks`);
+  for (const hook of ['preinstall', 'install', 'postinstall', 'prepare']) {
+    assert.equal(scripts[hook], undefined, `package.json must have no ${hook} script`);
   }
 
   assert.ok(

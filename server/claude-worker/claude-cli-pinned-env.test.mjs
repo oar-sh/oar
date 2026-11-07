@@ -15,6 +15,8 @@ test('the pinned names cover the routing, trust and credential variables, and th
     'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
     'CLAUDE_CODE_USE_GATEWAY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY',
     'no_proxy', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS', 'CLAUDE_CODE_CERT_STORE', 'SSL_CERT_FILE',
+    // Claude Code 2.1.319: the cloud-sessions token, and the two switches that keep certificates it would drop.
+    'CLAUDE_CODE_SESSIONS_OAUTH_TOKEN', 'CLAUDE_CODE_DISABLE_LOOPED_CROSS_CERT_DROP', 'CLAUDE_CODE_DISABLE_SELF_NAMED_CERT_DROP',
   ]) assert.ok(CLAUDE_CLI_PINNED_ENV.includes(name), name);
   // Left to the folder: the model choice, and NODE_OPTIONS (see the list).
   for (const name of ['ANTHROPIC_MODEL', 'NODE_OPTIONS', 'CLAUDE_CONFIG_DIR']) assert.equal(CLAUDE_CLI_PINNED_ENV.includes(name), false, name);

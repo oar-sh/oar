@@ -14,6 +14,7 @@ import {
 } from '../server/services/oar-state-migration-service.mjs';
 import { readConfiguredDataDir, resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
 import { RESCUE_DIR_NAME, TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
+import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from '../server/services/native-addon-build-service.mjs';
 import { DB_FILE_NAME, DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile } from '../server/services/database-file.mjs';
 import { BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE, backupDatabase, configWarnings, describeBackups, sanitizeReason } from '../server/services/db-backup-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
@@ -2407,6 +2408,15 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
     return { code: 1, reason: 'npm-failed' };
   }
   logger.log(`[oar] Installed @oar-sh/oar@${target}.`);
+  // No prebuilt SQLite binding here: build it before the relay restarts on
+  // the new version (native-addon-build-service.mjs).
+  if (needsSourceBuild()) {
+    const build = await buildBetterSqlite3({ packageRoot, env: npm.env, spawnImpl, logger, onOutput: (text) => process.stdout.write(text) });
+    if (!build.ok) {
+      logger.error(`[oar] The relay keeps running the version it has loaded. Run ${NATIVE_BUILD_COMMAND}, then restart it.`);
+      return { code: 1, reason: 'native-build-failed' };
+    }
+  }
 
   // A running relay picks the new code up on restart; ask for the queue-idle
   // deferred one so no in-flight turn is cut off.
@@ -2444,6 +2454,23 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
     logger.log('[oar] Could not request a relay restart; restart it manually to load the update.');
   }
   return { code: 0, reason: 'updated' };
+}
+
+/**
+ * `oar build-native [--force]`: the SQLite binding of better-sqlite3 where no
+ * prebuilt one ships (Termux, 32-bit ARM, FreeBSD); elsewhere nothing to do,
+ * so an installer may run it everywhere. `--force` builds anyway, which only
+ * tests the toolchain where a prebuilt binding ships: better-sqlite3 loads
+ * that one first.
+ */
+async function runBuildNative({ argv = [], env = process.env, logger = console, spawnImpl = spawn } = {}) {
+  const force = argv.includes('--force');
+  if (!force && !needsSourceBuild()) {
+    logger.log(`[oar] better-sqlite3 ships a prebuilt SQLite binding for ${process.platform}-${process.arch}; nothing to build.`);
+    return { code: 0, reason: 'prebuilt' };
+  }
+  const result = await buildBetterSqlite3({ packageRoot: resolvePackageRoot(), force, env, spawnImpl, logger, onOutput: (text) => process.stdout.write(text) });
+  return result.ok ? { code: 0, reason: 'built' } : { code: 1, reason: 'build-failed' };
 }
 
 /** `oar` without a command: the menu in a terminal, the status and the usage elsewhere. */
@@ -2495,6 +2522,7 @@ const COMMANDS = {
   doctor: runDoctor,
   backup: runBackup,
   update: runUpdate,
+  'build-native': runBuildNative,
   help: async ({ logger = console } = {}) => {
     logger.log(usageText());
     return { code: 0, reason: 'help' };

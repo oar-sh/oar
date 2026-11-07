@@ -100,10 +100,10 @@ export function createRemoteRelayLoopbackClient({
       req.httpVersionMinor = 1;
       req.httpVersion = '1.1';
       if (hasBody) {
-        // What the wire would deliver: JSON, parsed. `_body` tells the JSON
-        // body parser the body is already there.
+        // What the wire would deliver: JSON, parsed. The headers carry no
+        // content-length or transfer-encoding, so the JSON body parser finds
+        // no body to read and leaves this one in place.
         req.body = JSON.parse(JSON.stringify(body));
-        req._body = true;
       }
       req.complete = true;
       req.push(null);

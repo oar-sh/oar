@@ -163,6 +163,13 @@ export function shouldRequireNewOpenAIConversation({
   );
 }
 
+// The path a `{*splat}` route matched: express 5 hands it over as its
+// decoded segments, or not at all when the path ends at the slash.
+export function splatPath(req) {
+  const splat = req.params?.splat;
+  return Array.isArray(splat) ? splat.join('/') : String(splat || '');
+}
+
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
@@ -2142,8 +2149,6 @@ export function registerMessagesRoutes(app, deps) {
     deepseekClaudeConfigDir = '',
   } = deps;
 
-  const ttyConsoleActive = runtimeState?.ttyConsoleActive === true;
-
   // ─── Sub-agent runs: header, timeline, live events ─────────────────────────
   const subagentTimeline = createSubagentTimelineService({ db, stmts });
 
@@ -2255,18 +2260,6 @@ export function registerMessagesRoutes(app, deps) {
     LIMIT 1
   `);
 
-  function isAbnormalWorkerTelemetry(payload = {}, level = 'log') {
-    const normalizedLevel = String(level || 'log').trim().toLowerCase();
-    if (normalizedLevel === 'warn' || normalizedLevel === 'error') return true;
-    const event = String(payload?.event || '').trim().toLowerCase();
-    const state = String(payload?.state || '').trim().toLowerCase();
-    if (state === 'error') return true;
-    return event.includes('error')
-      || event.includes('failed')
-      || event.includes('failure')
-      || event.includes('blocked');
-  }
-
   function readBridgeIdentity(req) {
     return relayBridgeOwnerService?.normalizeIdentity?.({
       pid: req.headers['x-relay-process-pid'],
@@ -2340,8 +2333,6 @@ export function registerMessagesRoutes(app, deps) {
     const payload = extra && typeof extra === 'object'
       ? { ...envelope, ...extra }
       : envelope;
-    const shouldLog = !ttyConsoleActive || isAbnormalWorkerTelemetry(payload, level);
-    if (!shouldLog) return;
     const method = typeof console[level] === 'function' ? level : 'log';
     console[method](`[${ts()}] WORKER    ${JSON.stringify(payload)}`);
   }
@@ -4021,8 +4012,8 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
-  app.get('/api/files/*', auth, (req, res) => {
-    const requestedPath = String(req.params?.[0] || '').trim();
+  app.get('/api/files/{*splat}', auth, (req, res) => {
+    const requestedPath = splatPath(req).trim();
     const rootOverride = resolveScopedWorkspaceRootPath(req);
     const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath) return res.status(400).json({ error: 'Invalid file path' });
@@ -4043,8 +4034,8 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
-  app.get('/api/files-preview/*', auth, (req, res) => {
-    const requestedPath = String(req.params?.[0] || '').trim();
+  app.get('/api/files-preview/{*splat}', auth, (req, res) => {
+    const requestedPath = splatPath(req).trim();
     const normalizedPath = normalizeWorkspaceRelativePath(requestedPath);
     const rootOverride = resolveScopedWorkspaceRootPath(req);
     const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);

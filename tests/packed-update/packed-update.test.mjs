@@ -1,19 +1,17 @@
 /**
  * A simulated `npm i -g` update from a packed 0.9.19 to a packed 0.9.20, in
  * temp global prefixes ("Verification"): the real tarballs,
- * the real npm, the real preinstall, the installed relays started the way a
- * launcher starts them.
+ * the real npm, the installed relays started the way a launcher starts them.
  *
  *  A. pinned data folder (every launcher of a global install): the new
  *     version runs on the copilot.db 0.9.19 left, no oar.db appears, and its
  *     first start writes a pre-update backup;
- *  B. unpinned (a relay before 0.9.14 that ran on the database inside the
- *     package): the new package's preinstall copies that database out before
- *     npm deletes the old package, and the new relay takes it over, still
- *     named copilot.db;
  *  C. fresh: the new package on an empty data folder creates oar.db.
  *
- * Slow (two packs, three global installs, five relay starts) and needs the
+ * (B, a relay before 0.9.14 on the database inside the package, was rescued
+ * by a preinstall from 0.9.14 to 0.9.22; 0.9.23 has none.)
+ *
+ * Slow (two packs, two global installs, three relay starts) and needs the
  * npm registry or a warm npm cache, so it is not part of `npm test`:
  *
  *   node --test tests/packed-update/packed-update.test.mjs
@@ -33,7 +31,6 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
-import { NPM_ALLOW_SCRIPTS_ARG } from "../../server/services/oar-cli-helpers.mjs";
 import { buildRelayServerEnv, repoRoot, reserveFreePort, sleep, waitForServerReady } from "../relay-server-harness.mjs";
 
 // 0.9.19 as released (the merge before the db-file work) and this branch.
@@ -42,7 +39,7 @@ const NEW_REF = "HEAD";
 const PACKAGE_NAME = "@oar-sh/oar";
 const SLOW = { timeout: 15 * 60_000 };
 const GIB = 1024 ** 3;
-// What the three installs and the npm cache take on the disk before the
+// What the installs and the npm cache take on the disk before the
 // backup is written, beyond the relay's own rule.
 const INSTALL_HEADROOM = GIB;
 
@@ -111,13 +108,14 @@ async function packRef(ref, name) {
 
 const packageDirOf = (prefix) => path.join(prefix, "lib", "node_modules", ...PACKAGE_NAME.split("/"));
 
-// `npm i -g` as `oar update` runs it (the allow-scripts flag lets the
-// preinstall and better-sqlite3's install run), with the state root the
-// preinstall copies a rescued database into.
+// `npm i -g` as `oar update` runs it, with the test's state root. 0.9.19
+// still has better-sqlite3 12, whose install script fetches its binary, so
+// the flag lists it beside koffi (oar update of 0.9.23 lists koffi only).
+const ALLOW_SCRIPTS_ARG = "--allow-scripts=better-sqlite3,koffi";
 async function npmInstallGlobal({ prefix, tgz, stateRoot }) {
   fs.mkdirSync(prefix, { recursive: true });
   return run("npm", [
-    "install", "-g", "--prefix", prefix, NPM_ALLOW_SCRIPTS_ARG, "--no-audit", "--no-fund", "--prefer-offline", tgz,
+    "install", "-g", "--prefix", prefix, ALLOW_SCRIPTS_ARG, "--no-audit", "--no-fund", "--prefer-offline", tgz,
   ], { cwd: root, env: { ...hostlessEnv(), OAR_STATE_ROOT: stateRoot } });
 }
 
@@ -154,12 +152,8 @@ function writeConfig(state, extra = {}) {
   }, null, 2)}\n`, { mode: 0o600 });
 }
 
-/**
- * The installed relay started as a launcher starts it. `pinned: false`
- * leaves COPILOT_WEB_RELAY_DATA_DIR out, so the relay picks its data folder
- * itself (0.9.19: the package's server/data).
- */
-async function startInstalledRelay({ pkg, state, pinned = true }) {
+/** The installed relay started as a launcher starts it. */
+async function startInstalledRelay({ pkg, state }) {
   const token = randomUUID();
   const port = await reserveFreePort();
   const harnessEnv = buildRelayServerEnv(state);
@@ -176,9 +170,8 @@ async function startInstalledRelay({ pkg, state, pinned = true }) {
     OAR_STATE_ROOT: state.stateRoot,
     OAR_NO_UPDATE_CHECK: "1",
     COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: "1",
+    COPILOT_WEB_RELAY_DATA_DIR: state.dataDir,
   });
-  if (pinned) env.COPILOT_WEB_RELAY_DATA_DIR = state.dataDir;
-  else delete env.COPILOT_WEB_RELAY_DATA_DIR;
 
   const proc = spawn(process.execPath, [
     path.join(pkg, "server", "server.js"), "--token", token, "--port", String(port), "--owner-pid", String(process.pid),
@@ -322,55 +315,6 @@ describe("packed npm update 0.9.19 -> 0.9.20", { skip: skipReason }, () => {
     assert.equal(manifest.lastResult?.status, "written");
     // The backup is of the old relay's data.
     assert.deepEqual(titlesIn(path.join(backupsDir, backups[0])), ["marker-a"]);
-  });
-
-  test("B: unpinned 0.9.19 on the package's server/data: the preinstall rescues it, 0.9.20 takes it over as copilot.db", SLOW, async () => {
-    const state = makeState("b");
-    // No dataDir: without the env pin 0.9.19 runs on <package>/server/data.
-    writeConfig(state);
-    const prefix = path.join(root, "prefix-b");
-    const pkg = packageDirOf(prefix);
-    const packageData = path.join(pkg, "server", "data");
-
-    await npmInstallGlobal({ prefix, tgz: oldPack.tgz, stateRoot: state.stateRoot });
-    const old = await startInstalledRelay({ pkg, state, pinned: false });
-    await stopRelay(old);
-    assert.ok(fs.existsSync(path.join(packageData, "copilot.db")), `0.9.19 unpinned left no ${packageData}/copilot.db\n${old.output}`);
-    assert.ok(!fs.existsSync(state.dataDir) || dbFiles(state.dataDir, "copilot.db").length === 0, "nothing in the state root's data folder yet");
-    addMarker(path.join(packageData, "copilot.db"), "marker-b");
-
-    // The update: npm deletes the old package, its server/data with it; the
-    // new package's preinstall copied it out first.
-    const install = await npmInstallGlobal({ prefix, tgz: newPack.tgz, stateRoot: state.stateRoot });
-    assert.ok(!fs.existsSync(path.join(packageData, "copilot.db")), "npm removed the old package's database");
-    const rescueRoot = path.join(state.dataDir, "rescued-package-data");
-    const rescues = fs.existsSync(rescueRoot) ? fs.readdirSync(rescueRoot) : [];
-    assert.equal(rescues.length, 1, `one rescue copy in ${rescueRoot}: ${JSON.stringify(rescues)}\n--- npm ---\n${install.stdout}\n${install.stderr}`);
-    assert.ok(!rescues[0].endsWith(".partial"), rescues[0]);
-    const rescuedDb = path.join(rescueRoot, rescues[0], "data", "copilot.db");
-    assert.ok(fs.existsSync(rescuedDb), `the rescue holds data/copilot.db: ${JSON.stringify(fs.readdirSync(path.join(rescueRoot, rescues[0], "data")))}`);
-
-    // Pinned now, as every 0.9.20 launcher starts it.
-    const relay = await startInstalledRelay({ pkg, state });
-    let answer;
-    try {
-      answer = await about(relay);
-    } finally {
-      await stopRelay(relay);
-    }
-    // It took the rescued database over under its old name.
-    assert.equal(answer.relay.dbPath, path.join(state.dataDir, "copilot.db"), relay.output);
-    assert.equal(answer.stats.conversations, 1, relay.output);
-    assert.deepEqual(dbFiles(state.dataDir, "oar.db"), [], relay.output);
-    assert.deepEqual(titlesIn(path.join(state.dataDir, "copilot.db")), ["marker-b"]);
-    // The rescue copy is kept, renamed as looked at; the decision recorded.
-    const left = fs.readdirSync(path.join(rescueRoot, rescues[0], "data"));
-    assert.ok(left.some((name) => /^copilot\.db\.adopted-/.test(name)), `rescue copy renamed: ${JSON.stringify(left)}`);
-    const checked = JSON.parse(fs.readFileSync(path.join(state.dataDir, "earlier-databases.json"), "utf8"));
-    assert.ok(checked.sources.some((entry) => entry.outcome === "adopted"), JSON.stringify(checked));
-    // And its first start on it backed it up (default folder: the state root's backups).
-    const backups = fs.existsSync(path.join(state.stateRoot, "backups")) ? fs.readdirSync(path.join(state.stateRoot, "backups")) : [];
-    assert.equal(backups.filter((name) => /-pre-update-from-unknown\.db$/.test(name)).length, 1, `${JSON.stringify(backups)}\n${relay.output}`);
   });
 
   test("C: fresh data folder: 0.9.20 creates oar.db, no copilot.db", SLOW, async () => {

@@ -186,5 +186,5 @@ node --test .github/extensions/web-relay/skills/*.test.mjs
 When modifying the extension:
 - Keep polling loop responsive: avoid long synchronous operations
 - Don't block WebSocket handling: stream events instead of buffering large responses
-- Test with both macOS/Linux (tmux paths) and Windows (TTY-Console)
+- Test with both macOS/Linux (tmux paths) and Windows
 - Update test files alongside feature changes

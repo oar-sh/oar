@@ -40,6 +40,8 @@ function createService(store, { exitCode = 0, output = ['added 1 package'], ...o
     installMethod: 'npm-global',
     env: {},
     platform: 'linux',
+    // better-sqlite3 ships a binary for linux-x64: nothing to build.
+    arch: 'x64',
     // No npm beside this Node, so the plain `npm` from PATH is spawned.
     execPath: '/opt/absent/bin/node',
     existsImpl: () => false,
@@ -67,12 +69,52 @@ function createService(store, { exitCode = 0, output = ['added 1 package'], ...o
   return { service, spawned, shutdowns, events };
 }
 
+test('where no SQLite binary ships, the binding is built after npm and before the restart', async () => {
+  const store = settingsStore();
+  const builds = [];
+  const { service, shutdowns, events } = createService(store, {
+    platform: 'android',
+    arch: 'arm64',
+    packageRoot: '/data/prefix/lib/node_modules/@oar-sh/oar',
+    buildNativeAddons: async (options) => {
+      events.push('build');
+      builds.push(options);
+      options.onOutput('gyp info ok\n');
+      options.logger.log('[oar] The SQLite binding is built.');
+      return { ok: true, status: 'built' };
+    },
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, true);
+  assert.equal(builds.length, 1);
+  assert.equal(builds[0].packageRoot, '/data/prefix/lib/node_modules/@oar-sh/oar');
+  assert.equal(builds[0].platform, 'android');
+  assert.deepEqual(events, ['build', `write:${UPDATE_ATTEMPT_SETTING_KEY}`, 'shutdown']);
+  assert.equal(shutdowns.length, 1);
+  assert.match(service.getSnapshot().log, /gyp info ok\n\[oar\] The SQLite binding is built\.\n$/);
+});
+
+test('a binding that does not build ends the update in an error and keeps the relay running', async () => {
+  const store = settingsStore();
+  const { service, shutdowns } = createService(store, {
+    platform: 'android',
+    arch: 'arm64',
+    buildNativeAddons: async () => ({ ok: false, status: 'failed', error: 'node-gyp exited with code 1' }),
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 is installed, but its SQLite binding did not build (node-gyp exited with code 1). Run oar build-native, then restart the relay.');
+  assert.equal(service.getSnapshot().state, 'error');
+  assert.equal(shutdowns.length, 0);
+  assert.equal(store.rows.has(UPDATE_ATTEMPT_SETTING_KEY), false);
+});
+
 test('a successful update persists the attempt before requesting the restart', async () => {
   const store = settingsStore();
   const { service, spawned, shutdowns, events } = createService(store);
   const result = await service.startUpdate({ version: '0.9.2' });
   assert.equal(result.ok, true);
-  assert.deepEqual(spawned, [['npm', 'install', '-g', '--allow-scripts=@oar-sh/oar,better-sqlite3,koffi', '@oar-sh/oar@0.9.2']]);
+  assert.deepEqual(spawned, [['npm', 'install', '-g', '--allow-scripts=koffi', '@oar-sh/oar@0.9.2']]);
   assert.equal(shutdowns.length, 1);
   assert.equal(shutdowns[0].restart, true);
 
@@ -173,7 +215,7 @@ test('the update runs the npm beside this Node, into the prefix the package sits
   await service.startUpdate({ version: '0.9.2' });
   assert.deepEqual(calls, [{
     command: '/home/dev/.oar/runtime/node/bin/npm',
-    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '--allow-scripts=@oar-sh/oar,better-sqlite3,koffi', '@oar-sh/oar@0.9.2'],
+    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '--allow-scripts=koffi', '@oar-sh/oar@0.9.2'],
     path: '/home/dev/.oar/runtime/node/bin:/usr/bin:/bin',
   }]);
 });

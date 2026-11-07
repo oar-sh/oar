@@ -18,6 +18,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | DeepSeek API key | DeepSeek chats | Entered in **⚙️ Settings**, stored in the relay database. No CLI is needed: the turns run on the Claude Code build that comes with OAR (see [DeepSeek](providers.md#deepseek)) |
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
 | `cloudflared` (optional) | the built-in Cloudflare tunnel | Not included; install it yourself (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)) |
+| Python 3, make and a C++ compiler | only where better-sqlite3 ships no SQLite binding: Android (Termux), 32-bit ARM, FreeBSD | OAR builds the binding there with `oar build-native` (see [npm](#npm)). On Termux: `pkg install python clang make` |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
 
 ## macOS and Linux
@@ -42,7 +43,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.22 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.23 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -55,16 +56,18 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.22'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.23'` before the command.
 
 ## npm
 
 ```bash
-npm install -g --allow-scripts=@oar-sh/oar,better-sqlite3,koffi @oar-sh/oar
+npm install -g --allow-scripts=koffi @oar-sh/oar
 oar setup
 ```
 
-npm 12 runs no install script it was not told to allow, and two of OAR's dependencies fetch their native binary in one; without `--allow-scripts` the install succeeds there and the relay then fails to start. OAR's own (`@oar-sh/oar`) copies the data an earlier version kept inside the package before npm removes it. npm 10 and 11 accept the flag and need none. The installers and `oar update` pass it themselves.
+npm 12 runs no install script it was not told to allow, and one of OAR's dependencies, koffi (under the Copilot SDK), picks its native binary in one. OAR itself has no install script. npm 10 and 11 accept the flag and need none. The installers and `oar update` pass it themselves.
+
+better-sqlite3 ships its SQLite binding for Linux, macOS and Windows on x64 and arm64. Anywhere else (Android under Termux, 32-bit ARM, FreeBSD) run `oar build-native` once after the install: it compiles the binding in the installed package and needs Python 3, make and a C++ compiler (on Termux, `pkg install python clang make` first). The relay says so when it starts without one. `oar update` and the **Update** button build it themselves on those platforms; on the others `oar build-native` has nothing to do.
 
 ## From a git checkout
 
@@ -151,6 +154,7 @@ A global install keeps its state in `~/.oar` (`%APPDATA%\oar` on Windows; `OAR_S
 
 - **Global install:** **⚙️ Settings → General → Check for updates** shows a newer release with an **Update** button, which installs it with npm and restarts the relay once no turn is running. `oar update` does the same from a terminal. Automatic checks are opt-in: **Check for updates automatically** asks oar.sh about twice a day. `OAR_NO_UPDATE_CHECK=1` in the relay's environment blocks every check, manual ones included.
 - **Git checkout:** `git pull`, `npm install`, then restart the relay (**🌄 Restart web relay** in the conversation's **︙** menu).
+- **From 0.9.13 or older:** a relay before 0.9.14 could keep its database, uploads and config inside the package folder, which `npm install -g` deletes. 0.9.14 to 0.9.22 copied them out during the install; 0.9.23 and later no longer do. Before you update, copy `data/`, `uploads/` and `config.json` from the installed package's `server` folder (`npm root -g`, then `@oar-sh/oar/server`) into a new folder under `rescued-package-data` in the data folder, for example `~/.oar/data/rescued-package-data/before-update/` (`%APPDATA%\oar\data\rescued-package-data\before-update\` on Windows). The first start of the new version takes them over, as it did the copies the install made.
 
 The first start of a new version (in a checkout: of a new commit) copies the database into the backup folder before that version's migrations, and keeps the last two (`dbBackups` in [the configuration](configuration.md)). The in-app update says before it installs whether that copy will be made, or why not (a full disk). To go back, see [Restore a database backup](troubleshooting.md#restore-a-database-backup).
 

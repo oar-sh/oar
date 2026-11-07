@@ -728,6 +728,78 @@ test('a rescue copy the rescue did not finish (.partial) is never taken over', (
   }
 });
 
+// A rescue copy of a package that held no database: its uploads, its Cursor
+// stores, or both.
+function writeFilesOnlyRescue(install, { uploads = true, cursor = false } = {}) {
+  const rescue = path.join(install.dataDir, RESCUE_DIR_NAME, STAMP);
+  fs.mkdirSync(path.join(rescue, 'data'), { recursive: true });
+  if (uploads) {
+    fs.mkdirSync(path.join(rescue, 'uploads'), { recursive: true });
+    fs.writeFileSync(path.join(rescue, 'uploads', UPLOAD), 'rescued upload');
+  }
+  if (cursor) {
+    fs.mkdirSync(path.join(rescue, 'data', 'cursor-agents', 'agent-1'), { recursive: true });
+    fs.writeFileSync(path.join(rescue, 'data', 'cursor-agents', 'agent-1', 'store.db'), 'store');
+  }
+  return rescue;
+}
+
+test('a rescue copy with uploads and no database: the first start serves them, says nothing was lost, and does not copy them again', () => {
+  const install = createInstall();
+  try {
+    writeFilesOnlyRescue(install);
+    const earlierDatabase = adopt(install);
+    assert.equal(earlierDatabase.status, 'files');
+    // Where the relay serves uploads from (resolveUploadDir: <data>/uploads).
+    assert.equal(fs.readFileSync(path.join(install.uploadDir, UPLOAD), 'utf8'), 'rescued upload');
+    assert.match(install.logs.at(-1), /^\[data\] Copied 1 upload\(s\) and 0 Cursor file\(s\) of .+ where missing\.$/);
+    assert.equal(lostPackageDatabaseWarning({
+      unpinnedLaunchers: ['an earlier launcher'], earlierDatabase, databaseCreated: true, evidence: true,
+      serverDir: install.serverDir, dbPath: install.pinnedDb,
+    }), null);
+    install.logs.length = 0;
+    adopt(install, { now: () => new Date('2026-10-20T13:00:00.000Z') });
+    assert.deepEqual(install.logs, []);
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('uploads and Cursor stores of a rescue copy that could not be copied at the first start are tried again at the next', () => {
+  const install = createInstall();
+  try {
+    writeFilesOnlyRescue(install, { cursor: true });
+    const failing = { ...fs, copyFileSync: () => { throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' }); } };
+    adopt(install, { fsImpl: failing });
+    const store = path.join(install.dataDir, 'cursor-agents', 'agent-1', 'store.db');
+    assert.equal(fs.existsSync(path.join(install.uploadDir, UPLOAD)), false);
+    assert.equal(fs.existsSync(store), false);
+    adopt(install, { now: () => new Date('2026-10-20T13:00:00.000Z') });
+    assert.equal(fs.readFileSync(path.join(install.uploadDir, UPLOAD), 'utf8'), 'rescued upload');
+    assert.equal(fs.readFileSync(store, 'utf8'), 'store');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('the database in a configured dataDir, the uploads in a rescue copy (0.9.13): both come over, the user folder stays byte for byte', () => {
+  const install = createInstall();
+  try {
+    const ownData = path.join(install.root, 'oar-own-data');
+    writeDatabase(path.join(ownData, 'copilot.db'), { marker: 'own-data', at: '2026-10-20T09:00:00.000Z' });
+    fs.mkdirSync(install.stateRoot, { recursive: true });
+    fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ dataDir: ownData }));
+    const ownBefore = snapshotDir(ownData);
+    writeFilesOnlyRescue(install);
+    assert.equal(adopt(install).status, 'adopted');
+    assert.equal(readMarker(install.pinnedDb), 'own-data');
+    assert.equal(fs.readFileSync(path.join(install.uploadDir, UPLOAD), 'utf8'), 'rescued upload', 'served');
+    assert.deepEqual(snapshotDir(ownData), ownBefore, 'the user folder byte for byte');
+  } finally {
+    install.cleanup();
+  }
+});
+
 // ─── A database the update already removed ───────────────────────────────────
 
 test('a launcher that ran the relay on the package database, with nothing of it found, is said loudly', () => {

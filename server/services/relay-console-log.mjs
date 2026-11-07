@@ -8,9 +8,8 @@
 // read, so the runtime copies it into `<log dir>/relay-console.log`, with a
 // time stamp per line and a size limit.
 //
-// The copy is taken from the console's methods rather than from stdout: the
-// terminal console (tty-console) redraws its prompt on stdout, and none of
-// that belongs in a log.
+// The copy is taken from the console's methods rather than from stdout, so
+// what a library writes to stdout directly stays out of it.
 
 import fs from 'fs';
 import path from 'path';

@@ -55,7 +55,7 @@ async function startApp({ clock = null, routes = null } = {}) {
     logger: { warn() {} },
   });
   app.get('/api/status', relayAuth.auth, (_req, res) => res.json({ ok: true }));
-  app.get('/api/files/*', relayAuth.auth, (_req, res) => res.type('text').send('file'));
+  app.get('/api/files/{*splat}', relayAuth.auth, (_req, res) => res.type('text').send('file'));
   if (routes) routes(app, relayAuth);
   const server = await new Promise((resolve) => {
     const listening = app.listen(0, '127.0.0.1', () => resolve(listening));

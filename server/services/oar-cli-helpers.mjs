@@ -86,6 +86,7 @@ const CLI_COMMANDS = {
   autostart: { words: ['signin', 'boot', 'off', 'status'], flags: ['--replace'] },
   uninstall: { flags: ['--purge'] },
   update: { flags: ['--beta'], values: ['--to'] },
+  'build-native': { flags: ['--force'] },
   copilot: { flags: ['--install-extension', '--no-install-extension'], values: ['--port', '--migrate-from'], forwards: true },
 };
 
@@ -116,6 +117,9 @@ export function usageText() {
     '  oar backup [--reason <text>]',
     '                         A copy of the database into the backup folder (safe while the relay runs)',
     '  oar update [--beta] [--to <version>]',
+    '  oar build-native [--force]',
+    '                         Build the SQLite binding where no prebuilt one ships (Termux, 32-bit ARM);',
+    '                         --force builds where one ships too, which only tests the build tools',
     '  oar help               This text',
     '  oar --version',
   ].join('\n');
@@ -401,11 +405,10 @@ export function buildServicePath({ nodeBin, envPath = '', homeDir = '' } = {}) {
  * native binary). npm 12 runs no install script it was not told to allow, and
  * a global install has no package.json of its own to say so; npm 10 and 11
  * accept the flag and run the scripts as before. `npm-install-scripts.test.mjs`
- * holds this list to the lockfile.
+ * holds this list to the lockfile. better-sqlite3 13 has no install script:
+ * where it ships no binary, OAR builds it (native-addon-build-service.mjs).
  */
-// @oar-sh/oar itself: its preinstall copies the data an earlier version
-// kept inside the package before npm deletes it (package-data-rescue.mjs).
-export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['@oar-sh/oar', 'better-sqlite3', 'koffi']);
+export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['koffi']);
 export const NPM_ALLOW_SCRIPTS_ARG = `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`;
 
 /**
