@@ -35,6 +35,18 @@ import {
   REMOTE_RELAY_APPROVAL_SOURCE,
   normalizeRelayAskInput,
 } from './relay-asks.mjs';
+import {
+  OPENAI_IMAGE_BACKGROUNDS,
+  OPENAI_IMAGE_LIMITS,
+  OPENAI_IMAGE_OUTPUT_FORMATS,
+  validateOpenAIImageOptions,
+} from './openai-image-options.mjs';
+import {
+  OPENAI_IMAGE_BUILTIN_PRESETS,
+  OPENAI_IMAGE_PRESET_LIMITS,
+  cleanOpenAIImagePresetName,
+  splitOpenAIImagePreset,
+} from './openai-image-presets.mjs';
 
 // The one name every provider lists the tool under. Up to 0.9.17 it was
 // `remote_relay`; that name is still accepted where a runtime dispatches a
@@ -156,6 +168,8 @@ export const REMOTE_RELAY_SESSION_SETTINGS = Object.freeze([
   // Plan-only: agents may set and clear it; set, a send or an
   // update_session naming another mode is refused.
   'planOnly',
+  // An image session's defaults (size, quality, count, format, background).
+  'image',
 ]);
 export const REMOTE_RELAY_THINKING_DISPLAYS = THINKING_DISPLAY_MODES;
 // update_session's `group` value that takes a session out of its group (JSON
@@ -237,6 +251,10 @@ export const REMOTE_RELAY_LIMITS = Object.freeze({
   healthIntervalMs: 60_000,
   requestTimeoutMs: 15_000,
   responseMaxBytes: 5 * 1024 * 1024,
+  // send / create_session to an image session: paths of images on the target
+  // relay that go to the model with the prompt.
+  imagesMax: OPENAI_IMAGE_LIMITS.inputImagesMax,
+  imagePathMaxChars: 4096,
 });
 
 export const REMOTE_RELAY_ERROR_CODES = Object.freeze({
@@ -313,6 +331,8 @@ export const AGENT_SESSIONS_SOCKET_EVENT = 'agent_sessions_settings_updated';
 export const REMOTE_RELAY_LOCAL_ALIAS = 'this';
 export const REMOTE_RELAY_LOCAL_ID = 'self';
 export const REMOTE_RELAY_CLOUD_PROVIDER = 'claude-cloud';
+// The provider of image sessions (gpt-image-*, dall-e-*): images and image go there.
+export const REMOTE_RELAY_IMAGE_PROVIDER = 'openai';
 
 export const REMOTE_RELAY_TOOL_DESCRIPTION =
   'Work with sessions on OAR relays: the other relays this relay is paired with ("remote relays") '
@@ -360,8 +380,14 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'answer: ask the user (unless they told you to decide yourself) and pass the answer '
   + 'with answer_question. Write actions can first need the user\'s approval. Always '
   + 'tell the user which relay and session you worked on. '
+  + 'Image sessions (provider "openai" with a gpt-image or dall-e model): send and create_session take images (absolute paths '
+  + 'on the target relay to edit or work from) and image {size, quality, count, output_format, background, preset} for that turn '
+  + '(preset: a name relay_info lists in imagePresets; the fields named win over it); '
+  + 'update_session image sets the session\'s defaults. Their replies list images [{path, width, height, mime}] (absolute paths '
+  + 'on that relay, which a later send can attach) with a line on size and model; a failed image call is not repeated more than once. '
   + 'usage reports what the provider plans of a relay have left (Copilot, Claude, Claude Cloud, Cursor, Grok: '
-  + 'meters with used, allowance, remaining, utilization and reset time; providers not set up or not tracked say so) '
+  + 'meters with used, allowance, remaining, utilization and reset time; providers not set up or not tracked say so; '
+  + 'OpenAI images: today\'s spend against the relay\'s daily cap) '
   + 'and whether a Claude usage limit has paused turns there, before you start work that costs. '
   + 'read_task_output {session, task_id} reads the end of a background shell or Monitor task\'s output there '
   + '(task ids from read_session\'s tasks; also for an hour after the task ended): the last lines, minutes '
@@ -436,7 +462,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
         + 'workspaces of a relay. usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. '
         + 'read_task_output: the end of a background shell task\'s output. send: prompt an '
         + 'existing session. create_session: start a new session with a first prompt. update_session: change '
-        + 'another session\'s settings (model, effort, mode, auto-compact window, title, group, thinking, cwd). wait: keep waiting for '
+        + 'another session\'s settings (model, effort, mode, auto-compact window, title, group, thinking, cwd, image defaults). wait: keep waiting for '
         + 'a reply. answer_question: answer a question the remote agent asked. stop: stop the running turn. '
         + 'archive: archive a session. subscribe / unsubscribe / list_subscriptions / transfer_subscriptions: '
         + 'be woken by events of sessions on this relay or a paired one (relay may be left out: "this"). '
@@ -544,6 +570,35 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       type: 'string',
       enum: [...THINKING_DISPLAY_MODES],
       description: 'update_session: whether a Claude session\'s thinking text shows in its transcript (summarized) or not (omitted).',
+    },
+    images: {
+      type: 'array',
+      items: { type: 'string' },
+      maxItems: REMOTE_RELAY_LIMITS.imagesMax,
+      description: `send / create_session to an OpenAI image session (provider openai, a gpt-image or dall-e model): up to ${REMOTE_RELAY_LIMITS.imagesMax} `
+        + `absolute paths of PNG, JPEG or WebP files on the target relay (each at most ${OPENAI_IMAGE_LIMITS.inputImageBytesMax / (1024 * 1024)} MB) that the model edits or works from, `
+        + 'with text as the instruction. Allowed: files inside the target session\'s working directory, or images any session there '
+        + 'generated (the paths its replies list). Refused for other models; a paired relay must run an OAR that takes them.',
+    },
+    image: {
+      type: 'object',
+      properties: {
+        size: { type: 'string', description: '"auto" or WIDTHxHEIGHT, e.g. 1536x1024: gpt-image takes both edges multiples of 16, the longer at most 3840, at most 3840x2160 pixels (gpt-image-2 and later: at least 655360 pixels, e.g. 1024x640), aspect 1:3 to 3:1; dall-e-3 1024x1024, 1792x1024 or 1024x1792; dall-e-2 256x256, 512x512 or 1024x1024.' },
+        quality: { type: 'string', description: 'gpt-image: auto, low, medium or high, and xhigh or max on the gpt-image 2.5 and 2.6 models (checked against the session\'s model); dall-e-3: standard or hd.' },
+        count: { type: 'integer', minimum: 1, maximum: OPENAI_IMAGE_LIMITS.countMax, description: `Images per turn, 1 to ${OPENAI_IMAGE_LIMITS.countMax} (dall-e-3: 1). Default 1.` },
+        output_format: { type: 'string', enum: [...OPENAI_IMAGE_OUTPUT_FORMATS], description: 'gpt-image only: png (default), webp or jpeg.' },
+        background: { type: 'string', enum: [...OPENAI_IMAGE_BACKGROUNDS], description: 'gpt-image only: auto (default), transparent (png or webp) or opaque.' },
+        preset: {
+          type: 'string',
+          maxLength: OPENAI_IMAGE_PRESET_LIMITS.nameChars,
+          description: `send / create_session only: a named set of these options, e.g. ${OPENAI_IMAGE_BUILTIN_PRESETS.map((preset) => `"${preset.name}"`).join(', ')} `
+            + '(the built-ins; relay_info lists imagePresets with the relay owner\'s own). It sits over the session\'s defaults, '
+            + 'and the fields named next to it win over it. An unknown name is refused with the list; nothing is sent.',
+        },
+      },
+      description: 'send / create_session: image options for that turn, over the session\'s defaults. update_session: the image '
+        + 'session\'s defaults from now on (the fields named replace those defaults; auto, 1 and png set one back; no preset). '
+        + 'Refused for a session whose model makes no images.',
     },
     question_id: { type: 'string', description: 'answer_question: id from pendingQuestions. withdraw: the id ask returned.' },
     question: {
@@ -696,8 +751,8 @@ export const REMOTE_RELAY_ACTION_ARGUMENTS = Object.freeze({
   read_session: Object.freeze(['session', 'last', 'before', 'include_activity', 'max_chars']),
   read_task_output: Object.freeze(['session', 'task_id', 'lines']),
   wait: Object.freeze(['session', 'message_id', 'wait_seconds']),
-  send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy', 'provider']),
-  create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds', 'planOnly']),
+  send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy', 'provider', 'images', 'image']),
+  create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds', 'planOnly', 'images', 'image']),
   update_session: Object.freeze(['session', ...REMOTE_RELAY_SESSION_SETTINGS]),
   answer_question: Object.freeze(['question_id', 'answer', 'choices']),
   stop: Object.freeze(['session']),
@@ -913,6 +968,12 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
       }
       args.effort = effort;
     }
+    const imagesCheck = readImagePaths(input?.images);
+    if (!imagesCheck.ok) return imagesCheck;
+    if (imagesCheck.paths.length) args.images = imagesCheck.paths;
+    const imageCheck = readTurnImageOptions(input?.image);
+    if (!imageCheck.ok) return imageCheck;
+    if (Object.keys(imageCheck.values).length) args.image = imageCheck.values;
     if (action === 'send') {
       const busyCheck = optionalEnum('if_busy', REMOTE_RELAY_IF_BUSY);
       if (!busyCheck.ok) return busyCheck;
@@ -920,10 +981,16 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
       const providerCheck = optionalProvider(sendProviders, (value, list) =>
         `provider "${value}" can't be used with send; send takes one of: ${list} (the Claude session's subscription or API key)`);
       if (!providerCheck.ok) return providerCheck;
+      if (args.provider && (args.images || args.image)) {
+        return invalid('images and image go to an OpenAI image session, not with provider (a Claude session\'s billing)');
+      }
     } else {
       const providerCheck = optionalProvider(providers, (value, list) =>
         `provider "${value}" is not a provider here; this relay offers: ${list}`);
       if (!providerCheck.ok) return providerCheck;
+      if (args.provider && args.provider !== REMOTE_RELAY_IMAGE_PROVIDER && (args.images || args.image)) {
+        return invalid(`images and image go with provider "${REMOTE_RELAY_IMAGE_PROVIDER}" and an image model (gpt-image-*, dall-e-*), not provider "${args.provider}"`);
+      }
       optionalText('cwd', 1000);
       optionalText('title', 200);
       // An empty group is no group: the default grouping applies.
@@ -980,6 +1047,53 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
   }
   const waits = Object.prototype.hasOwnProperty.call(args, 'wait_seconds');
   return { ok: true, action, args, ...(waits ? waitLimited : {}) };
+}
+
+// Image paths are read on the target relay, whose platform this relay may not
+// share: a POSIX path or a drive path (C:\ or C:/). Network and device paths
+// (\\host\share, //host/share, \\?\, \\.\) are refused: merely touching one can
+// open a connection that hands out the relay's credentials.
+const ABSOLUTE_PATH_PATTERN = /^(?:\/(?!\/)|[A-Za-z]:[\\/])/;
+
+/**
+ * send / create_session's `images`: absolute paths, at most imagesMax, the
+ * same path named twice kept once. A single text is one path.
+ */
+function readImagePaths(value) {
+  if (value === undefined || value === null || value === '') return { ok: true, paths: [] };
+  const list = typeof value === 'string' ? [value] : value;
+  if (!Array.isArray(list)) return invalid('images must be a list of absolute file paths on the target relay');
+  const paths = [];
+  for (const entry of list) {
+    if (typeof entry !== 'string') return invalid('images must be a list of absolute file paths on the target relay');
+    const path = entry.trim();
+    if (!path) continue;
+    if (path.length > REMOTE_RELAY_LIMITS.imagePathMaxChars || path.includes('\0')) return invalid('images: a path is too long or not a path');
+    if (!ABSOLUTE_PATH_PATTERN.test(path)) {
+      return invalid(`images: "${path.slice(0, 120)}" is not an absolute local path; give the full path on the target relay (no network paths)`);
+    }
+    if (!paths.includes(path)) paths.push(path);
+  }
+  if (paths.length > REMOTE_RELAY_LIMITS.imagesMax) return invalid(`images takes at most ${REMOTE_RELAY_LIMITS.imagesMax} paths`);
+  return { ok: true, paths };
+}
+
+/**
+ * send / create_session's `image`: the options as the validator checks them
+ * (without a model; the target checks them against its session's), and
+ * `preset` as a clean name. Only its shape is checked here: the target
+ * relay knows its presets and resolves the name.
+ */
+function readTurnImageOptions(value) {
+  const { preset, own } = splitOpenAIImagePreset(value);
+  const checked = validateOpenAIImageOptions(own, { field: 'image' });
+  if (!checked.ok) return invalid(checked.error);
+  if (preset === null || preset === undefined || (typeof preset === 'string' && !preset.trim())) {
+    return { ok: true, values: checked.values };
+  }
+  const name = cleanOpenAIImagePresetName(preset);
+  if (name.error) return invalid(`image.preset: ${name.error}`);
+  return { ok: true, values: { ...checked.values, preset: name.name } };
 }
 
 function readBoolean(value) {
@@ -1060,6 +1174,14 @@ export function validateRemoteRelaySessionSettings(input) {
     if (!THINKING_DISPLAY_MODES.includes(display)) return invalid(`thinking_display must be one of: ${THINKING_DISPLAY_MODES.join(', ')}`);
     values.thinking_display = display;
   }
+  // A preset is a turn's: the defaults are the fields themselves.
+  const { preset: defaultsPreset, own: defaults } = splitOpenAIImagePreset(input?.image);
+  if (defaultsPreset !== null && defaultsPreset !== undefined && toText(defaultsPreset) !== '') {
+    return invalid('image.preset: a preset is per turn (send, create_session); name its fields to set defaults');
+  }
+  const image = validateOpenAIImageOptions(defaults, { field: 'image' });
+  if (!image.ok) return invalid(image.error);
+  if (Object.keys(image.values).length) values.image = image.values;
   if (!Object.keys(values).length) {
     return invalid(`update_session needs at least one setting to change: ${REMOTE_RELAY_SESSION_SETTINGS.join(', ')}`);
   }

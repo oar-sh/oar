@@ -42,6 +42,7 @@ import { mapUsageSnapshotRow, fetchUsageSummaryPromise } from '../services/usage
 import { readStoredClaudeContextUsage, resolveAutoCompactWindowStatus } from '../services/claude-context-usage.mjs';
 import { buildContextUsageView } from '../services/context-usage-view.mjs';
 import { cleanupGeneratedImagesForConversation as cleanupGeneratedImagesForConversationDefault } from '../services/generated-image-cleanup-service.mjs';
+import { withGeneratedImageFiles } from '../services/generated-image-files.mjs';
 import { stopSessionWorkerProcesses } from '../services/session-worker-stop-service.mjs';
 import { isWorkerOnOtherBuild } from '../services/worker-recycle-service.mjs';
 import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
@@ -97,6 +98,30 @@ import {
   isSafeProviderModelId,
 } from '../../shared/model-id.mjs';
 import { openAIReasoningEffortsForModel } from '../../shared/openai-reasoning.mjs';
+import {
+  IMAGE_INPUT_REFUSED_CODE,
+  OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
+  OPENAI_IMAGE_NO_MODEL_CODE,
+  isOpenAIImageModelId,
+  openAIImageModelNeedsOpenAIText,
+  openAIImageNoModelText,
+  pickOpenAIImageDefaultModel,
+  validateOpenAIImageOptions,
+} from '../../shared/openai-image-options.mjs';
+import {
+  OPENAI_IMAGE_DAILY_CAP_DEFAULT_USD,
+  OPENAI_IMAGE_PRESETS_PATH,
+  OPENAI_IMAGE_SETTINGS_FIELDS,
+  OPENAI_IMAGE_SPEND_SETTING_KEYS,
+} from '../../shared/openai-image-spend.mjs';
+import {
+  OPENAI_IMAGE_PRESET_REFUSED_CODE,
+  OPENAI_IMAGE_PRESETS_SETTING_KEY,
+  applyOwnOpenAIImagePresetChange,
+  listOpenAIImagePresets,
+  parseOwnOpenAIImagePresets,
+} from '../../shared/openai-image-presets.mjs';
+import { buildOpenAIImagePlanCard } from '../services/plan-usage-openai-image.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
 import {
   REMOTE_RELAY_ERROR_CODES,
@@ -310,7 +335,8 @@ export function parseOpenAISettingsUpdateRequest(body = {}) {
   const hasEnabledModels = Array.isArray(payload.enabledModels);
   const hasAutoEnableNew = typeof payload.autoEnableNew === 'boolean';
   if (!remove && !hasModel && !apiKey && !hasEnabled && !hasBaseUrl && !hasEnabledModels && !hasAutoEnableNew) {
-    return { ok: false, error: 'No OpenAI settings update provided' };
+    // `empty`: the body may still carry the image cap fields alone.
+    return { ok: false, empty: true, error: 'No OpenAI settings update provided' };
   }
   if (hasModel && !isSafeProviderModelId(model)) {
     return { ok: false, error: 'Invalid OpenAI model ID' };
@@ -335,6 +361,39 @@ export function parseOpenAISettingsUpdateRequest(body = {}) {
     ...(Array.isArray(payload.shownModels) ? { shownModels: payload.shownModels } : {}),
     enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
   };
+}
+
+// The highest daily cap of OpenAI image spend the settings take, in USD.
+export const OPENAI_IMAGE_DAILY_CAP_MAX_USD = 10_000;
+
+/**
+ * The image cap fields of POST /api/settings/openai: `imageDailyCapUsd` (USD,
+ * 0 to OPENAI_IMAGE_DAILY_CAP_MAX_USD, to the cent; 0 or null: no cap) and
+ * `allowImagesToday` (true sets the owner's override for the relay's day,
+ * false clears it). `{ ok, present, dailyCapUsd?, allowToday? }`, or
+ * `{ ok:false, present:true, error }`.
+ */
+export function parseOpenAIImageSpendSettingsRequest(body = {}) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const capField = OPENAI_IMAGE_SETTINGS_FIELDS.dailyCapUsd;
+  const allowField = OPENAI_IMAGE_SETTINGS_FIELDS.allowToday;
+  const hasCap = payload[capField] !== undefined;
+  const hasAllow = payload[allowField] !== undefined;
+  if (!hasCap && !hasAllow) return { ok: true, present: false };
+  const result = { ok: true, present: true };
+  if (hasCap) {
+    const raw = payload[capField];
+    const number = raw === null ? 0 : (typeof raw === 'string' && raw.trim() ? Number(raw.trim()) : raw);
+    if (typeof number !== 'number' || !Number.isFinite(number) || number < 0 || number > OPENAI_IMAGE_DAILY_CAP_MAX_USD) {
+      return { ok: false, present: true, error: `${capField} must be a number of USD from 0 (no cap) to ${OPENAI_IMAGE_DAILY_CAP_MAX_USD}` };
+    }
+    result.dailyCapUsd = Math.round(number * 100) / 100;
+  }
+  if (hasAllow) {
+    if (typeof payload[allowField] !== 'boolean') return { ok: false, present: true, error: `${allowField} must be true or false` };
+    result.allowToday = payload[allowField];
+  }
+  return result;
 }
 
 export function parseClaudeSettingsUpdateRequest(body = {}) {
@@ -543,6 +602,42 @@ function copilotListedModelIds(modelState = {}) {
       .map((value) => String(value || '').trim().toLowerCase())
       .filter((value) => value && value.toLowerCase() !== 'auto'),
   );
+}
+
+/**
+ * A Copilot catalog without its image ids (gpt-image-*, dall-e-*): the
+ * Copilot runtime cannot serve them, so neither New Chat, the composer nor
+ * relay_info offers them for Copilot. The OpenAI layer adds back the ones
+ * the OpenAI provider lists, as that provider's alone.
+ */
+export function withoutCopilotImageModels(modelState = {}) {
+  const models = Array.isArray(modelState?.models) ? modelState.models : [];
+  if (!models.some((modelId) => isOpenAIImageModelId(modelId))) return modelState;
+  const kept = models.filter((modelId) => !isOpenAIImageModelId(modelId));
+  const withoutImageKeys = (map) => (map && typeof map === 'object' && !Array.isArray(map)
+    ? Object.fromEntries(Object.entries(map).filter(([modelId]) => !isOpenAIImageModelId(modelId)))
+    : map);
+  const listedOr = (modelId) => (isOpenAIImageModelId(modelId) ? (kept[0] || '') : modelId);
+  return {
+    ...modelState,
+    models: kept,
+    ...(modelState.currentModel !== undefined ? { currentModel: listedOr(modelState.currentModel) } : {}),
+    ...(modelState.defaultModel !== undefined ? { defaultModel: listedOr(modelState.defaultModel) } : {}),
+    ...(modelState.reasoningByModel ? { reasoningByModel: withoutImageKeys(modelState.reasoningByModel) } : {}),
+    ...(modelState.contextLimitsByModel ? { contextLimitsByModel: withoutImageKeys(modelState.contextLimitsByModel) } : {}),
+    ...(modelState.modelMetadataByModel ? { modelMetadataByModel: withoutImageKeys(modelState.modelMetadataByModel) } : {}),
+    ...(modelState.providersByModel ? { providersByModel: withoutImageKeys(modelState.providersByModel) } : {}),
+    ...(Array.isArray(modelState.unavailableModels)
+      ? { unavailableModels: modelState.unavailableModels.filter((modelId) => !isOpenAIImageModelId(modelId)) }
+      : {}),
+  };
+}
+
+/** The refusal of a Copilot chat on an image model (400), or null for any other model. */
+function copilotImageModelRefusal(model = '') {
+  const modelId = String(model || '').trim();
+  if (!isOpenAIImageModelId(modelId)) return null;
+  return { ok: false, error: openAIImageModelNeedsOpenAIText(modelId), code: OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE };
 }
 
 export function buildModelCatalogWithClaudeProvider(modelState = {}, claudeSettings = {}) {
@@ -978,11 +1073,6 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'claude-api') return 'claude-api';
   if (normalized === 'github' || normalized === 'github-copilot') return 'github';
   return '';
-}
-
-function isOpenAIImageModelId(model = '') {
-  const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
-  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
 }
 
 function isPidAlive(pidValue) {
@@ -2215,7 +2305,7 @@ export function registerSessionsRoutes(app, deps) {
     deleteOrphanedUploads,
     cleanupGeneratedImagesForConversation = cleanupGeneratedImagesForConversationDefault,
     queueCounts,
-    getModelCatalogState,
+    getModelCatalogState: readCopilotModelCatalogState,
     updateModelCatalog,
     listModelVariantRows,
     refreshModelVariantCatalogFromCli,
@@ -2301,6 +2391,12 @@ export function registerSessionsRoutes(app, deps) {
     // Tokens per turn and per day (services/token-usage-service.mjs): a
     // deleted chat drops its turn rows. Absent in older wiring and most tests.
     tokenUsageService = null,
+    // OpenAI image spend (shared/openai-image-spend.mjs): the state for the
+    // Check Usage card (`({ conversationId? }) → state`), and the call that
+    // re-announces it after the cap or the override changed. Absent in older
+    // wiring and most tests: no card, nothing announced.
+    getOpenAIImageSpendState = null,
+    notifyOpenAIImageSpendChanged = () => {},
     reconcileUnstartedConversationProviders = async () => ({
       updatedUnstartedConversations: 0,
       skippedStartedConversations: 0,
@@ -2431,6 +2527,9 @@ export function registerSessionsRoutes(app, deps) {
     // the wiring does not pass one.
     shareRepository = null,
   } = deps;
+  // Copilot's catalog as every route here serves it: without the image ids
+  // its runtime cannot serve (an OpenAI Image chat takes them from OpenAI).
+  const getModelCatalogState = () => withoutCopilotImageModels(readCopilotModelCatalogState());
   const sdkSessionSyncService = createSdkSessionSyncService(db);
   // Built on first use: many route tests hand in a database without tables.
   let shareRepositoryInstance = shareRepository;
@@ -5056,7 +5155,9 @@ export function registerSessionsRoutes(app, deps) {
       group: conversationGroupPayload(resolvedConversationId, req),
       // Its place in the group's hand order, as on the list rows.
       groupPosition: conversationGroupPositionOf(conv),
-      messages: history.messages,
+      // Generated images with their file on this relay and their size, for
+      // this page's rows only (agents on other relays name the files).
+      messages: withGeneratedImageFiles(history.messages, { resolveSessionStateRoot }),
       pageInfo: history.pageInfo,
     });
   });
@@ -5331,6 +5432,18 @@ export function registerSessionsRoutes(app, deps) {
         return res.status(503).json({ error: 'This setting is unavailable until the relay restarts (its storage is missing).' });
       }
     }
+    // A Copilot chat cannot move to an image model: its runtime cannot serve
+    // one. The model it has already is written back as before.
+    if (
+      existing
+      && Object.prototype.hasOwnProperty.call(req.body || {}, 'preferredModel')
+      && normalizePreferredModel(req.body.preferredModel) !== normalizePreferredModel(existing.preferred_model)
+    ) {
+      const runtime = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
+      const provider = String(runtime?.provider_type || '').trim().toLowerCase();
+      const imageRefusal = provider === 'github' ? copilotImageModelRefusal(req.body.preferredModel) : null;
+      if (imageRefusal) return res.status(400).json(imageRefusal);
+    }
     if (remoteRequest && readPlanOnly(existing)
       && Object.prototype.hasOwnProperty.call(req.body || {}, 'preferredRelayMode')
       && planOnlyRefusesMode(req.body.preferredRelayMode)) {
@@ -5344,7 +5457,7 @@ export function registerSessionsRoutes(app, deps) {
   // ─── PATCH /api/conversation/:id/settings — the relay_tool's update_session ───
   //
   // `{ settings: { model, effort, mode, auto_compact_window, title, group,
-  // thinking_enabled, thinking_display, cwd }, dry_run, owner_approved }`.
+  // thinking_enabled, thinking_display, cwd, image }, dry_run, owner_approved }`.
   // Reached by an agent of this relay (the loopback) and by a paired relay's
   // agent (under the inbound switch); the owner may call it too. It applies
   // this relay's own rule: an agent changes freely only a session its own
@@ -5361,11 +5474,21 @@ export function registerSessionsRoutes(app, deps) {
 
   const SESSION_SETTINGS_INVALID = 'SESSION_SETTINGS_INVALID';
 
+  /** An image session's defaults as stored (`{}` for none, or for any other session). */
+  function readImageDefaults(conversationId) {
+    try {
+      return stmts.readConversationImageDefaults?.(conversationId) || {};
+    } catch {
+      return {};
+    }
+  }
+
   function currentSessionSettings(conversationId) {
     const conv = stmts.getConvAnyStatus.get(conversationId) || {};
     const runtime = stmts.getRuntimeSessionByConversation?.get?.(conversationId) || null;
     const workspace = resolveConversationWorkspaceState?.({ conversationId }) || null;
     const window = parseAutoCompactWindow(conv.auto_compact_window);
+    const imageDefaults = readImageDefaults(conversationId);
     return {
       model: normalizePreferredModel(conv.preferred_model) || String(runtime?.provider_model || runtime?.model || '').trim() || null,
       effort: normalizePreferredReasoningEffort(conv.preferred_reasoning_effort) || null,
@@ -5377,6 +5500,7 @@ export function registerSessionsRoutes(app, deps) {
       thinking_display: parseThinkingDisplay(conv.thinking_display),
       cwd: String(workspace?.currentWorkspaceRootPath || workspace?.configuredWorkspaceRootPath || conv.configured_workspace_root_path || '').trim() || null,
       planOnly: readPlanOnly(conv),
+      ...(Object.keys(imageDefaults).length ? { image: imageDefaults } : {}),
     };
   }
 
@@ -5429,6 +5553,8 @@ export function registerSessionsRoutes(app, deps) {
     const change = (key) => { if (!plan.changed.includes(key)) plan.changed.push(key); };
 
     if (wanted.model !== undefined && normalizePreferredModel(wanted.model) !== normalizePreferredModel(conversation.preferred_model)) {
+      const imageRefusal = provider === 'github' ? copilotImageModelRefusal(wanted.model) : null;
+      if (imageRefusal) return fail(400, `${imageRefusal.error} Nothing was changed.`, { code: imageRefusal.code });
       plan.preferences.preferredModel = wanted.model;
       change('model');
     }
@@ -5548,6 +5674,29 @@ export function registerSessionsRoutes(app, deps) {
         }
         plan.cwd = validated.realPath;
         change('cwd');
+      }
+    }
+    // An image session's defaults: what is named replaces the stored value of
+    // that option, the rest stays. Checked against the model the session has
+    // after this call; any other session is refused.
+    if (wanted.image !== undefined) {
+      // The model an image turn runs: the runtime session's (the send path's),
+      // or the one this call moves it to.
+      const imageModel = String(plan.preferences.preferredModel || runtime?.provider_model || runtime?.model || current.model || '').trim();
+      if (provider === 'github' && isOpenAIImageModelId(imageModel)) {
+        return fail(400, `${openAIImageModelNeedsOpenAIText(imageModel)} Nothing was changed.`, { code: OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE });
+      }
+      if (provider !== 'openai' || !isOpenAIImageModelId(imageModel)) {
+        return fail(400, `Image defaults go to an OpenAI image session; this session runs ${imageModel || provider}. Nothing was changed.`, { code: IMAGE_INPUT_REFUSED_CODE });
+      }
+      const stored = readImageDefaults(conversationId);
+      const checkedImage = validateOpenAIImageOptions({ ...stored, ...wanted.image }, { model: imageModel });
+      if (!checkedImage.ok) return fail(400, `${checkedImage.error}. Nothing was changed.`, { code: IMAGE_INPUT_REFUSED_CODE });
+      const sameAsStored = Object.keys(checkedImage.values).length === Object.keys(stored).length
+        && Object.entries(checkedImage.values).every(([key, value]) => stored[key] === value);
+      if (!sameAsStored) {
+        plan.image = checkedImage.values;
+        change('image');
       }
     }
     plan.changed.sort((a, b) => REMOTE_RELAY_SESSION_SETTINGS.indexOf(a) - REMOTE_RELAY_SESSION_SETTINGS.indexOf(b));
@@ -5711,13 +5860,22 @@ export function registerSessionsRoutes(app, deps) {
       if (!titled.ok) return failAfter(titled.statusCode || 500, { error: titled.error || 'Failed to update the title.' });
       written.push('title');
     }
+    if (plan.image) {
+      try {
+        if (typeof stmts.writeConversationImageDefaults !== 'function') throw new Error('Image session defaults are unavailable on this relay');
+        stmts.writeConversationImageDefaults(conversationId, plan.image);
+      } catch (error) {
+        return failAfter(503, { code: 'IMAGE_DEFAULTS_UNAVAILABLE', error: `${error?.message || 'The image defaults could not be stored'}.` });
+      }
+      written.push('image');
+    }
     if (Object.keys(plan.preferences).length) {
       applyConversationPreferences({
         conversationId,
         existing: stmts.getConvAnyStatus.get(conversationId),
         body: plan.preferences,
       });
-      written.push(...plan.changed.filter((key) => !['cwd', 'title', 'group'].includes(key)));
+      written.push(...plan.changed.filter((key) => !['cwd', 'title', 'group', 'image'].includes(key)));
     }
     // Groups through the agent path: an owner's group the session leaves is
     // never removed (it stays, empty if it was the last member); a group an
@@ -6758,6 +6916,12 @@ export function registerSessionsRoutes(app, deps) {
       requestedBootstrapModel
       || (isProviderModelAvailable(catalogSelectedModel, availableModels) ? catalogSelectedModel : '')
     );
+    // An OpenAI Image chat asked for without a model starts on the image
+    // default the OpenAI list offers (else its first gpt-image), never on
+    // the shared catalog's current model, which makes no images.
+    const openAIImageDefaultModel = requestedProviderType === 'openai-image' && !requestedBootstrapModel
+      ? pickOpenAIImageDefaultModel([...availableOpenAIModels])
+      : '';
     const providerModelSelection = useClaudeCloudProvider
       // The cloud takes plain ids; with no model in the request the tab's
       // default applies (never the shared catalog's current model).
@@ -6774,7 +6938,7 @@ export function registerSessionsRoutes(app, deps) {
         })
       : useOpenAIProvider
       ? resolveProviderModelSelection({
-          requestedModel: providerRequestedModel(availableOpenAIModels),
+          requestedModel: openAIImageDefaultModel || providerRequestedModel(availableOpenAIModels),
           // The removed resolveOpenAISessionModel carried this last-resort id.
           configuredModel: openAISettings.model || 'gpt-4o',
           availableModels: availableOpenAIModels,
@@ -6833,6 +6997,12 @@ export function registerSessionsRoutes(app, deps) {
         supportedModels: providerModelSelection.availableModels || [],
       });
     }
+    const useCopilotProvider = !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider
+      && !useGrokProvider && !useDeepSeekProvider && !useClaudeApiProvider;
+    // A Copilot chat on an image id would reach the Copilot runtime, which
+    // cannot serve it: refused before anything is written.
+    const copilotImageRefusal = useCopilotProvider ? copilotImageModelRefusal(requestedBootstrapModel || catalogSelectedModel) : null;
+    if (copilotImageRefusal) return res.status(400).json(copilotImageRefusal);
     // Copilot falls back to the catalogue's current model for an id it does
     // not list, which New Chat (it only offers listed ids) never meets. An
     // agent naming a mistyped id ("gpt-5-4") would get a session on another
@@ -6971,6 +7141,11 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     const selectedModel = providerModelSelection ? providerModelSelection.model : (copilotBoundModel || catalogSelectedModel);
+    // Asked for without a model, an image chat needs a gpt-image model in the
+    // OpenAI list; it never falls back to a chat model, which makes no images.
+    if (requestedProviderType === 'openai-image' && !requestedBootstrapModel && !openAIImageDefaultModel) {
+      return res.status(400).json({ ok: false, error: openAIImageNoModelText(), code: OPENAI_IMAGE_NO_MODEL_CODE });
+    }
     if (requestedProviderType === 'openai-image' && !isOpenAIImageModelId(selectedModel)) {
       return res.status(400).json({
         ok: false,
@@ -7433,6 +7608,73 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // ─── OpenAI image spend: the daily cap and the owner's override ─────────────
+  // app_settings values here are JSON; a bare string reads as itself.
+  const readJsonAppSetting = (key) => {
+    let row = null;
+    try {
+      row = stmts.getAppSetting?.get?.(key) || null;
+    } catch {
+      row = null;
+    }
+    if (!row || row.value === null || row.value === undefined) return undefined;
+    try {
+      return JSON.parse(row.value);
+    } catch {
+      return row.value;
+    }
+  };
+  // The relay's local day, the one image spend is booked and capped by.
+  const relayLocalDay = () => {
+    try {
+      const day = String(tokenUsageService?.localDay?.() || '');
+      if (/^\d{4}-\d{2}-\d{2}$/.test(day)) return day;
+    } catch {}
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  };
+  /**
+   * The cap fields every OpenAI settings answer carries: `imageDailyCapUsd`
+   * (USD; 0 = no cap; never saved = the default), `imagesAllowedToday` (the
+   * owner allowed image turns past the cap for the relay's current day) and
+   * `imagesAllowedAt` (when, while it holds).
+   */
+  const openAIImageSpendSettingsPayload = () => {
+    const stored = readJsonAppSetting(OPENAI_IMAGE_SPEND_SETTING_KEYS.dailyCapUsd);
+    const cap = stored === undefined ? OPENAI_IMAGE_DAILY_CAP_DEFAULT_USD : Number(stored);
+    const allowed = readJsonAppSetting(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideDay) === relayLocalDay();
+    const allowedAt = allowed ? readJsonAppSetting(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideAt) : null;
+    return {
+      // An unreadable value is the default, never "no cap".
+      imageDailyCapUsd: Number.isFinite(cap) && cap >= 0 ? cap : OPENAI_IMAGE_DAILY_CAP_DEFAULT_USD,
+      imagesAllowedToday: allowed,
+      imagesAllowedAt: allowed && typeof allowedAt === 'string' ? allowedAt : null,
+    };
+  };
+  /** Writes the parsed cap fields together; throws when the settings cannot be written. */
+  const writeOpenAIImageSpendSettings = (change) => {
+    if (typeof stmts?.upsertAppSetting?.run !== 'function' || typeof stmts?.deleteAppSetting?.run !== 'function') {
+      throw new Error('OpenAI image settings are unavailable');
+    }
+    const nowIso = new Date().toISOString();
+    db.transaction(() => {
+      if (change.dailyCapUsd !== undefined) {
+        stmts.upsertAppSetting.run(OPENAI_IMAGE_SPEND_SETTING_KEYS.dailyCapUsd, JSON.stringify(change.dailyCapUsd), nowIso);
+      }
+      // Changing the cap keeps the override; only the switch sets or ends it.
+      if (change.allowToday === true) {
+        stmts.upsertAppSetting.run(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideDay, JSON.stringify(relayLocalDay()), nowIso);
+        stmts.upsertAppSetting.run(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideAt, JSON.stringify(nowIso), nowIso);
+      } else if (change.allowToday === false) {
+        stmts.deleteAppSetting.run(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideDay);
+        stmts.deleteAppSetting.run(OPENAI_IMAGE_SPEND_SETTING_KEYS.overrideAt);
+      }
+    })();
+    try {
+      notifyOpenAIImageSpendChanged();
+    } catch {}
+  };
+
   app.get('/api/settings/openai', auth, (_req, res) => {
     const settings = getOpenAIProviderSettings();
     return res.json({
@@ -7440,12 +7682,43 @@ export function registerSessionsRoutes(app, deps) {
       enabled: settings?.enabled === true,
       model: String(settings?.model || 'gpt-4o').trim() || 'gpt-4o',
       baseUrl: String(settings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+      // What New Chat preselects for an OpenAI Image chat (null: no image model on).
+      imageDefaultModel: settings?.enabled === true
+        ? (pickOpenAIImageDefaultModel([settings.model, ...(Array.isArray(settings.models) ? settings.models : [])]) || null)
+        : null,
+      ...openAIImageSpendSettingsPayload(),
     });
   });
 
   app.post('/api/settings/openai', auth, async (req, res) => {
+    // The image cap and "Allow for today" are the owner's alone: an agent of
+    // this relay or a paired one could lift the cap on itself. Nothing of the
+    // request is applied then.
+    const imageSpend = parseOpenAIImageSpendSettingsRequest(req.body);
+    if (imageSpend.present && readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      return res.status(403).json({ error: 'The OpenAI image cap and "Allow for today" are this relay\'s owner\'s settings alone.' });
+    }
+    if (!imageSpend.ok) return res.status(400).json({ error: imageSpend.error });
     const parsed = parseOpenAISettingsUpdateRequest(req.body);
-    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (!parsed.ok && !(parsed.empty && imageSpend.present)) return res.status(400).json({ error: parsed.error });
+    if (!parsed.ok) {
+      // The cap fields alone: the provider settings stay as they are.
+      try {
+        writeOpenAIImageSpendSettings(imageSpend);
+      } catch (error) {
+        return res.status(500).json({ error: String(error?.message || error) });
+      }
+      const current = getOpenAIProviderSettings();
+      const payload = {
+        configured: current?.configured === true,
+        enabled: current?.enabled === true,
+        model: String(current?.model || 'gpt-4o').trim() || 'gpt-4o',
+        baseUrl: String(current?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
+        ...openAIImageSpendSettingsPayload(),
+      };
+      io.emit('openai_settings_updated', payload);
+      return res.json({ ok: true, ...payload, models: [], warning: null });
+    }
     const previous = getOpenAIProviderSettings();
     const result = setOpenAIProviderSettings(parsed);
     if (!result?.ok) {
@@ -7457,6 +7730,14 @@ export function registerSessionsRoutes(app, deps) {
         startedConversationCount: Number(result?.startedConversationCount || 0),
         activeQueueConversationCount: Number(result?.activeQueueConversationCount || 0),
       });
+    }
+    let imageSpendError = null;
+    if (imageSpend.present) {
+      try {
+        writeOpenAIImageSpendSettings(imageSpend);
+      } catch (error) {
+        imageSpendError = `The image cap was not saved: ${String(error?.message || error)}`;
+      }
     }
     const shouldDiscover = result.enabled === true && (
       !!parsed.apiKey
@@ -7496,6 +7777,7 @@ export function registerSessionsRoutes(app, deps) {
       model: String(currentSettings?.model || result.model || 'gpt-4o').trim() || 'gpt-4o',
       baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
       reconciliation,
+      ...openAIImageSpendSettingsPayload(),
     };
     io.emit('models_updated', modelsUpdatedPayload(
       getModelCatalogState(),
@@ -7509,11 +7791,59 @@ export function registerSessionsRoutes(app, deps) {
       ok: true,
       ...settingsPayload,
       models: Array.isArray(discovery?.models) ? discovery.models : [],
-      warning: reconciliationFailures.length
+      warning: imageSpendError || (reconciliationFailures.length
         ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
+        : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed'))),
     });
   });
+
+  // ─── OpenAI image presets ─────────────────────────────────────────────────
+  // The built-ins and the owner's own (app_settings openai_image_presets).
+  // Every change is one preset, read and written in one transaction, so two
+  // pages saving at once cannot drop each other's preset. A paired relay's
+  // agent may read them (relay_info lists them) but never change them.
+  const readOwnOpenAIImagePresets = () => parseOwnOpenAIImagePresets(readJsonAppSetting(OPENAI_IMAGE_PRESETS_SETTING_KEY) ?? []);
+  const openAIImagePresetsPayload = (own = readOwnOpenAIImagePresets()) => ({ presets: listOpenAIImagePresets(own) });
+  const changeOwnOpenAIImagePresets = (req, res, change) => {
+    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      return res.status(403).json({ error: 'Image presets are changed by this relay\'s owner only.' });
+    }
+    if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+      return res.status(500).json({ error: 'Image preset settings are unavailable' });
+    }
+    let outcome;
+    try {
+      outcome = db.transaction(() => {
+        const applied = applyOwnOpenAIImagePresetChange(readOwnOpenAIImagePresets(), change);
+        if (applied.ok) {
+          stmts.upsertAppSetting.run(OPENAI_IMAGE_PRESETS_SETTING_KEY, JSON.stringify(applied.presets), new Date().toISOString());
+        }
+        return applied;
+      })();
+    } catch (error) {
+      return res.status(500).json({ error: String(error?.message || error) });
+    }
+    if (!outcome.ok) {
+      return res.status(400).json({ error: outcome.error, code: OPENAI_IMAGE_PRESET_REFUSED_CODE });
+    }
+    const payload = openAIImagePresetsPayload(outcome.presets);
+    io.emit('openai_image_presets_updated', payload);
+    return res.json({ ok: true, ...payload });
+  };
+
+  app.get(OPENAI_IMAGE_PRESETS_PATH, auth, (_req, res) => res.json(openAIImagePresetsPayload()));
+
+  // body { preset: { name, size?, quality?, count?, output_format?, background? }, replace? }
+  app.put(OPENAI_IMAGE_PRESETS_PATH, auth, (req, res) => changeOwnOpenAIImagePresets(req, res, {
+    op: 'put',
+    preset: req.body?.preset ?? null,
+    replace: req.body?.replace === true,
+  }));
+
+  app.delete(`${OPENAI_IMAGE_PRESETS_PATH}/:name`, auth, (req, res) => changeOwnOpenAIImagePresets(req, res, {
+    op: 'delete',
+    name: String(req.params?.name ?? ''),
+  }));
 
   // Copilot has no credentials or model list of its own in settings (it
   // authenticates through the host's `copilot` login and its catalog comes from
@@ -9452,6 +9782,23 @@ export function registerSessionsRoutes(app, deps) {
       deepseekActuals: deepseekEnabled ? readDeepSeekActuals() : null,
       claudeApiCard,
     });
+    // OpenAI images: today's spend against the daily cap, from the booking.
+    if (typeof getOpenAIImageSpendState === 'function') {
+      const conversationId = String(req.query?.conversationId || '').trim();
+      let imageSpendState = null;
+      let imageSpendError = null;
+      try {
+        imageSpendState = await getOpenAIImageSpendState(conversationId ? { conversationId } : {});
+      } catch (error) {
+        imageSpendError = String(error?.message || error);
+      }
+      let openAIConfigured = false;
+      try {
+        openAIConfigured = getOpenAIProviderSettings()?.configured === true;
+      } catch {}
+      const imageCard = buildOpenAIImagePlanCard({ state: imageSpendState, error: imageSpendError, configured: openAIConfigured });
+      if (imageCard && Array.isArray(report.providers)) report.providers.push(imageCard);
+    }
     // Every tab's Tokens sections, from the token booking.
     if (tokenUsageService) {
       appendTokenSections(report.providers, (options) => tokenUsageService.readPeriods(options), {

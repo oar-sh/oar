@@ -148,6 +148,9 @@ export function createSdkMessageNormalizer() {
         openThought = { reasoningId: allocateThoughtId(), text: '' };
       }
       openThought.text = capThought(openThought.text + chunk);
+      // Gated as stream text; the thought's close sends the whole text.
+      if (!shouldEmitStreamUpdate(openThought.text, openThought.lastEmittedText)) return actions;
+      openThought.lastEmittedText = openThought.text;
       actions.push({
         channel: 'thought',
         payload: {

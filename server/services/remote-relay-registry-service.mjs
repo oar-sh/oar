@@ -226,7 +226,9 @@ export function createRemoteRelayRegistry({
       version: toText(version) || null,
       platform: toText(platform) || null,
       publicUrl: settings.publicUrl || null,
-      remoteRelays: { protocol: REMOTE_RELAY_PROTOCOL, inbound: settings.inboundEnabled },
+      // imageInputs: send and create_session may carry images and image
+      // options here; an older relay would drop them and run the turn without.
+      remoteRelays: { protocol: REMOTE_RELAY_PROTOCOL, inbound: settings.inboundEnabled, imageInputs: true },
     };
   }
 

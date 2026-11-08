@@ -17,6 +17,9 @@ function createMockApp() {
     patch(path, ...handlers) {
       routes.set(`PATCH ${path}`, handlers);
     },
+    put(path, ...handlers) {
+      routes.set(`PUT ${path}`, handlers);
+    },
     delete(path, ...handlers) {
       routes.set(`DELETE ${path}`, handlers);
     },

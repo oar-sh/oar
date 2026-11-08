@@ -131,7 +131,8 @@ export async function loadRelayQuestions(conversationId) {
   // after a link the relay did not know: its notice keeps the screen empty
   // until the reader opens something.
   const readingAView = document.body?.classList?.contains('inbox-view-active')
-    || document.body?.classList?.contains('status-view-active');
+    || document.body?.classList?.contains('status-view-active')
+    || document.body?.classList?.contains('media-view-active');
   if (!conversationId && pending.length && !readingAView && !isConversationAutoOpenHeld()) {
     const latest = pending
       .slice()

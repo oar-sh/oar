@@ -545,6 +545,9 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'update_session', relay: 'this', session: 'conv-a', model: 'claude-opus-5', effort: 'high', mode: 'plan', auto_compact_window: 200000, title: 'Docs pass', group: 'Docs', thinking_enabled: false, thinking_display: 'omitted', cwd: '/home/dev/next' },
     { action: 'update_session', relay: 'this', session: 'conv-a', group: null, auto_compact_window: 'auto' },
     { action: 'update_session', relay: 'this', session: 'conv-a', group: 'none' },
+    { action: 'update_session', relay: 'this', session: 'conv-a', image: { size: '1536x1024', quality: 'low', background: 'opaque' } },
+    { action: 'send', relay: 'this', session: 'conv-a', text: 'warmer light', images: ['/home/dev/project/sketch.png'], image: { size: '1024x1024', count: 2 } },
+    { action: 'create_session', relay: 'this', text: 'a lighthouse', provider: 'openai', model: 'gpt-image-2', images: ['C:\\Users\\dev\\ref.webp'], image: { output_format: 'webp' } },
     { action: 'answer_question', relay: 'this', session: 'conv-a', question_id: 'q-1', choices: ['Yes'] },
     { action: 'stop', relay: 'this', session: 'conv-a' },
     { action: 'archive', relay: 'this', session: 'conv-a' },
@@ -734,7 +737,7 @@ test('create_session refuses an argument it does not take and lists its argument
   assert.equal(refused.ok, false);
   assert.equal(refused.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
   assert.match(refused.error, /^create_session does not take: groupId, scope, session\./);
-  assert.match(refused.error, /Its arguments: relay, text, provider, model, cwd, repo, branch, mode, effort, title, group, wait_seconds, planOnly\./);
+  assert.match(refused.error, /Its arguments: relay, text, provider, model, cwd, repo, branch, mode, effort, title, group, wait_seconds, planOnly, images, image\./);
   assert.match(refused.error, /Nothing was created\./);
   // The refusal comes first, before any other check of the call.
   assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', bogus: 1 }).error.startsWith('create_session does not take: bogus'), true);
@@ -811,7 +814,7 @@ test('update_session: a full-permission write action on one session, with the se
   assert.equal(isRemoteRelayWriteAction('update_session'), true);
   assert.equal(remoteRelayPermissionAllows('prompt', 'update_session'), false);
   assert.equal(remoteRelayPermissionAllows('full', 'update_session'), true);
-  assert.deepEqual([...REMOTE_RELAY_SESSION_SETTINGS], ['model', 'effort', 'mode', 'auto_compact_window', 'title', 'group', 'thinking_enabled', 'thinking_display', 'cwd', 'planOnly']);
+  assert.deepEqual([...REMOTE_RELAY_SESSION_SETTINGS], ['model', 'effort', 'mode', 'auto_compact_window', 'title', 'group', 'thinking_enabled', 'thinking_display', 'cwd', 'planOnly', 'image']);
   assert.deepEqual([...REMOTE_RELAY_ACTION_ARGUMENTS.update_session], ['session', ...REMOTE_RELAY_SESSION_SETTINGS]);
   const parsed = validateRemoteRelayToolInput({
     action: 'update_session', relay: 'this', session: ' conv-a ', model: ' claude-opus-5 ', effort: 'HIGH', mode: 'Plan',
@@ -881,7 +884,7 @@ test('update_session: auto_compact_window, thinking and mode are checked for the
 test('update_session refuses an argument it does not take, the owner-only switch with a word on why', () => {
   const refused = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', model: 'x', text: 'go' });
   assert.equal(refused.ok, false);
-  assert.match(refused.error, /^update_session does not take: text\. Its arguments: relay, session, model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd, planOnly\. Nothing was changed\.$/);
+  assert.match(refused.error, /^update_session does not take: text\. Its arguments: relay, session, model, effort, mode, auto_compact_window, title, group, thinking_enabled, thinking_display, cwd, planOnly, image\. Nothing was changed\.$/);
   const owner = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', may_create_sessions: true });
   assert.equal(owner.ok, false);
   assert.match(owner.error, /does not take: may_create_sessions\..*the owner's setting alone/);
@@ -937,4 +940,122 @@ test('planOnly: create_session and update_session take it as a boolean; the sche
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /clears it only with planOnly:false and another mode in the same call \(alone, planOnly:false changes nothing, and on a plan-only session the answer says so\)/);
   assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.planOnly.description, /only together with a mode other than plan; alone it changes nothing \(on a plan-only session the answer says so\)/);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /list_sessions and read_session show planOnly/);
+});
+// platform-agnostic: the contract checks image paths as text for any target
+// platform (POSIX or drive paths); the target relay resolves them.
+test('images and image: send and create_session to an image session; update_session sets the defaults', () => {
+  const send = validateRemoteRelayToolInput({
+    action: 'send', relay: 'this', session: 'conv-a', text: 'make it night',
+    images: [' /home/dev/project/a.png ', '/home/dev/project/a.png', 'E:\\art\\b.jpg', 'D:/art/c.webp'],
+    image: { size: '2048X1152', quality: 'High', count: 4, output_format: 'png', background: 'transparent' },
+  });
+  assert.equal(send.ok, true, send.error);
+  assert.deepEqual(send.args.images, ['/home/dev/project/a.png', 'E:\\art\\b.jpg', 'D:/art/c.webp'], 'trimmed, a repeated path once');
+  assert.deepEqual(send.args.image, { size: '2048x1152', quality: 'high', count: 4, output_format: 'png', background: 'transparent' });
+  // One path as text is a list of one.
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 't', images: '/home/dev/x.png' }).args.images, ['/home/dev/x.png']);
+  // Empty values are no argument.
+  const empty = validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 't', images: [], image: { size: '', quality: null } });
+  assert.equal(empty.ok, true, empty.error);
+  assert.equal('images' in empty.args, false);
+  assert.equal('image' in empty.args, false);
+
+  const refusals = [
+    [{ images: ['project/a.png'] }, /not an absolute local path/],
+    [{ images: ['~/a.png'] }, /not an absolute local path/],
+    [{ images: ['file:///home/dev/a.png'] }, /not an absolute local path/],
+    [{ images: ['\\\\fileserver\\share\\b.png'] }, /no network paths/],
+    [{ images: ['//fileserver/share/b.png'] }, /no network paths/],
+    [{ images: ['\\\\?\\C:\\art\\b.png'] }, /no network paths/],
+    [{ images: ['\\\\.\\pipe\\x'] }, /no network paths/],
+    [{ images: ['/home/dev/a\0.png'] }, /not a path/],
+    [{ images: ['/' + 'a'.repeat(REMOTE_RELAY_LIMITS.imagePathMaxChars)] }, /too long/],
+    [{ images: ['/a1.png', '/a2.png', '/a3.png', '/a4.png', '/a5.png'] }, /at most 4 paths/],
+    [{ images: [7] }, /list of absolute file paths/],
+    [{ images: { path: '/a.png' } }, /list of absolute file paths/],
+    [{ image: { size: '1000x1000' } }, /^image\.size 1000x1000: both edges must be multiples of 16/],
+    [{ image: { size: '4096x1024' } }, /longer edge/],
+    [{ image: { count: 5 } }, /1 to 4/],
+    [{ image: { quality: 'ultra' } }, /image\.quality must be one of/],
+    [{ image: { output_format: 'gif' } }, /png, webp, jpeg/],
+    [{ image: { seed: 3 } }, /image does not take: seed/],
+    [{ image: '1024x1024' }, /image must be an object/],
+  ];
+  for (const [extra, pattern] of refusals) {
+    for (const base of [
+      { action: 'send', relay: 'this', session: 'conv-a', text: 'go' },
+      { action: 'create_session', relay: 'this', text: 'go', provider: 'openai' },
+    ]) {
+      const result = validateRemoteRelayToolInput({ ...base, ...extra });
+      assert.equal(result.ok, false, JSON.stringify(extra));
+      assert.equal(result.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+      assert.match(result.error, pattern, JSON.stringify(extra));
+    }
+  }
+  // Another provider, or send's Claude billing, cannot carry them.
+  assert.match(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', provider: 'claude', images: ['/a.png'] }).error, /provider "openai"/);
+  assert.match(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', provider: 'cursor', image: { size: 'auto' } }).error, /provider "openai"/);
+  assert.match(validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 'go', provider: 'claude-api', images: ['/a.png'] }).error, /not with provider/);
+  // Without a provider the target's own (or the default) decides: the relay checks the model.
+  assert.equal(validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', images: ['/a.png'] }).ok, true);
+
+  const update = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', image: { quality: 'MEDIUM', size: 'auto' } });
+  assert.equal(update.ok, true, update.error);
+  assert.deepEqual(update.args, { relay: 'this', session: 'conv-a', image: { quality: 'medium', size: 'auto' } });
+  assert.ok(REMOTE_RELAY_SESSION_SETTINGS.includes('image'));
+  assert.match(validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', image: { count: 0 } }).error, /1 to 4/);
+  assert.match(validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', image: {} }).error, /at least one setting/);
+  assert.match(validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', images: ['/a.png'] }).error, /update_session does not take: images/);
+
+  // Other actions name them in ignored.
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'read_session', relay: 'this', session: 'c', images: ['/a.png'] }).ignored, ['images']);
+
+  const properties = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties;
+  assert.equal(properties.images.maxItems, REMOTE_RELAY_LIMITS.imagesMax);
+  assert.deepEqual(Object.keys(properties.image.properties), ['size', 'quality', 'count', 'output_format', 'background', 'preset']);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /images \[\{path, width, height, mime\}\]/);
+});
+
+test('image.preset: a turn names a preset by its shape alone; update_session takes none', () => {
+  const send = validateRemoteRelayToolInput({
+    action: 'send', relay: 'this', session: 'conv-a', text: 'a harbour at dusk',
+    image: { preset: '  Wallpaper   4K ', quality: 'Medium' },
+  });
+  assert.equal(send.ok, true, send.error);
+  // The name cleaned (trimmed, single spaces), the fields next to it checked;
+  // which preset it is, the target relay decides.
+  assert.deepEqual(send.args.image, { quality: 'medium', preset: 'Wallpaper 4K' });
+  const created = validateRemoteRelayToolInput({ action: 'create_session', relay: 'this', text: 'go', provider: 'openai', image: { preset: 'Lantern sketches' } });
+  assert.equal(created.ok, true, created.error);
+  assert.deepEqual(created.args.image, { preset: 'Lantern sketches' }, 'a name this relay does not know is the target\'s to judge');
+  // An empty preset is no preset.
+  const blank = validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 't', image: { preset: '  ', size: 'auto' } });
+  assert.deepEqual(blank.args.image, { size: 'auto' });
+  assert.equal('image' in validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 't', image: { preset: null } }).args, false);
+
+  for (const [preset, pattern] of [
+    ['x'.repeat(41), /^image\.preset: a preset name has at most 40 characters$/],
+    [7, /^image\.preset: a preset name must be text$/],
+    ['Draft\u200bsquare', /control or invisible characters/],
+  ]) {
+    const refused = validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 't', image: { preset } });
+    assert.equal(refused.ok, false, String(preset));
+    assert.equal(refused.code, REMOTE_RELAY_ERROR_CODES.invalidInput);
+    assert.match(refused.error, pattern);
+  }
+  // The fields next to a preset are checked as ever.
+  assert.match(validateRemoteRelayToolInput({ action: 'send', relay: 'this', session: 'c', text: 't', image: { preset: 'Sticker', count: 9 } }).error, /1 to 4/);
+
+  const defaults = validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', image: { preset: 'Sticker', size: '1024x1024' } });
+  assert.equal(defaults.ok, false);
+  assert.match(defaults.error, /^image\.preset: a preset is per turn \(send, create_session\); name its fields to set defaults$/);
+  // An empty one is no preset there either.
+  assert.equal(validateRemoteRelayToolInput({ action: 'update_session', relay: 'this', session: 'conv-a', image: { preset: '', size: 'auto' } }).ok, true);
+
+  const schema = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.image.properties.preset;
+  assert.equal(schema.type, 'string');
+  assert.equal(schema.maxLength, 40);
+  assert.match(schema.description, /"Draft square", "Photo landscape", "Portrait", "Wallpaper 4K", "Sticker"/);
+  assert.match(schema.description, /fields named next to it win over it/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /imagePresets/);
 });

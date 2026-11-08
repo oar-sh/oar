@@ -30,6 +30,22 @@ import {
   validateRemoteRelayToolInput,
   withRemotePromptHeader,
 } from '../../shared/remote-relay-contract.mjs';
+import {
+  IMAGE_INPUT_REFUSED_CODE,
+  OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
+  OPENAI_IMAGE_NO_MODEL_CODE,
+  formatOpenAIImageSummary,
+  isOpenAIImageModelId,
+  openAIImageModelNeedsOpenAIText,
+  openAIImageNoModelText,
+  pickOpenAIImageDefaultModel,
+} from '../../shared/openai-image-options.mjs';
+import {
+  OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
+  OPENAI_IMAGE_PRESETS_PATH,
+  OPENAI_IMAGE_USAGE_PATH,
+  formatOpenAIImageUsd,
+} from '../../shared/openai-image-spend.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
 import { PLAN_ONLY_ERROR_CODE, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { matchQuestionChoice } from '../../shared/question-answer-rule.mjs';
@@ -110,6 +126,8 @@ const PROGRESS_ACTIVITY_COUNT = 5;
 const ACTIVITY_LINE_MAX = 300;
 const ACTIVITY_LINES_PER_MESSAGE = 20;
 const REPLY_TEXT_MAX = REMOTE_RELAY_LIMITS.perMessageChars * 2;
+// The images one message lists (an image turn makes at most four).
+const REPLY_IMAGES_MAX = 8;
 // A message that would only fit as a stub is dropped instead (read_session).
 const MIN_TRIMMED_MESSAGE_CHARS = 200;
 const TITLE_MAX = 80;
@@ -316,12 +334,17 @@ function catalogModelsLabelled(catalog, label) {
     .map(([model]) => model);
 }
 
-/** Copilot's catalogue: every model of /api/models no other provider claims alone. */
+/**
+ * Copilot's catalogue: every model of /api/models no other provider claims
+ * alone, without image ids (a relay that predates their filter lists them;
+ * the Copilot runtime cannot serve them).
+ */
 function catalogGithubModels(catalog) {
   const models = catalog?.models || {};
   const providersByModel = isPlainObject(models.providersByModel) ? models.providersByModel : {};
   const catalogModels = Array.isArray(models.models) ? models.models.map(toText).filter(Boolean) : [];
   return catalogModels.filter((model) => {
+    if (isOpenAIImageModelId(model)) return false;
     const providers = catalogProvidersFor(providersByModel, model);
     return providers.length === 0 || providers.includes(CATALOG_PROVIDER_LABELS.github);
   });
@@ -426,6 +449,61 @@ function isTransientRemoteError(error) {
 
 // POST /api/message answers a replayed messageId with this (409).
 const DUPLICATE_MESSAGE_ID_CODE = 'DUPLICATE_MESSAGE_ID';
+
+// The actions that carry images or image options to the target.
+const IMAGE_INPUT_ACTIONS = new Set(['send', 'create_session', 'update_session']);
+
+function imageInputRefusalText(error) {
+  const body = isPlainObject(error?.remoteBody) ? error.remoteBody : null;
+  if (toText(body?.code) !== IMAGE_INPUT_REFUSED_CODE) return null;
+  return toText(body.error).replace(/[.\s]+$/, '') || 'refused';
+}
+
+/** The target's words when its OpenAI image cap refused a send (409), or null for any other error. */
+function imageCapRefusalText(error) {
+  const body = isPlainObject(error?.remoteBody) ? error.remoteBody : null;
+  if (toText(body?.code) !== OPENAI_IMAGE_DAILY_CAP_REACHED_CODE) return null;
+  return toText(body.error) || 'the daily cap of OpenAI image spend is reached';
+}
+
+/** A route the target does not have: an OAR from before it. */
+function isMissingRemoteRoute(error) {
+  return Number(error?.status) === 404 || toText(error?.code) === REMOTE_RELAY_ERROR_CODES.notFound;
+}
+
+/**
+ * The spend state of a target's OpenAI images as the agent reads it (the
+ * `usage` action's entry), or null for a state that says nothing.
+ */
+function openAIImageSpendEntry(state) {
+  if (!isPlainObject(state)) return null;
+  const number = (value) => {
+    const parsed = Number(value);
+    return value !== null && value !== undefined && value !== '' && Number.isFinite(parsed) ? parsed : null;
+  };
+  const used = Math.round(((number(state.spentUsd) ?? 0) + (number(state.reservedUsd) ?? 0)) * 100) / 100;
+  const cap = number(state.capUsd);
+  const capUsd = cap !== null && cap > 0 ? cap : null;
+  const remaining = capUsd === null ? null : Math.max(0, Math.round((capUsd - used) * 100) / 100);
+  const allowedToday = state.allowedToday === true;
+  const reached = capUsd !== null && state.reached === true;
+  const text = capUsd === null
+    ? `today ${formatOpenAIImageUsd(used)}, no daily cap`
+    : `today ${formatOpenAIImageUsd(used)} of the daily cap of ${formatOpenAIImageUsd(capUsd)} (${Math.round((used / capUsd) * 100)} %), ${formatOpenAIImageUsd(remaining)} left`
+      + (reached ? (allowedToday ? '; past the cap, allowed for today by the owner' : '; new image turns are refused until tomorrow (relay time) or until the owner allows more for today') : '');
+  return {
+    label: 'OpenAI images',
+    day: toText(state.day) || null,
+    usedUsd: used,
+    capUsd,
+    remainingUsd: remaining,
+    ...(number(state.monthUsd) !== null ? { monthUsd: number(state.monthUsd) } : {}),
+    warning: state.warning === true,
+    reached,
+    allowedToday,
+    text,
+  };
+}
 
 function isOwnDuplicateMessage(error, messageId) {
   const body = isPlainObject(error?.remoteBody) ? error.remoteBody : null;
@@ -586,13 +664,61 @@ export function remoteFollowUpState(rows, replyMessageId, page, { sawBackgroundW
   };
 }
 
+function positiveIntOrNull(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function generatedImageAttachments(row) {
+  return (Array.isArray(row?.attachments) ? row.attachments : []).filter((entry) => isPlainObject(entry?.generatedImage));
+}
+
+/**
+ * The images an assistant message made, as the agent reads them: their files
+ * on the target relay (which a later send there can attach), size and type.
+ * A relay that does not give the path (an older one, a file gone) lists none.
+ */
+function replyImagesOf(row) {
+  const images = [];
+  for (const attachment of generatedImageAttachments(row)) {
+    const path = toText(attachment.generatedImage.path);
+    if (!path) continue;
+    images.push({
+      path,
+      width: positiveIntOrNull(attachment.width),
+      height: positiveIntOrNull(attachment.height),
+      mime: toText(attachment.type) || null,
+    });
+    if (images.length >= REPLY_IMAGES_MAX) break;
+  }
+  return images;
+}
+
+/**
+ * An assistant message's text, or for an image turn whose model wrote none
+ * the line on what it made ("1 image · 1536x1024 · gpt-image-2"): newer
+ * relays store that line as the text, older messages have nothing.
+ */
+function assistantText(row, model = '') {
+  const text = String(row?.text ?? '');
+  if (text.trim()) return text;
+  const generated = generatedImageAttachments(row);
+  if (!generated.length) return text;
+  return formatOpenAIImageSummary({
+    images: generated.map((attachment) => ({ width: positiveIntOrNull(attachment.width), height: positiveIntOrNull(attachment.height) })),
+    model: toText(row?.model) || toText(model),
+  });
+}
+
 function replyOf(row, extra = {}) {
-  const clipped = clipMiddle(toText(row?.text), REPLY_TEXT_MAX);
+  const clipped = clipMiddle(toText(assistantText(row)), REPLY_TEXT_MAX);
+  const images = replyImagesOf(row);
   return {
     text: clipped.text,
     model: toText(row?.model) || null,
     messageId: toText(row?.id) || null,
     ...(clipped.truncated ? { truncated: true } : {}),
+    ...(images.length ? { images } : {}),
     ...extra,
   };
 }
@@ -1453,24 +1579,43 @@ export function createRemoteRelayDispatcher({
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unsupported,
         `Relay "${ctx.relay.name}" reports only the Copilot quota in an older shape; it needs an update for plan usage per provider.`);
     }
-    const limit = await call(ctx, 'GET', '/api/usage-limit').catch(() => null);
-    const providers = cards.slice(0, 12).map(usageCard).filter(Boolean);
+    const [limit, imageSpend] = await Promise.all([
+      call(ctx, 'GET', '/api/usage-limit').catch(() => null),
+      // OpenAI images against the relay's daily cap; an OAR from before the
+      // cap has no route for it, and then no entry.
+      call(ctx, 'GET', OPENAI_IMAGE_USAGE_PATH)
+        .then((state) => ({ entry: openAIImageSpendEntry(state) }))
+        .catch((error) => ({ entry: null, failed: !isMissingRemoteRoute(error) })),
+    ]);
+    const openaiImages = imageSpend.entry;
+    // The entry says it all: the report's own OpenAI images card would be a second copy.
+    const providers = cards.slice(0, 12).map(usageCard).filter(Boolean)
+      .filter((card) => !(openaiImages && card.provider === 'openai'));
     const set = providers.filter((card) => !['not-configured', 'unavailable'].includes(card.status)).map((card) => card.provider);
     const usageLimit = limit?.ok === true ? usageLimitState(limit) : null;
+    const notes = [
+      usageLimit ? '' : 'The usage-limit state was not available there.',
+      imageSpend.failed ? 'The OpenAI image spend was not available there.' : '',
+    ].filter(Boolean);
     return {
-      summary: `usage → ${ctx.relay.name}: ${set.join(', ') || 'no provider'} reported${usageLimit?.pauses?.length ? `, ${usageLimit.pauses.length} paused at a usage limit` : ''}`,
+      summary: `usage → ${ctx.relay.name}: ${set.join(', ') || 'no provider'} reported${usageLimit?.pauses?.length ? `, ${usageLimit.pauses.length} paused at a usage limit` : ''}${openaiImages ? `; OpenAI images ${openaiImages.text}` : ''}`,
       providers,
+      ...(openaiImages ? { openaiImages } : {}),
       usageLimit,
-      ...(usageLimit ? {} : { note: 'The usage-limit state was not available there.' }),
+      ...(notes.length ? { note: notes.join(' ') } : {}),
     };
   }
 
   async function relayInfo(ctx) {
-    const [identity, catalog, groups] = await Promise.all([
+    const [identity, catalog, groups, presets] = await Promise.all([
       call(ctx, 'GET', '/api/relay/identity').catch(() => null),
       loadCatalog(ctx),
       relayGroups(ctx),
+      // The image presets a send or create_session may name; an OAR from
+      // before them has no route, and then no list.
+      call(ctx, 'GET', OPENAI_IMAGE_PRESETS_PATH).catch(() => null),
     ]);
+    const imagePresets = Array.isArray(presets?.presets) ? relayImagePresets(presets.presets) : null;
     const status = catalog.status;
     const providers = buildProviders(catalog);
     const remoteRelays = isPlainObject(identity?.remoteRelays) ? identity.remoteRelays : null;
@@ -1488,6 +1633,8 @@ export function createRemoteRelayDispatcher({
       // The inbound switch is about other relays' agents; this relay's own are
       // let in by the agent-sessions setting, which is on or this would not run.
       acceptsAgentPrompts: ctx.relay.local ? true : (remoteRelays ? remoteRelays.inbound !== false : null),
+      // Whether send and create_session may carry images and image there.
+      imageInputs: ctx.relay.local ? true : remoteRelays?.imageInputs === true,
       ...(ctx.relay.local ? {
         sessionRules: `create_session: at most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time; a session an agent created cannot create sessions unless the owner allowed it for that session (mayCreateSessions); sessions run on this relay's accounts. update_session: sessions you started freely, any other (the owner's, another agent's, your creator's) after the owner's Allow (once per conversation).`,
       } : {}),
@@ -1501,7 +1648,22 @@ export function createRemoteRelayDispatcher({
       defaultRelayMode: toText(status.defaultRelayMode) || null,
       // The session groups a create_session there may name (`group`).
       ...groups,
+      ...(imagePresets ? { imagePresets } : {}),
     };
+  }
+
+  /** A target's image presets as relay_info lists them: name, the values, builtIn. */
+  function relayImagePresets(list) {
+    return list.slice(0, 40).filter(isPlainObject).map((preset) => {
+      const name = toText(preset.name).slice(0, 40);
+      if (!name) return null;
+      const values = {};
+      for (const key of ['size', 'quality', 'count', 'output_format', 'background']) {
+        const value = preset[key];
+        if (key === 'count' ? Number.isInteger(value) : (typeof value === 'string' && value.trim())) values[key] = key === 'count' ? value : value.trim().slice(0, 40);
+      }
+      return { name, ...values, builtIn: preset.builtIn === true };
+    }).filter(Boolean);
   }
 
   /**
@@ -1724,7 +1886,8 @@ export function createRemoteRelayDispatcher({
     };
   }
 
-  function messageText(row) {
+  function messageText(row, sessionModel = '') {
+    if (row?.role === 'assistant') return assistantText(row, sessionModel);
     const text = String(row?.text ?? '');
     // The header line is ours (or another relay's): the badge fields say the
     // same, so the agent reads the prompt itself.
@@ -1737,7 +1900,7 @@ export function createRemoteRelayDispatcher({
    * returns a 9000-character reply whole, ten messages in the default 12000
    * still get 4000 each. A trimmed message keeps its head and its tail.
    */
-  function shapeMessages(rows, { maxChars, includeActivity }) {
+  function shapeMessages(rows, { maxChars, includeActivity, sessionModel = '' }) {
     const list = Array.isArray(rows) ? rows.filter(Boolean) : [];
     const out = [];
     const perMessageMax = Math.max(REMOTE_RELAY_LIMITS.perMessageChars, Math.floor(maxChars / Math.max(1, list.length)));
@@ -1745,7 +1908,7 @@ export function createRemoteRelayDispatcher({
     let omitted = 0;
     for (let index = list.length - 1; index >= 0; index -= 1) {
       const row = list[index];
-      const perMessage = clipMiddle(messageText(row), perMessageMax);
+      const perMessage = clipMiddle(messageText(row, sessionModel), perMessageMax);
       let text = perMessage.text;
       let truncated = perMessage.truncated;
       if (text.length > budget) {
@@ -1762,6 +1925,8 @@ export function createRemoteRelayDispatcher({
       // The newest lines, as the progress path reads them: the relay keeps the
       // newest per thread now, so the first ones are not the start anyway.
       const activities = includeActivity && role === 'assistant' ? activityTexts(row.activities, { fromEnd: true }) : [];
+      // Like the tool lines, outside the text budget: a few short entries.
+      const images = role === 'assistant' ? replyImagesOf(row) : [];
       out.unshift({
         id: toText(row.id),
         role,
@@ -1772,6 +1937,7 @@ export function createRemoteRelayDispatcher({
         ...(via ? { via } : {}),
         text,
         ...(truncated ? { truncated: true } : {}),
+        ...(images.length ? { images } : {}),
         ...(activities.length ? { activities } : {}),
       });
       if (budget <= 0 && index > 0) {
@@ -1800,9 +1966,12 @@ export function createRemoteRelayDispatcher({
       sessionWorkers(ctx),
     ]);
     const worker = workers.workerFor(conversationId);
+    const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
+    const sessionModel = toText(runtime.providerModel) || toText(conversation?.preferredModel) || toText(runtime.model) || null;
     const { messages, omitted } = shapeMessages(conversation?.messages, {
       maxChars: args.max_chars,
       includeActivity: args.include_activity,
+      sessionModel,
     });
     let olderCursor = null;
     if (omitted > 0 && messages.length) {
@@ -1813,7 +1982,6 @@ export function createRemoteRelayDispatcher({
         beforeTimestamp: toText(conversation.pageInfo.olderCursor.beforeTimestamp),
       });
     }
-    const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
     const via = toText(conversation?.origin?.relayName);
     const inFlight = progressSnapshot(conversation?.inFlight);
     // Its session group, with the other members and what each is doing.
@@ -1839,7 +2007,7 @@ export function createRemoteRelayDispatcher({
         id: conversationId,
         title: toText(conversation?.title),
         provider: toText(runtime.providerType) || 'github',
-        model: toText(runtime.providerModel) || toText(conversation?.preferredModel) || toText(runtime.model) || null,
+        model: sessionModel,
         mode: toText(conversation?.preferredRelayMode) || null,
         cwd: toText(conversation?.currentWorkspaceRootPath) || null,
         archived: conversation?.archived === true,
@@ -1983,7 +2151,7 @@ export function createRemoteRelayDispatcher({
    * When the replay fails too, nobody knows; the error carries the session
    * and message id so the agent checks with wait instead of sending again.
    */
-  async function postPrompt(ctx, { session, text, origin, model, mode, effort, billing = '' }) {
+  async function postPrompt(ctx, { session, text, origin, model, mode, effort, billing = '', imagePaths = null, image = null }) {
     const messageId = String(randomUUID());
     const body = {
       conversationId: session,
@@ -1993,6 +2161,9 @@ export function createRemoteRelayDispatcher({
       ...(model ? { model } : {}),
       ...(mode ? { relayMode: mode } : {}),
       ...(effort ? { reasoningEffort: effort } : {}),
+      // Read on the target: the paths are its own files.
+      ...(Array.isArray(imagePaths) && imagePaths.length ? { imagePaths } : {}),
+      ...(isPlainObject(image) && Object.keys(image).length ? { image } : {}),
     };
     // A Claude session moved to another billing with this message: one call,
     // which switches and enqueues together on the target, or does neither.
@@ -2003,12 +2174,12 @@ export function createRemoteRelayDispatcher({
     try {
       sent = await post();
     } catch (error) {
-      if (!isTransientRemoteError(error)) throw error;
+      if (!isTransientRemoteError(error)) throw imageInputFailure(ctx, error, session) || imageCapFailure(ctx, error, session) || error;
       try {
         sent = await post();
       } catch (retryError) {
         if (isOwnDuplicateMessage(retryError, messageId)) return { duplicate: false, messageId };
-        if (!isTransientRemoteError(retryError)) throw retryError;
+        if (!isTransientRemoteError(retryError)) throw imageInputFailure(ctx, retryError, session) || imageCapFailure(ctx, retryError, session) || retryError;
         throw new DispatchFailure(502, toText(retryError.code) || REMOTE_RELAY_ERROR_CODES.offline,
           `${toText(retryError.message) || `Relay "${ctx.relay.name}" did not answer`}; the prompt may or may not have been queued.`,
           {
@@ -2028,7 +2199,105 @@ export function createRemoteRelayDispatcher({
       duplicate: false,
       messageId: toText(sent?.messageId) || messageId,
       effort: normalizeEffort(sent?.selectedReasoningEffort),
+      // How many of the images the target attached; null when it does not say.
+      imageInputs: Number.isInteger(sent?.imageInputs) && sent.imageInputs >= 0 ? sent.imageInputs : null,
     };
+  }
+
+  /** The target's refusal of the images or image options, as the agent reads it, or null for any other error. */
+  function imageInputFailure(ctx, error, session) {
+    const reason = imageInputRefusalText(error);
+    if (reason === null) return null;
+    const refusal = new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+      `Relay "${ctx.relay.name}" refused the images or image options: ${reason}. Nothing was sent.`,
+      { session, remoteCode: IMAGE_INPUT_REFUSED_CODE });
+    refusal.imageInputReason = reason;
+    return refusal;
+  }
+
+  /**
+   * The target's OpenAI image cap refused the send (409): its words, which
+   * name the spend and the cap, and that nothing was sent; or null for any
+   * other error.
+   */
+  function imageCapFailure(ctx, error, session) {
+    const words = imageCapRefusalText(error);
+    if (words === null) return null;
+    const where = ctx.relay.local ? 'This relay' : `Relay "${ctx.relay.name}"`;
+    return new DispatchFailure(409, REMOTE_RELAY_ERROR_CODES.providerUnavailable,
+      `${where} refused the image turn: ${words.replace(/[.\s]+$/, '')}.${/nothing was sent/i.test(words) ? '' : ' Nothing was sent.'}`,
+      {
+        session,
+        remoteCode: OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
+        note: 'Ask the user to allow more for today (Settings → Providers → OpenAI on that relay) or wait until tomorrow (relay time); do not send it again before.',
+      });
+  }
+
+  /**
+   * Before create_session starts an OpenAI image session: refused when the
+   * target's daily cap of image spend is reached and the owner did not allow
+   * today, so no session is left behind. A target without the route (an OAR
+   * from before the cap) has no cap; any other failure to read it is no
+   * reason to stop, since the target checks the cap again at the send.
+   */
+  async function refuseAtImageCap(ctx) {
+    let state = null;
+    try {
+      // A target that hangs delays the session by 5 s at most; a timeout
+      // carries on like any other error (the send-time check decides).
+      state = await call(ctx, 'GET', OPENAI_IMAGE_USAGE_PATH, { timeoutMs: 5000 });
+    } catch {
+      return;
+    }
+    const entry = openAIImageSpendEntry(state);
+    if (!entry?.reached || entry.allowedToday) return;
+    const where = ctx.relay.local ? 'This relay' : `Relay "${ctx.relay.name}"`;
+    throw new DispatchFailure(409, REMOTE_RELAY_ERROR_CODES.providerUnavailable,
+      `${where} has reached its daily cap of OpenAI image spend: ${formatOpenAIImageUsd(entry.usedUsd)} today of ${formatOpenAIImageUsd(entry.capUsd)}. No session was created.`,
+      {
+        remoteCode: OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
+        note: 'Ask the user to allow more for today (Settings → Providers → OpenAI on that relay) or wait until tomorrow (relay time).',
+      });
+  }
+
+  /**
+   * A target that takes the images answers how many it attached. An older one
+   * that slipped in after the check (a downgrade) drops them silently and runs
+   * the turn without: the prompt is queued by then, so the agent is told.
+   */
+  function imageEchoNote(ctx, sent, imagePaths) {
+    const wanted = Array.isArray(imagePaths) ? imagePaths.length : 0;
+    if (!wanted || sent?.duplicate) return null;
+    const where = ctx.relay.local ? 'This relay' : `Relay "${ctx.relay.name}"`;
+    if (sent.imageInputs === null || sent.imageInputs === undefined) {
+      return `${where} did not confirm that it attached the ${wanted === 1 ? 'image' : `${wanted} images`}; the turn may run without them.`;
+    }
+    if (sent.imageInputs < wanted) {
+      return `${where} attached ${sent.imageInputs} of ${wanted} images; the turn may run without them.`;
+    }
+    return null;
+  }
+
+  /**
+   * images and image need a target that takes them: an older OAR passes the
+   * body fields over and runs (and bills) the turn without them. Its identity
+   * is read fresh: the stored copy keeps only the fields this relay knew of
+   * when it last probed. A relay without the identity route is older still.
+   */
+  async function refuseWithoutImageInputs(ctx, action) {
+    let identity = null;
+    try {
+      identity = await call(ctx, 'GET', '/api/relay/identity');
+    } catch (error) {
+      if (!(Number(error?.status) === 404 || toText(error?.code) === REMOTE_RELAY_ERROR_CODES.notFound)) throw error;
+    }
+    if (isPlainObject(identity?.remoteRelays) && identity.remoteRelays.imageInputs === true) return;
+    const nothing = action === 'update_session'
+      ? 'nothing was changed'
+      : (action === 'create_session' ? 'nothing was created or sent' : 'nothing was sent');
+    throw new DispatchFailure(409, REMOTE_RELAY_ERROR_CODES.unsupported,
+      `Relay "${ctx.relay.name}" runs an older OAR that cannot take images or image options: ${nothing}.`,
+      { note: 'Leave images and image out to work there without them, or ask the user to update that relay.' });
   }
 
   /**
@@ -2212,7 +2481,16 @@ export function createRemoteRelayDispatcher({
     const requested = normalizeEffort(args.effort) || normalizeEffort(settled?.effort);
     const own = requested ? '' : normalizeEffort(conversation?.preferredReasoningEffort);
     const origin = await buildOrigin(ctx);
-    const { sent, choice } = await postPromptWithEffort(ctx, { session, text: args.text, origin, model, mode, billing: switchTo }, {
+    const { sent, choice } = await postPromptWithEffort(ctx, {
+      session,
+      text: args.text,
+      origin,
+      model,
+      mode,
+      billing: switchTo,
+      imagePaths: args.images,
+      image: args.image,
+    }, {
       effort: requested || own,
       source: requested ? EFFORT_SOURCES.requested : (own ? EFFORT_SOURCES.remote : ''),
       note: null,
@@ -2220,6 +2498,8 @@ export function createRemoteRelayDispatcher({
     const billingNote = switchTo
       ? `Session ${session} now runs on ${switchTo === 'claude-api' ? 'the API key' : 'the subscription'}, from this message on (a running turn finishes on the old billing).`
       : '';
+    const imageNote = imageEchoNote(ctx, sent, args.images);
+    const note = [effortResult(choice).note, billingNote, imageNote].filter(Boolean).join(' ');
     return deliverAndWait('send', ctx, {
       session,
       sent,
@@ -2229,7 +2509,7 @@ export function createRemoteRelayDispatcher({
         ...(billing && REMOTE_RELAY_SEND_PROVIDERS.includes(provider) ? { provider: switchTo || provider } : {}),
         ...(switchTo ? { billingSwitched: true } : {}),
         ...effortResult(choice),
-        ...(billingNote ? { note: [effortResult(choice).note, billingNote].filter(Boolean).join(' ') } : {}),
+        ...(note ? { note } : {}),
       },
     });
   }
@@ -2243,6 +2523,13 @@ export function createRemoteRelayDispatcher({
    * model left unchecked for want of a list included.
    */
   function settleRequestedModel(ctx, catalog, provider, requested, { creating, extraModels = [], updating = false }) {
+    // Refused here before the provider's list is looked at, which lacks the
+    // id and would answer "unknown model" without the way out.
+    if (provider === 'github' && isOpenAIImageModelId(requested)) {
+      throw new DispatchFailure(400, OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
+        `${openAIImageModelNeedsOpenAIText(requested)} ${creating ? 'No session was created.' : (updating ? 'Nothing was changed.' : 'Nothing was sent.')}`,
+        { provider, model: requested, note: 'Pass provider "openai" with this model (relay_info lists the openai models), or a Copilot model that writes text.' });
+    }
     const entry = catalog ? listProviders(catalog).find((candidate) => candidate.provider === provider) : null;
     const offered = catalog ? offeredModelList(catalog, provider) : null;
     const check = checkRequestedProviderModel({
@@ -2337,13 +2624,27 @@ export function createRemoteRelayDispatcher({
       note = settled.note;
       variantEffort = normalizeEffort(settled.effort);
     }
+    // An OpenAI session started with images or image options is an image
+    // session: it mirrors this session's model only when that makes images,
+    // else it takes the image default of the target's OpenAI list (the pick
+    // its New Chat makes). A list without an image model is refused below.
+    const wantsImages = (Array.isArray(args.images) && args.images.length > 0) || isPlainObject(args.image);
+    const imageSession = provider === 'openai' && wantsImages;
     // A cloud session without a requested model gets the Claude Cloud tab's
     // default, as New Chat does: the bootstrap picks it, nothing is mirrored.
     if (!model && cloud) {
       modelSource = 'remote default';
     } else if (!model) {
-      model = matchOfferedModel(ctx.caller.model, entry.models);
-      modelSource = model ? 'same as this session' : '';
+      const mirrored = matchOfferedModel(ctx.caller.model, entry.models);
+      const imageDefault = imageSession && !isOpenAIImageModelId(mirrored) ? pickOpenAIImageDefaultModel(entry.models) : '';
+      // Never a chat model for an image session: it would make no images.
+      if (imageSession && !imageDefault && !isOpenAIImageModelId(mirrored)) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.unknownModel,
+          `${openAIImageNoModelText(`relay "${ctx.relay.name}"`)} No session was created.`,
+          { remoteCode: OPENAI_IMAGE_NO_MODEL_CODE });
+      }
+      model = imageDefault || mirrored;
+      modelSource = imageDefault ? 'remote default' : (model ? 'same as this session' : '');
     }
     if (!model && !cloud) {
       model = entry.defaultModel || entry.models[0] || '';
@@ -2351,6 +2652,16 @@ export function createRemoteRelayDispatcher({
       if (toText(ctx.caller.model)) {
         note = `${provider} on relay "${ctx.relay.name}" does not offer ${ctx.caller.model}; the session uses its default model ${model || '(none)'}.`;
       }
+    }
+    // Images and image options go to an image session only. Settled here, the
+    // provider (this session's when none is named) and the model are known:
+    // refused before the bootstrap, so no session is left behind. Only what
+    // needs the new session's folder (the paths) is the target's to refuse.
+    if (wantsImages && (provider !== 'openai' || !isOpenAIImageModelId(model))) {
+      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+        `images and image go to an OpenAI image session (provider "openai" with a gpt-image or dall-e model); this one would run ${provider}${model ? ` ${model}` : ''}. `
+        + 'Pass provider "openai" and leave model out (the relay\'s image default) or name an image model relay_info lists. No session was created.',
+        { remoteCode: IMAGE_INPUT_REFUSED_CODE });
     }
     // planOnly starts the session locked in plan mode: with no mode named it
     // starts in plan; another mode named is refused before anything is made.
@@ -2361,6 +2672,9 @@ export function createRemoteRelayDispatcher({
     }
     const mode = args.mode || (planOnly ? 'plan' : ctx.caller.mode) || toText(catalog.status.defaultRelayMode) || '';
     const title = args.title || firstLine(args.text, TITLE_MAX) || 'Remote session';
+    // An image session would make its first images at once: a target whose
+    // daily cap of image spend is reached refuses before it is created.
+    if (provider === 'openai' && isOpenAIImageModelId(model)) await refuseAtImageCap(ctx);
     const origin = await buildOrigin(ctx);
 
     // The effort mirrors the caller like the model does: this session's when
@@ -2449,7 +2763,15 @@ export function createRemoteRelayDispatcher({
     }
     let sent;
     try {
-      const posted = await postPromptWithEffort(ctx, { session, text: args.text, origin, model: boundModel, mode }, choice);
+      const posted = await postPromptWithEffort(ctx, {
+        session,
+        text: args.text,
+        origin,
+        model: boundModel,
+        mode,
+        imagePaths: args.images,
+        image: args.image,
+      }, choice);
       sent = posted.sent;
       if (!cloud || choice.effort) choice = posted.choice;
       // From here the new session's queued turn counts toward the cap itself.
@@ -2457,6 +2779,16 @@ export function createRemoteRelayDispatcher({
     } catch (error) {
       // The session exists by now: say so, or the agent starts a second one.
       const remoteCode = toText(error?.remoteBody?.code);
+      if (error instanceof DispatchFailure && error.imageInputReason) {
+        throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
+          `Relay "${ctx.relay.name}" refused the images or image options of the first prompt: ${error.imageInputReason}. The session ${session} was created, but the prompt was not queued.`,
+          {
+            session,
+            remoteCode: IMAGE_INPUT_REFUSED_CODE,
+            openUrl: remoteConversationUrl(ctx.relay.url, session) || null,
+            note: 'Use send with this session and other images or image options (or none); do not create another session.',
+          });
+      }
       if (!choice.effort || !isEffortRejection(error)) {
         // The remote's own 4xx is passed on, anything else is a 502, as
         // mapRemoteError answers them.
@@ -2488,6 +2820,8 @@ export function createRemoteRelayDispatcher({
           note: 'Use send with this session and an effort it takes (or none); do not create another session.',
         });
     }
+    const imageNote = imageEchoNote(ctx, sent, args.images);
+    const effortFields = effortResult(choice);
     const result = await deliverAndWait('create_session', ctx, {
       session,
       sent,
@@ -2501,7 +2835,8 @@ export function createRemoteRelayDispatcher({
         ...(cloud ? { repo: toText(bootstrap?.cloud?.repoUrl) || args.repo, branch: toText(bootstrap?.cloud?.branch) || args.branch || null } : {}),
         ...(toText(bootstrap?.workspaceRootWarning) ? { cwdWarning: toText(bootstrap.workspaceRootWarning) } : {}),
         ...(note ? { modelNote: note } : {}),
-        ...effortResult(choice),
+        ...effortFields,
+        ...(imageNote ? { note: [effortFields.note, imageNote].filter(Boolean).join(' ') } : {}),
         // The session group it went into, as list_sessions shows it.
         group,
         ...(groupWarning ? { groupWarning } : {}),
@@ -2824,6 +3159,21 @@ export function createRemoteRelayDispatcher({
     };
   }
 
+  /**
+   * The changed settings for the summary line. Names only, but the image
+   * defaults (an object) with what they were set to:
+   * `image {size 1536x1024, quality low}`.
+   */
+  function changedText(changed, settings) {
+    return changed.map((key) => {
+      if (key !== 'image' || !isPlainObject(settings?.image)) return key;
+      const parts = Object.entries(settings.image)
+        .filter(([, value]) => toText(value))
+        .map(([name, value]) => `${name} ${clipLine(value, 40)}`);
+      return parts.length ? `image {${parts.join(', ')}}` : key;
+    }).join(', ');
+  }
+
   /** The `settings` of an answer as the agent reads it: the target's, the group in list_sessions' shape. */
   function settingsResult(settings) {
     if (!isPlainObject(settings)) return null;
@@ -2851,7 +3201,7 @@ export function createRemoteRelayDispatcher({
       notes.push('This mode lasts until the next send that names another mode or comes from a caller in another mode: a send without mode passes the caller\'s own mode.');
     }
     return {
-      summary: `update_session → ${where}: ${changed.join(', ') || 'nothing changed'}`,
+      summary: `update_session → ${where}: ${changedText(changed, plan.settings) || 'nothing changed'}`,
       session: plan.session,
       settings: settingsResult(answer?.settings),
       changed,
@@ -3860,6 +4210,20 @@ export function createRemoteRelayDispatcher({
     if (action === 'create_session') {
       const problem = createSessionProblem(caller, args);
       if (problem) return finish(failure(400, REMOTE_RELAY_ERROR_CODES.invalidInput, problem, { relay: relay.name }));
+    }
+    // Images toward a paired relay that cannot take them: refused before
+    // anyone is asked and before anything is created or sent. This relay
+    // itself always takes them.
+    if (!local && IMAGE_INPUT_ACTIONS.has(action) && (args.images || args.image)) {
+      try {
+        await refuseWithoutImageInputs({ relay, caller, hops, conversationId, signal }, action);
+      } catch (error) {
+        if (error instanceof DispatchFailure) {
+          return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
+        }
+        if (isRemoteRelayError(error)) return finish(mapRemoteError(error, relay, { action, args }));
+        throw error;
+      }
     }
     // The group a create_session names, looked up on the target before anyone
     // is asked, like the model: the card names it, and an unknown group (or a

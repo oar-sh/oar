@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 import { fileVersionToken, serveFileWithRangeSupport, withFileVersion } from '../services/file-serving.mjs';
+import { registerMediaRoutes } from './media-routes.mjs';
 import { validateEntryName } from '../services/explorer-entry-name.mjs';
 import { countEntries, createDirectory, removeEntry, renameEntry } from '../services/explorer-mutations.mjs';
 import {
@@ -64,6 +65,47 @@ import {
   unknownProviderModelText,
 } from '../services/provider-model-selection.mjs';
 import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
+import {
+  OPENAI_IMAGE_LIMITS,
+  OPENAI_IMAGE_MIME_BY_FORMAT,
+  OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
+  checkOpenAIImageSize,
+  formatOpenAIImageSummary,
+  isOpenAIImageModelId,
+  mergeOpenAIImageOptions,
+  openAIImageModelFamily,
+  openAIImageModelNeedsOpenAIText,
+  validateOpenAIImageOptions,
+} from '../../shared/openai-image-options.mjs';
+import { OPENAI_IMAGE_PARTIAL_IMAGES, OPENAI_IMAGE_PARTIALS_DIR } from '../../shared/openai-image-previews.mjs';
+import {
+  SSE_EVENT_TOO_LARGE_CODE,
+  interpretOpenAIImageStreamEvent,
+  isEventStreamResponse,
+  readSseEvents,
+} from '../services/openai-image-stream.mjs';
+import { createOpenAIImagePreviewTurns } from '../services/openai-image-preview-turns.mjs';
+import {
+  OPENAI_IMAGE_CAP_WARN_RATIO,
+  OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
+  OPENAI_IMAGE_USAGE_PATH,
+  formatOpenAIImageUsd,
+} from '../../shared/openai-image-spend.mjs';
+import { estimateOpenAIImageCost } from '../../shared/openai-image-prices.mjs';
+import {
+  OPENAI_IMAGE_PRESETS_SETTING_KEY,
+  findOpenAIImagePreset,
+  parseOwnOpenAIImagePresets,
+  splitOpenAIImagePreset,
+} from '../../shared/openai-image-presets.mjs';
+import {
+  createOpenAIImageSpendService,
+  openAIImageCapRefusalText,
+  openAIImageTryCharge,
+  openAIImageTryRunId,
+} from '../services/openai-image-spend-service.mjs';
+import { IMAGE_INPUT_REFUSED_CODE, resolveImageInputRoots, resolveImageInputs } from '../services/image-input-paths.mjs';
+import { IMAGE_HEADER_BYTES, readImageHeader } from '../../shared/image-header.mjs';
 import { stripModelTierSuffix } from '../../shared/claude-cloud/repo-url.mjs';
 import {
   createSubagentTimelineService,
@@ -206,34 +248,32 @@ function isAutoModel(model) {
   return String(model || '').trim().toLowerCase() === AUTO_MODEL_SENTINEL;
 }
 
-function isOpenAIImageModelId(model = '') {
-  const normalized = String(model || '').trim().toLowerCase().replace(/^openai\//, '');
-  return normalized.startsWith('gpt-image-') || normalized.startsWith('dall-e-');
-}
-
-const OPENAI_IMAGE_QUALITY_VALUES = new Set(['auto', 'low', 'medium', 'high']);
-const OPENAI_IMAGE_SIZE_VALUES = new Set([
-  'auto',
-  '256x256',
-  '512x512',
-  '1024x1024',
-  '1536x1024',
-  '1024x1536',
-  '1792x1024',
-  '1024x1792',
-]);
-
+// A quality or size any image model family takes (shared/openai-image-options.mjs),
+// or ''. The model's own family is checked where the request is built.
 function normalizeOpenAIImageQuality(value = '') {
-  const normalized = String(value || '').trim().toLowerCase();
-  return OPENAI_IMAGE_QUALITY_VALUES.has(normalized) ? normalized : '';
+  const checked = validateOpenAIImageOptions({ quality: value });
+  return checked.ok ? (checked.values.quality || '') : '';
 }
 
 function normalizeOpenAIImageSize(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
-  if (OPENAI_IMAGE_SIZE_VALUES.has(normalized)) return normalized;
+  // The composer's size select is the context-tier select: its own values
+  // mean the API's default size.
   if (normalized === 'default' || normalized === 'long_context') return 'auto';
-  return '';
+  if (!normalized) return '';
+  return checkOpenAIImageSize(normalized).size || '';
 }
+
+// How long one OpenAI image request may take, from sending it to the last
+// byte of the reply; config.json `openaiImageGenerateTimeoutMs` and
+// `openaiImageEditTimeoutMs` override them. Above 300 s undici's own header
+// timeout ends a request first.
+export const OPENAI_IMAGE_GENERATE_TIMEOUT_MS = 180_000;
+export const OPENAI_IMAGE_EDIT_TIMEOUT_MS = 300_000;
+// The pause before the one retry of a request that may pass the second time.
+const OPENAI_IMAGE_RETRY_DELAY_MS = 2_000;
+// OpenAI takes up to 16 input images on an edit.
+const OPENAI_IMAGE_EDIT_INPUTS_MAX = 16;
 
 function normalizeSessionWorkerId(value) {
   const text = String(value || '').trim();
@@ -1445,6 +1485,7 @@ export function buildDequeuedRelayMessage({
   try {
     messageKind = String(stmts.getMessageByConversation?.get?.(msg.id, msg.conversation_id)?.kind || '').trim();
   } catch {}
+  const imageOptions = parseQueueImageOptions(msg.image_options_json);
   return {
     id: msg.id,
     conversationId: msg.conversation_id,
@@ -1477,8 +1518,21 @@ export function buildDequeuedRelayMessage({
     ownerAssignedAt: msg.owner_assigned_at || null,
     ownerLeaseExpiresAt: msg.owner_lease_expires_at || null,
     imageOperationId: String(msg.image_operation_id || '').trim() || null,
+    // An image turn's options as the send settled them; a turn without an
+    // operation sends them with its direct request.
+    ...(imageOptions ? { imageOptions } : {}),
     ...(isRelayAutomatedMessageKind(messageKind) ? { messageKind } : {}),
   };
+}
+
+function parseQueueImageOptions(value) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function buildAttachmentPromptContext(attachments) {
@@ -1631,49 +1685,35 @@ function parseOpenAIImageBase64Value(value) {
   return Buffer.from(raw, 'base64').toString('base64');
 }
 
-function normalizeOpenAIImageOptionString(value, fieldName) {
-  if (value === undefined || value === null) return undefined;
-  const normalized = String(value).trim();
-  if (!normalized) return undefined;
-  if (!/^[a-z0-9._-]{2,32}$/i.test(normalized)) {
-    throw new Error(`Invalid OpenAI image option "${fieldName}"`);
-  }
-  return normalized;
-}
-
-export function normalizeOpenAIImageGenerateRequestBody(rawBody, { maxImages = 10 } = {}) {
+/**
+ * The body of one image request (the generate route's, or the one the
+ * execute route builds from an operation), checked against the model's
+ * family. `n` is the count; size and quality "auto" pass and are left out
+ * for a dall-e model when the request is built. A prompt that came from an
+ * agent on another relay loses its "[Remote prompt from …]" header: OpenAI
+ * would draw it.
+ */
+export function normalizeOpenAIImageGenerateRequestBody(rawBody) {
   const body = rawBody && typeof rawBody === 'object' ? rawBody : {};
   const messageId = String(body.messageId || '').trim();
   const conversationId = String(body.conversationId || '').trim();
   const model = String(body.model || '').trim();
-  const prompt = String(body.prompt || '').trim();
+  const prompt = stripRemotePromptHeader(String(body.prompt || '')).trim();
   if (!messageId) throw new Error('Missing messageId');
   if (!conversationId) throw new Error('Missing conversationId');
   if (!model) throw new Error('Missing model');
   if (!prompt) throw new Error('Missing prompt');
 
-  const hasN = Object.prototype.hasOwnProperty.call(body, 'n');
-  let n = undefined;
-  if (hasN) {
-    const parsed = Number(body.n);
-    const maxN = Math.max(1, Math.trunc(Number(maxImages) || 10));
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > maxN) {
-      throw new Error(`Invalid n value (must be an integer between 1 and ${maxN})`);
-    }
-    n = parsed;
-  }
+  const legacySize = String(body.size ?? '').trim().toLowerCase();
+  const checked = validateOpenAIImageOptions({
+    size: legacySize === 'default' || legacySize === 'long_context' ? 'auto' : body.size,
+    quality: body.quality,
+    count: body.n,
+    output_format: body.output_format,
+    background: body.background,
+  }, { model, field: 'image' });
+  if (!checked.ok) throw new Error(checked.error);
 
-  const sizeRaw = body.size;
-  let size = undefined;
-  if (sizeRaw !== undefined && sizeRaw !== null && String(sizeRaw).trim()) {
-    const normalizedSize = String(sizeRaw).trim().toLowerCase();
-    if (normalizedSize !== 'auto' && !/^\d{2,5}x\d{2,5}$/i.test(normalizedSize)) {
-      throw new Error('Invalid size value (expected "<width>x<height>" or "auto")');
-    }
-    size = normalizedSize;
-  }
-
-  const quality = normalizeOpenAIImageOptionString(body.quality, 'quality');
   const attachments = body.attachments;
   if (attachments !== undefined && !Array.isArray(attachments)) {
     throw new Error('attachments must be an array when provided');
@@ -1684,10 +1724,285 @@ export function normalizeOpenAIImageGenerateRequestBody(rawBody, { maxImages = 1
     conversationId,
     model,
     prompt,
-    n,
-    size,
-    quality,
+    n: checked.values.count,
+    size: checked.values.size,
+    quality: checked.values.quality,
+    output_format: checked.values.output_format,
+    background: checked.values.background,
     attachments: Array.isArray(attachments) ? attachments : [],
+  };
+}
+
+/**
+ * The fields OpenAI gets for one image request. dall-e models take no
+ * output_format or background, and their "auto" size or quality is not sent
+ * (the API's own default); they answer in b64_json only when asked to.
+ */
+export function buildOpenAIImageRequestFields(requestBody = {}) {
+  const family = openAIImageModelFamily(requestBody.model);
+  const isGptImage = family === 'gpt-image';
+  const fields = { model: requestBody.model, prompt: requestBody.prompt };
+  if (!isGptImage) fields.response_format = 'b64_json';
+  if (requestBody.n !== undefined) fields.n = requestBody.n;
+  for (const key of ['size', 'quality']) {
+    const value = requestBody[key];
+    if (value && (isGptImage || value !== 'auto')) fields[key] = value;
+  }
+  if (isGptImage) {
+    if (requestBody.output_format) fields.output_format = requestBody.output_format;
+    if (requestBody.background) fields.background = requestBody.background;
+  }
+  return fields;
+}
+
+const OPENAI_IMAGE_USAGE_DETAIL_KEYS = Object.freeze(['input_tokens_details', 'output_tokens_details']);
+
+/**
+ * The `usage` block of an OpenAI image reply, numbers only (top level and
+ * the two token-detail blocks), or null when there is none.
+ */
+export function normalizeOpenAIImageUsage(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const numbersOf = (source) => {
+    const out = {};
+    for (const [key, value] of Object.entries(source || {})) {
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) out[key] = value;
+    }
+    return out;
+  };
+  const usage = numbersOf(raw);
+  for (const key of OPENAI_IMAGE_USAGE_DETAIL_KEYS) {
+    const detail = raw[key];
+    if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+      const numbers = numbersOf(detail);
+      if (Object.keys(numbers).length) usage[key] = numbers;
+    }
+  }
+  return Object.keys(usage).length ? usage : null;
+}
+
+/**
+ * Two image usages added up, field by field and detail by detail (a stream
+ * of a count > 1 request reports one per completed image); null + null is
+ * null.
+ */
+export function addOpenAIImageUsage(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  const sum = { ...a };
+  for (const [key, value] of Object.entries(b)) {
+    if (typeof value === 'number') sum[key] = (typeof sum[key] === 'number' ? sum[key] : 0) + value;
+    else if (value && typeof value === 'object') sum[key] = addOpenAIImageUsage(sum[key] && typeof sum[key] === 'object' ? sum[key] : null, value);
+  }
+  return sum;
+}
+
+// The base64 characters that decode to the first IMAGE_HEADER_BYTES bytes.
+const IMAGE_HEADER_BASE64_CHARS = Math.ceil(IMAGE_HEADER_BYTES / 3) * 4;
+
+/** readImageHeader of a canonical base64 payload, decoding only its start. */
+function readBase64ImageHeader(base64) {
+  const text = String(base64 || '');
+  if (!text) return null;
+  return readImageHeader(Buffer.from(text.slice(0, IMAGE_HEADER_BASE64_CHARS), 'base64'));
+}
+
+// What one OpenAI image request came to, as `kind`:
+// - 'unsent': it never reached OpenAI (no connection, no name, no TLS);
+//   nothing was billed.
+// - 'timeout', 'broken', 'server': no answer in time, the connection broke
+//   off after the request may have gone out, or a 5xx; it may have been
+//   billed.
+// - 'stream': a streamed reply that broke off, or ended without its image,
+//   after OpenAI had started on it; it may have been billed.
+// - 'refused': a 4xx (429 included); nothing came of it, a retry is refused
+//   the same way.
+// - 'unprocessed': a 2xx the relay could not read; billed.
+// The first five are tried once more; the last two never.
+const OPENAI_IMAGE_RETRY_KINDS = new Set(['unsent', 'timeout', 'broken', 'server', 'stream']);
+const OPENAI_IMAGE_AMBIGUOUS_KINDS = new Set(['timeout', 'broken', 'server', 'stream']);
+const OPENAI_IMAGE_UNSENT_ERROR_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+const OPENAI_IMAGE_TIMEOUT_ERROR_CODES = new Set(['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);
+
+export const OPENAI_IMAGE_INTERRUPTED_NOTE = 'The relay was interrupted while OpenAI was working on the image; the request may have been billed; retry the message.';
+export const OPENAI_IMAGE_REPEATED_NOTE = 'This image request was already sent to OpenAI once and was not sent again; the first request may have been billed; retry the message.';
+// The guidance under every image failure note: the note itself says what to do.
+const OPENAI_IMAGE_FAILURE_GUIDANCE = 'If this keeps failing, include the error code when you report it.';
+
+/** The `code` of a thrown fetch error and of every cause under it. */
+function fetchErrorCodes(error) {
+  const codes = [];
+  const seen = new Set();
+  const visit = (entry, depth) => {
+    if (!entry || typeof entry !== 'object' || seen.has(entry) || depth > 4) return;
+    seen.add(entry);
+    if (entry.code) codes.push(String(entry.code));
+    visit(entry.cause, depth + 1);
+    if (Array.isArray(entry.errors)) for (const inner of entry.errors) visit(inner, depth + 1);
+  };
+  visit(error, 0);
+  return codes;
+}
+
+function isTlsFailureCode(code) {
+  return code.startsWith('ERR_TLS_') || code.startsWith('ERR_SSL_') || code.includes('CERT') || code === 'EPROTO';
+}
+
+/** 'unsent', 'timeout' or 'broken' for an error fetch threw (see OPENAI_IMAGE_RETRY_KINDS). */
+export function classifyOpenAIImageFetchError(error) {
+  if (error?.name === 'TimeoutError' || error?.cause?.name === 'TimeoutError') return 'timeout';
+  const codes = fetchErrorCodes(error);
+  if (codes.some((code) => OPENAI_IMAGE_TIMEOUT_ERROR_CODES.has(code))) return 'timeout';
+  if (codes.length && codes.every((code) => OPENAI_IMAGE_UNSENT_ERROR_CODES.has(code) || isTlsFailureCode(code))) return 'unsent';
+  return 'broken';
+}
+
+function describeFetchError(error) {
+  const codes = [...new Set(fetchErrorCodes(error))];
+  const message = String(error?.message || error || 'request error').trim();
+  return codes.length ? `${message} (${codes.join(', ')})` : message;
+}
+
+function formatNoteDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0);
+  return value >= 1000 ? `${Math.round(value / 1000)} s` : `${Math.round(value)} ms`;
+}
+
+function asSentence(text) {
+  const value = String(text || '').trim();
+  return !value || /[.!?]$/.test(value) ? value : `${value}.`;
+}
+
+/**
+ * The failure of an image request after its tries: the note the chat shows
+ * (`error`), the attempt's code, `outcome` 'uncertain' when it may have been
+ * billed (else 'terminal'), and the HTTP status the generate route answers.
+ * A request that never reached OpenAI on its last try but may have been
+ * billed on the first is told as the first.
+ */
+export function openAIImageFailureResult(tries, { timeoutMs = 0, resent = false } = {}) {
+  const list = Array.isArray(tries) && tries.length ? tries : [{ kind: 'broken' }];
+  const last = list[list.length - 1];
+  const ambiguous = list.find((entry) => OPENAI_IMAGE_AMBIGUOUS_KINDS.has(entry.kind)) || null;
+  const deciding = last.kind === 'unsent' && ambiguous ? ambiguous : last;
+  // A resend without stream fields is the second request of a turn whose
+  // first was refused for them before any work.
+  const triedText = resent ? 'sent twice, once without previews' : (list.length > 1 ? 'tried twice' : 'tried once');
+  const maybeBilled = 'the request may have been billed; retry the message.';
+  // A refusal or an unreadable reply after a first try that may have been
+  // billed: the note says so too.
+  const earlierBilled = ambiguous && !OPENAI_IMAGE_AMBIGUOUS_KINDS.has(deciding.kind) && deciding.kind !== 'unsent'
+    ? ' The first try may have been billed as well.'
+    : '';
+  const base = {
+    ok: false,
+    tries: list.length,
+    sent: list.some((entry) => entry.kind !== 'unsent'),
+    ...(deciding.detail ? { detail: String(deciding.detail).slice(0, 500) } : {}),
+    upstreamStatus: Number.isFinite(Number(deciding.status)) && Number(deciding.status) > 0 ? Number(deciding.status) : null,
+  };
+  switch (deciding.kind) {
+    case 'unsent':
+      return { ...base, status: 502, outcome: 'terminal', code: 'IMAGE_PROVIDER_UNREACHABLE', error: 'OpenAI could not be reached; nothing was billed; retry the message.' };
+    case 'timeout': {
+      const waited = deciding.ownTimeout === false ? 'in time' : `within ${formatNoteDuration(timeoutMs)}`;
+      return { ...base, status: 504, outcome: 'uncertain', code: 'IMAGE_PROVIDER_NO_ANSWER', error: `OpenAI did not answer ${waited} (${triedText}); ${maybeBilled}` };
+    }
+    case 'server':
+      return { ...base, status: 502, outcome: 'uncertain', code: 'IMAGE_PROVIDER_UNAVAILABLE', error: `OpenAI answered ${deciding.status || 'with a server error'} (${triedText}); ${maybeBilled}` };
+    case 'stream':
+      return { ...base, status: 502, outcome: 'uncertain', code: 'IMAGE_STREAM_BROKEN', error: `OpenAI's image stream broke off before the image was complete (${triedText}); ${maybeBilled}` };
+    case 'refused': {
+      const message = String(deciding.message || '').trim().slice(0, 240);
+      return {
+        ...base,
+        status: deciding.status >= 400 && deciding.status < 500 ? deciding.status : 502,
+        outcome: 'terminal',
+        code: 'IMAGE_PROVIDER_REJECTED',
+        error: `${asSentence(`OpenAI refused the image request (${deciding.status})${message ? `: ${message}` : ''}`)}${earlierBilled}`,
+      };
+    }
+    case 'unprocessed':
+      return {
+        ...base,
+        status: 502,
+        outcome: 'terminal',
+        code: 'IMAGE_REPLY_UNPROCESSED',
+        relayProcessing: true,
+        error: `The relay could not process the image OpenAI returned (${deciding.detail || 'unknown error'}). The generation was billed; the message was not retried.${earlierBilled}`,
+      };
+    default:
+      return { ...base, status: 502, outcome: 'uncertain', code: 'IMAGE_PROVIDER_NO_ANSWER', error: `The connection to OpenAI broke off (${triedText}); ${maybeBilled}` };
+  }
+}
+
+/**
+ * The note on an image request that came through on its second try after a
+ * first that may have reached OpenAI (OPENAI_IMAGE_AMBIGUOUS_KINDS): both may
+ * have been billed. Empty when the earlier tries never went out.
+ */
+export function openAIImageRetriedNote(tries, { timeoutMs = 0 } = {}) {
+  const first = (Array.isArray(tries) ? tries : []).find((entry) => OPENAI_IMAGE_AMBIGUOUS_KINDS.has(entry?.kind));
+  if (!first) return '';
+  const tail = 'it was sent once more and the first try may have been billed as well.';
+  switch (first.kind) {
+    case 'timeout': {
+      const waited = first.ownTimeout === false ? 'in time' : `within ${formatNoteDuration(timeoutMs)}`;
+      return `OpenAI did not answer the first try ${waited}; ${tail}`;
+    }
+    case 'server':
+      return `OpenAI answered the first try with ${first.status || 'a server error'}; ${tail}`;
+    case 'stream':
+      return `OpenAI's image stream broke off on the first try; ${tail}`;
+    default:
+      return `The connection to OpenAI broke off on the first try; ${tail}`;
+  }
+}
+
+/**
+ * The failure of an image request whose next try the daily cap stopped
+ * before it was sent (`refusal`: the spend service's reserveTry). Nothing of
+ * that try reached OpenAI; an earlier try may have been billed, and the note
+ * says so then.
+ */
+export function openAIImageCapRefusalResult(tries, refusal = {}) {
+  const list = Array.isArray(tries) ? tries : [];
+  const earlierBilled = list.some((entry) => OPENAI_IMAGE_AMBIGUOUS_KINDS.has(entry?.kind));
+  return {
+    ok: false,
+    tries: list.length,
+    sent: list.some((entry) => entry?.kind !== 'unsent'),
+    status: 409,
+    outcome: earlierBilled ? 'uncertain' : 'terminal',
+    code: OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
+    error: openAIImageCapRefusalText({ tryNumber: earlierBilled ? 2 : 1, refusal }),
+    upstreamStatus: null,
+  };
+}
+
+// The file system the partial preview route serves through: its open
+// follows no link.
+const PARTIAL_PREVIEW_FS = Object.freeze({
+  ...fs,
+  openSync: (file) => fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)),
+});
+
+// The longest image note /api/response takes into the reply text.
+const OPENAI_IMAGE_NOTE_MAX = 500;
+
+/** A request refused before anything was sent to OpenAI. */
+function openAIImageRequestRefusal(status, code, error) {
+  return { ok: false, tries: 0, sent: false, status, outcome: 'terminal', code, error, upstreamStatus: null };
+}
+
+/** The `terminalError` /api/response gets for a failed image request. */
+function openAIImageTerminalError(result) {
+  return {
+    code: result.code,
+    message: String(result.error || 'Image operation failed').slice(0, 500),
+    ...(result.detail ? { detail: String(result.detail).slice(0, 500) } : {}),
+    guidance: OPENAI_IMAGE_FAILURE_GUIDANCE,
+    retryable: false,
   };
 }
 
@@ -1699,7 +2014,26 @@ function isOpenAIImageAttachment(raw) {
   return dataUrl.startsWith('data:image/');
 }
 
-export function resolveOpenAIImageEditAttachment(rawAttachments, {
+export function resolveOpenAIImageEditAttachment(rawAttachments, options = {}) {
+  return resolveOpenAIImageEditAttachments(rawAttachments, { ...options, maxImages: 1 })[0] || null;
+}
+
+/**
+ * Every image attachment of an edit, in the order given (the first is the
+ * base image), at most `maxImages`; the others are ignored.
+ */
+export function resolveOpenAIImageEditAttachments(rawAttachments, {
+  maxImages = OPENAI_IMAGE_EDIT_INPUTS_MAX,
+  ...options
+} = {}) {
+  const attachments = Array.isArray(rawAttachments) ? rawAttachments : [];
+  return attachments
+    .filter((entry) => isOpenAIImageAttachment(entry))
+    .slice(0, Math.max(1, Math.trunc(Number(maxImages) || 1)))
+    .map((entry) => resolveOneOpenAIImageEditAttachment(entry, options));
+}
+
+function resolveOneOpenAIImageEditAttachment(image, {
   maxImageBytes = 20 * 1024 * 1024,
   allowedRootPath = '',
   // Folders of earlier versions that uploads are still read from: only a
@@ -1707,12 +2041,8 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
   allowedBlobRootPaths = [],
   allowedGeneratedImagesRootPath = '',
 } = {}) {
-  const attachments = Array.isArray(rawAttachments) ? rawAttachments : [];
-  const firstImage = attachments.find((entry) => isOpenAIImageAttachment(entry));
-  if (!firstImage) return null;
-
-  const dataUrl = String(firstImage.dataUrl || '').trim();
-  let mimeType = String(firstImage.type || '').trim().toLowerCase();
+  const dataUrl = String(image.dataUrl || '').trim();
+  let mimeType = String(image.type || '').trim().toLowerCase();
   let bytes = null;
 
   if (dataUrl.startsWith('data:')) {
@@ -1722,7 +2052,7 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
     const payload = parseOpenAIImageBase64Value(parts.payload);
     bytes = Buffer.from(payload, 'base64');
   } else {
-    const filePath = String(firstImage.path || '').trim();
+    const filePath = String(image.path || '').trim();
     if (!filePath) throw new Error('Image attachment is missing file path or data URL');
     const allowedRoot = String(allowedRootPath || '').trim();
     const blobRoots = (Array.isArray(allowedBlobRootPaths) ? allowedBlobRootPaths : [])
@@ -1756,6 +2086,8 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
     bytes = fs.readFileSync(filePath);
   }
 
+  // What the bytes are wins over what the attachment says they are.
+  mimeType = (Buffer.isBuffer(bytes) && readImageHeader(bytes)?.mime) || mimeType;
   if (!mimeType.startsWith('image/')) {
     throw new Error('Image attachment must use image/* MIME type');
   }
@@ -1769,13 +2101,20 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
   return {
     bytes,
     mimeType,
-    name: String(firstImage.name || 'image').trim().slice(0, 120) || 'image',
+    name: String(image.name || 'image').trim().slice(0, 120) || 'image',
   };
 }
 
-export function normalizeOpenAIImageApiGeneratedImages(payload, { maxImages = 8 } = {}) {
+/**
+ * The images of an OpenAI image reply. Their type comes from the format
+ * asked for (`outputFormat`), else the one the reply names, else PNG; the
+ * image's own header has the last word.
+ */
+export function normalizeOpenAIImageApiGeneratedImages(payload, { maxImages = 8, outputFormat = '' } = {}) {
   const rows = Array.isArray(payload?.data) ? payload.data : [];
   const maxCount = Math.max(1, Math.trunc(Number(maxImages) || 8));
+  const format = String(outputFormat || payload?.output_format || '').trim().toLowerCase();
+  const declaredMime = OPENAI_IMAGE_MIME_BY_FORMAT[format] || OPENAI_IMAGE_MIME_BY_FORMAT.png;
   const generatedImages = [];
   for (const [index, row] of rows.entries()) {
     if (index >= maxCount) break;
@@ -1785,7 +2124,7 @@ export function normalizeOpenAIImageApiGeneratedImages(payload, { maxImages = 8 
     const revisedPrompt = String(row.revised_prompt || row.revisedPrompt || '').trim();
     generatedImages.push({
       data,
-      mimeType: 'image/png',
+      mimeType: readBase64ImageHeader(data)?.mime || declaredMime,
       name: `generated-image-${index + 1}`,
       ...(revisedPrompt ? { revisedPrompt } : {}),
     });
@@ -1853,7 +2192,12 @@ function createGeneratedImageAttachment({
   resolveSessionStateRoot,
 }) {
   const imageId = `img-${String(imageIndex + 1).padStart(2, '0')}`;
-  const extension = resolveGeneratedImageExtension(image.mimeType);
+  const bytes = Buffer.from(String(image.dataBase64 || ''), 'base64');
+  // The type and pixel size the image's own header gives; the type the
+  // sender named only when the header is not one the reader knows.
+  const header = readImageHeader(bytes);
+  const mimeType = header?.mime || image.mimeType;
+  const extension = resolveGeneratedImageExtension(mimeType);
   const location = resolveGeneratedImageStoragePath({
     resolveSessionStateRoot,
     sdkSessionId,
@@ -1864,7 +2208,6 @@ function createGeneratedImageAttachment({
   });
   fs.mkdirSync(location.absoluteDir, { recursive: true });
   const tmpPath = path.join(location.absoluteDir, `${location.fileName}.${process.pid}.${Date.now()}.tmp`);
-  const bytes = Buffer.from(String(image.dataBase64 || ''), 'base64');
   fs.writeFileSync(tmpPath, bytes);
   try {
     fs.renameSync(tmpPath, location.absolutePath);
@@ -1876,8 +2219,9 @@ function createGeneratedImageAttachment({
   }
   return {
     name: `${String(image.name || 'generated-image').replace(/\.[a-z0-9]+$/i, '') || 'generated-image'}-${imageIndex + 1}.${extension}`,
-    type: image.mimeType,
+    type: mimeType,
     size: bytes.length,
+    ...(header ? { width: header.width, height: header.height } : {}),
     contentUrl: `/api/generated-image/${encodeURIComponent(conversationId)}/${encodeURIComponent(messageId)}/${encodeURIComponent(imageId)}/content`,
     generatedImage: {
       imageId,
@@ -2029,6 +2373,9 @@ export function registerMessagesRoutes(app, deps) {
     MAX_UPLOAD_ATTACHMENTS,
     uploadsDir,
     uploadReadDirs = [uploadsDir],
+    // What a send's `imagePaths` never reads, beside the upload dirs: the
+    // relay's data dir (`dirs`), its database and config files (`files`).
+    imageInputDenyPaths = { dirs: [], files: [] },
     MAX_REPO_TREE_NODES,
     MAX_REQUEUE_RETRIES,
     MAX_IMAGE_DATA_URL_LENGTH,
@@ -2132,6 +2479,11 @@ export function registerMessagesRoutes(app, deps) {
     // (services/request-boundary.mjs). The runtime passes the check built
     // with the configured marker headers.
     isTrulyLocalRequest = createLocalRequestCheck().isTrulyLocal,
+    // The pause before the one retry of an OpenAI image request.
+    openAIImageRetryDelayMs = OPENAI_IMAGE_RETRY_DELAY_MS,
+    // How long the partial previews of an image request that ended wait for
+    // the turn's end (services/openai-image-preview-turns.mjs).
+    openAIImagePreviewLeftoverMs,
     featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
@@ -2154,6 +2506,10 @@ export function registerMessagesRoutes(app, deps) {
     claudeApiUsageService = null,
     // Tokens per turn for every provider (token-usage-service.mjs).
     tokenUsageService = null,
+    // OpenAI image spend and its daily cap (openai-image-spend-service.mjs):
+    // the runtime shares one instance with the settings routes. Without it
+    // (tests) the routes make their own over tokenUsageService.
+    openAIImageSpend = null,
     // The delivery fence's runtime half for GET /api/pending, as on the
     // socket: the Claude API claim check (null: no refusal) and what a fenced
     // row does (the swap, or fail closed).
@@ -2195,6 +2551,24 @@ export function registerMessagesRoutes(app, deps) {
     // (claude-session-leftovers.mjs).
     deepseekClaudeConfigDir = '',
   } = deps;
+
+  // An app_settings value as text ('' when unset or unreadable).
+  const readAppSettingText = (key) => {
+    try {
+      return String(stmts?.getAppSetting?.get?.(key)?.value ?? '').trim();
+    } catch {
+      return '';
+    }
+  };
+  // OpenAI image spend: the cap check and reservation before each try, its
+  // booking after, the send-time refusal and the spend state.
+  const imageSpend = openAIImageSpend || createOpenAIImageSpendService({
+    tokenUsageService,
+    readSetting: readAppSettingText,
+    db,
+    emit: (event, payload) => io?.emit?.(event, payload),
+    logger: console,
+  });
 
   // ─── Sub-agent runs: header, timeline, live events ─────────────────────────
   const subagentTimeline = createSubagentTimelineService({ db, stmts });
@@ -4059,6 +4433,19 @@ export function registerMessagesRoutes(app, deps) {
     });
   });
 
+  // The media gallery (🧠 Media tab, global Media view) and its index.
+  registerMediaRoutes(app, {
+    auth,
+    db,
+    uploadPathForSha,
+    fetchBrowsableDrives,
+    resolveGeneratedImagePath: ({ sessionId, relativePath }) => resolveGeneratedImageReadPath({
+      resolveSessionStateRoot,
+      sessionId,
+      relativePath,
+    }),
+  });
+
   app.get('/api/files/{*splat}', auth, (req, res) => {
     const requestedPath = splatPath(req).trim();
     const rootOverride = resolveScopedWorkspaceRootPath(req);
@@ -4871,6 +5258,8 @@ export function registerMessagesRoutes(app, deps) {
       provider,
       attachments: rawAttachments,
       imageTarget: rawImageTarget,
+      imagePaths: rawImagePaths,
+      image: rawImageOptions,
     } = req.body;
     // A prompt from another relay's agent (body `origin` or the
     // X-OAR-Remote-Origin header) is refused while the inbound switch is off.
@@ -4907,7 +5296,7 @@ export function registerMessagesRoutes(app, deps) {
       Array.isArray(rawAttachments) ? rawAttachments.filter((item) => item && typeof item === 'object').length : (rawAttachments ? 1 : 0),
     );
     const referenceResolution = collectReferenceAttachmentsFromText(trimmedText);
-    const attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
+    let attachments = mergeMessageAttachments(normalizedAttachments, referenceResolution.attachments);
     const imageTarget = rawImageTarget && typeof rawImageTarget === 'object'
       ? {
           messageId: String(rawImageTarget.messageId || '').trim(),
@@ -4922,6 +5311,17 @@ export function registerMessagesRoutes(app, deps) {
         code: 'IMAGE_CONTINUITY_DISABLED',
       });
     }
+    // Images named by path on this relay and the turn's own image options
+    // (relay_tool send and create_session). Both go to an OpenAI image
+    // session only; the paths are read before anything is stored, and one
+    // that may not be read refuses the whole send.
+    const refuseImageInput = (error) => res.status(400).json({ code: IMAGE_INPUT_REFUSED_CODE, error });
+    const imagePathsGiven = rawImagePaths !== undefined && rawImagePaths !== null;
+    const imageOptionsGiven = rawImageOptions !== undefined && rawImageOptions !== null;
+    if (imagePathsGiven && (!Array.isArray(rawImagePaths) || rawImagePaths.some((entry) => typeof entry !== 'string'))) {
+      return refuseImageInput('imagePaths must be a list of absolute file paths on this relay');
+    }
+    const imagePathList = imagePathsGiven ? rawImagePaths.filter((entry) => entry !== '') : [];
 
     if (trimmedText.toLowerCase() === '/compact') {
       if (attachments.length) return res.status(400).json({ error: 'Compact command does not accept attachments' });
@@ -5443,6 +5843,16 @@ export function registerMessagesRoutes(app, deps) {
           latestUserMessageModel: stmts.getLatestUserMessageModel?.get?.(conversationId)?.model || '',
         })
       : null;
+    // Copilot lists image ids its runtime cannot serve: a Copilot chat on one
+    // is refused with a pointer to an OpenAI Image chat, whoever sends.
+    const copilotModelId = usesGitHubCatalog ? String(inheritedModel ? inheritedModel.model : (model || '')).trim() : '';
+    if (copilotModelId && isOpenAIImageModelId(copilotModelId)) {
+      return res.status(400).json({
+        error: `${openAIImageModelNeedsOpenAIText(copilotModelId)} Nothing was sent.`,
+        code: OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
+        ...(conversationId ? { conversationId } : {}),
+      });
+    }
     const githubModelResolution = usesGitHubCatalog
       ? resolveRequestedModel(inheritedModel ? inheritedModel.model : model)
       : null;
@@ -5545,6 +5955,17 @@ export function registerMessagesRoutes(app, deps) {
         error: 'Select an image model before editing a generated image',
         code: 'IMAGE_TARGET_REQUIRES_IMAGE_MODEL',
       });
+    }
+    if ((imagePathsGiven || imageOptionsGiven) && !openAIImageModel) {
+      return refuseImageInput(`Images and image options go to an OpenAI image session; this session runs ${requestedModel || 'no image model'}`);
+    }
+    // An image turn from another relay's agent takes its images from
+    // `imagePaths` alone: an @file: token resolves against this relay's
+    // workspace root, not the session's folder, and carries no stored copy.
+    let ignoredReferenceAttachments = 0;
+    if (remoteRequest.remote && openAIImageModel && referenceResolution.attachments.length) {
+      ignoredReferenceAttachments = referenceResolution.attachments.length;
+      attachments = mergeMessageAttachments(normalizedAttachments, []);
     }
     // A send that names no effort runs with the conversation's own, clamped
     // to the nearest level the model has. Null when there is nothing to keep
@@ -5668,11 +6089,66 @@ export function registerMessagesRoutes(app, deps) {
       // is already 1M.
       normalizedContextTier = 'default';
     }
+    // An image turn's options: the session's defaults (update_session
+    // `image`), then the preset the turn names (`image.preset`), then the
+    // turn's own. The owner's composer names quality and size in the effort
+    // and context-tier fields, which are the turn's own; an agent's turn
+    // names them in `image`, and its effort counts below the defaults. Only
+    // what an agent sent is refused here: the composer's choice goes on as
+    // before, checked against the model when it runs. The options are
+    // resolved here, at queue time: a preset changed later does not change a
+    // queued turn.
+    let imageOptions = null;
+    if (openAIImageModel) {
+      const { preset: presetName, own: ownImageInput } = splitOpenAIImagePreset(rawImageOptions);
+      const preset = findOpenAIImagePreset(presetName, parseOwnOpenAIImagePresets(readAppSettingText(OPENAI_IMAGE_PRESETS_SETTING_KEY)));
+      if (!preset.ok) return refuseImageInput(`${asSentence(preset.error)} Nothing was sent.`);
+      const ownImageOptions = validateOpenAIImageOptions(ownImageInput, { model: requestedModel });
+      if (!ownImageOptions.ok) return refuseImageInput(ownImageOptions.error);
+      const keptQuality = !explicitReasoningEffort && requestedReasoningEffort && !['auto', 'none'].includes(requestedReasoningEffort)
+        ? { quality: requestedReasoningEffort }
+        : {};
+      const fieldOptions = {
+        ...(explicitReasoningEffort ? { quality: requestedReasoningEffort } : {}),
+        ...(String(contextTier || '').trim() && !['default', 'long_context'].includes(requestedContextTier) ? { size: normalizedContextTier } : {}),
+      };
+      let sessionDefaults = {};
+      if (!shouldCreateConversation) {
+        try {
+          sessionDefaults = stmts.readConversationImageDefaults?.(conversationId) || {};
+        } catch {}
+      }
+      const layers = remoteRequest.remote
+        ? [keptQuality, fieldOptions, sessionDefaults, preset.values, ownImageOptions.values]
+        : [keptQuality, sessionDefaults, preset.values, fieldOptions, ownImageOptions.values];
+      const merged = layers.reduce((options, layer) => mergeOpenAIImageOptions(options, layer), {});
+      const checked = validateOpenAIImageOptions(merged, { model: requestedModel });
+      if (checked.ok) {
+        imageOptions = mergeOpenAIImageOptions(checked.values, null);
+      } else if (imagePathsGiven || imageOptionsGiven) {
+        return refuseImageInput(checked.error);
+      } else {
+        imageOptions = [keptQuality, fieldOptions].reduce((options, layer) => mergeOpenAIImageOptions(options, layer), {});
+      }
+      // Today's image spend has reached the daily cap: refused for every
+      // sender before anything is stored (the owner's override lifts it).
+      let capRefusal = null;
+      try {
+        capRefusal = imageSpend.sendRefusal();
+      } catch (error) {
+        capRefusal = { code: OPENAI_IMAGE_DAILY_CAP_REACHED_CODE, error: `The relay could not check the daily cap of OpenAI images (${error?.message || error}). Nothing was sent.` };
+      }
+      if (capRefusal) {
+        return res.status(409).json({ error: capRefusal.error, code: capRefusal.code, ...(conversationId ? { conversationId } : {}) });
+      }
+    }
     if (!requestedRelayMode) return res.status(400).json({ error: 'Unsupported relay mode' });
     const conversationWorkspaceState = (!shouldCreateConversation && typeof resolveConversationWorkspaceState === 'function')
       ? resolveConversationWorkspaceState({ conversationId })
       : null;
-    let workspaceRootUpdate = attachments.length === 0
+    // Images by path count as attachments: a "cd …" in their prompt moves
+    // no folder, and they are checked against the folder the session has now.
+    let workspaceRootUpdate = attachments.length === 0 && imagePathList.length === 0
       ? maybeApplyWorkspaceRootFromMessage(
           trimmedText,
           conversationWorkspaceState?.currentWorkspaceRootPath || null,
@@ -5740,6 +6216,56 @@ export function registerMessagesRoutes(app, deps) {
           conversationId,
         });
       }
+    }
+
+    // The images by path: every one checked and read before anything is
+    // stored, then kept in the upload store, so each becomes an attachment
+    // with its bytes' hash and sniffed type (and an asset of the operation).
+    // They come first: the first image is the base of an edit.
+    let imageInputs = [];
+    let imageInputsDropped = 0;
+    if (imagePathsGiven) {
+      if (shouldCreateConversation) {
+        return refuseImageInput('imagePaths need an existing session: create it first, then send the images to it');
+      }
+      let sessionStateRoot = '';
+      try {
+        sessionStateRoot = String(resolveSessionStateRoot?.() || '');
+      } catch {}
+      const roots = resolveImageInputRoots({
+        cwd: conversationWorkspaceState?.currentWorkspaceRootPath || '',
+        sessionStateRoot,
+        deniedDirs: [...(imageInputDenyPaths?.dirs || []), uploadsDir, ...(uploadReadDirs || [])],
+        deniedFiles: imageInputDenyPaths?.files || [],
+      });
+      const resolvedImages = resolveImageInputs(imagePathList, {
+        roots,
+        isLiveConversation: (id) => {
+          const row = stmts.getConvAnyStatus?.get?.(id) || null;
+          return !!row && String(row.status || '').trim() !== 'deleted';
+        },
+      });
+      if (!resolvedImages.ok) return refuseImageInput(resolvedImages.error);
+      const resolvedHashes = new Set(resolvedImages.images.map((image) => image.sha256));
+      const otherAttachments = attachments.filter((attachment) => !resolvedHashes.has(String(attachment?.sha256 || '').trim().toLowerCase()));
+      const total = resolvedImages.images.length + otherAttachments.length;
+      if (total > OPENAI_IMAGE_LIMITS.inputImagesMax) {
+        return refuseImageInput(`An image turn takes at most ${OPENAI_IMAGE_LIMITS.inputImagesMax} images; this one would have ${total} with the message's other attachments`);
+      }
+      try {
+        imageInputs = resolvedImages.images.map((image) => ({
+          ...persistUploadBuffer(image.bytes, { name: image.name, type: image.mime }),
+          // The type the bytes are, not the one an earlier upload of the
+          // same bytes was stored with.
+          type: image.mime,
+          width: image.width,
+          height: image.height,
+        }));
+      } catch (error) {
+        return res.status(500).json({ code: 'IMAGE_INPUT_STORE_FAILED', error: `The images could not be stored on this relay: ${error?.message || error}` });
+      }
+      imageInputsDropped = imagePathList.length - imageInputs.length;
+      attachments = [...imageInputs, ...otherAttachments];
     }
 
     const convId = shouldCreateConversation ? uuidv4() : conversationId;
@@ -5978,6 +6504,7 @@ export function registerMessagesRoutes(app, deps) {
         null,
         null,
       );
+      if (imageOptions) stmts.setQueueImageOptions?.run?.(JSON.stringify(imageOptions), msgId);
       if (imageContinuityEnabled && openAIImageModel) {
         if (!imageOperationService?.createEnqueuedOperation) {
           throw new Error('Image operation service is unavailable');
@@ -5989,11 +6516,7 @@ export function registerMessagesRoutes(app, deps) {
           prompt: trimmedText,
           selectedImageModel: requestedModel,
           executionMode: 'direct_images',
-          parameters: {
-            quality: requestedReasoningEffort,
-            size: normalizedContextTier,
-            count: 1,
-          },
+          parameters: imageOptions || { count: 1 },
           attachments,
           imageTarget,
           createdAt: now,
@@ -6158,8 +6681,17 @@ export function registerMessagesRoutes(app, deps) {
       workspaceRootWarning: workspaceRootUpdate.error || null,
       workspaceRootChanged: !!workspaceRootUpdate.changed,
       ...workspaceRootPayload(),
-      referenceAttachmentCount: referenceResolution.attachments.length,
+      referenceAttachmentCount: referenceResolution.attachments.length - ignoredReferenceAttachments,
       skippedReferenceAttachments: referenceResolution.skipped,
+      ...(ignoredReferenceAttachments ? { ignoredReferenceAttachments } : {}),
+      // How many images from imagePaths the turn has, and how many named
+      // twice (the same file, or the same bytes) were kept once.
+      ...(imagePathsGiven ? { imageInputs: imageInputs.length } : {}),
+      ...(imageInputsDropped > 0 ? {
+        imageInputsDropped,
+        imageInputsNote: `${imageInputsDropped} of the ${imagePathList.length} image paths named an image already attached; it was attached once.`,
+      } : {}),
+      ...(imageOptions ? { imageOptions } : {}),
       // Attachment references that no longer resolve (a deleted upload) are
       // dropped silently by normalizeAttachments; the sender is told how many.
       droppedAttachmentCount: Math.max(0, requestedAttachmentCount - normalizedAttachments.length),
@@ -7652,8 +8184,516 @@ export function registerMessagesRoutes(app, deps) {
     return res.json({ ok: true, ...result });
   });
 
+  // Image operations whose OpenAI request runs in this process, and the
+  // direct image requests (no operation) this process sent, by queue
+  // message: a second run of either would be billed again.
+  const executingImageOperations = new Set();
+  const dispatchedImageMessages = new Map();
+  const DISPATCHED_IMAGE_MESSAGES_MAX = 500;
+  const openAIImageTimeoutFromConfig = (key, fallback) => (Number(config?.[key]) > 0 ? Number(config[key]) : fallback);
+  const openAIImageGenerateTimeoutMs = openAIImageTimeoutFromConfig('openaiImageGenerateTimeoutMs', OPENAI_IMAGE_GENERATE_TIMEOUT_MS);
+  const openAIImageEditTimeoutMs = openAIImageTimeoutFromConfig('openaiImageEditTimeoutMs', OPENAI_IMAGE_EDIT_TIMEOUT_MS);
+  // The partial previews of the running image turns: files beside the
+  // turn's final images, events to the owner's clients (every socket is the
+  // owner's: share views read over HTTP and have none).
+  const imagePreviews = createOpenAIImagePreviewTurns({
+    resolveSessionStateRoot,
+    sessionIdFor: (conversationId) => String(stmts.getConvAnyStatus?.get?.(conversationId)?.sdk_session_id || '').trim() || conversationId,
+    emit: (event, payload) => io?.emit?.(event, payload),
+    ...(openAIImagePreviewLeftoverMs !== undefined ? { leftoverMs: openAIImagePreviewLeftoverMs } : {}),
+  });
+
+  // A partial preview of a running image turn, for the owner's clients
+  // only: only a file the turn wrote and still has is served (no path is
+  // built from the request), never through a share link, and gone with the
+  // turn.
+  app.get(`/api/generated-image/:conversationId/:messageId/${OPENAI_IMAGE_PARTIALS_DIR}/:fileName`, auth, (req, res) => {
+    const file = imagePreviews.partialFile({
+      conversationId: String(req.params.conversationId || '').trim(),
+      messageId: String(req.params.messageId || '').trim(),
+      fileName: String(req.params.fileName || '').trim(),
+    });
+    // lstat: a link put in the turn's partials folder is not followed.
+    let stat = null;
+    try {
+      stat = file ? fs.lstatSync(file.path) : null;
+    } catch {}
+    if (!stat?.isFile()) return res.status(404).json({ error: 'Preview not found' });
+    return serveFileWithRangeSupport(req, res, file.path, { size: stat.size, contentType: file.mime }, {
+      safeName: path.basename(file.path).replace(/"/g, ''),
+      // And the open itself refuses a link swapped in after the lstat (POSIX;
+      // Windows has no O_NOFOLLOW, the lstat is the guard there).
+      fsImpl: PARTIAL_PREVIEW_FS,
+    });
+  });
+
+  function noteDispatchedImageMessage(messageId) {
+    dispatchedImageMessages.delete(messageId);
+    dispatchedImageMessages.set(messageId, { at: Date.now(), running: true });
+    while (dispatchedImageMessages.size > DISPATCHED_IMAGE_MESSAGES_MAX) {
+      dispatchedImageMessages.delete(dispatchedImageMessages.keys().next().value);
+    }
+    return dispatchedImageMessages.get(messageId);
+  }
+
+  /**
+   * One try of an OpenAI image request: `{ ok: true, generatedImages, usage }`
+   * or `{ kind, status?, message?, detail? }` (see OPENAI_IMAGE_RETRY_KINDS).
+   * The timeout covers the reply's body as well, a streamed one whole.
+   * `fields` asking for a stream get one read event by event (a reply that is
+   * no event stream is read as JSON); `onPartial` sees each partial image.
+   */
+  async function sendOpenAIImageRequestOnce({ url, headers, fields, editImages, family, timeoutMs, outputFormat, model, onPartial = null }) {
+    // The images asked for: a stream's events past them are dropped.
+    const expectedImages = Math.max(1, Math.trunc(Number(fields.n) || 1));
+    let response;
+    try {
+      let body;
+      if (editImages.length) {
+        body = new FormData();
+        for (const [key, value] of Object.entries(fields)) body.set(key, String(value));
+        // gpt-image takes every image, the first being the base; dall-e-2
+        // takes one.
+        const images = family === 'gpt-image' ? editImages : editImages.slice(0, 1);
+        for (const image of images) {
+          body.append(
+            family === 'gpt-image' ? 'image[]' : 'image',
+            new Blob([image.bytes], { type: image.mimeType }),
+            image.name,
+          );
+        }
+      } else {
+        body = JSON.stringify(fields);
+      }
+      response = await fetch(url, {
+        method: 'POST',
+        headers: editImages.length ? headers : { ...headers, 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      const kind = classifyOpenAIImageFetchError(error);
+      return { kind, ownTimeout: error?.name === 'TimeoutError', detail: describeFetchError(error) };
+    }
+
+    const status = Number(response.status);
+    if (response.ok && fields.stream === true && isEventStreamResponse(response)) {
+      return readOpenAIImageStream(response, { status, outputFormat, model, onPartial, expectedImages });
+    }
+    let rawText = '';
+    try {
+      rawText = String(await response.text()).trim();
+    } catch (error) {
+      // A 2xx whose body broke off is billed; an error status keeps its class.
+      if (response.ok) return { kind: 'unprocessed', status, detail: `the reply broke off: ${describeFetchError(error)}` };
+      return status >= 500 ? { kind: 'server', status } : { kind: 'refused', status };
+    }
+    let payload = {};
+    if (rawText) {
+      try {
+        payload = JSON.parse(rawText);
+      } catch {
+        // After a 2xx the generation is billed; a retry pays again. An error
+        // status with a body that is not JSON stays a provider failure.
+        if (response.ok) return { kind: 'unprocessed', status, detail: 'OpenAI image API returned invalid JSON' };
+        payload = null;
+      }
+    }
+    if (!response.ok) {
+      const message = String(payload?.error?.message || payload?.message || (payload ? '' : rawText)).trim().slice(0, 240);
+      if (!Number.isFinite(status) || status >= 500) return { kind: 'server', status, message };
+      return { kind: 'refused', status, message };
+    }
+    try {
+      const generatedImages = normalizeOpenAIImageApiGeneratedImages(payload, {
+        maxImages: MAX_UPLOAD_ATTACHMENTS,
+        outputFormat,
+      });
+      return { ok: true, generatedImages, usage: normalizeOpenAIImageUsage(payload?.usage) };
+    } catch (error) {
+      // The usage the reply carried is what was billed.
+      const usage = normalizeOpenAIImageUsage(payload?.usage);
+      // The provider answered 2xx, so the generation is billed; what failed
+      // is the relay's handling of the reply. Logged with the stack: a retry
+      // pays again and fails the same way.
+      console.error(
+        `[${ts()}] IMAGE     reply of ${model} not processed: ${error?.message || error} (body ${rawText.length} chars)\n${error?.stack || ''}`,
+      );
+      return { kind: 'unprocessed', status, detail: error?.message || 'OpenAI image API returned no images', ...(usage ? { usage } : {}) };
+    }
+  }
+
+  /**
+   * The rest of a streamed reply (after a 2xx with an event stream): each
+   * partial goes to `onPartial`, each completed event's image is kept in
+   * order (a count > 1 turn may get several), and the completed events'
+   * usages add up to the request's. A stream that breaks off, ends without an image
+   * or reports a server error after OpenAI started may have been billed:
+   * 'stream', 'timeout' or 'server', tried once more. An error event that
+   * names a refusal is 'refused'; an image the relay cannot read, or an event
+   * past the reader's cap, 'unprocessed'.
+   *
+   * Once every image asked for (`expectedImages`) is complete, a stream that
+   * breaks off or times out before its end still answers them: they are
+   * billed, and a retry would buy them again. Partials past
+   * OPENAI_IMAGE_PARTIAL_IMAGES per image or past the images asked for, and
+   * completed events past those images, are dropped unread.
+   *
+   * Every result carries `partials` (received) and, once a completed event
+   * was read, `usage`: a try that fails after it books that usage
+   * (openAIImageTryCharge).
+   */
+  async function readOpenAIImageStream(response, { status, outputFormat, model, onPartial, expectedImages = 1 }) {
+    const completed = [];
+    let usage = null;
+    let partials = 0;
+    // What every result carries for the booking.
+    const counted = (result) => ({ ...result, partials, ...(usage ? { usage } : {}) });
+    const answer = () => {
+      try {
+        const generatedImages = normalizeOpenAIImageApiGeneratedImages({
+          data: completed.map((payload) => ({ b64_json: payload.b64_json })),
+          output_format: completed[0].output_format,
+        }, { maxImages: MAX_UPLOAD_ATTACHMENTS, outputFormat });
+        return counted({ ok: true, generatedImages });
+      } catch (error) {
+        console.error(`[${ts()}] IMAGE     streamed reply of ${model} not processed: ${error?.message || error}\n${error?.stack || ''}`);
+        return counted({ kind: 'unprocessed', status, detail: error?.message || 'OpenAI image stream returned no images' });
+      }
+    };
+    try {
+      for await (const sse of readSseEvents(response.body)) {
+        const event = interpretOpenAIImageStreamEvent(sse);
+        if (event.type === 'partial') {
+          partials += 1;
+          const partialIndex = Number.isInteger(event.payload.partial_image_index) ? event.payload.partial_image_index : partials - 1;
+          const shown = completed.length < expectedImages && partialIndex >= 0 && partialIndex < OPENAI_IMAGE_PARTIAL_IMAGES;
+          if (onPartial && shown) {
+            try {
+              await onPartial({
+                imageIndex: completed.length,
+                partialIndex,
+                b64: event.payload.b64_json,
+                outputFormat: event.payload.output_format || outputFormat,
+              });
+            } catch (error) {
+              console.warn(`[${ts()}] IMAGE     partial of ${model} not shown: ${error?.message || error}`);
+            }
+          }
+        } else if (event.type === 'completed') {
+          if (completed.length >= expectedImages) continue;
+          completed.push(event.payload);
+          usage = addOpenAIImageUsage(usage, normalizeOpenAIImageUsage(event.payload.usage));
+        } else if (event.type === 'invalid' && sse.event.endsWith('.completed')) {
+          return counted({ kind: 'unprocessed', status, detail: 'OpenAI image stream sent an unreadable image' });
+        } else if (event.type === 'error') {
+          const { message, type, code } = event.error;
+          const named = `${type} ${code}`.toLowerCase();
+          const detail = `error event in the stream${code ? ` (${code})` : ''} after ${partials} partial image(s)`;
+          if (['server', 'internal', 'overloaded', 'timeout', 'unavailable'].some((word) => named.includes(word)) || !named.trim()) {
+            return counted({ kind: 'server', message, detail });
+          }
+          return counted({ kind: 'refused', status: 400, message, detail, streamed: true });
+        }
+      }
+    } catch (error) {
+      if (error?.code === SSE_EVENT_TOO_LARGE_CODE) return counted({ kind: 'unprocessed', status, detail: error.message });
+      if (completed.length >= expectedImages) {
+        console.warn(`[${ts()}] IMAGE     ${model} stream broke off after its ${completed.length} image(s): kept (${describeFetchError(error)})`);
+        return answer();
+      }
+      const kind = classifyOpenAIImageFetchError(error);
+      return counted({
+        kind: kind === 'timeout' ? 'timeout' : 'stream',
+        ownTimeout: error?.name === 'TimeoutError',
+        detail: `the stream broke off after ${partials} partial image(s): ${describeFetchError(error)}`,
+      });
+    }
+    if (!completed.length) return counted({ kind: 'stream', detail: `the stream ended without an image after ${partials} partial image(s)` });
+    return answer();
+  }
+
+  /**
+   * The OpenAI image request of one turn, for the execute route and the
+   * generate route alike: the request with every option and every input
+   * image, a timeout per try (generate / edit), and one retry of a try that
+   * may pass the second time, with the same Idempotency-Key (OpenAI may
+   * ignore it; the note says the request may have been billed). Never more
+   * than two requests: nothing else may send this turn again.
+   *
+   * `requestBody` is normalizeOpenAIImageGenerateRequestBody's. Resolves
+   * `{ ok: true, generatedImages, model, endpoint, usage, tries, note? }`
+   * (`note`: openAIImageRetriedNote's) or openAIImageFailureResult's failure.
+   *
+   * A gpt-image request is streamed with OPENAI_IMAGE_PARTIAL_IMAGES partials
+   * per image (dall-e models do not stream). With `preview` ({ conversationId,
+   * messageId }: the queue message the turn answers) the owner's clients see
+   * each try start and each partial; a retry drops the first try's, and the
+   * turn's end (/api/response) the rest.
+   *
+   * Each try is checked against the daily cap and reserves its estimate
+   * right before it is sent (the resend without stream fields keeps the
+   * reservation); the cap refuses a try with OPENAI_IMAGE_DAILY_CAP_REACHED
+   * and sends nothing. When the try ends, its cost is booked under the queue
+   * row (`scopeId`: the image attempt, or the claim, that runs it; run_id
+   * image:<scopeId>:try<n>) and its reservation dropped, in one step.
+   */
+  async function runOpenAIImageRequest(requestBody, { idempotencyKey = '', preview = null, scopeId = '' } = {}) {
+    const settings = getOpenAIProviderSettings();
+    if (settings?.configured !== true || !String(settings?.apiKey || '').trim()) {
+      return openAIImageRequestRefusal(503, 'IMAGE_PROVIDER_NOT_CONFIGURED', 'OpenAI BYOK is not configured');
+    }
+    const baseUrl = String(settings.baseUrl || '').trim().replace(/\/+$/, '');
+    if (!baseUrl) return openAIImageRequestRefusal(503, 'IMAGE_PROVIDER_NOT_CONFIGURED', 'OpenAI base URL is not configured');
+
+    let editImages = [];
+    try {
+      editImages = resolveOpenAIImageEditAttachments(requestBody.attachments, {
+        maxImageBytes: MAX_UPLOAD_BYTES,
+        allowedRootPath: uploadsDir,
+        allowedBlobRootPaths: uploadReadDirs.slice(1),
+        allowedGeneratedImagesRootPath: resolveSessionStateRoot?.() || '',
+      });
+    } catch (error) {
+      return openAIImageRequestRefusal(400, 'IMAGE_REQUEST_INVALID', error?.message || 'Invalid image attachment');
+    }
+
+    const family = openAIImageModelFamily(requestBody.model);
+    const fields = buildOpenAIImageRequestFields(requestBody);
+    const endpoint = editImages.length ? '/images/edits' : '/images/generations';
+    const timeoutMs = editImages.length ? openAIImageEditTimeoutMs : openAIImageGenerateTimeoutMs;
+    const headers = {
+      Authorization: `Bearer ${settings.apiKey}`,
+      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+    };
+    let streaming = family === 'gpt-image' && OPENAI_IMAGE_PARTIAL_IMAGES > 0;
+    const previewTurn = preview
+      ? imagePreviews.begin({
+        conversationId: preview.conversationId,
+        messageId: preview.messageId,
+        size: requestBody.size,
+        quality: requestBody.quality,
+        count: requestBody.n,
+        model: requestBody.model,
+      })
+      : null;
+    const tries = [];
+    // HTTP requests of this turn, the resend without stream fields included:
+    // never more than two.
+    let calls = 0;
+    let resent = false;
+    let result = null;
+    // What a try of this request costs, and where it books.
+    const spendRequest = {
+      model: requestBody.model,
+      size: requestBody.size,
+      quality: requestBody.quality,
+      count: requestBody.n,
+      inputImages: editImages.length,
+    };
+    const bookingScope = String(scopeId || '').trim() || `claim_${randomUUID()}`;
+    // The try in flight's reservation: held across the resend, released
+    // (with its booking, or without one) when the try ends.
+    let reservation = null;
+    previewTurn?.started(1);
+    try {
+      for (;;) {
+        if (!reservation) {
+          const tryNumber = tries.length + 1;
+          const reserved = imageSpend.reserveTry({ estimateUsd: estimateOpenAIImageCost(spendRequest).costUsd });
+          if (!reserved.ok) {
+            console.warn(`[${ts()}] IMAGE     ${requestBody.model} ${endpoint} try=${tryNumber} stopped by the daily cap`);
+            result = openAIImageCapRefusalResult(tries, reserved);
+            break;
+          }
+          reservation = reserved.reservation;
+        }
+        calls += 1;
+        const tried = await sendOpenAIImageRequestOnce({
+          url: `${baseUrl}${endpoint}`,
+          // The resend's body differs from the first request's: its own key.
+          headers: resent && idempotencyKey ? { ...headers, 'Idempotency-Key': `${idempotencyKey}-nostream` } : headers,
+          fields: streaming ? { ...fields, stream: true, partial_images: OPENAI_IMAGE_PARTIAL_IMAGES } : fields,
+          editImages,
+          family,
+          timeoutMs,
+          outputFormat: requestBody.output_format,
+          model: requestBody.model,
+          onPartial: previewTurn ? (partial) => previewTurn.partial(partial) : null,
+        });
+        // The resend without stream fields (below) is the same try: it keeps
+        // the reservation and books once.
+        const resend = streaming && calls < 2 && tried.kind === 'refused' && Number(tried.status) === 400 && !tried.streamed
+          && /\bstream|partial_image/i.test(String(tried.message || '').slice(0, 240));
+        if (!resend) {
+          imageSpend.settleTry(reservation, {
+            conversationId: requestBody.conversationId,
+            turnId: requestBody.messageId,
+            runId: openAIImageTryRunId(bookingScope, tries.length + 1),
+            model: requestBody.model,
+            charge: openAIImageTryCharge({ tried, request: spendRequest }),
+          });
+          reservation = null;
+        }
+        if (tried.ok) {
+          const note = openAIImageRetriedNote(tries, { timeoutMs });
+          result = {
+            ok: true,
+            generatedImages: tried.generatedImages,
+            model: requestBody.model,
+            endpoint,
+            usage: tried.usage,
+            tries: tries.length + 1,
+            ...(note ? { note } : {}),
+          };
+          break;
+        }
+        // An endpoint that takes no stream (an OpenAI-compatible one, or a
+        // model OpenAI does not stream) refuses the fields with a 400 before
+        // any work: the same try again without them, nothing billed. It
+        // counts as one of the two requests, so a resend that fails is final.
+        // Any other refusal (a 429 that names streaming, say) is no reason.
+        if (resend) {
+          console.warn(`[${ts()}] IMAGE     ${requestBody.model} ${endpoint} refused streaming; sent again without it`);
+          streaming = false;
+          resent = true;
+          continue;
+        }
+        tries.push(tried);
+        console.warn(
+          `[${ts()}] IMAGE     ${requestBody.model} ${endpoint} try=${tries.length} ${tried.kind}`
+          + `${tried.status ? ` status=${tried.status}` : ''}${tried.detail ? ` ${String(tried.detail).slice(0, 200)}` : ''}`,
+        );
+        if (calls >= 2 || !OPENAI_IMAGE_RETRY_KINDS.has(tried.kind)) break;
+        await delay(openAIImageRetryDelayMs);
+        previewTurn?.retry();
+        previewTurn?.started(tries.length + 1);
+      }
+    } finally {
+      // A throw or an abort: the try books nothing it did not book above.
+      imageSpend.releaseTry(reservation);
+      previewTurn?.ended({ ok: Boolean(result?.ok) });
+    }
+    return result || openAIImageFailureResult(tries, { timeoutMs, resent });
+  }
+
+  /**
+   * The reply line of an image turn: what came back, and what this turn's
+   * tries were booked at ("~USD 0.21", marked "(estimate)" when any part is
+   * one, "(price unknown, estimated)" for the stand-in); from 80 % of the
+   * daily cap on, today's spend against it.
+   */
+  function openAIImageReplyLine({ images, model, turnId }) {
+    let cost = null;
+    let state = null;
+    try {
+      cost = imageSpend.turnCost(turnId);
+      state = imageSpend.buildState();
+    } catch (error) {
+      console.warn(`[${ts()}] IMAGE     the cost of ${String(turnId || '').slice(0, 8)} could not be read: ${error?.message || error}`);
+    }
+    let line = formatOpenAIImageSummary({ images, model, costUsd: cost ? cost.costUsd : null });
+    if (cost?.unknownPrice) line += ' (price unknown, estimated)';
+    else if (cost?.estimated) line += ' (estimate)';
+    // The spend state's own rule (booked and in flight, `warning`), as the
+    // banner reads it.
+    if (state?.capUsd && state.warning) {
+      const todayUsd = (Number(state.spentUsd) || 0) + (Number(state.reservedUsd) || 0);
+      line += ` · today ${formatOpenAIImageUsd(todayUsd)} of ${state.capUsd.toFixed(2)} (${Math.round((todayUsd / state.capUsd) * 100)} %)`;
+    }
+    return line;
+  }
+
+  // Today's OpenAI image spend against the daily cap (the Check Usage card,
+  // the banner, a paired relay's check before create_session); with
+  // `?conversationId=` also that chat's.
+  app.get(OPENAI_IMAGE_USAGE_PATH, auth, (req, res) => {
+    const conversationId = String(req.query?.conversationId || '').trim().slice(0, 200) || null;
+    try {
+      return res.json(imageSpend.buildState({ conversationId }));
+    } catch (error) {
+      return res.status(500).json({ error: `Image spend could not be read: ${error?.message || error}` });
+    }
+  });
+
+  /**
+   * An image attempt the recovery found cut off while its request ran
+   * ('started', now 'uncertain'): it may have been billed, so its estimate
+   * is booked as image:<attemptId>:recovered, unless a try of that attempt
+   * was booked already.
+   */
+  function bookRecoveredImageAttempt(operation, attempt) {
+    if (!operation || !attempt?.id) return;
+    let parameters = {};
+    try {
+      parameters = JSON.parse(operation.parameters_json || '{}') || {};
+    } catch {}
+    let inputImages = operation.parent_node_id ? 1 : 0;
+    if (!operation.parent_node_id) {
+      try {
+        inputImages = (stmts.listAssets?.all?.(operation.id) || []).length;
+      } catch {}
+    }
+    try {
+      imageSpend.bookRecovered({
+        conversationId: operation.conversation_id,
+        turnId: operation.queue_message_id,
+        attemptId: attempt.id,
+        model: operation.selected_image_model,
+        startedAt: attempt.started_at,
+        request: { size: parameters.size, quality: parameters.quality, count: parameters.count ?? 1, inputImages },
+      });
+    } catch (error) {
+      console.warn(`[${ts()}] IMAGE_OP  the estimate of attempt=${attempt.id} was not booked: ${error?.message || error}`);
+    }
+  }
+
+  /**
+   * Why a queue row may not go back to pending (/api/requeue): `{ running:
+   * true }` while its image request runs in this process, `{ failure }`
+   * (a terminalError) once its request went to OpenAI, or null for a row
+   * whose request was never sent (requeueing it bills nothing).
+   */
+  function imageTurnRequeueStop(queueRow) {
+    const operationId = String(queueRow?.image_operation_id || '').trim();
+    if (operationId) {
+      if (executingImageOperations.has(operationId)) return { running: true };
+      const attempt = stmts.getLatestAttempt?.get?.(operationId) || null;
+      if (!attempt) return null;
+      if (attempt.status === 'started') {
+        stmts.finishAttempt.run({
+          id: attempt.id,
+          status: 'uncertain',
+          providerRequestId: null,
+          providerConversationId: null,
+          providerResponseId: null,
+          httpStatus: null,
+          errorCode: 'IMAGE_ATTEMPT_INTERRUPTED',
+          errorMessage: OPENAI_IMAGE_INTERRUPTED_NOTE,
+          completedAt: new Date().toISOString(),
+        });
+        bookRecoveredImageAttempt(stmts.getOperation?.get?.(operationId), attempt);
+        return { failure: { code: 'IMAGE_ATTEMPT_INTERRUPTED', message: OPENAI_IMAGE_INTERRUPTED_NOTE, guidance: OPENAI_IMAGE_FAILURE_GUIDANCE } };
+      }
+      return {
+        failure: {
+          code: String(attempt.error_code || '').trim() || 'IMAGE_ATTEMPT_REPEATED',
+          message: String(attempt.error_message || '').trim() || OPENAI_IMAGE_REPEATED_NOTE,
+          guidance: OPENAI_IMAGE_FAILURE_GUIDANCE,
+        },
+      };
+    }
+    const dispatched = dispatchedImageMessages.get(String(queueRow?.id || ''));
+    if (!dispatched) return null;
+    if (dispatched.running) return { running: true };
+    return { failure: { code: 'IMAGE_ATTEMPT_REPEATED', message: OPENAI_IMAGE_REPEATED_NOTE, guidance: OPENAI_IMAGE_FAILURE_GUIDANCE } };
+  }
+
   // Called by the relay's own worker on this machine; nothing that came in
   // through a proxy or the tunnel may start a provider image request.
+  // The request runs in this process (runOpenAIImageRequest): its timeout
+  // and its one retry are the only ones. A failure ends the row with a note,
+  // never with a requeue: a requeued image turn was billed again.
   app.post('/api/image-operations/:operationId/execute', auth, async (req, res) => {
     if (!isTrulyLocalRequest(req)) {
       return res.status(403).json({ error: 'Image operation execution is reachable from this machine only' });
@@ -7673,6 +8713,11 @@ export function registerMessagesRoutes(app, deps) {
     if (!queueRow || queueRow.image_operation_id !== operationId) {
       return res.status(409).json({ error: 'Image operation queue linkage is unavailable' });
     }
+    // Delivered again while its request still runs here (a worker that
+    // died and came back): that run finishes the row.
+    if (executingImageOperations.has(operationId)) {
+      return res.status(202).json({ ok: true, outcome: 'executing', operationId });
+    }
 
     const now = new Date().toISOString();
     const selfHeaders = {
@@ -7680,6 +8725,23 @@ export function registerMessagesRoutes(app, deps) {
       'Content-Type': 'application/json',
     };
     const selfBaseUrl = `http://127.0.0.1:${config.port}`;
+    const publishFailure = async (terminalError) => {
+      // `terminalError` is the field /api/response reads; under any other
+      // name the failure was refused as an empty reply and the row stayed
+      // processing until the relay recovered and re-ran it.
+      const response = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
+        method: 'POST',
+        headers: selfHeaders,
+        body: JSON.stringify({
+          messageId: operation.queue_message_id,
+          conversationId: operation.conversation_id,
+          terminalError,
+        }),
+      }).catch(() => null);
+      if (!response?.ok) {
+        console.warn(`[${ts()}] IMAGE_OP  failed to publish the failure of operation=${operationId}`);
+      }
+    };
     const acquireAttempt = db.transaction(() => {
       const current = stmts.getLatestAttempt.get(operationId);
       if (current?.status === 'started') {
@@ -7697,15 +8759,19 @@ export function registerMessagesRoutes(app, deps) {
           providerResponseId: null,
           httpStatus: null,
           errorCode: 'IMAGE_ATTEMPT_INTERRUPTED',
-          errorMessage: 'Image execution was interrupted after provider dispatch may have begun',
+          errorMessage: OPENAI_IMAGE_INTERRUPTED_NOTE,
           completedAt: now,
         });
         return { acquired: false, attempt: current, stale: true };
       }
+      // An attempt that ended: its note was published, or publishing it
+      // failed and the row came back. Either way the request is not sent
+      // again.
+      if (current) return { acquired: false, attempt: current, finished: true };
       const attempt = {
         id: `img_attempt_${uuidv4()}`,
         operationId,
-        attemptNumber: Math.max(1, Number(current?.attempt_number || 0) + 1),
+        attemptNumber: 1,
         provider: operation.provider,
         capabilitySnapshotJson: JSON.stringify({
           executionMode: operation.execution_mode,
@@ -7718,339 +8784,250 @@ export function registerMessagesRoutes(app, deps) {
     });
     const acquired = acquireAttempt();
     if (acquired.stale) {
-      await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
-        method: 'POST',
-        headers: selfHeaders,
-        body: JSON.stringify({
-          messageId: operation.queue_message_id,
-          conversationId: operation.conversation_id,
-          // `terminalError` is the field /api/response reads; under any other
-          // name the failure was refused as an empty reply and the row stayed
-          // processing until the relay recovered and re-ran it.
-          terminalError: {
-            code: 'IMAGE_ATTEMPT_INTERRUPTED',
-            message: 'Image generation may have completed before the relay was interrupted. It was not retried to avoid duplicate images.',
-            retryable: false,
-          },
-        }),
-      }).catch(() => null);
+      bookRecoveredImageAttempt(operation, acquired.attempt);
+      await publishFailure({
+        code: 'IMAGE_ATTEMPT_INTERRUPTED',
+        message: OPENAI_IMAGE_INTERRUPTED_NOTE,
+        guidance: OPENAI_IMAGE_FAILURE_GUIDANCE,
+        retryable: false,
+      });
       return res.status(409).json({
         ok: false,
         outcome: 'uncertain',
         operationId,
-        error: 'The previous image attempt ended in an uncertain state and was not retried',
+        code: 'IMAGE_ATTEMPT_INTERRUPTED',
+        error: OPENAI_IMAGE_INTERRUPTED_NOTE,
+      });
+    }
+    if (acquired.finished) {
+      const earlier = acquired.attempt;
+      const message = String(earlier.error_message || '').trim() || OPENAI_IMAGE_REPEATED_NOTE;
+      const code = String(earlier.error_code || '').trim() || 'IMAGE_ATTEMPT_REPEATED';
+      await publishFailure({ code, message, guidance: OPENAI_IMAGE_FAILURE_GUIDANCE, retryable: false });
+      return res.status(409).json({
+        ok: false,
+        outcome: ['failed_terminal', 'failed_retryable'].includes(earlier.status) ? 'terminal' : 'uncertain',
+        operationId,
+        code,
+        error: message,
       });
     }
     if (!acquired.acquired) {
       return res.status(202).json({ ok: true, outcome: 'executing', operationId });
     }
 
-    const requestAttachments = [];
-    if (operation.parent_node_id) {
-      const parentNode = stmts.getNode.get(operation.parent_node_id);
-      const parentMessage = parentNode
-        ? db.prepare(`SELECT attachments FROM messages WHERE id = ?`).get(parentNode.assistant_message_id)
-        : null;
-      const parentAttachment = parseAttachments(parentMessage?.attachments).find((attachment) => (
-        String(attachment?.generatedImage?.imageId || '').trim() === parentNode?.attachment_image_id
-      ));
-      const generatedImage = parentAttachment?.generatedImage;
-      const parentPath = resolveGeneratedImageReadPath({
-        resolveSessionStateRoot,
-        sessionId: generatedImage?.sessionId,
-        relativePath: generatedImage?.relativePath,
-      });
-      if (!parentPath) {
+    executingImageOperations.add(operationId);
+    try {
+      const finishAttempt = (result) => {
         stmts.finishAttempt.run({
           id: acquired.attempt.id,
-          status: 'failed_terminal',
+          // A request that never reached OpenAI (unreachable, or stopped by
+          // the daily cap before it was sent) closes as retryable: nothing
+          // was billed, and the recovery books nothing for it.
+          status: result.outcome === 'uncertain'
+            ? 'uncertain'
+            : ((result.code === 'IMAGE_PROVIDER_UNREACHABLE' || (result.code === OPENAI_IMAGE_DAILY_CAP_REACHED_CODE && !result.sent))
+              ? 'failed_retryable'
+              : 'failed_terminal'),
           providerRequestId: null,
           providerConversationId: null,
           providerResponseId: null,
-          httpStatus: 400,
-          errorCode: 'IMAGE_PARENT_UNAVAILABLE',
-          errorMessage: 'The parent generated image is unavailable',
+          httpStatus: result.upstreamStatus || null,
+          errorCode: result.code,
+          errorMessage: String(result.error || '').slice(0, 500),
           completedAt: new Date().toISOString(),
         });
+      };
+      const fail = async (result) => {
+        finishAttempt(result);
+        await publishFailure(openAIImageTerminalError(result));
         return res.status(409).json({
           ok: false,
-          outcome: 'terminal',
-          code: 'IMAGE_PARENT_UNAVAILABLE',
-          error: 'The parent generated image is unavailable',
+          outcome: result.outcome,
+          operationId,
+          code: result.code,
+          error: result.error,
+          ...(result.usage ? { usage: result.usage } : {}),
         });
-      }
-      requestAttachments.push({
-        name: parentAttachment.name,
-        type: parentAttachment.type,
-        path: parentPath,
-      });
-    } else {
-      for (const asset of stmts.listAssets.all(operationId)) {
+      };
+
+      const requestAttachments = [];
+      if (operation.parent_node_id) {
+        const parentNode = stmts.getNode.get(operation.parent_node_id);
+        const parentMessage = parentNode
+          ? db.prepare(`SELECT attachments FROM messages WHERE id = ?`).get(parentNode.assistant_message_id)
+          : null;
+        const parentAttachment = parseAttachments(parentMessage?.attachments).find((attachment) => (
+          String(attachment?.generatedImage?.imageId || '').trim() === parentNode?.attachment_image_id
+        ));
+        const generatedImage = parentAttachment?.generatedImage;
+        const parentPath = resolveGeneratedImageReadPath({
+          resolveSessionStateRoot,
+          sessionId: generatedImage?.sessionId,
+          relativePath: generatedImage?.relativePath,
+        });
+        if (!parentPath) {
+          return await fail({
+            ...openAIImageRequestRefusal(400, 'IMAGE_PARENT_UNAVAILABLE', 'The parent generated image is unavailable'),
+            upstreamStatus: 400,
+          });
+        }
         requestAttachments.push({
-          name: asset.original_name || 'reference-image',
-          type: asset.media_type,
-          path: uploadPathForSha(asset.content_sha256),
+          name: parentAttachment.name,
+          type: parentAttachment.type,
+          path: parentPath,
         });
+      } else {
+        // In the order they were attached: the first is the base image.
+        for (const asset of stmts.listAssets.all(operationId)) {
+          requestAttachments.push({
+            name: asset.original_name || 'reference-image',
+            type: asset.media_type,
+            path: uploadPathForSha(asset.content_sha256),
+          });
+        }
       }
-    }
 
-    let parameters = {};
-    try {
-      parameters = JSON.parse(operation.parameters_json || '{}');
-    } catch {}
-    const generationBody = {
-      messageId: operation.queue_message_id,
-      conversationId: operation.conversation_id,
-      model: operation.selected_image_model,
-      prompt: operation.prompt,
-      n: Number.isInteger(Number(parameters.count)) ? Number(parameters.count) : 1,
-      attachments: requestAttachments,
-    };
-    if (parameters.size === 'auto' || /^\d{2,5}x\d{2,5}$/i.test(String(parameters.size || ''))) {
-      generationBody.size = parameters.size;
-    }
-    if (/^(auto|standard|hd|low|medium|high)$/i.test(String(parameters.quality || ''))) {
-      generationBody.quality = parameters.quality;
-    }
-
-    let generatedPayload = null;
-    try {
-      const generatedResponse = await fetch(`${selfBaseUrl}${remotePath}/api/openai/images/generate`, {
-        method: 'POST',
-        headers: selfHeaders,
-        body: JSON.stringify(generationBody),
-      });
-      generatedPayload = await generatedResponse.json().catch(() => ({}));
-      if (!generatedResponse.ok) {
-        const error = new Error(generatedPayload?.error || `OpenAI image request failed (${generatedResponse.status})`);
-        error.status = generatedResponse.status;
-        throw error;
-      }
-      const finalizeResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
-        method: 'POST',
-        headers: selfHeaders,
-        body: JSON.stringify({
+      // {size, quality, count, output_format, background}; any may be
+      // missing, count is 1 then.
+      let parameters = {};
+      try {
+        parameters = JSON.parse(operation.parameters_json || '{}') || {};
+      } catch {}
+      let requestBody;
+      try {
+        requestBody = normalizeOpenAIImageGenerateRequestBody({
           messageId: operation.queue_message_id,
           conversationId: operation.conversation_id,
-          text: '',
-          generatedImages: generatedPayload.generatedImages,
-          model: generatedPayload.model || operation.selected_image_model,
-        }),
-      });
-      const finalized = await finalizeResponse.json().catch(() => ({}));
-      if (!finalizeResponse.ok) {
-        const error = new Error(finalized?.error || `Image finalization failed (${finalizeResponse.status})`);
-        error.status = finalizeResponse.status;
-        throw error;
+          model: operation.selected_image_model,
+          prompt: operation.prompt,
+          n: parameters.count ?? 1,
+          size: parameters.size,
+          quality: parameters.quality,
+          output_format: parameters.output_format,
+          background: parameters.background,
+          attachments: requestAttachments,
+        });
+      } catch (error) {
+        return await fail(openAIImageRequestRefusal(400, 'IMAGE_REQUEST_INVALID', String(error?.message || 'Invalid image request')));
       }
-      return res.json({
-        ok: true,
-        outcome: 'completed',
-        operationId,
-        generatedImageCount: Array.isArray(generatedPayload.generatedImages)
-          ? generatedPayload.generatedImages.length
-          : 0,
+
+      const result = await runOpenAIImageRequest(requestBody, {
+        idempotencyKey: String(operation.idempotency_key || operation.id),
+        preview: { conversationId: operation.conversation_id, messageId: operation.queue_message_id },
+        scopeId: acquired.attempt.id,
       });
-    } catch (error) {
-      const status = Number(error?.status || 0);
-      // `relayProcessing`: the provider answered 2xx and the relay could not
-      // process the reply. The generation is billed, a retry pays again and
-      // fails the same way, so the row fails like a refusal.
-      const relayProcessing = generatedPayload?.relayProcessing === true;
-      const terminal = (status >= 400 && status < 500) || relayProcessing;
-      const uncertain = !!generatedPayload?.generatedImages;
-      const outcome = terminal ? 'terminal' : (uncertain ? 'uncertain' : 'retryable');
-      const errorMessage = relayProcessing
-        ? `The relay could not process the image OpenAI returned (${error?.message || 'unknown error'}). The generation was billed; the message was not retried.`
-        : String(error?.message || 'Image operation failed');
-      stmts.finishAttempt.run({
-        id: acquired.attempt.id,
-        status: terminal ? 'failed_terminal' : (uncertain ? 'uncertain' : 'failed_retryable'),
-        providerRequestId: null,
-        providerConversationId: null,
-        providerResponseId: null,
-        httpStatus: status || null,
-        errorCode: terminal
-          ? (relayProcessing ? 'IMAGE_REPLY_UNPROCESSED' : 'IMAGE_PROVIDER_REJECTED')
-          : (uncertain ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_UNAVAILABLE'),
-        errorMessage: errorMessage.slice(0, 500),
-        completedAt: new Date().toISOString(),
-      });
-      if (outcome === 'retryable') {
-        const requeueResponse = await fetch(`${selfBaseUrl}${remotePath}/api/requeue`, {
-          method: 'POST',
-          headers: selfHeaders,
-          body: JSON.stringify({ messageId: operation.queue_message_id }),
-        }).catch(() => null);
-        if (!requeueResponse?.ok) {
-          console.warn(`[${ts()}] IMAGE_OP  failed to requeue retryable operation=${operationId}`);
-        }
-      } else {
-        const failure = {
-          code: outcome === 'uncertain'
-            ? 'IMAGE_FINALIZATION_UNCERTAIN'
-            : (relayProcessing ? 'IMAGE_REPLY_UNPROCESSED' : 'IMAGE_PROVIDER_REJECTED'),
-          message: errorMessage.slice(0, 500),
-          retryable: false,
-        };
-        const failResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
+      if (!result.ok) return await fail(result);
+
+      let finalizeError = null;
+      try {
+        const finalizeResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
           method: 'POST',
           headers: selfHeaders,
           body: JSON.stringify({
             messageId: operation.queue_message_id,
             conversationId: operation.conversation_id,
-            terminalError: failure,
+            text: '',
+            generatedImages: result.generatedImages,
+            model: result.model || operation.selected_image_model,
+            // A first try that may have been billed too: the reply says so.
+            ...(result.note ? { imageNote: result.note } : {}),
           }),
-        }).catch(() => null);
-        if (!failResponse?.ok) {
-          console.warn(`[${ts()}] IMAGE_OP  failed to finalize ${outcome} operation=${operationId}`);
-        }
+        });
+        const finalized = await finalizeResponse.json().catch(() => ({}));
+        if (!finalizeResponse.ok) finalizeError = finalized?.error || `Image finalization failed (${finalizeResponse.status})`;
+      } catch (error) {
+        finalizeError = error?.message || 'Image finalization failed';
       }
-      return res.status(outcome === 'retryable' ? 503 : 409).json({
-        ok: false,
-        outcome,
+      if (finalizeError) {
+        return await fail({
+          ok: false,
+          outcome: 'uncertain',
+          code: 'IMAGE_FINALIZATION_UNCERTAIN',
+          error: `The images OpenAI returned could not be saved (${finalizeError}). The generation was billed; the message was not retried.`,
+          upstreamStatus: 200,
+          usage: result.usage,
+        });
+      }
+      return res.json({
+        ok: true,
+        outcome: 'completed',
         operationId,
-        error: String(error?.message || 'Image operation failed'),
+        generatedImageCount: result.generatedImages.length,
+        usage: result.usage,
+        ...(result.note ? { note: result.note } : {}),
       });
+    } finally {
+      executingImageOperations.delete(operationId);
     }
   });
 
+  // The relay's own workers call this on this machine for an image turn
+  // without an operation (image continuity off). Like the execute route it
+  // is local only: through the tunnel, or with a paired relay's token, it
+  // would spend the owner's money outside the queue. One request per queue
+  // message: a second call for the same message is refused.
   app.post('/api/openai/images/generate', auth, async (req, res) => {
     touchCli();
-    const settings = getOpenAIProviderSettings();
-    if (settings?.configured !== true || !String(settings?.apiKey || '').trim()) {
-      return res.status(503).json({ error: 'OpenAI BYOK is not configured' });
+    if (!isTrulyLocalRequest(req)) {
+      return res.status(403).json({ error: 'OpenAI image requests are reachable from this machine only' });
     }
 
     let requestBody;
     try {
-      requestBody = normalizeOpenAIImageGenerateRequestBody(req.body, {
-        maxImages: MAX_UPLOAD_ATTACHMENTS,
-      });
+      requestBody = normalizeOpenAIImageGenerateRequestBody(req.body);
     } catch (error) {
-      return res.status(400).json({ error: error?.message || 'Invalid OpenAI image request' });
+      return res.status(400).json({
+        error: error?.message || 'Invalid OpenAI image request',
+        code: 'IMAGE_REQUEST_INVALID',
+        outcome: 'terminal',
+      });
+    }
+    if (dispatchedImageMessages.has(requestBody.messageId)) {
+      return res.status(409).json({
+        error: OPENAI_IMAGE_REPEATED_NOTE,
+        code: 'IMAGE_ATTEMPT_REPEATED',
+        outcome: 'uncertain',
+      });
     }
 
-    const baseUrl = String(settings.baseUrl || '').trim().replace(/\/+$/, '');
-    if (!baseUrl) return res.status(503).json({ error: 'OpenAI base URL is not configured' });
-
-    let editAttachment = null;
-    if (Array.isArray(requestBody.attachments) && requestBody.attachments.length > 0) {
-      try {
-        editAttachment = resolveOpenAIImageEditAttachment(requestBody.attachments, {
-          maxImageBytes: MAX_UPLOAD_BYTES,
-          allowedRootPath: uploadsDir,
-          allowedBlobRootPaths: uploadReadDirs.slice(1),
-          allowedGeneratedImagesRootPath: resolveSessionStateRoot?.() || '',
-        });
-      } catch (error) {
-        return res.status(400).json({ error: error?.message || 'Invalid image attachment' });
-      }
-    }
-
-    const options = {
-      model: requestBody.model,
-      prompt: requestBody.prompt,
-    };
-    const supportsResponseFormat = String(requestBody.model || '')
-      .trim()
-      .toLowerCase()
-      .replace(/^openai\//, '')
-      .startsWith('dall-e-');
-    if (supportsResponseFormat) options.response_format = 'b64_json';
-    if (requestBody.n !== undefined) options.n = requestBody.n;
-    if (requestBody.size) options.size = requestBody.size;
-    if (requestBody.quality) options.quality = requestBody.quality;
-
-    const endpoint = editAttachment ? '/images/edits' : '/images/generations';
-    let response;
+    const dispatched = noteDispatchedImageMessage(requestBody.messageId);
+    // One run of the message: the claim's attempt id (a restart claims the
+    // row anew), so its tries never merge into an earlier run's rows.
+    // Known gap: this path (image continuity off) keeps no attempt row, so a
+    // try a relay restart cuts off is booked nowhere; the operation path's
+    // recovery books such a try as an estimate. docs/providers.md says so.
+    let claimId = '';
     try {
-      if (editAttachment) {
-        const form = new FormData();
-        form.set('model', options.model);
-        form.set('prompt', options.prompt);
-        if (options.response_format) form.set('response_format', String(options.response_format));
-        if (options.n !== undefined) form.set('n', String(options.n));
-        if (options.size) form.set('size', String(options.size));
-        if (options.quality) form.set('quality', String(options.quality));
-        form.set(
-          'image',
-          new Blob([editAttachment.bytes], { type: editAttachment.mimeType }),
-          editAttachment.name,
-        );
-        response = await fetch(`${baseUrl}${endpoint}`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${settings.apiKey}`,
-          },
-          body: form,
-        });
-      } else {
-        response = await fetch(`${baseUrl}${endpoint}`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${settings.apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(options),
-        });
-      }
-    } catch (error) {
-      return res.status(502).json({ error: `OpenAI image API request failed: ${error?.message || 'request error'}` });
-    }
+      claimId = String(stmts.findQById?.get?.(requestBody.messageId)?.attempt_id || '').trim();
+    } catch {}
+    const result = await runOpenAIImageRequest(requestBody, {
+      idempotencyKey: `oar-image-${requestBody.messageId}`,
+      preview: { conversationId: requestBody.conversationId, messageId: requestBody.messageId },
+      scopeId: claimId ? `claim_${claimId}` : '',
+    });
+    // A request that never reached OpenAI may be sent again.
+    if (result.ok || result.sent) dispatched.running = false;
+    else dispatchedImageMessages.delete(requestBody.messageId);
 
-    const rawText = String(await response.text().catch(() => '')).trim();
-    let payload = {};
-    if (rawText) {
-      try {
-        payload = JSON.parse(rawText);
-      } catch {
-        // After a 2xx the generation is billed; the callers fail the row
-        // instead of paying for it again. An error status with a body that
-        // is not JSON stays a provider failure.
-        return res.status(502).json({
-          error: 'OpenAI image API returned invalid JSON',
-          ...(response.ok ? { relayProcessing: true } : {}),
-        });
-      }
-    }
-
-    if (!response.ok) {
-      const detail = String(payload?.error?.message || payload?.message || rawText).trim().slice(0, 240);
-      const upstreamStatus = Number(response.status);
-      const relayStatus = Number.isFinite(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus < 500
-        ? upstreamStatus
-        : 502;
-      return res.status(relayStatus).json({
-        error: `OpenAI image API failed (${response.status})${detail ? `: ${detail}` : ''}`,
-        upstreamStatus: Number.isFinite(upstreamStatus) ? upstreamStatus : null,
+    if (!result.ok) {
+      return res.status(result.status).json({
+        error: result.error,
+        code: result.code,
+        outcome: result.outcome,
+        upstreamStatus: result.upstreamStatus,
+        ...(result.detail ? { detail: result.detail } : {}),
+        ...(result.relayProcessing ? { relayProcessing: true } : {}),
       });
     }
-
-    let generatedImages = [];
-    try {
-      generatedImages = normalizeOpenAIImageApiGeneratedImages(payload, {
-        maxImages: MAX_UPLOAD_ATTACHMENTS,
-      });
-    } catch (error) {
-      // The provider answered 2xx, so the generation is billed; what failed
-      // is the relay's handling of the reply. Logged with the stack, and
-      // flagged so the callers fail the row instead of requeueing it: a
-      // retry pays again and fails the same way.
-      console.error(
-        `[${ts()}] IMAGE     reply of ${requestBody.model} not processed: ${error?.message || error} (body ${rawText.length} chars)\n${error?.stack || ''}`,
-      );
-      return res.status(502).json({
-        error: error?.message || 'OpenAI image API returned no images',
-        relayProcessing: true,
-      });
-    }
-
     return res.json({
       ok: true,
-      generatedImages,
-      model: requestBody.model,
-      endpoint,
+      generatedImages: result.generatedImages,
+      model: result.model,
+      endpoint: result.endpoint,
+      usage: result.usage,
+      // The worker hands it to /api/response as `imageNote`.
+      ...(result.note ? { note: result.note } : {}),
     });
   });
 
@@ -8149,12 +9126,16 @@ export function registerMessagesRoutes(app, deps) {
       console.log(`[${ts()}] FENCE     ${messageId?.slice(0,8)} legacy unfenced response write`);
     }
 
+    // The partial previews of an image turn go once its reply or its
+    // failure note is stored (or was already).
     if (q && q.status === 'done') {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_done`);
+      imagePreviews.finish(messageId, 'done');
       return res.json({ ok: true, ignored: 'already_done' });
     }
     if (q && q.status === 'failed') {
       console.log(`[${ts()}] RESPONSE  ${messageId?.slice(0,8)} ignored=already_failed`);
+      imagePreviews.finish(messageId, 'failed');
       return res.json({ ok: true, ignored: 'already_failed' });
     }
 
@@ -8259,6 +9240,7 @@ export function registerMessagesRoutes(app, deps) {
         + `${terminalFailure.functionCallId ? ` call=${terminalFailure.functionCallId}` : ''}`
         + `${terminalFailure.requestId ? ` req=${terminalFailure.requestId}` : ''}`,
       );
+      imagePreviews.finish(messageId, 'failed');
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
     }
 
@@ -8266,7 +9248,7 @@ export function registerMessagesRoutes(app, deps) {
     const hasPendingQuestion = !!stmts.findPendingQuestionByMessage?.get(messageId);
     const hasRecentlyAnsweredQuestion = !!stmts.findRecentlyAnsweredQuestionByMessage?.get(messageId, holdCutoff);
     const conversation = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
-    const resolvedText = await resolveRelayResponseText({
+    let resolvedText = await resolveRelayResponseText({
       text: trimmedText,
       conversation,
       queueTimestamp: q?.timestamp || null,
@@ -8348,6 +9330,29 @@ export function registerMessagesRoutes(app, deps) {
       });
     } catch (error) {
       return res.status(500).json({ error: error?.message || 'Failed to persist generated images' });
+    }
+    // An image turn whose model wrote no text: the reply line says what came
+    // back ("1 image · 1536x1024 · gpt-image-2"), so the chat and an agent
+    // that reads text only see the same.
+    const imageTurnModel = [resolvedAssistantModel, requestedModel].find((candidate) => isOpenAIImageModelId(candidate)) || '';
+    const imageSummaryLine = Boolean(!resolvedText && generatedImageAttachments.length && (q?.image_operation_id || imageTurnModel));
+    if (imageSummaryLine) {
+      resolvedText = openAIImageReplyLine({
+        images: generatedImageAttachments,
+        model: imageTurnModel || resolvedAssistantModel || '',
+        turnId: messageId,
+      });
+    }
+    // The image request came through on its second try, and the first may
+    // have been billed as well: the reply says so, on the reply line when
+    // that is the text, so an agent that reads text only sees it too.
+    const imageNote = generatedImageAttachments.length
+      ? String(req.body.imageNote || '').trim().slice(0, OPENAI_IMAGE_NOTE_MAX)
+      : '';
+    if (imageNote) {
+      resolvedText = imageSummaryLine
+        ? `${resolvedText}. Note: ${imageNote}`
+        : `${String(resolvedText || '').trimEnd()}${resolvedText ? '\n\n' : ''}Note: ${imageNote}`;
     }
     const assistantAttachments = generatedImageAttachments.length ? JSON.stringify(generatedImageAttachments) : null;
     const now = new Date().toISOString();
@@ -8479,8 +9484,10 @@ export function registerMessagesRoutes(app, deps) {
       // Ensure UI is updated even if the response was duplicate/late
       if (currentStatus === 'done') {
         io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+        imagePreviews.finish(messageId, 'done');
       } else if (currentStatus === 'failed') {
         io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'failed' });
+        imagePreviews.finish(messageId, 'failed');
       }
       return res.json({ ok: true, ignored: 'not_pending_or_processing', actualStatus: currentStatus });
     }
@@ -8629,6 +9636,8 @@ export function registerMessagesRoutes(app, deps) {
       },
     });
     io.emit('message_status', { messageId, conversationId: targetConversationId, status: 'done' });
+    // The final images are in the chat: the previews go.
+    imagePreviews.finish(messageId, generatedImageAttachments.length ? 'done' : 'failed');
     if (usageLimitPause) {
       try {
         usageLimitPauseService.schedulePause(usageLimitPause, { queueRow: q });
@@ -9533,7 +10542,13 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
 
-    io.emit('relay_thought', {
+    // An update in flight (done false) is volatile, as relay_stream: each one
+    // carries the whole thought so far (up to MAX_THOUGHT_CHARS), so keeping
+    // them in the connection-state-recovery buffer, or queueing them on a
+    // socket that does not drain, holds a turn's worth of copies — gigabytes
+    // for a few long reasoning turns at once. A reconnect resync reads the
+    // stored snapshot instead; the final thought (done) is never dropped.
+    (done ? io : io.volatile).emit('relay_thought', {
       messageId,
       conversationId,
       mode: relayMode,
@@ -9804,6 +10819,41 @@ export function registerMessagesRoutes(app, deps) {
       // The CLI already took this prompt: any requeue class would run it again.
       failConsumedQueueRow(q, { reason: 'requeue', attemptId: claimedAttemptId });
       return res.json({ ok: true, terminal: true, code: STEER_SETTLE_FAILED_STABLE_CODE });
+    }
+    if (q && q.status === 'processing') {
+      // An image turn whose request went to OpenAI is never run again: a
+      // second run is billed again. One still running here finishes the row
+      // itself; one that ended, or was cut off, ends with the note.
+      const imageStop = imageTurnRequeueStop(q);
+      if (imageStop?.running) return res.json({ ok: true, held: 'image-request-running' });
+      if (imageStop) {
+        const failed = failQueueMessage({
+          queueRow: q,
+          messageId,
+          conversationId: q.conversation_id,
+          relayMode: normalizeRelayMode(q.relay_mode) || DEFAULT_RELAY_MODE,
+          model: q.model || null,
+          responseText: buildTerminalFailureTextForChat(imageStop.failure),
+          failureRecord: {
+            kind: 'terminal',
+            error: 'image-not-requeued',
+            code: normalizeTerminalErrorCode(imageStop.failure.code),
+            stableCode: `relay.${normalizeTerminalErrorCode(imageStop.failure.code)}`,
+            message: imageStop.failure.message,
+            guidance: imageStop.failure.guidance,
+            retryCount: Number(q.retry_count || 0),
+            failedAt: new Date().toISOString(),
+          },
+          attemptId: claimedAttemptId,
+        });
+        if (failed) {
+          settleRelayAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-terminal-failure' });
+          settleRelaySubagentAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-terminal-failure' });
+          console.warn(`[${ts()}] FAILED    ${messageId?.slice(0,8)} reason=image-not-requeued code=${imageStop.failure.code}`);
+          imagePreviews.finish(messageId, 'failed');
+        }
+        return res.json({ ok: true, terminal: true, code: `relay.${normalizeTerminalErrorCode(imageStop.failure.code)}` });
+      }
     }
     if (q && q.status === 'processing' && String(req.body?.code || '').trim() === 'relay.provider-mismatch') {
       // A routing refusal, not a delivery failure: the legacy relay handed

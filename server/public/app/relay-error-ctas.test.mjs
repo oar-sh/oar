@@ -179,3 +179,15 @@ test('New Chat brings its refusal note into view: the dialog body scrolls on a p
   const source = fs.readFileSync(fileURLToPath(new URL('./journal-view.js', import.meta.url)), 'utf8');
   assert.match(source, /note\.hidden = false;\n\s+\/\/ The modal's body scrolls: on a phone the note lands below the fold\.\n\s+note\.scrollIntoView\?\.\(\{ block: 'nearest' \}\);/);
 });
+
+test('an image turn stopped by the daily image cap opens the OpenAI tab at the cap', () => {
+  const note = 'Daily image cap reached: image turns are refused until tomorrow. Error code: relay.openai-image-daily-cap-reached.';
+  assert.deepEqual(
+    relayErrorCtaActions(note).map((item) => [item.action, item.label]),
+    [['open-openai-image-cap', 'OpenAI image cap']],
+  );
+  assert.deepEqual(
+    relayErrorCtaActionsForCode('OPENAI_IMAGE_DAILY_CAP_REACHED'.toLowerCase().replace(/_/g, '-')).map((item) => item.action),
+    ['open-openai-image-cap'],
+  );
+});

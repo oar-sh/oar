@@ -168,7 +168,9 @@ export function createReasoningStreamHandlers({
     const reasoningId = reasoningIdFor(event);
     const deltaContent = String(event?.data?.deltaContent ?? event?.data?.delta ?? "");
     if (!deltaContent) return;
-    const accumulated = (reasoningAccum.get(reasoningId) || "") + deltaContent;
+    // Capped before the gate: past the cap the text stops changing, so the
+    // same 16 KiB is not posted again and the accumulator stops growing.
+    const accumulated = capThought((reasoningAccum.get(reasoningId) || "") + deltaContent);
     reasoningAccum.set(reasoningId, accumulated);
     const lastSent = reasoningLastSent.get(reasoningId) || "";
     if (!shouldEmitDelta(accumulated, lastSent)) return;

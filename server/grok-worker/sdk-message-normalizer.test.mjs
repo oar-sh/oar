@@ -9,6 +9,7 @@ import {
 import { extractGrokModelsFromInitialize } from './acp-client.mjs';
 import { classifyGrokError } from './grok-sdk-adapter.mjs';
 import { buildGrokUserText, grokModeNudge } from './grok-turn-runner.mjs';
+import { MAX_THOUGHT_CHARS } from '../../shared/thought-cap.mjs';
 
 test('extractTextContent handles nested ACP content shapes', () => {
   assert.equal(extractTextContent({ text: 'hello' }), 'hello');
@@ -172,4 +173,20 @@ test('grokModeNudge and buildGrokUserText', () => {
   });
   assert.match(text, /Hello/);
   assert.match(text, /a\.txt/);
+});
+
+test('a long thought streamed one token at a time is gated and stops at the cap', () => {
+  const normalizer = createSdkMessageNormalizer();
+  let interim = 0;
+  let afterCap = 0;
+  for (let i = 0; i < 2 * MAX_THOUGHT_CHARS; i += 1) {
+    const out = normalizer.normalizeAcpUpdate({ sessionUpdate: 'agent_thought_chunk', content: { text: '考' } });
+    interim += out.length;
+    if (i >= MAX_THOUGHT_CHARS) afterCap += out.length;
+  }
+  assert.ok(interim <= Math.ceil(MAX_THOUGHT_CHARS / 24) + 1, `${interim} interim thoughts`);
+  assert.equal(afterCap, 0, 'no update once the capped text stops changing');
+  const final = normalizer.finalizeResult({}).find((action) => action.channel === 'thought');
+  assert.equal(final.payload.done, true);
+  assert.equal(final.payload.text.length, MAX_THOUGHT_CHARS);
 });

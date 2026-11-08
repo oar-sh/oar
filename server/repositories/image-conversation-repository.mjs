@@ -1,5 +1,7 @@
 'use strict';
 
+import crypto from 'crypto';
+
 const IMAGE_SCHEMA_VERSION = 1;
 
 export function migrateImageConversationSchema(db) {
@@ -200,6 +202,10 @@ export function createImageConversationRepository(db) {
       WHERE operation.queue_message_id = ?
     `),
     linkQueueOperation: db.prepare(`UPDATE queue SET image_operation_id = ? WHERE id = ? AND image_operation_id IS NULL`),
+    // queue.image_options_json comes with migration 0040: prepared on first
+    // use, and without the column (a failed migration) the options are not
+    // kept and the worker sends the composer's quality and size as before.
+    setQueueImageOptions: { run: (json, id) => queueImageOptionsStatement()?.run(json, id) },
     insertAsset: db.prepare(`
       INSERT INTO image_operation_assets (
         operation_id, ordinal, role, upload_id, content_sha256, media_type, created_at
@@ -309,9 +315,72 @@ export function createImageConversationRepository(db) {
     return statements.insertEdge.run(edge);
   }
 
+  // A conversation's image defaults (migration 0040) live on its image
+  // sessions: every one of them carries the same copy, and a conversation
+  // without one gets a session for them. Prepared on first use: without the
+  // column (a failed migration) a read finds none and a write throws.
+  let queueOptionsStatement;
+  function queueImageOptionsStatement() {
+    if (queueOptionsStatement !== undefined) return queueOptionsStatement;
+    const hasColumn = db.prepare(`PRAGMA table_info(queue)`).all().some((column) => column.name === 'image_options_json');
+    queueOptionsStatement = hasColumn ? db.prepare(`UPDATE queue SET image_options_json = ? WHERE id = ?`) : null;
+    return queueOptionsStatement;
+  }
+
+  let defaultsStatements = null;
+  function imageDefaultsStatements() {
+    if (defaultsStatements) return defaultsStatements;
+    const hasColumn = db.prepare(`PRAGMA table_info(image_sessions)`).all().some((column) => column.name === 'defaults_json');
+    if (!hasColumn) return null;
+    defaultsStatements = {
+      read: db.prepare(`
+        SELECT defaults_json FROM image_sessions
+        WHERE conversation_id = ? AND defaults_json IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `),
+      write: db.prepare(`UPDATE image_sessions SET defaults_json = ? WHERE conversation_id = ?`),
+    };
+    return defaultsStatements;
+  }
+
+  /** A conversation's image defaults as stored (`{}` when it has none). */
+  function readConversationImageDefaults(conversationId) {
+    const row = imageDefaultsStatements()?.read.get(String(conversationId || '')) || null;
+    if (!row) return {};
+    try {
+      const parsed = JSON.parse(row.defaults_json);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Stores a conversation's image defaults (checked by the caller). */
+  function writeConversationImageDefaults(conversationId, defaults, { sessionId, now = new Date().toISOString() } = {}) {
+    const statementsForDefaults = imageDefaultsStatements();
+    if (!statementsForDefaults) throw new Error('Image session defaults are unavailable until the relay restarts');
+    const json = JSON.stringify(defaults && typeof defaults === 'object' ? defaults : {});
+    const conversation = String(conversationId || '');
+    db.transaction(() => {
+      if (statementsForDefaults.write.run(json, conversation).changes > 0) return;
+      statements.insertSession.run({
+        id: sessionId || `img_session_${crypto.randomUUID()}`,
+        conversationId: conversation,
+        origin: 'native',
+        schemaVersion: IMAGE_SCHEMA_VERSION,
+        createdAt: now,
+        updatedAt: now,
+      });
+      statementsForDefaults.write.run(json, conversation);
+    })();
+  }
+
   return {
     ...statements,
     imageSchemaVersion: IMAGE_SCHEMA_VERSION,
     insertEdgeChecked,
+    readConversationImageDefaults,
+    writeConversationImageDefaults,
   };
 }

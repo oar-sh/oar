@@ -15,6 +15,7 @@ import {
   REMOTE_RELAY_THINKING_DISPLAYS,
 } from '../../shared/remote-relay-contract.mjs';
 import { RELAY_ASK_URGENCIES } from '../../shared/relay-asks.mjs';
+import { OPENAI_IMAGE_BACKGROUNDS, OPENAI_IMAGE_OUTPUT_FORMATS } from '../../shared/openai-image-options.mjs';
 import {
   REMOTE_RELAY_CALL_FAILED,
   REMOTE_RELAY_TOOL_DESCRIPTION,
@@ -80,6 +81,20 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   thinking_enabled: z.boolean().optional().describe(FIELDS.thinking_enabled.description),
   planOnly: z.boolean().optional().describe(FIELDS.planOnly.description),
   thinking_display: choice('thinking_display', REMOTE_RELAY_THINKING_DISPLAYS),
+  // A list, or one path as text, which the contract takes as well.
+  images: z.union([z.array(z.string()), z.string()]).optional().describe(FIELDS.images.description),
+  // Loose like quiet_hours: the contract's validator checks the values per
+  // model family and names an unknown key; the two fixed lists are enums as
+  // in the JSON schema.
+  image: z.looseObject({
+    size: z.string().optional().describe(FIELDS.image.properties.size.description),
+    quality: z.string().optional().describe(FIELDS.image.properties.quality.description),
+    count: z.number().optional().describe(FIELDS.image.properties.count.description),
+    output_format: z.enum([...OPENAI_IMAGE_OUTPUT_FORMATS]).optional().describe(FIELDS.image.properties.output_format.description),
+    background: z.enum([...OPENAI_IMAGE_BACKGROUNDS]).optional().describe(FIELDS.image.properties.background.description),
+    // Free text: the target relay knows its presets and resolves the name.
+    preset: z.string().optional().describe(FIELDS.image.properties.preset.description),
+  }).optional().describe(FIELDS.image.description),
   question_id: text('question_id'),
   // ask: the contract's validator refuses a question or detail that is too
   // long, or more than eight options, with a message the model can act on.

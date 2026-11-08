@@ -161,6 +161,7 @@ import { loadKeepingLiveRows } from './transcript-reload-freshness.mjs';
 import { backgroundTasksSnapshotMark } from './background-tasks-view.mjs';
 import { newerPageReachesEnd } from './transcript-island.mjs';
 import { initPinnedMessagesView, openPinnedMessagesModal, setPinsConversation } from './pinned-messages-view.mjs';
+import { afterContextRender, initContextTabs, leaveContextTab, resetContextTab, wrapContextBody } from './context-media-tab.js';
 import { initHiddenMessagesView, openHiddenMessagesModal, setHiddenMessagesConversation } from './hidden-messages-view.mjs';
 import { bindChatSelectionGuard, chatSelectionGuard, isChatInteractionHeld } from './selection-guard.mjs';
 import { loadRepoBrowserTree, openRepoBrowser, closeRepoBrowser, setRepoBrowserSessionInfo, resetWorkspaceRepoBrowserForRootChange } from './attachments-view.js';
@@ -221,6 +222,13 @@ import {
   sessionLockNoteText,
   sessionLockProviderKey,
 } from './conversation-provider-indicator.mjs';
+import { imageQualityOptions } from './openai-image-composer.mjs';
+import { hideImageComposerControls, syncImageComposerControls } from './image-composer-ui.js';
+import {
+  onOpenAIImageSpendChange,
+  syncChatMenuImageCost,
+  syncOpenAIImageSpendBanner,
+} from './openai-image-cost-ui.js';
 import {
   initMessageSearchView,
   openMessageSearchModal,
@@ -278,6 +286,7 @@ import { closeQuestionsPanel, initQuestionsPanel, openQuestionsPanel, setQuestio
 import { questionsTwinLabel } from './questions-view.mjs';
 import { closeRelaySchedulePanel } from './relay-schedules-ui.js';
 import { isInboxViewActive } from './inbox-ui.js';
+import { isMediaViewActive, leaveMediaView, toggleMediaView } from './media-view.js';
 import { initScrollbarHover } from './scrollbar-hover.mjs';
 import {
   autoCompactWindowNotes,
@@ -297,11 +306,11 @@ import {
   autoCompactWindowFromIndex,
   formatAutoCompactWindowLabel,
 } from './auto-compact-window-options.mjs';
-import { renderPlanUsageHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
+import { renderPlanUsageHtml, renderPlanUsageCardHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
 import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
 import { FONT_SCALE_CHANGE_EVENT, getUiScale, initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
-import { isStatusViewActive, toggleStatusView } from './status-view.mjs';
+import { isStatusViewActive, leaveStatusView, toggleStatusView } from './status-view.mjs';
 import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
 import {
   initCwdPicker,
@@ -1659,13 +1668,6 @@ function modelProvidersForId(modelId, providersByModel = {}) {
   return providers.map((provider) => String(provider || '').trim().toLowerCase()).filter(Boolean);
 }
 
-function openAIImageSizesForModel(modelId = '') {
-  const normalized = String(modelId || '').trim().toLowerCase().replace(/^openai\//, '');
-  if (normalized.startsWith('dall-e-2')) return ['256x256', '512x512', '1024x1024'];
-  if (normalized.startsWith('dall-e-3')) return ['1024x1024', '1792x1024', '1024x1792'];
-  return ['auto', '1024x1024', '1536x1024', '1024x1536'];
-}
-
 function modelVisibleForActiveProvider(modelId, activeProviderType, providersByModel = {}) {
   const normalizedModelId = String(modelId || '').trim().toLowerCase();
   if (!normalizedModelId) return false;
@@ -1799,8 +1801,12 @@ function selectedReasoningEffortValue() {
 function updateReasoningSelectorForModel(modelId, preferredEffort = '', { persist = false } = {}) {
   const select = document.getElementById('reasoning-effort-select');
   if (!select) return;
-  select.title = isOpenAIImageModelId(modelId) ? 'Quality' : 'Reasoning effort';
-  const options = reasoningOptionsForModel(modelId);
+  const imageModel = isOpenAIImageModelId(modelId);
+  select.title = imageModel ? 'Quality' : 'Reasoning effort';
+  // An image model's Quality: the catalog's values its family takes.
+  const options = imageModel
+    ? imageQualityOptions(modelId, reasoningOptionsForModel(modelId))
+    : reasoningOptionsForModel(modelId);
   const currentEffort = String(select.value || '').trim().toLowerCase();
   const storedEffort = String(localStorage.getItem(REASONING_STORAGE_KEY) || '').trim().toLowerCase();
   select.innerHTML = '';
@@ -2082,20 +2088,16 @@ function updateContextTierSelector(modelId) {
   const select = document.getElementById('context-tier-select');
   if (!select) return;
   if (isOpenAIImageModelId(modelId)) {
-    const current = String(select.value || '').trim().toLowerCase();
-    const imageSizes = openAIImageSizesForModel(modelId);
-    select.innerHTML = '';
-    for (const size of imageSizes) {
-      const option = document.createElement('option');
-      option.value = size;
-      option.textContent = size;
-      select.appendChild(option);
-    }
-    select.value = imageSizes.includes(current) ? current : 'auto';
-    select.title = 'Image size';
+    // Size (with Custom…), Count, Format and Background: image-composer-ui.js,
+    // from the conversation's stored values.
+    syncImageComposerControls(modelId, currentConvId);
+    // Today's image spend near or at the daily cap: the banner of an image chat.
+    syncOpenAIImageSpendBanner({ imageChat: true });
     updateModelPricingDetails(modelId, 'default');
     return;
   }
+  hideImageComposerControls();
+  syncOpenAIImageSpendBanner({ imageChat: false });
   const tierOptions = buildContextTierOptions({
     modelId,
     providerType: activeComposerProviderType(),
@@ -3454,6 +3456,27 @@ function usageCardIsFresh(provider) {
   return Number.isFinite(at) && Date.now() - at < USAGE_LIVE_FRESH_MS;
 }
 
+/**
+ * A new OpenAI image spend state (the socket event): the kept report's
+ * 'openai' card takes it, and the open modal redraws that card alone.
+ */
+function applyImageSpendToUsageReport(state) {
+  if (!state || !Array.isArray(lastUsageReport?.providers)) return;
+  const index = lastUsageReport.providers.findIndex((card) => card?.imageSpend && normalizeUsageProvider(card.provider) === 'openai');
+  if (index < 0) return;
+  const card = { ...lastUsageReport.providers[index], imageSpend: { ...lastUsageReport.providers[index].imageSpend, ...state } };
+  const providers = lastUsageReport.providers.slice();
+  providers[index] = card;
+  storeUsageReport({ ...lastUsageReport, providers });
+  if (summaryModalState.kind !== 'usage') return;
+  const panel = document.getElementById('summary-modal-body')?.querySelector('[data-usage-panel="openai"]');
+  if (!panel) return;
+  const updating = panel.hasAttribute('data-updating');
+  panel.outerHTML = renderPlanUsageCardHtml(card, { active: !panel.hidden });
+  if (updating) markUsageCardUpdating('openai', true);
+}
+onOpenAIImageSpendChange(applyImageSpendToUsageReport);
+
 /** The "Updating…" marker on one card, while its live read runs. */
 function markUsageCardUpdating(provider, updating) {
   const body = document.getElementById('summary-modal-body');
@@ -4036,11 +4059,13 @@ async function loadContextSummaryAndRender(convId) {
   const detailText = String(payload.text || '').trim();
   // The structured breakdown is the answer; the runtime's own text dump stays
   // available underneath for the details it carries that categories don't.
-  const bodyHtml = usageHtml
+  const contextHtml = usageHtml
     ? `${usageHtml}${autoCompactHtml}${thinkingHtml}${thoughtsHtml}${attributionHtml}${agentSessionsHtml}${detailText
       ? `<details class="ctx-usage-raw"><summary>Raw details</summary><pre>${escHtml(detailText)}</pre></details>`
       : ''}`
     : `${autoCompactHtml}${thinkingHtml}${thoughtsHtml}${attributionHtml}${agentSessionsHtml}<pre>${escHtml(detailText || 'No context data available.')}</pre>`;
+  // Two categories: Context (this body) and the session's Media gallery.
+  const bodyHtml = wrapContextBody(contextHtml, settingsConversationId);
 
   renderSummaryModalContent({
     title: 'Context usage',
@@ -4049,7 +4074,11 @@ async function loadContextSummaryAndRender(convId) {
     refresh: () => loadContextSummaryAndRender(refreshLookupId),
     kind: 'context',
   });
-  setSummaryModalLeaveHandler('context', () => commitAutoCompactDraft());
+  setSummaryModalLeaveHandler('context', () => {
+    commitAutoCompactDraft();
+    leaveContextTab();
+  });
+  afterContextRender();
 }
 
 async function showUsage() {
@@ -4111,6 +4140,9 @@ async function showContext() {
     });
     return;
   }
+  // A fresh open shows Context first; Media is one tap away.
+  initContextTabs();
+  resetContextTab(convId);
   if (btn) {
     btn.textContent = '⏳';
     btn.disabled = true;
@@ -5141,6 +5173,13 @@ function toggleChatActionsMenu() {
   syncThemeMenuLabel();
   syncAboutMenuLabel();
   const willOpen = !!menu.hidden;
+  // An image chat's cost, asked from the relay each time the menu opens.
+  if (willOpen) {
+    void syncChatMenuImageCost({
+      conversationId: currentConvId,
+      imageChat: isOpenAIImageModelId(document.getElementById('model-select')?.value || ''),
+    }).then(() => { if (!menu.hidden) placeChatActionsMenu(); });
+  }
   menu.hidden = !willOpen;
   trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
   if (willOpen) {
@@ -5717,6 +5756,14 @@ async function initApp() {
       closeChatActionsMenu();
       openCurrentCloudSession(showExternalLinkFallback);
     });
+    // The global Media view: every session's pictures, in the transcript's place.
+    bindMenuAction(document.getElementById('chat-menu-media'), (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      lockChatActionsMenuShield(350);
+      closeChatActionsMenu();
+      void window.toggleMediaView();
+    });
     const chatMenuSettingsBtn = document.getElementById('chat-menu-settings');
     bindMenuAction(chatMenuSettingsBtn, (event) => {
       event.preventDefault();
@@ -5990,6 +6037,7 @@ async function bootstrap() {
     // Leaving the Inbox goes back to the conversation it was opened from.
     // Opened from Status it stored none: `returnTo` is the session history stands on.
     closeInboxView: ({ returnTo = '' } = {}) => { if (isInboxViewActive()) void toggleInboxView({ returnTo }); },
+    closeMediaView: ({ returnTo = '' } = {}) => { if (isMediaViewActive()) void toggleMediaView({ returnTo }); },
     closeChangeCwdMenu: () => closeChangeCwdMenu({ focusTrigger: true }),
     closeGitChangesModal,
     closeGitDiffViewer,
@@ -6169,9 +6217,21 @@ window.openOriginConversation = openOriginConversation;
 // history stands on.
 window.toggleStatusView = () => {
   leaveInboxView();
+  leaveMediaView();
   return toggleStatusView({ returnTo: sessionHistoryConversation() });
 };
-window.toggleInboxView = () => toggleInboxView({ returnTo: sessionHistoryConversation() });
+window.toggleInboxView = () => {
+  leaveMediaView();
+  return toggleInboxView({ returnTo: sessionHistoryConversation() });
+};
+// The global Media view shares that place too.
+window.toggleMediaView = () => toggleMediaView({
+  returnTo: sessionHistoryConversation(),
+  leaveOthers: () => {
+    leaveInboxView();
+    leaveStatusView();
+  },
+});
 window.refreshConversations = refreshConversations;
 window.renderConvList = renderConvList;
 window.handleAttachmentInput = handleAttachmentInput;

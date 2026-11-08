@@ -891,6 +891,8 @@
   .inbox-count.is-urgent { background: var(--danger); color: #fff; }
   body.inbox-view-active #input-area { display: none; }
   body.inbox-view-active #pending-question-banner { display: none; }
+  body.media-view-active #input-area { display: none; }
+  body.media-view-active #pending-question-banner { display: none; }
   .inbox-view { display: grid; gap: calc(7px * var(--ui-scale)); padding: calc(4px * var(--ui-scale)) 0 calc(12px * var(--ui-scale)); }
   .inbox-filter { display: flex; gap: calc(3px * var(--ui-scale)); flex-wrap: wrap; }
   .inbox-filter-option {
@@ -1837,6 +1839,31 @@
   /* Two classes: .settings-help, later in this sheet, would grey it out. */
   .settings-help.claude-api-field-error { color: var(--danger); }
   .settings-help.claude-api-field-error[hidden] { display: none; }
+  /* OpenAI's image cap and presets (openai-image-cost-ui.js). */
+  .settings-help.openai-image-field-error { color: var(--danger); }
+  .settings-help.openai-image-field-error[hidden] { display: none; }
+  #openai-image-cap-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: calc(6px * var(--ui-scale));
+    padding: calc(3px * var(--ui-scale)) calc(7px * var(--ui-scale));
+    outline: none;
+    font-size: var(--fs-meta-md);
+    width: min(calc(140px * var(--ui-scale)), 100%);
+  }
+  #openai-image-cap-input[aria-invalid="true"] { border-color: var(--danger); }
+  .openai-image-cap-row { display: flex; flex-wrap: wrap; gap: calc(6px * var(--ui-scale)); align-items: center; }
+  #openai-image-spend-line[data-state="warning"] { color: var(--warn); }
+  #openai-image-spend-line[data-state="error"] { color: var(--danger); }
+  #openai-image-allow-today-btn[hidden],
+  #openai-image-stop-allowing-btn[hidden] { display: none; }
+  .openai-image-presets-list { list-style: none; margin: 0; padding: 0; width: 100%; display: flex; flex-direction: column; gap: calc(4px * var(--ui-scale)); }
+  .openai-image-preset-row { display: flex; align-items: center; gap: calc(6px * var(--ui-scale)); min-width: 0; }
+  .openai-image-preset-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+  .openai-image-preset-text strong { font-weight: 600; overflow-wrap: anywhere; }
+  .openai-image-preset-details { color: var(--muted); font-size: var(--fs-meta-sm); overflow-wrap: anywhere; }
+  .openai-image-preset-tag { color: var(--muted); font-size: var(--fs-meta-xs); flex: 0 0 auto; }
   /* The native spin buttons of a number field follow the theme: light ones
      on a dark field read as a glitch. */
   :root:not([data-theme="light"]) input[type="number"] { color-scheme: dark; }
@@ -2499,6 +2526,27 @@
     width: 100%; max-width: 100%; box-sizing: border-box;
     min-width: 0;
   }
+  /* A running image turn in the live bubble (image-turn-placeholder.mjs): the
+     image area keeps the size's aspect ratio from the first second, so a
+     partial arriving does not move the transcript. */
+  .image-turn-placeholder { display: flex; flex-direction: column; gap: calc(4px * var(--ui-scale)); margin: calc(2px * var(--ui-scale)) 0 calc(6px * var(--ui-scale)); }
+  .thinking-bubble:has(> .image-turn-placeholder) > .dots { display: none; }
+  .image-turn-placeholder-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: calc(6px * var(--ui-scale)); color: var(--text); font-size: var(--fs-meta-md); }
+  .image-turn-placeholder-timer { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .image-turn-placeholder-retry { color: var(--muted); font-style: italic; }
+  .image-turn-placeholder-retry[hidden] { display: none; }
+  .image-turn-placeholder-details { color: var(--muted); font-size: var(--fs-meta-sm); overflow-wrap: anywhere; }
+  .image-turn-placeholder-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: calc(6px * var(--ui-scale)); width: min(100%, calc(360px * var(--ui-scale))); }
+  .image-turn-placeholder-grid:not([data-count="1"]) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .image-turn-placeholder-tile {
+    position: relative; overflow: hidden; border-radius: calc(10px * var(--ui-scale));
+    border: 1px solid var(--border); background: var(--bg3);
+    animation: image-turn-pulse 1.8s ease-in-out infinite;
+  }
+  .image-turn-placeholder-tile.has-preview { animation: none; }
+  .image-turn-placeholder-tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+  @keyframes image-turn-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+  @media (prefers-reduced-motion: reduce) { .image-turn-placeholder-tile { animation: none; } }
   /* Sticky inside the scroller: Stop on the live bubble is the only way to
      stop a turn, and a long turn must stay stoppable without scrolling back
      up. It sticks within its own bubble only, so it never rides over the
@@ -3315,6 +3363,190 @@
     border-color: var(--accent);
     color: var(--accent);
   }
+  /* The media gallery (media-gallery-ui.js): the 🧠 Media tab and the global
+     Media view. A messenger's shared media: square tiles under month
+     headers, 3 columns on a phone; a Files tab as a list. */
+  .media-gallery {
+    display: flex;
+    flex-direction: column;
+    gap: calc(8px * var(--ui-scale));
+    min-width: 0;
+  }
+  .media-gallery[data-scope="global"] {
+    padding: calc(12px * var(--ui-scale));
+    max-width: calc(1100px * var(--ui-scale));
+    margin: 0 auto;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .media-gallery-tabs,
+  .media-gallery-chips,
+  .context-tab-strip {
+    display: flex;
+    align-items: center;
+    gap: calc(4px * var(--ui-scale));
+    flex-wrap: wrap;
+  }
+  .media-gallery-tab,
+  .media-gallery-chip,
+  .context-tab {
+    flex: 0 0 auto;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: calc(8px * var(--ui-scale));
+    height: calc(28px * var(--ui-scale));
+    padding: 0 calc(10px * var(--ui-scale));
+    font-size: var(--fs-meta-md);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .media-gallery-tab[aria-selected="true"],
+  .media-gallery-chip[aria-pressed="true"],
+  .context-tab[aria-selected="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .context-tab-count {
+    margin-left: calc(4px * var(--ui-scale));
+    color: var(--muted);
+  }
+  .context-tab-strip {
+    margin-bottom: calc(10px * var(--ui-scale));
+  }
+  .media-gallery-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: calc(6px * var(--ui-scale));
+  }
+  .media-gallery-select,
+  .media-gallery-search {
+    height: calc(28px * var(--ui-scale));
+    border: 1px solid var(--border);
+    border-radius: calc(8px * var(--ui-scale));
+    background: var(--bg2);
+    color: var(--text);
+    font-size: var(--fs-meta-md);
+    padding: 0 calc(6px * var(--ui-scale));
+    max-width: 100%;
+  }
+  .media-gallery-select[data-media-filter="session"] {
+    max-width: calc(260px * var(--ui-scale));
+  }
+  .media-gallery-search {
+    flex: 1 1 calc(180px * var(--ui-scale));
+    min-width: 0;
+  }
+  .media-gallery-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: calc(4px * var(--ui-scale));
+    font-size: var(--fs-meta-md);
+    color: var(--muted);
+  }
+  .media-gallery-status p {
+    margin: calc(4px * var(--ui-scale)) 0;
+    color: var(--muted);
+    font-size: var(--fs-meta-md);
+  }
+  .media-month-label {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    margin: 0;
+    padding: calc(6px * var(--ui-scale)) calc(2px * var(--ui-scale));
+    background: var(--bg);
+    color: var(--muted);
+    font-size: var(--fs-meta-md);
+    font-weight: 600;
+  }
+  .media-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(calc(140px * var(--ui-scale)), 1fr));
+    gap: 2px;
+  }
+  .media-tile {
+    position: relative;
+    aspect-ratio: 1;
+    padding: 0;
+    border: 0;
+    background: var(--bg3);
+    overflow: hidden;
+    cursor: pointer;
+    content-visibility: auto;
+    contain-intrinsic-size: calc(140px * var(--ui-scale));
+  }
+  .media-tile img,
+  .media-tile video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    pointer-events: none;
+  }
+  .media-tile:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .media-tile-archived img,
+  .media-tile-archived video {
+    opacity: 0.6;
+  }
+  .media-tile-badge,
+  .media-tile-play {
+    position: absolute;
+    font-size: calc(12px * var(--ui-scale));
+    line-height: 1;
+    padding: calc(3px * var(--ui-scale)) calc(4px * var(--ui-scale));
+    border-radius: calc(6px * var(--ui-scale));
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+  }
+  .media-tile-badge { right: calc(4px * var(--ui-scale)); bottom: calc(4px * var(--ui-scale)); }
+  .media-tile-play { left: calc(4px * var(--ui-scale)); bottom: calc(4px * var(--ui-scale)); }
+  .media-file-list {
+    display: flex;
+    flex-direction: column;
+  }
+  .media-file-row {
+    display: flex;
+    align-items: center;
+    gap: calc(10px * var(--ui-scale));
+    padding: calc(8px * var(--ui-scale)) calc(4px * var(--ui-scale));
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+  }
+  .media-file-icon { font-size: calc(22px * var(--ui-scale)); }
+  .media-file-text { display: flex; flex-direction: column; min-width: 0; }
+  .media-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .media-file-meta { color: var(--muted); font-size: var(--fs-meta-md); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .media-gallery-more {
+    align-self: center;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text);
+    border-radius: calc(8px * var(--ui-scale));
+    padding: calc(4px * var(--ui-scale)) calc(12px * var(--ui-scale));
+    cursor: pointer;
+  }
+  .media-gallery-sentinel { height: 1px; }
+  @media (max-width: 680px) {
+    .media-grid { grid-template-columns: repeat(3, 1fr); }
+    .media-gallery[data-scope="global"] { padding: calc(8px * var(--ui-scale)) calc(4px * var(--ui-scale)); }
+    .media-gallery-select[data-media-filter="session"] { max-width: 100%; flex: 1 1 100%; }
+    .media-gallery-tabs,
+    .media-gallery-chips,
+    .context-tab-strip {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+  }
   .plan-usage-card-titles {
     display: flex;
     flex-direction: column;
@@ -3411,6 +3643,17 @@
     background: var(--bg3);
   }
   .plan-usage-meter-secondary .plan-usage-bar { height: calc(6px * var(--ui-scale)); border-radius: calc(3px * var(--ui-scale)); }
+  /* A bar with a mark on it (the OpenAI images card's 80 % warning line). */
+  .plan-usage-bar-marked { position: relative; }
+  .plan-usage-bar-mark {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--text);
+    opacity: 0.55;
+  }
   .plan-usage-bar-fill {
     display: block;
     height: 100%;
@@ -4294,7 +4537,12 @@
   #mode-select,
   #model-select,
   #reasoning-effort-select,
-  #context-tier-select {
+  #context-tier-select,
+  #image-size-custom-input,
+  #image-preset-select,
+  #image-count-select,
+  #image-format-select,
+  #image-background-select {
     background: var(--bg3); border: 1px solid var(--border); color: var(--text);
     border-radius: calc(8px * var(--ui-scale)); height: calc(30px * var(--ui-scale)); padding: 0 calc(8px * var(--ui-scale)); font-size: var(--fs-core-control);
     width: 100%; min-width: 0; outline: none;
@@ -4302,7 +4550,64 @@
   #mode-select:focus,
   #model-select:focus,
   #reasoning-effort-select:focus,
-  #context-tier-select:focus { border-color: var(--accent); }
+  #context-tier-select:focus,
+  #image-size-custom-input:focus,
+  #image-preset-select:focus,
+  #image-count-select:focus,
+  #image-format-select:focus,
+  #image-background-select:focus { border-color: var(--accent); }
+  /* An image model's custom W×H under the Size select, and Count, Format and
+     Background side by side: three narrow selects fit the 340px popover and
+     the phone's bottom sheet alike. */
+  #image-size-custom-input { box-sizing: border-box; font-family: var(--mono, monospace); }
+  /* No iOS focus zoom (see #conv-filter-input). */
+  @media (pointer: coarse), (max-width: 680px) {
+    #image-size-custom-input { font-size: max(16px, 1rem); }
+  }
+  #image-size-custom-input[aria-invalid="true"] { border-color: var(--danger); }
+  .image-size-custom-row { display: flex; flex-direction: column; gap: calc(3px * var(--ui-scale)); margin-top: calc(4px * var(--ui-scale)); }
+  .image-size-custom-row[hidden],
+  .image-size-custom-error[hidden],
+  .composer-settings-image-row[hidden],
+  .composer-settings-image-row .composer-settings-field[hidden] { display: none; }
+  .image-size-custom-error { color: var(--danger); font-size: var(--fs-meta-sm); overflow-wrap: anywhere; }
+  .composer-settings-image-row { display: flex; gap: calc(6px * var(--ui-scale)); min-width: 0; }
+  /* An image model's Preset select with "Save as preset…" beside it, and
+     what a pick skipped or a save answered under them. */
+  #image-preset-field[hidden],
+  .image-preset-note[hidden] { display: none; }
+  .image-preset-row { display: flex; gap: calc(6px * var(--ui-scale)); min-width: 0; align-items: center; }
+  .image-preset-row #image-preset-select { flex: 1 1 auto; }
+  .image-preset-save-btn {
+    flex: 0 0 auto;
+    background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+    border-radius: calc(8px * var(--ui-scale)); height: calc(30px * var(--ui-scale)); padding: 0 calc(8px * var(--ui-scale));
+    font-size: var(--fs-core-control); cursor: pointer; white-space: nowrap;
+  }
+  .image-preset-save-btn:hover { border-color: var(--accent); }
+  .image-preset-save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .image-preset-note { color: var(--muted); font-size: var(--fs-meta-sm); overflow-wrap: anywhere; }
+  .image-preset-note[data-state="error"] { color: var(--danger); }
+  /* Today's OpenAI image spend in an image chat: amber from the warning
+     mark, red once the cap stops image turns. */
+  #openai-image-spend-banner {
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: calc(8px * var(--ui-scale));
+    padding: calc(3px * var(--ui-scale)) calc(8px * var(--ui-scale));
+    margin-bottom: calc(5px * var(--ui-scale));
+    font-size: var(--fs-meta-sm);
+    overflow-wrap: anywhere;
+  }
+  #openai-image-spend-banner[hidden] { display: none; }
+  #openai-image-spend-banner[data-kind="reached"] {
+    background: color-mix(in srgb, var(--danger) 14%, var(--bg2));
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .composer-settings-image-row .composer-settings-field { flex: 1 1 0; }
   /* Live background-task fold above the composer. The summary reuses the
      relay tones so its running state matches the sidebar dot / burger bars. */
   #background-tasks-panel {
@@ -6790,6 +7095,10 @@
   /* CWD-pick mode is launched from the summary / new-chat modals (z 12050),
      so the browser must stack above them; #relay-toast stays on top at 12600. */
   #repo-browser-modal.cwd-pick-mode { z-index: 12400; }
+  /* A picture opened from the 🧠 Media tab shows above that modal, and its
+     annotate editor above the picture. */
+  #file-preview-modal.over-summary { z-index: 12200; }
+  body:has(#file-preview-modal.over-summary) #image-annotate-modal { z-index: 12300; }
   .repo-cwd-pick-bar {
     display: flex;
     align-items: center;
@@ -7872,19 +8181,22 @@
        width is the scroll padding too, so a tab scrolled into view (the
        selected one, a focused one) clears it. */
     .settings-tab-strip,
-    .plan-usage-tab-strip {
+    .plan-usage-tab-strip,
+    .context-tab-strip,
+    .media-gallery-tabs,
+    .media-gallery-chips {
       --tab-strip-fade: calc(44px * var(--ui-scale));
       scroll-padding-inline: var(--tab-strip-fade);
     }
-    :is(.settings-tab-strip, .plan-usage-tab-strip)[data-fade="right"] {
+    :is(.settings-tab-strip, .plan-usage-tab-strip, .context-tab-strip, .media-gallery-tabs, .media-gallery-chips)[data-fade="right"] {
       -webkit-mask-image: linear-gradient(to left, transparent, #000 var(--tab-strip-fade));
       mask-image: linear-gradient(to left, transparent, #000 var(--tab-strip-fade));
     }
-    :is(.settings-tab-strip, .plan-usage-tab-strip)[data-fade="both"] {
+    :is(.settings-tab-strip, .plan-usage-tab-strip, .context-tab-strip, .media-gallery-tabs, .media-gallery-chips)[data-fade="both"] {
       -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--tab-strip-fade), #000 calc(100% - var(--tab-strip-fade)), transparent);
       mask-image: linear-gradient(to right, transparent, #000 var(--tab-strip-fade), #000 calc(100% - var(--tab-strip-fade)), transparent);
     }
-    :is(.settings-tab-strip, .plan-usage-tab-strip)[data-fade="left"] {
+    :is(.settings-tab-strip, .plan-usage-tab-strip, .context-tab-strip, .media-gallery-tabs, .media-gallery-chips)[data-fade="left"] {
       -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--tab-strip-fade));
       mask-image: linear-gradient(to right, transparent, #000 var(--tab-strip-fade));
     }
@@ -8266,6 +8578,7 @@
             <button id="chat-menu-watching" class="chat-actions-menu-item chat-menu-meta-chip" type="button" role="menuitem" hidden>👁 Watching sessions…</button>
             <button id="chat-menu-schedules" class="chat-actions-menu-item chat-menu-meta-chip" type="button" role="menuitem" hidden>⏰ Schedules…</button>
             <button id="chat-menu-origin" class="chat-actions-menu-item chat-menu-meta-chip" type="button" role="menuitem" hidden>↗ Started by an agent</button>
+            <div id="chat-menu-image-cost" class="chat-actions-menu-meta" data-testid="chat-menu-image-cost" hidden><span id="chat-menu-image-cost-value" class="chat-actions-menu-meta-secondary">OpenAI images: …</span></div>
             <button id="chat-menu-edit-title" class="chat-actions-menu-item" type="button" role="menuitem">✍️ Edit conversation title</button>
             <button id="chat-menu-questions" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>📓 Questions</button>
             <button id="chat-menu-pins" class="chat-actions-menu-item chat-menu-twin" type="button" role="menuitem" hidden>📍 Pinned messages</button>
@@ -8287,7 +8600,8 @@
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
             <button id="chat-menu-open-cloud-session" class="chat-actions-menu-item" type="button" role="menuitem" hidden>☁️ Open on claude.ai</button>
-            <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
+            <button id="chat-menu-media" class="chat-actions-menu-item" type="button" role="menuitem">🖼️ Media</button>
+    <button id="chat-menu-settings" class="chat-actions-menu-item" type="button" role="menuitem">⚙️ Settings</button>
             <button id="chat-menu-about" class="chat-actions-menu-item" type="button" role="menuitem">ℹ️ About OAR</button>
             <button id="chat-menu-restart-relay" class="chat-actions-menu-item" type="button" role="menuitem">🌄 Restart web relay</button>
             <button id="chat-menu-suspend-host" class="chat-actions-menu-item" type="button" role="menuitem" onclick="openSuspendHostConfirmation()">💤 Suspend host</button>
@@ -8310,6 +8624,8 @@
       <div id="share-preview-banner" role="note"></div>
       <div id="model-banner"></div>
       <div id="usage-limit-banner" role="status" aria-live="polite" hidden></div>
+      <!-- Today's OpenAI image spend in an image chat (openai-image-cost-ui.js). -->
+      <div id="openai-image-spend-banner" data-testid="openai-image-spend-banner" role="status" aria-live="polite" hidden></div>
       <div id="cloud-session-line" aria-label="Cloud session" hidden></div>
       <div id="model-metadata-blocker" aria-live="polite">
         <span id="model-metadata-blocker-text">Model metadata is unavailable. Refresh to choose a model and reasoning effort.</span>
@@ -8367,6 +8683,15 @@
             </select>
             <div id="model-lock-note" hidden></div>
           </div>
+          <!-- An image model's presets (image-composer-ui.js). -->
+          <div id="image-preset-field" class="composer-settings-field" data-field="image-preset" hidden>
+            <label class="composer-settings-field-label" for="image-preset-select">Preset</label>
+            <div class="image-preset-row">
+              <select id="image-preset-select" data-testid="image-preset-select" title="Image preset"><option value="">None</option></select>
+              <button id="image-preset-save-btn" data-testid="image-preset-save" type="button" class="image-preset-save-btn" title="Save the image options below as a preset">Save as preset…</button>
+            </div>
+            <div id="image-preset-note" data-testid="image-preset-note" class="image-preset-note" role="status" aria-live="polite" hidden></div>
+          </div>
           <div class="composer-settings-field" data-field="effort">
             <label id="reasoning-effort-label" class="composer-settings-field-label" for="reasoning-effort-select">Effort</label>
             <select id="reasoning-effort-select" title="Reasoning effort" disabled>
@@ -8378,6 +8703,26 @@
             <select id="context-tier-select" title="Context window">
               <option value="default">—</option>
             </select>
+            <!-- An image model's "Custom…" size (image-composer-ui.js). -->
+            <div id="image-size-custom-row" class="image-size-custom-row" hidden>
+              <input id="image-size-custom-input" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="2048x1152" aria-label="Custom image size, width x height" aria-describedby="image-size-custom-error">
+              <div id="image-size-custom-error" class="image-size-custom-error" role="alert" hidden></div>
+            </div>
+          </div>
+          <!-- An image model's Count, Format and Background (image-composer-ui.js). -->
+          <div id="image-options-row" class="composer-settings-image-row" hidden>
+            <div class="composer-settings-field" data-field="image-count">
+              <label class="composer-settings-field-label" for="image-count-select">Count</label>
+              <select id="image-count-select" title="Images per turn"></select>
+            </div>
+            <div class="composer-settings-field" data-field="image-format">
+              <label class="composer-settings-field-label" for="image-format-select">Format</label>
+              <select id="image-format-select" title="Image format"></select>
+            </div>
+            <div class="composer-settings-field" data-field="image-background">
+              <label class="composer-settings-field-label" for="image-background-select">Background</label>
+              <select id="image-background-select" title="Image background"></select>
+            </div>
           </div>
           <!-- Subscription | API key in a Claude chat (claude-billing-toggle-ui.js). -->
           <div id="claude-billing-toggle" class="claude-billing-toggle composer-settings-field" data-field="billing" hidden></div>
@@ -9035,6 +9380,37 @@
               <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
             </div>
             <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
+          </div>
+          <!-- Image turns: the daily cap, today's spend and the presets (openai-image-cost-ui.js). -->
+          <div id="openai-image-spend-section" class="settings-row settings-row-column settings-gap" data-testid="openai-image-spend-section">
+            <label for="openai-image-cap-input">Daily image cap (USD)</label>
+            <div class="openai-image-cap-row">
+              <input
+                id="openai-image-cap-input"
+                data-testid="openai-image-cap-input"
+                type="number"
+                inputmode="decimal"
+                min="0"
+                max="10000"
+                step="0.01"
+                value="5"
+                aria-label="Daily image cap in US dollars, 0 for no cap"
+                aria-describedby="openai-image-spend-error openai-image-cap-help"
+              >
+              <button id="openai-image-cap-save-btn" data-testid="openai-image-cap-save" type="button" class="summary-btn">Save cap</button>
+            </div>
+            <div id="openai-image-spend-error" data-testid="openai-image-spend-error" class="settings-help openai-image-field-error" role="alert" hidden></div>
+            <div id="openai-image-cap-help" class="settings-help">What image turns may cost this relay per day (relay time), estimates included. Once today's spend reaches it, new image turns are refused until tomorrow or until you allow more for today; a running turn finishes. 0 means no cap.</div>
+            <div id="openai-image-spend-line" data-testid="openai-image-spend-line" class="settings-help settings-provider-status" role="status">Today's image spend is not known yet.</div>
+            <div class="settings-actions">
+              <button id="openai-image-allow-today-btn" data-testid="openai-image-allow-today" type="button" class="summary-btn" hidden>Allow past the cap for today</button>
+              <button id="openai-image-stop-allowing-btn" data-testid="openai-image-stop-allowing" type="button" class="summary-btn" hidden>Stop allowing</button>
+            </div>
+            <div id="openai-image-spend-status" class="settings-help" role="status" aria-live="polite"></div>
+            <label class="settings-gap-sm" id="openai-image-presets-label">Image presets</label>
+            <ul id="openai-image-presets-list" data-testid="openai-image-presets-list" class="openai-image-presets-list" aria-labelledby="openai-image-presets-label"></ul>
+            <div id="openai-image-presets-error" class="settings-help openai-image-field-error" role="alert" hidden></div>
+            <div id="openai-image-presets-note" class="settings-help"></div>
           </div>
         </div>
         <div

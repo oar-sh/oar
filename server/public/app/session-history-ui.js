@@ -77,6 +77,8 @@ function overlayDescriptors(closers) {
     { name: 'inbox', find: () => document.body, isOpen: (el) => !!el?.classList?.contains('inbox-view-active'), close: backToSession(closers.closeInboxView) },
     // Status the same way.
     { name: 'status', find: () => document.body, isOpen: (el) => !!el?.classList?.contains('status-view-active'), close: backToSession(closers.closeStatusView) },
+    // And the global Media view.
+    { name: 'media', find: () => document.body, isOpen: (el) => !!el?.classList?.contains('media-view-active'), close: backToSession(closers.closeMediaView) },
     { name: 'composer-settings', find: byId('composer-settings'), isOpen: isShown, close: closers.closeComposerSettings },
     { name: 'chat-actions-menu', find: byId('chat-actions-menu'), isOpen: isShown, close: closers.closeChatActionsMenu },
     { name: 'summary-modal', find: byId('summary-modal'), isOpen: isVisible, close: closers.closeSummaryModal },

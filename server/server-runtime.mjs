@@ -84,6 +84,7 @@ import { sessionLaunchMutex } from './services/session-launch-mutex-service.mjs'
 import { createWorkerRecycleService, sweepArchivedWorkers } from './services/worker-recycle-service.mjs';
 import { createClaudeApiUsageService } from './services/claude-api-usage-service.mjs';
 import { createTokenUsageService } from './services/token-usage-service.mjs';
+import { createOpenAIImageSpendService } from './services/openai-image-spend-service.mjs';
 import { createClaudeApiCapWatch, createClaudeApiPlanUsage, createClaudeApiStopNoteLedger } from './services/plan-usage-claude-api.mjs';
 import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, DEFAULT_DEEPSEEK_MODEL, deepseekModelLabel } from '../shared/deepseek-models.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
@@ -5807,6 +5808,16 @@ const claudeApiUsageService = createClaudeApiUsageService({ db, logger: console 
 // Tokens per turn and per day for every provider, booked from the
 // workers' reports; the Tokens sections in Check Usage and About read it.
 const tokenUsageService = createTokenUsageService({ db, logger: console });
+// OpenAI image spend against its daily cap: one ledger of the tries in
+// flight for the image routes and the settings route alike. Its events go
+// to the owner's clients once the socket server is up.
+const openAIImageSpend = createOpenAIImageSpendService({
+  tokenUsageService,
+  readSetting: readAppSettingValue,
+  db,
+  emit: (event, payload) => io?.emit?.(event, payload),
+  logger: console,
+});
 // This month's spend on the key against the cap, and the Check Usage card
 // (services/plan-usage-claude-api.mjs), over the same local days.
 const claudeApiPlanUsage = createClaudeApiPlanUsage({
@@ -8175,6 +8186,11 @@ const sharedRouteDeps = {
   path,
   uploadsDir: UPLOAD_DIR,
   uploadReadDirs: UPLOAD_READ_DIRS,
+  // Never read for a send's imagePaths, even inside the session's folder.
+  imageInputDenyPaths: {
+    dirs: [DATA_DIR],
+    files: [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`, `${DB_PATH}-journal`, CONFIG_PATH],
+  },
   fetchUsageSummary,
   fetchCopilotBillingUsage,
   fetchGrokBillingUsage: createGrokBillingUsageFetcher(),
@@ -8231,6 +8247,9 @@ const sharedRouteDeps = {
   claudeBillingSwitchService,
   claudeApiUsageService,
   tokenUsageService,
+  openAIImageSpend,
+  getOpenAIImageSpendState: (options) => openAIImageSpend.buildState(options),
+  notifyOpenAIImageSpendChanged: () => openAIImageSpend.notifyImageSpendChanged(),
   claudeApiClaimCheck,
   onClaudeBillingFence: handleClaudeBillingFence,
   claudeApiPlanUsage,

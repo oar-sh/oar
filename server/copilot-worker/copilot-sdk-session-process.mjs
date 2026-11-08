@@ -5005,10 +5005,12 @@ export function createCopilotSdkSessionRunner({
 
   /**
    * One image-model row (shared/worker-runtime/direct-openai-image.mjs). With
-   * an image operation the relay's execute route publishes the reply, the
-   * failure or the requeue itself; without one the shared helper publishes
-   * the reply, and a refusal by the provider is published here as the row's
-   * failure. Anything else requeues the row, as on the extension engine.
+   * an image operation the relay's execute route publishes the reply or the
+   * failure itself; without one the shared helper publishes the reply, and
+   * any failure of the request is published here as the row's failure, never
+   * requeued: the relay already retried it once, and a second run is billed
+   * again. Only an execute call that did not get through requeues the row
+   * (the route refuses to send an operation's request twice).
    */
   async function runDirectImageTurn(message) {
     const id = String(message.id || '');
@@ -5025,11 +5027,11 @@ export function createCopilotSdkSessionRunner({
       dbg('image turn', message.id, result.via, result.outcome);
     } catch (error) {
       if (isOpenAIImageTerminalError(error)) {
-        // A refusal by OpenAI, or a reply the relay could not process after
-        // OpenAI answered 2xx; the codes are the ones the relay's image
-        // operation uses for the same two cases.
-        const code = error.relayProcessing === true ? 'image-reply-unprocessed' : 'image-provider-rejected';
-        dbg(error.relayProcessing === true ? 'image reply not processed' : 'image turn refused by OpenAI', message.id, error.message);
+        // The relay's note and code (the ones its image operation uses for
+        // the same cases); an older relay names no code.
+        const code = error.imageCode
+          || (error.relayProcessing === true ? 'image-reply-unprocessed' : 'image-provider-rejected');
+        dbg('image turn failed', message.id, code, error.message);
         await publishResponse(message, {
           text: error.message,
           model: null,

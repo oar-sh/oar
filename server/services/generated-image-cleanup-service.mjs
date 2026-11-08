@@ -25,7 +25,8 @@ function parseMessageAttachments(rawAttachments, { parseAttachments, hydrateAtta
   return attachments.map((entry) => hydrateAttachment(entry)).filter(Boolean);
 }
 
-function resolveGeneratedImagePath({
+/** The file of a generated-image attachment under `root`, or null for one that would leave its folder. */
+export function resolveGeneratedImagePath({
   root,
   sessionId,
   relativePath,

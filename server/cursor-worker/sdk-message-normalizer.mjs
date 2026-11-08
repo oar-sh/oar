@@ -170,6 +170,9 @@ export function createSdkMessageNormalizer() {
       deltaOwnsThinking = true;
       if (!openThought) openThought = { reasoningId: allocateThoughtId(), text: '' };
       openThought.text = capThought(openThought.text + String(update?.text || ''));
+      // Gated as stream text; the thought's close sends the whole text.
+      if (!shouldEmitStreamUpdate(openThought.text, openThought.lastEmittedText)) return actions;
+      openThought.lastEmittedText = openThought.text;
       actions.push({
         channel: 'thought',
         payload: {
@@ -201,6 +204,14 @@ export function createSdkMessageNormalizer() {
 
     if (type === 'turn-ended') {
       if (update?.usage && typeof update.usage === 'object') lastUsage = update.usage;
+      // A thought the turn left open: what the delta gating held back.
+      if (openThought?.text.trim() && openThought.text !== openThought.lastEmittedText) {
+        openThought.lastEmittedText = openThought.text;
+        actions.push({
+          channel: 'thought',
+          payload: { reasoningId: openThought.reasoningId, text: openThought.text, done: false, subagentRunId: null },
+        });
+      }
       return actions;
     }
 
@@ -231,6 +242,8 @@ export function createSdkMessageNormalizer() {
           state.openThought = { reasoningId: `cursor-thought-${runId}-${state.thoughtIndex++}`, text: '' };
         }
         state.openThought.text = capThought(state.openThought.text + String(nested.text || ''));
+        if (!shouldEmitStreamUpdate(state.openThought.text, state.openThought.lastEmittedText)) return actions;
+        state.openThought.lastEmittedText = state.openThought.text;
         actions.push({
           channel: 'thought',
           payload: {

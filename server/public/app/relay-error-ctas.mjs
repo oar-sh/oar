@@ -61,6 +61,11 @@ const RELAY_ERROR_CTAS = Object.freeze({
     Object.freeze({ action: 'open-claude-api-cap', label: 'Claude API settings' }),
     SWITCH_TO_SUBSCRIPTION_CTA,
   ]),
+  // An image turn the daily OpenAI image cap stopped before its try: the
+  // cap field and "Allow for today" are on the OpenAI tab.
+  'openai-image-daily-cap-reached': Object.freeze([
+    Object.freeze({ action: 'open-openai-image-cap', label: 'OpenAI image cap' }),
+  ]),
   // A turn the Claude API refused (claude-api-backend.mjs, describeClaudeApiFailure).
   'claude-api-key': CLAUDE_API_SETTINGS_CTA,
   'claude-api-key-source': CLAUDE_API_SETTINGS_CTA,

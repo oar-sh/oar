@@ -219,6 +219,8 @@ export function createTokenUsageService({
       listAllDayRows: db.prepare(`SELECT * FROM ${TOKEN_USAGE_DAYS_TABLE}`),
       listTurnRows: db.prepare(`SELECT * FROM ${TURN_TOKEN_USAGE_TABLE} WHERE turn_id = ? ORDER BY at, run_id, model`),
       listConversationRows: db.prepare(`SELECT * FROM ${TURN_TOKEN_USAGE_TABLE} WHERE conversation_id = ? ORDER BY at, turn_id, run_id, model`),
+      listBillingDayRows: db.prepare(`SELECT * FROM ${TURN_TOKEN_USAGE_TABLE} WHERE day = ? AND provider = ? AND billing = ? ORDER BY at, turn_id, run_id, model`),
+      listBillingConversationRows: db.prepare(`SELECT * FROM ${TURN_TOKEN_USAGE_TABLE} WHERE conversation_id = ? AND provider = ? AND billing = ? ORDER BY at, turn_id, run_id, model`),
       deleteConversationRows: db.prepare(`DELETE FROM ${TURN_TOKEN_USAGE_TABLE} WHERE conversation_id = ?`),
     };
   }
@@ -410,6 +412,18 @@ export function createTokenUsageService({
     };
   }
 
+  /**
+   * The turn rows of one provider and billing, of one day or of one chat
+   * (`day` or `conversationId`), for the views that need what the day rows
+   * do not keep (cost_source); null when the tables are not there.
+   */
+  function readTurnRows({ provider, billing = '', day = null, conversationId = null } = {}) {
+    const s = ready();
+    if (!s) return null;
+    if (conversationId) return s.listBillingConversationRows.all(String(conversationId), provider, billing).map(turnRowOut);
+    return s.listBillingDayRows.all(String(day || localDay(now())), provider, billing).map(turnRowOut);
+  }
+
   /** The chat is deleted: its turn rows go, the day rows stay. */
   function forgetConversation(conversationId) {
     const s = ready();
@@ -423,6 +437,7 @@ export function createTokenUsageService({
     readPeriods,
     readTurn,
     readConversation,
+    readTurnRows,
     forgetConversation,
     localDay: (ms = now()) => localDay(ms),
     timeZone: formatDay.resolvedOptions().timeZone,

@@ -59,7 +59,7 @@ function createHarness({ setCopilotProviderSettings, engine = 'extension' } = {}
   const register = (method) => (routePath, ...handlers) => {
     routes.set(`${method} ${routePath}`, handlers);
   };
-  const app = { routes, get: register('GET'), post: register('POST'), patch: register('PATCH'), delete: register('DELETE') };
+  const app = { routes, get: register('GET'), post: register('POST'), patch: register('PATCH'), put: register('PUT'), delete: register('DELETE') };
   const emitted = [];
   let stored = engine;
   registerSessionsRoutes(app, {

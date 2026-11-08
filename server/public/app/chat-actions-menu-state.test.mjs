@@ -17,6 +17,7 @@ const RELAY_WIDE = [
   'chat-menu-theme-toggle',
   'chat-menu-usage',
   'chat-menu-select-models',
+  'chat-menu-media',
   'chat-menu-settings',
   'chat-menu-about',
   'chat-menu-restart-relay',

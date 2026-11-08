@@ -60,6 +60,12 @@ import { buildWorkflowRunCard } from './background-tasks-view.mjs';
 import { mergeLiveSubagentRun, subagentRowsMarkup } from './subagent-row.mjs';
 import { rememberSubagentRuns, syncSubagentRowClock } from './subagent-viewer.mjs';
 import { isMessagePinned, toggleMessagePin } from './pinned-messages-view.mjs';
+import { clearImageTurnPlaceholder, noteInFlightImageTurn, renderImageTurnPlaceholder } from './image-turn-placeholder.mjs';
+import { isOpenAIImageModelId } from './conversation-provider-indicator.mjs';
+import { buildImageSendOptions, imageEffortForSend } from './openai-image-composer.mjs';
+import { readImageComposerSendInput, flagImageComposerSizeError } from './image-composer-ui.js';
+import { focusOpenAIImageCapInput, refreshOpenAIImageSpendState } from './openai-image-cost-ui.js';
+import { OPENAI_IMAGE_DAILY_CAP_REACHED_CODE } from './openai-image-spend.mjs';
 import { isMessageHiddenFromShares, setConversationHiddenMessages } from './hidden-messages-view.mjs';
 import { parsePreviewCommand, runPreviewCommand } from './preview-command.mjs';
 import { buildTranscriptPreviewCard } from './preview-cards.mjs';
@@ -2014,6 +2020,7 @@ export function showThinking(messageId = null, autoScroll = true) {
       stopBtn.classList.toggle('stopping', stopping);
     }
     anchorThinkingBubble(existing, nextMessageId || existing.dataset.messageId);
+    renderImageTurnPlaceholder();
     syncThinkingFollowButtons(existing, getThinkingFollowMode());
     observeThinkingBubble(existing);
     if (getThinkingFollowMode()) applyThinkingFollow();
@@ -2049,6 +2056,8 @@ export function showThinking(messageId = null, autoScroll = true) {
       <div class="subagent-bubbles-container" data-subagent-bubbles-root="1"></div>
     </div>`;
   anchorThinkingBubble(div, nextMessageId);
+  // An image turn's placeholder (timer, size, partials) belongs in it.
+  renderImageTurnPlaceholder();
   syncThinkingCompaction(div);
   renderThinkingThoughts();
   renderThinkingStream();
@@ -2064,6 +2073,7 @@ export function showThinking(messageId = null, autoScroll = true) {
 export function removeThinking() {
   thinkingMessageId = null;
   lastInFlightSnapshotKey = '';
+  clearImageTurnPlaceholder();
   takeThinkingBubbleOff();
 }
 
@@ -2323,6 +2333,31 @@ export function renderThinkingActivities() {
   }
 }
 
+// An image turn running when the page opens the conversation (or reconnects)
+// gets its placeholder from the snapshot: the timer from the turn's own start,
+// the model the conversation runs. `inFlight.image` (size, quality, count,
+// model, attempt, startedAt, previews), when the relay sends it, fills in the
+// rest.
+function noteInFlightImageTurnFromSnapshot(inFlight, messageId) {
+  const conversation = currentConvId ? conversations[currentConvId] : null;
+  const model = String(
+    inFlight?.image?.model
+    || inFlight?.model
+    || conversation?.runtimeProviderModel
+    || conversation?.runtime_provider_model
+    || conversation?.preferredModel
+    || '',
+  ).trim();
+  if (!inFlight?.image && !isOpenAIImageModelId(model)) return;
+  noteInFlightImageTurn({
+    conversationId: currentConvId,
+    messageId,
+    startedAt: inFlight?.processingAt || inFlight?.timestamp || null,
+    model,
+    image: inFlight?.image || null,
+  });
+}
+
 export function restoreInFlightThinking(inFlight, autoScroll = true) {
   const messageId = String(inFlight?.messageId || '').trim();
   const status = String(inFlight?.status || '').trim().toLowerCase();
@@ -2347,6 +2382,7 @@ export function restoreInFlightThinking(inFlight, autoScroll = true) {
     return;
   }
   lastInFlightSnapshotKey = snapshotKey;
+  noteInFlightImageTurnFromSnapshot(inFlight, messageId);
   // The snapshot may have been read before the newest live frame was stored.
   const liveStreamSeq = relayStreamStateByMessageId.get(messageId)?.seq || 0;
   const liveStreamText = relayStreamTextByMessageId.get(messageId);
@@ -3435,12 +3471,25 @@ async function resendStoppedSteer(conversationId, markerId) {
   try {
     if (!(await validateSelectedConversationBeforeSend(conversationKey))) return;
     const selectedModel = document.getElementById('model-select')?.value || '';
-    const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
-    const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+    let selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+    let selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
     const selectedMode = document.getElementById('mode-select')?.value || 'agent';
     if (!selectedReasoningEffort) {
       showTransientRelayNotice('Select a reasoning effort after refreshing model metadata.');
       return;
+    }
+    // As a send from the composer: an image model's options go along.
+    let selectedImageOptions;
+    if (isOpenAIImageModelId(selectedModel)) {
+      const built = buildImageSendOptions({ model: selectedModel, ...readImageComposerSendInput() });
+      if (!built.ok) {
+        if (built.field === 'size') flagImageComposerSizeError(built.error);
+        showTransientRelayNotice(built.error);
+        return;
+      }
+      selectedImageOptions = built.image;
+      selectedContextTier = built.contextTier;
+      selectedReasoningEffort = imageEffortForSend(selectedModel, selectedReasoningEffort);
     }
     // As a send from the composer (loadEndForOwnSend): the Resend goes to
     // the end.
@@ -3458,6 +3507,8 @@ async function resendStoppedSteer(conversationId, markerId) {
       }, ownSendFollows(send), clientMessageId, true);
       bubbleAppended = true;
     }
+    // A refusal the user can act on (the daily image cap) says why.
+    let refusal = '';
     const r = await sendMessageApi({
       messageId: clientMessageId,
       clientId: CLIENT_ID,
@@ -3466,14 +3517,20 @@ async function resendStoppedSteer(conversationId, markerId) {
       reasoningEffort: selectedReasoningEffort,
       contextTier: selectedContextTier,
       relayMode: selectedMode,
+      image: selectedImageOptions,
       conversationId: conversationKey,
       attachments,
       resendOfMessageId: String(sourceNode?.dataset?.messageId || '').trim() || undefined,
+    }, {
+      onRefused: (reason, payload) => {
+        refusal = reason;
+        if (payload?.code === OPENAI_IMAGE_DAILY_CAP_REACHED_CODE) void refreshOpenAIImageSpendState();
+      },
     });
     if (!r) {
       if (!hasSendEchoArrived(clientMessageId)) {
         dropOptimisticBubble();
-        showTransientRelayNotice('Could not resend the message. Please try again.');
+        showTransientRelayNotice(refusal || 'Could not resend the message. Please try again.', refusal ? 8000 : undefined);
         return;
       }
       sent = true;
@@ -3763,6 +3820,10 @@ export function runRelayErrorCta(cta) {
   if (cta === 'open-claude-api-cap') {
     openSettingsModal('providers', 'claude-api');
     focusClaudeApiCapInput();
+  }
+  if (cta === 'open-openai-image-cap') {
+    openSettingsModal('providers', 'openai');
+    focusOpenAIImageCapInput();
   }
   if (cta === 'open-claude-api-billing') window.open(CLAUDE_API_BILLING_URL, '_blank', 'noopener');
   if (cta === 'open-claude-api-limits') window.open(CLAUDE_API_LIMITS_URL, '_blank', 'noopener');
@@ -4117,6 +4178,8 @@ export function renderNoConversationState() {
   if (String(currentConvId || '').trim()) return false;
   const el = getMessagesElement();
   if (!el || el.querySelector('.status-view')) return false;
+  // The global Media view holds the transcript's place with nothing open.
+  if (document.body.classList.contains('media-view-active')) return false;
   const existing = el.querySelector('.empty-state');
   // A transcript with rows in it belongs to something else (a render in flight).
   if (!existing && el.children.length) return false;
@@ -4168,6 +4231,9 @@ export function refreshStreamViewLayout() {
 export function renderMessages(msgs, scroll = true, meta = {}) {
   const el = getMessagesElement();
   if (!el) return false;
+  // The global Media view holds the transcript's place with nothing open: a
+  // refresh (socket reconnect, CLI back online) must not clear it.
+  if (!String(currentConvId || '').trim() && document.body.classList.contains('media-view-active')) return false;
   lastRenderMessagesArgs = { msgs, meta };
   const ordered = sortConversationMessages(msgs || []);
   const snapshotKey = buildMessageSnapshotKey(ordered, meta);
@@ -4829,10 +4895,25 @@ export async function sendMessage() {
   const targetConversationId = String(currentConvId || '').trim() || null;
   const draftAttachments = selectedAttachments.slice();
   const selectedModel = document.getElementById('model-select').value || '';
-  const selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
-  const selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
+  let selectedReasoningEffort = String(document.getElementById('reasoning-effort-select')?.value || '').trim().toLowerCase();
+  let selectedContextTier = String(document.getElementById('context-tier-select')?.value || 'default').trim();
   const selectedMode = document.getElementById('mode-select').value || 'agent';
   const draftImageEditTarget = imageEditTarget;
+  // An image model's Size, Quality, Count, Format and Background go as the
+  // turn's `image` options, checked for the model before anything is sent:
+  // a custom size still being typed (or one the model refuses) stops here.
+  let selectedImageOptions;
+  if (isOpenAIImageModelId(selectedModel)) {
+    const built = buildImageSendOptions({ model: selectedModel, ...readImageComposerSendInput() });
+    if (!built.ok) {
+      if (built.field === 'size') flagImageComposerSizeError(built.error);
+      showTransientRelayNotice(built.error);
+      return;
+    }
+    selectedImageOptions = built.image;
+    selectedContextTier = built.contextTier;
+    selectedReasoningEffort = imageEffortForSend(selectedModel, selectedReasoningEffort);
+  }
   let composerConversationId = targetConversationId;
   const viewingSendConversation = () => String(currentConvId || '').trim() === String(composerConversationId || '').trim();
   if (!(await validateSelectedConversationBeforeSend(targetConversationId))) {
@@ -4899,6 +4980,7 @@ export async function sendMessage() {
       reasoningEffort: selectedReasoningEffort,
       contextTier: selectedContextTier,
       relayMode: selectedMode,
+      image: selectedImageOptions,
       conversationId: targetConversationId || undefined,
       newConversation: isNew || undefined,
       // The billing this page shows for a Claude chat: the relay refuses the
@@ -4926,6 +5008,9 @@ export async function sendMessage() {
         if (payload?.code === 'CLAUDE_BILLING_CHANGED' && targetConversationId) {
           noteConversationBilling(targetConversationId, payload.billing);
         }
+        // The daily image cap stopped the send: the draft stays (below),
+        // the relay's words show, and the image chat's banner learns why.
+        if (payload?.code === OPENAI_IMAGE_DAILY_CAP_REACHED_CODE) void refreshOpenAIImageSpendState();
       },
     });
     if (!r) {

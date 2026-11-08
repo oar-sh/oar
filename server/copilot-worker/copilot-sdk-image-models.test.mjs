@@ -158,7 +158,9 @@ test('without an image operation the worker calls the image API and publishes th
 
 test('an image request OpenAI refuses fails the row with the image code, not a Copilot turn note', async () => {
   const { stub, started, runner } = setup({
-    '/api/openai/images/generate': () => { throw httpError(400, { error: 'Invalid image size' }); },
+    '/api/openai/images/generate': () => {
+      throw httpError(400, { error: 'OpenAI refused the image request (400): Invalid image size.', code: 'IMAGE_PROVIDER_REJECTED' });
+    },
   });
 
   assert.equal(await runner.handlePendingPayload({ message: imageMessage }), true);
@@ -166,7 +168,7 @@ test('an image request OpenAI refuses fails the row with the image code, not a C
   assert.equal(started.length, 0);
   assert.equal(stub.bodiesFor('/api/requeue').length, 0);
   const [response] = stub.bodiesFor('/api/response');
-  assert.equal(response.text, 'OpenAI image request failed: Invalid image size');
+  assert.equal(response.text, 'OpenAI refused the image request (400): Invalid image size.');
   assert.equal(response.terminalError.code, 'image-provider-rejected');
   assert.equal(response.terminalError.stableCode, 'image-provider-rejected');
   assert.equal(response.terminalError.queueMessageId, 'q-1');
@@ -176,7 +178,12 @@ test('an image request OpenAI refuses fails the row with the image code, not a C
 
 test('a reply the relay could not process fails the row with the unprocessed-reply code, not a requeue', async () => {
   const { stub, started, runner } = setup({
-    '/api/openai/images/generate': () => { throw httpError(502, { error: 'OpenAI image API returned invalid JSON', relayProcessing: true }); },
+    '/api/openai/images/generate': () => {
+      throw httpError(502, {
+        error: 'The relay could not process the image OpenAI returned (OpenAI image API returned invalid JSON). The generation was billed; the message was not retried.',
+        relayProcessing: true,
+      });
+    },
   });
 
   assert.equal(await runner.handlePendingPayload({ message: imageMessage }), true);
@@ -190,15 +197,24 @@ test('a reply the relay could not process fails the row with the unprocessed-rep
   assert.equal(response.attemptId, 'attempt-q-1');
 });
 
-test('an image API failure that may pass requeues the row', async () => {
-  const { stub, runner } = setup({
-    '/api/openai/images/generate': () => { throw httpError(502, { error: 'Bad gateway' }); },
-  });
+test('an image API failure the relay already retried fails the row: generate never runs again', async () => {
+  const note = 'OpenAI answered 502 (tried twice); the request may have been billed; retry the message.';
+  for (const answer of [
+    () => { throw httpError(502, { error: note, code: 'IMAGE_PROVIDER_UNAVAILABLE', outcome: 'uncertain' }); },
+    // The call to the relay itself broke off.
+    () => { throw new Error('socket hang up'); },
+  ]) {
+    const { stub, runner } = setup({ '/api/openai/images/generate': answer });
 
-  assert.equal(await runner.handlePendingPayload({ message: imageMessage }), true);
+    assert.equal(await runner.handlePendingPayload({ message: imageMessage }), true);
 
-  assert.equal(stub.bodiesFor('/api/response').length, 0);
-  assert.deepEqual(stub.bodiesFor('/api/requeue'), [{ messageId: 'q-1', attemptId: 'attempt-q-1' }]);
+    assert.equal(stub.bodiesFor('/api/openai/images/generate').length, 1);
+    assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+    const [response] = stub.bodiesFor('/api/response');
+    assert.match(response.text, /may have been billed; retry the message\.$/);
+    assert.equal(response.terminalError.kind, 'openai-image-failed');
+    assert.equal(response.attemptId, 'attempt-q-1');
+  }
 });
 
 test('an image row delivered while a chat turn runs is not steered into it', async () => {

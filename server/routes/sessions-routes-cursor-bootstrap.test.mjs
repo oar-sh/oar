@@ -16,6 +16,9 @@ function createMockApp() {
     patch(path, ...handlers) {
       routes.set(`PATCH ${path}`, handlers);
     },
+    put(path, ...handlers) {
+      routes.set(`PUT ${path}`, handlers);
+    },
     delete(path, ...handlers) {
       routes.set(`DELETE ${path}`, handlers);
     },
@@ -484,4 +487,49 @@ test('implicit provider inference selects cursor for cursor-only models', async 
     providerType: 'cursor',
     providerModel: 'cheetah',
   });
+});
+
+// An OpenAI Image chat asked for by its provider ("openai-image") without a model.
+test('an OpenAI Image chat without a model starts on the image default (a fixed order), else the first gpt-image listed', async () => {
+  const openAI = (models) => ({ configured: true, enabled: true, model: 'gpt-4o', models: ['gpt-4o', ...models] });
+  const cases = [
+    [['gpt-image-1', 'gpt-image-2.6-flare', 'gpt-image-2.6-sunburst', 'gpt-image-2.5-flare-2026-09-08', 'gpt-image-2.5-flare'], 'gpt-image-2.5-flare'],
+    [['gpt-image-2.6-flare', 'gpt-image-2.5-flare-2026-09-08', 'gpt-image-2'], 'gpt-image-2.5-flare-2026-09-08'],
+    [['gpt-image-2.6-flare', 'gpt-image-2'], 'gpt-image-2'],
+    [['dall-e-3', 'gpt-image-1', 'gpt-image-1.5'], 'gpt-image-1'],
+  ];
+  for (const [models, expected] of cases) {
+    const { app, bindingCalls } = createBootstrapHarness({ openAISettings: openAI(models) });
+    const response = await callBootstrap(app, { providerType: 'openai-image' });
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    assert.equal(response.body.selectedModel, expected);
+    assert.equal(response.body.selectedProviderType, 'openai');
+    assert.equal(bindingCalls[0].options.providerType, 'openai');
+  }
+  // A model named wins; a plain OpenAI chat keeps its configured model.
+  const named = createBootstrapHarness({ openAISettings: openAI(['gpt-image-1', 'gpt-image-2.5-flare']) });
+  assert.equal((await callBootstrap(named.app, { providerType: 'openai-image', model: 'gpt-image-1' })).body.selectedModel, 'gpt-image-1');
+  assert.equal((await callBootstrap(named.app, { providerType: 'openai' })).body.selectedModel, 'gpt-4o');
+  // No gpt-image model on (dall-e is never picked): refused with its own code.
+  const none = createBootstrapHarness({ openAISettings: openAI(['dall-e-3']) });
+  const refused = await callBootstrap(none.app, { providerType: 'openai-image' });
+  assert.equal(refused.statusCode, 400);
+  assert.equal(refused.body.code, 'OPENAI_IMAGE_NO_MODEL');
+  assert.match(refused.body.error, /has no gpt-image model/);
+  // A chat model named for an image chat: refused as before.
+  const chatModel = await callBootstrap(none.app, { providerType: 'openai-image', model: 'gpt-4o' });
+  assert.equal(chatModel.statusCode, 400);
+  assert.equal(chatModel.body.code, 'OPENAI_IMAGE_MODEL_REQUIRED');
+});
+
+test('the OpenAI settings name the image default New Chat preselects', async () => {
+  const read = async (openAISettings) => {
+    const { app } = createBootstrapHarness({ openAISettings });
+    return (await callRoute(app.routes.get('GET /api/settings/openai'), { headers: {}, body: {}, query: {}, params: {} })).body;
+  };
+  assert.equal((await read({ configured: true, enabled: true, model: 'gpt-4o', models: ['gpt-image-1', 'gpt-image-2'] })).imageDefaultModel, 'gpt-image-2');
+  assert.equal((await read({ configured: true, enabled: true, model: 'gpt-image-2.6-flare', models: ['gpt-image-2.5-flare'] })).imageDefaultModel, 'gpt-image-2.5-flare');
+  assert.equal((await read({ configured: true, enabled: true, model: 'gpt-4o', models: ['gpt-image-1', 'gpt-image-2.6-flare'] })).imageDefaultModel, 'gpt-image-1');
+  assert.equal((await read({ configured: true, enabled: true, model: 'gpt-4o', models: ['gpt-4o'] })).imageDefaultModel, null);
+  assert.equal((await read({ configured: true, enabled: false, model: 'gpt-4o', models: ['gpt-image-2'] })).imageDefaultModel, null);
 });

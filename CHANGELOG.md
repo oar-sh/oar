@@ -3,6 +3,148 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.25] — 2026-11-09
+
+Highlights: a media gallery, and agents that make images. Every picture,
+video and file of a session is now in one place, the Media tab of the 🧠
+modal, and 🖼️ Media in the ︙ menu shows those of every session of the
+relay, with filters and a search; the file viewer moves through the whole
+gallery. Agents drive OpenAI Image sessions through `relay_tool`: they send
+pictures to edit and set the size, quality, count, format and background.
+While gpt-image works, the reply shows partial previews; the composer gets
+a custom size, a count, a format, a background and presets, and the
+gpt-image-2.5 and 2.6 models take xhigh and max quality. Every image turn
+shows what it cost, a daily cap of USD 5 per relay unless you change it
+keeps image spend in check, and a failed image turn costs at most two calls
+instead of up to five. The relay's memory no longer grows while several
+agents stream long thinking at once.
+
+### Added
+
+- **Media gallery.** The 🧠 modal has two tabs, Context (where it opens)
+  and Media: the session's pictures and videos as a square grid under month
+  headers, three columns on a phone, with a Files tab for attached PDFs,
+  audio and documents. **🖼️ Media** in the ︙ menu shows the media of every
+  session of the relay, with filters (All, Mine, Agent, Generated, a
+  provider, a session, Hide archived) and a search. It collects uploads,
+  `@file:` pictures, generated images and the pictures agents put in their
+  replies; a picture shown in several messages appears once, at its newest
+  message, and a deleted local file is left out. A tap opens the file
+  viewer, which now moves through the whole gallery (it loads more at the
+  end) and offers **Open in session** and **Copy path / link**. The pictures
+  on screen that could not load while the relay was away load again once it
+  is back; one scrolled out of view waits for the next reconnect.
+  Owner only: not in shared views, and no agent reads it through
+  `relay_tool`, on this relay or a paired one.
+- **Media index.** The relay keeps the gallery's index in its database
+  (migration 0039) and fills it for older messages in the background after
+  the upgrade, in short slices.
+- **Agents drive OpenAI Image sessions.** `relay_tool`'s `send` and
+  `create_session` take `images`, up to 4 absolute paths of PNG, JPEG or
+  WebP files on the target relay, and `image`, the turn's size (any W×H
+  within the model's limits), quality, count (1 to 4), output format and
+  background; `update_session` with `image` sets a session's own defaults
+  (migration 0040). The target relay takes only files inside the session's
+  working directory or images one of its sessions generated, follows links
+  to the real file, and checks each file's first bytes. Replies list the
+  pictures as `images` with their paths there, and a reply without text
+  reads like `1 image · 1536x1024 · gpt-image-2`. A paired relay must run
+  this version (`imageInputs` in `relay_info`); an older one is refused
+  before anything is sent. A new image session without a model starts on
+  gpt-image-2.5-flare (else its dated snapshot, else gpt-image-2, else the
+  first gpt-image model listed), and is refused when none is listed.
+
+- **Image previews.** While a gpt-image model makes an image, the reply's
+  bubble shows a timer with the size and quality, then two partial previews
+  as OpenAI streams them, then the final image. Previews reach your open
+  clients only, never the transcript, shared views, the media gallery or
+  agents, and their files go when the turn ends.
+- **Image composer.** An image chat's composer has a Custom… size (any
+  W×H the model takes, checked as you type), a Count (1 to 4), a Format
+  and a Background for gpt-image models.
+
+- **What image turns cost.** Every try of an OpenAI image turn is priced
+  as it ends, from the usage OpenAI reports and its published rates, and
+  estimated where OpenAI reports no usage for a try that may have been
+  billed; a model the relay has no price for counts at the dearest listed
+  price. The reply line ends with the cost, the chat menu shows what a
+  chat's images cost, and Check Usage has an OpenAI images card.
+- **A daily cap for OpenAI images.** USD 5 per relay and day unless you
+  change it (Settings → Providers → OpenAI; 0 is no cap). A request that
+  would pass it is not sent, and once it is reached new image messages are
+  refused, from you and from agents alike; estimates count toward it. A
+  warning shows from 80 %. Allow for today lifts it until midnight.
+- **Image presets.** Five built-in bundles of size, quality, format and
+  background, and your own (Save as preset… in the composer); agents name
+  one as image.preset.
+- **xhigh and max image quality.** The gpt-image-2.5 and 2.6 models take
+  the two higher qualities, in the composer and for agents; other models
+  keep auto, low, medium and high. Sizes for gpt-image-2 and later need at
+  least 655,360 pixels (1024x640), as OpenAI requires.
+
+### Changed
+
+- **OpenAI Image turns.** All attached images go to the edit, in order,
+  not only the first, and the format and background reach OpenAI. Quality
+  is checked per model family before the call (gpt-image: auto, low,
+  medium, high). OpenAI gets 3 minutes for a new image and 5 for
+  an edit (`openaiImageGenerateTimeoutMs`, `openaiImageEditTimeoutMs`).
+- **Copilot hides image models.** Copilot's `gpt-image-*` and `dall-e-*`
+  ids, which its runtime cannot serve, are left out of its model list; a
+  Copilot chat on one is refused with a pointer to OpenAI Image.
+
+### Fixed
+
+- **An image turn costs at most two calls.** A timeout, a server error or
+  a broken connection is tried once more, then the turn ends with a note
+  that says whether the request may have been billed; before, the turn went
+  back into the queue up to five times and ended as "Relay timeout after 5
+  attempts", each attempt a new billed request. When the second try works,
+  the reply notes that the first may have been billed as well. A relay
+  restart during the call no longer repeats it either.
+- **The relay's own image route is local only.** A paired relay's token can
+  no longer call it directly, past the queue.
+- **An agent's prompt header no longer reaches the image model.**
+- **Relay memory no longer grows while several agents stream long thinking
+  at the same time.** A few sessions thinking at length at once could make
+  the relay hold more and more memory until it ran out. Thinking still shows
+  live; a slow connection may skip some of the updates in between, and the
+  whole thought arrives when it ends and after a reconnect, as before.
+
+### Upgrade notes
+
+- **The first start takes a little longer on a big database.** Before it
+  listens, the relay copies its database to the backups folder, as before,
+  and migration 0039 creates the media index and queues every message for
+  it once: about 0.2 s per 200,000 messages on a small server. Migration
+  0040 adds two columns. Nothing else waits.
+- **The gallery fills in the background.** After the start the relay
+  indexes the older messages in slices of about 20 ms every half second,
+  in no particular order: about 3 minutes per 200,000 messages on a small
+  server, longer on a phone or with long messages. Until it ends, the
+  gallery shows what is indexed and "Indexing older messages… (N left)". A
+  restart picks up where it stopped.
+- **The daily cap for OpenAI images is on after the update**: USD 5 per
+  relay and day, in Settings → Providers → OpenAI (0 is no cap). Without an
+  OpenAI key nothing changes, and Check Usage shows no OpenAI images card
+  until something was booked in the month.
+- **Sessions still on 0.9.24's worker wait one worker start.** A session
+  whose worker still runs the old code is given a new worker before its
+  next message, as in 0.9.24. A Claude session's agent gets `images` and
+  `image` in `relay_tool` with its new worker.
+- **Mixed versions work together**, except for images across relays: a
+  0.9.25 relay refuses to send `images` or `image` to a paired 0.9.24 relay
+  and sends nothing, and a 0.9.24 relay cannot send them.
+- **Going back to 0.9.24** needs no database step. Install it with
+  `npm install -g @oar-sh/oar@0.9.24` (in a git checkout:
+  `git checkout v0.9.24`, then a relay restart). 0.9.24 ignores the media
+  index and the image defaults and has no daily image cap, so image turns
+  are not limited there. The index's triggers stay in the database and
+  queue the messages written on 0.9.24, which a later 0.9.25 indexes. To
+  remove the index, drop its two triggers first, then its three tables, as
+  `server/migrations/0039-media-index.mjs` describes; a table dropped
+  before its trigger breaks every new message.
+
 ## [0.9.24] — 2026-11-08
 
 Highlights: a much smaller install. The Claude and Cursor agent SDKs leave

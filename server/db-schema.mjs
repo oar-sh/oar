@@ -44,6 +44,8 @@ import { migrateConversationPlanOnly } from './migrations/0035-conversation-plan
 import { migrateTokenUsage } from './migrations/0036-token-usage.mjs';
 import { migrateRelayAsksQueueId } from './migrations/0037-relay-asks-queue-id.mjs';
 import { migrateTurnSeq } from './migrations/0038-turn-seq.mjs';
+import { migrateMediaIndex } from './migrations/0039-media-index.mjs';
+import { migrateImageSessionDefaults } from './migrations/0040-image-session-defaults.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1094,6 +1096,23 @@ try {
   migrateTurnSeq(db);
 } catch (error) {
   console.warn(`[turn-seq] migration 0038 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The media gallery index: tables, the two queue triggers on messages and a
+// one-time seed of the queue. The gallery works without it (empty), so a
+// failure is logged and retried next boot.
+try {
+  migrateMediaIndex(db);
+} catch (error) {
+  console.warn(`[media-index] migration 0039 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// An image session's own size/quality/count defaults. Image turns run on the
+// built-in defaults without it, so a failure is logged and retried next boot.
+try {
+  migrateImageSessionDefaults(db);
+} catch (error) {
+  console.warn(`[image-sessions] migration 0040 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

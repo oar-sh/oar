@@ -38,7 +38,7 @@ test.after(() => {
 function createMockApp() {
   const routes = new Map();
   const record = (method) => (routePath, ...handlers) => routes.set(`${method} ${routePath}`, handlers);
-  return { routes, get: record('GET'), post: record('POST'), patch: record('PATCH'), delete: record('DELETE') };
+  return { routes, get: record('GET'), post: record('POST'), patch: record('PATCH'), put: record('PUT'), delete: record('DELETE') };
 }
 
 function createMockDb(activeQueueCount = 0) {

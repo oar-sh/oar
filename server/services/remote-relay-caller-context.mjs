@@ -153,6 +153,12 @@ function describeSettingsChange(args) {
   if (toText(args.thinking_display)) parts.push(`Thinking text: ${toText(args.thinking_display) === 'omitted' ? 'hidden' : 'visible'}`);
   if (toText(args.cwd)) parts.push(`Folder: ${excerpt(args.cwd)} (its CLI restarts there)`);
   if (typeof args.planOnly === 'boolean') parts.push(`planOnly: ${args.planOnly}`);
+  if (args.image && typeof args.image === 'object' && !Array.isArray(args.image)) {
+    const options = Object.entries(args.image)
+      .filter(([, value]) => toText(value))
+      .map(([name, value]) => `${name.replace(/_/g, ' ')} ${excerpt(value)}`);
+    if (options.length) parts.push(`Image defaults: ${options.join(', ')}`);
+  }
   return parts.join(' · ');
 }
 

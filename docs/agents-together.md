@@ -83,7 +83,8 @@ cap it is refused with `CLAUDE_API_CAP_REACHED` and nothing is queued.
 
 Two read actions help an agent plan: `usage` says what each provider's plan has left on a relay
 (Cursor's spend against its limit, Claude's windows and whether a usage limit has paused turns,
-Copilot and Grok where they are tracked; never account names, addresses or tokens), and
+Copilot and Grok where they are tracked, OpenAI images against the daily cap; never account names,
+addresses or tokens), and
 `list_sessions` / `read_session` give each session's `state` (`running_turn`, `background_only` or
 `idle`) with its background agents and shell tasks, and the [session group](web-ui.md#session-groups)
 it is in. An agent can name an existing group (`group`, an id or name `relay_info` lists) when it
@@ -91,8 +92,8 @@ creates a session, here or on a paired relay; an unknown group is refused and no
 Renaming, dissolving and rearranging groups stays yours.
 
 **Changing another session's settings.** With `update_session` an agent sets another session's
-model, reasoning effort, relay mode, auto-compact window, title, group, thinking or working folder for
-its next turns, without prompting it, and gets back the settings and what changed. The checks are those
+model, reasoning effort, relay mode, auto-compact window, title, group, thinking, working folder or, on
+an image session, image defaults (see [below](#images-in-prompts-and-replies)) for its next turns, without prompting it, and gets back the settings and what changed. The checks are those
 of `send` (an unknown model is refused with the close matches); a group name that does not exist yet
 makes a new group, and `"none"` takes the session out of its group. A group you made is never removed
 this way: when an agent takes out its last session, the group stays, shown empty in your sidebar (rename
@@ -137,6 +138,50 @@ and can call `wait` again.
 An argument an action does not take is never dropped without a word. `create_session` and
 `update_session` refuse the call, list the arguments they take, and change nothing; every other action still runs and
 names the arguments it did not take in `ignored: [...]`.
+
+### Images in prompts and replies
+
+An agent can drive an [OpenAI Image](providers.md#openai-byok-and-openai-image) session like any
+other. `send` and `create_session` take `images`, up to 4 absolute paths of PNG, JPEG or WebP
+files on the target relay (a list, or one path as text; each file at most 20 MB, 16384 pixels a
+side and 64 megapixels), which go to the model with the prompt as the images to edit or work from,
+the first as the base; and `image`, the options of that turn: `size`, `quality`, `count` (1 to 4),
+`output_format` and `background`, with the values [OpenAI Image](providers.md#openai-byok-and-openai-image)
+lists per model family (`{"size":"1536x1024","quality":"high","count":2}`). `update_session` with
+`image` sets the session's own defaults: the fields named replace those defaults, the others stay
+(`auto`, 1 and `png` set one back), and a turn's `image` overrides them field by field; a preset
+is a turn's only, never a default. `create_session` with provider `openai`, `images` or `image` and no `model` starts on
+the relay's image default (the first of `gpt-image-2.5-flare`, its dated snapshot and `gpt-image-2`
+that its OpenAI list has, else the first `gpt-image-*` listed); with none listed it is refused
+(`OPENAI_IMAGE_NO_MODEL`) and nothing is created. `images` or `image` with another provider or a
+model that makes no images is refused before anything is created.
+
+The target relay reads the files itself and takes only what lies inside the session's working
+directory, as it was before the message (a `cd` in the same message does not count), or an image
+that any session there generated, archived ones included. It follows links to the real file and
+refuses one that leads elsewhere; it never reads its own data folder, uploads, database or config
+file, network paths (`\\host\share`), or a file whose first bytes are no PNG, JPEG or WebP, whatever
+its name says (an animated PNG or WebP neither). A path given twice, or two copies of one file,
+count once. A refusal names the reason, and nothing is sent; so is a session whose model makes no
+images. The paths are checked against the new session's folder, so on `create_session` the session
+exists by then: a refused path or option leaves it without its first prompt, the answer names it,
+and a `send` to it goes on from there.
+
+Replies (`send`, `create_session`, `wait`, `read_session`) list the turn's pictures as
+`images: [{path, width, height, mime}]`, with the files' paths on that relay, which a later `send`
+can attach to iterate. When the model wrote no text, the reply text is a line like
+`1 image · 1536x1024 · gpt-image-2 · ~USD 0.04`, with the turn's cost when the relay knows it. A
+failed image call is tried at most twice, and the note says whether it may have been billed. A
+paired relay has to run an OAR that takes images (`imageInputs: true` in `relay_info`); with an
+older one, `images` and `image` are refused before anything is created, sent or changed.
+
+`image` may also name a preset, `image.preset`, one of the names `relay_info` lists as `imagePresets` (the
+built-ins and the owner's own); the session's defaults lie below it and the turn's own fields over it. An
+unknown name is refused with the list. Image turns count toward the relay's daily cap of OpenAI image spend
+([OpenAI Image](providers.md#openai-byok-and-openai-image)): once it is reached, `send` is refused with
+`OPENAI_IMAGE_DAILY_CAP_REACHED` ("Nothing was sent."), `create_session` for an image session before the
+session is made ("No session was created."), and a turn already queued ends with that note. The owner lifts it
+for the day; agents cannot. `usage` shows the relay's OpenAI image spend today, the cap and what is left.
 
 When an agent prompts a session on another relay, that relay shows a **↗ from …** badge with the
 sending relay, session and model on the message, and marks sessions an agent created in the

@@ -555,6 +555,11 @@ export function createSdkMessageNormalizer() {
         const thinking = state.thinking.get(index);
         if (thinking) {
           thinking.text = capThought(thinking.text + String(event?.delta?.thinking || ''));
+          // Gated as stream text: a delta can be one token, and every update
+          // carries the whole thought. Past the cap the text stops changing,
+          // so nothing more goes out until the block's final frame.
+          if (!shouldEmitStreamUpdate(thinking.text, thinking.lastEmittedText)) return actions;
+          thinking.lastEmittedText = thinking.text;
           actions.push({
             channel: 'thought',
             payload: {
@@ -715,7 +720,7 @@ export function createSdkMessageNormalizer() {
       const assistantError = lastAssistantError;
       lastAssistantError = '';
       const apiErrorStatus = Number(sdkMessage.api_error_status ?? NaN);
-      return [{
+      return [...flushOpenThoughts(), {
         channel: 'result',
         payload: {
           text: String(sdkMessage.result || '').trim(),
@@ -743,6 +748,29 @@ export function createSdkMessageNormalizer() {
     }
 
     return [];
+  }
+
+  // A thinking block the turn left open (aborted, failed) never gets its
+  // final frame: what the delta gating held back goes out with the result,
+  // so the stored thought ends with the last delta.
+  function flushOpenThoughts() {
+    const actions = [];
+    for (const state of threads.values()) {
+      for (const thinking of state.thinking.values()) {
+        if (!thinking.text.trim() || thinking.text === thinking.lastEmittedText) continue;
+        thinking.lastEmittedText = thinking.text;
+        actions.push({
+          channel: 'thought',
+          payload: {
+            reasoningId: thinking.reasoningId,
+            text: thinking.text,
+            done: false,
+            subagentRunId: subagentRunIdFor(state.key === 'main' ? null : state.key),
+          },
+        });
+      }
+    }
+    return actions;
   }
 
   function finalStreamText() {

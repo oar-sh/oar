@@ -81,6 +81,8 @@ import {
   galleryNeighborIndex,
   galleryNeighbors,
   galleryPositionLabel,
+  galleryCanStep,
+  extendGallery,
 } from './viewer-gallery.mjs';
 import {
   deepestExistingAncestor,
@@ -672,9 +674,10 @@ function updateFilePreviewUiState() {
   if (bottomChrome) {
     bottomChrome.hidden = !gallery;
     document.getElementById('file-preview-position').textContent = galleryPositionLabel(gallery);
-    document.getElementById('file-preview-prev').disabled = galleryNeighborIndex(gallery, -1) === -1;
-    document.getElementById('file-preview-next').disabled = galleryNeighborIndex(gallery, 1) === -1;
+    document.getElementById('file-preview-prev').disabled = !galleryCanStep(gallery, -1);
+    document.getElementById('file-preview-next').disabled = !galleryCanStep(gallery, 1);
   }
+  renderGalleryDetails(gallery);
 }
 
 /**
@@ -1231,7 +1234,7 @@ export function openUploadedAttachmentViewer(name, contentUrl, mimeType, options
       kind: uploadPreviewKind(mimeType),
       name: String(name || 'attachment'),
       rawUrl: String(contentUrl || ''),
-      size: 0,
+      size: Number(options?.size) > 0 ? Number(options.size) : 0,
       contentType: String(mimeType || '').toLowerCase(),
     },
   });
@@ -1249,7 +1252,7 @@ export function openGalleryItem(item, gallery) {
   if (!item) return Promise.resolve(false);
   const source = item.source || gallery?.source || 'workspace';
   if (source === 'upload') {
-    openUploadedAttachmentViewer(item.name, item.href, item.mime, { gallery });
+    openUploadedAttachmentViewer(item.name, item.href, item.mime, { gallery, size: item.size });
     return Promise.resolve(true);
   }
   const open = source === 'workspace' ? openWorkspaceFilePreview : openDriveFilePreview;
@@ -1335,7 +1338,9 @@ export function renderFilePreview() {
   const kindLabel = String(payload.kind || 'text').toUpperCase();
   const langLabel = payload.language ? ` · ${payload.language}` : '';
   const truncatedLabel = payload.truncated ? ` · truncated to ${formatBytes(FILE_PREVIEW_MAX_BYTES)}` : '';
-  metaEl.textContent = `${kindLabel}${langLabel} · ${formatBytes(payload.size || 0)}${truncatedLabel}`;
+  // An attachment opened by its address may come without a size: no "0 B" then.
+  const sizeLabel = payload.size > 0 || filePreviewState.source !== 'upload' ? ` · ${formatBytes(payload.size || 0)}` : '';
+  metaEl.textContent = `${kindLabel}${langLabel}${sizeLabel}${truncatedLabel}`;
 
   const cardMeta = payload.size > 0 ? formatBytes(payload.size) : '';
 
@@ -1560,11 +1565,63 @@ export async function openWorkspaceFilePreviewFromRepo(rawPath, options = {}) {
 
 /** Show the file `delta` steps along the gallery; false at either end. */
 export async function stepFilePreviewGallery(delta) {
-  const gallery = filePreviewState.gallery;
-  const index = galleryNeighborIndex(gallery, delta);
+  let gallery = filePreviewState.gallery;
+  let index = galleryNeighborIndex(gallery, delta);
+  if (index === -1 && galleryCanStep(gallery, delta)) {
+    // A paged gallery: the next page is fetched and the step goes on into it.
+    let page = null;
+    try {
+      page = await gallery.loadMore();
+    } catch {
+      page = null;
+    }
+    if (filePreviewState.gallery !== gallery) return false;
+    gallery = extendGallery(gallery, page || { items: [], hasMore: false });
+    filePreviewState.gallery = gallery;
+    index = galleryNeighborIndex(gallery, delta);
+    if (index === -1) {
+      renderFilePreview();
+      return false;
+    }
+  }
   if (index === -1) return false;
   const next = galleryAt(gallery, index);
   return openGalleryItem(next.items[index], next);
+}
+
+// What a gallery says about its open item (the media gallery: session,
+// date, who sent it) and the buttons it adds ("Open in session", "Copy
+// path"), built here so the viewer markup stays the same for every gallery.
+function renderGalleryDetails(gallery) {
+  const toolbar = document.querySelector('#file-preview-chrome-top .file-preview-toolbar');
+  let caption = document.getElementById('file-preview-gallery-caption');
+  if (!caption && toolbar) {
+    caption = document.createElement('div');
+    caption.id = 'file-preview-gallery-caption';
+    caption.className = 'file-preview-meta';
+    toolbar.insertAdjacentElement('afterend', caption);
+  }
+  document.querySelectorAll('[data-gallery-action]').forEach((button) => button.remove());
+  const item = gallery?.items?.[gallery.index];
+  const details = item && typeof gallery.describe === 'function' ? gallery.describe(item) : null;
+  if (caption) {
+    caption.textContent = details?.caption || '';
+    caption.hidden = !details?.caption;
+  }
+  if (!toolbar || !Array.isArray(details?.actions)) return;
+  const anchor = document.getElementById('file-preview-copy-btn');
+  for (const action of details.actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'file-preview-btn';
+    button.textContent = action.label;
+    button.dataset.galleryAction = action.id;
+    button.addEventListener('click', () => {
+      viewerControls.interaction();
+      void action.run(item);
+    });
+    toolbar.insertBefore(button, anchor || null);
+  }
 }
 
 // Preview payloads of the open file's neighbours, fetched ahead so a swipe
@@ -2935,8 +2992,8 @@ const viewerSwipe = createSwipeRecognizer({
       return;
     }
     // Past either end the content gives a little, then holds.
-    const toward = galleryNeighborIndex(filePreviewState.gallery, dx < 0 ? 1 : -1);
-    const shift = toward === -1 ? dx * 0.25 : dx;
+    // A page still to load counts as somewhere to go.
+    const shift = galleryCanStep(filePreviewState.gallery, dx < 0 ? 1 : -1) ? dx : dx * 0.25;
     bodyEl.style.transform = `translateX(${shift}px)`;
   },
   onEnd: ({ axis, swipe }) => {

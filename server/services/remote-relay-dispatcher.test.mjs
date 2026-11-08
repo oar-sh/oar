@@ -528,7 +528,18 @@ function createFakeRemote() {
         });
         conv.activeTurn = true;
         remote.onMessage?.(conv, body);
-        return { ok: true, messageId: body.messageId, conversationId: conv.id, selectedReasoningEffort: effort || null };
+        // A relay that takes images says how many it attached (imagesAttached
+        // overrides that; undefined: it says nothing, as an older one).
+        const attached = Object.prototype.hasOwnProperty.call(remote, 'imagesAttached')
+          ? remote.imagesAttached
+          : (Array.isArray(body.imagePaths) ? body.imagePaths.length : undefined);
+        return {
+          ok: true,
+          messageId: body.messageId,
+          conversationId: conv.id,
+          selectedReasoningEffort: effort || null,
+          ...(attached !== undefined ? { imageInputs: attached } : {}),
+        };
       }
 
       if (method === 'GET' && path === '/api/relay-questions') {
@@ -1782,6 +1793,35 @@ test('a relay that binds another model than the one asked is named in the answer
   assert.equal(result.status, 200);
   assert.equal(result.body.model, 'gpt-5.6-luna');
   assert.match(result.body.modelNote, /Relay "linux-test" started the session on gpt-5\.6-luna, not on claude-sonnet-5 as asked\./);
+});
+
+test('a Copilot session on an image model is refused with the way to an OpenAI Image session', async () => {
+  const { run, remote, approvals } = setup({ caller: { provider: 'github', model: 'gpt-5.6-luna', mode: 'ask' } });
+  // A target that predates the filter still lists the id for Copilot.
+  remote.models.models.push('gpt-image-1');
+  remote.models.providersByModel['gpt-image-1'] = ['github-copilot', 'openai-byok'];
+  const info = await run('relay_info', { relay: 'linux-test' });
+  const byName = Object.fromEntries(info.body.providers.map((entry) => [entry.provider, entry]));
+  assert.equal(byName.github.models.includes('gpt-image-1'), false);
+  assert.ok(byName.openai.models.includes('gpt-image-1'));
+
+  const created = await run('create_session', { ...CREATE_ARGS, provider: 'github', model: 'gpt-image-1' });
+  assert.equal(created.status, 400);
+  assert.equal(created.body.code, 'IMAGE_MODEL_NEEDS_OPENAI');
+  assert.equal(created.body.error, '"gpt-image-1" makes images: start an OpenAI Image chat (provider openai) for it. No session was created.');
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(approvals.length, 0, 'no card for a call that cannot run');
+
+  withSession(remote, { provider: 'github', model: 'gpt-5.6-luna' });
+  const sent = await run('send', { ...SEND_ARGS, model: 'dall-e-3' });
+  assert.equal(sent.body.code, 'IMAGE_MODEL_NEEDS_OPENAI');
+  assert.match(sent.body.error, /^"dall-e-3" makes images: .* Nothing was sent\.$/);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+
+  // The OpenAI provider takes it.
+  const image = await run('create_session', { ...CREATE_ARGS, provider: 'openai', model: 'gpt-image-1' });
+  assert.equal(image.status, 200, JSON.stringify(image.body));
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').at(-1).body.model, 'gpt-image-1');
 });
 
 test('a provider not set up there answers as such, before its model is looked at', async () => {
@@ -4783,4 +4823,501 @@ test('a Safety check card is never offered to an agent or answered by one, on a 
   assert.equal(local.status, 403);
   assert.match(local.body.error, /this card is the user's to answer/);
   assert.equal(here.local.questions.get('question-safety').status, 'pending');
+});
+
+// ─── images and image (OpenAI image sessions) ───────────────────────────────
+
+const IMAGE_PATHS = Object.freeze(['/home/dev/project/sketch.png', '/home/dev/project/photo.jpg']);
+const IMAGE_OPTIONS = Object.freeze({ size: '1536x1024', quality: 'low' });
+
+function takesImages(remote) {
+  remote.identity = { ...remote.identity, remoteRelays: { ...remote.identity.remoteRelays, imageInputs: true } };
+  return remote;
+}
+
+function imageInputRefusal(relay, error) {
+  return remoteError(`${CODES.httpPrefix}400`, `Relay "${relay.name}" answered HTTP 400: ${error}`, 400, {
+    ok: false, code: 'IMAGE_INPUT_REFUSED', error,
+  });
+}
+
+test('send passes images and image on to the target in the message body; without them neither is sent', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  const result = await run('send', { ...SEND, images: [...IMAGE_PATHS], image: { ...IMAGE_OPTIONS } });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.note, undefined, 'both images attached: nothing to say');
+  const [post] = remote.callsTo('POST', '/api/message');
+  assert.deepEqual(post.body.imagePaths, IMAGE_PATHS);
+  assert.deepEqual(post.body.image, IMAGE_OPTIONS);
+  assert.equal(remote.callsTo('GET', '/api/relay/identity').length, 1, 'the identity is read once, fresh');
+
+  const plain = await run('send', SEND);
+  assert.equal(plain.status, 200);
+  const second = remote.callsTo('POST', '/api/message')[1].body;
+  assert.equal(Object.prototype.hasOwnProperty.call(second, 'imagePaths'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(second, 'image'), false);
+  assert.equal(remote.callsTo('GET', '/api/relay/identity').length, 1, 'no identity read without images');
+});
+
+// The target's OpenAI list has an image model: an image session needs one.
+function listsImageModel(remote, model = 'gpt-image-2') {
+  remote.models.models.push(model);
+  remote.models.providersByModel[model] = ['openai-byok'];
+}
+
+test('create_session passes images and image with its first message after the bootstrap', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  listsImageModel(remote);
+  const result = await run('create_session', { ...CREATE, provider: 'openai', images: [IMAGE_PATHS[0]], image: { count: 2 } });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const bootstrap = remote.callsTo('POST', '/api/conversation/bootstrap')[0].body;
+  assert.equal(Object.prototype.hasOwnProperty.call(bootstrap, 'imagePaths'), false, 'the bootstrap gets none');
+  const [post] = remote.callsTo('POST', '/api/message');
+  assert.equal(post.body.conversationId, 'conv-new-1');
+  assert.deepEqual(post.body.imagePaths, [IMAGE_PATHS[0]]);
+  assert.deepEqual(post.body.image, { count: 2 });
+});
+
+test('an OpenAI session started with images and no model takes the image default of the target\'s list', async () => {
+  const listOpenAI = (remote, models) => {
+    remote.models.models.push(...models);
+    for (const model of models) remote.models.providersByModel[model] = ['openai-byok'];
+  };
+  const created = async ({ caller = {}, models, args }) => {
+    const { run, remote } = setup({ caller: { provider: 'openai', model: 'gpt-4o', ...caller } });
+    takesImages(remote);
+    listOpenAI(remote, models);
+    const result = await run('create_session', { ...CREATE, provider: 'openai', ...args });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    return { result, bootstrap: remote.callsTo('POST', '/api/conversation/bootstrap')[0].body };
+  };
+
+  // The default when listed; a text model of this session is not mirrored.
+  const listed = await created({ models: ['gpt-image-1', 'gpt-image-2.5-flare'], args: { images: [IMAGE_PATHS[0]] } });
+  assert.equal(listed.bootstrap.model, 'gpt-image-2.5-flare');
+  assert.equal(listed.result.body.modelSource, 'remote default');
+  assert.equal(listed.result.body.modelNote, undefined);
+
+  // A newer model the list offers does not win over the default.
+  const newer = await created({ models: ['gpt-image-2.6-flare', 'gpt-image-2.6-sunburst', 'gpt-image-2.5-flare'], args: { images: [IMAGE_PATHS[0]] } });
+  assert.equal(newer.bootstrap.model, 'gpt-image-2.5-flare');
+
+  // Else the next of the fixed order; image options alone make an image session too.
+  const second = await created({ models: ['gpt-image-1', 'gpt-image-2', 'dall-e-3'], args: { image: { count: 2 } } });
+  assert.equal(second.bootstrap.model, 'gpt-image-2');
+
+  // An image model of this session that the target lists is mirrored.
+  const mirrored = await created({ caller: { model: 'gpt-image-1' }, models: ['gpt-image-1', 'gpt-image-2.5-flare'], args: { images: [IMAGE_PATHS[0]] } });
+  assert.equal(mirrored.bootstrap.model, 'gpt-image-1');
+  assert.equal(mirrored.result.body.modelSource, 'same as this session');
+
+  // Without images or image options: this session's model, as before.
+  const text = await created({ models: ['gpt-image-2.5-flare'], args: {} });
+  assert.equal(text.bootstrap.model, 'gpt-4o');
+
+  // No gpt-image model listed there: refused, nothing created.
+  const { run, remote } = setup({ caller: { provider: 'openai', model: 'gpt-4o' } });
+  takesImages(remote);
+  listOpenAI(remote, ['dall-e-3']);
+  const none = await run('create_session', { ...CREATE, provider: 'openai', images: [IMAGE_PATHS[0]] });
+  assert.equal(none.status, 400, JSON.stringify(none.body));
+  assert.equal(none.body.code, 'REMOTE_RELAY_UNKNOWN_MODEL');
+  assert.equal(none.body.remoteCode, 'OPENAI_IMAGE_NO_MODEL');
+  assert.match(none.body.error, /has no gpt-image model.*No session was created\./);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+});
+
+test('a paired relay whose identity does not say imageInputs is refused before anything is created or sent', async () => {
+  const { run, remote, approvals } = setup({ caller: { mode: 'ask' } });
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  const sent = await run('send', { ...SEND, images: [...IMAGE_PATHS] });
+  assert.equal(sent.status, 409);
+  assert.equal(sent.body.code, CODES.unsupported);
+  assert.equal(sent.body.error, 'Relay "linux-test" runs an older OAR that cannot take images or image options: nothing was sent.');
+  const created = await run('create_session', { ...CREATE, provider: 'openai', image: { quality: 'low' } });
+  assert.equal(created.status, 409);
+  assert.match(created.body.error, /nothing was created or sent\.$/);
+  const updated = await run('update_session', { relay: 'linux-test', session: 'conv-1', image: { size: '1024x1024' } });
+  assert.equal(updated.status, 409);
+  assert.match(updated.body.error, /cannot take images or image options: nothing was changed\.$/);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(remote.callsTo('PATCH', '/api/conversation/conv-1/settings').length, 0);
+  assert.equal(approvals.length, 0, 'no card for a call that cannot run');
+
+  // A relay without the identity route is older still.
+  remote.fail('GET', '/api/relay/identity', remoteError(CODES.notFound, 'not found', 404));
+  const old = await run('send', { ...SEND, image: { quality: 'low' } });
+  assert.equal(old.status, 409);
+  assert.equal(old.body.code, CODES.unsupported);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+});
+
+test('this relay always takes images: no identity read', async () => {
+  const { run, local } = setupLocal();
+  withLocalSession(local, { provider: 'openai', model: 'gpt-image-2' });
+  const result = await run('send', { ...SEND, relay: 'this', images: [IMAGE_PATHS[0]], image: { ...IMAGE_OPTIONS } });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(local.callsTo('GET', '/api/relay/identity').length, 0);
+  const [post] = local.callsTo('POST', '/api/message');
+  assert.deepEqual(post.body.imagePaths, [IMAGE_PATHS[0]]);
+  assert.deepEqual(post.body.image, IMAGE_OPTIONS);
+});
+
+test('a target that attaches fewer images than were sent, or does not say, is named in a note', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  remote.imagesAttached = 1;
+  const fewer = await run('send', { ...SEND, images: [...IMAGE_PATHS] });
+  assert.equal(fewer.status, 200);
+  assert.equal(fewer.body.status, 'queued', 'the prompt is queued: no failure after the fact');
+  assert.match(fewer.body.note, /Relay "linux-test" attached 1 of 2 images; the turn may run without them\./);
+
+  remote.imagesAttached = undefined;
+  const silent = await run('send', { ...SEND, images: [IMAGE_PATHS[0]] });
+  assert.match(silent.body.note, /did not confirm that it attached the image; the turn may run without them\./);
+
+  // image options alone: nothing to count.
+  const optionsOnly = await run('send', { ...SEND, image: { quality: 'low' } });
+  assert.equal(optionsOnly.body.note, undefined);
+});
+
+test('the target\'s IMAGE_INPUT_REFUSED is an invalid input with its words; create_session names the session it made', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  listsImageModel(remote);
+  withSession(remote, { provider: 'claude', model: 'claude-sonnet-5' });
+  const original = remote.request;
+  remote.request = async (relay, method, path, options = {}) => {
+    if (method === 'POST' && path === '/api/message' && options.body?.imagePaths) {
+      remote.calls.push({ relay: relay.name, method, path, body: options.body });
+      throw imageInputRefusal(relay, 'claude-sonnet-5 makes no images; images go to an OpenAI image session.');
+    }
+    return original(relay, method, path, options);
+  };
+  const sent = await run('send', { ...SEND, images: [IMAGE_PATHS[0]] });
+  assert.equal(sent.status, 400);
+  assert.equal(sent.body.code, CODES.invalidInput);
+  assert.equal(sent.body.remoteCode, 'IMAGE_INPUT_REFUSED');
+  assert.equal(sent.body.error, 'Relay "linux-test" refused the images or image options: claude-sonnet-5 makes no images; images go to an OpenAI image session. Nothing was sent.');
+  assert.equal(remote.callsTo('POST', '/api/message').length, 1, 'a refusal is not replayed');
+
+  const created = await run('create_session', { ...CREATE, provider: 'openai', images: [IMAGE_PATHS[1]] });
+  assert.equal(created.status, 400);
+  assert.equal(created.body.code, CODES.invalidInput);
+  assert.equal(created.body.session, 'conv-new-2');
+  assert.equal(created.body.remoteCode, 'IMAGE_INPUT_REFUSED');
+  assert.match(created.body.error, /refused the images or image options of the first prompt: claude-sonnet-5 makes no images.*\. The session conv-new-2 was created, but the prompt was not queued\.$/);
+  assert.match(created.body.note, /do not create another session/);
+});
+
+test('create_session with images for a session that makes no images is refused before the bootstrap', async () => {
+  // The provider left out is this session's (Claude here).
+  const fromCaller = setup({ caller: { provider: 'claude', model: 'claude-sonnet-5' } });
+  takesImages(fromCaller.remote);
+  const own = await fromCaller.run('create_session', { ...CREATE, images: [IMAGE_PATHS[0]] });
+  assert.equal(own.status, 400, JSON.stringify(own.body));
+  assert.equal(own.body.code, CODES.invalidInput);
+  assert.equal(own.body.remoteCode, 'IMAGE_INPUT_REFUSED');
+  assert.match(own.body.error, /^images and image go to an OpenAI image session .*this one would run claude claude-sonnet-5\. .*No session was created\.$/);
+  assert.equal(own.body.session, undefined);
+  assert.equal(fromCaller.remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(fromCaller.remote.callsTo('POST', '/api/message').length, 0);
+
+  // OpenAI with a chat model named.
+  const chat = setup({ caller: { provider: 'openai', model: 'gpt-4o' } });
+  takesImages(chat.remote);
+  listsImageModel(chat.remote, 'gpt-4o');
+  listsImageModel(chat.remote, 'gpt-image-2');
+  const named = await chat.run('create_session', { ...CREATE, provider: 'openai', model: 'gpt-4o', image: { size: '1024x1024' } });
+  assert.equal(named.status, 400, JSON.stringify(named.body));
+  assert.match(named.body.error, /this one would run openai gpt-4o\. .*No session was created\.$/);
+  assert.equal(chat.remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+});
+
+test('relay_info says whether the relay takes images and image', async () => {
+  const { run, remote } = setup();
+  assert.equal((await run('relay_info', { relay: 'linux-test' })).body.imageInputs, false);
+  takesImages(remote);
+  assert.equal((await run('relay_info', { relay: 'linux-test' })).body.imageInputs, true);
+  assert.equal((await setupLocal().run('relay_info', { relay: 'this' })).body.imageInputs, true);
+});
+
+test('update_session passes image defaults on and its summary names their values', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { origin: AGENT_ORIGIN, provider: 'openai', model: 'gpt-image-2' });
+  const result = await run('update_session', { relay: 'linux-test', session: 'conv-1', image: { ...IMAGE_OPTIONS } });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const [dry] = remote.callsTo('PATCH', '/api/conversation/conv-1/settings');
+  assert.deepEqual(dry.body.settings, { image: IMAGE_OPTIONS });
+  assert.equal(result.body.summary, 'update_session → linux-test session conv-1: image {size 1536x1024, quality low}');
+});
+
+// ─── Image replies ───────────────────────────────────────────────────────────
+
+function generatedImage(index, { path = `/home/dev/state/sdk-1/generated-images/conv-1/reply-img/img-0${index}.png`, width = 1536, height = 1024, type = 'image/png' } = {}) {
+  return {
+    name: `generated-image-${index}.png`,
+    type,
+    size: 2048,
+    ...(width ? { width, height } : {}),
+    generatedImage: {
+      imageId: `img-0${index}`,
+      messageId: 'reply-img',
+      conversationId: 'conv-1',
+      sessionId: 'sdk-1',
+      relativePath: `conv-1/reply-img/img-0${index}.png`,
+      ...(path ? { path } : {}),
+    },
+  };
+}
+
+test('a reply lists the images it made; an empty text becomes the line on them, a written one stays', () => {
+  const settled = settleRemoteReply([
+    { id: 'reply-img', role: 'assistant', text: '', model: 'gpt-image-2', sourceMessageId: 'm-1', attachments: [generatedImage(1), generatedImage(2)] },
+  ], 'm-1');
+  assert.equal(settled.status, 'done');
+  assert.equal(settled.reply.text, '2 images · 1536x1024 · gpt-image-2');
+  assert.deepEqual(settled.reply.images, [
+    { path: '/home/dev/state/sdk-1/generated-images/conv-1/reply-img/img-01.png', width: 1536, height: 1024, mime: 'image/png' },
+    { path: '/home/dev/state/sdk-1/generated-images/conv-1/reply-img/img-02.png', width: 1536, height: 1024, mime: 'image/png' },
+  ]);
+
+  const written = settleRemoteReply([
+    { id: 'reply-img', role: 'assistant', text: 'Here is the poster.', model: 'gpt-image-2', sourceMessageId: 'm-1', attachments: [generatedImage(1)] },
+  ], 'm-1');
+  assert.equal(written.reply.text, 'Here is the poster.');
+  assert.equal(written.reply.images.length, 1);
+
+  // An older relay gives no path: no images list, the line still says what was made.
+  const older = settleRemoteReply([
+    { id: 'reply-img', role: 'assistant', text: '', model: 'gpt-image-2', sourceMessageId: 'm-1', attachments: [generatedImage(1, { path: '', width: 0 })] },
+  ], 'm-1');
+  assert.equal(older.reply.text, '1 image · gpt-image-2');
+  assert.equal(Object.prototype.hasOwnProperty.call(older.reply, 'images'), false);
+
+  const plain = settleRemoteReply([{ id: 'r', role: 'assistant', text: 'Done.', sourceMessageId: 'm-1' }], 'm-1');
+  assert.equal(Object.prototype.hasOwnProperty.call(plain.reply, 'images'), false);
+
+  // Capped, whatever the target sends.
+  const many = settleRemoteReply([
+    { id: 'reply-img', role: 'assistant', text: '', sourceMessageId: 'm-1', attachments: Array.from({ length: 12 }, (_, index) => generatedImage(index + 1)) },
+  ], 'm-1');
+  assert.equal(many.reply.images.length, 8);
+});
+
+test('send waits for an image reply and returns its images', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  remote.onMessage = (conv, body) => {
+    remote.addMessage('conv-1', { id: 'reply-img', role: 'assistant', text: '', model: 'gpt-image-2', sourceMessageId: body.messageId, attachments: [generatedImage(1)] });
+    conv.activeTurn = false;
+  };
+  const result = await run('send', { ...SEND, wait_seconds: 30, image: { size: '1536x1024' } });
+  assert.equal(result.body.status, 'done', JSON.stringify(result.body));
+  assert.equal(result.body.reply.text, '1 image · 1536x1024 · gpt-image-2');
+  assert.equal(result.body.reply.images[0].path, '/home/dev/state/sdk-1/generated-images/conv-1/reply-img/img-01.png');
+});
+
+test('read_session lists each message\'s images and names the session\'s model in the line of an older one', async () => {
+  const { run, remote } = setup();
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  remote.addMessage('conv-1', { id: 'm-draw', role: 'user', text: 'Draw a lighthouse' });
+  remote.addMessage('conv-1', { id: 'reply-img', role: 'assistant', text: '', sourceMessageId: 'm-draw', attachments: [generatedImage(1, { width: 1024, height: 1024 })] });
+  remote.addMessage('conv-1', { id: 'm-again', role: 'user', text: 'Once more, wider' });
+  remote.addMessage('conv-1', { id: 'reply-img-2', role: 'assistant', text: 'Wider version.', model: 'gpt-image-2', sourceMessageId: 'm-again', attachments: [generatedImage(2)] });
+  const result = await run('read_session', { relay: 'linux-test', session: 'conv-1', last: 4 });
+  assert.equal(result.status, 200);
+  const [, first, , second] = result.body.messages;
+  assert.equal(first.text, '1 image · 1024x1024 · gpt-image-2', 'the session\'s model when the message names none');
+  assert.deepEqual(first.images, [{ path: '/home/dev/state/sdk-1/generated-images/conv-1/reply-img/img-01.png', width: 1024, height: 1024, mime: 'image/png' }]);
+  assert.equal(second.text, 'Wider version.');
+  assert.equal(second.images.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(result.body.messages[0], 'images'), false, 'a user message lists none');
+});
+
+// ─── image presets and the daily cap of image spend ──────────────────────────
+
+// The spend state and presets routes of a target; `usage` / `presets`: the
+// JSON, an Error, or undefined for a target without the route (404).
+function withImageSpendRoutes(target, { usage, presets } = {}) {
+  const original = target.request.bind(target);
+  target.request = async (relay, method, path, options = {}) => {
+    for (const [route, answer] of [['/api/image-usage', usage], ['/api/openai-image-presets', presets]]) {
+      if (method !== 'GET' || path !== route) continue;
+      target.calls.push({ relay: relay.name, method, path });
+      if (answer === undefined) throw remoteError(CODES.notFound, `Relay "${relay.name}": not found`, 404);
+      if (answer instanceof Error) throw answer;
+      return answer;
+    }
+    return original(relay, method, path, options);
+  };
+}
+
+const SPEND_STATE = Object.freeze({
+  day: '2026-09-20',
+  capUsd: 5,
+  spentUsd: 4.1,
+  reservedUsd: 0.2,
+  estimatedUsd: 0.3,
+  unknownPriceUsd: 0,
+  monthUsd: 31.75,
+  ratio: 0.86,
+  warning: true,
+  reached: false,
+  allowedToday: false,
+  allowedAt: null,
+});
+const REACHED = Object.freeze({ ...SPEND_STATE, spentUsd: 5.2, reservedUsd: 0, ratio: 1.04, reached: true });
+
+test('relay_info lists the target\'s image presets; a target without them lists none', async () => {
+  const { run, remote } = setup();
+  withImageSpendRoutes(remote, {
+    presets: {
+      presets: [
+        { name: 'Wallpaper 4K', size: '3840x2160', quality: 'high', builtIn: true },
+        { name: 'Lantern sketches', size: '1024x1536', quality: 'low', count: 2, secret: 'x', builtIn: false },
+        { name: '', size: '1024x1024' },
+      ],
+    },
+  });
+  const info = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(info.status, 200, JSON.stringify(info.body));
+  assert.deepEqual(info.body.imagePresets, [
+    { name: 'Wallpaper 4K', size: '3840x2160', quality: 'high', builtIn: true },
+    { name: 'Lantern sketches', size: '1024x1536', quality: 'low', count: 2, builtIn: false },
+  ]);
+
+  const older = setup();
+  const plain = await older.run('relay_info', { relay: 'linux-test' });
+  assert.equal(plain.status, 200);
+  assert.equal(Object.prototype.hasOwnProperty.call(plain.body, 'imagePresets'), false);
+});
+
+test('send passes image.preset on; the target resolves it', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  const result = await run('send', { ...SEND, image: { preset: 'Wallpaper 4K', quality: 'medium' } });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.deepEqual(remote.callsTo('POST', '/api/message')[0].body.image, { quality: 'medium', preset: 'Wallpaper 4K' });
+});
+
+test('create_session of an image session is refused before the bootstrap while the target\'s cap is reached', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  listsImageModel(remote);
+  withImageSpendRoutes(remote, { usage: REACHED });
+  const refused = await run('create_session', { ...CREATE, provider: 'openai', image: { preset: 'Wallpaper 4K' } });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, CODES.providerUnavailable);
+  assert.equal(refused.body.remoteCode, 'OPENAI_IMAGE_DAILY_CAP_REACHED');
+  assert.equal(refused.body.error, 'Relay "linux-test" has reached its daily cap of OpenAI image spend: USD 5.20 today of USD 5.00. No session was created.');
+  assert.match(refused.body.note, /allow more for today/);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(remote.callsTo('POST', '/api/message').length, 0);
+
+  // A model named outright is checked the same way, images or not.
+  const named = await run('create_session', { ...CREATE, provider: 'openai', model: 'gpt-image-2' });
+  assert.equal(named.status, 409);
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+});
+
+test('create_session goes on when the owner allowed today, below the cap, without the route, or when the state cannot be read', async () => {
+  for (const usage of [
+    { ...REACHED, allowedToday: true, allowedAt: '2026-09-20T09:00:00.000Z' },
+    SPEND_STATE,
+    undefined,
+    remoteError(`${CODES.httpPrefix}500`, 'Relay "linux-test" answered HTTP 500', 500, { error: 'database is locked' }),
+  ]) {
+    const { run, remote } = setup();
+    takesImages(remote);
+    listsImageModel(remote);
+    withImageSpendRoutes(remote, { usage });
+    const created = await run('create_session', { ...CREATE, provider: 'openai', image: { count: 1 } });
+    assert.equal(created.status, 200, JSON.stringify({ usage, body: created.body }));
+    assert.equal(remote.callsTo('GET', '/api/image-usage').length, 1);
+    assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 1);
+  }
+  // A session that is no image session is never checked.
+  const { run, remote } = setup();
+  withImageSpendRoutes(remote, { usage: REACHED });
+  assert.equal((await run('create_session', CREATE)).status, 200);
+  assert.equal(remote.callsTo('GET', '/api/image-usage').length, 0);
+});
+
+function capRefusal(relay, error) {
+  return remoteError(`${CODES.httpPrefix}409`, `Relay "${relay}" answered HTTP 409: ${error}`, 409, {
+    ok: false, code: 'OPENAI_IMAGE_DAILY_CAP_REACHED', error,
+  });
+}
+
+test('a send the target\'s cap refuses comes back with its words and that nothing was sent', async () => {
+  const { run, remote } = setup();
+  takesImages(remote);
+  withSession(remote, { provider: 'openai', model: 'gpt-image-2' });
+  remote.fail('POST', '/api/message', capRefusal('linux-test', 'Today\'s estimated OpenAI image spend on relay "linux-test", USD 4.62, and this turn\'s estimate, USD 0.50, would pass the daily cap of USD 5.00.'));
+  const refused = await run('send', { ...SEND, image: { preset: 'Sticker' } });
+  assert.equal(refused.status, 409, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, CODES.providerUnavailable);
+  assert.equal(refused.body.remoteCode, 'OPENAI_IMAGE_DAILY_CAP_REACHED');
+  assert.equal(refused.body.error, 'Relay "linux-test" refused the image turn: Today\'s estimated OpenAI image spend on relay "linux-test", USD 4.62, and this turn\'s estimate, USD 0.50, would pass the daily cap of USD 5.00. Nothing was sent.');
+  assert.equal(refused.body.session, 'conv-1');
+  assert.equal(remote.callsTo('POST', '/api/message').length, 1, 'a refusal is not replayed');
+
+  // Words that already say so are not repeated.
+  remote.fail('POST', '/api/message', capRefusal('linux-test', 'The daily cap of USD 5.00 is reached. Nothing was sent. Ask the user.'));
+  const worded = await run('send', SEND);
+  assert.equal(worded.body.error, 'Relay "linux-test" refused the image turn: The daily cap of USD 5.00 is reached. Nothing was sent. Ask the user.');
+});
+
+test('usage adds the target\'s OpenAI images against its daily cap, in place of the card', async () => {
+  const { run, remote } = setup();
+  const imageCard = { provider: 'openai', label: 'OpenAI images', status: 'ok', meters: [{ label: 'Daily cap', unit: 'usd', used: 4.3, allowance: 5 }] };
+  withUsageRoutes(remote, { usage: { providers: [...USAGE_REPORT.providers, imageCard] } });
+  withImageSpendRoutes(remote, { usage: SPEND_STATE });
+  const result = await run('usage', { relay: 'spare-test' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.deepEqual(result.body.openaiImages, {
+    label: 'OpenAI images',
+    day: '2026-09-20',
+    usedUsd: 4.3,
+    capUsd: 5,
+    remainingUsd: 0.7,
+    monthUsd: 31.75,
+    warning: true,
+    reached: false,
+    allowedToday: false,
+    text: 'today USD 4.30 of the daily cap of USD 5.00 (86 %), USD 0.70 left',
+  });
+  assert.deepEqual(result.body.providers.map((card) => card.provider), ['cursor', 'grok', 'claude'], 'not twice');
+  assert.match(result.body.summary, /; OpenAI images today USD 4\.30 of the daily cap of USD 5\.00 \(86 %\), USD 0\.70 left$/);
+
+  withImageSpendRoutes(remote, { usage: { ...REACHED, allowedToday: true } });
+  const allowed = await run('usage', { relay: 'spare-test' });
+  assert.match(allowed.body.openaiImages.text, /past the cap, allowed for today by the owner$/);
+  withImageSpendRoutes(remote, { usage: { ...SPEND_STATE, capUsd: null, ratio: null, warning: false } });
+  const uncapped = await run('usage', { relay: 'spare-test' });
+  assert.equal(uncapped.body.openaiImages.capUsd, null);
+  assert.equal(uncapped.body.openaiImages.remainingUsd, null);
+  assert.equal(uncapped.body.openaiImages.text, 'today USD 4.30, no daily cap');
+});
+
+test('usage of a target without the image spend route has no entry; a failed read says so', async () => {
+  const { run, remote } = setup();
+  withUsageRoutes(remote, { usage: USAGE_REPORT });
+  const older = await run('usage', { relay: 'spare-test' });
+  assert.equal(older.status, 200);
+  assert.equal(Object.prototype.hasOwnProperty.call(older.body, 'openaiImages'), false);
+  assert.doesNotMatch(older.body.note, /OpenAI image spend/);
+  withImageSpendRoutes(remote, { usage: remoteError(`${CODES.httpPrefix}500`, 'Relay answered HTTP 500', 500, { error: 'boom' }) });
+  const failed = await run('usage', { relay: 'spare-test' });
+  assert.equal(Object.prototype.hasOwnProperty.call(failed.body, 'openaiImages'), false);
+  assert.match(failed.body.note, /The OpenAI image spend was not available there\./);
 });

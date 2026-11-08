@@ -13,6 +13,7 @@ function createMockApp() {
     get: register('GET'),
     post: register('POST'),
     patch: register('PATCH'),
+    put: register('PUT'),
     delete: register('DELETE'),
   };
 }

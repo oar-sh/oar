@@ -461,7 +461,7 @@ test('the start-up allowlist is the keys and tables a real start writes, and not
     'push_vapid_public_key',
     'relay_last_exit',
   ]);
-  assert.deepEqual([...STARTUP_TABLES].sort(), ['model_selector_state', 'model_variants', 'relay_restart_orchestrator']);
+  assert.deepEqual([...STARTUP_TABLES].sort(), ['media_index_meta', 'model_selector_state', 'model_variants', 'relay_restart_orchestrator']);
   const dir = tempDir();
   try {
     writeStartupOnlyDatabase(copilot(dir));

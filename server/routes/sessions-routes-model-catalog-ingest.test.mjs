@@ -20,7 +20,7 @@ const CURATED = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'claude-sonnet-4.6'
 function createMockApp() {
   const routes = new Map();
   const register = (method) => (path, ...handlers) => { routes.set(`${method} ${path}`, handlers); };
-  return { routes, get: register('GET'), post: register('POST'), patch: register('PATCH'), delete: register('DELETE') };
+  return { routes, get: register('GET'), post: register('POST'), patch: register('PATCH'), put: register('PUT'), delete: register('DELETE') };
 }
 
 function createHarness() {

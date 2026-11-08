@@ -448,6 +448,11 @@ test('update_session cards: the write card lists the settings; the approval card
     formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'update_session', args: { session: 'conv-abcdef1234', title: 'Docs pass' }, sessionSettings: { session: 'conv-abcdef1234', title: 'sidebar polish' } }),
     'This agent wants to change the settings of sessions on relay "linux-test" that its conversation did not start (yours or other agents\'), first “sidebar polish” (conv-abc).\n\nTitle: “Docs pass”',
   );
+  assert.equal(
+    formatRemoteRelayApprovalPrompt({ relay: RELAY, action: 'update_session', args: { session: 'conv-abcdef1234', image: { size: '1536x1024', quality: 'low', output_format: 'webp' } } }),
+    'Allow the agent to change the settings of a session on relay "linux-test" (session conv-abc)?\n\n'
+      + 'Image defaults: size 1536x1024, quality low, output format webp',
+  );
 
   let card = null;
   const harness = setup({

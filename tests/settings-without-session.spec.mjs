@@ -28,6 +28,7 @@ const RELAY_WIDE_ENTRIES = [
   "chat-menu-pwa-version",
   "chat-menu-queue-status",
   "chat-menu-select-models",
+  "chat-menu-media",
   "chat-menu-settings",
   "chat-menu-about",
   "chat-menu-restart-relay",

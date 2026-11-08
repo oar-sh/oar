@@ -65,6 +65,7 @@ import { refreshClaudeAuthSection } from './claude-auth-ui.js';
 import { refreshGrokAuthSection } from './grok-auth-ui.js';
 import { syncDeepSeekSettingsInputs } from './deepseek-settings-ui.js';
 import { syncClaudeApiSettingsInputs } from './claude-api-settings-ui.js';
+import { applyOpenAIImageSpendSettings, syncOpenAIImageSpendSettings } from './openai-image-cost-ui.js';
 
 export {
   applyDeepSeekSettingsState,
@@ -642,6 +643,8 @@ function setOpenAISettingsControlsDisabled(disabled) {
 
 export function applyOpenAISettingsState(settings = {}, { resetInputs = false } = {}) {
   ensureOpenAISettingsInputTracking();
+  // The daily image cap, when the answer names it (openai-image-cost-ui.js).
+  if (typeof document !== 'undefined') applyOpenAIImageSpendSettings(settings || {});
   openAISettingsState = {
     configured: settings?.configured === true,
     enabled: settings?.configured === true && settings?.enabled === true,
@@ -2120,6 +2123,7 @@ export function openSettingsModal(tab, providerTab) {
   openAISettingsInputsDirty = false;
   ensureOpenAISettingsInputTracking();
   void syncOpenAISettingsInputs();
+  void syncOpenAIImageSpendSettings();
   claudeSettingsInputsDirty = false;
   ensureClaudeSettingsInputTracking();
   void syncClaudeSettingsInputs();

@@ -45,10 +45,12 @@ export const STARTUP_SETTING_KEYS = Object.freeze([
   'model_refresh_last',
 ]);
 // And the tables such a start fills that hold no one's work: the model
-// catalog and its refresh state, the restart orchestrator's one row. (The
-// shadow tables of the message search are left out too: they follow
-// messages.) Any other table with a row makes the start refuse.
-export const STARTUP_TABLES = Object.freeze(['model_variants', 'model_selector_state', 'relay_restart_orchestrator']);
+// catalog and its refresh state, the restart orchestrator's one row, the
+// media index's extractor version (migration 0039; its items and queue
+// follow messages and stay empty without them). (The shadow tables of the
+// message search are left out too: they follow messages.) Any other table
+// with a row makes the start refuse.
+export const STARTUP_TABLES = Object.freeze(['model_variants', 'model_selector_state', 'relay_restart_orchestrator', 'media_index_meta']);
 
 /** A database's files: the main file, its -wal and its -shm. */
 export function sideFiles(name) {

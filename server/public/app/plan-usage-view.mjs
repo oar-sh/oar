@@ -9,6 +9,13 @@
  */
 
 import { escapeHtml } from './context-usage-view.mjs';
+import {
+  imageUsageBadgesHtml,
+  imageUsageCardFacts,
+  imageUsageCardMessage,
+  normalizeImageSpendState,
+  renderImageUsageMeterHtml,
+} from './openai-image-spend.mjs';
 
 // Null-prototype so an unrecognized `status`/`source` can only ever miss —
 // a plain literal would resolve keys like `constructor` off the prototype and
@@ -45,6 +52,8 @@ const PROVIDER_ALIASES = Object.freeze(Object.assign(Object.create(null), {
   copilot: 'github',
   'github-copilot': 'github',
   'copilot-github': 'github',
+  // An image chat's provider: its spend is the 'openai' card's.
+  'openai-image': 'openai',
 }));
 
 /** @returns {string} the canonical usage-card id for a provider spelling. */
@@ -383,15 +392,28 @@ function renderAccountLine(account) {
   return `<span class="plan-usage-account">${parts.map(escapeHtml).join(' · ')}</span>`;
 }
 
+// The figures of the OpenAI images card the spend state draws (the relay's
+// own ones of the same things give way).
+const IMAGE_SPEND_FACT_IDS = new Set(['openai-images-today', 'openai-images-month', 'openai-images-override']);
+
 function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
-  const meters = Array.isArray(card.meters) ? card.meters : [];
+  // OpenAI images: the spend state (`imageSpend`, live from the socket
+  // event too) draws the meter with the cap's 80 % mark, the figures, the
+  // badges and the message, in "USD 1.23".
+  const imageSpend = card.imageSpend ? normalizeImageSpendState(card.imageSpend) : null;
+  const meters = (Array.isArray(card.meters) ? card.meters : [])
+    .filter((meter) => !imageSpend || meter?.id !== 'openai-images-daily-cap');
   const charts = Array.isArray(card.charts) ? card.charts.filter(Boolean) : [];
   const details = Array.isArray(card.details) ? card.details : [];
-  const allNotes = Array.isArray(card.notes) ? card.notes.filter(Boolean) : [];
+  const allNotes = (Array.isArray(card.notes) ? card.notes.filter(Boolean) : [])
+    .filter((note) => !imageSpend || !IMAGE_SPEND_FACT_IDS.has(note?.id));
   // Figures go in one list under the bars; sentences stay notes, and on a
   // card with figures they come last, after the tables, so the numbers read
   // first.
-  const facts = allNotes.filter(isFactNote);
+  const facts = [
+    ...(imageSpend ? imageUsageCardFacts(imageSpend) : []),
+    ...allNotes.filter(isFactNote),
+  ];
   const notes = allNotes.filter((note) => !isFactNote(note));
   const notesHtml = notes.map((note) => renderNote(note, { now, timeZone })).join('');
   const detailsHtml = details.map(renderDetailSection).join('');
@@ -400,6 +422,7 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
   const statusBadge = STATUS_BADGES[card.status];
   const sourceBadge = SOURCE_LABELS[card.source];
   const badges = [
+    imageSpend ? imageUsageBadgesHtml(imageSpend) : '',
     card.planName ? `<span class="plan-usage-badge plan-usage-badge-plan">${escapeHtml(card.planName)}</span>` : '',
     statusBadge ? `<span class="plan-usage-badge plan-usage-badge-status">${escapeHtml(statusBadge)}</span>` : '',
     sourceBadge ? `<span class="plan-usage-badge">${escapeHtml(sourceBadge)}</span>` : '',
@@ -408,13 +431,14 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
   const primary = meters.filter((meter) => meter.emphasis !== 'secondary');
   const secondary = meters.filter((meter) => meter.emphasis === 'secondary');
 
-  const metersHtml = meters.length
+  const metersHtml = `${imageSpend ? renderImageUsageMeterHtml(imageSpend) : ''}${meters.length
     ? `${primary.map((meter) => renderMeter(meter, now)).join('')}${
       secondary.length
         ? `<div class="plan-usage-secondary">${secondary.map((meter) => renderMeter(meter, now)).join('')}</div>`
         : ''
     }`
-    : '';
+    : ''}`;
+  const message = imageSpend ? imageUsageCardMessage(imageSpend) : card.message;
 
   const capturedLabel = card.capturedAt
     ? `Updated ${escapeHtml(String(card.capturedAt).replace('T', ' ').slice(0, 16))} UTC`
@@ -430,7 +454,7 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
         </span>
         <span class="plan-usage-badges">${badges}</span>
       </header>
-      ${card.message ? `<div class="plan-usage-message">${escapeHtml(card.message)}</div>` : ''}
+      ${message ? `<div class="plan-usage-message">${escapeHtml(message)}</div>` : ''}
       ${metersHtml}
       ${facts.length ? `<dl class="plan-usage-facts">${facts.map(renderFact).join('')}</dl>` : ''}
       ${charts.map(renderChart).join('')}
@@ -441,6 +465,14 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
       </div>
     </section>
   `;
+}
+
+/**
+ * One card alone, for a live redraw in the open modal (the OpenAI images
+ * card on a new spend state).
+ */
+export function renderPlanUsageCardHtml(card, { now = new Date(), active = true, timeZone = undefined } = {}) {
+  return card ? renderCard(card, now, { active, timeZone }) : '';
 }
 
 function renderTab(card, activeProvider) {

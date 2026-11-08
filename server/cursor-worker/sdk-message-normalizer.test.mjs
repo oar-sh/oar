@@ -7,6 +7,7 @@ import {
   shouldEmitStreamUpdate,
   summarizeToolInput,
 } from './sdk-message-normalizer.mjs';
+import { MAX_THOUGHT_CHARS } from '../../shared/thought-cap.mjs';
 
 function delta(update) {
   return { source: 'delta', update };
@@ -76,13 +77,15 @@ test('thinking deltas coalesce into one thought with a stable reasoningId', () =
   assert.equal(reasoningId, 'cursor-thought-main-0-0');
   assert.deepEqual(first[0].payload, { reasoningId, text: 'ponder', done: false, subagentRunId: null });
 
-  const second = normalizer.normalize(delta({ type: 'thinking-delta', text: 'ing more' }));
+  // Gated as stream text: a short delta without a boundary waits.
+  assert.deepEqual(normalizer.normalize(delta({ type: 'thinking-delta', text: 'ing more' })), []);
+  const second = normalizer.normalize(delta({ type: 'thinking-delta', text: '.' }));
   assert.equal(second[0].payload.reasoningId, reasoningId);
-  assert.equal(second[0].payload.text, 'pondering more');
+  assert.equal(second[0].payload.text, 'pondering more.');
 
   const done = normalizer.normalize(delta({ type: 'thinking-completed', thinkingDurationMs: 1200 }));
   assert.equal(done.length, 1);
-  assert.deepEqual(done[0].payload, { reasoningId, text: 'pondering more', done: true, subagentRunId: null });
+  assert.deepEqual(done[0].payload, { reasoningId, text: 'pondering more.', done: true, subagentRunId: null });
 
   // The next delta opens a new thought with a distinct id.
   const next = normalizer.normalize(delta({ type: 'thinking-delta', text: 'fresh thought' }));
@@ -286,8 +289,11 @@ test('thought text is capped at 16KiB per thought', () => {
   const normalizer = createSdkMessageNormalizer();
   const first = normalizer.normalize(delta({ type: 'thinking-delta', text: 'y'.repeat(20 * 1024) }));
   assert.equal(first[0].payload.text.length, 16 * 1024);
+  // Past the cap the text no longer changes, so no update goes out.
   const second = normalizer.normalize(delta({ type: 'thinking-delta', text: 'overflow' }));
-  assert.equal(second[0].payload.text.length, 16 * 1024);
+  assert.deepEqual(second, []);
+  const done = normalizer.normalize(delta({ type: 'thinking-completed' }));
+  assert.equal(done[0].payload.text.length, 16 * 1024);
 });
 
 test('a relay_tool custom-tool call reads as its action and target', () => {
@@ -415,4 +421,35 @@ test('tool-call-delta frames attribute subagent text and thinking to their run',
   assert.match(finalStream.payload.text, /PING.*ok/s);
   // The main thread's accumulators are untouched by subagent frames.
   assert.equal(normalizer.finalStreamText(), '');
+});
+
+test('a long thought streamed one token at a time is gated and stops at the cap', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const run = (wrap) => {
+    let interim = 0;
+    let afterCap = 0;
+    for (let i = 0; i < 2 * MAX_THOUGHT_CHARS; i += 1) {
+      const out = normalizer.normalize(wrap({ type: 'thinking-delta', text: '考' }));
+      interim += out.length;
+      if (i >= MAX_THOUGHT_CHARS) afterCap += out.length;
+    }
+    assert.ok(interim <= Math.ceil(MAX_THOUGHT_CHARS / 24) + 1, `${interim} interim thoughts`);
+    assert.equal(afterCap, 0, 'no update once the capped text stops changing');
+    const done = normalizer.normalize(wrap({ type: 'thinking-completed' }));
+    assert.equal(done[0].payload.done, true);
+    assert.equal(done[0].payload.text.length, MAX_THOUGHT_CHARS);
+  };
+  run((update) => delta(update));
+  // A subagent's thought, nested in its task tool call.
+  run((taskUpdate) => delta({ type: 'tool-call-delta', callId: 'toolu_flood_run', taskUpdate }));
+});
+
+test('a thought the turn left open sends its held-back tail when the turn ends', () => {
+  const normalizer = createSdkMessageNormalizer();
+  normalizer.normalize(delta({ type: 'thinking-delta', text: 'Weighing' }));
+  assert.deepEqual(normalizer.normalize(delta({ type: 'thinking-delta', text: ' it' })), []);
+  const ended = normalizer.normalize(delta({ type: 'turn-ended' }));
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0].payload.text, 'Weighing it');
+  assert.deepEqual(normalizer.normalize(delta({ type: 'turn-ended' })), []);
 });

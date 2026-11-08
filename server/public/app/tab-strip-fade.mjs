@@ -6,7 +6,7 @@
 
 import { FONT_SCALE_CHANGE_EVENT } from './font-scaling.js';
 
-export const TAB_STRIP_SELECTOR = '.settings-tab-strip, .plan-usage-tab-strip';
+export const TAB_STRIP_SELECTOR = '.settings-tab-strip, .plan-usage-tab-strip, .context-tab-strip, .media-gallery-tabs, .media-gallery-chips';
 
 // Sub-pixel scroll ends (a zoomed page) count as the end.
 const EDGE_SLACK_PX = 1;

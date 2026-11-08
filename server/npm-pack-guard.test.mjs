@@ -52,7 +52,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // queue wake hook) to 610. 640 leaves room for the 0.9.22 work. 660 until
 // 2026-11-07; the agent SDKs installed on demand (their pins folders, the
 // store, the loader and the Settings rows) took it to 630 and beyond.
-const MAX_ENTRIES = 660;
+// 680 since 2026-11-08: image previews took it to 663 (the image stream
+// reader and the preview turns on the server, shared/openai-image-previews,
+// the composer's image module and controls and the placeholder in the
+// client); the image cost and presets work that follows adds about eight
+// (the price table, the spend contract, the presets, their services and
+// client parts).
+const MAX_ENTRIES = 680;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -76,8 +82,10 @@ const MAX_ENTRIES = 660;
 // leaves room for the fixes that follow; the pins folders of the agent SDKs
 // installed on demand (three lockfiles, about 70 KB) take a part of it. The
 // SDKs themselves left the install, which is far smaller for it: this ceiling
-// counts only OAR's own files.
-const MAX_UNPACKED_BYTES = 10 * 1024 * 1024;
+// counts only OAR's own files. 10.5 MiB since 2026-11-08: the image work
+// (agent images, previews, and next the cost and presets) took it to
+// 10,528,735 with previews; about 150 KB more is expected for the cost part.
+const MAX_UNPACKED_BYTES = 10.5 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },
@@ -85,6 +93,7 @@ const FORBIDDEN = [
   { name: 'env file', pattern: /(^|\/)\.env/ },
   { name: 'test file', pattern: /\.(test|spec)\.mjs$/ },
   { name: 'test harness', pattern: /-test-harness\.mjs$/ },
+  { name: 'test fixture module', pattern: /-test-fixtures\.mjs$/ },
   { name: 'test fixture', pattern: /(^|\/)fixtures\// },
   { name: 'server data', pattern: /^server\/(data|logs|backups)\// },
   { name: 'upload payload', pattern: /^server\/uploads\/(?!README\.md$)./ },

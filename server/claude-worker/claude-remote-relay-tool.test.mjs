@@ -517,3 +517,26 @@ test('an injected gate decides without asking the relay', async () => {
   assert.equal(stub.calls.some((call) => call.routePath === '/api/remote-relays/summary'), false);
   await settled(runner);
 });
+
+test('the zod mirror takes images as a list or one path, and the image enums of the JSON schema', () => {
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', images: ['/home/dev/a.png', '/home/dev/b.png'] }).success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', images: '/home/dev/a.png' }).success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', images: 7 }).success, false);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', image: { size: '1024x1024', output_format: 'webp', background: 'transparent' } }).success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', image: { output_format: 'gif' } }).success, false);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', image: { background: 'clear' } }).success, false);
+  const image = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.image.properties;
+  for (const key of ['output_format', 'background']) {
+    for (const value of image[key].enum) {
+      assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.image.safeParse({ [key]: value }).success, true, `${key} ${value}`);
+    }
+  }
+});
+
+test('the zod mirror takes image.preset as text, its description from the contract', () => {
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', image: { preset: 'Wallpaper 4K', quality: 'medium' } }).success, true);
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SCHEMA.safeParse({ action: 'send', image: { preset: 4 } }).success, false);
+  const image = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.image.properties;
+  assert.deepEqual(Object.keys(REMOTE_RELAY_TOOL_ZOD_SHAPE.image.unwrap().shape), Object.keys(image), 'every image field mirrored, in order');
+  assert.equal(REMOTE_RELAY_TOOL_ZOD_SHAPE.image.unwrap().shape.preset.description, image.preset.description);
+});

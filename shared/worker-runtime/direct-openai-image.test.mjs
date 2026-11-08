@@ -4,7 +4,6 @@ import assert from 'node:assert/strict';
 import {
   DIRECT_IMAGE_OUTCOMES,
   OPENAI_IMAGE_TERMINAL_CODE,
-  isDirectOpenAIImageTerminalStatus,
   isOpenAIImageTerminalError,
   runDirectOpenAIImageTurn,
   shouldUseDirectOpenAIImageApi,
@@ -54,11 +53,6 @@ test('only OpenAI image models take the direct path', () => {
   assert.equal(shouldUseDirectOpenAIImageApi(), false);
 });
 
-test('the provider statuses that fail an image request outright', () => {
-  for (const status of [400, 401, 403, 404, 409, 422, 429, 503]) assert.equal(isDirectOpenAIImageTerminalStatus(status), true, status);
-  for (const status of [500, 502, 504, undefined, 'x']) assert.equal(isDirectOpenAIImageTerminalStatus(status), false, String(status));
-});
-
 test('an image operation reports the outcome the execute route answered', async () => {
   for (const outcome of DIRECT_IMAGE_OUTCOMES) {
     const api = recordingApi({ '/api/image-operations/img_op_7/execute': { ok: true, outcome } });
@@ -67,7 +61,7 @@ test('an image operation reports the outcome the execute route answered', async 
       message: { ...message, imageOperationId: 'img_op_7' },
       requestOptions: { longCall: true },
     });
-    assert.deepEqual(result, { via: 'operation', outcome });
+    assert.deepEqual(result, { via: 'operation', outcome, usage: null });
     assert.equal(api.calls.length, 1);
     assert.deepEqual(api.calls[0].body, { messageId: 'q-7' });
     assert.deepEqual(api.calls[0].options, { longCall: true });
@@ -102,11 +96,13 @@ test('an image operation that fails otherwise or answers an unknown outcome thro
   );
 });
 
-test('the direct path generates, then publishes the images with the caller fields', async () => {
+test('the direct path generates, then publishes the images with the caller fields and the usage', async () => {
+  const usage = { input_tokens: 12, output_tokens: 4160, total_tokens: 4172 };
   const api = recordingApi({
     '/api/openai/images/generate': {
       model: 'gpt-image-1',
       generatedImages: [{ data: 'aGVsbG8=', mimeType: 'image/png', name: 'a' }, { data: 'aGk=', mimeType: 'image/png', name: 'b' }],
+      usage,
     },
   });
   const result = await runDirectOpenAIImageTurn({
@@ -114,7 +110,7 @@ test('the direct path generates, then publishes the images with the caller field
     message: { ...message, reasoningEffort: 'medium', contextTier: '1536x1024' },
     responseFields: { attemptId: 'attempt-7' },
   });
-  assert.deepEqual(result, { via: 'direct', outcome: 'completed', imageCount: 2, model: 'gpt-image-1' });
+  assert.deepEqual(result, { via: 'direct', outcome: 'completed', imageCount: 2, model: 'gpt-image-1', usage });
   assert.deepEqual(api.calls.map((c) => c.routePath), ['/api/activity', '/api/openai/images/generate', '/api/response']);
   const generate = api.bodyOf('/api/openai/images/generate');
   assert.equal(generate.quality, 'medium');
@@ -124,39 +120,118 @@ test('the direct path generates, then publishes the images with the caller field
   assert.equal(response.generatedImages.length, 2);
   assert.equal(response.modelOrigin, 'manual');
   assert.equal(response.attemptId, 'attempt-7');
+  assert.deepEqual(response.imageUsage, usage);
+  assert.equal('imageNote' in response, false);
 });
 
-test('a provider refusal on the direct path is a terminal image error; anything else is not', async () => {
-  const refused = recordingApi({ '/api/openai/images/generate': () => { throw httpError(400, { error: 'Invalid image size' }); } });
+test('the relay\'s note on a second try goes with the published images', async () => {
+  const note = 'The connection to OpenAI broke off on the first try; it was sent once more and the first try may have been billed as well.';
+  const api = recordingApi({
+    '/api/openai/images/generate': {
+      model: 'gpt-image-1',
+      generatedImages: [{ data: 'aGVsbG8=', mimeType: 'image/png', name: 'a' }],
+      note,
+    },
+  });
+  await runDirectOpenAIImageTurn({ api, message });
+  assert.equal(api.bodyOf('/api/response').imageNote, note);
+});
+
+test('the direct path sends the turn\'s image options over the composer\'s fields', async () => {
+  const api = recordingApi({ '/api/openai/images/generate': { generatedImages: [{ data: 'aGk=' }] } });
+  await runDirectOpenAIImageTurn({
+    api,
+    message: {
+      ...message,
+      quality: 'low',
+      size: '1024x1024',
+      imageOptions: { size: '1536x1024', quality: 'high', count: 2, output_format: 'webp', background: 'transparent' },
+    },
+  });
+  const generate = api.bodyOf('/api/openai/images/generate');
+  assert.equal(generate.size, '1536x1024');
+  assert.equal(generate.quality, 'high');
+  assert.equal(generate.n, 2);
+  assert.equal(generate.output_format, 'webp');
+  assert.equal(generate.background, 'transparent');
+});
+
+test('every failure of the direct request is a terminal image error with the relay\'s note', async () => {
+  const note = 'OpenAI refused the image request (400): Invalid image size.';
+  const refused = recordingApi({
+    '/api/openai/images/generate': () => { throw httpError(400, { error: note, code: 'IMAGE_PROVIDER_REJECTED', outcome: 'terminal' }); },
+  });
   await assert.rejects(
     runDirectOpenAIImageTurn({ api: refused, message }),
     (error) => isOpenAIImageTerminalError(error)
       && error.code === OPENAI_IMAGE_TERMINAL_CODE
-      && error.message === 'OpenAI image request failed: Invalid image size'
+      && error.imageCode === 'image-provider-rejected'
+      && error.message === note
       && error.status === 400,
   );
   assert.equal(refused.calls.some((c) => c.routePath === '/api/response'), false);
 
-  const gateway = recordingApi({ '/api/openai/images/generate': () => { throw httpError(502, { error: 'Bad gateway' }); } });
-  await assert.rejects(runDirectOpenAIImageTurn({ api: gateway, message }), (error) => error.status === 502 && !isOpenAIImageTerminalError(error));
+  // A 5xx the relay already retried once: no requeue either.
+  const gateway = recordingApi({
+    '/api/openai/images/generate': () => {
+      throw httpError(502, { error: 'OpenAI answered 502 (tried twice); the request may have been billed; retry the message.', code: 'IMAGE_PROVIDER_UNAVAILABLE' });
+    },
+  });
+  await assert.rejects(
+    runDirectOpenAIImageTurn({ api: gateway, message }),
+    (error) => isOpenAIImageTerminalError(error) && error.imageCode === 'image-provider-unavailable' && /may have been billed/.test(error.message),
+  );
+  assert.equal(gateway.calls.filter((c) => c.routePath === '/api/openai/images/generate').length, 1);
+
+  // The call to the relay broke off while OpenAI may have been working.
+  const cut = recordingApi({ '/api/openai/images/generate': () => { throw new Error('socket hang up'); } });
+  await assert.rejects(
+    runDirectOpenAIImageTurn({ api: cut, message }),
+    (error) => isOpenAIImageTerminalError(error)
+      && error.message === 'The relay did not finish the image request (socket hang up); the request may have been billed; retry the message.',
+  );
 
   const empty = recordingApi({ '/api/openai/images/generate': { generatedImages: [] } });
-  await assert.rejects(runDirectOpenAIImageTurn({ api: empty, message }), /returned no images/);
+  await assert.rejects(runDirectOpenAIImageTurn({ api: empty, message }), (error) => isOpenAIImageTerminalError(error) && /returned no images/.test(error.message));
 
-  await assert.rejects(runDirectOpenAIImageTurn({ api: recordingApi(), message: { ...message, text: '  ' } }), /missing prompt/);
+  await assert.rejects(
+    runDirectOpenAIImageTurn({ api: recordingApi(), message: { ...message, text: '  ' } }),
+    (error) => isOpenAIImageTerminalError(error) && /missing prompt/.test(error.message),
+  );
 });
 
 test('a reply the relay could not process is a terminal image error on the direct path, not a requeue', async () => {
   const api = recordingApi({
-    '/api/openai/images/generate': () => { throw httpError(502, { error: 'Maximum call stack size exceeded', relayProcessing: true }); },
+    '/api/openai/images/generate': () => {
+      throw httpError(502, {
+        error: 'The relay could not process the image OpenAI returned (Maximum call stack size exceeded). The generation was billed; the message was not retried.',
+        code: 'IMAGE_REPLY_UNPROCESSED',
+        relayProcessing: true,
+      });
+    },
   });
   await assert.rejects(
     () => runDirectOpenAIImageTurn({ api, message }),
     (error) => isOpenAIImageTerminalError(error)
       && error.status === 502
       && error.relayProcessing === true
+      && error.imageCode === 'image-reply-unprocessed'
       && /could not process the image OpenAI returned \(Maximum call stack size exceeded\)/.test(error.message)
       && /The generation was billed; the message was not retried\./.test(error.message),
   );
   assert.equal(api.calls.some((c) => c.routePath === '/api/response'), false);
+});
+
+test('images that cannot be published are a terminal error: the billed request is not run again', async () => {
+  const api = recordingApi({
+    '/api/openai/images/generate': { generatedImages: [{ data: 'aGk=' }] },
+    '/api/response': () => { throw httpError(500, { error: 'disk full' }); },
+  });
+  await assert.rejects(
+    runDirectOpenAIImageTurn({ api, message }),
+    (error) => isOpenAIImageTerminalError(error)
+      && error.imageCode === 'image-finalization-uncertain'
+      && /could not be saved \(disk full\)\. The generation was billed/.test(error.message),
+  );
+  assert.equal(api.calls.filter((c) => c.routePath === '/api/openai/images/generate').length, 1);
 });

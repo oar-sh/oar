@@ -158,7 +158,7 @@ test('GET /api/relay/identity describes this relay', async () => {
     version: '0.9.4',
     platform: 'win32',
     publicUrl: null,
-    remoteRelays: { protocol: 1, inbound: true },
+    remoteRelays: { protocol: 1, inbound: true, imageInputs: true },
   });
 });
 

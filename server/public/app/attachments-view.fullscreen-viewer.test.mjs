@@ -78,7 +78,7 @@ test('a gallery is built from the folder a file was opened from, and stepped by 
   assert.match(step, /return openGalleryItem\(next\.items\[index\], next\);/);
   // An item is opened by what it is: an upload by its address, a file by its path.
   const openItem = functionBody(source, 'openGalleryItem');
-  assert.match(openItem, /if \(source === 'upload'\) \{\s*openUploadedAttachmentViewer\(item\.name, item\.href, item\.mime, \{ gallery \}\);/);
+  assert.match(openItem, /if \(source === 'upload'\) \{\s*openUploadedAttachmentViewer\(item\.name, item\.href, item\.mime, \{ gallery, size: item\.size \}\);/);
   assert.match(openItem, /return open\(item\.path, \{ gallery, viaGallery: true \}\)/);
   // Chat media: attachments carry their address and type for the gallery
   // collector, and the conversation's click handler opens through the gallery.

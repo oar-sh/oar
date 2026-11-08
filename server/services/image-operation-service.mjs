@@ -1,6 +1,7 @@
 'use strict';
 
 import crypto from 'crypto';
+import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import { createImageContextService } from './image-context-service.mjs';
 
 function canonicalJson(value) {
@@ -37,6 +38,9 @@ export function createImageOperationService({
     createdAt = new Date().toISOString(),
   } = {}) {
     const operationId = `img_op_${uuidv4()}`;
+    // The prompt OpenAI gets: an agent's prompt from another relay without
+    // the "[Remote prompt from …]" header the relay put above it.
+    const imagePrompt = stripRemotePromptHeader(String(prompt || '')).trim();
     let imageSessionId;
     let parentNodeId = null;
     let reconstructionMode = executionMode === 'native_responses' ? 'native' : 'image_only';
@@ -78,7 +82,7 @@ export function createImageOperationService({
       queueMessageId,
       kind,
       parentNodeId,
-      prompt: String(prompt || ''),
+      prompt: imagePrompt,
       selectedImageModel,
       orchestrationModel,
       provider: 'openai',
@@ -94,7 +98,7 @@ export function createImageOperationService({
       queueMessageId,
       kind,
       parentNodeId,
-      prompt: String(prompt || ''),
+      prompt: imagePrompt,
       selectedImageModel,
       orchestrationModel,
       provider: 'openai',

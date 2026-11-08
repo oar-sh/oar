@@ -72,6 +72,8 @@ import { applyAgentSdkState } from './agent-sdk-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
 import { applyClaudeUsageLimit, applyConversationBilling, applyUsageLimitPause } from './usage-limit-ui.js';
+import { applyOpenAIImagePresets, applyOpenAIImageSpendState } from './openai-image-cost-ui.js';
+import { OPENAI_IMAGE_PRESETS_EVENT, OPENAI_IMAGE_USAGE_EVENT } from './openai-image-spend.mjs';
 import {
   showThinking,
   removeThinking,
@@ -111,6 +113,12 @@ import { mergeRelayThoughts } from './relay-thoughts.mjs';
 import { conversationPayloadCache } from './conversation-payload-cache.mjs';
 import { planOnlyAfterBroadcast } from './plan-board-shared.mjs';
 import { noteConversationGone } from './session-history-ui.js';
+import { handleImagePreview, handleImagePreviewReset, handleImageStarted } from './image-turn-placeholder.mjs';
+import {
+  OPENAI_IMAGE_PREVIEW_EVENT,
+  OPENAI_IMAGE_PREVIEW_RESET_EVENT,
+  OPENAI_IMAGE_STARTED_EVENT,
+} from './openai-image-composer.mjs';
 
 // A live row of the conversation on screen joins its kept window, so a
 // switch away and back still shows it. Rows of other conversations do not:
@@ -370,6 +378,9 @@ export async function connectSocket(overrideDeps) {
     setCliOnline(true);
     renderConvList();
     resyncAfterConnect();
+    // For views that load from the relay on their own (the media gallery's
+    // tiles): what failed while the relay was away can be asked for again.
+    window.dispatchEvent(new CustomEvent('oar:relay-connected'));
     // Every loaded page again, not page one only: events missed while the
     // socket was down touched rows anywhere in the list.
     scheduleLoadedConversationsRefresh();
@@ -441,6 +452,15 @@ export async function connectSocket(overrideDeps) {
         .then(() => deps?.refreshCurrentView?.())
         .catch(() => {});
     }
+  });
+  // Today's OpenAI image spend after every booking and every change of the
+  // cap or the override (the banner, Settings, Check Usage), and the image
+  // presets after every change (the composer's select, Settings).
+  socket.on(OPENAI_IMAGE_USAGE_EVENT, (payload) => {
+    applyOpenAIImageSpendState(payload);
+  });
+  socket.on(OPENAI_IMAGE_PRESETS_EVENT, (payload) => {
+    applyOpenAIImagePresets(payload);
   });
   // No view refresh here: the engine switch rebinds nothing — it only changes
   // which worker the NEXT Copilot conversation spawns.
@@ -654,6 +674,12 @@ export async function connectSocket(overrideDeps) {
     if (sourceMessageId) clearRelayStreamStateForMessage(sourceMessageId);
     refreshSessionWorkerStatus().catch(() => {});
   });
+  // A running image turn of the open conversation: its placeholder in the
+  // live bubble (timer, size, the newest partials). Other conversations'
+  // events are ignored there.
+  socket.on(OPENAI_IMAGE_STARTED_EVENT, (payload) => handleImageStarted(payload));
+  socket.on(OPENAI_IMAGE_PREVIEW_EVENT, (payload) => handleImagePreview(payload));
+  socket.on(OPENAI_IMAGE_PREVIEW_RESET_EVENT, (payload) => handleImagePreviewReset(payload));
   // A folder's commit attribution changed (any client): an open context modal
   // re-reads it so its row and effect text match.
   socket.on('workspace_root_attribution_updated', () => {

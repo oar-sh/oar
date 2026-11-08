@@ -102,7 +102,7 @@ test('the self name is the relay name, else the injected hostname', () => {
   assert.equal(setup({ selfName: '' }).registry.selfName(), 'devbox');
 });
 
-test('selfIdentity reports the injected platform and version and the protocol', () => {
+test('selfIdentity reports the injected platform and version, the protocol and that it takes images', () => {
   const { registry } = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.publicUrl]: JSON.stringify('https://relay-a.example.test') } });
   assert.deepEqual(registry.selfIdentity(), {
     relayId: 'uuid-1',
@@ -110,7 +110,7 @@ test('selfIdentity reports the injected platform and version and the protocol', 
     version: '0.9.4',
     platform: 'win32',
     publicUrl: 'https://relay-a.example.test',
-    remoteRelays: { protocol: 1, inbound: true },
+    remoteRelays: { protocol: 1, inbound: true, imageInputs: true },
   });
 });
 

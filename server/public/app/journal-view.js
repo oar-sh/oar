@@ -126,12 +126,14 @@ import {
 } from './new-conversation-model-choice.mjs';
 import { buildCatalogModelOptions } from './model-selector-options.mjs';
 import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
+import { rememberImageComposerValues } from './image-composer-ui.js';
 import {
   conversationProviderIndicatorKey,
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
 import { leaveInboxView } from './inbox-ui.js';
+import { leaveMediaView } from './media-view.js';
 import {
   CLAUDE_CLOUD_PROVIDER,
   buildCloudSourceWarnings,
@@ -1330,7 +1332,8 @@ function showConversationUnknown(id, { lastOpenedBefore = '' } = {}) {
 
 export async function openConversation(id, options = {}) {
   // The Inbox owns the transcript like the status view does.
-  const didLeaveInboxView = leaveInboxView();
+  const didLeaveMediaView = leaveMediaView();
+  const didLeaveInboxView = leaveInboxView() || didLeaveMediaView;
   const didLeaveStatusView = leaveStatusView() || didLeaveInboxView;
   document.getElementById('input-area')?.removeAttribute('hidden');
   const previousConversationId = String(currentConvId || '').trim();
@@ -1844,9 +1847,14 @@ async function populateNewConversationModelSelect(providerType = 'github') {
     const cloudDefault = claudeCloudDefaultModel(newConversationClaudeCloudSettingsCache, eligibleModels);
     if (cloudDefault) target.value = cloudDefault;
   } else {
+    // An OpenAI Image chat starts on the relay's image default (its OpenAI
+    // settings name it) unless the last model used is an image one it offers.
+    const providerDefault = normalizedProvider === 'claude-api'
+      ? newConversationClaudeApiSettingsCache?.model
+      : (normalizedProvider === 'openai-image' ? newConversationOpenAISettingsCache?.imageDefaultModel : '');
     const preselected = preselectNewConversationModel(Array.from(target.options, (option) => option.value), {
       storedModel,
-      providerDefault: normalizedProvider === 'claude-api' ? newConversationClaudeApiSettingsCache?.model : '',
+      providerDefault,
       allowAuto: normalizedProvider !== 'openai-image',
     });
     if (preselected) target.value = preselected;
@@ -2561,6 +2569,8 @@ async function openBootstrappedConversation({
   // default model and has no effort, so it must not become what the next
   // local chat starts with.
   if (selectedProvider !== CLAUDE_CLOUD_PROVIDER) rememberBootstrappedSelection(payload);
+  // The chosen size becomes the new chat's own, read when its composer is built.
+  if (selectedProvider === 'openai-image' && selectedSize) rememberImageComposerValues(conversationId, { size: selectedSize });
   await refreshConversations();
   await openConversation(conversationId);
   if (selectedProvider === 'openai-image') {

@@ -1,5 +1,6 @@
 import { BASE, TOKEN, CLIENT_ID, IS_SHARE_PREVIEW, SHARE_PREVIEW_CONVERSATION_ID, SHARED_CONVERSATION_TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
 import { liveActivityCap } from './live-activity-cap.mjs';
+import { OPENAI_IMAGE_PRESETS_PATH, OPENAI_IMAGE_SETTINGS_FIELDS, OPENAI_IMAGE_USAGE_PATH } from './openai-image-spend.mjs';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
 // being backgrounded can hang indefinitely on a half-open mobile connection and
@@ -541,6 +542,63 @@ export async function updateOpenAISettings({
   if (Array.isArray(shownModels)) payload.shownModels = shownModels;
   if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   return settingsRequest('/api/settings/openai', payload, 'Failed to update OpenAI settings');
+}
+
+/**
+ * The daily image cap and today's override (POST /api/settings/openai with
+ * only these fields). Throws with the relay's words: a paired relay's
+ * request is refused (403).
+ */
+export async function updateOpenAIImageSpendSettings({ imageDailyCapUsd = undefined, allowImagesToday = undefined } = {}) {
+  const payload = {};
+  if (imageDailyCapUsd !== undefined) payload[OPENAI_IMAGE_SETTINGS_FIELDS.dailyCapUsd] = Number(imageDailyCapUsd);
+  if (typeof allowImagesToday === 'boolean') payload[OPENAI_IMAGE_SETTINGS_FIELDS.allowToday] = allowImagesToday;
+  return settingsRequest('/api/settings/openai', payload, 'Failed to update the image cap');
+}
+
+/** Today's image spend; with a conversation, that chat's cost too. Null on any failure. */
+export async function loadOpenAIImageUsage({ conversationId = '' } = {}) {
+  const id = String(conversationId || '').trim();
+  return quietGet(id ? `${OPENAI_IMAGE_USAGE_PATH}?conversationId=${encodeURIComponent(id)}` : OPENAI_IMAGE_USAGE_PATH);
+}
+
+// The presets routes: the relay's `error` and `code` ride on the thrown Error.
+async function imagePresetsRequest(method, path, body = null) {
+  if (!networkRequestsEnabled) return null;
+  let response;
+  try {
+    response = await fetch(`${BASE}${path}`, {
+      signal: requestTimeoutSignal(),
+      method,
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  } catch (error) {
+    noteFetchFailure(path, error);
+    throw Object.assign(new Error(`The relay could not be reached (${readableServerError(toErrorMessage(error))}).`), { status: 0, code: null });
+  }
+  noteFetchSuccess();
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(readableServerError(result?.error || '') || `The relay answered HTTP ${response.status}.`),
+      { status: response.status, code: result?.code || null },
+    );
+  }
+  return result;
+}
+
+/** `{ presets }` (built-ins and own), or null when the relay has none to give. */
+export async function loadOpenAIImagePresets() {
+  return quietGet(OPENAI_IMAGE_PRESETS_PATH);
+}
+
+export async function saveOpenAIImagePreset(preset, { replace = false } = {}) {
+  return imagePresetsRequest('PUT', OPENAI_IMAGE_PRESETS_PATH, { preset, ...(replace ? { replace: true } : {}) });
+}
+
+export async function deleteOpenAIImagePreset(name) {
+  return imagePresetsRequest('DELETE', `${OPENAI_IMAGE_PRESETS_PATH}/${encodeURIComponent(String(name || ''))}`);
 }
 
 export async function loadCursorSettings() {

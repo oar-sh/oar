@@ -648,3 +648,27 @@ test('the DeepSeek budget help text names the steps the bar is drawn with', asyn
   assert.equal(utilizationColor(75), '#e3b341');
   assert.equal(utilizationColor(90), '#f85149');
 });
+
+test('the OpenAI images card draws its meter, figures and badges from the spend state', async () => {
+  const { buildOpenAIImagePlanCard } = await import('../../services/plan-usage-openai-image.mjs');
+  const state = {
+    day: '2026-08-08', capUsd: 5, spentUsd: 4, reservedUsd: 0.1, estimatedUsd: 0.2, unknownPriceUsd: 0,
+    monthUsd: 7.8, ratio: 0.82, warning: true, reached: false, allowedToday: false, allowedAt: null,
+  };
+  const card = buildOpenAIImagePlanCard({ state, configured: true });
+  const html = renderPlanUsageHtml({ version: 2, generatedAt: NOW.toISOString(), providers: [card] }, { now: NOW, activeProvider: 'openai-image' });
+  assert.match(html, /data-usage-panel="openai"/);
+  assert.match(html, /OpenAI images/);
+  assert.match(html, /class="plan-usage-bar-mark" style="left:80%"/);
+  assert.match(html, /USD 4\.10 of 5\.00 · resets at midnight/);
+  assert.match(html, /Today&#39;s OpenAI image spend: USD 4\.10 of 5\.00\./);
+  assert.match(html, /Estimated<span class="plan-usage-fact-hint">/);
+  assert.equal((html.match(/data-meter-id="openai-images-daily-cap"/g) || []).length, 1, 'one meter, not the generic one too');
+  assert.doesNotMatch(html, /\$/);
+  // A newer state redraws the card alone.
+  const { renderPlanUsageCardHtml } = await import('./plan-usage-view.mjs');
+  const reached = renderPlanUsageCardHtml({ ...card, imageSpend: { ...state, spentUsd: 5, reached: true } }, { now: NOW });
+  assert.match(reached, /Cap reached/);
+  assert.match(reached, /Daily image cap reached/);
+  assert.equal(normalizeUsageProvider('openai-image'), 'openai');
+});

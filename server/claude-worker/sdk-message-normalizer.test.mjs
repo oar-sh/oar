@@ -8,6 +8,7 @@ import {
   shouldEmitStreamUpdate,
   summarizeToolInput,
 } from './sdk-message-normalizer.mjs';
+import { MAX_THOUGHT_CHARS } from '../../shared/thought-cap.mjs';
 
 function streamTextDelta(text, parentToolUseId = null) {
   return {
@@ -798,4 +799,41 @@ test('the receipt text alone marks a background launch for producers without the
     message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bg_2', content: [{ type: 'text', text: 'Async agent launched successfully. agentId: x' }] }] },
   });
   assert.equal(receipt.find((action) => action.channel === 'subagent').payload.status, 'running');
+});
+
+test('a long thought streamed one token at a time is gated and stops at the cap', () => {
+  // DeepSeek streams reasoning a token per delta, and every thought update
+  // carries the whole thought so far: sent per delta, a 16 Ki-char thought
+  // went out tens of thousands of times (the relay held every copy).
+  const normalizer = createSdkMessageNormalizer();
+  const frame = (event) => normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event });
+  frame({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } });
+  const deltas = 2 * MAX_THOUGHT_CHARS;
+  let interim = 0;
+  let afterCap = 0;
+  for (let i = 0; i < deltas; i += 1) {
+    const out = frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '考' } });
+    interim += out.length;
+    if (i >= MAX_THOUGHT_CHARS) afterCap += out.length;
+  }
+  assert.ok(interim <= Math.ceil(MAX_THOUGHT_CHARS / 24) + 1, `${interim} interim thoughts for ${deltas} deltas`);
+  assert.equal(afterCap, 0, 'no update once the capped text stops changing');
+  const stop = frame({ type: 'content_block_stop', index: 0 });
+  assert.equal(stop.length, 1);
+  assert.equal(stop[0].payload.done, true);
+  assert.equal(stop[0].payload.text.length, MAX_THOUGHT_CHARS, 'the final frame carries the whole capped thought');
+});
+
+test('a thinking block the turn left open sends its held-back tail with the result', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const frame = (event) => normalizer.normalize({ type: 'stream_event', parent_tool_use_id: null, event });
+  frame({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } });
+  frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Weighing' } });
+  assert.deepEqual(frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: ' it' } }), []);
+  // No content_block_stop: the turn was stopped mid-thought.
+  const actions = normalizer.normalize({ type: 'result', subtype: 'error_during_execution', is_error: true, num_turns: 1, duration_api_ms: 10 });
+  assert.deepEqual(actions.map((action) => action.channel), ['thought', 'result']);
+  assert.equal(actions[0].payload.text, 'Weighing it');
+  // Nothing more to flush on a later result.
+  assert.deepEqual(normalizer.normalize({ type: 'result', subtype: 'success', num_turns: 1, duration_api_ms: 10 }).map((a) => a.channel), ['result']);
 });

@@ -67,6 +67,7 @@ export const CHAT_ACTIONS_MENU_ENTRY_IDS = Object.freeze([
   'chat-menu-change-cwd',
   'chat-menu-git-changes',
   'chat-menu-open-cloud-session',
+  'chat-menu-media',
   'chat-menu-settings',
   'chat-menu-about',
   'chat-menu-restart-relay',
