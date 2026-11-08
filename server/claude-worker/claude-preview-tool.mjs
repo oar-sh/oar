@@ -1,10 +1,10 @@
 /**
  * The relay's `preview` tool for the Claude worker, shaped as an SDK MCP tool
  * definition (`{ name, description, inputSchema, handler }`) so the adapter can
- * hand it to `createSdkMcpServer` and this module never imports the agent SDK.
+ * hand it to `createSdkMcpServer`. Its zod comes with the installed SDK.
  */
 
-import * as z from 'zod';
+import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 
 import {
   PREVIEW_TOOL_DESCRIPTION,
@@ -12,6 +12,9 @@ import {
   PREVIEW_TOOL_NAME,
   executePreviewTool,
 } from '../../shared/preview-tool-core.mjs';
+
+// zod as the installed Claude SDK carries it: the tool schemas go to that SDK.
+const { z } = await loadAgentSdk('claude');
 
 const FIELDS = PREVIEW_TOOL_INPUT_SCHEMA.properties;
 

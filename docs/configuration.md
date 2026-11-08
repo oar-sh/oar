@@ -25,6 +25,8 @@ The modal is organised into seven tabs — **General**, **Providers** (with a **
 | General | Check for updates automatically | off | Opt-in: the relay asks oar.sh for the latest version about twice a day. **Check for updates** works regardless; `OAR_NO_UPDATE_CHECK=1` blocks both |
 | General | Check for updates, Update, Dismiss, Cancel update | — | **Check for updates** asks oar.sh now. When a newer release exists, **Update** installs it with npm (global installs; a git checkout is told to pull and restart) and queues a relay restart for when no turn runs; **Dismiss** hides that version (not offered for a critical update), **Cancel update** stops an install that is running, and **Update log** shows its output (see [Updating](install.md#updating)) |
 | General | Default CWD for new sessions | relay workspace root | Working directory for newly created sessions that have none of their own |
+| General | Windows helper | — | Windows relays only: the state of koffi, which the relay's lock check downloads on demand, with **Retry** after a failed install (see [Agent SDKs](install.md#agent-sdks)) |
+| Providers | Agent SDK row (Claude, Claude API, DeepSeek, Cursor) | — | The **Claude Agent SDK** or **Cursor SDK** the relay downloads for the provider: its state, the pinned and installed version, the install log, the next automatic retry after a failure, and **Install**, **Cancel**, **Retry** or **Reinstall** (see [Agent SDKs](install.md#agent-sdks)) |
 | Providers | CLI row (Copilot, Claude, Grok) | — | The provider CLI's version, path and install method; **Install**, **Update** or **Switch to native installer** for Claude and Grok, with the **Install log**; read-only for Copilot (see [Installing a provider CLI](providers.md#installing-a-provider-cli-from-the-relay)) |
 | Providers | Copilot engine | SDK | Extension when this relay cannot run the SDK engine (see [engine choice](providers.md#github-copilot--engine-choice)) |
 | Providers | OpenAI API key / model / base URL | — / `gpt-4o` / `https://api.openai.com/v1` | Enables the OpenAI and OpenAI Image providers |
@@ -142,6 +144,8 @@ The `restart*` keys tune the restart of a session's CLI (`/api/restart-orchestra
 | `COPILOT_WEB_RELAY_LOG_DIR` | Log directory (`relay-console.log`, `worker-<session>.log`, and `server.log`/`server-err.log` when `oar` started the relay in the background) |
 | `OAR_NO_CONSOLE_LOG=1` | Keep no copy of the relay's console in `relay-console.log` |
 | `OAR_STATE_ROOT` | State root of a global install, instead of `~/.oar` / `%APPDATA%\oar` |
+| `OAR_SDK_DIR` | Where the relay keeps the agent SDKs it downloads, instead of `sdks` in the state root. On Windows only, it must be a local folder of at most 120 characters. `oar uninstall --purge` leaves a folder outside the state root in place (see [Agent SDKs](install.md#agent-sdks)) |
+| `OAR_AGENT_SDK_SOURCE=store` | A git checkout downloads and uses the agent SDKs like a global install, instead of running its devDependencies. Without it, a checkout whose devDependencies lack the SDK packages (after `npm install --omit=dev`, for example) does the same |
 | `OAR_NO_UPDATE_CHECK=1` | Never contact oar.sh, not even for a manual update check |
 | `OAR_UPDATE_MANIFEST_URL` | The version manifest the update check and `oar update` read, instead of `https://oar.sh/latest.json` |
 | `OAR_HOST_SUSPEND_DRY_RUN=1` | On a Windows relay, **Suspend host** logs the suspend instead of sleeping the machine |

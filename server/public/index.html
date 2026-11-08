@@ -1673,6 +1673,15 @@
     background: transparent;
     border-color: transparent;
   }
+  /* Select Models: new models found that the modal has not shown yet. */
+  .chat-menu-new-dot {
+    width: calc(8px * var(--ui-scale));
+    height: calc(8px * var(--ui-scale));
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+  }
+  .chat-menu-new-dot[hidden] { display: none; }
   .chat-actions-menu-meta {
     display: inline-flex;
     align-items: center;
@@ -1954,6 +1963,17 @@
   .settings-auth-row { gap: calc(5px * var(--ui-scale)); align-items: center; width: 100%; margin-top: calc(4px * var(--ui-scale)); }
   .settings-auth-row-wrap { flex-wrap: wrap; row-gap: calc(4px * var(--ui-scale)); }
   .settings-radio-stack { display: flex; flex-direction: column; gap: calc(4px * var(--ui-scale)); }
+  /* Models: one "Check <provider>" row per provider, its last check under
+     the name in the help text's colour. */
+  #settings-modal .settings-row.model-refresh-provider-row:has(> input[type="checkbox"]) > label {
+    flex-direction: column; align-items: flex-start; justify-content: center;
+  }
+  .model-refresh-provider-last {
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+    font-weight: normal;
+    overflow-wrap: anywhere;
+  }
   /* These rows are laid out as flex and hidden from script via `.hidden = true`.
      Their `display: flex` lives HERE rather than in a style="" attribute on
      purpose: an inline declaration outranks every selector-based rule (short of
@@ -5933,6 +5953,42 @@
     border-color: var(--warn, #f7c873);
     color: var(--warn, #f7c873);
   }
+  .model-reasoning-chip-new {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  /* "Turn new models on automatically" at the top of a provider tab. */
+  .model-auto-enable-row {
+    display: flex;
+    align-items: center;
+    gap: calc(5px * var(--ui-scale));
+    padding: calc(4px * var(--ui-scale)) calc(7px * var(--ui-scale));
+    border: 1px solid var(--border);
+    border-radius: calc(10px * var(--ui-scale));
+    background: var(--bg3);
+    font-size: 0.84rem;
+    min-height: calc(30px * var(--ui-scale));
+    cursor: pointer;
+  }
+  .model-auto-enable-toggle {
+    width: calc(18px * var(--ui-scale));
+    height: calc(18px * var(--ui-scale));
+    flex-shrink: 0;
+    accent-color: var(--accent);
+  }
+  .model-auto-enable-copy {
+    display: flex;
+    flex-direction: column;
+    gap: calc(2px * var(--ui-scale));
+    min-width: 0;
+  }
+  .model-auto-enable-title {
+    font-weight: 600;
+  }
+  .model-auto-enable-help {
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
   .model-variant-list {
     display: flex;
     flex-direction: column;
@@ -7907,7 +7963,8 @@
       min-height: calc(32px * var(--ui-scale));
       padding: calc(5px * var(--ui-scale)) calc(4px * var(--ui-scale));
     }
-    .model-variant-checkbox {
+    .model-variant-checkbox,
+    .model-auto-enable-toggle {
       width: calc(22px * var(--ui-scale));
       height: calc(22px * var(--ui-scale));
     }
@@ -8226,7 +8283,7 @@
             <button id="chat-menu-group" class="chat-actions-menu-item" type="button" role="menuitem">🧩 Session group…</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
             <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
-            <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models</button>
+            <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models<span id="chat-menu-select-models-dot" class="chat-menu-new-dot" aria-hidden="true" hidden></span></button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
             <button id="chat-menu-open-cloud-session" class="chat-actions-menu-item" type="button" role="menuitem" hidden>☁️ Open on claude.ai</button>
@@ -8663,6 +8720,31 @@
           </div>
           <div class="settings-help settings-gap-xs">A sub-agent's record keeps every tool call's full input and the first 4 KB of each result. After this many days the relay removes them from finished agents, once a day; the thoughts, the reply, notes and the one-line summary of each call stay. Always keeps everything. A setting of this relay.</div>
         </section>
+        <section class="settings-section" id="settings-section-models" aria-labelledby="settings-section-models-title">
+          <h3 class="settings-section-title" id="settings-section-models-title">Models</h3>
+          <div class="settings-row settings-gap">
+            <label for="model-refresh-auto-toggle">Check for new models</label>
+            <input
+              id="model-refresh-auto-toggle"
+              type="checkbox"
+              onchange="updateModelRefreshAutoSetting(this.checked)"
+              aria-label="Check for new models"
+              checked
+            >
+          </div>
+          <div class="settings-row settings-gap">
+            <label for="model-refresh-interval-select">How often</label>
+            <select id="model-refresh-interval-select" onchange="updateModelRefreshIntervalSetting(this.value)" aria-label="How often to check for new models">
+              <option value="6">Every 6 h</option>
+              <option value="12">Every 12 h</option>
+              <option value="24" selected>Every 24 h</option>
+              <option value="72">Every 3 days</option>
+              <option value="168">Every 7 days</option>
+            </select>
+          </div>
+          <div id="model-refresh-providers" class="settings-gap" role="group" aria-label="Providers checked for new models"></div>
+          <div class="settings-help settings-gap-xs">The relay asks each switched-on provider for its model list this often. A provider whose list was refreshed in the meantime (Refresh in Select Models, a settings save, a sign-in) waits a full interval again, and a failed check is tried again after an hour at the earliest. Whether a new model starts on is set per provider in Select Models. A setting of this relay.</div>
+        </section>
         <section class="settings-section" id="settings-section-relay" aria-labelledby="settings-section-relay-title">
           <h3 class="settings-section-title" id="settings-section-relay-title">This relay</h3>
           <div class="settings-row settings-row-column settings-gap">
@@ -8734,6 +8816,9 @@
               <code id="windows-autostart-manual-command" style="display: block; margin-top: calc(4px * var(--ui-scale)); user-select: all;"></code>
             </div>
           </div>
+          <!-- The Windows helper (koffi) the relay's lock check reads process start
+               times with; agent-sdk-ui.js draws the row, on a Windows relay only. -->
+          <div id="agent-sdk-koffi-row" class="settings-gap" data-agent-sdk="koffi" hidden></div>
         </section>
         <section class="settings-section" id="settings-section-updates" aria-labelledby="settings-section-updates-title">
           <h3 class="settings-section-title" id="settings-section-updates-title">Updates</h3>
@@ -8980,6 +9065,8 @@
               <pre id="cli-claude-log"></pre>
             </details>
           </div>
+          <!-- Agent SDK row; agent-sdk-ui.js draws it. -->
+          <div id="agent-sdk-claude-row" data-agent-sdk="claude" style="margin-bottom: calc(6px * var(--ui-scale));"></div>
           <!-- Claude account auth UI (Relogin / Logout); claude-auth-ui.js drives the state. -->
           <div id="claude-auth-section">
             <div class="settings-row" style="margin-bottom: 0;">
@@ -9069,6 +9156,8 @@
           data-settings-provider-panel="claude-api"
           hidden
         >
+          <!-- Claude API chats run on the Claude Agent SDK; agent-sdk-ui.js draws the row. -->
+          <div id="agent-sdk-claude-api-row" data-agent-sdk="claude"></div>
           <div class="settings-row settings-row-column settings-gap">
             <label for="claude-api-key-input">Claude API</label>
             <div class="settings-row settings-row-full settings-row-lead">
@@ -9274,6 +9363,8 @@
           data-settings-provider-panel="cursor"
           hidden
         >
+          <!-- Agent SDK row; agent-sdk-ui.js draws it. -->
+          <div id="agent-sdk-cursor-row" data-agent-sdk="cursor"></div>
           <div class="settings-row settings-row-column settings-gap">
             <label for="cursor-api-key-input">Cursor SDK</label>
             <div class="settings-row settings-row-full settings-row-lead">
@@ -9367,6 +9458,8 @@
           data-settings-provider-panel="deepseek"
           hidden
         >
+          <!-- DeepSeek chats run on the Claude Agent SDK; agent-sdk-ui.js draws the row. -->
+          <div id="agent-sdk-deepseek-row" data-agent-sdk="claude"></div>
           <div class="settings-row settings-row-column settings-gap">
             <label for="deepseek-api-key-input">DeepSeek</label>
             <div class="settings-row settings-row-full settings-row-lead">

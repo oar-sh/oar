@@ -27,7 +27,23 @@ const CHECK_DIR_PREFIX = '.database-file-check-';
 // one's work, not no rows: every start writes these settings (seen on a
 // real start of 0.9.19 on an empty folder). A later boot-time key goes here
 // deliberately; any other key makes the start refuse.
-export const STARTUP_SETTING_KEYS = Object.freeze(['push_vapid_public_key', 'push_vapid_private_key', 'relay_last_exit']);
+// Since 0.9.24 a start also writes each provider's model map as it finds
+// it (provider-model-state.mjs) and the last model refresh. A version that
+// runs on copilot.db writes none of them; a start of this one, which the
+// browser test uses as its stand-in, writes several.
+export const STARTUP_SETTING_KEYS = Object.freeze([
+  'push_vapid_public_key',
+  'push_vapid_private_key',
+  'relay_last_exit',
+  'copilot_model_state',
+  'openai_model_state',
+  'claude_model_state',
+  'cursor_model_state',
+  'grok_model_state',
+  'deepseek_model_state',
+  'claude_api_model_state',
+  'model_refresh_last',
+]);
 // And the tables such a start fills that hold no one's work: the model
 // catalog and its refresh state, the restart orchestrator's one row. (The
 // shadow tables of the message search are left out too: they follow

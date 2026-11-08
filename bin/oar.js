@@ -18,6 +18,7 @@ import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from '../s
 import { DB_FILE_NAME, DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile } from '../server/services/database-file.mjs';
 import { BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE, backupDatabase, configWarnings, describeBackups, sanitizeReason } from '../server/services/db-backup-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
+import { createAgentSdkStore } from '../server/services/agent-sdk-store.mjs';
 import {
   getLauncherLogDir,
   getLegacyManagedConfigDir,
@@ -26,8 +27,9 @@ import {
   resolveStateLayout,
 } from '../server/services/oar-state-layout.mjs';
 import {
-  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, describeRelayAddress, DOCTOR_PROBES, generateAuthToken,
-  listSystemdDropIns, NPM_ALLOW_SCRIPTS_ARG, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderDoctorReport,
+  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, describeAgentSdks, describeRelayAddress, DOCTOR_PROBES,
+  generateAuthToken, listSystemdDropIns, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderAgentSdkLines,
+  renderDoctorReport,
   resolveNpmInvocation, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
 } from '../server/services/oar-cli-helpers.mjs';
 import { describeConfiguredTunnel, describeTunnelState } from '../server/services/cloudflared-tunnel-service.mjs';
@@ -2256,7 +2258,6 @@ export async function runDoctor(options = {}) {
       return { id: probe.id, ok: false };
     }
   });
-  probes.push({ id: 'cursor', ok: true, version: 'bundled (@cursor/sdk)' });
 
   const port = endpointOf(paths.config).port;
   const holder = paths.config ? createWindowsPortCheck(ctx)(port) : null;
@@ -2277,8 +2278,56 @@ export async function runDoctor(options = {}) {
     warnings: holder ? [windowsPortWarning(port, holder)] : [],
     // The relay resolves a relative cloudflaredTunnel.binary against server/.
     tunnel: describeConfiguredTunnel(paths.config?.cloudflaredTunnel, { env: ctx.env, configBaseDir: path.join(ctx.packageRoot, 'server') }),
+    agentSdks: describeAgentSdks({ env: ctx.env, platform: ctx.platform }),
   }));
   return { code: 0, reason: 'doctor' };
+}
+
+/**
+ * `oar sdk [status]`: the agent SDKs as `oar doctor` shows them.
+ * `oar sdk install <claude|cursor|koffi> [--reinstall]`: installs one through
+ * the relay's store, without the relay, for a headless host whose web UI is
+ * the problem; npm's output streams to the terminal. Exit 1 when it did not
+ * end ready.
+ */
+export async function runSdk(options = {}) {
+  const ctx = cliContext(options);
+  const argv = ctx.argv || [];
+  if (argv[0] !== 'install') {
+    ctx.logger.log(renderAgentSdkLines(describeAgentSdks({ env: ctx.env, platform: ctx.platform })).join('\n'));
+    return { code: 0, reason: 'sdk-status' };
+  }
+  const id = argv[1];
+  if (!id) {
+    ctx.logger.error('[oar] oar sdk install needs the SDK: claude, cursor or koffi.');
+    return { code: 2, reason: 'usage' };
+  }
+  const store = (ctx.createAgentSdkStore || createAgentSdkStore)({ env: ctx.env, platform: ctx.platform, logger: { log: () => {} } });
+  let shown = '';
+  const unsubscribe = store.subscribe((snapshot) => {
+    const text = snapshot.sdks[id]?.log || '';
+    // The log is the retained tail: print what is new since the last look.
+    const fresh = text.startsWith(shown) ? text.slice(shown.length) : text;
+    if (fresh) ctx.stdout.write(fresh);
+    shown = text;
+  });
+  try {
+    const started = store.install(id, { force: argv.includes('--reinstall'), reason: 'oar sdk install' });
+    if (!started.ok) {
+      ctx.logger.error(`[oar] ${started.error}`);
+      return { code: 1, reason: 'sdk-install-failed' };
+    }
+    const status = started.ready ? started.status : await store.ensure(id, { reason: 'oar sdk install', retryFailed: true });
+    if (status?.state !== 'ready') {
+      ctx.logger.error(`[oar] ${status?.label || id}: ${status?.error || 'not installed'}`);
+      return { code: 1, reason: 'sdk-install-failed' };
+    }
+    ctx.logger.log(`[oar] ${status.label} ${status.installed} is ready in ${status.dir}.`);
+    return { code: 0, reason: 'sdk-installed' };
+  } finally {
+    unsubscribe();
+    store.dispose();
+  }
 }
 
 /**
@@ -2392,7 +2441,7 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
   logger.log(`[oar] Updating @oar-sh/oar ${runningVersion} -> ${target} ...`);
   const npm = resolveNpmInvocation({ packageRoot, env });
   const exitCode = await new Promise((resolve) => {
-    const child = spawnImpl(npm.command, ['install', '-g', ...npm.prefixArgs, NPM_ALLOW_SCRIPTS_ARG, `@oar-sh/oar@${target}`], {
+    const child = spawnImpl(npm.command, ['install', '-g', ...npm.prefixArgs, `@oar-sh/oar@${target}`], {
       stdio: 'inherit',
       env: npm.env,
       ...(process.platform === 'win32' ? { shell: true, windowsHide: true } : {}),
@@ -2523,6 +2572,7 @@ const COMMANDS = {
   backup: runBackup,
   update: runUpdate,
   'build-native': runBuildNative,
+  sdk: runSdk,
   help: async ({ logger = console } = {}) => {
     logger.log(usageText());
     return { code: 0, reason: 'help' };

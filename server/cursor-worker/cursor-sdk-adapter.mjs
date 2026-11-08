@@ -1,6 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 
+import { loadAgentSdk } from '../agent-sdk-loader.mjs';
+
 import {
   createTurnLiveness,
   createTurnStalledError,
@@ -18,7 +20,7 @@ import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '
  */
 
 async function defaultAgentFactory() {
-  const { Agent } = await import('@cursor/sdk');
+  const { Agent } = await loadAgentSdk('cursor');
   return {
     create: (options) => Agent.create(options),
     resume: (agentId, options) => Agent.resume(agentId, options),
@@ -30,7 +32,7 @@ async function defaultAgentFactory() {
 // `storeFactoryImpl(storePath, { cwd })` with the real store rooted in the
 // storePath's directory.
 async function defaultStoreFactory() {
-  const { SqliteLocalAgentStore } = await import('@cursor/sdk/sqlite');
+  const { SqliteLocalAgentStore } = await loadAgentSdk('cursor', { entry: 'sqlite' });
   return (storePath, { cwd } = {}) =>
     SqliteLocalAgentStore.open({
       workspaceRef: cwd || path.dirname(storePath),
@@ -497,7 +499,7 @@ async function defaultModelsList({ apiKey }) {
   // The namespace form is the only working call shape: `Cursor` has a private
   // constructor and `models` is a static member, so the old client-instance
   // fallback could only ever throw a TypeError that masked the real error.
-  const sdk = await import('@cursor/sdk');
+  const sdk = await loadAgentSdk('cursor');
   return sdk.Cursor.models.list({ apiKey });
 }
 

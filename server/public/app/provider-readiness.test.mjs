@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SEED_CATALOG_SOURCE,
+  blockingReadinessReasons,
   getProviderReadiness,
   isProviderSetupRequired,
   isSetupRequired,
@@ -124,6 +125,102 @@ test('the live copy starts unknown, follows the inputs and tells listeners only 
   unsubscribe();
   updateProviderReadinessInputs({ catalog: seedCatalog });
   assert.equal(seen.length, 3);
+  resetProviderReadinessForTests();
+});
+
+function sdkSnapshot(claude = {}, cursor = {}) {
+  return {
+    root: '/srv/fixture/sdks',
+    host: { platform: 'linux', arch: 'x64', libc: 'glibc' },
+    sdks: {
+      claude: { id: 'claude', label: 'Claude Agent SDK', state: 'ready', ...claude },
+      cursor: { id: 'cursor', label: 'Cursor SDK', state: 'ready', ...cursor },
+      koffi: { id: 'koffi', label: 'Windows helper (koffi)', state: 'unsupported', support: 'no' },
+    },
+  };
+}
+
+const sdkProvidersOn = { ...nothingReady, claude: { enabled: true }, claudeApi: { enabled: true }, deepseek: { enabled: true }, cursor: { enabled: true }, grok: { enabled: true } };
+
+test('without an agent SDK snapshot nothing changes, and no reasons are added', () => {
+  for (const agentSdks of [undefined, null, {}, { sdks: null }]) {
+    const readiness = resolveProviderReadiness({ ...sdkProvidersOn, agentSdks });
+    assert.deepEqual(readiness.ready, ['claude', 'claude-api', 'cursor', 'grok', 'deepseek']);
+    assert.equal('reasons' in readiness, false);
+  }
+});
+
+test('ready SDKs change nothing but say so with an empty reasons map', () => {
+  const readiness = resolveProviderReadiness({ ...sdkProvidersOn, agentSdks: sdkSnapshot() });
+  assert.deepEqual(readiness.ready, ['claude', 'claude-api', 'cursor', 'grok', 'deepseek']);
+  assert.deepEqual(readiness.reasons, {});
+});
+
+test('a missing or installing SDK keeps its providers ready, with a note: the first chat installs it', () => {
+  const missing = resolveProviderReadiness({ ...sdkProvidersOn, agentSdks: sdkSnapshot({ state: 'missing' }, { state: 'installing' }) });
+  assert.deepEqual(missing.ready, ['claude', 'claude-api', 'cursor', 'grok', 'deepseek']);
+  assert.equal(isSetupRequired(missing), false);
+  for (const providerId of ['claude', 'claude-api', 'deepseek']) {
+    assert.deepEqual(missing.reasons[providerId], {
+      blocking: false,
+      text: 'Claude Agent SDK not installed yet — it installs with the first chat or from Settings',
+    }, providerId);
+  }
+  assert.deepEqual(missing.reasons.cursor, { blocking: false, text: 'Cursor SDK is installing — the first chat waits for it' });
+  assert.equal(missing.reasons.grok, undefined, 'Grok runs on no agent SDK');
+});
+
+test('a failed or unavailable SDK makes its providers not ready, with the reason', () => {
+  const readiness = resolveProviderReadiness({
+    ...sdkProvidersOn,
+    agentSdks: sdkSnapshot({ state: 'error', error: 'npm exited with code 1' }, { state: 'unsupported' }),
+  });
+  assert.deepEqual(readiness.ready, ['grok']);
+  assert.deepEqual(readiness.reasons.claude, { blocking: true, text: 'Claude Agent SDK install failed: npm exited with code 1' });
+  assert.equal(readiness.reasons['claude-api'].blocking, true);
+  assert.equal(readiness.reasons.deepseek.blocking, true);
+  assert.deepEqual(readiness.reasons.cursor, { blocking: true, text: 'Cursor SDK not available on this platform' });
+  // Three providers share Claude's SDK: its reason is given once.
+  assert.deepEqual(blockingReadinessReasons(readiness), [
+    'Claude Agent SDK install failed: npm exited with code 1',
+    'Cursor SDK not available on this platform',
+  ]);
+  assert.deepEqual(blockingReadinessReasons(null), []);
+  assert.equal(resolveProviderReadiness({ ...sdkProvidersOn, agentSdks: sdkSnapshot({ state: 'error' }) }).reasons.claude.text, 'Claude Agent SDK install failed');
+});
+
+test('only enabled providers are judged, and a failed SDK can be the setup wall', () => {
+  const onlyClaude = { ...nothingReady, claude: { enabled: true }, agentSdks: sdkSnapshot({ state: 'unsupported' }) };
+  const readiness = resolveProviderReadiness(onlyClaude);
+  assert.deepEqual(readiness.ready, []);
+  assert.deepEqual(Object.keys(readiness.reasons), ['claude']);
+  assert.equal(isSetupRequired(readiness), true);
+  // Copilot is not on an agent SDK: a real catalog keeps the relay usable.
+  const withCopilot = resolveProviderReadiness({ ...onlyClaude, catalog: { ...seedCatalog, source: 'server-discovery:boot' } });
+  assert.deepEqual(withCopilot.ready, ['github']);
+  // An SDK the snapshot does not name, or a state it does not know, changes nothing.
+  const unnamed = resolveProviderReadiness({ ...onlyClaude, agentSdks: { sdks: { cursor: { state: 'error' } } } });
+  assert.deepEqual(unnamed.ready, ['claude']);
+  const odd = resolveProviderReadiness({ ...onlyClaude, agentSdks: sdkSnapshot({ state: 'paused' }) });
+  assert.deepEqual(odd.ready, ['claude']);
+});
+
+test('the live copy takes the SDK snapshot and tells listeners when a reason changes', () => {
+  resetProviderReadinessForTests();
+  const seen = [];
+  subscribeProviderReadiness((readiness) => seen.push(readiness));
+  updateProviderReadinessInputs({ ...nothingReady, claude: { enabled: true } });
+  assert.equal(seen.length, 1);
+  updateProviderReadinessInputs({ agentSdks: sdkSnapshot({ state: 'installing', log: 'a\n', logSeq: 1 }) });
+  assert.equal(seen.length, 2, 'a note is a change');
+  // A log flush of the same install is not.
+  updateProviderReadinessInputs({ agentSdks: sdkSnapshot({ state: 'installing', log: 'a\nb\n', logSeq: 2 }) });
+  assert.equal(seen.length, 2);
+  updateProviderReadinessInputs({ agentSdks: sdkSnapshot({ state: 'error', error: 'boom' }) });
+  assert.equal(seen.length, 3);
+  assert.equal(isProviderSetupRequired(), true);
+  updateProviderReadinessInputs({ agentSdks: sdkSnapshot() });
+  assert.equal(isProviderSetupRequired(), false);
   resetProviderReadinessForTests();
 });
 

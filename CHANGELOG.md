@@ -3,6 +3,171 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.24] — 2026-11-08
+
+Highlights: a much smaller install. The Claude and Cursor agent SDKs leave
+the package, and the relay downloads the one a provider needs from npm when
+it is set up or first used: the package takes about 50 MB on Linux x64
+instead of about 650 MB, plus the SDKs of the providers you use. Neither the
+start nor a first chat waits for the download; the chat shows "Installing
+the … SDK" and runs when it ends. Copilot needs nothing downloaded. The
+relay also checks each provider for new models on its own, every 24 hours
+by default, announces new ones with a toast and a "New" tag, and lets you
+choose per provider whether new models start on; OpenAI models can now be
+picked as well. gpt-image replies above about 3 MB are no longer lost.
+
+### Added
+
+- **Check for new models.** The relay now asks each switched-on provider
+  for its model list on its own: a minute after it starts for the
+  providers that are due, then every 24 hours. Claude and Grok are asked
+  only when their CLI is installed or they are signed in. Settings →
+  General has a new Models section with the switch, how often (every 6 h,
+  12 h, 24 h, 3 days or 7 days) and one "Check <provider>" box per
+  provider, each with its last check or "Not set up". A provider whose
+  list was refreshed some other way (Refresh in Select Models, a settings
+  save, a sign-in, and for Copilot the look it takes when the relay
+  starts) waits a full interval again, and a failed check is tried again
+  after an hour at the earliest.
+- **New models are announced.** A refresh that finds models it has not
+  seen before shows a toast, such as "2 new Cursor models (on)", whose Show
+  opens Select Models on that provider. The chat menu's Select Models has a
+  dot, and each new model a "New" tag, until Select Models is opened.
+- **Agent SDK rows in Settings.** The Claude, Claude API, DeepSeek and
+  Cursor tabs show their SDK's state, the pinned and the installed version,
+  the install log and the next automatic retry, with Install, Cancel, Retry
+  and Reinstall. On a Windows relay, Settings → General → This relay has a
+  "Windows helper" row for koffi, with Retry.
+- **`oar sdk`, and the agent SDKs in `oar doctor`.** `oar doctor` shows the
+  SDK folder and, per SDK, the pinned version, the installed one and its
+  state; `oar sdk` prints the same lines. `oar sdk install
+  claude|cursor|koffi [--reinstall]` installs one without the relay, for a
+  headless host whose web UI is the problem.
+
+### Changed
+
+- **The agent SDKs are downloaded on demand.** The Claude Agent SDK (Claude,
+  Claude API and DeepSeek chats) and the Cursor SDK are no longer in the
+  package, which is smaller by roughly their size: about 50 MB installed
+  on Linux x64 instead of about 650 MB. The relay downloads the one a
+  provider needs from npm, at the version this release pins: when you
+  set the provider up (a Claude login, a provider switched on, a key saved),
+  at the provider's first chat, and at start for the providers in use. The
+  start never waits for it, and neither does a first chat: it opens at
+  once, shows "Installing the … SDK" and delivers the message when the
+  install ends; a failed install shows its cause in the chat and keeps the
+  message queued until a Retry in Settings, or the automatic retry,
+  installs the SDK. The SDKs live in `sdks/` in the state root
+  (`OAR_SDK_DIR` moves it; on Windows it must be a local folder of at most
+  120 characters): about 360–370 MB for Claude on Windows and Linux x64
+  and 345–350 MB on macOS arm64, most of it the Claude Code binary, and
+  40–50 MB for Cursor. The pinned version and the one before are kept, and
+  any folder a running session uses. An install's progress (npm's output,
+  the bytes it downloads) is checked every 15 seconds: 5 minutes without
+  any counts as a network failure. An install takes at most 2 hours,
+  enough for the Claude SDK on links down to about 0.4 Mbit/s. A download
+  that fails for want of a connection, or stalls like that, is tried again
+  after 1, 5 and 15 minutes. OAR needs the npm registry once per SDK
+  version and does not work offline; the host's npm config (registry,
+  proxy, cafile, cache, offline settings) applies. Where a vendor has no
+  build, the row says "Not available on this platform": the Cursor SDK on
+  Windows arm64, both SDKs on Android under Termux (run OAR in a proot
+  Debian there), 32-bit ARM and FreeBSD. See docs/install.md, Agent SDKs.
+- **How an SDK is installed.** `npm ci` from a lockfile that ships with OAR,
+  at exact versions, into a folder of its own that counts as installed only
+  once its marker, which lists the files and their sizes, checks out.
+  Installs run with scripts disabled, koffi's included. A git checkout runs
+  the same agent SDK versions as devDependencies, as long as they are
+  installed there (not after `npm install --omit=dev`, for example);
+  otherwise, or with `OAR_AGENT_SDK_SOURCE=store`, it downloads them like
+  an install. Below the pinned packages the versions can differ: the
+  Claude SDK's own lockfile has newer releases of eight of them than the
+  package's lockfile (@babel/runtime 7.29.13, encodeurl 2.0.1,
+  eventsource-parser 3.1.1, express-rate-limit 8.7.3, jose 6.2.15,
+  on-finished 2.4.2, range-parser 1.3.0, standardwebhooks 1.1.1).
+- **The Copilot SDK leaves the package.** No server code used
+  `@github/copilot-sdk`: Copilot workers run on the SDK that comes with the
+  Copilot CLI, and the CLI resolves the extension's
+  `@github/copilot-sdk/extension` import itself. Copilot needs nothing
+  downloaded.
+- **A plain `npm install -g @oar-sh/oar`.** koffi went with the Copilot
+  SDK, so no shipped dependency has an install script any more: npm 12
+  needs no `--allow-scripts`, and the **Update** button and `oar update`
+  pass none. On Windows the relay downloads koffi itself (about 3 MB) for
+  its lock check, with scripts disabled like the SDKs: its binary comes
+  prebuilt in `@koromix/koffi-win32-<arch>`.
+- **The Windows lock check without koffi.** Until koffi is there, a relay
+  lock whose owner's start time is unknown counts as stale when it was
+  written before the last boot, or when its process id now runs a program
+  other than Node. A lock left by a crash or a reboot, whose process id
+  Windows has handed on, no longer keeps the relay from starting, which
+  matters most for a relay started at boot after an update reboot. The
+  take-over of an earlier database uses the same rule. The start after
+  koffi arrived has the full check again.
+- `engine.io` 6.6.11 (was 6.6.9) under socket.io, from a lockfile refresh:
+  a new version of a package already in the tree.
+- In the Claude SDK's install: `@modelcontextprotocol/sdk` 1.32.2 (was
+  1.30.0), pinned there as the SDK's peer, with `hono` 4.13.17 (was
+  4.13.9), `@hono/node-server` 2.1.6 (was 2.1.0), `fast-uri` 3.1.9 (was
+  3.1.8) and `ip-address` 10.7.6 (was 10.4.0). All are new versions of
+  packages that were already in the tree; no package was added.
+- **Whether a new model starts on is yours to choose.** Every Select
+  Models tab, Copilot and OpenAI included, starts with "Turn new models on
+  automatically", on by default. Models that are off today stay off; only
+  models found from now on follow the switch. A new effort level of a
+  Copilot model follows the model's other levels.
+- **A model you turn off stays off.** Each provider now remembers every
+  model it has offered and whether it is on. Unticking everything leaves
+  the default model on instead of turning every model back on; a model that
+  leaves the list and comes back keeps its state; removing a Cursor,
+  DeepSeek, Claude API or OpenAI key and adding one again finds the models
+  as they were. When every model you turned on has left the list, the
+  default model stands in and the provider's tab says so. The pickers show
+  the same models after the upgrade as before.
+- **OpenAI models can be picked.** The Select Models OpenAI tab lists the
+  key's models with checkboxes, like the other providers; after the
+  upgrade all of them stay on.
+
+### Fixed
+
+- **gpt-image replies above about 3 MB were lost, and the turn was billed up
+  to five times.** The relay checked the base64 of a generated image with a
+  regular expression over the whole string. V8 stops optimising regexps once
+  a process has generated more than 1 MB of regexp code and holds more than
+  16 MB of executable memory, which a relay reaches after some uptime; the
+  unoptimised check then overflows V8's regexp stack at 4,194,304 characters
+  with "Maximum call stack size exceeded", the reply was answered as a
+  provider outage, and the queue retried the paid generation four more times
+  before "Relay timeout after 5 attempts". The base64 and data-URL checks on
+  the relay's image paths (OpenAI replies, generated images, edit
+  attachments) are character loops now; a reply the relay cannot process
+  after the provider answered 2xx fails the message at once, with the reason
+  and a note that the generation was billed, instead of being requeued, and
+  the error is logged with its stack.
+
+### Upgrade notes
+
+- **The first Claude or Cursor chat after the update may wait.** The new
+  relay downloads the agent SDKs of the providers in use at its first start,
+  in the background, once: about 360–370 MB for Claude (345–350 MB on
+  macOS arm64) and 40–50 MB for Cursor. A chat that comes first shows
+  "Installing the … SDK" and runs once the download is done. A host that
+  cannot reach the npm registry, or a mirror set in its npm config, cannot
+  run Claude, Claude API, DeepSeek or Cursor chats on this version.
+- **Sessions still on 0.9.23's worker wait one worker start.** A session
+  whose worker still runs the old code is given a new worker before its
+  next message, so the first message after the update waits for that start
+  instead of failing.
+- **No migration.** As before, the relay copies its database to the
+  backups folder before the first start of a new version.
+- **Going back to 0.9.23** needs no database step. Install it with
+  `npm install -g --allow-scripts=koffi @oar-sh/oar@0.9.23` (in a git
+  checkout: `git checkout v0.9.23`, then `npm ci`). 0.9.23 does not use
+  `sdks/` in the state root; delete it once no 0.9.24 relay runs. Model
+  choices made on 0.9.24 do not go back with it: for Claude, Claude API,
+  Cursor, Grok and DeepSeek, 0.9.23 shows the models that were on at the
+  update, and OpenAI offers every model again; Copilot keeps its choices.
+
 ## [0.9.23] — 2026-11-07
 
 Highlights: a dependency round. The Copilot, Claude and Cursor SDKs, zod,

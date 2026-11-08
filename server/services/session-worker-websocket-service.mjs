@@ -132,6 +132,11 @@ export function createSessionWorkerWebSocketService({
   // ready: (sessionId, buildId, pid). The registry keeps it, so the relay can
   // tell a worker on older code from one that runs what the relay runs.
   onWorkerBuildId = () => {},
+  // A worker said hello: ({ sessionId, pid, kind, buildId }), with what the
+  // socket knows of it. Called before the hello's own request for work, so
+  // the relay can register the process and fence it first (a stale worker
+  // reconnecting to a new relay: the worker recycle).
+  onWorkerHello = () => {},
   // The relay's own build id, sent in every server.hello so a worker can log
   // that it runs other code; null leaves the key out.
   buildId = null,
@@ -572,6 +577,16 @@ export function createSessionWorkerWebSocketService({
         meta.ready = payload.ready !== false;
         meta.lastHelloAt = nowIso();
         noteHeartbeat(meta, 'worker-hello');
+        if (meta.sessionId) {
+          try {
+            onWorkerHello({
+              sessionId: meta.sessionId,
+              pid: meta.pid || null,
+              kind: meta.workerKind || null,
+              buildId: meta.workerBuildId || null,
+            });
+          } catch {}
+        }
         emitEvent(ws, serverHello('ack', meta.sessionId));
         void maybeDeliverToSocket(ws, 'worker-hello');
         return;

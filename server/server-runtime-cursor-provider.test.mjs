@@ -101,7 +101,10 @@ test('shared route deps export the cursor settings trio', () => {
     'const sharedRouteDeps = {',
     '\nregisterMessagesRoutes(app, sharedRouteDeps);',
   );
-  assert.match(depsSource, /\n  getCursorProviderSettings,\n  setCursorProviderSettings,\n  refreshCursorProviderModels,\n/);
+  // The refresh goes out wrapped, so every caller resets Cursor's refresh
+  // clock; a save that leaves Cursor enabled installs its SDK.
+  assert.match(depsSource, /\n  getCursorProviderSettings,\n  setCursorProviderSettings: withAgentSdkSetup\(setCursorProviderSettings, 'cursor', [^\n]*\),\n  refreshCursorProviderModels: trackedModelRefreshers\.refreshCursorProviderModels,\n/);
+  assert.match(source, /refreshCursorProviderModels: modelRefreshLedger\.track\('cursor', refreshCursorProviderModels\),/);
 });
 
 test('cursor model discovery is timeout-guarded around @cursor/sdk', () => {
@@ -109,7 +112,8 @@ test('cursor model discovery is timeout-guarded around @cursor/sdk', () => {
     'async function refreshCursorProviderModels(',
     '\nconst DEFAULT_CONFIG',
   );
-  assert.match(refreshSource, /await import\('@cursor\/sdk'\)/);
+  // The SDK the relay installed (agent-sdk-loader.mjs).
+  assert.match(refreshSource, /await loadAgentSdk\('cursor'\)/);
   assert.match(refreshSource, /CURSOR_MODEL_DISCOVERY_TIMEOUT_MS/);
   assert.match(source, /const CURSOR_MODEL_DISCOVERY_TIMEOUT_MS = 20_000;/);
 });
@@ -190,24 +194,28 @@ test('cursor settings expose per-model efforts with a none-first ladder', () => 
   assert.equal(effortDeletes.length, 2);
 });
 
-test('cursor settings honor the Select Models enabled subset', () => {
+test('cursor settings honor the models Select Models turned on', () => {
   assert.match(source, /const CURSOR_ENABLED_MODELS_SETTING_KEY = 'cursor_enabled_models';/);
   const settingsSource = sliceBetween(
     'function getCursorProviderSettings() {',
     '\nfunction setCursorProviderSettings(',
   );
-  // The enabled subset is filtered against the discovered list, and an empty
-  // selection falls back to every available model (mirrors Claude).
-  assert.match(settingsSource, /isSafeCursorModelId\(modelId\) && availableSet\.has\(modelId\)/);
-  assert.match(settingsSource, /\.\.\.\(enabledSelection\.length \? enabledSelection : availableModels\),/);
+  // The model map decides, built once from the old allowlist; the default
+  // model always stays on and an empty selection never means "all".
+  assert.match(settingsSource, /providerModelState\.resolve\('cursor', \{/);
+  assert.match(settingsSource, /legacyAllowlist: \(\) => \{[\s\S]*?CURSOR_ENABLED_MODELS_SETTING_KEY/);
   assert.match(settingsSource, /availableModels,[\s\S]{0,80}?enabledModels: resolvedModels,/);
   const updateSource = sliceBetween(
     'function setCursorProviderSettings(',
     '\nconst CURSOR_MODEL_DISCOVERY_TIMEOUT_MS',
   );
-  assert.match(updateSource, /CURSOR_ENABLED_MODELS_SETTING_KEY, JSON\.stringify\(normalizedEnabledModels\)/);
-  // Key removal clears the subset along with the discovered models.
-  assert.match(updateSource, /stmts\.deleteAppSetting\.run\(CURSOR_ENABLED_MODELS_SETTING_KEY\);\n\s*stmts\.deleteAppSetting\.run\(CURSOR_MODEL_EFFORTS_SETTING_KEY\);/);
+  assert.match(updateSource, /providerModelState\.select\('cursor', \{/);
+  assert.doesNotMatch(updateSource, /CURSOR_ENABLED_MODELS_SETTING_KEY/);
+  // Key removal keeps the map: a key added again finds its models as they were.
+  assert.match(updateSource, /stmts\.deleteAppSetting\.run\(CURSOR_MODELS_SETTING_KEY\);\n\s*stmts\.deleteAppSetting\.run\(CURSOR_MODEL_EFFORTS_SETTING_KEY\);/);
+  const discoverySource = sliceBetween('async function refreshCursorProviderModels(', '\nfunction readGrokModelListSetting(');
+  assert.match(discoverySource, /providerModelState\.reconcile\('cursor', \{ availableModels: getCursorProviderSettings\(\)\.availableModels \}\)/);
+  assert.match(discoverySource, /return \{ ok: true, models, newModels: added, error: null \};/);
 });
 
 test('shared route deps export the cursor session-root resolver', () => {

@@ -853,25 +853,31 @@ test('a relay that did not come up beside a held lock: stop its relay when the h
   const relay = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });
   t.after(() => relay.kill());
   await new Promise((resolve) => relay.once('spawn', resolve));
+  // Unknown: a live Node process the lock records no identity for, since
+  // this boot (on Windows a lock from before it, or a pid that runs another
+  // program, would be stale).
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });
+  t.after(() => other.kill());
+  await new Promise((resolve) => other.once('spawn', resolve));
   const cases = [
-    { pid: relay.pid, holder: processIdentity(relay.pid), alive: undefined },
-    { pid: 5252, holder: null, alive: (pid) => pid === 5252 },
+    { pid: relay.pid, holder: processIdentity(relay.pid), startedAt: '2026-10-21T08:00:00.000Z' },
+    { pid: other.pid, holder: null, startedAt: new Date().toISOString() },
   ];
   const outputs = [];
-  for (const { pid, holder, alive } of cases) {
+  for (const { pid, holder, startedAt } of cases) {
     const install = makeInstall(t, { config: EXISTING });
     const lockPath = path.join(install.stateRoot, 'data', 'relay-server.lock');
     fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-    fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid, tokenHash: 'x', startedAt: '2026-10-21T08:00:00.000Z', holder }));
-    // No isProcessAliveImpl for the known one: the CLI's own check.
-    const result = await runStart(install.options({ isProcessAliveImpl: alive, readyWaitMs: 100 }));
+    fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid, tokenHash: 'x', startedAt, holder }));
+    // The CLI's own check, not the harness's stand-in.
+    const result = await runStart(install.options({ isProcessAliveImpl: undefined, readyWaitMs: 100 }));
     assert.deepEqual(result, { code: 1, reason: 'server-not-ready' });
     outputs.push({ install, lockPath, pid });
   }
   const [known, unknown] = outputs;
   assert.ok(known.install.lines.some((line) => line.includes(`The lock ${known.lockPath} is held by relay process ${known.pid} (started 2026-10-21T08:00:00.000Z): oar stop, or end process ${known.pid}.`)), known.install.output());
   assert.doesNotMatch(known.install.output(), /delete/);
-  assert.ok(unknown.install.lines.some((line) => line.includes(`The lock ${unknown.lockPath} names process 5252, which cannot be told to be a relay: if no relay is running, end process 5252 or delete the lock.`)), unknown.install.output());
+  assert.ok(unknown.install.lines.some((line) => line.includes(`The lock ${unknown.lockPath} names process ${unknown.pid}, which cannot be told to be a relay: if no relay is running, end process ${unknown.pid} or delete the lock.`)), unknown.install.output());
 });
 
 test('stop asks the relay to stop and waits until its port is closed', async (t) => {

@@ -12,7 +12,7 @@ import {
   tailOf,
 } from './cli-process-runner.mjs';
 import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from './native-addon-build-service.mjs';
-import { NPM_ALLOW_SCRIPTS_ARG, resolveNpmInvocation } from './oar-cli-helpers.mjs';
+import { resolveNpmInvocation } from './oar-cli-helpers.mjs';
 import { compareSemverIsh, parseSemverIsh } from '../../shared/update-semver.mjs';
 
 // Applies an OAR self-update: `npm i -g @oar-sh/oar@<version>` with the log
@@ -227,7 +227,7 @@ export function createUpdateInstallService({
     // (args are fixed strings + a validated semver, so no injection surface).
     const npm = resolveNpmInvocation({ execPath, packageRoot, platform, env, existsImpl });
     const command = npm.command;
-    const args = ['install', '-g', ...npm.prefixArgs, NPM_ALLOW_SCRIPTS_ARG, `${UPDATE_PACKAGE_NAME}@${target}`];
+    const args = ['install', '-g', ...npm.prefixArgs, `${UPDATE_PACKAGE_NAME}@${target}`];
     const result = await runToCompletion(
       () => spawnImpl(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],

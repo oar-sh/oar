@@ -21,6 +21,7 @@ import {
 } from './model-variant-catalog-service.mjs';
 import { buildModelSnapshotFields, extractModelDescriptors } from '../../shared/model-descriptors.mjs';
 import { sortCopilotModels } from '../../shared/copilot-model-order.mjs';
+import { createProviderModelStateStore } from './provider-model-state.mjs';
 
 const FIXTURE = JSON.parse(fs.readFileSync(new URL('../../shared/fixtures/copilot-catalog-raw-2026-09-07.json', import.meta.url), 'utf8'));
 const CURATED = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'claude-sonnet-4.6', 'claude-haiku-4.5'];
@@ -379,4 +380,130 @@ test('authoritative sources are the runtime-backed publishers only', () => {
   for (const source of ['bootstrap', 'rpc-snapshot', 'help-fallback', 'manual-refresh', '']) {
     assert.equal(AUTHORITATIVE_SNAPSHOT_SOURCE_RE.test(source), false, source);
   }
+});
+
+// ─── The Copilot model map ──────────────────────────────────────────────────
+
+function bootServiceWithModelState({ settings = new Map(), newModels = [], snapshots = [] } = {}) {
+  const store = createProviderModelStateStore({
+    readSetting: (key) => settings.get(key) ?? '',
+    writeSetting: (key, value) => { settings.set(key, String(value)); },
+  });
+  const database = new Database(':memory:');
+  applySchema(database);
+  const service = createModelVariantCatalogService({
+    defaultModel: 'gpt-5.4-mini',
+    curatedModelIds: CURATED,
+    modelStateStore: store,
+    onNewModels: (ids, on) => newModels.push({ ids, on }),
+    onAuthoritativeSnapshot: ({ source }) => snapshots.push(source),
+  });
+  service.updateModelCatalog({ models: ['gpt-5.4-mini'], currentModel: 'gpt-5.4-mini', defaultModel: 'gpt-5.4-mini', source: 'bootstrap' });
+  service.bindDatabase(database);
+  return { service, store, settings, newModels, snapshots };
+}
+
+const enabledOf = (service, variantId) => service.listModelVariantRows().find((row) => row.variantId === variantId)?.enabled;
+
+test('model map: the upgrade knows the table and keeps what is visible', () => {
+  const { service, store } = bootServiceWithModelState();
+  const state = store.readCopilot();
+  assert.deepEqual(state.knownModels, [...new Set(service.listModelVariantRows().map((row) => row.baseModelId))]);
+  assert.deepEqual(state.disabledVariants, []);
+  assert.equal(state.autoEnableNew, true);
+  assert.deepEqual(service.getCopilotModelState(), { autoEnableNew: true, unseen: [] });
+});
+
+test('model map: a whole new model follows the switch, is flagged new and reported', () => {
+  const { service, newModels, snapshots } = bootServiceWithModelState();
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-test-new'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(enabledOf(service, 'gpt-test-new-none'), true);
+  assert.deepEqual(service.getCopilotModelState().unseen, ['gpt-test-new']);
+  assert.deepEqual(newModels, [{ ids: ['gpt-test-new'], on: true }]);
+  assert.deepEqual(snapshots, ['copilot-sdk-worker:session-start']);
+  assert.equal(service.markCopilotModelsSeen(), true);
+  assert.deepEqual(service.getCopilotModelState().unseen, []);
+  assert.equal(service.markCopilotModelsSeen(), false);
+
+  service.setCopilotAutoEnableNew(false);
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-test-new', 'gpt-test-other'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(enabledOf(service, 'gpt-test-other-none'), false);
+  assert.deepEqual(newModels.at(-1), { ids: ['gpt-test-other'], on: false });
+});
+
+test('model map: a new effort row follows the model\'s other rows', () => {
+  const { service } = bootServiceWithModelState();
+  service.setEnabledModelVariants(['gpt-5.4-mini-low']);
+  const metadata = (efforts) => ({ 'gpt-5.4-mini': { supportedEfforts: efforts }, 'gpt-5.4': { supportedEfforts: efforts } });
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-5.4'], modelMetadataByModel: metadata(['low']), source: 'copilot-sdk-worker:session-start' });
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-5.4'], modelMetadataByModel: metadata(['low', 'minimal']), source: 'copilot-sdk-worker:session-start' });
+  // gpt-5.4-mini has its low row on: the new minimal row starts on.
+  assert.equal(enabledOf(service, 'gpt-5.4-mini-minimal'), true);
+  // gpt-5.4 has every row off: its new minimal row starts off.
+  assert.equal(enabledOf(service, 'gpt-5.4-minimal'), false);
+});
+
+test('model map: a row turned off and pruned comes back off; turned on, it is forgotten', () => {
+  const { service, store } = bootServiceWithModelState();
+  service.setEnabledModelVariants(['gpt-5.4-mini-none', 'gpt-5.4-none']);
+  assert.ok(store.readCopilot().disabledVariants.includes('gpt-5.3-codex-none'));
+  // The runtime stops listing gpt-5.3-codex: its disabled rows are pruned.
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-5.4'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(service.listModelVariantRows().some((row) => row.baseModelId === 'gpt-5.3-codex'), false);
+  // It comes back: still off, and not new.
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.3-codex'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(enabledOf(service, 'gpt-5.3-codex-none'), false);
+  assert.deepEqual(service.getCopilotModelState().unseen, []);
+  service.setEnabledModelVariants(['gpt-5.4-mini-none', 'gpt-5.3-codex-none']);
+  assert.equal(store.readCopilot().disabledVariants.includes('gpt-5.3-codex-none'), false);
+  assert.ok(store.readCopilot().disabledVariants.includes('gpt-5.4-none'));
+});
+
+test('model map: an empty selection is refused and changes nothing', () => {
+  const { service } = bootServiceWithModelState();
+  const before = rowSummary(service);
+  service.setEnabledModelVariants([]);
+  assert.deepEqual(rowSummary(service), before);
+});
+
+test('without a model map new rows start off as before', () => {
+  const { service } = bootService();
+  service.updateModelCatalog({ models: ['gpt-5.4-mini', 'gpt-test-new'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(enabledOf(service, 'gpt-test-new-none'), false);
+  assert.deepEqual(service.getCopilotModelState(), { autoEnableNew: false, unseen: [] });
+});
+
+test('model map: a save changes only the rows it showed; a row a refresh added meanwhile stays on', () => {
+  const { service } = bootServiceWithModelState();
+  // The modal draws the seed rows of gpt-5.4-mini and gpt-5.4 …
+  const shown = service.listModelVariantRows()
+    .filter((row) => row.baseModelId === 'gpt-5.4-mini' || row.baseModelId === 'gpt-5.4')
+    .map((row) => row.variantId);
+  // … then a snapshot adds a model (switch on) before the user saves.
+  service.updateModelCatalog({ models: [...CURATED, 'gpt-test-new'], source: 'copilot-sdk-worker:session-start' });
+  assert.equal(enabledOf(service, 'gpt-test-new-none'), true);
+  // The save the modal sends: what it drew, gpt-5.4 unticked; the full list it knew.
+  const known = service.listModelVariantRows().filter((row) => row.baseModelId !== 'gpt-test-new' && row.baseModelId !== 'gpt-5.4').map((row) => row.variantId);
+  service.setEnabledModelVariants(known, { shownVariantIds: shown });
+  assert.equal(enabledOf(service, 'gpt-test-new-none'), true, 'not shown: kept on');
+  assert.equal(enabledOf(service, 'gpt-5.4-none'), false, 'shown and unticked: off');
+  assert.equal(enabledOf(service, 'gpt-5.4-mini-none'), true);
+});
+
+test('model map: a save right after a snapshot, before the re-render, leaves the new rows alone', () => {
+  const { service, store } = bootServiceWithModelState();
+  service.setCopilotAutoEnableNew(false);
+  service.updateModelCatalog({ models: [...CURATED, 'gpt-test-new'], source: 'copilot-sdk-worker:session-start' });
+  // Turned on elsewhere meanwhile.
+  service.setEnabledModelVariants([...service.listEnabledModelVariantRows().map((row) => row.variantId), 'gpt-test-new-high'],
+    { shownVariantIds: ['gpt-test-new-high'] });
+  // This page saves only the Copilot rows it drew, which never included gpt-test-new.
+  const drawn = service.listModelVariantRows().filter((row) => row.baseModelId === 'gpt-5.4-mini').map((row) => row.variantId);
+  service.setEnabledModelVariants(drawn, { shownVariantIds: drawn });
+  assert.equal(enabledOf(service, 'gpt-test-new-high'), true);
+  assert.equal(enabledOf(service, 'gpt-test-new-low'), false);
+  assert.equal(store.readCopilot().disabledVariants.includes('gpt-test-new-high'), false);
+  // Without a shown list (an older page) the list is the whole set, as before.
+  service.setEnabledModelVariants(['gpt-5.4-mini-none']);
+  assert.equal(enabledOf(service, 'gpt-test-new-high'), false);
 });

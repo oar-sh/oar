@@ -99,11 +99,15 @@ export async function runDirectOpenAIImageTurn({
       attachments: Array.isArray(message?.attachments) ? message.attachments : [],
     }, requestOptions);
   } catch (error) {
-    if (isDirectOpenAIImageTerminalStatus(error?.status)) {
-      const terminalError = new Error(
-        `OpenAI image request failed: ${error?.detail || `HTTP ${error?.status || 'error'}`}`,
-      );
+    // `relayProcessing`: the provider answered 2xx and the relay could not
+    // process the reply; the generation is billed, so no requeue either.
+    const relayProcessing = error?.body?.relayProcessing === true;
+    if (isDirectOpenAIImageTerminalStatus(error?.status) || relayProcessing) {
+      const terminalError = new Error(relayProcessing
+        ? `The relay could not process the image OpenAI returned (${error?.detail || 'unknown error'}). The generation was billed; the message was not retried.`
+        : `OpenAI image request failed: ${error?.detail || `HTTP ${error?.status || 'error'}`}`);
       terminalError.code = OPENAI_IMAGE_TERMINAL_CODE;
+      terminalError.relayProcessing = relayProcessing;
       terminalError.status = error?.status;
       terminalError.detail = error?.detail || null;
       throw terminalError;

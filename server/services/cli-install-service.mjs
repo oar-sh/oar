@@ -70,8 +70,9 @@ const GENERIC_VERSION_PATTERN = /(\d+\.\d+(?:\.\d+)*)/;
 /**
  * The frozen descriptor table: the only place an install command exists.
  *
- * Cursor is deliberately absent — `@cursor/sdk` is a pure npm package and the
- * relay never invokes a `cursor-agent` binary, so an install button there would
+ * Cursor is deliberately absent — `@cursor/sdk` is an npm package the relay
+ * installs on demand (agent-sdk-store.mjs) and the relay never invokes a
+ * `cursor-agent` binary, so an install button there would
  * install a CLI nothing runs (plan §2.4). Adding it back later is a data change
  * here, not a code change.
  *

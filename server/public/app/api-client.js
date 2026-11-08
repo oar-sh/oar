@@ -331,6 +331,8 @@ export async function updateClaudeSettings({
   enabled = undefined,
   model = undefined,
   enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
   attributionMode = undefined,
   backgroundCommandLimitMinutes = undefined,
 } = {}) {
@@ -338,6 +340,8 @@ export async function updateClaudeSettings({
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+  if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   if (typeof attributionMode === 'string' && attributionMode.trim()) payload.attributionMode = attributionMode.trim();
   if (Number.isFinite(backgroundCommandLimitMinutes)) payload.backgroundCommandLimitMinutes = backgroundCommandLimitMinutes;
   return settingsRequest('/api/settings/claude', payload, 'Failed to update Claude settings');
@@ -393,6 +397,25 @@ export async function cancelCliInstall() {
   return settingsRequest('/api/cli/install/cancel', null, 'Failed to cancel the CLI install');
 }
 
+// Agent SDKs the relay installs on demand. As for the CLIs, the body carries
+// only an SDK id, which the relay looks up in its own table.
+export async function getAgentSdkStatus() {
+  return apiFetch('/api/agent-sdks/status');
+}
+
+export async function startAgentSdkInstall(sdk, { reinstall = false } = {}) {
+  return settingsRequest(
+    '/api/agent-sdks/install',
+    { sdk: String(sdk || ''), reinstall: reinstall === true },
+    'Failed to start the SDK install',
+  );
+}
+
+// Stops a running install, and dismisses a failure otherwise.
+export async function cancelAgentSdkInstall(sdk) {
+  return settingsRequest('/api/agent-sdks/install/cancel', { sdk: String(sdk || '') }, 'Failed to cancel the SDK install');
+}
+
 // Grok account auth (Sign in / Sign out). One route shorter than Claude's: the
 // device code rides in the authorize URL and the CLI polls x.ai itself, so
 // nothing is ever pasted back through the relay.
@@ -424,11 +447,15 @@ export async function updateGrokSettings({
   enabled = undefined,
   model = undefined,
   enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
 } = {}) {
   const payload = {};
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+  if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   return settingsRequest('/api/settings/grok', payload, 'Failed to update Grok settings');
 }
 
@@ -493,18 +520,26 @@ export async function loadClaudeCloudBranches(repo) {
 
 export async function updateOpenAISettings({
   apiKey = '',
-  model = 'gpt-4o',
+  model = undefined,
   baseUrl = undefined,
   enabled = undefined,
+  enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
   remove = false,
 } = {}) {
   const payload = {
     apiKey: String(apiKey || '').trim(),
-    model: String(model || '').trim() || 'gpt-4o',
     remove: remove === true,
   };
+  // Every Settings call names the model; the Select Models save does not, and
+  // must not reset the default model to gpt-4o.
+  if (model !== undefined) payload.model = String(model || '').trim() || 'gpt-4o';
   if (typeof baseUrl === 'string') payload.baseUrl = String(baseUrl).trim();
   if (typeof enabled === 'boolean') payload.enabled = enabled;
+  if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+  if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   return settingsRequest('/api/settings/openai', payload, 'Failed to update OpenAI settings');
 }
 
@@ -517,6 +552,8 @@ export async function updateCursorSettings({
   model = undefined,
   enabled = undefined,
   enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
   remove = false,
 } = {}) {
   const payload = {
@@ -528,6 +565,8 @@ export async function updateCursorSettings({
   if (typeof model === 'string' && model.trim()) payload.model = model.trim();
   if (typeof enabled === 'boolean') payload.enabled = enabled;
   if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+  if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+  if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   return settingsRequest('/api/settings/cursor', payload, 'Failed to update Cursor settings');
 }
 
@@ -546,6 +585,8 @@ export async function updateDeepSeekSettings({
   model = undefined,
   enabled = undefined,
   enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
   baseUrl = undefined,
   attribution = undefined,
   monthlyBudget = undefined,
@@ -563,6 +604,8 @@ export async function updateDeepSeekSettings({
     if (typeof model === 'string' && model.trim()) payload.model = model.trim();
     if (typeof enabled === 'boolean') payload.enabled = enabled;
     if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+    if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+    if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
     if (baseUrl === null || typeof baseUrl === 'string') payload.baseUrl = baseUrl === null ? null : String(baseUrl).trim();
     if (typeof attribution === 'string' && attribution.trim()) payload.attribution = attribution.trim();
     if (monthlyBudget === null || (typeof monthlyBudget === 'number' && Number.isFinite(monthlyBudget))) payload.monthlyBudget = monthlyBudget;
@@ -590,6 +633,8 @@ export async function updateClaudeApiSettings({
   model = undefined,
   enabled = undefined,
   enabledModels = undefined,
+  shownModels = undefined,
+  autoEnableNew = undefined,
   monthlyCapUsd = undefined,
   remove = false,
 } = {}) {
@@ -602,6 +647,8 @@ export async function updateClaudeApiSettings({
     if (typeof model === 'string' && model.trim()) payload.model = model.trim();
     if (typeof enabled === 'boolean') payload.enabled = enabled;
     if (Array.isArray(enabledModels)) payload.enabledModels = enabledModels;
+    if (Array.isArray(shownModels)) payload.shownModels = shownModels;
+    if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
     if (monthlyCapUsd === null || (typeof monthlyCapUsd === 'number' && Number.isFinite(monthlyCapUsd))) payload.monthlyCapUsd = monthlyCapUsd;
   }
   return settingsRequest('/api/settings/claude-api', payload, 'Failed to update Claude API settings');
@@ -940,14 +987,50 @@ export async function refreshModelVariantCatalog() {
   return apiFetch('/api/model-variants/refresh', { method: 'POST' });
 }
 
-export async function saveEnabledModelVariants(enabledVariantIds = []) {
+/**
+ * Copilot's selection and its "Turn new models on automatically". A null
+ * list leaves the selection alone (only the switch changes): an empty one is
+ * refused, at least one variant stays on. `shownVariantIds` names the rows
+ * the save could see: the relay turns only those on or off.
+ */
+export async function saveEnabledModelVariants(enabledVariantIds = [], { autoEnableNew = undefined, shownVariantIds = undefined } = {}) {
+  const payload = {};
+  if (enabledVariantIds !== null) {
+    payload.enabledVariantIds = Array.isArray(enabledVariantIds)
+      ? enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+  }
+  if (Array.isArray(shownVariantIds)) {
+    payload.shownVariantIds = shownVariantIds.map((value) => String(value || '').trim()).filter(Boolean);
+  }
+  if (typeof autoEnableNew === 'boolean') payload.autoEnableNew = autoEnableNew;
   return apiFetch('/api/model-variants', {
     method: 'PATCH',
-    body: JSON.stringify({
-      enabledVariantIds: Array.isArray(enabledVariantIds)
-        ? enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
-        : [],
-    }),
+    body: JSON.stringify(payload),
+  });
+}
+
+// Opening Select Models clears every provider's "New" tags and the menu dot;
+// answers `{ ok, unseenNewModelCount }`.
+export async function markModelsSeen() {
+  return apiFetch('/api/model-variants/seen', { method: 'POST' });
+}
+
+// Settings › General › Models: the background check for new models. A failed
+// read throws with the relay's reason, which the section shows.
+export async function loadModelRefreshSettings() {
+  return apiFetchOrThrow('/api/model-refresh-settings');
+}
+
+/** Any of `{ auto, intervalHours, excluded }`; a refused value throws with the relay's reason. */
+export async function updateModelRefreshSettings(patch = {}) {
+  const payload = {};
+  if (typeof patch.auto === 'boolean') payload.auto = patch.auto;
+  if (patch.intervalHours !== undefined) payload.intervalHours = Number(patch.intervalHours);
+  if (Array.isArray(patch.excluded)) payload.excluded = patch.excluded.map((value) => String(value || '').trim()).filter(Boolean);
+  return apiFetchOrThrow('/api/model-refresh-settings', {
+    method: 'POST',
+    body: JSON.stringify(payload),
   });
 }
 

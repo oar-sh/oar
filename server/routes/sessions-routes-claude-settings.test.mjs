@@ -12,6 +12,15 @@ import {
 } from './sessions-routes.mjs';
 import { claudeBackgroundCommandLimitSettingsFields } from '../../shared/claude-background-command-limit.mjs';
 
+test('the provider parsers pass the Select Models switch on', async () => {
+  const { parseCursorSettingsUpdateRequest, parseGrokSettingsUpdateRequest } = await import('./sessions-routes.mjs');
+  assert.deepEqual(parseClaudeSettingsUpdateRequest({ autoEnableNew: false }), { ok: true, autoEnableNew: false });
+  assert.deepEqual(parseGrokSettingsUpdateRequest({ enabledModels: [], autoEnableNew: true }), { ok: true, enabledModels: [], autoEnableNew: true });
+  assert.equal(parseCursorSettingsUpdateRequest({ autoEnableNew: true }).autoEnableNew, true);
+  // Anything but a boolean is not a switch.
+  assert.equal(parseClaudeSettingsUpdateRequest({ autoEnableNew: 'true' }).ok, false);
+});
+
 test('parseClaudeSettingsUpdateRequest requires at least one field', () => {
   assert.equal(parseClaudeSettingsUpdateRequest({}).ok, false);
   assert.equal(parseClaudeSettingsUpdateRequest({ enabled: true }).ok, true);

@@ -20,13 +20,13 @@ A conversation that has no message and nothing queued yet is moved back to Copil
 
 ## What the agent SDKs contact
 
-OAR itself sends nothing anywhere but the update check, which is off until you enable it (see [Security notes](security.md)). The three agent SDKs it ships, and the CLIs they bundle, talk to their own services from the relay host whenever a chat of theirs runs:
+OAR itself sends nothing anywhere but the update check, which is off until you enable it (see [Security notes](security.md)). The three agent SDKs it runs, and the CLIs that come with them, talk to their own services from the relay host whenever a chat of theirs runs:
 
-- **Copilot** (`@github/copilot-sdk`, which brings the Copilot CLI): GitHub's Copilot service, on the host's Copilot CLI login. OpenAI (BYOK) chats run the same runtime against the OpenAI-compatible endpoint you configured.
+- **Copilot** (the Copilot CLI and the SDK that comes with it): GitHub's Copilot service, on the host's Copilot CLI login. OpenAI (BYOK) chats run the same runtime against the OpenAI-compatible endpoint you configured.
 - **Claude, Claude API and DeepSeek** (`@anthropic-ai/claude-agent-sdk`, which brings Claude Code): Anthropic's API, on the host's Claude login or on the Claude API key; DeepSeek chats on DeepSeek's endpoint instead. In Claude and Claude API chats Claude Code also makes its own calls to Anthropic (update checks, telemetry, error reports) as it does anywhere; a DeepSeek chat switches those off (see [DeepSeek](#deepseek)).
-- **Cursor** (`@cursor/sdk`): Cursor's backend (`api2.cursor.sh`), on your Cursor API key; the agent runs there, and its tools run on the relay host through the SDK. The SDK carries Statsig's JavaScript client, a dependency it pins, to read feature flags; in the version OAR ships, that client starts with its event logging off and its own network traffic blocked, and takes its flags from Cursor's backend. Package scanners still list it as telemetry. There is no setting to leave it out short of not installing the SDK.
+- **Cursor** (`@cursor/sdk`): Cursor's backend (`api2.cursor.sh`), on your Cursor API key; the agent runs there, and its tools run on the relay host through the SDK. The SDK carries Statsig's JavaScript client, a dependency it pins, to read feature flags; in the version OAR ships, that client starts with its event logging off and its own network traffic blocked, and takes its flags from Cursor's backend. Package scanners still list it as telemetry. There is no setting to leave it out short of not using Cursor: the relay downloads the SDK only once Cursor is set up or used.
 
-All three are installed with OAR whether you use the provider or not.
+None of them comes in OAR's package. The Copilot CLI is yours to install, and the relay downloads the Claude and Cursor SDKs from npm only for a provider you set up or use (see [Agent SDKs](install.md#agent-sdks)).
 
 ## GitHub Copilot — engine choice
 
@@ -38,6 +38,8 @@ Copilot conversations, and OpenAI (BYOK) ones, run on one of two engines, chosen
 | ------ | --------- | ----- |
 | **SDK** (default) | A headless Node worker per conversation, driving the Copilot CLI's bundled SDK runtime | Needs only a Copilot CLI that is installed and signed in; there is no extension to install or keep in sync. This engine has [mid-turn steering](web-ui.md#while-a-turn-runs), the [background task panel](web-ui.md#background-tasks) with a working **Stop**, **Cancel** on a steered message the runtime has not picked up yet, and multi-select question cards, for every Copilot model, hosted or BYOK. There is no TUI: the tmux console shows the worker's log |
 | **Extension** | The Copilot CLI in a terminal session with OAR's web-relay extension loaded | The engine OAR started with. **🖥️ Inspect tmux console** shows the live Copilot TUI (Linux and macOS, with tmux). Messages sent during a turn queue behind it |
+
+Neither engine needs an SDK from npm, so the relay downloads nothing for Copilot: the SDK engine runs the SDK that comes with the Copilot CLI, and the extension's `@github/copilot-sdk/extension` import is resolved by the CLI that loads it.
 
 The SDK engine has been the default since 0.9.2. A relay where nobody has saved a choice uses it whenever it can and falls back to **Extension** when it cannot; a saved choice always wins. Saving **SDK** is refused, with the reason shown in place of the engine description, when:
 
@@ -67,6 +69,8 @@ Turn on **⚙️ Settings → Providers → Claude → Enable Claude for New Cha
 
 Claude turns run on the Claude Code build bundled with the Agent SDK, so they need no Claude Code CLI on the host. Once the CLI is installed or updated from the panel (see [below](#installing-a-provider-cli-from-the-relay)) and the relay has restarted, turns run on that CLI instead; `CLAUDE_CODE_EXECUTABLE` in the relay's environment names one too. The CLI itself is needed for the account row, **Relogin** and **Logout**, and for Claude Cloud's login.
 
+The Agent SDK, and the Claude Code build with it, is not part of OAR's package: the relay downloads it from npm after a Claude login, when you switch Claude on, or at the first Claude chat if it is still missing, and keeps it in the state root (about 360–370 MB; see [Agent SDKs](install.md#agent-sdks)). Claude API and DeepSeek chats use the same download. The **Claude Agent SDK** row in this tab shows its state and the pinned and installed version, with the install log and **Retry** or **Reinstall**.
+
 **Commit attribution.** Commits an agent makes in a Claude session end with `Co-authored-by: Open Agent Relay (<model>) <no-reply@oar.sh>` — the model's name in the parentheses, e.g. `Claude Fable 5.1` — and pull request bodies with `🤖 Generated with [Open Agent Relay](https://oar.sh)`. The same tab has the choice: **OAR** (default), **vanilla** (Claude Code's own `Co-Authored-By: Claude …` lines) or **off** (no attribution). A repo folder can override it for all of its Claude sessions from the **🧠** context modal. A change reaches a running session with its next message (a switch back to vanilla restarts the session's CLI between turns). [Claude Cloud](#claude-cloud) chats follow the same setting. Other providers are not affected: their tools have no such setting.
 
 **Background command limit.** **Claude background command limit** in the same tab (30 min to 8 h in 30-minute steps, default 2 h, saved with **Save Claude settings**) sets how long a command Claude runs in the background may take before Claude Code stops it, when Claude does not give the command a timeout of its own. Claude can still ask for up to 8 h for a single command. A command Claude runs in the foreground moves to the background after 2 minutes, so the turn goes on while it runs; commands that start with `sleep`, and commands of sub-agents, stay in the foreground and may then take up to the limit. Claude is also told the limit, to write the full output of long commands to a log file instead of piping it into `tail` or `head`, and to start runs that must survive a session restart detached with `nohup`. The CLI reads the limit when it starts: a change applies to Claude sessions started after you save, and a running session keeps its limit until it restarts. Claude Cloud chats are not affected.
@@ -78,7 +82,7 @@ The same panel manages the account itself. The row at the top names the signed-i
 
 If Claude has never been logged in on the host, running `claude` there once works too.
 
-Enabling Claude also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers (default model `claude-sonnet-5`). Use **🤗 Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled. Discovery runs the Claude Code build bundled with the Agent SDK, so `claude update` alone never surfaces a new Claude model: that arrives with an OAR update.
+Enabling Claude also runs model discovery against the Agent SDK and adds the discovered `claude-*` model IDs to the pickers (default model `claude-sonnet-5`). Use **🤗 Select Models → Claude SDK** to choose which of them appear in the composer; the configured default model always stays enabled. Discovery runs the Claude Code build bundled with the Agent SDK, so `claude update` alone never surfaces a new Claude model: that arrives with an OAR update, whose relay downloads the new Agent SDK when it starts.
 
 What Claude conversations support:
 
@@ -101,7 +105,7 @@ Differences from Copilot conversations:
 
 Claude chats on a Claude Console API key instead of your subscription. Paste the key in **⚙️ Settings → Providers → Claude API** and turn on **Enable Claude API for New Chat and the billing switch**. The key comes from the Console's [API keys](https://platform.claude.com/settings/keys) page. Any `sk-ant-` Console key is taken; Claude login and session tokens (`sk-ant-oat…`, `sk-ant-ort…`, `sk-ant-si…`, `sk-ant-cc…`) and Admin keys (`sk-ant-admin…`) are refused when you save. A key Anthropic itself refuses stays saved, and the tab's status line says so (`API key saved, but Anthropic refused it: …`) until a save or **Refresh models** goes through. Create the key inside a workspace: Anthropic answers a key that is not tied to one with HTTP 400 (naming the workspace in OAR is planned).
 
-The turns are billed to the Console organisation the key belongs to. A Claude API chat runs on the same Claude worker as a Claude chat, with the same tools, modes, question cards, sub-agents, steering, background tasks and `[1m]` long-context variants. Sub-agents, compaction, web search and Ultracode workflows run on the key too.
+The turns are billed to the Console organisation the key belongs to. A Claude API chat runs on the same Claude worker as a Claude chat, with the same tools, modes, question cards, sub-agents, steering, background tasks and `[1m]` long-context variants. Sub-agents, compaction, web search and Ultracode workflows run on the key too. That worker runs on the Claude Agent SDK, which the relay downloads when you save the key or switch Claude API on, unless a Claude or DeepSeek setup already did (see [Agent SDKs](install.md#agent-sdks)); the tab has the same **Claude Agent SDK** row as the Claude tab.
 
 **Models.** Saving the key asks Anthropic which models it may use (`GET /v1/models`), and so do switching Claude API on again and **Refresh models**. Until the first answer the tab offers the Claude tab's models; when a later call fails, the stored list stays. **🤗 Select Models → Claude API** chooses which of them appear in the composer. The default model is the Claude tab's default if the key offers it, else the first Sonnet, unless you choose another one on the tab.
 
@@ -207,6 +211,8 @@ Under the fields OAR warns about what the cloud clone will not have: commits tha
 
 Paste your Cursor API key in **⚙️ Settings → Providers → Cursor**; **Enable Cursor for New Chat model selection** is on once a key is saved. Saving the key runs model discovery and also discovers each model's supported reasoning-effort tiers; use **🤗 Select Models → Cursor SDK** to choose which models appear in the composer (the configured default model, `composer-2.5` unless you change it, always stays enabled).
 
+The Cursor SDK is not part of OAR's package: the relay downloads it from npm when you save the key, or at the first Cursor chat if it is still missing (40–50 MB; see [Agent SDKs](install.md#agent-sdks)). The **Cursor SDK** row in the tab shows its state and the pinned and installed version, with the install log and **Retry** or **Reinstall**. Cursor publishes no build for Windows on arm64, Android, 32-bit ARM or FreeBSD: there the row says *Not available on this platform*.
+
 What Cursor conversations support:
 
 - Per-message model and reasoning effort — effort tiers come from per-model discovery, and `none` means the model's default behavior
@@ -249,7 +255,7 @@ is `grok-4.5`), and question cards are not available — the protocol has no ask
 
 Paste your DeepSeek API key in **⚙️ Settings → Providers → DeepSeek**; **Enable DeepSeek for New Chat model selection** is on once a key is saved. Saving the key asks DeepSeek which models it serves (`GET /models`), and **🤗 Select Models → DeepSeek** chooses which of them appear in the composer. Without an answer from DeepSeek the tab offers `deepseek-flash` and `deepseek-v4-pro`. The default model is `deepseek-flash` unless you choose another one on the tab.
 
-A DeepSeek chat runs Claude Code on the relay host, the build bundled with the Agent SDK, against DeepSeek's [Anthropic-compatible API](https://api-docs.deepseek.com/guides/anthropic_api). The agent works in the chat's folder with Claude Code's tools, and DeepSeek's model does the thinking. The turns are billed to the DeepSeek account the key belongs to.
+A DeepSeek chat runs Claude Code on the relay host, the build bundled with the Agent SDK, against DeepSeek's [Anthropic-compatible API](https://api-docs.deepseek.com/guides/anthropic_api). The agent works in the chat's folder with Claude Code's tools, and DeepSeek's model does the thinking. The turns are billed to the DeepSeek account the key belongs to. The relay downloads the Agent SDK when you save the key, unless a Claude or Claude API setup already did (see [Agent SDKs](install.md#agent-sdks)); the tab has the same **Claude Agent SDK** row as the Claude tab.
 
 What DeepSeek conversations support:
 

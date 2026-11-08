@@ -1,4 +1,4 @@
-import { createSdkMcpServer, query } from '@anthropic-ai/claude-agent-sdk';
+import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 
 import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
@@ -8,6 +8,9 @@ import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-too
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
 import { createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
 import { CLAUDE_LIVE_FLAG_SETTINGS_CODE, CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE } from './claude-turn-failure.mjs';
+
+// The SDK the relay installed for this worker (agent-sdk-loader.mjs).
+const { createSdkMcpServer, query } = await loadAgentSdk('claude');
 
 export { CLAUDE_LIVE_FLAG_SETTINGS_CODE };
 

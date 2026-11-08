@@ -5,6 +5,8 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 
+import { agentSdkFromCheckout, findReadyAgentSdkDir, writeAgentSdkLease } from "./agent-sdk-paths.mjs";
+
 // An EPERM is a process this user may not signal: alive.
 export function defaultIsProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -17,11 +19,26 @@ export function defaultIsProcessAlive(pid) {
 }
 
 let processTimes;
+// koffi for the kernel call: a checkout's devDependency, else the copy the
+// relay installs on demand (any installed version will do). Throws while
+// there is none. The folder is leased once loaded: its binary stays mapped
+// for the life of the process.
+export function loadRelayKoffi({ env = process.env, fromCheckout = agentSdkFromCheckout("koffi", { env }) } = {}) {
+  if (fromCheckout) return createRequire(import.meta.url)("koffi");
+  const dir = findReadyAgentSdkDir("koffi", { env, anyVersion: true });
+  if (!dir) throw Object.assign(new Error("koffi is not installed yet"), { code: "ERR_MODULE_NOT_FOUND" });
+  const entry = path.join(dir, "entry.cjs");
+  const koffi = createRequire(entry)(entry);
+  writeAgentSdkLease(dir, { bootId: currentBootId() });
+  return koffi;
+}
+
 // When a process started, in ms, or null when that cannot be told. Windows
-// asks the kernel (GetProcessTimes through koffi, which the Copilot SDK
-// brings): PowerShell fails in ConstrainedLanguage mode and with a broken
-// TEMP. Elsewhere `ps`.
-export function processStartedAt(pid, { platform = process.platform } = {}) {
+// asks the kernel (GetProcessTimes through koffi): PowerShell fails in
+// ConstrainedLanguage mode and with a broken TEMP. Elsewhere `ps`. Without
+// koffi (Windows, until the relay installed it) null, which the lock checks
+// meet with unknownStartMayRun.
+export function processStartedAt(pid, { platform = process.platform, loadKoffi = loadRelayKoffi } = {}) {
   try {
     if (platform !== "win32") {
       // `lstart`, the full date; LC_ALL=C to parse; unparsable: cannot tell.
@@ -29,10 +46,11 @@ export function processStartedAt(pid, { platform = process.platform } = {}) {
       const ms = Date.parse(String(result.stdout || "").trim());
       return Number.isFinite(ms) ? ms : null;
     }
-    if (!processTimes) {
-      const koffi = createRequire(import.meta.url)("koffi");
+    if (processTimes?.loadKoffi !== loadKoffi) {
+      const koffi = loadKoffi();
       const kernel32 = koffi.load("kernel32.dll");
       processTimes = {
+        loadKoffi,
         open: kernel32.func("void * __stdcall OpenProcess(uint32_t access, bool inherit, uint32_t pid)"),
         times: kernel32.func("bool __stdcall GetProcessTimes(void *h, _Out_ uint64_t *a, _Out_ uint64_t *b, _Out_ uint64_t *c, _Out_ uint64_t *d)"),
         close: kernel32.func("bool __stdcall CloseHandle(void *h)"),
@@ -89,6 +107,40 @@ function sameStart(a, b) {
   return typeof a === "number" && typeof b === "number" ? Math.abs(a - b) <= 1000 : a === b;
 }
 
+// A Windows process's image name in lower case ("node.exe"), or null when it
+// cannot be told. tasklist, not PowerShell (see processStartedAt).
+export function processImageName(pid, { spawnSyncImpl = spawnSync } = {}) {
+  try {
+    const result = spawnSyncImpl("tasklist", ["/FI", `PID eq ${Number(pid)}`, "/FO", "CSV", "/NH"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+    const row = String(result?.stdout || "").split(/\r?\n/).find((line) => line.startsWith('"'));
+    const fields = (row?.match(/"[^"]*"/g) || []).map((field) => field.slice(1, -1));
+    if (fields.length < 2 || Number(fields[1]) !== Number(pid)) return null;
+    return fields[0].toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+// The image names a relay runs as: node.exe, or the Node it was started with.
+export function relayImageNames({ execPath = process.execPath, env = process.env } = {}) {
+  return new Set(["node.exe", path.win32.basename(String(execPath || "")), path.win32.basename(String(env?.COPILOT_WEB_RELAY_NODE || ""))]
+    .map((name) => name.toLowerCase())
+    .filter(Boolean));
+}
+
+// A live pid whose start cannot be told (Windows while koffi is not
+// installed): on Windows a lock written before the last boot, or whose pid
+// now runs another program than Node, is stale; else the pid holds it.
+// Without these a lock a crash or a reboot left behind, whose pid Windows
+// has handed on, would keep the relay from starting.
+function unknownStartMayRun(lock, pid, { platform, bootTime, imageNameOf, relayImages }) {
+  if (platform !== "win32") return true;
+  const lockedAt = Date.parse(String(lock?.startedAt || ""));
+  if (Number.isFinite(lockedAt) && lockedAt < bootTime) return false;
+  const image = imageNameOf(pid);
+  return !image || relayImages.has(image);
+}
+
 /**
  * Whether the relay a lock names may still run; true when that cannot be
  * told: better a refused start than two relays. A lock this version wrote
@@ -98,7 +150,8 @@ function sameStart(a, b) {
  * recorded (Linux) is not the running one. Only a lock without the format
  * (0.9.13's) goes by the clock, the one case a clock step can mislead:
  * written before the last boot, or older than the pid's process by more
- * than 5 s (a reused pid), it is stale.
+ * than 5 s (a reused pid), it is stale. A start that cannot be told goes
+ * through unknownStartMayRun.
  */
 export function lockHolderMayRun({
   lock,
@@ -107,20 +160,25 @@ export function lockHolderMayRun({
   bootIdOf = currentBootId,
   startedAtOf = processStartedAt,
   bootTime = Date.now() - os.uptime() * 1000,
+  platform = process.platform,
+  imageNameOf = processImageName,
+  relayImages = relayImageNames(),
 }) {
   const pid = Number.parseInt(String(lock?.pid ?? ""), 10);
   if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) return false;
+  const unknownStart = { platform, bootTime, imageNameOf, relayImages };
   if (lock?.format >= 2 || lock?.holder) {
     const current = lock.holder ? identityOf(pid) : null;
     const recordedBoot = lock.holder?.bootId || lock.bootId;
     const runningBoot = current?.bootId || bootIdOf();
     if (recordedBoot && runningBoot && recordedBoot !== runningBoot) return false;
-    return !current || sameStart(lock.holder.start, current.start);
+    return current ? sameStart(lock.holder.start, current.start) : unknownStartMayRun(lock, pid, unknownStart);
   }
   const lockedAt = Date.parse(String(lock?.startedAt || ""));
   if (Number.isFinite(lockedAt) && lockedAt < bootTime) return false;
   const startedAt = startedAtOf(pid);
-  if (Number.isFinite(lockedAt) && startedAt !== null && startedAt > lockedAt + 5000) return false;
+  if (startedAt === null) return unknownStartMayRun(lock, pid, unknownStart);
+  if (Number.isFinite(lockedAt) && startedAt > lockedAt + 5000) return false;
   return true;
 }
 
@@ -163,6 +221,10 @@ export function createRelaySingletonGuard({
   bootIdOf = currentBootId,
   startedAtOf = processStartedAt,
   bootTime = Date.now() - os.uptime() * 1000,
+  // What a pid runs, when its start cannot be told (unknownStartMayRun).
+  platform = process.platform,
+  imageNameOf = processImageName,
+  relayImages = relayImageNames(),
   // An unreadable lock is read again for `readRetryMs`; still unreadable,
   // it is stale only when its time is more than `unreadableStaleMs` off.
   readRetryMs = 2000,
@@ -321,7 +383,7 @@ export function createRelaySingletonGuard({
       // A lock from before the last boot, or whose pid now belongs to a
       // process started after it, is stale (a crash, a power loss, a forced
       // reboot): recovered below.
-      if (existingPid && lockHolderMayRun({ lock: existingLock, isProcessAlive: processAlive, identityOf, bootIdOf, startedAtOf, bootTime })) {
+      if (existingPid && lockHolderMayRun({ lock: existingLock, isProcessAlive: processAlive, identityOf, bootIdOf, startedAtOf, bootTime, platform, imageNameOf, relayImages })) {
         const owner = existingTokenHash && existingTokenHash === currentTokenHash
           ? "Relay already running"
           : "Relay appears to be owned by another live process";

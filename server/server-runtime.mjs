@@ -68,12 +68,15 @@ import { createClaudeCloudCredentials } from '../shared/claude-cloud/credentials
 import { createClaudeCloudClient } from '../shared/claude-cloud/api-client.mjs';
 import { resolveClaudeCloudBaseUrl } from '../shared/claude-cloud/base-url.mjs';
 import { createClaudeCloudSettingsService } from './services/claude-cloud-settings-service.mjs';
-import { createDeepSeekSettingsService } from './services/deepseek-settings-service.mjs';
+import { DEEPSEEK_API_KEY_SETTING_KEY, createDeepSeekSettingsService } from './services/deepseek-settings-service.mjs';
 import { createWorkerPostRedaction } from './services/worker-secret-redaction.mjs';
 import { createDeepSeekBalanceService } from './services/deepseek-balance-service.mjs';
 import { deepseekCardCurrency } from './services/plan-usage-deepseek.mjs';
 import { createDeepSeekUsageImportService } from './services/deepseek-usage-import.mjs';
-import { createClaudeApiSettingsService } from './services/claude-api-settings-service.mjs';
+import { CLAUDE_API_KEY_SETTING_KEY, createClaudeApiSettingsService } from './services/claude-api-settings-service.mjs';
+import { createProviderModelStateStore } from './services/provider-model-state.mjs';
+import { buildProviderRefreshTable, createModelRefreshLedger, createModelRefreshSettings, refreshProviderModels } from './services/provider-model-refresh.mjs';
+import { createModelRefreshScheduler } from './services/model-refresh-scheduler.mjs';
 import { createClaudeBillingSwitchService, normalizeClaudeBilling } from './services/claude-billing-switch-service.mjs';
 import { createClaudeBillingSwapService } from './services/claude-billing-swap-service.mjs';
 import { createWorkerReplacement, createWorkerReplacementFence } from './services/worker-replacement.mjs';
@@ -88,6 +91,10 @@ import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } fr
 import { createClaudeAccountUsageService } from './services/claude-account-usage-service.mjs';
 import { createGitRemoteService } from './services/git-remote-service.mjs';
 import { createCliInstallService, writeCliBinariesToConfigFile } from './services/cli-install-service.mjs';
+import { createAgentSdkStore } from './services/agent-sdk-store.mjs';
+import { createAgentSdkLaunchGate, staleWorkerLosesAgentSdk } from './services/agent-sdk-launch-gate.mjs';
+import { agentSdkFromCheckout } from './services/agent-sdk-paths.mjs';
+import { agentSdkDirEnvName, AgentSdkMissingError, loadAgentSdk, resolveAgentSdkSource, setAgentSdkStore } from './agent-sdk-loader.mjs';
 import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
 import webpush from 'web-push';
@@ -123,6 +130,7 @@ import { createActiveDeviceTracker } from './services/push-active-device-service
 import { registerPushRoutes } from './routes/push-routes.mjs';
 import { registerAboutRoutes } from './routes/about-routes.mjs';
 import { registerRelayRestartRoutes } from './routes/relay-restart-routes.mjs';
+import { registerAgentSdkRoutes } from './routes/agent-sdk-routes.mjs';
 import { createAboutService } from './services/about-service.mjs';
 import { resolveBuildId } from '../shared/build-id.mjs';
 import { createImageOperationService } from './services/image-operation-service.mjs';
@@ -137,7 +145,7 @@ import { createPlanUsageService } from './services/plan-usage-service.mjs';
 import { splitFreeAndBufferTokens } from './services/context-usage-view.mjs';
 import { normalizeCursorAllowanceSettings } from './services/plan-usage-cursor.mjs';
 import { normalizeGrokAllowanceSettings } from './services/plan-usage-grok.mjs';
-import { createGrokBillingUsageFetcher } from './services/grok-billing-usage.mjs';
+import { createGrokBillingUsageFetcher, readGrokCliAuthKey } from './services/grok-billing-usage.mjs';
 import { createCursorDashboardUsageFetcher, readCursorIdeSessionToken } from './services/cursor-dashboard-usage.mjs';
 import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
@@ -163,7 +171,7 @@ import { createRelayCliLauncherService } from './services/relay-cli-launcher-ser
 import { createSessionWorkerRegistry, normalizeWorkerKind } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
 import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
-import { applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli } from './services/session-worker-launch-service.mjs';
+import { agentSdkForWorkerKind, applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli, resolveWorkerKind } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -375,6 +383,29 @@ for (const dir of UPLOAD_READ_DIRS.slice(1)) {
   } catch {}
 }
 
+// Which models of OpenAI, Claude, Cursor and Grok are on (the DeepSeek and
+// Claude API services keep their maps the same way).
+const providerModelState = createProviderModelStateStore({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value, stamp) => stmts.upsertAppSetting.run(key, value, stamp),
+});
+// When each provider's models were last refreshed, by anything, and the new
+// models the next models_updated announces (provider-model-refresh.mjs).
+const modelRefreshLedger = createModelRefreshLedger({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value, stamp) => stmts.upsertAppSetting.run(key, value, stamp),
+  // What a provider's refresh error may echo: its key or token, cut out
+  // before the error is stored, shown in Settings or logged.
+  secretsFor: (provider) => ({
+    openai: () => [readAppSettingValue(OPENAI_API_KEY_SETTING_KEY)],
+    cursor: () => [readAppSettingValue(CURSOR_API_KEY_SETTING_KEY), readCursorDashboardSessionToken()],
+    deepseek: () => [readAppSettingValue(DEEPSEEK_API_KEY_SETTING_KEY)],
+    'claude-api': () => [readAppSettingValue(CLAUDE_API_KEY_SETTING_KEY)],
+    grok: () => [process.env.XAI_API_KEY, readGrokCliAuthKey()?.key],
+    claude: () => [process.env.ANTHROPIC_API_KEY],
+  }[provider]?.() || []),
+});
+
 async function refreshOpenAIProviderModels() {
   const settings = getOpenAIProviderSettings();
   if (!settings.enabled) return { ok: false, models: [], error: 'OpenAI API key is not configured' };
@@ -410,7 +441,8 @@ async function refreshOpenAIProviderModels() {
       .filter((modelId) => isOpenAIModelId(modelId)),
   ])).filter(Boolean);
   stmts.upsertAppSetting.run(OPENAI_MODELS_SETTING_KEY, JSON.stringify(models), new Date().toISOString());
-  return { ok: true, models, error: null };
+  const { added } = providerModelState.reconcile('openai', { availableModels: getOpenAIProviderSettings().availableModels });
+  return { ok: true, models, newModels: added, error: null };
 }
 
 function getOpenAIProviderSettings() {
@@ -427,12 +459,21 @@ function getOpenAIProviderSettings() {
   } catch {
     models = [];
   }
+  const availableModels = Array.from(new Set([model, ...models]));
+  // Every discovered model was offered before the model map: an upgrade
+  // keeps them all on.
+  const enabledModels = providerModelState.resolve('openai', { availableModels, defaultModel: model });
   return {
     configured: !!apiKey,
     enabled,
     apiKey,
     model,
-    models: Array.from(new Set([model, ...models])),
+    models: enabledModels.models,
+    availableModels,
+    enabledModels: enabledModels.models,
+    autoEnableNew: enabledModels.autoEnableNew,
+    fallback: enabledModels.fallback,
+    unseenModels: enabledModels.unseen,
     baseUrl: readAppSettingValue(OPENAI_BASE_URL_SETTING_KEY) || DEFAULT_OPENAI_BASE_URL,
     providerType: 'openai',
   };
@@ -443,6 +484,7 @@ function setOpenAIProviderSettings(update = {}) {
   const apiKey = payload.apiKey;
   const model = payload.model;
   const enabled = payload.enabled;
+  const enabledModels = payload.enabledModels;
   const remove = payload.remove === true;
   const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
   const baseUrl = hasBaseUrl ? payload.baseUrl : '';
@@ -481,6 +523,7 @@ function setOpenAIProviderSettings(update = {}) {
         activeQueueConversationCount,
       };
     }
+    // The model map stays: a key added again finds its models as they were.
     stmts.deleteAppSetting.run(OPENAI_API_KEY_SETTING_KEY);
     stmts.deleteAppSetting.run(OPENAI_MODELS_SETTING_KEY);
     stmts.upsertAppSetting.run(OPENAI_ENABLED_SETTING_KEY, 'false', nowIso);
@@ -504,6 +547,21 @@ function setOpenAIProviderSettings(update = {}) {
         stmts.deleteAppSetting.run(OPENAI_BASE_URL_SETTING_KEY);
       }
     }
+    if (Array.isArray(enabledModels) || typeof payload.autoEnableNew === 'boolean') {
+      // The models Select Models showed are set as ticked; an empty list
+      // leaves the default model alone, never all.
+      providerModelState.select('openai', {
+        enabledModels: Array.isArray(enabledModels)
+          ? enabledModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeProviderModelId(value))
+          : undefined,
+        // The rows the browser drew; an older page sends none.
+        shownModels: Array.isArray(payload.shownModels)
+          ? payload.shownModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeProviderModelId(value))
+          : getOpenAIProviderSettings().availableModels,
+        defaultModel: normalizedModel,
+        autoEnableNew: payload.autoEnableNew,
+      });
+    }
   }
   const current = getOpenAIProviderSettings();
   return {
@@ -511,6 +569,9 @@ function setOpenAIProviderSettings(update = {}) {
     configured: current.configured,
     enabled: current.enabled,
     model: current.model,
+    models: current.models,
+    availableModels: current.availableModels,
+    autoEnableNew: current.autoEnableNew,
     baseUrl: current.baseUrl,
   };
 }
@@ -554,15 +615,14 @@ function getClaudeProviderSettings() {
     model,
     ...(discovered.length ? discovered : DEFAULT_CLAUDE_MODELS),
   ])).filter(Boolean);
-  const availableSet = new Set(availableModels);
-  const enabledSelection = readClaudeModelListSetting(CLAUDE_ENABLED_MODELS_SETTING_KEY)
-    .filter((modelId) => availableSet.has(modelId));
-  // The enabled subset (chosen in the Select Models modal) drives the model
-  // catalog and composers; an empty selection means "all available".
-  const models = Array.from(new Set([
-    model,
-    ...(enabledSelection.length ? enabledSelection : availableModels),
-  ])).filter(Boolean);
+  // The models that are on (Select Models and the model map) drive the
+  // catalog and composers; the default model always is.
+  const enabledModels = providerModelState.resolve('claude', {
+    availableModels,
+    defaultModel: model,
+    legacyAllowlist: () => readClaudeModelListSetting(CLAUDE_ENABLED_MODELS_SETTING_KEY),
+  });
+  const models = enabledModels.models;
   const storedEfforts = readClaudeModelEffortsSetting();
   const effortsByModel = {};
   for (const availableModel of availableModels) {
@@ -586,6 +646,9 @@ function getClaudeProviderSettings() {
     models,
     availableModels,
     enabledModels: models,
+    autoEnableNew: enabledModels.autoEnableNew,
+    fallback: enabledModels.fallback,
+    unseenModels: enabledModels.unseen,
     effortsByModel,
     modelsDiscovered,
     attributionMode: normalizeClaudeAttributionMode(readAppSettingValue(CLAUDE_ATTRIBUTION_SETTING_KEY)) || DEFAULT_CLAUDE_ATTRIBUTION_MODE,
@@ -644,15 +707,20 @@ function setClaudeProviderSettings(update = {}) {
       stmts.deleteAppSetting.run(CLAUDE_MODELS_SETTING_KEY);
     }
   }
-  if (Array.isArray(enabledModels)) {
-    const normalizedEnabledModels = enabledModels
-      .map((value) => String(value || '').trim())
-      .filter((value) => value && isSafeClaudeModelId(value));
-    if (normalizedEnabledModels.length) {
-      stmts.upsertAppSetting.run(CLAUDE_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
-    } else {
-      stmts.deleteAppSetting.run(CLAUDE_ENABLED_MODELS_SETTING_KEY);
-    }
+  if (Array.isArray(enabledModels) || typeof payload.autoEnableNew === 'boolean') {
+    // The models Select Models showed are set as ticked; an empty list
+    // leaves the default model alone, never all.
+    providerModelState.select('claude', {
+      enabledModels: Array.isArray(enabledModels)
+        ? enabledModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeClaudeModelId(value))
+        : undefined,
+      // The rows the browser drew; an older page sends none.
+      shownModels: Array.isArray(payload.shownModels)
+        ? payload.shownModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeClaudeModelId(value))
+        : getClaudeProviderSettings().availableModels,
+      defaultModel: normalizedModel,
+      autoEnableNew: payload.autoEnableNew,
+    });
   }
   const current = getClaudeProviderSettings();
   return {
@@ -662,6 +730,7 @@ function setClaudeProviderSettings(update = {}) {
     model: current.model,
     models: current.models,
     availableModels: current.availableModels,
+    autoEnableNew: current.autoEnableNew,
     attributionMode: current.attributionMode,
   };
 }
@@ -709,7 +778,7 @@ async function refreshClaudeProviderModels() {
   let claudeQuery = null;
   let releaseInputGate = () => {};
   try {
-    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const { query } = await loadAgentSdk('claude');
     const inputGate = new Promise((resolve) => { releaseInputGate = resolve; });
     claudeQuery = query({
       // Streaming-input mode with a gated (never-yielding) prompt keeps the
@@ -762,8 +831,13 @@ async function refreshClaudeProviderModels() {
     const mergedEfforts = mergeClaudeModelEfforts(readClaudeModelEffortsSetting(), effortsByModel);
     stmts.upsertAppSetting.run(CLAUDE_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
     stmts.upsertAppSetting.run(CLAUDE_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(mergedEfforts), nowIso);
-    return { ok: true, models, error: null };
+    const { added } = providerModelState.reconcile('claude', { availableModels: getClaudeProviderSettings().availableModels });
+    return { ok: true, models, newModels: added, error: null };
   } catch (error) {
+    // No SDK installed yet: nothing is asked, the stored catalogue stays.
+    if (error instanceof AgentSdkMissingError) {
+      return { ok: false, models: settings.models, sdkMissing: true, error: `Claude model discovery waits for the SDK: ${error.message}` };
+    }
     return {
       ok: false,
       models: settings.models,
@@ -827,24 +901,19 @@ function getCursorProviderSettings() {
     models = [];
   }
   const availableModels = Array.from(new Set([model, ...(models.length ? models : DEFAULT_CURSOR_MODELS)]));
-  const availableSet = new Set(availableModels);
-  let enabledSelection = [];
-  try {
-    const parsed = JSON.parse(readAppSettingValue(CURSOR_ENABLED_MODELS_SETTING_KEY) || '[]');
-    if (Array.isArray(parsed)) {
-      enabledSelection = parsed
-        .map((value) => String(value || '').trim())
-        .filter((modelId) => isSafeCursorModelId(modelId) && availableSet.has(modelId));
-    }
-  } catch {
-    enabledSelection = [];
-  }
-  // The enabled subset (chosen in the Select Models modal) drives the model
-  // catalog and composers; an empty selection means "all available".
-  const resolvedModels = Array.from(new Set([
-    model,
-    ...(enabledSelection.length ? enabledSelection : availableModels),
-  ])).filter(Boolean);
+  // The models that are on (Select Models and the model map) drive the
+  // catalog and composers; the default model always is.
+  const enabledModels = providerModelState.resolve('cursor', {
+    availableModels,
+    defaultModel: model,
+    legacyAllowlist: () => {
+      const parsed = JSON.parse(readAppSettingValue(CURSOR_ENABLED_MODELS_SETTING_KEY) || '[]');
+      return Array.isArray(parsed)
+        ? parsed.map((value) => String(value || '').trim()).filter((modelId) => isSafeCursorModelId(modelId))
+        : [];
+    },
+  });
+  const resolvedModels = enabledModels.models;
   const storedEfforts = readCursorModelEffortsSetting();
   const storedReasoningOff = readCursorModelReasoningOffSetting();
   const effortsByModel = {};
@@ -868,6 +937,9 @@ function getCursorProviderSettings() {
     models: resolvedModels,
     availableModels,
     enabledModels: resolvedModels,
+    autoEnableNew: enabledModels.autoEnableNew,
+    fallback: enabledModels.fallback,
+    unseenModels: enabledModels.unseen,
     effortsByModel,
     reasoningOffByModel,
     // Pre-effort installs have models but no efforts setting; the settings
@@ -1109,9 +1181,9 @@ function setCursorProviderSettings(update = {}) {
         activeQueueConversationCount,
       };
     }
+    // The model map stays: a key added again finds its models as they were.
     stmts.deleteAppSetting.run(CURSOR_API_KEY_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_MODELS_SETTING_KEY);
-    stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY);
     stmts.deleteAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY);
     stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, 'false', nowIso);
@@ -1129,15 +1201,20 @@ function setCursorProviderSettings(update = {}) {
     if (nextEnabled && !hasApiKey) return { ok: false, error: 'Cursor API key is not configured' };
     stmts.upsertAppSetting.run(CURSOR_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_SETTING_KEY, normalizedModel, nowIso);
-    if (Array.isArray(enabledModels)) {
-      const normalizedEnabledModels = enabledModels
-        .map((value) => String(value || '').trim())
-        .filter((value) => value && isSafeCursorModelId(value));
-      if (normalizedEnabledModels.length) {
-        stmts.upsertAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
-      } else {
-        stmts.deleteAppSetting.run(CURSOR_ENABLED_MODELS_SETTING_KEY);
-      }
+    if (Array.isArray(enabledModels) || typeof payload.autoEnableNew === 'boolean') {
+      // The models Select Models showed are set as ticked; an empty list
+      // leaves the default model alone, never all.
+      providerModelState.select('cursor', {
+        enabledModels: Array.isArray(enabledModels)
+          ? enabledModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeCursorModelId(value))
+          : undefined,
+        // The rows the browser drew; an older page sends none.
+        shownModels: Array.isArray(payload.shownModels)
+          ? payload.shownModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeCursorModelId(value))
+          : getCursorProviderSettings().availableModels,
+        defaultModel: normalizedModel,
+        autoEnableNew: payload.autoEnableNew,
+      });
     }
   }
   const current = getCursorProviderSettings();
@@ -1148,6 +1225,7 @@ function setCursorProviderSettings(update = {}) {
     model: current.model,
     models: current.models,
     availableModels: current.availableModels,
+    autoEnableNew: current.autoEnableNew,
   };
 }
 
@@ -1204,7 +1282,7 @@ async function refreshCursorProviderModels() {
     return { ok: false, models: settings.models, error: 'Cursor API key is not configured' };
   }
   try {
-    const mod = await import('@cursor/sdk');
+    const mod = await loadAgentSdk('cursor');
     // The namespace form is the only working call shape: `Cursor` has a
     // private constructor and `models` is static, so the old client-instance
     // fallback could only throw a TypeError that replaced the real error.
@@ -1243,8 +1321,12 @@ async function refreshCursorProviderModels() {
     stmts.upsertAppSetting.run(CURSOR_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
     stmts.upsertAppSetting.run(CURSOR_MODEL_REASONING_OFF_SETTING_KEY, JSON.stringify(reasoningOffByModel), nowIso);
-    return { ok: true, models, error: null };
+    const { added } = providerModelState.reconcile('cursor', { availableModels: getCursorProviderSettings().availableModels });
+    return { ok: true, models, newModels: added, error: null };
   } catch (error) {
+    if (error instanceof AgentSdkMissingError) {
+      return { ok: false, models: settings.models, sdkMissing: true, error: `Cursor model discovery waits for the SDK: ${error.message}` };
+    }
     return {
       ok: false,
       models: settings.models,
@@ -1294,13 +1376,12 @@ function getGrokProviderSettings() {
     model,
     ...(discovered.length ? discovered : DEFAULT_GROK_MODELS),
   ])).filter(Boolean);
-  const availableSet = new Set(availableModels);
-  const enabledSelection = readGrokModelListSetting(GROK_ENABLED_MODELS_SETTING_KEY)
-    .filter((modelId) => availableSet.has(modelId));
-  const models = Array.from(new Set([
-    model,
-    ...(enabledSelection.length ? enabledSelection : availableModels),
-  ])).filter(Boolean);
+  const enabledModels = providerModelState.resolve('grok', {
+    availableModels,
+    defaultModel: model,
+    legacyAllowlist: () => readGrokModelListSetting(GROK_ENABLED_MODELS_SETTING_KEY),
+  });
+  const models = enabledModels.models;
   const storedEfforts = readGrokModelEffortsSetting();
   const effortsByModel = {};
   for (const availableModel of availableModels) {
@@ -1319,6 +1400,9 @@ function getGrokProviderSettings() {
     models,
     availableModels,
     enabledModels: models,
+    autoEnableNew: enabledModels.autoEnableNew,
+    fallback: enabledModels.fallback,
+    unseenModels: enabledModels.unseen,
     effortsByModel,
     modelsDiscovered,
     providerType: 'grok',
@@ -1353,15 +1437,20 @@ function setGrokProviderSettings(update = {}) {
       stmts.deleteAppSetting?.run?.(GROK_MODELS_SETTING_KEY);
     }
   }
-  if (Array.isArray(enabledModels)) {
-    const normalizedEnabledModels = enabledModels
-      .map((value) => String(value || '').trim())
-      .filter((value) => value && isSafeGrokModelId(value));
-    if (normalizedEnabledModels.length) {
-      stmts.upsertAppSetting.run(GROK_ENABLED_MODELS_SETTING_KEY, JSON.stringify(normalizedEnabledModels), nowIso);
-    } else {
-      stmts.deleteAppSetting?.run?.(GROK_ENABLED_MODELS_SETTING_KEY);
-    }
+  if (Array.isArray(enabledModels) || typeof payload.autoEnableNew === 'boolean') {
+    // The models Select Models showed are set as ticked; an empty list
+    // leaves the default model alone, never all.
+    providerModelState.select('grok', {
+      enabledModels: Array.isArray(enabledModels)
+        ? enabledModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeGrokModelId(value))
+        : undefined,
+      // The rows the browser drew; an older page sends none.
+      shownModels: Array.isArray(payload.shownModels)
+        ? payload.shownModels.map((value) => String(value || '').trim()).filter((value) => value && isSafeGrokModelId(value))
+        : getGrokProviderSettings().availableModels,
+      defaultModel: normalizedModel,
+      autoEnableNew: payload.autoEnableNew,
+    });
   }
   const current = getGrokProviderSettings();
   return {
@@ -1371,6 +1460,7 @@ function setGrokProviderSettings(update = {}) {
     model: current.model,
     models: current.models,
     availableModels: current.availableModels,
+    autoEnableNew: current.autoEnableNew,
   };
 }
 
@@ -1452,7 +1542,8 @@ async function refreshGrokProviderModels() {
     const models = Array.from(new Set([settings.model, ...discovered])).filter(Boolean);
     stmts.upsertAppSetting.run(GROK_MODELS_SETTING_KEY, JSON.stringify(models), nowIso);
     stmts.upsertAppSetting.run(GROK_MODEL_EFFORTS_SETTING_KEY, JSON.stringify(effortsByModel), nowIso);
-    return { ok: true, models, error: null };
+    const { added } = providerModelState.reconcile('grok', { availableModels: getGrokProviderSettings().availableModels });
+    return { ok: true, models, newModels: added, error: null };
   } catch (error) {
     return {
       ok: false,
@@ -1509,6 +1600,8 @@ const FALLBACK_COPILOT_ENGINE = 'extension';
 const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
 const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
+// The allowlists before 0.9.24 (Claude, Cursor, Grok): read once to build
+// the model map, then left as they are so an older version still finds them.
 const CLAUDE_ENABLED_MODELS_SETTING_KEY = 'claude_enabled_models';
 const CLAUDE_MODEL_EFFORTS_SETTING_KEY = 'claude_model_efforts';
 // oar | vanilla | off — what commits and PRs made in Claude sessions say
@@ -2678,6 +2771,10 @@ const modelVariantCatalog = createModelVariantCatalogService({
   curatedModelIds: CURATED_MODEL_IDS,
   autoModelSentinel: AUTO_MODEL_SENTINEL,
   runCopilotCliCommand,
+  modelStateStore: providerModelState,
+  onNewModels: (baseModelIds, on) => modelRefreshLedger.noteNewModels('github', baseModelIds.map((id) => ({ id, on }))),
+  // A worker's snapshot read the runtime's list: a Copilot model refresh.
+  onAuthoritativeSnapshot: () => modelRefreshLedger.record('github', { ok: true }),
 });
 const {
   SUPPORTED_REASONING_EFFORTS,
@@ -2990,6 +3087,7 @@ const deepseekSettingsService = createDeepSeekSettingsService({
   },
   deleteSetting: (key) => stmts.deleteAppSetting.run(key),
   listProviderCandidates: () => stmts.listRuntimeSessionProviderCandidates?.all?.() || [],
+  onModelsRefreshed: (result) => modelRefreshLedger.record('deepseek', result),
 });
 function getDeepSeekProviderSettings() {
   return deepseekSettingsService.getSettings();
@@ -3007,6 +3105,7 @@ const claudeApiSettingsService = createClaudeApiSettingsService({
   listProviderCandidates: () => stmts.listRuntimeSessionProviderCandidates?.all?.() || [],
   countLiveKeyWorkers: () => (sessionWorkerRegistry?.listWorkers?.() || []).filter((worker) => worker?.kind === 'claude-api').length,
   getClaudeProviderSettings: () => getClaudeProviderSettings(),
+  onModelsRefreshed: (result) => modelRefreshLedger.record('claude-api', result),
 });
 function getClaudeApiProviderSettings() {
   return claudeApiSettingsService.getSettings();
@@ -3094,6 +3193,44 @@ try {
   }
 } catch (error) {
   console.warn(`[cli-install] failed to apply persisted CLI bindings: ${error?.message || error}`);
+}
+
+// The agent SDKs (and koffi on Windows) the relay installs on demand
+// (agent-sdk-store.mjs). Registered with the loader, so this process takes
+// them from the store, never from a worker folder in its environment.
+const agentSdkStore = createAgentSdkStore({
+  fromCheckout: (sdk) => agentSdkFromCheckout(sdk),
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+});
+setAgentSdkStore(agentSdkStore);
+// A provider that was just set up gets its SDK at once, in the
+// background; a failure shows in its Settings tab and on the first chat.
+function installAgentSdkForSetup(sdk, reason) {
+  if (resolveAgentSdkSource(sdk)) return;
+  void agentSdkStore.ensure(sdk, { reason, retryFailed: true }).catch((error) => {
+    console.warn(`[agent-sdk] ${sdk} install after ${reason} failed: ${error?.message || error}`);
+  });
+}
+claudeAuthService.onLoginSuccess?.(() => installAgentSdkForSetup('claude', 'Claude login'));
+// The SDKs whose providers are in use: enabled, logged in, or with a
+// conversation that is not archived. koffi wherever the store supports it.
+function agentSdksInUse() {
+  const inUse = new Set(['koffi']);
+  const providerSdk = { claude: 'claude', 'claude-api': 'claude', deepseek: 'claude', cursor: 'cursor' };
+  try {
+    if (getClaudeProviderSettings()?.enabled === true || claudeAuthService.getCachedStatus?.()?.loggedIn === true) inUse.add('claude');
+    if (claudeApiSettingsService.getSettings?.()?.enabled === true || deepseekSettingsService.getSettings?.()?.enabled === true) inUse.add('claude');
+    if (getCursorProviderSettings()?.enabled === true) inUse.add('cursor');
+    const rows = db.prepare(`SELECT DISTINCT r.provider_type AS provider FROM runtime_sessions r JOIN conversations c ON c.id = r.conversation_id WHERE c.archived = 0`).all();
+    for (const row of rows) {
+      const sdk = providerSdk[String(row?.provider || '').trim().toLowerCase()];
+      if (sdk) inUse.add(sdk);
+    }
+  } catch (error) {
+    console.warn(`[agent-sdk] could not tell which providers are in use: ${error?.message || error}`);
+  }
+  return [...inUse];
 }
 
 // ─── Web Push ─────────────────────────────────────────────────────────────────
@@ -3383,6 +3520,20 @@ const relayCliLauncherService = createRelayCliLauncherService({
   workerScope,
 });
 
+// The launch gate (agent-sdk-launch-gate.mjs): never waits for an install.
+// A session it held back gets its launch back when the install ends or the
+// SDK turns ready later: the restart schedule cleared, the queue woken.
+const agentSdkLaunchGate = createAgentSdkLaunchGate({
+  store: agentSdkStore,
+  sdkForWorkerKind: agentSdkForWorkerKind,
+  resolveSource: (sdk) => resolveAgentSdkSource(sdk),
+  noteInstalling: (sdkSessionId, { label }) => workerLaunchNoteService.handle({ type: 'installing', sdkSessionId, lifecycle: { sdkLabel: label } }),
+  onSessionsReleased: ({ sessions }) => {
+    for (const sdkSessionId of sessions) sessionWorkerSupervisor.clearRestartSchedule?.(sdkSessionId);
+    wakeSessionWorkerQueue('agent-sdk-ready');
+  },
+});
+
 async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true } = {}) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
@@ -3413,6 +3564,11 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const workerLaunchEnv = buildSessionWorkerLaunchEnvForSession(normalizedTargetSessionId);
+  // Synchronous: nothing between the gate and the launch can start a
+  // second worker for the session.
+  const agentSdkDir = agentSdkLaunchGate.check(normalizedTargetSessionId, resolveWorkerKind(workerLaunchEnv));
+  if (agentSdkDir.deferred) return { deferred: agentSdkDir.deferred };
+  if (agentSdkDir.dir) workerLaunchEnv[agentSdkDirEnvName(agentSdkDir.sdk)] = agentSdkDir.dir;
   const launched = await launchSessionCli({
     workerScope,
     targetSessionId: normalizedTargetSessionId,
@@ -3427,6 +3583,9 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
   });
   const workerPid = Number.isInteger(Number(launched?.pid)) ? Number(launched.pid) : null;
+  // The worker leases its folder when it loads the SDK; this covers the
+  // seconds before, so no clean-up takes it in between.
+  if (agentSdkDir.dir && workerPid) agentSdkStore.lease(agentSdkDir.dir, workerPid);
   const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
   const launchMode = String(launched?.launchMode || 'detached').trim();
   const tmuxSessionName = String(launched?.tmuxSessionName || '').trim();
@@ -6259,6 +6418,7 @@ const copilotModelDiscoveryService = createCopilotModelDiscoveryService({
   }),
   resolveInstalledPaths: () => resolveInstalledCopilotPaths({ config }),
   updateModelCatalog,
+  onRefreshed: (result) => modelRefreshLedger.record('github', result),
   logger: console,
 });
 const contextSnapshotService = createContextSnapshotService({
@@ -7085,8 +7245,50 @@ const workerRecycleService = createWorkerRecycleService({
   // The stop and the launch under the per-session launch mutex the Change
   // CWD relaunch and the launch routes take (sessions-routes.mjs).
   runExclusive: (sid, fn) => sessionLaunchMutex.runExclusive(sid, fn),
+  // The kinds the launch gate gives an agent SDK: once stale, recycled
+  // without waiting for their CLI child, and fenced until then.
+  isAgentSdkWorker: (worker) => staleWorkerLosesAgentSdk(worker?.kind, { sdkForWorkerKind: agentSdkForWorkerKind, fromCheckout: (sdk) => agentSdkFromCheckout(sdk) }),
   logger: console,
 });
+
+// A worker's hello, before the hello's own request for work: the registry
+// learns the process, its kind and its build id (a relay that just started
+// has no entry yet, and the delivery would register the process without its
+// build id), and the recycle sweeps, so a stale worker on an agent SDK is
+// fenced before anything is handed to it.
+function noteSessionWorkerHello({ sessionId, pid, kind = null, buildId = null } = {}) {
+  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true || runtimeShutdownStarted) return;
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  // A killed session's worker is registered by nothing, as the delivery
+  // leaves it unregistered.
+  if (sessionWorkerSupervisor?.isKillBlocked?.(sid) !== true) {
+    const statedPid = Number.isInteger(Number(pid)) && Number(pid) > 0 ? Number(pid) : null;
+    let worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
+    // No entry, or one with no process behind it (a launch the agent SDK
+    // gate deferred leaves 'new'): the process saying hello is the session's
+    // worker, ready, as its first heartbeat would make it (/api/heartbeat).
+    if (!worker || worker.status === 'new' || (!worker.workerId && !worker.pid)) {
+      worker = sessionWorkerRegistry?.upsertWorker?.({
+        ...(worker || {}),
+        sdkSessionId: sid,
+        workerId: worker?.workerId || `worker-${sid.slice(0, 8)}`,
+        status: 'ready',
+        pid: statedPid || worker?.pid || null,
+        queueDepth: Math.max(0, Number(queueCounts?.().pendingCount || 0)),
+      }) || null;
+    } else if (statedPid && worker.pid !== statedPid) {
+      worker = sessionWorkerRegistry?.upsertWorker?.({ ...worker, sdkSessionId: sid, pid: statedPid, status: worker.status || 'ready' }) || null;
+    }
+    // Stated for the process just registered, in an upsert of its own: the
+    // registry drops a build id that comes with a new pid and equals the old
+    // entry's (the old process's, spread in).
+    if (worker && ((kind && worker.kind !== kind) || (buildId && worker.buildId !== buildId))) {
+      sessionWorkerRegistry?.upsertWorker?.({ ...worker, ...(kind ? { kind } : {}), ...(buildId ? { buildId } : {}) });
+    }
+  }
+  void workerRecycleService.sweepNow();
+}
 
 // Once at start, after the restart's own worker reconnects settled: what
 // still runs for an archived conversation is stopped and stays stopped.
@@ -7322,6 +7524,9 @@ const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
     const worker = sessionWorkerRegistry?.getWorker?.(sid) || null;
     if (worker && worker.buildId !== buildId) sessionWorkerRegistry?.upsertWorker?.({ ...worker, buildId });
   },
+  // Registers the process and runs the recycle's sweep before the hello's
+  // request for work (noteSessionWorkerHello).
+  onWorkerHello: noteSessionWorkerHello,
   // Sent in server.hello, so a worker on other code can say so in its log.
   buildId: BUILD_ID,
   isWorkerProcessAlive: (pid) => isProcessAlive(Number(pid)),
@@ -7710,6 +7915,85 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
   logger: console,
 });
 
+// Every refresh of a provider's models resets its clock in the ledger,
+// whoever asks; the background check refreshes what is due through the same
+// table as the Select Models Refresh button.
+const trackedModelRefreshers = {
+  refreshOpenAIProviderModels: modelRefreshLedger.track('openai', refreshOpenAIProviderModels),
+  refreshClaudeProviderModels: modelRefreshLedger.track('claude', refreshClaudeProviderModels),
+  refreshCursorProviderModels: modelRefreshLedger.track('cursor', refreshCursorProviderModels),
+  refreshGrokProviderModels: modelRefreshLedger.track('grok', refreshGrokProviderModels),
+};
+const modelRefreshSettings = createModelRefreshSettings({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value, stamp) => stmts.upsertAppSetting.run(key, value, stamp),
+});
+// Claude and Grok are set up when their CLI is installed or their login is
+// there: a file lookup and the last status, never a CLI started to ask.
+function isClaudeModelRefreshSetUp() {
+  // Discovery runs on the SDK: none installed yet, nothing to ask.
+  if (!resolveAgentSdkSource('claude')) return false;
+  return !!cliInstallService.resolveCliBinary('claude')
+    || claudeCloudCredentials.describe().hasToken === true
+    || claudeAuthService.getCachedStatus?.()?.loggedIn === true;
+}
+function isGrokModelRefreshSetUp() {
+  return !!String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim()
+    || !!cliInstallService.resolveCliBinary('grok')
+    || !!readGrokCliAuthKey();
+}
+const modelRefreshTable = buildProviderRefreshTable({
+  getOpenAIProviderSettings,
+  getClaudeProviderSettings,
+  getCursorProviderSettings,
+  getGrokProviderSettings,
+  ...trackedModelRefreshers,
+  deepseekSettingsService,
+  claudeApiSettingsService,
+  copilotModelDiscoveryService,
+  isClaudeSetUp: isClaudeModelRefreshSetUp,
+  isGrokSetUp: isGrokModelRefreshSetUp,
+});
+// A freshly installed SDK fills its provider's catalogue at once, as a
+// fresh CLI install does.
+agentSdkStore.onReady(({ id } = {}) => {
+  // A session the gate held back, or whose launch gave up on a failed
+  // install, delivers its queued message now.
+  agentSdkLaunchGate.onReady(id);
+  const providers = { claude: ['claude'], cursor: ['cursor'] }[id];
+  if (!providers) return;
+  void refreshProviderModels({ table: modelRefreshTable, providers, reason: 'agent-sdk-installed', gate: 'isSetUp' }).catch((error) => {
+    console.warn(`[agent-sdk] model refresh after the ${id} install failed: ${error?.message || error}`);
+  });
+});
+const modelRefreshScheduler = createModelRefreshScheduler({
+  getSettings: () => modelRefreshSettings.get(),
+  getLast: () => modelRefreshLedger.readLast(),
+  getTable: () => modelRefreshTable,
+  refreshProviders: ({ providers, reason }) => refreshProviderModels({ table: modelRefreshTable, providers, reason, gate: 'isSetUp' }),
+  logger: console,
+});
+
+// The same for the settings routes: a save that leaves the provider enabled
+// installs its SDK in the background.
+function withAgentSdkSetup(setter, sdk, isEnabled, reason) {
+  return (...args) => {
+    const result = setter(...args);
+    try { if (result?.ok !== false && isEnabled()) installAgentSdkForSetup(sdk, reason); } catch {}
+    return result;
+  };
+}
+function withAgentSdkUpdate(service, reason) {
+  if (!service) return service;
+  return Object.assign(Object.create(service), {
+    update: (...args) => {
+      const result = service.update(...args);
+      try { if (result?.ok !== false && service.getSettings?.()?.enabled === true) installAgentSdkForSetup('claude', reason); } catch {}
+      return result;
+    },
+  });
+}
+
 const sharedRouteDeps = {
   auth,
   isTrulyLocalRequest: localRequestCheck.isTrulyLocal,
@@ -7766,27 +8050,27 @@ const sharedRouteDeps = {
   setDefaultSessionWorkspaceRootPath,
   getOpenAIProviderSettings,
   setOpenAIProviderSettings,
-  refreshOpenAIProviderModels,
+  refreshOpenAIProviderModels: trackedModelRefreshers.refreshOpenAIProviderModels,
   getCopilotProviderSettings,
   setCopilotProviderSettings,
   getClaudeProviderSettings,
-  setClaudeProviderSettings,
-  refreshClaudeProviderModels,
+  setClaudeProviderSettings: withAgentSdkSetup(setClaudeProviderSettings, 'claude', () => getClaudeProviderSettings()?.enabled === true, 'Claude enabled'),
+  refreshClaudeProviderModels: trackedModelRefreshers.refreshClaudeProviderModels,
   getCursorProviderSettings,
-  setCursorProviderSettings,
-  refreshCursorProviderModels,
+  setCursorProviderSettings: withAgentSdkSetup(setCursorProviderSettings, 'cursor', () => getCursorProviderSettings()?.enabled === true, 'Cursor key saved'),
+  refreshCursorProviderModels: trackedModelRefreshers.refreshCursorProviderModels,
   getGrokProviderSettings,
   setGrokProviderSettings,
-  refreshGrokProviderModels,
+  refreshGrokProviderModels: trackedModelRefreshers.refreshGrokProviderModels,
   getClaudeCloudProviderSettings,
   claudeCloudSettingsService,
   claudeCloudSessionService,
   getDeepSeekProviderSettings,
-  deepseekSettingsService,
+  deepseekSettingsService: withAgentSdkUpdate(deepseekSettingsService, 'DeepSeek set up'),
   deepseekBalanceService,
   deepseekUsageImportService,
   getClaudeApiProviderSettings,
-  claudeApiSettingsService,
+  claudeApiSettingsService: withAgentSdkUpdate(claudeApiSettingsService, 'Claude API set up'),
   claudeCloudRepoService,
   // The login's state for the workers' nudge route (never the token).
   claudeCloudLoginStatus: { describe: () => claudeCloudCredentials.describe() },
@@ -7807,6 +8091,15 @@ const sharedRouteDeps = {
   listModelVariantRows,
   refreshModelVariantCatalogFromCli,
   setEnabledModelVariants,
+  getCopilotModelState: modelVariantCatalog.getCopilotModelState,
+  setCopilotAutoEnableNew: modelVariantCatalog.setCopilotAutoEnableNew,
+  markCopilotModelsSeen: modelVariantCatalog.markCopilotModelsSeen,
+  markProviderModelsSeen: (provider) => providerModelState.markSeen(provider),
+  modelRefreshLedger,
+  modelRefreshSettings,
+  modelRefreshScheduler,
+  isClaudeModelRefreshSetUp,
+  isGrokModelRefreshSetUp,
   parseModelVariantSelection,
   SUPPORTED_REASONING_EFFORTS,
   buildRelayReadyBannerData,
@@ -7968,6 +8261,7 @@ const sharedRouteDeps = {
   shareRepository,
 };
 registerMessagesRoutes(app, sharedRouteDeps);
+registerAgentSdkRoutes(app, { auth, io, agentSdkStore });
 registerSessionsRoutes(app, sharedRouteDeps);
 registerConversationGroupRoutes(app, sharedRouteDeps);
 registerAskUserRoutes(app, sharedRouteDeps);
@@ -8054,6 +8348,7 @@ registerAboutRoutes(app, {
     isRelayCliOnline: () => runtimeState.cliOnline === true,
     listWorkers: () => sessionWorkerRegistry.listWorkers(),
     getUpdateState: () => buildUpdateStatePayload(),
+    getAgentSdkStatus: () => agentSdkStore.snapshot(),
     describeBackups: () => describeBackups({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, config, sizes: false }),
   }),
 });
@@ -8700,11 +8995,16 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   const discoveryShutdown = copilotModelDiscoveryService.dispose().catch((error) => {
     console.warn(`${runtimeLogPrefix()}Copilot model discovery shutdown failed: ${error?.message || error}`);
   });
+  // Stops the timer at once; a check in flight ends with the discoveries above.
+  void modelRefreshScheduler.dispose();
   try { claudeAuthService.dispose(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Claude auth service shutdown failed: ${error?.message || error}`);
   }
   try { cliInstallService.dispose(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}CLI install service shutdown failed: ${error?.message || error}`);
+  }
+  try { agentSdkStore.dispose(); } catch (error) {
+    console.warn(`${runtimeLogPrefix()}agent SDK store shutdown failed: ${error?.message || error}`);
   }
   try { grokAuthService.dispose(); } catch (error) {
     console.warn(`${runtimeLogPrefix()}Grok auth service shutdown failed: ${error?.message || error}`);
@@ -8880,6 +9180,20 @@ httpServer.listen(config.port, listenHost, () => {
   // Deferred and unref'd (a few seconds behind the startup import's own CLI
   // spawn); a relay without an installed Copilot CLI skips it entirely.
   copilotModelDiscoveryService.scheduleStartupRefresh();
+  // "Check for new models": a first look a minute in (overdue providers),
+  // then every quarter of an hour; unref'd.
+  modelRefreshScheduler.start();
+  // At start: the SDKs of the providers in use, and koffi on
+  // Windows, installed in the background when their pinned folder is
+  // missing (after an update: the new pins); the start never waits for it.
+  // A git checkout runs the devDependencies it has installed and leaves
+  // the store alone for those.
+  const storeSdks = agentSdkStore.ids().filter((sdk) => !agentSdkFromCheckout(sdk));
+  if (storeSdks.length) {
+    void agentSdkStore.reconcile({ inUse: agentSdksInUse().filter((sdk) => storeSdks.includes(sdk)) }).catch((error) => {
+      console.warn(`[agent-sdk] start-up check failed: ${error?.message || error}`);
+    });
+  }
   // Archived conversations' workers: stopped once, 30 s in, so the workers
   // that reconnect after the restart and the first prime have settled. With
   // routing off the relay launches no workers, so there is nothing to sweep.

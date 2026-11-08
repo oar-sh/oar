@@ -448,7 +448,19 @@ test('(d) a copilot.db with only start-up settings and no oar.db: nothing change
 });
 
 test('the start-up allowlist is the keys and tables a real start writes, and nothing a user makes', () => {
-  assert.deepEqual([...STARTUP_SETTING_KEYS].sort(), ['push_vapid_private_key', 'push_vapid_public_key', 'relay_last_exit']);
+  assert.deepEqual([...STARTUP_SETTING_KEYS].sort(), [
+    'claude_api_model_state',
+    'claude_model_state',
+    'copilot_model_state',
+    'cursor_model_state',
+    'deepseek_model_state',
+    'grok_model_state',
+    'model_refresh_last',
+    'openai_model_state',
+    'push_vapid_private_key',
+    'push_vapid_public_key',
+    'relay_last_exit',
+  ]);
   assert.deepEqual([...STARTUP_TABLES].sort(), ['model_selector_state', 'model_variants', 'relay_restart_orchestrator']);
   const dir = tempDir();
   try {

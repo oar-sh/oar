@@ -7,7 +7,7 @@
 // conversations yet, and `pick` when conversations exist but none is open.
 // A readiness answer that is unknown counts as ready, as everywhere else.
 
-import { isSetupRequired } from './provider-readiness.mjs';
+import { blockingReadinessReasons, isSetupRequired } from './provider-readiness.mjs';
 
 export const SETUP_HEADING = 'Set up a provider';
 export const SETUP_TEXT = 'Turn on Claude, Cursor, OpenAI, Grok or DeepSeek in Settings → Providers, or sign in to the Copilot CLI on the relay host.';
@@ -27,11 +27,14 @@ const ACTIONS = Object.freeze({
  */
 export function resolveNoConversationState({ readiness = null, conversationCount = 0, mobile = false } = {}) {
   if (isSetupRequired(readiness)) {
+    // A provider that is on but whose SDK failed says why: "turn on Claude"
+    // alone would read as wrong to someone who did.
+    const reasons = blockingReadinessReasons(readiness);
     return {
       variant: 'setup',
       icon: '⚙️',
       heading: SETUP_HEADING,
-      text: SETUP_TEXT,
+      text: reasons.length ? `${SETUP_TEXT} ${reasons.map((text) => `${text.replace(/[.\s]+$/, '')}.`).join(' ')}` : SETUP_TEXT,
       actions: [ACTIONS.openSettings(true), ACTIONS.newChat(false)],
     };
   }

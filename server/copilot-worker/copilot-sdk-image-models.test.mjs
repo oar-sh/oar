@@ -174,6 +174,22 @@ test('an image request OpenAI refuses fails the row with the image code, not a C
   assert.equal(response.attemptId, 'attempt-q-1');
 });
 
+test('a reply the relay could not process fails the row with the unprocessed-reply code, not a requeue', async () => {
+  const { stub, started, runner } = setup({
+    '/api/openai/images/generate': () => { throw httpError(502, { error: 'OpenAI image API returned invalid JSON', relayProcessing: true }); },
+  });
+
+  assert.equal(await runner.handlePendingPayload({ message: imageMessage }), true);
+
+  assert.equal(started.length, 0);
+  assert.equal(stub.bodiesFor('/api/requeue').length, 0);
+  const [response] = stub.bodiesFor('/api/response');
+  assert.match(response.text, /could not process the image OpenAI returned \(OpenAI image API returned invalid JSON\)/);
+  assert.equal(response.terminalError.code, 'image-reply-unprocessed');
+  assert.equal(response.terminalError.stableCode, 'image-reply-unprocessed');
+  assert.equal(response.attemptId, 'attempt-q-1');
+});
+
 test('an image API failure that may pass requeues the row', async () => {
   const { stub, runner } = setup({
     '/api/openai/images/generate': () => { throw httpError(502, { error: 'Bad gateway' }); },

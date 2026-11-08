@@ -556,7 +556,8 @@ export function createSessionWorkerSupervisor({
     if (!to || from === to) return true;
     const allowed = {
       new: new Set(['starting', 'ready', 'error', 'processing']),
-      starting: new Set(['ready', 'error']),
+      // 'new': a start the agent SDK gate deferred, so no worker came up.
+      starting: new Set(['ready', 'error', 'new']),
       ready: new Set(['processing', 'starting', 'error']),
       processing: new Set(['ready', 'error']),
       error: new Set(['starting', 'ready']),
@@ -682,6 +683,23 @@ export function createSessionWorkerSupervisor({
           });
           if (!isStartActive() || isKillBlocked(sessionId)) {
             return buildStartBlockedResult();
+          }
+          // Not launched, and not a failure either (the agent SDK it needs is
+          // still installing, agent-sdk-launch-gate.mjs): no worker, no
+          // restart backoff, no launch note; the turn stays queued until the
+          // gate hands the session its launch back.
+          if (spawned?.deferred) {
+            const waitingState = setWorkerState(sessionId, {
+              sdkSessionId: sessionId,
+              // No worker yet ('new'), so nothing waits for its heartbeat.
+              status: 'new',
+              workerId: null,
+              pid: null,
+              queueDepth: startingState.queueDepth || 0,
+              retryCount: startingState.retryCount || 0,
+              lastError: null,
+            });
+            return { ok: true, deferred: String(spawned.deferred), reused: false, worker: waitingState, lifecycle: toLifecycleSnapshot(sessionId) };
           }
           const readyState = setWorkerState(sessionId, {
             ...startingState,

@@ -27,6 +27,31 @@
  * `quietMs` without a delivery or a turn end for the session, the runners'
  * own idle time.
  *
+ * A stale worker on an agent SDK the store installs (`isAgentSdkWorker`: the
+ * claude, claude-api, deepseek and cursor kinds, unless a git checkout runs
+ * that SDK from its own node_modules) is the exception. An update moves the
+ * SDKs out of the package, so the files such a worker would start its next
+ * CLI child from may be gone, and a message it gets once its child has idled
+ * out fails. So:
+ *
+ * - it skips the 'cli' and 'quiet' holds and is recycled as soon as its turn,
+ *   question and compaction holds (and the processing row) allow;
+ * - its background hold stays a hold, and is the one hold it is not fenced
+ *   for: background tasks run in the CLI child, so while they do the child is
+ *   up and a delivery goes to it, never to a new child from the gone files;
+ * - from the first sweep that sees it stale until its recycle, the
+ *   replacement fence (below) keeps every delivery away from it, so what is
+ *   queued waits for the new worker's cold start rather than failing on the
+ *   old one;
+ * - a relay that has just started knows its holds only from its first
+ *   heartbeat's steering snapshot: until that comes it waits ('steering'),
+ *   fenced, for at most `steeringWaitMs`; one that still has sent none by
+ *   then is judged as any other worker, unfenced.
+ *
+ * Besides the periodic sweep, a sweep runs at start and on every worker hello
+ * (`sweepNow`), so a stale worker that reconnects to a new relay is fenced
+ * before the hello's own request for work is answered.
+ *
  * From the moment a recycle passes its holds until its launch is done, the
  * replacement fence (worker-replacement.mjs) keeps every delivery away from
  * the process being replaced, and the stop and the launch run under the
@@ -61,9 +86,10 @@ const LOG_TAG = '[worker-recycle]';
  * the worker's own release holds (workerReleaseHold; 'turn' also for a
  * processing row the session owns), 'cli' while its CLI child runs, and
  * 'quiet' while a worker that does not report its CLI child has had a
- * delivery or a turn end within `quietMs`.
+ * delivery or a turn end within `quietMs`, and 'steering' while a worker on
+ * an agent SDK has not yet sent the snapshot that names its holds.
  */
-export const RECYCLE_HOLDS = Object.freeze(['turn', 'question', 'compaction', 'background', 'cli', 'quiet']);
+export const RECYCLE_HOLDS = Object.freeze(['turn', 'question', 'compaction', 'background', 'cli', 'quiet', 'steering']);
 const RECYCLABLE_STATUSES = new Set(['ready', 'processing']);
 
 function sid8(sid) {
@@ -155,6 +181,15 @@ export function createWorkerRecycleService({
   // without a delivery or a turn end: the Claude and Copilot runners'
   // idleShutdownMs, after which they stop the child themselves.
   quietMs = 10 * 60_000,
+  // worker → whether its kind runs on an agent SDK (agentSdkForWorkerKind):
+  // such a worker, once stale, skips the cli and quiet holds and is fenced
+  // until its recycle (see the header).
+  isAgentSdkWorker = () => false,
+  // How long a stale worker on an agent SDK may go without a steering
+  // snapshot (from when this service first saw its process) before it is
+  // judged as any other worker. Its heartbeat sends one within a second of
+  // a relay's hello.
+  steeringWaitMs = 30_000,
   logger = console,
 } = {}) {
   if (typeof stopWorker !== 'function' || typeof launchWorker !== 'function') {
@@ -214,8 +249,13 @@ export function createWorkerRecycleService({
         pendingLaunch: null,
         lastWaitLogAt: -Infinity,
         // When this service first saw the session's current pid: the quiet
-        // window's start for a worker with no start time and no queue rows.
+        // window's start for a worker with no start time and no queue rows,
+        // and the steering wait's start.
         firstSeen: null,
+        // The pid this service fenced as a stale worker on an agent SDK
+        // waiting for its recycle (sdkFenceUp), or null. A recycle admitted
+        // takes the fence over and clears this.
+        sdkFence: null,
       };
       bySession.set(sid, state);
     }
@@ -394,8 +434,18 @@ export function createWorkerRecycleService({
       });
     } finally {
       // A stop that did not go through (or never ran) leaves the old worker
-      // serving its session: it takes work again at once.
-      if (!stopped) fence.release(sid, pid);
+      // serving its session: it takes work again at once. Not one on an
+      // agent SDK the update took away: its fence stays up through the
+      // stop's backoff, until the worker goes or the tries reach stuckAfter
+      // (the sweep keeps it, sdkFenced), so no queued row goes to it.
+      if (!stopped) {
+        if (isAgentSdkWorker(worker) === true && state.failures > 0 && state.failures < stuckAfter && stillSameProcess(sid, pid)) {
+          state.sdkFence = pid;
+          log(`fence kept ${sid8(sid)} pid ${pid}: its stop failed, deliveries wait for the retry`);
+        } else {
+          fence.release(sid, pid);
+        }
+      }
     }
   }
 
@@ -454,17 +504,68 @@ export function createWorkerRecycleService({
    * worker's start, else when this service first saw the process. Throws
    * when a probe does; the caller counts that as a probe failure.
    */
-  function holdFor(sid, worker, state) {
+  function holdFor(sid, worker, state, sdkMode = null) {
     if (hasRunningTurn(sid) === true) return 'turn';
+    if (sdkMode === 'steering') return 'steering';
     const releaseHold = workerReleaseHold(worker);
     if (releaseHold) return releaseHold;
+    // A stale worker on an agent SDK goes as soon as its own holds allow: its
+    // next CLI child may have no files left to start from.
+    if (sdkMode === 'fast') return null;
     const cliAlive = worker?.steering?.cliAlive;
     if (cliAlive === true) return 'cli';
     if (cliAlive === false) return null;
+    const since = toTimeMs(quietSince(sid)) ?? toTimeMs(worker.startedAt) ?? firstSeenAt(state, worker);
+    return now() - since < quietMs ? 'quiet' : null;
+  }
+
+  // When this service first saw the worker's current process.
+  function firstSeenAt(state, worker) {
     const pid = toPid(worker.pid);
     if (state.firstSeen?.pid !== pid) state.firstSeen = { pid, at: now() };
-    const since = toTimeMs(quietSince(sid)) ?? toTimeMs(worker.startedAt) ?? state.firstSeen.at;
-    return now() - since < quietMs ? 'quiet' : null;
+    return state.firstSeen.at;
+  }
+
+  /**
+   * How a stale worker on an agent SDK is judged: 'fast' (its steering
+   * snapshot names its holds: no cli or quiet hold, fenced until the
+   * recycle), 'steering' (no snapshot yet, within `steeringWaitMs` of when
+   * this service first saw the process: wait for it, fenced), or null (not on
+   * an agent SDK, or a snapshot never came: as any other worker). Throws
+   * when the predicate does; the caller counts that as a probe failure.
+   */
+  function sdkModeFor(worker, state) {
+    if (isAgentSdkWorker(worker) !== true) return null;
+    if (worker?.steering && typeof worker.steering === 'object') return 'fast';
+    return now() - firstSeenAt(state, worker) < steeringWaitMs ? 'steering' : null;
+  }
+
+  // Raises the fence for a stale worker on an agent SDK until its recycle:
+  // whatever is queued for the session waits for the new worker.
+  function sdkFenceUp(sid, pid, state, confirmed) {
+    confirmed.add(sid);
+    if (state.sdkFence === pid && fence.isHeld(sid, pid)) return;
+    fence.hold(sid, pid);
+    if (state.sdkFence !== pid) log(`fenced ${sid8(sid)} pid ${pid}: stale on an agent SDK, deliveries wait for the recycle`);
+    state.sdkFence = pid;
+  }
+
+  // A recycle (or an archived stop) admitted for the session owns the fence
+  // from here: it lowers it when it is done.
+  function sdkFenceHandOver(state) {
+    state.sdkFence = null;
+  }
+
+  // Lowers the fences this service raised for workers no longer judged
+  // fenced by this sweep: gone, recycled, in a background hold, a probe that
+  // failed, a snapshot that never came.
+  function sdkFencesDown(confirmed) {
+    for (const [sid, state] of bySession) {
+      if (state.sdkFence === null || confirmed.has(sid)) continue;
+      const pid = state.sdkFence;
+      state.sdkFence = null;
+      if (fence.release(sid, pid)) log(`unfenced ${sid8(sid)} pid ${pid}`);
+    }
   }
 
   function noteWaiting(sid, state, hold, nextWaiting) {
@@ -509,6 +610,8 @@ export function createWorkerRecycleService({
       return;
     }
     const running = new Set();
+    // The sessions whose agent-SDK fence this sweep keeps up (sdkFenceUp).
+    const sdkFenced = new Set();
     for (const worker of workers) {
       const sid = String(worker?.sdkSessionId || '').trim();
       if (!sid) continue;
@@ -527,36 +630,51 @@ export function createWorkerRecycleService({
         continue;
       }
       const state = stateFor(sid);
-      if (state.inFlight || now() < state.nextAttemptAt) continue;
+      if (state.inFlight) continue;
+      if (now() < state.nextAttemptAt) {
+        // A failed stop's agent-SDK fence stays up through the backoff, up to
+        // stuckAfter tries; then the old worker serves again.
+        if (state.sdkFence !== null && state.sdkFence === pid && state.failures < stuckAfter) sdkFenced.add(sid);
+        continue;
+      }
       if (state.recycledPid && state.recycledPid === toPid(worker.pid)) continue;
       let hold = null;
       let archived = false;
+      let sdkMode = null;
       try {
-        hold = holdFor(sid, worker, state);
+        sdkMode = sdkModeFor(worker, state);
+        hold = holdFor(sid, worker, state, sdkMode);
         if (!hold) archived = isArchived(sid) === true;
       } catch (error) {
         // The relay cannot tell whether the session is busy or archived: the
         // worker is not stopped on a guess, and the probe is retried later.
+        // Nor is it fenced on a guess: an agent-SDK fence comes down.
         noteFailure(sid, state, 'probe', errorText(error, 'unknown'));
         continue;
       }
       if (hold) {
+        // Background tasks keep the CLI child up, so a delivery goes to it:
+        // the one hold such a worker waits out unfenced.
+        if (sdkMode && hold !== 'background') sdkFenceUp(sid, pid, state, sdkFenced);
         noteWaiting(sid, state, hold, nextWaiting);
         continue;
       }
       if (inFlight >= maxInFlight) {
         deferred = true;
+        if (sdkMode) sdkFenceUp(sid, pid, state, sdkFenced);
         continue;
       }
       if (archived) {
         // Fenced from here: the holds just passed, and a delivery to the
         // process being stopped would start a turn on it.
         fence.hold(sid, pid);
+        sdkFenceHandOver(state);
         startedSteps.push(begin(state, () => stopArchived(sid, worker, state)));
         continue;
       }
       if (!canLaunchNow()) {
         deferred = true;
+        if (sdkMode) sdkFenceUp(sid, pid, state, sdkFenced);
         continue;
       }
       lastAdmitAt = now();
@@ -564,8 +682,10 @@ export function createWorkerRecycleService({
       // await: no delivery can reach the old process between this check and
       // its stop, nor between the stop and the launch.
       fence.hold(sid, pid);
+      sdkFenceHandOver(state);
       startedSteps.push(begin(state, () => recycle(sid, worker, state)));
     }
+    sdkFencesDown(sdkFenced);
     // Launches owed after a stop went through: the registry lists no new
     // process for those sessions.
     for (const [sid, state] of bySession) {
@@ -639,6 +759,20 @@ export function createWorkerRecycleService({
     }
     started = true;
     scheduleNext();
+    // The start's own sweep: workers left from before the restart need not
+    // wait a whole interval.
+    runSweep();
+  }
+
+  /**
+   * A sweep now, outside the interval, while the service runs (a worker's
+   * hello). Its judging, the fence included, is done synchronously before
+   * this returns; the promise resolves once the recycles it started are done.
+   * Never rejects.
+   */
+  function sweepNow() {
+    if (!started) return Promise.resolve();
+    return sweep().catch(() => {});
   }
 
   function stop() {
@@ -667,7 +801,7 @@ export function createWorkerRecycleService({
     };
   }
 
-  return { start, stop, sweep, isStale, status };
+  return { start, stop, sweep, sweepNow, isStale, status };
 }
 
 /**

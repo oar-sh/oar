@@ -18,6 +18,7 @@
 import { randomUUID } from 'node:crypto';
 
 export const WORKER_LAUNCH_NOTE_KINDS = Object.freeze({
+  installing: 'worker-launch-installing',
   failed: 'worker-launch-failed',
   stopped: 'worker-launch-stopped',
   started: 'worker-launch-started',
@@ -47,6 +48,11 @@ export function buildWorkerLaunchNoteText({ type, lifecycle = {}, retryEveryMs =
   const tries = Math.max(0, Number(lifecycle?.retryCount || 0));
   const triesText = `${tries} ${tries === 1 ? 'try' : 'tries'}`;
   const cause = clipCause(lifecycle?.lastError);
+  if (type === 'installing') {
+    // The first chat of a provider whose agent SDK is not installed yet
+    // (agent-sdk-store.mjs): the relay installs it before the worker starts.
+    return `⏳ Installing the ${lifecycle?.sdkLabel || 'agent SDK'} on the relay host, once for this version. Your message is delivered when it is ready.`;
+  }
   if (type === 'launched') {
     return `✅ The worker for this conversation started at ${formatTime(lifecycle?.launchAt || new Date().toISOString())}. The queued message is being delivered.`;
   }
@@ -77,6 +83,7 @@ export function createWorkerLaunchNoteService({
   const episodes = new Map();
 
   function kindFor(type) {
+    if (type === 'installing') return WORKER_LAUNCH_NOTE_KINDS.installing;
     if (type === 'launched') return WORKER_LAUNCH_NOTE_KINDS.started;
     if (type === 'stopped') return WORKER_LAUNCH_NOTE_KINDS.stopped;
     return WORKER_LAUNCH_NOTE_KINDS.failed;
@@ -105,7 +112,7 @@ export function createWorkerLaunchNoteService({
       stmts.updateConvTime?.run?.(at, conversationId);
     });
     write();
-    episodes.set(sdkSessionId, { messageId, conversationId, timestamp: at });
+    episodes.set(sdkSessionId, { messageId, conversationId, timestamp: at, kind, text });
     try { emit('assistant_message', { conversationId, messageId, message: messagePayload({ messageId, text, kind, timestamp: at }) }); } catch {}
     try { logger.log?.(`[worker-launch] conv=${conversationId.slice(0, 8)} note opened (${type}): ${clipCause(lifecycle?.lastError)}`); } catch {}
   }
@@ -113,6 +120,11 @@ export function createWorkerLaunchNoteService({
   function update(episode, sdkSessionId, { type, lifecycle }) {
     const kind = kindFor(type);
     const text = buildWorkerLaunchNoteText({ type, lifecycle, retryEveryMs, retryWindowMs, formatTime });
+    // The same note again (a launch deferred on every prime while an agent
+    // SDK installs): no write, no broadcast.
+    if (episode.kind === kind && episode.text === text) return;
+    episode.kind = kind;
+    episode.text = text;
     updateNote.run(text, kind, episode.messageId);
     try {
       emit('message_updated', {
@@ -130,7 +142,7 @@ export function createWorkerLaunchNoteService({
   /** The supervisor's onLaunchState listener. */
   function handle({ type, sdkSessionId, lifecycle = null } = {}) {
     const sid = String(sdkSessionId || '').trim();
-    if (!sid || !['exhausted', 'retry-failed', 'stopped', 'launched'].includes(type)) return false;
+    if (!sid || !['installing', 'exhausted', 'retry-failed', 'stopped', 'launched'].includes(type)) return false;
     const episode = episodes.get(sid) || null;
     if (episode) {
       update(episode, sid, { type, lifecycle });

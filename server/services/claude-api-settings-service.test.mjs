@@ -290,16 +290,52 @@ test('the composer list keeps the default model and only models that are offered
   });
   const settings = service(store);
   settings.update(parseClaudeApiSettingsUpdateRequest({ model: 'claude-opus-5-5', enabledModels: ['claude-haiku-5-5', 'claude-retired-4'] }));
-  assert.deepEqual(JSON.parse(store.values.get(CLAUDE_API_ENABLED_MODELS_SETTING_KEY)), ['claude-haiku-5-5', 'claude-retired-4']);
+  // The old allowlist is no longer written; the model map holds the choice.
+  assert.equal(store.values.has(CLAUDE_API_ENABLED_MODELS_SETTING_KEY), false);
   const current = settings.getSettings();
   assert.equal(current.model, 'claude-opus-5-5');
   assert.deepEqual(current.models, ['claude-opus-5-5', 'claude-haiku-5-5']);
+  // An empty choice leaves the default model alone, never every model.
   settings.update(parseClaudeApiSettingsUpdateRequest({ enabledModels: [] }));
-  assert.deepEqual(settings.getSettings().models, ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']);
+  assert.deepEqual(settings.getSettings().models, ['claude-opus-5-5']);
   // An empty model goes back to the derived default.
   settings.update(parseClaudeApiSettingsUpdateRequest({ model: '' }));
   assert.equal(store.values.has(CLAUDE_API_MODEL_SETTING_KEY), false);
   assert.equal(settings.getSettings().model, 'claude-sonnet-5-5');
+});
+
+test('an allowlist saved before the model map shows the same models', () => {
+  const store = createStore({
+    [CLAUDE_API_KEY_SETTING_KEY]: TEST_KEY,
+    [CLAUDE_API_MODEL_SETTING_KEY]: 'claude-opus-5-5',
+    [CLAUDE_API_MODELS_SETTING_KEY]: JSON.stringify([{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }, { id: 'claude-haiku-5-5' }]),
+    [CLAUDE_API_ENABLED_MODELS_SETTING_KEY]: JSON.stringify(['claude-haiku-5-5']),
+  });
+  const current = service(store).getSettings();
+  assert.deepEqual(current.models, ['claude-opus-5-5', 'claude-haiku-5-5']);
+  assert.equal(current.autoEnableNew, true);
+  assert.equal(current.fallback, false);
+});
+
+test('a model listed later follows the switch; removing the key keeps the map', async () => {
+  const store = createStore({ [CLAUDE_API_KEY_SETTING_KEY]: TEST_KEY, [CLAUDE_API_MODEL_SETTING_KEY]: 'claude-opus-5-5' });
+  const listed = { data: [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }] };
+  const settings = service(store, { fetchImpl: async (...args) => modelsFetch(listed.data)(...args) });
+  await settings.refreshModels();
+  settings.update(parseClaudeApiSettingsUpdateRequest({ enabledModels: ['claude-opus-5-5'], autoEnableNew: false }));
+  // The first listing was new against the Claude tab's list that stood in.
+  assert.equal(settings.markModelsSeen(), true);
+  listed.data = [{ id: 'claude-opus-5-5' }, { id: 'claude-sonnet-5-5' }, { id: 'claude-haiku-5-5' }];
+  const refreshed = await settings.refreshModels();
+  assert.deepEqual(refreshed.newModels, [{ id: 'claude-haiku-5-5', on: false }]);
+  assert.deepEqual(settings.getSettings().models, ['claude-opus-5-5']);
+  assert.deepEqual(settings.getSettings().unseenModels, ['claude-haiku-5-5']);
+  assert.equal(settings.markModelsSeen(), true);
+  assert.equal(settings.update({ remove: true }).ok, true);
+  assert.ok(store.values.has('claude_api_model_state'));
+  settings.update(parseClaudeApiSettingsUpdateRequest({ apiKey: OTHER_KEY }));
+  await settings.refreshModels();
+  assert.deepEqual(settings.getSettings().models, ['claude-opus-5-5']);
 });
 
 test('the key cannot be removed while a Claude API conversation has a message or a queued one', () => {

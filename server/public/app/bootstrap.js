@@ -79,8 +79,10 @@ import {
   loadModelVariantCatalog,
   refreshModelVariantCatalog,
   saveEnabledModelVariants,
+  markModelsSeen,
   updateClaudeSettings,
   updateCursorSettings,
+  updateOpenAISettings,
   updateGrokSettings,
   updateDeepSeekSettings,
   updateClaudeApiSettings,
@@ -192,6 +194,24 @@ import {
   modelSelectorOptionsEqual,
   splitModelVariantId,
 } from './model-selector-options.mjs';
+import {
+  applyUnsavedModelTicks,
+  buildOpenAIModelRows,
+  collectUnsavedModelTicks,
+  isUnseenModelRow,
+  mergeUnseenByTab,
+  modelCheckboxSelection,
+  modelRefreshBlockFields,
+  modelRowSdkModelId,
+  modelSelectionSignature,
+  modelTabAutoEnableNew,
+  modelTabFallbackModel,
+  normalizeCopilotModelState,
+  renderModelAutoEnableRowHtml,
+  renderModelFallbackWarningHtml,
+  renderModelVariantCheckboxHtml,
+  renderNewModelChipHtml,
+} from './model-refresh-ui.mjs';
 import {
   buildContextTierOptions,
   resolveContextTierValue,
@@ -384,6 +404,8 @@ import {
   updateTaskStallMinutesSetting,
   updateRestartResumeSettingFromToggle,
   updateSubagentRecordRetentionSetting,
+  updateModelRefreshAutoSetting,
+  updateModelRefreshIntervalSetting,
 } from './settings-modal.js';
 import {
   togglePushOnThisDevice,
@@ -486,6 +508,7 @@ import {
   runCliInstall,
   cancelCliInstallRun,
 } from './cli-install-ui.js';
+import { refreshAgentSdkRows } from './agent-sdk-ui.js';
 import {
   updateAutoCheckSetting,
   checkForUpdatesNow,
@@ -613,6 +636,15 @@ let modelVariantCatalogState = {
   reasoningEfforts: [],
 };
 let modelVariantCatalogProviderTab = 'copilot';
+// The unseen ids each Select Models tab tagged "New" since the modal opened:
+// opening it marks them seen, and the re-render that follows keeps the tags.
+let selectModelsHeldUnseen = new Map();
+// modelSelectionSignature of the catalog the open Select Models was last
+// rendered from: a models_updated that changes none of it skips the re-render.
+let selectModelsRenderedSignature = '';
+// New models no Select Models has shown yet (GET /api/models, models_updated):
+// the dot on the menu entry.
+let unseenNewModelCount = 0;
 let suppressConversationPreferenceSync = false;
 let conversationPreferenceWriteVersion = 0;
 let latestQueueStatus = {
@@ -1845,10 +1877,24 @@ function rebuildModelSelectorOptionsForProvider() {
   return true;
 }
 
+function syncSelectModelsMenuDot(count) {
+  if (Number.isFinite(Number(count))) unseenNewModelCount = Math.max(0, Math.trunc(Number(count)));
+  const button = document.getElementById('chat-menu-select-models');
+  const dot = document.getElementById('chat-menu-select-models-dot');
+  if (dot) dot.hidden = unseenNewModelCount === 0;
+  // The dot is decorative; the name says it.
+  if (unseenNewModelCount > 0) button?.setAttribute('aria-label', 'Select Models (new models)');
+  else button?.removeAttribute('aria-label');
+}
+
 function updateModelCatalogState(payload) {
   // Shared readers never load the catalog, so this would only surface
   // "metadata unavailable" warnings for a picker they cannot see.
   if (isSharedReaderMode()) return;
+  // Before the early returns below: a deferred catalog still moves the dot.
+  if (payload && Object.prototype.hasOwnProperty.call(payload, 'unseenNewModelCount')) {
+    syncSelectModelsMenuDot(payload.unseenNewModelCount);
+  }
   // The catalog's `source` is the Copilot readiness signal (provider-readiness.mjs).
   updateProviderReadinessInputs({ catalog: payload && typeof payload === 'object' ? payload : null });
   const select = document.getElementById('model-select');
@@ -2619,6 +2665,7 @@ function applyModelVariantCatalogState(payload) {
         enabledModels: Array.isArray(payload.claudeModels.enabledModels)
           ? payload.claudeModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
           : [],
+        ...modelRefreshBlockFields(payload.claudeModels),
       }
       : null,
     cursorModels: payload?.cursorModels && typeof payload.cursorModels === 'object'
@@ -2630,6 +2677,7 @@ function applyModelVariantCatalogState(payload) {
         enabledModels: Array.isArray(payload.cursorModels.enabledModels)
           ? payload.cursorModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
           : [],
+        ...modelRefreshBlockFields(payload.cursorModels),
       }
       : null,
     grokModels: payload?.grokModels && typeof payload.grokModels === 'object'
@@ -2641,6 +2689,7 @@ function applyModelVariantCatalogState(payload) {
         enabledModels: Array.isArray(payload.grokModels.enabledModels)
           ? payload.grokModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
           : [],
+        ...modelRefreshBlockFields(payload.grokModels),
       }
       : null,
     deepseekModels: payload?.deepseekModels && typeof payload.deepseekModels === 'object'
@@ -2652,6 +2701,7 @@ function applyModelVariantCatalogState(payload) {
         enabledModels: Array.isArray(payload.deepseekModels.enabledModels)
           ? payload.deepseekModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
           : [],
+        ...modelRefreshBlockFields(payload.deepseekModels),
       }
       : null,
     claudeApiModels: payload?.claudeApiModels && typeof payload.claudeApiModels === 'object'
@@ -2663,8 +2713,24 @@ function applyModelVariantCatalogState(payload) {
         enabledModels: Array.isArray(payload.claudeApiModels.enabledModels)
           ? payload.claudeApiModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
           : [],
+        ...modelRefreshBlockFields(payload.claudeApiModels),
       }
       : null,
+    // OpenAI BYOK's selection, like Cursor's; null from a relay without one
+    // (the OpenAI tab then lists its models as managed in settings).
+    openaiModels: payload?.openaiModels && typeof payload.openaiModels === 'object'
+      ? {
+        defaultModel: String(payload.openaiModels.defaultModel || '').trim(),
+        availableModels: Array.isArray(payload.openaiModels.availableModels)
+          ? payload.openaiModels.availableModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        enabledModels: Array.isArray(payload.openaiModels.enabledModels)
+          ? payload.openaiModels.enabledModels.map((value) => String(value || '').trim()).filter(Boolean)
+          : [],
+        ...modelRefreshBlockFields(payload.openaiModels),
+      }
+      : null,
+    copilotModelState: normalizeCopilotModelState(payload?.copilotModelState),
   };
 }
 
@@ -2711,17 +2777,37 @@ async function reconcileOpenModelVariantModal() {
   const payload = await loadModelVariantCatalog();
   if (!payload) return;
   applyModelVariantCatalogState(payload);
+  // Another device opening or saving Select Models emits models_updated too:
+  // when nothing this modal shows changed, the ticks not saved yet stay as
+  // they are; otherwise they are carried across the re-render.
+  if (modelSelectionSignature(modelVariantCatalogState) === selectModelsRenderedSignature) return;
+  const checkboxes = () => Array.from(document.querySelectorAll(
+    '#summary-modal-body .model-variant-checkbox, #summary-modal-body .model-auto-enable-toggle',
+  ));
+  const unsavedTicks = collectUnsavedModelTicks(checkboxes());
   renderModelVariantCatalogBody();
+  applyUnsavedModelTicks(checkboxes(), unsavedTicks);
+}
+
+// Shown now: the "New" tags and the menu dot are cleared on the relay (fire
+// and forget). The open modal keeps its tags (selectModelsHeldUnseen).
+function markSelectModelsSeen() {
+  void markModelsSeen().then((result) => {
+    if (result) syncSelectModelsMenuDot(Number(result.unseenNewModelCount) || 0);
+  }).catch(() => {});
 }
 
 function renderModelVariantCatalogBody() {
   const providersByModel = modelCatalogState.providersByModel || {};
+  const openaiCatalog = modelVariantCatalogState.openaiModels;
   const variantBelongsToTab = (entry, tab) => {
     const activeTab = String(tab || 'copilot').trim().toLowerCase();
     const baseModelId = String(entry?.baseModelId || '').trim().toLowerCase();
     const entryProvider = String(entry?.provider || '').trim().toLowerCase();
     const providers = modelProvidersForId(baseModelId, providersByModel);
-    const hasOpenAIByok = providers.includes('openai-byok');
+    // With its own selection, the OpenAI tab lists exactly its own rows; a
+    // Copilot row of the same model stays on the Copilot tab.
+    const hasOpenAIByok = !openaiCatalog && providers.includes('openai-byok');
     // Each tab lists only rows sourced from that runtime: the Claude SDK tab
     // shows Claude-SDK rows exclusively, the Cursor SDK tab Cursor rows, the
     // Grok tab Grok rows, and Copilot never shows rows that a different runtime
@@ -2780,7 +2866,8 @@ function renderModelVariantCatalogBody() {
       .map((entry) => String(entry.baseModelId || '').trim().toLowerCase())
       .filter(Boolean),
   );
-  for (const [modelId, providers] of Object.entries(modelCatalogState.providersByModel || {})) {
+  // A relay without an OpenAI selection: its models are listed, managed in settings.
+  for (const [modelId, providers] of Object.entries(openaiCatalog ? {} : (modelCatalogState.providersByModel || {}))) {
     const baseModelId = String(modelId || '').trim().toLowerCase();
     if (!baseModelId) continue;
     const providerList = Array.isArray(providers) ? providers : [];
@@ -2800,6 +2887,9 @@ function renderModelVariantCatalogBody() {
     });
     grouped.set('openai-byok', providerRows);
     openAIBaseModelsAlreadyListed.add(baseModelId);
+  }
+  if (openaiCatalog?.availableModels?.length) {
+    grouped.set('openai-byok', buildOpenAIModelRows(openaiCatalog, humanizeModelLabel));
   }
   const claudeCatalog = modelVariantCatalogState.claudeModels;
   if (claudeCatalog?.availableModels?.length) {
@@ -2973,6 +3063,16 @@ function renderModelVariantCatalogBody() {
     else if (hasClaudeApiTab) modelVariantCatalogProviderTab = 'claude-api';
   }
   const visibleProviderOrder = providerOrder.filter((providerKey) => providerBelongsToTab(providerKey, modelVariantCatalogProviderTab));
+  selectModelsHeldUnseen = mergeUnseenByTab(selectModelsHeldUnseen, modelVariantCatalogState);
+  const tabUnseenIds = selectModelsHeldUnseen.get(modelVariantCatalogProviderTab) || new Set();
+  const tabAutoEnableNew = modelTabAutoEnableNew(modelVariantCatalogState, modelVariantCatalogProviderTab);
+  // A relay from before the switch sends none: no row then.
+  const autoEnableRowHtml = visibleProviderOrder.length && tabAutoEnableNew !== null
+    ? renderModelAutoEnableRowHtml(modelVariantCatalogProviderTab, tabAutoEnableNew)
+    : '';
+  const fallbackWarningHtml = renderModelFallbackWarningHtml(
+    modelTabFallbackModel(modelVariantCatalogState, modelVariantCatalogProviderTab),
+  );
   const providerTabButtons = `
     <div class="summary-tab-strip" style="display:flex;flex-wrap:wrap;gap:calc(4px * var(--ui-scale)) calc(5px * var(--ui-scale));align-items:center;">
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
@@ -3034,13 +3134,10 @@ function renderModelVariantCatalogBody() {
         : '';
       const variantRowsHtml = variantRows.map((row) => {
         const selectable = row.selectable !== false;
-        // SDK-provider rows (Claude/Cursor/Grok/DeepSeek) carry their own enabled
-        // flag; only Copilot variant rows read the enabledVariantIds selection.
-        const sdkProviderModelId = row.claudeModelId || row.cursorModelId || row.grokModelId || row.deepseekModelId
-          || row.claudeApiModelId || '';
-        const checked = sdkProviderModelId
-          ? row.enabled === true
-          : (selectable && selected.has(row.variantId));
+        // SDK-provider rows (Claude/Cursor/Grok/DeepSeek/OpenAI) carry their own
+        // enabled flag; only Copilot variant rows read the enabledVariantIds
+        // selection (renderModelVariantCheckboxHtml).
+        const sdkProviderModelId = modelRowSdkModelId(row);
         const effortChip = row.reasoningEffort
           ? ` <span class="model-reasoning-chip">${escHtml(row.reasoningEffort)}</span>`
           : '';
@@ -3053,20 +3150,12 @@ function renderModelVariantCatalogBody() {
             ? ' <span class="model-reasoning-chip">default model</span>'
             : ' <span class="model-reasoning-chip">managed in settings</span>')
           : '';
-        const sdkModelAttr = row.claudeModelId
-          ? ` data-claude-model="${escHtml(row.claudeModelId)}"`
-          : (row.cursorModelId
-            ? ` data-cursor-model="${escHtml(row.cursorModelId)}"`
-            : (row.grokModelId
-              ? ` data-grok-model="${escHtml(row.grokModelId)}"`
-              : (row.deepseekModelId
-                ? ` data-deepseek-model="${escHtml(row.deepseekModelId)}"`
-                : (row.claudeApiModelId ? ` data-claude-api-model="${escHtml(row.claudeApiModelId)}"` : ''))));
+        const newChip = isUnseenModelRow(row, tabUnseenIds) ? renderNewModelChipHtml() : '';
         return `
           <label class="model-variant-row">
-            <input class="model-variant-checkbox" type="checkbox" data-selectable="${selectable ? '1' : '0'}" data-variant-id="${escHtml(row.variantId)}"${sdkModelAttr} ${checked ? 'checked' : ''} ${selectable ? '' : 'disabled'}>
+            ${renderModelVariantCheckboxHtml(row, selected)}
             <span class="model-variant-row-copy">
-              <span class="model-variant-row-title"${row.claudeApiModelId ? ` title="${escHtml(row.claudeApiModelId)}"` : ''}>${escHtml(row.claudeApiModelId ? row.label : row.variantId)}${effortChip}${statusChip}${fixedChip}</span>
+              <span class="model-variant-row-title"${row.claudeApiModelId ? ` title="${escHtml(row.claudeApiModelId)}"` : ''}>${escHtml(row.claudeApiModelId ? row.label : row.variantId)}${effortChip}${statusChip}${fixedChip}${newChip}</span>
             </span>
           </label>
         `;
@@ -3095,6 +3184,8 @@ function renderModelVariantCatalogBody() {
   const bodyHtml = `
     <div style="display:flex;flex-direction:column;gap:calc(5px * var(--ui-scale))">
       ${providerTabButtons}
+      ${autoEnableRowHtml}
+      ${fallbackWarningHtml}
       <div style="font-size:0.8rem;color:var(--muted)">
         Saved globally for this relay. Refreshed: <strong>${escHtml(refreshedLabel)}</strong>
       </div>
@@ -3108,6 +3199,7 @@ function renderModelVariantCatalogBody() {
       <div style="display:grid;gap:calc(5px * var(--ui-scale))">${groupsHtml || '<div style="color:var(--muted)">No models discovered yet. Click Refresh.</div>'}</div>
     </div>
   `;
+  selectModelsRenderedSignature = modelSelectionSignature(modelVariantCatalogState);
   renderSummaryModalContent({
     title: '🤗 Select Models',
     subtitle: "Choose model variants shown under Model in the composer's ⚙ settings",
@@ -3117,7 +3209,10 @@ function renderModelVariantCatalogBody() {
       if (!refreshed) throw new Error('Failed to refresh model variants');
       reportOpenAIModelDiscoveryFailure(refreshed);
       applyModelVariantCatalogState(refreshed);
+      // The render holds the refresh's unseen ids with the tags already
+      // shown; the models it found are seen now too, as on open.
       renderModelVariantCatalogBody();
+      markSelectModelsSeen();
       await refreshModelCatalog(true);
     },
     kind: 'select-models',
@@ -3143,8 +3238,9 @@ function renderModelVariantCatalogBody() {
   }
 }
 
-async function openSelectModelsModal() {
-  modelVariantCatalogProviderTab = 'copilot';
+async function openSelectModelsModal(tab = 'copilot') {
+  modelVariantCatalogProviderTab = String(tab || '').trim().toLowerCase() || 'copilot';
+  selectModelsHeldUnseen = new Map();
   openSummaryModal({
     title: '🤗 Select Models',
     subtitle: 'Loading…',
@@ -3157,6 +3253,8 @@ async function openSelectModelsModal() {
     if (!payload) throw new Error('Failed to load model variants');
     applyModelVariantCatalogState(payload);
     renderModelVariantCatalogBody();
+    // This modal keeps its tags until it is opened again.
+    markSelectModelsSeen();
   } catch (error) {
     renderSummaryModalContent({
       title: '🤗 Select Models',
@@ -3172,44 +3270,39 @@ async function openSelectModelsModal() {
 async function saveSelectedModelsFromModal() {
   const body = document.getElementById('summary-modal-body');
   if (!body) return;
-  const claudeCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-claude-model]'));
-  const selectedClaudeModels = claudeCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-claude-model') || '').trim())
-    .filter(Boolean);
-  const cursorCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-cursor-model]'));
-  const selectedCursorModels = cursorCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-cursor-model') || '').trim())
-    .filter(Boolean);
-  const grokCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-grok-model]'));
-  const selectedGrokModels = grokCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-grok-model') || '').trim())
-    .filter(Boolean);
-  const deepseekCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-deepseek-model]'));
-  const selectedDeepSeekModels = deepseekCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-deepseek-model') || '').trim())
-    .filter(Boolean);
-  const claudeApiCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-claude-api-model]'));
-  const selectedClaudeApiModels = claudeApiCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-claude-api-model') || '').trim())
-    .filter(Boolean);
+  // Each provider's rendered rows: `enabled` the ticked model ids, `shown`
+  // every rendered one (the locked default model too). Read from the DOM,
+  // never the catalog state: a models_updated may already hold a model this
+  // render does not show, and the relay changes only the shown ids.
+  const providerSelection = (attribute) => {
+    const inputs = Array.from(body.querySelectorAll(`.model-variant-checkbox[${attribute}]`));
+    return { inputs, ...modelCheckboxSelection(inputs, attribute) };
+  };
+  const claudeSelection = providerSelection('data-claude-model');
+  const cursorSelection = providerSelection('data-cursor-model');
+  const grokSelection = providerSelection('data-grok-model');
+  const deepseekSelection = providerSelection('data-deepseek-model');
+  const claudeApiSelection = providerSelection('data-claude-api-model');
+  const openaiSelection = providerSelection('data-openai-model');
+  // The rendered tab's "Turn new models on automatically"; undefined for
+  // every other tab, whose switch the save leaves alone.
+  const autoEnableToggle = body.querySelector('.model-auto-enable-toggle[data-auto-enable-tab]');
+  const autoEnableNewFor = (tab) => (
+    autoEnableToggle && autoEnableToggle.getAttribute('data-auto-enable-tab') === tab
+      ? autoEnableToggle.checked === true
+      : undefined
+  );
   // Only the active provider tab's rows are in the DOM, but the PATCH
   // replaces the WHOLE enabled set — so the save must only change rows the
   // user could actually see. Off-screen variants keep their stored state,
   // otherwise saving from e.g. the OpenAI tab silently disables every
   // Copilot-only vendor group (Anthropic, Google, …).
-  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model]):not([data-deepseek-model]):not([data-claude-api-model])'));
-  const renderedVariantIds = new Set(renderedVariantCheckboxes
-    .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
-    .filter(Boolean));
-  const checkedVariantIds = renderedVariantCheckboxes
-    .filter((input) => input.checked)
-    .map((input) => String(input.getAttribute('data-variant-id') || '').trim())
-    .filter(Boolean);
+  const renderedVariantCheckboxes = Array.from(body.querySelectorAll('.model-variant-checkbox[data-selectable="1"]:not([data-claude-model]):not([data-cursor-model]):not([data-grok-model]):not([data-deepseek-model]):not([data-claude-api-model]):not([data-openai-model])'));
+  const {
+    enabled: checkedVariantIds,
+    shown: shownVariantIds,
+  } = modelCheckboxSelection(renderedVariantCheckboxes, 'data-variant-id');
+  const renderedVariantIds = new Set(shownVariantIds);
   const checkedVariantSet = new Set(checkedVariantIds);
   const selectedVariantIds = (modelVariantCatalogState.enabledVariantIds || [])
     .filter((variantId) => !renderedVariantIds.has(variantId) || checkedVariantSet.has(variantId));
@@ -3223,38 +3316,73 @@ async function saveSelectedModelsFromModal() {
   }
   setSummaryModalLoading(true);
   try {
-    if (hasVariantRows) {
-      const saved = await saveEnabledModelVariants(selectedVariantIds);
+    const copilotAutoEnableNew = autoEnableNewFor('copilot');
+    if (hasVariantRows || copilotAutoEnableNew !== undefined) {
+      // Without rows to save, only the switch: a null list keeps the selection.
+      const saved = await saveEnabledModelVariants(hasVariantRows ? selectedVariantIds : null, {
+        autoEnableNew: copilotAutoEnableNew,
+        shownVariantIds: hasVariantRows ? shownVariantIds : undefined,
+      });
       if (!saved) throw new Error('Failed to save model selection');
       applyModelVariantCatalogState(saved);
     }
-    if (claudeCheckboxes.length) {
-      const savedClaude = await updateClaudeSettings({ enabledModels: selectedClaudeModels });
+    if (claudeSelection.inputs.length) {
+      const savedClaude = await updateClaudeSettings({
+        enabledModels: claudeSelection.enabled,
+        shownModels: claudeSelection.shown,
+        autoEnableNew: autoEnableNewFor('anthropic'),
+      });
       if (!savedClaude) throw new Error('Failed to save Claude model selection');
       applyClaudeSettingsState(savedClaude);
     }
-    if (cursorCheckboxes.length) {
-      const savedCursor = await updateCursorSettings({ enabledModels: selectedCursorModels });
+    if (cursorSelection.inputs.length) {
+      const savedCursor = await updateCursorSettings({
+        enabledModels: cursorSelection.enabled,
+        shownModels: cursorSelection.shown,
+        autoEnableNew: autoEnableNewFor('cursor'),
+      });
       if (!savedCursor) throw new Error('Failed to save Cursor model selection');
       applyCursorSettingsState(savedCursor);
     }
-    if (grokCheckboxes.length) {
-      const savedGrok = await updateGrokSettings({ enabledModels: selectedGrokModels });
+    if (grokSelection.inputs.length) {
+      const savedGrok = await updateGrokSettings({
+        enabledModels: grokSelection.enabled,
+        shownModels: grokSelection.shown,
+        autoEnableNew: autoEnableNewFor('grok'),
+      });
       if (!savedGrok) throw new Error('Failed to save Grok model selection');
       applyGrokSettingsState(savedGrok);
     }
-    if (deepseekCheckboxes.length) {
-      const savedDeepSeek = await updateDeepSeekSettings({ enabledModels: selectedDeepSeekModels });
+    if (deepseekSelection.inputs.length) {
+      const savedDeepSeek = await updateDeepSeekSettings({
+        enabledModels: deepseekSelection.enabled,
+        shownModels: deepseekSelection.shown,
+        autoEnableNew: autoEnableNewFor('deepseek'),
+      });
       if (!savedDeepSeek) throw new Error('Failed to save DeepSeek model selection');
       applyDeepSeekSettingsState(savedDeepSeek);
     }
-    if (claudeApiCheckboxes.length) {
-      const savedClaudeApi = await updateClaudeApiSettings({ enabledModels: selectedClaudeApiModels });
+    if (claudeApiSelection.inputs.length) {
+      const savedClaudeApi = await updateClaudeApiSettings({
+        enabledModels: claudeApiSelection.enabled,
+        shownModels: claudeApiSelection.shown,
+        autoEnableNew: autoEnableNewFor('claude-api'),
+      });
       if (!savedClaudeApi) throw new Error('Failed to save Claude API model selection');
       applyClaudeApiSettingsState(savedClaudeApi);
     }
-    if (claudeCheckboxes.length || cursorCheckboxes.length || grokCheckboxes.length || deepseekCheckboxes.length
-      || claudeApiCheckboxes.length) {
+    if (openaiSelection.inputs.length) {
+      // No model named: the selection only, the default model stays.
+      const savedOpenAI = await updateOpenAISettings({
+        enabledModels: openaiSelection.enabled,
+        shownModels: openaiSelection.shown,
+        autoEnableNew: autoEnableNewFor('openai'),
+      });
+      if (!savedOpenAI) throw new Error('Failed to save OpenAI model selection');
+      applyOpenAISettingsState(savedOpenAI);
+    }
+    if ([claudeSelection, cursorSelection, grokSelection, deepseekSelection, claudeApiSelection, openaiSelection]
+      .some((selection) => selection.inputs.length)) {
       const refreshedCatalog = await loadModelVariantCatalog();
       if (refreshedCatalog) applyModelVariantCatalogState(refreshedCatalog);
     }
@@ -5288,6 +5416,7 @@ initSocketHandlers({
   refreshModelCatalog,
   updateModelCatalogState,
   reconcileOpenModelVariantModal,
+  openSelectModelsModal,
   applyConversationWorkspaceRootUpdate,
   applyConversationTitleUpdate,
   syncChatTitleControls,
@@ -5730,6 +5859,10 @@ async function initApp() {
   void refreshClaudeCloudSettingsState().then((state) => {
     updateProviderReadinessInputs({ claudeCloud: state || null });
   });
+  // Not awaited either: a provider whose SDK failed to install is not ready,
+  // and the read passes the snapshot to provider readiness itself. A missing
+  // answer changes nothing.
+  void refreshAgentSdkRows();
   await refreshModelCatalog(true);
   initFullscreenButton();
   initInstallButton();
@@ -5973,6 +6106,8 @@ window.previewTaskStallMinutesSetting = previewTaskStallMinutesSetting;
 window.updateTaskStallMinutesSetting = updateTaskStallMinutesSetting;
 window.updateRestartResumeSettingFromToggle = updateRestartResumeSettingFromToggle;
 window.updateSubagentRecordRetentionSetting = updateSubagentRecordRetentionSetting;
+window.updateModelRefreshAutoSetting = updateModelRefreshAutoSetting;
+window.updateModelRefreshIntervalSetting = updateModelRefreshIntervalSetting;
 window.togglePushOnThisDevice = togglePushOnThisDevice;
 window.updatePushPreferencesFromControls = updatePushPreferencesFromControls;
 window.openSettingsModal = openSettingsModal;

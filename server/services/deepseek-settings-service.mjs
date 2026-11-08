@@ -4,10 +4,11 @@
 //
 // One API key per relay, stored like the OpenAI and Cursor keys in the
 // settings table and never sent to the browser. Next to it: the switch, the
-// default model, the discovered models and the ones enabled for the
-// composer, an optional base URL, and the commit attribution of DeepSeek
-// chats. Discovery asks DeepSeek's `GET /models` (shared/deepseek-api.mjs);
-// when it has not run or failed, the built-in list stands in.
+// default model, the discovered models and which of them are on for the
+// composer (provider-model-state.mjs), an optional base URL, and the commit
+// attribution of DeepSeek chats. Discovery asks DeepSeek's `GET /models`
+// (shared/deepseek-api.mjs); when it has not run or failed, the built-in list
+// stands in.
 
 import { createDeepSeekApiClient, normalizeDeepSeekBaseUrl } from '../../shared/deepseek-api.mjs';
 import {
@@ -22,11 +23,14 @@ import {
 } from '../../shared/deepseek-models.mjs';
 import { DEEPSEEK_PRICE_CURRENCIES } from '../../shared/deepseek-pricing.mjs';
 import { isSafeDeepSeekModelId } from '../../shared/model-id.mjs';
+import { createProviderModelStateStore } from './provider-model-state.mjs';
 
 export const DEEPSEEK_API_KEY_SETTING_KEY = 'deepseek_api_key';
 export const DEEPSEEK_ENABLED_SETTING_KEY = 'deepseek_enabled';
 export const DEEPSEEK_MODEL_SETTING_KEY = 'deepseek_model';
 export const DEEPSEEK_MODELS_SETTING_KEY = 'deepseek_models';
+// The allowlist before 0.9.24: read once to build the model map, then left
+// as it is so an older version still finds it.
 export const DEEPSEEK_ENABLED_MODELS_SETTING_KEY = 'deepseek_enabled_models';
 export const DEEPSEEK_BASE_URL_SETTING_KEY = 'deepseek_base_url';
 export const DEEPSEEK_ATTRIBUTION_SETTING_KEY = 'deepseek_attribution';
@@ -95,9 +99,9 @@ function parseMonthlyBudgetCurrency(value) {
 }
 
 /**
- * Reads `{ apiKey?, enabled?, model?, enabledModels?, baseUrl?, attribution?,
- * monthlyBudget?, monthlyBudgetCurrency?, startingBalance?,
- * startingBalanceEdited?, remove? }` from a
+ * Reads `{ apiKey?, enabled?, model?, enabledModels?, autoEnableNew?,
+ * baseUrl?, attribution?, monthlyBudget?, monthlyBudgetCurrency?,
+ * startingBalance?, startingBalanceEdited?, remove? }` from a
  * request body. The
  * key is never echoed in an error.
  */
@@ -123,6 +127,14 @@ export function parseDeepSeekSettingsUpdateRequest(body = {}) {
   if (hasOwn(payload, 'enabledModels')) {
     if (!Array.isArray(payload.enabledModels)) return { ok: false, error: 'enabledModels must be a list' };
     update.enabledModels = uniqueModels(payload.enabledModels);
+  }
+  if (hasOwn(payload, 'shownModels')) {
+    if (!Array.isArray(payload.shownModels)) return { ok: false, error: 'shownModels must be a list' };
+    update.shownModels = uniqueModels(payload.shownModels);
+  }
+  if (hasOwn(payload, 'autoEnableNew')) {
+    if (typeof payload.autoEnableNew !== 'boolean') return { ok: false, error: 'autoEnableNew must be true or false' };
+    update.autoEnableNew = payload.autoEnableNew;
   }
   if (hasOwn(payload, 'baseUrl')) {
     const normalized = normalizeDeepSeekBaseUrl(payload.baseUrl === null ? '' : payload.baseUrl);
@@ -168,7 +180,11 @@ export function createDeepSeekSettingsService({
   listProviderCandidates = () => [],
   fetchImpl = globalThis.fetch,
   now = () => new Date(),
+  // (result) after each discovery: the model refresh ledger's clock.
+  onModelsRefreshed = () => {},
 } = {}) {
+  const modelState = createProviderModelStateStore({ readSetting, writeSetting, now });
+
   function readList(settingKey) {
     try {
       const parsed = JSON.parse(readSetting(settingKey) || '[]');
@@ -220,10 +236,13 @@ export function createDeepSeekSettingsService({
     const model = readModel();
     const discovered = readList(DEEPSEEK_MODELS_SETTING_KEY);
     const availableModels = uniqueModels([model, ...(discovered.length ? discovered : DEFAULT_DEEPSEEK_MODELS)]);
-    const storedEnabled = readList(DEEPSEEK_ENABLED_MODELS_SETTING_KEY)
-      .filter((entry) => availableModels.some((candidate) => candidate.toLowerCase() === entry.toLowerCase()));
-    // The default model always stays enabled; with no choice stored, all are.
-    const models = storedEnabled.length ? uniqueModels([model, ...storedEnabled]) : availableModels;
+    // The default model always stays on; the others as the model map says.
+    const enabled = modelState.resolve(DEEPSEEK_PROVIDER_TYPE, {
+      availableModels,
+      defaultModel: model,
+      legacyAllowlist: () => readList(DEEPSEEK_ENABLED_MODELS_SETTING_KEY),
+    });
+    const models = uniqueModels(enabled.models);
     return {
       configured: !!apiKey,
       enabled: !!apiKey && (enabledSetting === '' || enabledSetting === 'true'),
@@ -231,6 +250,9 @@ export function createDeepSeekSettingsService({
       model,
       models,
       availableModels,
+      autoEnableNew: enabled.autoEnableNew,
+      fallback: enabled.fallback,
+      unseenModels: enabled.unseen,
       discovered: discovered.length > 0,
       baseUrl: readBaseUrl(),
       attribution: readAttribution(),
@@ -291,9 +313,9 @@ export function createDeepSeekSettingsService({
           activeQueueConversationCount: counts.queued,
         };
       }
+      // The model map stays: a key added again finds its models as they were.
       deleteSetting(DEEPSEEK_API_KEY_SETTING_KEY);
       deleteSetting(DEEPSEEK_MODELS_SETTING_KEY);
-      deleteSetting(DEEPSEEK_ENABLED_MODELS_SETTING_KEY);
       writeSetting(DEEPSEEK_ENABLED_SETTING_KEY, 'false', stamp);
       return { ok: true, removed: true, keyChanged: previous.configured, discover: false, settings: describe() };
     }
@@ -315,12 +337,16 @@ export function createDeepSeekSettingsService({
     }
     if (hasOwn(parsed, 'enabled') || keyChanged) writeSetting(DEEPSEEK_ENABLED_SETTING_KEY, nextEnabled ? 'true' : 'false', stamp);
     if (hasOwn(parsed, 'model')) writeSetting(DEEPSEEK_MODEL_SETTING_KEY, parsed.model, stamp);
-    if (hasOwn(parsed, 'enabledModels')) {
-      if (parsed.enabledModels.length) {
-        writeSetting(DEEPSEEK_ENABLED_MODELS_SETTING_KEY, JSON.stringify(parsed.enabledModels), stamp);
-      } else {
-        deleteSetting(DEEPSEEK_ENABLED_MODELS_SETTING_KEY);
-      }
+    if (hasOwn(parsed, 'enabledModels') || hasOwn(parsed, 'autoEnableNew')) {
+      // The models Select Models showed are set as ticked; an empty list
+      // leaves the default model alone, never all.
+      modelState.select(DEEPSEEK_PROVIDER_TYPE, {
+        enabledModels: parsed.enabledModels,
+        // The rows the browser drew; an older page sends none.
+        shownModels: parsed.shownModels || previous.availableModels,
+        defaultModel: readModel(),
+        autoEnableNew: parsed.autoEnableNew,
+      });
     }
     if (hasOwn(parsed, 'attribution')) writeSetting(DEEPSEEK_ATTRIBUTION_SETTING_KEY, parsed.attribution, stamp);
     if (hasOwn(parsed, 'monthlyBudget')) {
@@ -361,6 +387,12 @@ export function createDeepSeekSettingsService({
    * failure keeps what was stored, so the pickers never empty out.
    */
   async function refreshModels() {
+    const result = await discoverModels();
+    try { onModelsRefreshed(result); } catch { /* the clock is best-effort */ }
+    return result;
+  }
+
+  async function discoverModels() {
     const settings = getSettings();
     if (!settings.configured) return { ok: false, models: settings.availableModels, error: 'DeepSeek API key is not configured' };
     try {
@@ -370,11 +402,17 @@ export function createDeepSeekSettingsService({
         return { ok: false, models: settings.availableModels, error: 'DeepSeek listed no DeepSeek models' };
       }
       writeSetting?.(DEEPSEEK_MODELS_SETTING_KEY, JSON.stringify(models), now().toISOString());
-      return { ok: true, models: getSettings().availableModels, error: null };
+      const availableModels = getSettings().availableModels;
+      const { added } = modelState.reconcile(DEEPSEEK_PROVIDER_TYPE, { availableModels });
+      return { ok: true, models: availableModels, newModels: added, error: null };
     } catch (error) {
       return { ok: false, models: settings.availableModels, error: error?.message || 'DeepSeek model discovery failed', code: error?.code || null };
     }
   }
 
-  return { getSettings, describe, update, refreshModels };
+  function markModelsSeen() {
+    return modelState.markSeen(DEEPSEEK_PROVIDER_TYPE);
+  }
+
+  return { getSettings, describe, update, refreshModels, markModelsSeen };
 }

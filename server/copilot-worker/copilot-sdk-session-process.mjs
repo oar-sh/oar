@@ -5025,15 +5025,18 @@ export function createCopilotSdkSessionRunner({
       dbg('image turn', message.id, result.via, result.outcome);
     } catch (error) {
       if (isOpenAIImageTerminalError(error)) {
-        dbg('image turn refused by OpenAI', message.id, error.message);
+        // A refusal by OpenAI, or a reply the relay could not process after
+        // OpenAI answered 2xx; the codes are the ones the relay's image
+        // operation uses for the same two cases.
+        const code = error.relayProcessing === true ? 'image-reply-unprocessed' : 'image-provider-rejected';
+        dbg(error.relayProcessing === true ? 'image reply not processed' : 'image turn refused by OpenAI', message.id, error.message);
         await publishResponse(message, {
           text: error.message,
           model: null,
           terminalError: {
             kind: 'openai-image-failed',
-            // The code the relay's image operation uses for the same refusal.
-            code: 'image-provider-rejected',
-            stableCode: 'image-provider-rejected',
+            code,
+            stableCode: code,
             message: error.message,
             ...(error.detail ? { detail: String(error.detail) } : {}),
             failedAt: new Date().toISOString(),

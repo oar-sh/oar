@@ -7,8 +7,8 @@
 //
 // One key per relay, stored like the DeepSeek and Cursor keys in the settings
 // table and never sent to a browser. Next to it: the switch, the default
-// model, the discovered models and the ones enabled for the composer, and an
-// optional monthly spend cap. Commit attribution, the background command
+// model, the discovered models and which of them are on for the composer
+// (provider-model-state.mjs), and an optional monthly spend cap. Commit attribution, the background command
 // limit, the effort levels and the compaction window are the Claude tab's, so
 // they are not stored here.
 //
@@ -25,6 +25,7 @@ import {
   isClaudeLongContextModelId,
   isSafeClaudeModelId,
 } from '../../shared/model-id.mjs';
+import { createProviderModelStateStore } from './provider-model-state.mjs';
 import { DEFAULT_CLAUDE_REASONING_EFFORTS, withClaudeUltracodeTier } from './provider-reasoning-effort.mjs';
 
 export const CLAUDE_API_PROVIDER_TYPE = 'claude-api';
@@ -34,6 +35,8 @@ export const CLAUDE_API_KEY_SETTING_KEY = 'claude_api_key';
 export const CLAUDE_API_ENABLED_SETTING_KEY = 'claude_api_enabled';
 export const CLAUDE_API_MODEL_SETTING_KEY = 'claude_api_model';
 export const CLAUDE_API_MODELS_SETTING_KEY = 'claude_api_models';
+// The allowlist before 0.9.24: read once to build the model map, then left
+// as it is so an older version still finds it.
 export const CLAUDE_API_ENABLED_MODELS_SETTING_KEY = 'claude_api_enabled_models';
 export const CLAUDE_API_MONTHLY_CAP_SETTING_KEY = 'claude_api_monthly_cap_usd';
 // The derived default a new key replaced, kept until that key's models are
@@ -180,8 +183,8 @@ function normalizeStoredModel(entry) {
 }
 
 /**
- * Reads `{ apiKey?, enabled?, model?, enabledModels?, monthlyCapUsd?,
- * remove? }` from a request body. The key is never echoed in an error, and a
+ * Reads `{ apiKey?, enabled?, model?, enabledModels?, autoEnableNew?,
+ * monthlyCapUsd?, remove? }` from a request body. The key is never echoed in an error, and a
  * Claude login token or an Admin key is refused by its prefix.
  */
 export function parseClaudeApiSettingsUpdateRequest(body = {}) {
@@ -212,6 +215,14 @@ export function parseClaudeApiSettingsUpdateRequest(body = {}) {
     if (!Array.isArray(payload.enabledModels)) return { ok: false, error: 'enabledModels must be a list' };
     update.enabledModels = uniqueModels(payload.enabledModels);
   }
+  if (hasOwn(payload, 'shownModels')) {
+    if (!Array.isArray(payload.shownModels)) return { ok: false, error: 'shownModels must be a list' };
+    update.shownModels = uniqueModels(payload.shownModels);
+  }
+  if (hasOwn(payload, 'autoEnableNew')) {
+    if (typeof payload.autoEnableNew !== 'boolean') return { ok: false, error: 'autoEnableNew must be true or false' };
+    update.autoEnableNew = payload.autoEnableNew;
+  }
   if (hasOwn(payload, 'monthlyCapUsd')) {
     const cap = parseClaudeApiMonthlyCap(payload.monthlyCapUsd);
     if (!cap.ok) return { ok: false, error: cap.error };
@@ -240,7 +251,11 @@ export function createClaudeApiSettingsService({
   // Where OAR_ANTHROPIC_API_BASE_URL is read (a loopback fake API in tests).
   env = process.env,
   now = () => new Date(),
+  // (result) after each discovery: the model refresh ledger's clock.
+  onModelsRefreshed = () => {},
 } = {}) {
+  const modelState = createProviderModelStateStore({ readSetting, writeSetting, now });
+
   function readClaudeSettings() {
     try {
       const settings = getClaudeProviderSettings();
@@ -321,10 +336,13 @@ export function createClaudeApiSettingsService({
     const model = stored && isUsableModelId(stored) ? stored : defaultModelFor(offered, claudeSettings, carried);
     const availableModels = uniqueModels([model, ...offered]);
     const availableKeys = new Set(availableModels.map((id) => id.toLowerCase()));
-    const storedEnabled = uniqueModels(readJsonList(CLAUDE_API_ENABLED_MODELS_SETTING_KEY))
-      .filter((entry) => availableKeys.has(entry.toLowerCase()));
-    // The default model always stays enabled; with no choice stored, all are.
-    const models = storedEnabled.length ? uniqueModels([model, ...storedEnabled]) : availableModels;
+    // The default model always stays on; the others as the model map says.
+    const enabled = modelState.resolve(CLAUDE_API_PROVIDER_TYPE, {
+      availableModels,
+      defaultModel: model,
+      legacyAllowlist: () => uniqueModels(readJsonList(CLAUDE_API_ENABLED_MODELS_SETTING_KEY)),
+    });
+    const models = uniqueModels(enabled.models);
 
     const detailsByBase = new Map(discovered.map((entry) => [entry.id.toLowerCase(), entry]));
     const claudeEfforts = claudeSettings?.effortsByModel && typeof claudeSettings.effortsByModel === 'object'
@@ -381,6 +399,9 @@ export function createClaudeApiSettingsService({
       models,
       availableModels,
       enabledModels: models,
+      autoEnableNew: enabled.autoEnableNew,
+      fallback: enabled.fallback,
+      unseenModels: enabled.unseen,
       discovered: discovered.length > 0,
       effortsByModel,
       contextWindowsByModel,
@@ -463,9 +484,9 @@ export function createClaudeApiSettingsService({
           activeQueueConversationCount: counts.queued,
         };
       }
+      // The model map stays: a key added again finds its models as they were.
       deleteSetting(CLAUDE_API_KEY_SETTING_KEY);
       deleteSetting(CLAUDE_API_MODELS_SETTING_KEY);
-      deleteSetting(CLAUDE_API_ENABLED_MODELS_SETTING_KEY);
       deleteSetting(CLAUDE_API_CARRIED_MODEL_SETTING_KEY);
       writeSetting(CLAUDE_API_ENABLED_SETTING_KEY, 'false', stamp);
       return {
@@ -498,12 +519,16 @@ export function createClaudeApiSettingsService({
       if (parsed.model) writeSetting(CLAUDE_API_MODEL_SETTING_KEY, parsed.model, stamp);
       else deleteSetting(CLAUDE_API_MODEL_SETTING_KEY);
     }
-    if (hasOwn(parsed, 'enabledModels')) {
-      if (parsed.enabledModels.length) {
-        writeSetting(CLAUDE_API_ENABLED_MODELS_SETTING_KEY, JSON.stringify(parsed.enabledModels), stamp);
-      } else {
-        deleteSetting(CLAUDE_API_ENABLED_MODELS_SETTING_KEY);
-      }
+    if (hasOwn(parsed, 'enabledModels') || hasOwn(parsed, 'autoEnableNew')) {
+      // The models Select Models showed are set as ticked; an empty list
+      // leaves the default model alone, never all.
+      modelState.select(CLAUDE_API_PROVIDER_TYPE, {
+        enabledModels: parsed.enabledModels,
+        // The rows the browser drew; an older page sends none.
+        shownModels: parsed.shownModels || previous.availableModels,
+        defaultModel: getSettings().model,
+        autoEnableNew: parsed.autoEnableNew,
+      });
     }
     if (hasOwn(parsed, 'monthlyCapUsd')) {
       if (parsed.monthlyCapUsd === null) deleteSetting(CLAUDE_API_MONTHLY_CAP_SETTING_KEY);
@@ -530,6 +555,12 @@ export function createClaudeApiSettingsService({
    * new key's.
    */
   async function refreshModels() {
+    const result = await discoverModels();
+    try { onModelsRefreshed(result); } catch { /* the clock is best-effort */ }
+    return result;
+  }
+
+  async function discoverModels() {
     const settings = getSettings();
     if (!settings.configured) return { ok: false, models: settings.availableModels, error: 'Claude API key is not configured' };
     const redact = (text) => String(text ?? '').split(settings.apiKey).join('[redacted]');
@@ -560,7 +591,9 @@ export function createClaudeApiSettingsService({
       writeSetting?.(CLAUDE_API_MODELS_SETTING_KEY, JSON.stringify(models), now().toISOString());
       // The key's own list now decides the default.
       deleteSetting?.(CLAUDE_API_CARRIED_MODEL_SETTING_KEY);
-      return { ok: true, models: getSettings().availableModels, error: null };
+      const availableModels = getSettings().availableModels;
+      const { added } = modelState.reconcile(CLAUDE_API_PROVIDER_TYPE, { availableModels });
+      return { ok: true, models: availableModels, newModels: added, error: null };
     } catch (error) {
       return {
         ok: false,
@@ -571,5 +604,9 @@ export function createClaudeApiSettingsService({
     }
   }
 
-  return { getSettings, describe, update, refreshModels, contextWindowFor };
+  function markModelsSeen() {
+    return modelState.markSeen(CLAUDE_API_PROVIDER_TYPE);
+  }
+
+  return { getSettings, describe, update, refreshModels, contextWindowFor, markModelsSeen };
 }

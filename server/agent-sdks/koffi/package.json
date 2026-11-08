@@ -1,0 +1,10 @@
+{
+  "name": "oar-agent-sdk-koffi",
+  "version": "0.0.0",
+  "private": true,
+  "description": "koffi, which the relay on Windows uses to read a process's start time; installed on demand from the lockfile beside this file.",
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "3.3.4"
+  }
+}

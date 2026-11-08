@@ -197,6 +197,16 @@ export function resolveWorkerKind(env = {}) {
   return Object.hasOwn(NODE_WORKER_DESCRIPTORS, kind) ? kind : 'copilot';
 }
 
+// The agent SDK a worker kind runs on (agent-sdk-store.mjs), or null: the
+// Claude workers (subscription, API key, DeepSeek) on the Claude SDK, Cursor
+// on its own; every other kind needs none.
+const WORKER_KIND_AGENT_SDK = Object.freeze({ claude: 'claude', 'claude-api': 'claude', deepseek: 'claude', cursor: 'cursor' });
+
+export function agentSdkForWorkerKind(kind) {
+  const key = String(kind || '').trim().toLowerCase();
+  return Object.hasOwn(WORKER_KIND_AGENT_SDK, key) ? WORKER_KIND_AGENT_SDK[key] : null;
+}
+
 export function applyClaudeProviderEnvironment(env = {}, {
   enabled = false,
   model = '',
@@ -933,6 +943,9 @@ export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
   // extension engine's "it is attached" marker.
   'OAR_MCP_SERVER',
   'OAR_MCP_SERVER_ATTACHED',
+  // The agent SDK folder a worker runs on for its whole life (agent-sdk-loader.mjs).
+  'OAR_AGENT_SDK_DIR_CLAUDE',
+  'OAR_AGENT_SDK_DIR_CURSOR',
   'SESSION_ID',
   'COPILOT_WORKSPACE_ROOT',
   'INIT_CWD',

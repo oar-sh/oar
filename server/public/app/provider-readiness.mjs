@@ -14,8 +14,46 @@
 // A payload that failed to load is `null`, and makes the whole answer
 // `known: false`. Callers treat an unknown answer as ready, which is today's
 // behaviour: a network blip must never show the setup wall.
+//
+// The agent SDK snapshot (GET /api/agent-sdks/status) is optional. With it, a
+// provider whose SDK failed to install or has no build for this host is not
+// ready, with the reason in `reasons`. A missing or installing SDK does not
+// block: the relay installs it on the first launch and keeps the turn queued,
+// so the provider stays ready and only gets a note.
 
 export const SEED_CATALOG_SOURCE = 'bootstrap-seed';
+
+// The SDK each provider's workers run on (session-worker-launch-service.mjs).
+const PROVIDER_AGENT_SDKS = Object.freeze({
+  claude: 'claude',
+  'claude-api': 'claude',
+  deepseek: 'claude',
+  cursor: 'cursor',
+});
+
+/**
+ * Why a provider's SDK keeps it from running, or what it waits for: `null`
+ * when the SDK is ready or its state is not one we know.
+ * @returns {{ blocking: boolean, text: string } | null}
+ */
+export function agentSdkReadinessReason(status) {
+  if (!status || typeof status !== 'object') return null;
+  const label = String(status.label || '').trim() || 'The agent SDK';
+  switch (status.state) {
+    case 'missing':
+      return { blocking: false, text: `${label} not installed yet — it installs with the first chat or from Settings` };
+    case 'installing':
+      return { blocking: false, text: `${label} is installing — the first chat waits for it` };
+    case 'error': {
+      const error = String(status.error || '').trim();
+      return { blocking: true, text: error ? `${label} install failed: ${error}` : `${label} install failed` };
+    }
+    case 'unsupported':
+      return { blocking: true, text: `${label} not available on this platform` };
+    default:
+      return null;
+  }
+}
 
 const SETTINGS_PROVIDERS = Object.freeze([
   ['openai', 'openai'],
@@ -40,21 +78,43 @@ const REQUIRED_INPUTS = Object.freeze(['openai', 'claude', 'cursor', 'grok', 'ca
  * @param {object|null} [input.grok]
  * @param {object|null} [input.deepseek] null on a relay without DeepSeek: not offered, not unknown
  * @param {object|null} [input.catalog]
- * @returns {{ known: boolean, anyReady: boolean, ready: string[], copilot: 'ready' | 'unknown' }}
+ * @param {object|null} [input.agentSdks] GET /api/agent-sdks/status; absent or null changes nothing
+ * @returns {{ known: boolean, anyReady: boolean, ready: string[], copilot: 'ready' | 'unknown', reasons?: Record<string, { blocking: boolean, text: string }> }}
+ *   `reasons` only with an agent SDK snapshot: by enabled provider whose SDK is not ready
  */
 export function resolveProviderReadiness(input = {}) {
   const payloads = input && typeof input === 'object' ? input : {};
   const known = REQUIRED_INPUTS.every((key) => payloads[key] && typeof payloads[key] === 'object');
+  const sdks = payloads.agentSdks && typeof payloads.agentSdks === 'object' && payloads.agentSdks.sdks && typeof payloads.agentSdks.sdks === 'object'
+    ? payloads.agentSdks.sdks
+    : null;
   const ready = [];
+  const reasons = {};
   for (const [key, providerId] of SETTINGS_PROVIDERS) {
-    if (payloads[key]?.enabled === true) ready.push(providerId);
+    if (payloads[key]?.enabled !== true) continue;
+    const reason = sdks && PROVIDER_AGENT_SDKS[providerId]
+      ? agentSdkReadinessReason(sdks[PROVIDER_AGENT_SDKS[providerId]])
+      : null;
+    if (reason) reasons[providerId] = reason;
+    if (!reason?.blocking) ready.push(providerId);
   }
   const source = String(payloads.catalog?.source || '').trim();
   const copilot = payloads.catalog && typeof payloads.catalog === 'object' && source && source !== SEED_CATALOG_SOURCE
     ? 'ready'
     : 'unknown';
   if (copilot === 'ready') ready.push('github');
-  return { known, anyReady: ready.length > 0, ready, copilot };
+  const answer = { known, anyReady: ready.length > 0, ready, copilot };
+  if (sdks) answer.reasons = reasons;
+  return answer;
+}
+
+/** The blocking reasons of a readiness answer, each once (three providers share Claude's SDK). */
+export function blockingReadinessReasons(readiness) {
+  const texts = Object.values(readiness?.reasons || {})
+    .filter((reason) => reason?.blocking === true)
+    .map((reason) => String(reason.text || '').trim())
+    .filter(Boolean);
+  return [...new Set(texts)];
 }
 
 /** The one question the empty screen, New Chat and the composer ask. */
@@ -76,12 +136,15 @@ const inputs = {
   grok: undefined,
   deepseek: undefined,
   catalog: undefined,
+  agentSdks: undefined,
 };
 let current = resolveProviderReadiness(inputs);
 const listeners = new Set();
 
 function readinessKey(readiness) {
-  return `${readiness.known ? 1 : 0}|${readiness.anyReady ? 1 : 0}|${readiness.ready.join(',')}|${readiness.copilot}`;
+  // Log flushes of an install leave the reasons as they were: no event.
+  const reasons = readiness.reasons ? JSON.stringify(readiness.reasons) : '';
+  return `${readiness.known ? 1 : 0}|${readiness.anyReady ? 1 : 0}|${readiness.ready.join(',')}|${readiness.copilot}|${reasons}`;
 }
 
 /**

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
 // Settings › General reads as headed groups. Rendered against the real
-// index.html: the five sections in order, every control in exactly one of
+// index.html: the six sections in order, every control in exactly one of
 // them, nothing loose in the panel.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const { document } = new JSDOM(indexHtml).window;
@@ -21,6 +21,7 @@ const EXPECTED = [
     'task-stall-minutes-slider',
     'subagent-record-retention-select',
   ]],
+  ['models', 'Models', ['model-refresh-auto-toggle', 'model-refresh-interval-select', 'model-refresh-providers']],
   ['relay', 'This relay', [
     'pwa-app-name-input',
     'restart-resume-toggle',
@@ -31,7 +32,7 @@ const EXPECTED = [
   ['updates', 'Updates', ['update-auto-check-toggle', 'update-check-now-btn', 'update-available-card', 'update-outcome']],
 ];
 
-test('General holds the five sections in order, each with its title', () => {
+test('General holds the six sections in order, each with its title', () => {
   const sections = [...panel().children];
   assert.deepEqual(sections.map((el) => el.id), EXPECTED.map(([name]) => `settings-section-${name}`));
   for (const [index, [name, title]] of EXPECTED.entries()) {
@@ -90,4 +91,8 @@ test('relay rows say whose setting they are', () => {
   for (const id of ['thoughts-expanded-toggle', 'live-activity-cap-slider', 'stream-view-toggle', 'scroll-on-send-toggle', 'conversation-window-retention-slider']) {
     assert.match(document.getElementById(id).closest('.settings-row').nextElementSibling.textContent, /Saved in this browser\.$/, id);
   }
+  // Models: one help line under the switch, the interval and the providers.
+  const modelsHelp = document.getElementById('model-refresh-providers').nextElementSibling;
+  assert.ok(modelsHelp.classList.contains('settings-help'), 'the Models section has a help line');
+  assert.match(modelsHelp.textContent, /a setting of this relay\.$/i);
 });

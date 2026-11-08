@@ -286,17 +286,71 @@ test('describe lists the enabled providers with versions and state', async () =>
   assert.deepEqual(about.stats.turnsByProvider.map((row) => row.label), ['GitHub Copilot', 'Claude Code', 'Cursor']);
 });
 
-test('the Copilot SDK engine reports the SDK and its workers', async () => {
+test('the Copilot SDK engine runs the SDK the Copilot CLI ships: the CLI version, no package', async () => {
   const { service } = aboutService({
     getProviderSettings: () => ({ github: { enabled: true, engine: 'sdk' } }),
     isRelayCliOnline: () => false,
     listWorkers: () => [],
+    // A stale caller's version for Copilot is not shown either.
+    sdkVersions: { github: '1.0.17', claude: '0.3.292', cursor: '1.0.36' },
   });
   const [copilot] = (await service.describe()).providers;
   assert.deepEqual(
-    { engine: copilot.engine, sdk: copilot.sdkVersion, state: copilot.state },
-    { engine: 'sdk', sdk: '1.0.17', state: 'idle' },
+    { engine: copilot.engine, cli: copilot.cliVersion, sdkPackage: copilot.sdkPackage, sdk: copilot.sdkVersion, state: copilot.state },
+    { engine: 'sdk', cli: '1.0.82', sdkPackage: null, sdk: null, state: 'idle' },
   );
+});
+
+test('the installed SDK versions come from the agent SDK store, read for each answer', async () => {
+  let claudeInstalled = '0.4.1';
+  let reads = 0;
+  const { service } = aboutService({
+    getAgentSdkStatus: () => {
+      reads += 1;
+      return {
+        root: '/srv/fixture/sdks',
+        host: { platform: 'linux', arch: 'x64', libc: 'glibc' },
+        sdks: {
+          claude: { id: 'claude', state: claudeInstalled ? 'ready' : 'missing', pinned: '0.4.1', installed: claudeInstalled },
+          cursor: { id: 'cursor', state: 'ready', pinned: '1.5.0', installed: '1.5.0' },
+        },
+      };
+    },
+  });
+  const first = (await service.describe()).providers;
+  assert.equal(first.find((row) => row.id === 'claude').sdkVersion, '0.4.1');
+  assert.equal(first.find((row) => row.id === 'claude').sdkPackage, '@anthropic-ai/claude-agent-sdk');
+  assert.equal(first.find((row) => row.id === 'cursor').sdkVersion, '1.5.0');
+  assert.equal(first.find((row) => row.id === 'github').sdkVersion, null);
+  assert.equal(reads, 1, 'one snapshot per answer');
+
+  // Not in the store (a git checkout runs its devDependency then): the
+  // package's own copy, as the loader would take it.
+  claudeInstalled = null;
+  const second = (await service.describe()).providers;
+  assert.equal(second.find((row) => row.id === 'claude').sdkVersion, '0.3.292');
+  assert.equal(reads, 2);
+});
+
+test('without a store, or with one that fails, the versions come from node_modules', async () => {
+  const root = path.join(path.sep, 'srv', 'fixture', 'oar');
+  const packageJson = (name, version) => [path.join(root, 'node_modules', ...name.split('/'), 'package.json'), JSON.stringify({ version })];
+  const fsImpl = fakeFs(Object.fromEntries([
+    packageJson('@anthropic-ai/claude-agent-sdk', '0.3.300'),
+    packageJson('@cursor/sdk', '1.0.40'),
+    packageJson('@github/copilot-sdk', '1.0.20'),
+  ]));
+  for (const getAgentSdkStatus of [undefined, () => { throw new Error('store gone'); }, () => null]) {
+    const { service } = aboutService({
+      sdkVersions: null,
+      packageRoot: root,
+      fsImpl,
+      getAgentSdkStatus,
+      getProviderSettings: () => ({ github: { enabled: true, engine: 'sdk' }, claude: { enabled: true }, cursor: { enabled: true } }),
+    });
+    const rows = (await service.describe()).providers;
+    assert.deepEqual(rows.map((row) => [row.id, row.sdkVersion]), [['github', null], ['claude', '0.3.300'], ['cursor', '1.0.40']]);
+  }
 });
 
 test('the totals are kept for a minute and read once for concurrent callers', async () => {

@@ -31,7 +31,9 @@ import {
   refreshSummaryModal,
   summaryModalState,
   IS_SHARED_VIEW,
+  showTransientRelayNotice,
 } from './store.js';
+import { newModelsToastFor } from './model-refresh-ui.mjs';
 import { scheduleContextUsageRefresh } from './api-client.js';
 import { capFinishedActivityEntries, capLiveActivityEntries, normalizeTurnSeq } from './activity-replay-state.mjs';
 import { liveActivityCap } from './live-activity-cap.mjs';
@@ -66,6 +68,7 @@ import { applyClaudeCloudSettingsState, refreshClaudeCloudSettingsState } from '
 import { applyClaudeCloudSessionEvent } from './claude-cloud-conversation-ui.js';
 import { updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { applyCliInstallState } from './cli-install-ui.js';
+import { applyAgentSdkState } from './agent-sdk-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
 import { applyClaudeUsageLimit, applyConversationBilling, applyUsageLimitPause } from './usage-limit-ui.js';
@@ -150,6 +153,7 @@ let deps = null;
  * @property {(force?: boolean) => (void | Promise<void>)} refreshModelCatalog
  * @property {(payload?: object) => void} updateModelCatalogState
  * @property {() => (void | Promise<void>)} reconcileOpenModelVariantModal
+ * @property {(tab?: string) => (void | Promise<void>)} [openSelectModelsModal]
  * @property {(payload?: object) => void} applyConversationWorkspaceRootUpdate
  * @property {(conversationId: string, title: string, updatedAt?: string | number | null) => void} applyConversationTitleUpdate
  * @property {() => void} syncChatTitleControls
@@ -414,6 +418,18 @@ export async function connectSocket(overrideDeps) {
   socket.on('models_updated', (payload) => {
     updateModelCatalogState(payload || {});
     void reconcileOpenModelVariantModal();
+    // A refresh that found models never seen before: one toast per event, on
+    // the clients connected now (the others get the menu dot and the tags).
+    const toast = newModelsToastFor(payload, { sharedView: IS_SHARED_VIEW });
+    if (toast) {
+      const { tab } = toast;
+      showTransientRelayNotice(toast.text, 10000, {
+        actionLabel: 'Show',
+        onAction: () => {
+          void Promise.resolve(deps?.openSelectModelsModal?.(tab)).catch(() => {});
+        },
+      });
+    }
   });
   // Each settings event also feeds provider readiness (provider-readiness.mjs),
   // so a Settings save changes the empty screen without a reload.
@@ -456,6 +472,11 @@ export async function connectSocket(overrideDeps) {
   // mid-install renders the full log instead of a suffix.
   socket.on('cli_install_state', (payload) => {
     applyCliInstallState(payload || null);
+  });
+  // Agent SDK installs, the same whole-buffer contract. It also feeds
+  // provider readiness (agent-sdk-ui.js passes the snapshot on).
+  socket.on('agent_sdk_state', (payload) => {
+    applyAgentSdkState(payload || null);
   });
   // Self-update transitions AND npm log chunks; same whole-buffer contract as
   // cli_install_state, so a client connecting mid-update renders the full log.

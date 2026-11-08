@@ -1,0 +1,13 @@
+{
+  "name": "oar-agent-sdk-claude",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Claude Agent SDK as OAR installs it on demand: exact pins, installed from the lockfile beside this file.",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
+    "@anthropic-ai/sdk": "0.116.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "4.6.7"
+  }
+}

@@ -53,7 +53,9 @@ oar/
 ├── .github/extensions/web-relay/   # Copilot CLI extension for the Extension engine (worker link, ask_user bridge, model snapshots)
 ├── bin/                            # The `oar` command (oar.js) and a Windows cmd shim for checkouts (bat/oar.bat)
 ├── docs/                           # User guides behind the README, preview-server guide, Copilot BYOK notes, SDK feature tracker
+├── scripts/                        # Proof, live-check and maintenance scripts (agent-sdk-lock.mjs writes the pins lockfiles)
 ├── server/
+│   ├── agent-sdks/                 # Pins of the agent SDKs (and koffi) the relay installs on demand: package.json, lockfile, entries
 │   ├── claude-api-worker/          # Claude API session worker (the Claude worker on a Claude Console API key)
 │   ├── claude-cloud-worker/        # Claude Cloud session worker (follows a cloud session's event stream; runs no agent itself)
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
@@ -293,6 +295,80 @@ Open a backup only read-only: `sqlite3 'file:<backup>?immutable=1'`, or
 `new Database(file, { readonly: true })`. A read-write open makes `-wal`/`-shm` beside it and can
 change it. Never copy a live database's main file alone; `oar backup` copies it safely while the
 relay runs.
+
+### Agent SDKs on demand
+
+The Claude Agent SDK, the Cursor SDK and, on Windows, koffi are not dependencies of the package.
+The relay installs them on demand (the user's side is in
+[Agent SDKs](docs/install.md#agent-sdks)).
+
+**Pins.** `server/agent-sdks/<sdk>/` (`claude`, `cursor`, `koffi`) is the only place a version is
+chosen. Each folder holds a private `package.json` with exact versions (Claude: the SDK and its
+peers `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk` and `zod`; Cursor: the SDK and `zod`;
+koffi alone), the `package-lock.json` that `npm ci` installs from, listing every platform's
+optional packages, and the entry files (`entry.mjs`, Cursor's `entry-sqlite.mjs`, koffi's
+`entry.cjs`). A loader imports the entry by path, and its bare imports resolve from the installed
+folder's own `node_modules`: no `NODE_PATH`, no exports map to read.
+
+**Store** (`server/services/agent-sdk-store.mjs`, layout in `agent-sdk-paths.mjs`). One folder per
+SDK, version and platform: `<state root>/sdks/<sdk>/<version>-<hash8>/`, or under `OAR_SDK_DIR`.
+The hash covers the pins folder's files and the platform. An install copies the pins into a
+`.partial-<hex>` folder, runs `npm ci --ignore-scripts` there (every SDK, koffi included: koffi's
+binary comes from its prebuilt optional package `@koromix/koffi-win32-<arch>`, which needs no
+script) with the npm next to this Node, checks the files, writes the marker `oar-sdk.json` (the files and their
+sizes) last and renames the folder into place. Only the marker decides ready. A `.store.lock` per
+SDK serialises installs and clean-ups across relays, checkouts and `oar sdk install` sharing the
+folder; every process that uses a folder leaves a lease in `.leases/`, and the clean-up keeps the
+pinned folder, the newest other one and every leased one. The last failure is kept in the settings
+row `agent_sdk_status`; network failures are retried after 1, 5 and 15 minutes. An install's
+progress (npm output with `--loglevel=http`, bytes growing in its folder or in npm's `_cacache/tmp`)
+is checked every 15 s; 5 minutes without any stops npm and counts as a network failure
+(`installStallMs`). The hard cap is 2 hours (`installTimeoutMs`), about 0.4 Mbit/s for the Claude
+SDK.
+
+**Loader** (`server/agent-sdk-loader.mjs`, `loadAgentSdk(sdk, { entry })`). In order:
+`OAR_AGENT_SDK_DIR_<SDK>` (the folder the relay launched the worker with, kept for the worker's
+life), then in the relay the store's ready folder, then in a git checkout the devDependency;
+otherwise `AgentSdkMissingError`. The launch gate in `server-runtime.mjs`
+(`agentSdkDirForLaunch`) maps claude, claude-api and deepseek workers to `claude` and cursor
+workers to `cursor`, and passes the folder on. A missing SDK never holds the request: the chat
+opens at once with the worker launch note *Installing the … SDK*, the turn stays queued, and the
+end of the install delivers it; a failed install puts the cause in the note and keeps the turn
+queued until a later install (Retry in Settings, or the automatic retry) succeeds. The relay's lock check loads koffi through
+`relay-singleton-guard.mjs`; without it a lock whose holder's start is unknown is stale on Windows
+when it was written before the last boot or its pid runs a program other than Node.
+
+**A checkout** runs the devDependencies and leaves the store alone: the root `package.json` names
+every pin of every folder as a devDependency at the same version. That holds only while the SDK
+packages are really installed in its `node_modules`; without them (after `npm install --omit=dev`,
+say) the checkout uses the store like an install. Only the pinned packages match: the root lockfile
+resolves their transitive dependencies on its own, so a checkout's tree can differ from the store's
+in those. `OAR_AGENT_SDK_SOURCE=store`
+makes a checkout use the store (in `~/.oar/sdks` or `%APPDATA%\oar\sdks`, shared with a global
+install, unless `OAR_SDK_DIR` names another folder).
+
+**Bumping an SDK** (or one of its peers, or koffi):
+
+1. Edit the exact versions in `server/agent-sdks/<sdk>/package.json`.
+2. On Linux, run `node scripts/agent-sdk-lock.mjs <sdk>`. It refuses to run elsewhere: npm on
+   Windows leaves the `libc` field out of the Linux entries it writes, and `npm ci` from such a
+   lock installs the glibc and the musl build side by side. It also refuses a lock that holds
+   another version than `package.json`, a zod below 4.6.6, a musl build without
+   `"libc": ["musl"]`, or a package with an install script (koffi's lock: exactly koffi, whose
+   script the install never runs; its binary comes from `@koromix/koffi-win32-<arch>`).
+3. In the repository root, `npm i -D -E <package>@<the same version>` for every version you
+   changed, a bumped peer included, so the checkout's devDependencies (exact, no `^`) and the root
+   lockfile match the pins.
+   `server/agent-sdk-pins.test.mjs` fails until they are equal. Do this on Linux too: the root
+   lockfile holds the same platform entries.
+4. Read the new lock's platform entries: every Linux build names its `libc`, and a vendor that
+   added or dropped a platform changes what *Not available on this platform* covers (update the
+   platform table in `docs/install.md`).
+5. Run `npm audit` in `server/agent-sdks/<sdk>/`.
+6. For the Claude SDK, run the proof scripts of [Claude API workers](#claude-api-workers) again.
+
+The next relay start of a release with new pins installs them for the providers in use; a
+changelog entry should say that the first chat after the update may wait for the download.
 
 ### API overview
 
@@ -1021,10 +1097,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **8525 pass / 0 fail / 10 skip on Linux (0.9.23, 2026-11-07)** — the count
+Expected: **0 fail** everywhere; **8803 pass / 10 skip on Linux (0.9.24, 2026-11-08)** (plus one failure a busy database on a loaded host caused) — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
 cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **20 skips** that
-are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`, POSIX checkout paths for the systemd unit) and run on Linux (0.9.23, 2026-11-07: **8515 pass / 0 fail / 20 skip**).
+are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`, POSIX checkout paths for the systemd unit) and run on Linux (0.9.24, 2026-11-08: **8793 pass / 20 skip**, plus one failure a proxy set in the host's environment caused).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

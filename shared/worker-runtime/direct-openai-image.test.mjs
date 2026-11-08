@@ -145,3 +145,18 @@ test('a provider refusal on the direct path is a terminal image error; anything 
 
   await assert.rejects(runDirectOpenAIImageTurn({ api: recordingApi(), message: { ...message, text: '  ' } }), /missing prompt/);
 });
+
+test('a reply the relay could not process is a terminal image error on the direct path, not a requeue', async () => {
+  const api = recordingApi({
+    '/api/openai/images/generate': () => { throw httpError(502, { error: 'Maximum call stack size exceeded', relayProcessing: true }); },
+  });
+  await assert.rejects(
+    () => runDirectOpenAIImageTurn({ api, message }),
+    (error) => isOpenAIImageTerminalError(error)
+      && error.status === 502
+      && error.relayProcessing === true
+      && /could not process the image OpenAI returned \(Maximum call stack size exceeded\)/.test(error.message)
+      && /The generation was billed; the message was not retried\./.test(error.message),
+  );
+  assert.equal(api.calls.some((c) => c.routePath === '/api/response'), false);
+});

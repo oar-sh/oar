@@ -7,6 +7,16 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  AGENT_SDK_IDS,
+  agentSdkSupport,
+  agentSdkFromCheckout,
+  findReadyAgentSdkDir,
+  getAgentSdkDescriptor,
+  readAgentSdkMarker,
+  readAgentSdkPin,
+  resolveAgentSdkRoot,
+} from './agent-sdk-paths.mjs';
 import { formatMegabytes } from './db-backup-service.mjs';
 
 export function generateAuthToken() {
@@ -87,6 +97,7 @@ const CLI_COMMANDS = {
   uninstall: { flags: ['--purge'] },
   update: { flags: ['--beta'], values: ['--to'] },
   'build-native': { flags: ['--force'] },
+  sdk: { words: ['install', 'status'], words2: [...AGENT_SDK_IDS], flags: ['--reinstall'] },
   copilot: { flags: ['--install-extension', '--no-install-extension'], values: ['--port', '--migrate-from'], forwards: true },
 };
 
@@ -117,6 +128,9 @@ export function usageText() {
     '  oar backup [--reason <text>]',
     '                         A copy of the database into the backup folder (safe while the relay runs)',
     '  oar update [--beta] [--to <version>]',
+    '  oar sdk [status]       The agent SDKs the relay installs on demand: folder, versions, state',
+    '  oar sdk install claude | cursor | koffi [--reinstall]',
+    '                         Install one now, without the relay (koffi: Windows only)',
     '  oar build-native [--force]',
     '                         Build the SQLite binding where no prebuilt one ships (Termux, 32-bit ARM);',
     '                         --force builds where one ships too, which only tests the build tools',
@@ -179,6 +193,8 @@ export function parseCliArgs(argv = []) {
     if (spec.values?.includes(name)) {
       if (arg === name) index += 1;
     } else if (spec.words?.includes(arg) && words === 0) {
+      words += 1;
+    } else if (spec.words2?.includes(arg) && words === 1) {
       words += 1;
     } else if (!spec.flags?.includes(arg)) {
       return { error: arg.startsWith('-') ? `Unknown option for oar ${command}: ${arg}` : `Unexpected argument: ${arg}` };
@@ -402,14 +418,14 @@ export function buildServicePath({ nodeBin, envPath = '', homeDir = '' } = {}) {
 
 /**
  * The dependencies whose install scripts OAR needs (they fetch or build a
- * native binary). npm 12 runs no install script it was not told to allow, and
- * a global install has no package.json of its own to say so; npm 10 and 11
- * accept the flag and run the scripts as before. `npm-install-scripts.test.mjs`
- * holds this list to the lockfile. better-sqlite3 13 has no install script:
- * where it ships no binary, OAR builds it (native-addon-build-service.mjs).
+ * native binary): none. npm 12 runs no install script it was not told to
+ * allow, so a package that gains one must be added here and passed to npm
+ * again; `npm-install-scripts.test.mjs` holds this list to the lockfile.
+ * better-sqlite3 13 has no install script (where it ships no binary, OAR
+ * builds it: native-addon-build-service.mjs), and koffi, whose script the
+ * list held, is installed on demand on Windows (agent-sdk-store.mjs).
  */
-export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze(['koffi']);
-export const NPM_ALLOW_SCRIPTS_ARG = `--allow-scripts=${NPM_INSTALL_SCRIPT_PACKAGES.join(',')}`;
+export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze([]);
 
 /**
  * How to run `npm install -g` so the update lands in the install that is
@@ -442,8 +458,9 @@ export function resolveNpmInvocation({
 
 /**
  * Provider CLIs `oar doctor` probes, with the args that answer fast. Cursor is
- * deliberately absent: the relay drives it through the bundled @cursor/sdk npm
- * package and never invokes a cursor-agent binary.
+ * deliberately absent: the relay drives it through the Cursor SDK it installs
+ * on demand (the agent SDK block of the report) and never invokes a
+ * cursor-agent binary.
  */
 export const DOCTOR_PROBES = Object.freeze([
   { id: 'gh (Copilot)', binary: 'gh', args: ['--version'] },
@@ -487,6 +504,50 @@ function renderBackupLines(backups, now) {
   return lines;
 }
 
+/**
+ * The agent SDKs as `oar doctor` and `oar sdk` show them, read from the disk
+ * alone (no lock, no spawn): the folder, and per SDK the pinned version, an
+ * installed one and its state. A checkout runs its devDependencies instead.
+ */
+export function describeAgentSdks({ env = process.env, platform = process.platform } = {}) {
+  // A checkout takes each SDK from its node_modules while it is installed there.
+  const fromCheckout = AGENT_SDK_IDS.every((id) => agentSdkFromCheckout(id, { env }) || getAgentSdkDescriptor(id).platforms?.includes(platform) === false);
+  const root = resolveAgentSdkRoot({ env, platform });
+  const rows = [];
+  for (const id of AGENT_SDK_IDS) {
+    const descriptor = getAgentSdkDescriptor(id);
+    let pin = null;
+    try { pin = readAgentSdkPin(id); } catch {}
+    if (!pin) {
+      rows.push({ id, label: descriptor.label, pinned: null, installed: null, state: 'pins missing from the package' });
+      continue;
+    }
+    const support = agentSdkSupport(pin);
+    if (descriptor.platforms && !descriptor.platforms.includes(platform)) continue;
+    if (agentSdkFromCheckout(id, { env })) {
+      rows.push({ id, label: descriptor.label, pinned: pin.version, installed: null, state: 'from the checkout (devDependency)' });
+      continue;
+    }
+    const ready = findReadyAgentSdkDir(id, { env, platform, root });
+    const older = ready ? null : findReadyAgentSdkDir(id, { env, platform, root, anyVersion: true });
+    const olderVersion = older ? readAgentSdkMarker(older)?.version || null : null;
+    const state = support === 'no'
+      ? 'not available on this platform'
+      : ready ? `ready${support === 'cli' ? " (runs the host's Claude Code CLI)" : ''}`
+        : olderVersion ? `${olderVersion} installed; the relay installs ${pin.version} at its next start or first chat`
+          : 'not installed (installs on first setup or first chat)';
+    rows.push({ id, label: descriptor.label, pinned: pin.version, installed: ready ? pin.version : olderVersion, state, dir: ready || older || null });
+  }
+  return { fromCheckout, root, rows };
+}
+
+export function renderAgentSdkLines(agentSdks) {
+  if (!agentSdks) return [];
+  const lines = [`  agent SDKs    : ${agentSdks.fromCheckout ? "from the checkout's node_modules (OAR_AGENT_SDK_SOURCE=store uses the store)" : agentSdks.root}`];
+  for (const row of agentSdks.rows) lines.push(`    ${row.id.padEnd(14)}: ${row.pinned ? `${row.pinned} ` : ''}${row.state}`);
+  return lines;
+}
+
 export function renderDoctorReport({
   version,
   nodeVersion,
@@ -502,6 +563,7 @@ export function renderDoctorReport({
   probes = [],
   warnings = [],
   tunnel = '',
+  agentSdks = null,
 }) {
   const yesNo = (v) => (v ? 'yes' : 'no');
   const lines = [
@@ -527,6 +589,7 @@ export function renderDoctorReport({
   for (const probe of probes) {
     lines.push(`    ${probe.id.padEnd(14)}: ${probe.ok ? probe.version || 'installed' : 'not found'}`);
   }
+  lines.push(...renderAgentSdkLines(agentSdks));
   for (const warning of warnings) lines.push(`  warning       : ${warning}`);
   return lines.join('\n');
 }

@@ -2,10 +2,10 @@
  * The relay's `relay_tool` tool for the Claude worker, shaped as an SDK MCP
  * tool definition (`{ name, description, inputSchema, handler }`) so the
  * adapter can hand it to `createSdkMcpServer` next to the preview tool. On the
- * wire it is `mcp__relay__relay_tool`; the module never imports the SDK.
+ * wire it is `mcp__relay__relay_tool`. Its zod comes with the installed SDK.
  */
 
-import * as z from 'zod';
+import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 
 import {
   REMOTE_RELAY_ACTIONS,
@@ -23,6 +23,9 @@ import {
   executeRemoteRelayTool,
   formatRemoteRelayToolResult,
 } from '../../shared/remote-relay-tool-core.mjs';
+
+// zod as the installed Claude SDK carries it: the tool schemas go to that SDK.
+const { z } = await loadAgentSdk('claude');
 
 const FIELDS = REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties;
 

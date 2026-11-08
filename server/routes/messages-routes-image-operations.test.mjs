@@ -115,3 +115,25 @@ test('a provider outage requeues the row instead of failing it', async (t) => {
   assert.deepEqual(posts.find((p) => p.route === '/api/requeue').body, { messageId: 'q-1' });
   assert.equal(posts.some((p) => p.route === '/api/response'), false);
 });
+
+test('a reply the relay could not process fails the row instead of requeueing the billed generation', async (t) => {
+  const posts = stubSelfFetch(t, {
+    '/api/openai/images/generate': [502, { error: 'Maximum call stack size exceeded', relayProcessing: true }],
+  });
+  const { deps, finished } = imageOperationDeps();
+  const routes = captureRoutes(deps, registerMessagesRoutes);
+
+  const { status, body } = await invokeRoute(routes, 'POST', EXECUTE, { params: { operationId: 'img_op_demo' } });
+
+  assert.equal(status, 409);
+  assert.equal(body.outcome, 'terminal');
+  assert.equal(finished[0].status, 'failed_terminal');
+  assert.equal(finished[0].errorCode, 'IMAGE_REPLY_UNPROCESSED');
+  assert.match(finished[0].errorMessage, /could not process the image OpenAI returned \(Maximum call stack size exceeded\)/);
+  const resolved = resolveTerminalFailurePayload(posts.find((p) => p.route === '/api/response').body);
+  assert.equal(resolved?.terminal, true);
+  // The row's code says what the attempt row says, not "provider rejected".
+  assert.equal(resolved.stableCode, 'relay.image-reply-unprocessed');
+  assert.match(resolved.message, /The generation was billed; the message was not retried\./);
+  assert.equal(posts.some((p) => p.route === '/api/requeue'), false);
+});

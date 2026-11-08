@@ -368,6 +368,9 @@ test('model variants list the DeepSeek models while the provider is on', async (
     defaultModel: 'deepseek-flash',
     availableModels: ['deepseek-flash', 'deepseek-v4-pro'],
     enabledModels: ['deepseek-flash', 'deepseek-v4-pro'],
+    autoEnableNew: true,
+    unseen: [],
+    fallback: false,
   });
 });
 

@@ -1526,14 +1526,61 @@ function resolveGeneratedImageExtension(mimeType) {
   return GENERATED_IMAGE_EXTENSIONS[normalized] || 'png';
 }
 
+// Base64 payloads are checked with a character loop, never with a regular
+// expression over the whole string. V8 compiles a regexp without
+// optimisation once the process has generated more than 1 MB of regexp code
+// and holds more than 16 MB of executable memory (TooMuchRegExpCode in
+// regexp.cc), which a relay reaches after some uptime. An unoptimised
+// `[...]+` then pushes one backtrack frame per character and overflows the
+// 64 MiB regexp stack at 4,194,304 characters, a PNG of about 3 MB, with
+// "Maximum call stack size exceeded": every gpt-image reply above that size
+// was dropped after the provider had billed it, and the row was retried four
+// more times (2026-11-07). A fresh process optimises the same regexp and
+// never shows it.
+// An empty string is not base64 here: every caller checks for a missing
+// payload first and answers it with its own message.
+export function isBase64Text(value) {
+  const text = String(value || '');
+  if (!text) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text.charCodeAt(i);
+    if (
+      (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+      || c === 43 || c === 47 || c === 61 // + / =
+      || c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12 // ASCII whitespace
+    ) continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * `data:<mime>;base64,<payload>` taken apart without a regexp over the
+ * payload: `{ mimeType, payload }`, or null when the string is not that
+ * shape (no comma, no `;base64` right before it, a parameter in the type,
+ * an empty payload).
+ */
+export function splitBase64DataUrl(dataUrl) {
+  const text = String(dataUrl || '');
+  if (!/^data:/i.test(text)) return null;
+  const comma = text.indexOf(',');
+  if (comma < 0) return null;
+  const header = text.slice('data:'.length, comma);
+  const payload = text.slice(comma + 1);
+  if (!/;base64$/i.test(header) || !payload) return null;
+  const mimeType = header.slice(0, -';base64'.length);
+  if (!mimeType || mimeType.includes(';') || mimeType.includes(',')) return null;
+  return { mimeType, payload };
+}
+
 function parseGeneratedImageData(raw) {
   const dataUrl = String(raw?.dataUrl || raw?.data_url || '').trim();
   if (dataUrl.startsWith('data:')) {
-    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
-    if (!match) throw new Error('Invalid generated image data URL');
+    const parts = splitBase64DataUrl(dataUrl);
+    if (!parts) throw new Error('Invalid generated image data URL');
     return {
-      mimeType: String(raw?.mimeType || raw?.mime_type || match[1] || '').trim().toLowerCase(),
-      dataBase64: String(match[2] || '').trim(),
+      mimeType: String(raw?.mimeType || raw?.mime_type || parts.mimeType || '').trim().toLowerCase(),
+      dataBase64: parts.payload.trim(),
     };
   }
   return {
@@ -1552,7 +1599,7 @@ export function normalizeGeneratedImageResponses(rawGeneratedImages, { maxImages
     const mimeType = parsed.mimeType || 'image/png';
     if (!mimeType.startsWith('image/')) throw new Error('Generated image type must be image/*');
     if (!parsed.dataBase64) throw new Error('Generated image payload is missing base64 data');
-    if (!/^[a-z0-9+/=\s]+$/i.test(parsed.dataBase64)) {
+    if (!isBase64Text(parsed.dataBase64)) {
       throw new Error('Generated image payload is not valid base64');
     }
     const buffer = Buffer.from(parsed.dataBase64, 'base64');
@@ -1578,7 +1625,7 @@ export function shouldAcceptAssistantResponsePayload({ text = '', terminalFailur
 function parseOpenAIImageBase64Value(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
-  if (!/^[a-z0-9+/=\s]+$/i.test(raw)) {
+  if (!isBase64Text(raw)) {
     throw new Error('OpenAI image payload contains invalid base64 data');
   }
   return Buffer.from(raw, 'base64').toString('base64');
@@ -1669,10 +1716,10 @@ export function resolveOpenAIImageEditAttachment(rawAttachments, {
   let bytes = null;
 
   if (dataUrl.startsWith('data:')) {
-    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
-    if (!match) throw new Error('Invalid image attachment data URL');
-    mimeType = mimeType || String(match[1] || '').trim().toLowerCase();
-    const payload = parseOpenAIImageBase64Value(match[2]);
+    const parts = splitBase64DataUrl(dataUrl);
+    if (!parts) throw new Error('Invalid image attachment data URL');
+    mimeType = mimeType || String(parts.mimeType || '').trim().toLowerCase();
+    const payload = parseOpenAIImageBase64Value(parts.payload);
     bytes = Buffer.from(payload, 'base64');
   } else {
     const filePath = String(firstImage.path || '').trim();
@@ -7806,9 +7853,16 @@ export function registerMessagesRoutes(app, deps) {
       });
     } catch (error) {
       const status = Number(error?.status || 0);
-      const terminal = status >= 400 && status < 500;
+      // `relayProcessing`: the provider answered 2xx and the relay could not
+      // process the reply. The generation is billed, a retry pays again and
+      // fails the same way, so the row fails like a refusal.
+      const relayProcessing = generatedPayload?.relayProcessing === true;
+      const terminal = (status >= 400 && status < 500) || relayProcessing;
       const uncertain = !!generatedPayload?.generatedImages;
       const outcome = terminal ? 'terminal' : (uncertain ? 'uncertain' : 'retryable');
+      const errorMessage = relayProcessing
+        ? `The relay could not process the image OpenAI returned (${error?.message || 'unknown error'}). The generation was billed; the message was not retried.`
+        : String(error?.message || 'Image operation failed');
       stmts.finishAttempt.run({
         id: acquired.attempt.id,
         status: terminal ? 'failed_terminal' : (uncertain ? 'uncertain' : 'failed_retryable'),
@@ -7816,8 +7870,10 @@ export function registerMessagesRoutes(app, deps) {
         providerConversationId: null,
         providerResponseId: null,
         httpStatus: status || null,
-        errorCode: terminal ? 'IMAGE_PROVIDER_REJECTED' : (uncertain ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_UNAVAILABLE'),
-        errorMessage: String(error?.message || 'Image operation failed').slice(0, 500),
+        errorCode: terminal
+          ? (relayProcessing ? 'IMAGE_REPLY_UNPROCESSED' : 'IMAGE_PROVIDER_REJECTED')
+          : (uncertain ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_UNAVAILABLE'),
+        errorMessage: errorMessage.slice(0, 500),
         completedAt: new Date().toISOString(),
       });
       if (outcome === 'retryable') {
@@ -7831,8 +7887,10 @@ export function registerMessagesRoutes(app, deps) {
         }
       } else {
         const failure = {
-          code: outcome === 'uncertain' ? 'IMAGE_FINALIZATION_UNCERTAIN' : 'IMAGE_PROVIDER_REJECTED',
-          message: String(error?.message || 'Image operation failed').slice(0, 500),
+          code: outcome === 'uncertain'
+            ? 'IMAGE_FINALIZATION_UNCERTAIN'
+            : (relayProcessing ? 'IMAGE_REPLY_UNPROCESSED' : 'IMAGE_PROVIDER_REJECTED'),
+          message: errorMessage.slice(0, 500),
           retryable: false,
         };
         const failResponse = await fetch(`${selfBaseUrl}${remotePath}/api/response`, {
@@ -7947,7 +8005,13 @@ export function registerMessagesRoutes(app, deps) {
       try {
         payload = JSON.parse(rawText);
       } catch {
-        return res.status(502).json({ error: 'OpenAI image API returned invalid JSON' });
+        // After a 2xx the generation is billed; the callers fail the row
+        // instead of paying for it again. An error status with a body that
+        // is not JSON stays a provider failure.
+        return res.status(502).json({
+          error: 'OpenAI image API returned invalid JSON',
+          ...(response.ok ? { relayProcessing: true } : {}),
+        });
       }
     }
 
@@ -7969,7 +8033,17 @@ export function registerMessagesRoutes(app, deps) {
         maxImages: MAX_UPLOAD_ATTACHMENTS,
       });
     } catch (error) {
-      return res.status(502).json({ error: error?.message || 'OpenAI image API returned no images' });
+      // The provider answered 2xx, so the generation is billed; what failed
+      // is the relay's handling of the reply. Logged with the stack, and
+      // flagged so the callers fail the row instead of requeueing it: a
+      // retry pays again and fails the same way.
+      console.error(
+        `[${ts()}] IMAGE     reply of ${requestBody.model} not processed: ${error?.message || error} (body ${rawText.length} chars)\n${error?.stack || ''}`,
+      );
+      return res.status(502).json({
+        error: error?.message || 'OpenAI image API returned no images',
+        relayProcessing: true,
+      });
     }
 
     return res.json({

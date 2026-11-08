@@ -37,8 +37,16 @@ import {
   updateSubagentRecordRetentionSetting as requestSubagentRecordRetentionSetting,
   loadFeatureFlagSettings,
   updateFeatureFlagSetting as requestFeatureFlagSetting,
+  loadModelRefreshSettings,
+  updateModelRefreshSettings as requestModelRefreshSettings,
   requestRelayRestart,
 } from './api-client.js';
+import {
+  formatModelRefreshIntervalLabel,
+  formatModelRefreshLastChecked,
+  nextModelRefreshExcluded,
+  normalizeModelRefreshSettings,
+} from './model-refresh-ui.mjs';
 import { DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES } from './background-task-timeout-options.mjs';
 import {
   DEFAULT_CLAUDE_BACKGROUND_COMMAND_LIMIT_MINUTES,
@@ -77,6 +85,7 @@ export {
 } from './claude-api-settings-ui.js';
 import { openClaudeCloudSettingsSection } from './claude-cloud-settings-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
+import { refreshAgentSdkRows } from './agent-sdk-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
 import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
@@ -397,6 +406,161 @@ export async function updateSubagentRecordRetentionSetting(value) {
     subagentRecordRetentionUpdateInFlight = false;
     syncSubagentRecordRetentionSelect();
   }
+}
+
+// "Check for new models" (Settings › General › Models): a relay setting, on
+// every 24 h by default, with one checkbox per enabled provider to leave it
+// out (server/services/model-refresh-scheduler.mjs). Starts at the relay's
+// defaults until its answer loads.
+let modelRefreshSettings = normalizeModelRefreshSettings(null);
+let modelRefreshUpdateInFlight = false;
+// The provider list waits for the relay's answer: "Loading…" until one
+// arrived, the reason while the last read failed.
+let modelRefreshProvidersLoaded = false;
+let modelRefreshLoadError = '';
+
+function syncModelRefreshIntervalOptions(select) {
+  const { intervalChoices, intervalHours } = modelRefreshSettings;
+  // A stored value outside today's choices still shows as itself.
+  const choices = intervalChoices.includes(intervalHours)
+    ? intervalChoices
+    : [...intervalChoices, intervalHours].sort((a, b) => a - b);
+  const current = Array.from(select.options).map((option) => option.value).join(',');
+  if (current === choices.join(',')) return;
+  select.replaceChildren(...choices.map((hours) => {
+    const option = document.createElement('option');
+    option.value = String(hours);
+    option.textContent = formatModelRefreshIntervalLabel(hours);
+    return option;
+  }));
+}
+
+function renderModelRefreshProviderRows(list) {
+  const excluded = new Set(modelRefreshSettings.excluded);
+  const disabled = modelRefreshUpdateInFlight || !modelRefreshSettings.auto;
+  const now = Date.now();
+  const status = (text, className) => {
+    const line = document.createElement('div');
+    line.className = className;
+    line.textContent = text;
+    return line;
+  };
+  let statusLine = null;
+  if (modelRefreshLoadError) {
+    statusLine = status(`Could not load the providers: ${modelRefreshLoadError}`, 'settings-help model-refresh-providers-error');
+  } else if (!modelRefreshProvidersLoaded) {
+    statusLine = status('Loading…', 'settings-help model-refresh-providers-loading');
+  } else if (!modelRefreshSettings.providers.length) {
+    statusLine = status('No provider is switched on.', 'settings-help');
+  }
+  // After a failed read, the providers of an earlier answer stay below it.
+  const providers = modelRefreshProvidersLoaded ? modelRefreshSettings.providers : [];
+  list.replaceChildren(...(statusLine ? [statusLine] : []), ...providers.map((provider) => {
+    const inputId = `model-refresh-provider-${provider.id.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`;
+    const row = document.createElement('div');
+    row.className = 'settings-row model-refresh-provider-row';
+    const label = document.createElement('label');
+    label.htmlFor = inputId;
+    const name = document.createElement('span');
+    name.textContent = `Check ${provider.label}`;
+    const last = document.createElement('span');
+    last.className = 'model-refresh-provider-last';
+    // An enabled provider without its key or CLI is not checked until it is.
+    last.textContent = provider.setUp ? formatModelRefreshLastChecked(provider.last, now) : 'Not set up';
+    label.append(name, last);
+    const input = document.createElement('input');
+    input.id = inputId;
+    input.type = 'checkbox';
+    input.dataset.modelRefreshProvider = provider.id;
+    input.setAttribute('aria-label', `Check ${provider.label} for new models`);
+    input.checked = !excluded.has(provider.id);
+    input.disabled = disabled;
+    input.addEventListener('change', () => {
+      void updateModelRefreshProviderSetting(provider.id, input.checked);
+    });
+    row.append(label, input);
+    return row;
+  }));
+}
+
+function syncModelRefreshSection() {
+  const toggle = document.getElementById('model-refresh-auto-toggle');
+  if (toggle instanceof HTMLInputElement) {
+    toggle.checked = modelRefreshSettings.auto;
+    toggle.disabled = modelRefreshUpdateInFlight;
+  }
+  const select = document.getElementById('model-refresh-interval-select');
+  if (select && select.tagName === 'SELECT') {
+    syncModelRefreshIntervalOptions(select);
+    select.value = String(modelRefreshSettings.intervalHours);
+    // Nothing to time while the check is off.
+    select.disabled = modelRefreshUpdateInFlight || !modelRefreshSettings.auto;
+  }
+  const list = document.getElementById('model-refresh-providers');
+  if (list) renderModelRefreshProviderRows(list);
+}
+
+export async function refreshModelRefreshSettings() {
+  // A new read: "Loading…" again until it answers, or the earlier list.
+  modelRefreshLoadError = '';
+  syncModelRefreshSection();
+  try {
+    const result = await loadModelRefreshSettings();
+    if (!result || typeof result !== 'object') throw new Error('The relay did not answer.');
+    modelRefreshSettings = normalizeModelRefreshSettings(result);
+    modelRefreshProvidersLoaded = true;
+    modelRefreshLoadError = '';
+  } catch (error) {
+    // Keep the last known value; the setting is not critical.
+    modelRefreshLoadError = String(error?.message || '').trim() || 'The relay did not answer.';
+  } finally {
+    syncModelRefreshSection();
+  }
+}
+
+async function saveModelRefreshSettings(patch, describe) {
+  if (modelRefreshUpdateInFlight) {
+    syncModelRefreshSection();
+    return;
+  }
+  modelRefreshUpdateInFlight = true;
+  syncModelRefreshSection();
+  try {
+    const result = await requestModelRefreshSettings(patch);
+    if (!result) throw new Error('Failed to update the check for new models.');
+    modelRefreshSettings = normalizeModelRefreshSettings(result);
+    modelRefreshProvidersLoaded = true;
+    modelRefreshLoadError = '';
+    showTransientRelayNotice(describe(modelRefreshSettings));
+  } catch (error) {
+    alert(error?.message || 'Failed to update the check for new models.');
+  } finally {
+    modelRefreshUpdateInFlight = false;
+    syncModelRefreshSection();
+  }
+}
+
+export function updateModelRefreshAutoSetting(checked) {
+  return saveModelRefreshSettings({ auto: checked === true }, (settings) => (settings.auto
+    ? `The relay checks for new models ${formatModelRefreshIntervalLabel(settings.intervalHours).toLowerCase()}.`
+    : 'The relay no longer checks for new models by itself.'));
+}
+
+export function updateModelRefreshIntervalSetting(value) {
+  return saveModelRefreshSettings({ intervalHours: Math.round(Number(value)) }, (settings) => (
+    `The relay checks for new models ${formatModelRefreshIntervalLabel(settings.intervalHours).toLowerCase()}.`
+  ));
+}
+
+export function updateModelRefreshProviderSetting(providerId, checked) {
+  const id = String(providerId || '').trim();
+  const label = modelRefreshSettings.providers.find((provider) => provider.id === id)?.label || id;
+  return saveModelRefreshSettings(
+    { excluded: nextModelRefreshExcluded(modelRefreshSettings.excluded, id, checked === true) },
+    (settings) => (settings.excluded.includes(id)
+      ? `${label} is no longer checked for new models.`
+      : `${label} is checked for new models.`),
+  );
 }
 
 export async function updateBackgroundTaskTimeoutSetting(value) {
@@ -1966,6 +2130,8 @@ export function openSettingsModal(tab, providerTab) {
   // in the meantime should show up the moment the panel opens. Sockets keep it
   // current from here on.
   void refreshCliInstallSections({ force: true });
+  // The agent SDK rows: a read of the store's state, nothing spawned.
+  void refreshAgentSdkRows();
   grokSettingsInputsDirty = false;
   ensureGrokSettingsInputTracking();
   void syncGrokSettingsInputs();
@@ -1989,6 +2155,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshRestartResumeSetting();
   syncSubagentRecordRetentionSelect();
   void refreshSubagentRecordRetentionSetting();
+  void refreshModelRefreshSettings();
   void refreshRelayRestartMaxWaitSetting();
   void refreshPushSettingsSection();
   void refreshPreviewsSection();

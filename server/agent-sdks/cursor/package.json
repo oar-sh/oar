@@ -1,0 +1,11 @@
+{
+  "name": "oar-agent-sdk-cursor",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Cursor SDK as OAR installs it on demand: exact pins, installed from the lockfile beside this file.",
+  "license": "MIT",
+  "dependencies": {
+    "@cursor/sdk": "1.3.1",
+    "zod": "4.6.7"
+  }
+}

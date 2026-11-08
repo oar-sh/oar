@@ -530,20 +530,24 @@ test('status() reports the relay id, the stale count, the recycles in flight and
   });
 });
 
-test('start() sweeps every interval on an unref\'d timer, and stop() ends it', async () => {
+test('start() sweeps at once, then every interval on an unref\'d timer, and stop() ends it', async () => {
   const app = setup({ workers: [worker('sid-timer')], options: { sweepIntervalMs: 15_000 } });
   app.service.start();
   const [timer] = app.clock.pending();
   assert.equal(timer.unrefed, true);
+  await flush();
+  assert.deepEqual(app.calls, [['stop', 'sid-timer'], ['launch', 'sid-timer']], 'the start\'s own sweep');
+  // A stale worker that turns up later waits for the interval.
+  app.registry.set('sid-later', worker('sid-later', { pid: 8 }));
   await app.clock.advance(14_999);
-  assert.deepEqual(app.calls, []);
+  assert.equal(app.calls.length, 2);
   await app.clock.advance(1);
-  assert.deepEqual(app.calls, [['stop', 'sid-timer'], ['launch', 'sid-timer']]);
-  app.registry.set('sid-timer', worker('sid-timer', { pid: 7 }));
+  assert.deepEqual(app.calls.slice(2), [['stop', 'sid-later'], ['launch', 'sid-later']]);
+  app.registry.set('sid-later', worker('sid-later', { pid: 9 }));
   app.service.stop();
   assert.equal(app.clock.pending().length, 0);
   await app.clock.advance(60_000);
-  assert.equal(app.calls.length, 2);
+  assert.equal(app.calls.length, 4);
 });
 
 test('while started, a recycle put off for the gap comes as soon as the gap ends, not a whole interval later', async () => {
@@ -552,7 +556,7 @@ test('while started, a recycle put off for the gap comes as soon as the gap ends
     options: { sweepIntervalMs: 15_000, minStartGapMs: 3_000 },
   });
   app.service.start();
-  await app.clock.advance(15_000);
+  await flush();
   assert.deepEqual(app.calls.map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-1', 'launch:sid-1']);
   await app.clock.advance(3_000);
   assert.deepEqual(app.calls.slice(2).map(([kind, sid]) => `${kind}:${sid}`), ['stop:sid-2', 'launch:sid-2']);
@@ -832,8 +836,293 @@ test('a quietSince that throws is a probe failure: nothing is stopped on a guess
   assert.match(app.logs[0], /probe failed sid-quie \(1\): db locked/);
 });
 
-test('the hold names include cli and quiet', () => {
-  assert.deepEqual(RECYCLE_HOLDS, ['turn', 'question', 'compaction', 'background', 'cli', 'quiet']);
+test('the hold names include cli, quiet and steering', () => {
+  assert.deepEqual(RECYCLE_HOLDS, ['turn', 'question', 'compaction', 'background', 'cli', 'quiet', 'steering']);
+});
+
+// ─── Stale workers on an agent SDK ──────────────────────────────────────────
+// An update can take the files their next CLI child starts from: they skip
+// the cli and quiet holds and are fenced from the first sweep that sees them
+// stale until their recycle.
+
+const SDK_KINDS = new Set(['claude', 'claude-api', 'deepseek', 'cursor']);
+const onAgentSdk = (entry) => SDK_KINDS.has(String(entry?.kind || ''));
+
+test('a stale claude or cursor worker whose CLI child runs is recycled without waiting for the child or the quiet time', async () => {
+  const kinds = ['claude', 'claude-api', 'deepseek', 'cursor'];
+  const app = setup({
+    workers: kinds.map((kind, index) => worker(`sid-sdk-${kind}`, { kind, pid: 200 + index, steering: { releasable: true, cliAlive: true } })),
+    options: { isAgentSdkWorker: onAgentSdk, quietSince: () => CLOCK_START - 1_000, maxInFlight: 10 },
+  });
+  await app.service.sweep();
+  assert.deepEqual(
+    app.calls.filter(([step]) => step === 'stop').map(([, sid]) => sid),
+    kinds.map((kind) => `sid-sdk-${kind}`),
+  );
+  assert.equal(app.calls.filter(([step]) => step === 'launch').length, kinds.length);
+  assert.deepEqual(app.service.status().waiting, []);
+});
+
+test('a stale worker without an agent SDK still waits for its CLI child and the quiet time', async () => {
+  const app = setup({
+    workers: [
+      worker('sid-copilot-cli', { kind: 'copilot-sdk', steering: { releasable: true, cliAlive: true } }),
+      worker('sid-grok-quiet', { kind: 'grok', steering: { releasable: true } }),
+      worker('sid-nokind-cli', { kind: null, steering: { releasable: true, cliAlive: true } }),
+    ],
+    options: { isAgentSdkWorker: onAgentSdk, quietSince: () => CLOCK_START - 1_000, fence: createWorkerReplacementFence() },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.service.status().waiting, [
+    { sdkSessionId: 'sid-copilot-cli', hold: 'cli' },
+    { sdkSessionId: 'sid-grok-quiet', hold: 'quiet' },
+    { sdkSessionId: 'sid-nokind-cli', hold: 'cli' },
+  ]);
+});
+
+test('a stale worker on an agent SDK still waits out a turn, a question, a compaction and background tasks', async () => {
+  const fence = createWorkerReplacementFence();
+  const holds = [
+    ['sid-sdk-row', { steering: { releasable: true, cliAlive: true } }, 'turn', 301],
+    ['sid-sdk-turn', { steering: { releasable: false, releaseHold: 'turn', cliAlive: true } }, 'turn', 302],
+    ['sid-sdk-question', { kind: 'cursor', steering: { releasable: false, releaseHold: 'question' } }, 'question', 303],
+    ['sid-sdk-compaction', { kind: 'deepseek', steering: { releasable: false, releaseHold: 'compaction', cliAlive: true } }, 'compaction', 304],
+    ['sid-sdk-background', { steering: { releasable: false, releaseHold: 'background', backgroundTaskCount: 1, cliAlive: true } }, 'background', 305],
+  ];
+  const app = setup({
+    workers: holds.map(([sid, extra, , pid]) => worker(sid, { ...extra, pid })),
+    running: (sid) => sid === 'sid-sdk-row',
+    options: { isAgentSdkWorker: onAgentSdk, fence },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.service.status().waiting, holds.map(([sdkSessionId, , hold]) => ({ sdkSessionId, hold })));
+  // Fenced while it waits, except for background tasks: those keep its CLI
+  // child up, and a delivery goes to that child.
+  for (const [sid, , hold, pid] of holds) {
+    assert.equal(fence.isHeld(sid, pid), hold !== 'background', `${sid} fenced`);
+  }
+  // Background tasks start in a fenced session (its turn ended with some
+  // left running): the fence comes down; they end: it is recycled.
+  app.registry.set('sid-sdk-turn', worker('sid-sdk-turn', { pid: 302, steering: { releasable: false, releaseHold: 'background', cliAlive: true } }));
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-turn', 302), false);
+  assert.deepEqual(app.calls, []);
+  app.registry.set('sid-sdk-turn', worker('sid-sdk-turn', { pid: 302, steering: { releasable: true, cliAlive: true } }));
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-sdk-turn'], ['launch', 'sid-sdk-turn']]);
+});
+
+test('deliveries to a stale worker on an agent SDK are fenced until its recycle, then go to the new worker', async () => {
+  const fence = createWorkerReplacementFence();
+  let turn = true;
+  const app = setup({
+    workers: [worker('sid-sdk-fence', { pid: 410, steering: { releasable: true, cliAlive: false } })],
+    running: () => turn,
+    stop: async (sid, opts, { registry }) => {
+      assert.equal(claim(410), null, 'nothing reaches the old process while it is stopped');
+      registry.delete(sid);
+      return { ok: true };
+    },
+    options: { isAgentSdkWorker: onAgentSdk, fence },
+  });
+  // A delivery path as the runtime's: refused while the fence is up for the
+  // asking process, else handed the queued row.
+  const queued = ['row-1'];
+  const claim = (pid) => (fence.isHeld('sid-sdk-fence', pid) ? null : queued.shift() || null);
+
+  await app.service.sweep();
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-sdk-fence', hold: 'turn' }]);
+  assert.equal(claim(410), null, 'the old process gets nothing while its turn runs');
+  assert.ok(app.logs.includes('[worker-recycle] fenced sid-sdk- pid 410: stale on an agent SDK, deliveries wait for the recycle'));
+  await app.service.sweep();
+  assert.equal(claim(410), null, 'still fenced on the next sweep');
+
+  turn = false;
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-sdk-fence'], ['launch', 'sid-sdk-fence']]);
+  const fresh = app.registry.get('sid-sdk-fence');
+  // The fence came down only after the old process was stopped (the stop
+  // ran first): the row is the new worker's.
+  assert.notEqual(fresh.pid, 410);
+  assert.equal(claim(fresh.pid), 'row-1', 'the new worker gets the row');
+  assert.deepEqual(fence.list(), []);
+});
+
+test('the agent-SDK fence waits for the recycle\'s pacing and stays up through a failed stop\'s backoff', async () => {
+  const fence = createWorkerReplacementFence();
+  let stopOk = false;
+  const app = setup({
+    workers: [
+      worker('sid-sdk-first', { pid: 420 }),
+      worker('sid-sdk-second', { pid: 421 }),
+    ],
+    stop: async (sid, opts, { registry }) => {
+      if (!stopOk) return { ok: false, error: 'worker-survived-stop' };
+      registry.delete(sid);
+      return { ok: true };
+    },
+    options: { isAgentSdkWorker: onAgentSdk, fence, minStartGapMs: 3_000, retryBaseMs: 1_000 },
+  });
+  await app.service.sweep();
+  // The first one's stop failed: its SDK's files may be gone, so it stays
+  // fenced through the backoff. The second one waits for the gap, fenced.
+  assert.deepEqual(app.calls, [['stop', 'sid-sdk-first']]);
+  assert.equal(fence.isHeld('sid-sdk-first', 420), true);
+  assert.equal(fence.isHeld('sid-sdk-second', 421), true);
+  assert.ok(app.logs.some((line) => /fence kept sid-sdk-.* pid 420: its stop failed/.test(line)));
+  // A sweep inside the backoff keeps it.
+  await app.clock.advance(500);
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-first', 420), true);
+  // The next slot: the first one again (its backoff is over); the second
+  // still waits, fenced.
+  stopOk = true;
+  await app.clock.advance(3_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(1), [['stop', 'sid-sdk-first'], ['launch', 'sid-sdk-first']]);
+  assert.equal(fence.isHeld('sid-sdk-second', 421), true);
+  await app.clock.advance(3_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(3), [['stop', 'sid-sdk-second'], ['launch', 'sid-sdk-second']]);
+  assert.deepEqual(fence.list(), []);
+});
+
+test('a failed stop\'s agent-SDK fence: no queued row reaches the old pid; down when the worker goes or after stuckAfter tries', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-sdk-stuck', { pid: 430 }), worker('sid-sdk-gone', { pid: 431 })],
+    stop: async () => ({ ok: false, error: 'worker-survived-stop' }),
+    options: { isAgentSdkWorker: onAgentSdk, fence, retryBaseMs: 1_000, stuckAfter: 3 },
+  });
+  // The delivery path asks the fence before it hands a queued row out.
+  const deliverable = (sid, pid) => !fence.isHeld(sid, pid);
+  await app.service.sweep();
+  assert.equal(deliverable('sid-sdk-stuck', 430), false, 'the queued row waits');
+  assert.equal(deliverable('sid-sdk-gone', 431), false);
+  // The worker exits: the next sweep lowers its fence.
+  app.registry.delete('sid-sdk-gone');
+  await app.clock.advance(100);
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-gone', 431), false);
+  assert.equal(deliverable('sid-sdk-stuck', 430), false);
+  // Tries two and three fail: at stuckAfter the old worker serves again.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await app.clock.advance(60_000);
+    await app.service.sweep();
+  }
+  assert.equal(app.calls.filter(([step, sid]) => step === 'stop' && sid === 'sid-sdk-stuck').length, 3);
+  assert.equal(fence.isHeld('sid-sdk-stuck', 430), false);
+  assert.equal(deliverable('sid-sdk-stuck', 430), true);
+});
+
+test('a stale worker on an agent SDK with no steering snapshot yet waits for one, fenced, then goes at once', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-sdk-hello', { pid: 430, steering: null })],
+    options: { isAgentSdkWorker: onAgentSdk, fence },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-sdk-hello', hold: 'steering' }]);
+  assert.equal(fence.isHeld('sid-sdk-hello', 430), true);
+  // Its first heartbeat names no hold.
+  app.registry.set('sid-sdk-hello', worker('sid-sdk-hello', { pid: 430, steering: { releasable: true, cliAlive: true } }));
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-sdk-hello'], ['launch', 'sid-sdk-hello']]);
+  assert.deepEqual(fence.list(), []);
+});
+
+test('a stale worker on an agent SDK that never sends a snapshot is judged as any other after steeringWaitMs, unfenced', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [worker('sid-sdk-mute', { pid: 440, steering: null })],
+    options: { isAgentSdkWorker: onAgentSdk, fence, steeringWaitMs: 30_000, quietSince: () => CLOCK_START },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-mute', 440), true);
+  await app.clock.advance(30_000);
+  await app.service.sweep();
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-sdk-mute', hold: 'quiet' }]);
+  assert.equal(fence.isHeld('sid-sdk-mute', 440), false);
+  assert.ok(app.logs.includes('[worker-recycle] unfenced sid-sdk- pid 440'));
+  assert.deepEqual(app.calls, []);
+});
+
+test('the agent-SDK fence comes down when the worker goes, when a probe fails, and is never raised for a session recycled under this build', async () => {
+  const fence = createWorkerReplacementFence();
+  let probeFails = false;
+  const app = setup({
+    workers: [
+      worker('sid-sdk-gone', { pid: 450 }),
+      worker('sid-sdk-probe', { pid: 451 }),
+    ],
+    running: (sid) => {
+      if (sid === 'sid-sdk-probe' && probeFails) throw new Error('db locked');
+      return true;
+    },
+    options: { isAgentSdkWorker: onAgentSdk, fence },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-gone', 450), true);
+  assert.equal(fence.isHeld('sid-sdk-probe', 451), true);
+  app.registry.delete('sid-sdk-gone');
+  probeFails = true;
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-gone', 450), false, 'a worker that left the registry is not fenced on');
+  assert.equal(fence.isHeld('sid-sdk-probe', 451), false, 'nothing is fenced on a guess');
+  assert.deepEqual(fence.list(), []);
+});
+
+test('the agent-SDK fence keeps a delivery from the session\'s worker pid only, and a recycle takes it over without a gap', async () => {
+  const fence = createWorkerReplacementFence();
+  let releaseStop = null;
+  let turn = true;
+  const app = setup({
+    workers: [worker('sid-sdk-handover', { pid: 460 })],
+    running: () => turn,
+    stop: (sid, opts, { registry }) => new Promise((resolve) => { releaseStop = () => { registry.delete(sid); resolve({ ok: true }); }; }),
+    options: { isAgentSdkWorker: onAgentSdk, fence },
+  });
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-handover', 460), true);
+  assert.equal(fence.isHeld('sid-sdk-handover', 461), false, 'another pid of the session is not fenced');
+  turn = false;
+  const swept = app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-handover', 460), true, 'still up as the recycle starts');
+  await flush();
+  // A sweep while the stop runs leaves the recycle's fence alone.
+  await app.service.sweep();
+  assert.equal(fence.isHeld('sid-sdk-handover', 460), true, 'up through the stop');
+  releaseStop();
+  await swept;
+  assert.deepEqual(app.calls, [['stop', 'sid-sdk-handover'], ['launch', 'sid-sdk-handover']]);
+  assert.deepEqual(fence.list(), []);
+});
+
+test('sweepNow (a worker hello) judges and fences synchronously while started, and does nothing before start', async () => {
+  const fence = createWorkerReplacementFence();
+  const app = setup({
+    workers: [],
+    running: () => true,
+    options: { isAgentSdkWorker: onAgentSdk, fence, sweepIntervalMs: 15_000 },
+  });
+  app.registry.set('sid-sdk-early', worker('sid-sdk-early', { pid: 470 }));
+  await app.service.sweepNow();
+  assert.deepEqual(fence.list(), [], 'not started: no sweep');
+
+  app.registry.delete('sid-sdk-early');
+  app.service.start();
+  await flush();
+  // A stale worker reconnects and says hello: fenced before the hello's own
+  // request for work is answered, with no await in between.
+  app.registry.set('sid-sdk-hello', worker('sid-sdk-hello', { pid: 471 }));
+  const swept = app.service.sweepNow();
+  assert.equal(fence.isHeld('sid-sdk-hello', 471), true);
+  await swept;
+  assert.deepEqual(app.service.status().waiting, [{ sdkSessionId: 'sid-sdk-hello', hold: 'turn' }]);
+  app.service.stop();
 });
 
 test('isWorkerOnOtherBuild: a different or absent build id is another build; an equal one is not; an unknown relay id compares nothing', () => {

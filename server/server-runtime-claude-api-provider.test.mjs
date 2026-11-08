@@ -26,7 +26,8 @@ test('the Claude API settings service is built on the settings table over the Cl
   assert.match(serviceSource, /getClaudeProviderSettings: \(\) => getClaudeProviderSettings\(\),/);
   const depsSource = sliceBetween('const sharedRouteDeps = {', '\n};');
   assert.match(depsSource, /\n  getClaudeApiProviderSettings,\n/);
-  assert.match(depsSource, /\n  claudeApiSettingsService,\n/);
+  // Wrapped: a save that leaves Claude API enabled installs the Claude SDK.
+  assert.match(depsSource, /\n  claudeApiSettingsService: withAgentSdkUpdate\(claudeApiSettingsService, [^\n]*\),\n/);
 });
 
 test('a Claude API conversation launches the Claude API worker with the saved key, never Claude or Copilot', () => {

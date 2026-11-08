@@ -21,25 +21,15 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 
 import { DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile, sideFiles } from './database-file.mjs';
+import { resolveOarRoot } from './oar-state-root.mjs';
 import { createRelaySingletonGuard } from './relay-singleton-guard.mjs';
 
 export const MIGRATION_MARKER = '.migrated';
 const MAX_LOGS_BYTES = 50 * 1024 * 1024;
 
-export function resolveOarRoot(env = process.env, platform = process.platform) {
-  const override = String(env.OAR_STATE_ROOT || '').trim();
-  if (override) return path.resolve(override);
-  if (platform === 'win32') {
-    const appData = String(env.APPDATA || '').trim();
-    if (appData) return path.join(appData, 'oar');
-    const profile = String(env.USERPROFILE || '').trim();
-    return path.join(profile || os.homedir(), 'AppData', 'Roaming', 'oar');
-  }
-  return path.join(os.homedir(), '.oar');
-}
+export { resolveOarRoot };
 
 function defaultIsProcessAlive(pid) {
   try {

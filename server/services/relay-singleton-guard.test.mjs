@@ -7,7 +7,8 @@ import crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
-import { createRelaySingletonGuard, defaultIsProcessAlive, lockHolderMayRun, processIdentity, processStartedAt } from './relay-singleton-guard.mjs';
+import { readAgentSdkPin } from './agent-sdk-paths.mjs';
+import { createRelaySingletonGuard, defaultIsProcessAlive, loadRelayKoffi, lockHolderMayRun, processIdentity, processImageName, processStartedAt, relayImageNames } from './relay-singleton-guard.mjs';
 import { scratchEnv } from './scratch-env-test-harness.mjs';
 
 // Every folder made here is removed at the end: a run used to leave one per test in the temp dir.
@@ -100,7 +101,8 @@ const secondsFromAt = (seconds) => new Date(AT + seconds * 1000);
 const setTime = (file, seconds) => fs.utimesSync(file, secondsFromAt(seconds), secondsFromAt(seconds));
 // Each look at the clock is 100 ms later: the retries take no time.
 const steppingClock = () => { let at = AT; return () => (at += 100); };
-const quiet = { logger: {}, identityOf: () => null, bootIdOf: () => '', isProcessAlive: () => true };
+// The Windows checks for a start that cannot be told have tests of their own.
+const quiet = { logger: {}, identityOf: () => null, bootIdOf: () => '', isProcessAlive: () => true, platform: 'linux' };
 
 test('a lock is never there half written: a start in that moment sees none of it or all of it', () => {
   const lockPath = tmpLock();
@@ -369,8 +371,9 @@ function leftLock(lockedAt) {
 }
 const LOCKED_AT = '2026-10-20T19:00:15.000Z';
 // Nothing here asks the host: its pids, boot id and identities are stubbed.
+// The Windows checks for a start that cannot be told have tests of their own.
 const acquireOver = (lockPath, options) => createRelaySingletonGuard({
-  lockPath, pid: 100, token: 'tok', logger: {}, isProcessAlive: () => true, identityOf: () => null, bootIdOf: () => '', ...options,
+  lockPath, pid: 100, token: 'tok', logger: {}, isProcessAlive: () => true, identityOf: () => null, bootIdOf: () => '', platform: 'linux', ...options,
 }).acquire();
 
 test('a lock from before the last boot is stale, even with its pid alive again', () => {
@@ -413,7 +416,87 @@ test('a pid this user may not signal (EPERM) counts as alive', () => {
   } finally {
     process.kill = realKill;
   }
-  assert.equal(lockHolderMayRun({ lock: { pid: 4, startedAt: LOCKED_AT }, isProcessAlive: () => true, startedAtOf: () => null, bootTime: 0 }), true);
+  assert.equal(lockHolderMayRun({ lock: { pid: 4, startedAt: LOCKED_AT }, isProcessAlive: () => true, startedAtOf: () => null, bootTime: 0, platform: 'linux' }), true);
+});
+
+// ─── Windows while koffi is not installed: the start cannot be told ──────────
+
+test('Windows, start unknown: a lock from before the last boot is stale, one since the boot is held', () => {
+  const at = Date.parse(LOCKED_AT);
+  const unknown = { platform: 'win32', identityOf: () => null, startedAtOf: () => null, imageNameOf: () => 'node.exe' };
+  for (const lock of [
+    { pid: 7348, startedAt: LOCKED_AT },
+    { pid: 7348, startedAt: LOCKED_AT, format: 2, holder: null },
+    { pid: 7348, startedAt: LOCKED_AT, format: 2, holder: { start: 'win:1' } },
+  ]) {
+    const what = JSON.stringify(lock);
+    assert.equal(lockHolderMayRun({ lock, isProcessAlive: () => true, bootTime: at + 60_000, ...unknown }), false, `before the boot: ${what}`);
+    assert.equal(lockHolderMayRun({ lock, isProcessAlive: () => true, bootTime: at - 60_000, ...unknown }), true, `since the boot: ${what}`);
+  }
+});
+
+test('Windows, start unknown: a pid that runs another program than Node does not hold the lock', () => {
+  const at = Date.parse(LOCKED_AT);
+  const lock = { pid: 7348, startedAt: LOCKED_AT, format: 2, holder: null };
+  const mayRun = (image, extra = {}) => lockHolderMayRun({
+    lock, isProcessAlive: () => true, bootTime: at - 60_000, platform: 'win32', identityOf: () => null, imageNameOf: () => image, ...extra,
+  });
+  assert.equal(mayRun('svchost.exe'), false, 'the pid went to another program');
+  assert.equal(mayRun('node.exe'), true, 'a Node process: may be the relay');
+  assert.equal(mayRun(null), true, 'cannot tell: held');
+  assert.equal(mayRun('node24.exe', { relayImages: relayImageNames({ execPath: 'C:\\tools\\node24.exe', env: {} }) }), true, 'the Node the relay runs on');
+  // Only while the start is unknown, and only on Windows.
+  assert.equal(mayRun('svchost.exe', { identityOf: () => null, platform: 'linux' }), true, 'not on Linux');
+  const held = { ...lock, holder: { start: 'win:5' } };
+  assert.equal(lockHolderMayRun({ lock: held, isProcessAlive: () => true, platform: 'win32', identityOf: () => ({ start: 'win:5' }), imageNameOf: () => 'svchost.exe' }), true, 'a known start decides');
+});
+
+test('Windows, start unknown: the relay starts over a stale lock whose pid was handed on', () => {
+  const lockPath = tmpLock();
+  fs.writeFileSync(lockPath, JSON.stringify({ format: 2, pid: 7348, tokenHash: 'x', startedAt: new Date().toISOString(), holder: null }));
+  const payload = acquireOver(lockPath, { platform: 'win32', startedAtOf: () => null, imageNameOf: () => 'explorer.exe', bootTime: 0 });
+  assert.equal(payload.pid, 100, 'recovered');
+  assert.equal(payload.holder, null, 'written without a start it cannot tell');
+  const again = tmpLock();
+  fs.writeFileSync(again, JSON.stringify({ format: 2, pid: 7348, tokenHash: 'x', startedAt: new Date().toISOString(), holder: null }));
+  assert.throws(() => acquireOver(again, { platform: 'win32', startedAtOf: () => null, imageNameOf: () => 'node.exe', bootTime: 0 }), /another live process/);
+});
+
+test('without koffi a Windows start time cannot be told: null, as when koffi fails to load', () => {
+  const missing = () => { throw Object.assign(new Error('koffi is not installed yet'), { code: 'ERR_MODULE_NOT_FOUND' }); };
+  assert.equal(processStartedAt(process.pid, { platform: 'win32', loadKoffi: missing }), null);
+});
+
+test('koffi comes from the store outside a checkout, and its folder is leased', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-koffi-'));
+  tempDirs.push(root);
+  assert.throws(() => loadRelayKoffi({ env: { OAR_SDK_DIR: root }, fromCheckout: false }), { code: 'ERR_MODULE_NOT_FOUND' });
+  // A finished install as the store leaves it, with a stand-in for koffi.
+  const pin = readAgentSdkPin('koffi');
+  const dir = path.join(root, 'koffi', pin.dirName);
+  const write = (rel, text) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), text);
+  };
+  write('entry.cjs', 'module.exports = { standIn: true };\n');
+  write('node_modules/koffi/package.json', '{"name":"koffi","version":"3.3.4"}\n');
+  const files = {};
+  for (const rel of ['entry.cjs', 'node_modules/koffi/package.json']) files[rel] = fs.statSync(path.join(dir, rel)).size;
+  write('oar-sdk.json', JSON.stringify({ format: 1, id: 'koffi', version: pin.version, hash: pin.hash, ...pin.host, libc: pin.host.libc || null, installedAt: new Date().toISOString(), files }));
+  assert.deepEqual(loadRelayKoffi({ env: { OAR_SDK_DIR: root }, fromCheckout: false }), { standIn: true });
+  assert.equal(fs.readdirSync(path.join(root, 'koffi', '.leases', pin.dirName)).length, 1, 'leased');
+});
+
+test('the image name comes from tasklist, null when it says nothing about the pid', () => {
+  const runs = [];
+  const tasklist = (stdout) => (command, args) => { runs.push([command, ...args]); return { stdout }; };
+  assert.equal(processImageName(7348, { spawnSyncImpl: tasklist('"node.exe","7348","Console","1","81.204 K"\r\n') }), 'node.exe');
+  assert.deepEqual(runs[0], ['tasklist', '/FI', 'PID eq 7348', '/FO', 'CSV', '/NH']);
+  assert.equal(processImageName(7348, { spawnSyncImpl: tasklist('"Svchost.EXE","7348","Services","0","9.000 K"\r\n') }), 'svchost.exe');
+  assert.equal(processImageName(7348, { spawnSyncImpl: tasklist('INFO: No tasks are running which match the specified criteria.\r\n') }), null);
+  assert.equal(processImageName(7348, { spawnSyncImpl: tasklist('"node.exe","1234","Console","1","1 K"\r\n') }), null, 'another pid');
+  assert.equal(processImageName(7348, { spawnSyncImpl: () => { throw new Error('ENOENT'); } }), null);
+  if (process.platform === 'win32') assert.equal(processImageName(process.pid), path.win32.basename(process.execPath).toLowerCase()); // host-platform: tasklist is Windows'
 });
 
 test('a process start time is read without PowerShell', () => {

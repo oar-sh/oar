@@ -27,6 +27,23 @@ test('with no provider ready the screen points to Settings → Providers, whatev
   }
 });
 
+test('a provider that is on but whose SDK failed says why on the setup screen, each reason once', () => {
+  const failed = {
+    ...notReady,
+    reasons: {
+      claude: { blocking: true, text: 'Claude Agent SDK install failed: npm exited with code 1' },
+      deepseek: { blocking: true, text: 'Claude Agent SDK install failed: npm exited with code 1' },
+      cursor: { blocking: true, text: 'Cursor SDK not available on this platform.' },
+      grok: { blocking: false, text: 'a note only' },
+    },
+  };
+  const state = resolveNoConversationState({ readiness: failed });
+  assert.equal(state.variant, 'setup');
+  assert.equal(state.text, `${SETUP_TEXT} Claude Agent SDK install failed: npm exited with code 1. Cursor SDK not available on this platform.`);
+  // Notes never reach it, and an empty map leaves the text alone.
+  assert.equal(resolveNoConversationState({ readiness: { ...notReady, reasons: {} } }).text, SETUP_TEXT);
+});
+
 test('a ready relay with no conversations invites the first chat', () => {
   const state = resolveNoConversationState({ readiness: ready, conversationCount: 0 });
   assert.equal(state.variant, 'first-chat');

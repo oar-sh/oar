@@ -24,7 +24,8 @@ test('the DeepSeek settings service is built on the settings table and handed to
   assert.match(runtimeSource, /listProviderCandidates: \(\) => stmts\.listRuntimeSessionProviderCandidates\?\.all\?\.\(\) \|\| \[\]/);
   const depsSource = sliceBetween('const sharedRouteDeps = {', '\n};');
   assert.match(depsSource, /\n  getDeepSeekProviderSettings,\n/);
-  assert.match(depsSource, /\n  deepseekSettingsService,\n/);
+  // Wrapped: a save that leaves DeepSeek enabled installs the Claude SDK.
+  assert.match(depsSource, /\n  deepseekSettingsService: withAgentSdkUpdate\(deepseekSettingsService, [^\n]*\),\n/);
 });
 
 test('a DeepSeek conversation gets its own worker and never falls through to a Copilot launch', () => {

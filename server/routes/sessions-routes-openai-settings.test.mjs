@@ -136,3 +136,25 @@ test('overlapping models keep GitHub provider without explicit metadata', () => 
   assert.deepEqual(enabled.providersByModel['gpt-5.4'], ['github-copilot', 'openai-byok']);
   assert.equal(enabled.modelMetadataByModel['gpt-5.4'].provider, 'github-copilot');
 });
+
+test('the Select Models save of the OpenAI tab: the models that are on and the switch', () => {
+  assert.deepEqual(parseOpenAISettingsUpdateRequest({ enabledModels: ['gpt-4o'], autoEnableNew: false }), {
+    ok: true,
+    remove: false,
+    apiKey: '',
+    enabledModels: ['gpt-4o'],
+    autoEnableNew: false,
+    enabled: undefined,
+  });
+  assert.equal(parseOpenAISettingsUpdateRequest({ autoEnableNew: true }).ok, true);
+  assert.equal(parseOpenAISettingsUpdateRequest({ autoEnableNew: 'yes' }).ok, false);
+});
+
+test('the catalog offers only the OpenAI models that are on', () => {
+  const payload = buildModelCatalogWithOpenAIProvider(
+    { models: ['auto', 'gpt-5.4-mini'], reasoningByModel: {} },
+    { enabled: true, model: 'gpt-4o', models: ['gpt-4o', 'gpt-4.1'], availableModels: ['gpt-4o', 'gpt-4.1', 'o3-test'] },
+  );
+  assert.ok(payload.models.includes('gpt-4.1'));
+  assert.equal(payload.models.includes('o3-test'), false);
+});

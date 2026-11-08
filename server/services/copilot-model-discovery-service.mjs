@@ -44,6 +44,9 @@ export function createCopilotModelDiscoveryService({
   updateModelCatalog,
   timeoutMs = DEFAULT_COPILOT_MODEL_DISCOVERY_TIMEOUT_MS,
   bootDelayMs = DEFAULT_COPILOT_MODEL_DISCOVERY_BOOT_DELAY_MS,
+  // (result, reason) after each refresh that got past the CLI check: the
+  // model refresh ledger's clock (the boot refresh included).
+  onRefreshed = () => {},
   logger = console,
 } = {}) {
   if (typeof createClient !== 'function' || typeof updateModelCatalog !== 'function') {
@@ -151,7 +154,10 @@ export function createCopilotModelDiscoveryService({
         }
         activeRefresh = null;
       }
-    })();
+    })().then((result) => {
+      try { onRefreshed(result, reason); } catch { /* the clock is best-effort */ }
+      return result;
+    });
     return activeRefresh;
   }
 

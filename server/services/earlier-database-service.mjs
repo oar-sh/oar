@@ -9,7 +9,7 @@ import {
 } from './database-file.mjs';
 import { resolveOarRoot } from './oar-state-migration-service.mjs';
 import { resolveStateLayout } from './oar-state-layout.mjs';
-import { defaultIsProcessAlive, lockHolderMayRun, processStartedAt as defaultProcessStartedAt } from './relay-singleton-guard.mjs';
+import { defaultIsProcessAlive, lockHolderMayRun, processImageName, processStartedAt as defaultProcessStartedAt } from './relay-singleton-guard.mjs';
 
 const SHA256_NAME = /^[a-f0-9]{64}$/;
 // The copies the install-time rescue of 0.9.14 to 0.9.22 made, in the data folder.
@@ -94,6 +94,8 @@ function adopt({
   platform = process.platform,
   isProcessAlive = defaultIsProcessAlive,
   processStartedAt = (pid) => defaultProcessStartedAt(pid, { platform }),
+  // What a pid runs, when its start cannot be told (Windows without koffi).
+  imageNameOf = processImageName,
   bootTime = Date.now() - os.uptime() * 1000,
   now = () => new Date(),
   clock = Date.now,
@@ -234,7 +236,7 @@ function adopt({
       fsImpl,
       rename,
       exists,
-      lockMayRun: (lock) => lockHolderMayRun({ lock, isProcessAlive, startedAtOf: processStartedAt, bootTime }),
+      lockMayRun: (lock) => lockHolderMayRun({ lock, isProcessAlive, startedAtOf: processStartedAt, bootTime, platform, imageNameOf }),
       normalize,
       progress,
     });

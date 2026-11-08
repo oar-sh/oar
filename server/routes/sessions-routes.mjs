@@ -155,6 +155,8 @@ import { deepseekStartingBalanceNote } from '../services/plan-usage-deepseek.mjs
 import { appendTokenSections } from '../services/plan-usage-tokens.mjs';
 import { DEEPSEEK_USAGE_CHECKPOINTS_TABLE } from '../migrations/0024-deepseek-usage-totals.mjs';
 import { claudeProjectDirSlug } from '../services/claude-session-root-service.mjs';
+import { buildProviderRefreshTable, refreshProviderModels } from '../services/provider-model-refresh.mjs';
+import { MODEL_REFRESH_INTERVAL_HOURS_CHOICES, MODEL_REFRESH_PROVIDERS, DEFAULT_MODEL_REFRESH_AUTO, DEFAULT_MODEL_REFRESH_INTERVAL_HOURS } from '../../shared/model-refresh-schedule.mjs';
 
 export { mapUsageSnapshotRow };
 
@@ -305,7 +307,9 @@ export function parseOpenAISettingsUpdateRequest(body = {}) {
   const hasEnabled = typeof payload.enabled === 'boolean';
   const hasBaseUrl = Object.prototype.hasOwnProperty.call(payload, 'baseUrl');
   const baseUrl = hasBaseUrl ? String(payload.baseUrl || '').trim() : undefined;
-  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasBaseUrl) {
+  const hasEnabledModels = Array.isArray(payload.enabledModels);
+  const hasAutoEnableNew = typeof payload.autoEnableNew === 'boolean';
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasBaseUrl && !hasEnabledModels && !hasAutoEnableNew) {
     return { ok: false, error: 'No OpenAI settings update provided' };
   }
   if (hasModel && !isSafeProviderModelId(model)) {
@@ -326,6 +330,9 @@ export function parseOpenAISettingsUpdateRequest(body = {}) {
     apiKey,
     ...(hasModel ? { model } : {}),
     ...(hasBaseUrl ? { baseUrl } : {}),
+    ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    ...(hasAutoEnableNew ? { autoEnableNew: payload.autoEnableNew } : {}),
+    ...(Array.isArray(payload.shownModels) ? { shownModels: payload.shownModels } : {}),
     enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
   };
 }
@@ -337,13 +344,14 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
   const model = hasModel ? (String(payload.model || '').trim() || 'claude-sonnet-5') : undefined;
   const hasModels = Array.isArray(payload.models);
   const hasEnabledModels = Array.isArray(payload.enabledModels);
+  const hasAutoEnableNew = typeof payload.autoEnableNew === 'boolean';
   const hasAttributionMode = Object.prototype.hasOwnProperty.call(payload, 'attributionMode');
   const attributionMode = hasAttributionMode ? normalizeClaudeAttributionMode(payload.attributionMode) : undefined;
   const hasBackgroundCommandLimit = Object.prototype.hasOwnProperty.call(payload, 'backgroundCommandLimitMinutes');
   const backgroundCommandLimit = hasBackgroundCommandLimit
     ? parseClaudeBackgroundCommandLimitUpdate(payload.backgroundCommandLimitMinutes)
     : null;
-  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAttributionMode && !hasBackgroundCommandLimit) {
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAutoEnableNew && !hasAttributionMode && !hasBackgroundCommandLimit) {
     return { ok: false, error: 'No Claude settings update provided' };
   }
   if (backgroundCommandLimit && !backgroundCommandLimit.ok) {
@@ -361,6 +369,8 @@ export function parseClaudeSettingsUpdateRequest(body = {}) {
     ...(hasModel ? { model } : {}),
     ...(hasModels ? { models: payload.models } : {}),
     ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    ...(hasAutoEnableNew ? { autoEnableNew: payload.autoEnableNew } : {}),
+    ...(Array.isArray(payload.shownModels) ? { shownModels: payload.shownModels } : {}),
     ...(hasAttributionMode ? { attributionMode } : {}),
     // Clamped to 30 min … 8 h and snapped to 30-minute steps.
     ...(backgroundCommandLimit ? { backgroundCommandLimitMinutes: backgroundCommandLimit.minutes } : {}),
@@ -459,7 +469,8 @@ export function parseCursorSettingsUpdateRequest(body = {}) {
   const apiKey = String(payload.apiKey || '').trim();
   const hasEnabled = typeof payload.enabled === 'boolean';
   const hasEnabledModels = Array.isArray(payload.enabledModels);
-  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasEnabledModels) {
+  const hasAutoEnableNew = typeof payload.autoEnableNew === 'boolean';
+  if (!remove && !hasModel && !apiKey && !hasEnabled && !hasEnabledModels && !hasAutoEnableNew) {
     return { ok: false, error: 'No Cursor settings update provided' };
   }
   if (hasModel && !isSafeCursorModelId(model)) {
@@ -480,6 +491,8 @@ export function parseCursorSettingsUpdateRequest(body = {}) {
     apiKey,
     ...(hasModel ? { model } : {}),
     ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    ...(hasAutoEnableNew ? { autoEnableNew: payload.autoEnableNew } : {}),
+    ...(Array.isArray(payload.shownModels) ? { shownModels: payload.shownModels } : {}),
     enabled: hasEnabled ? payload.enabled : (apiKey ? true : undefined),
   };
 }
@@ -491,7 +504,8 @@ export function parseGrokSettingsUpdateRequest(body = {}) {
   const model = hasModel ? (String(payload.model || '').trim() || 'grok-4.5') : undefined;
   const hasModels = Array.isArray(payload.models);
   const hasEnabledModels = Array.isArray(payload.enabledModels);
-  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels) {
+  const hasAutoEnableNew = typeof payload.autoEnableNew === 'boolean';
+  if (!hasEnabled && !hasModel && !hasModels && !hasEnabledModels && !hasAutoEnableNew) {
     return { ok: false, error: 'No Grok settings update provided' };
   }
   if (hasModel && !isSafeGrokModelId(model)) {
@@ -503,6 +517,8 @@ export function parseGrokSettingsUpdateRequest(body = {}) {
     ...(hasModel ? { model } : {}),
     ...(hasModels ? { models: payload.models } : {}),
     ...(hasEnabledModels ? { enabledModels: payload.enabledModels } : {}),
+    ...(hasAutoEnableNew ? { autoEnableNew: payload.autoEnableNew } : {}),
+    ...(Array.isArray(payload.shownModels) ? { shownModels: payload.shownModels } : {}),
   };
 }
 
@@ -2204,6 +2220,22 @@ export function registerSessionsRoutes(app, deps) {
     listModelVariantRows,
     refreshModelVariantCatalogFromCli,
     setEnabledModelVariants,
+    // Copilot's model map (model-variant-catalog-service.mjs) and the other
+    // providers' (provider-model-state.mjs): the switch, the "New" flags.
+    getCopilotModelState = () => ({ autoEnableNew: false, unseen: [] }),
+    setCopilotAutoEnableNew = null,
+    markCopilotModelsSeen = () => false,
+    markProviderModelsSeen = () => false,
+    // When each provider was last refreshed and the new models the next
+    // models_updated carries (provider-model-refresh.mjs), the background
+    // check's settings and the check itself. Absent in most tests.
+    modelRefreshLedger = null,
+    modelRefreshSettings = null,
+    modelRefreshScheduler = null,
+    // Whether Claude and Grok are set up for the background check (their CLI
+    // or their login); absent, switched on is enough.
+    isClaudeModelRefreshSetUp = () => true,
+    isGrokModelRefreshSetUp = () => true,
     SUPPORTED_REASONING_EFFORTS,
     buildRelayReadyBannerData,
     workspaceRootPayload,
@@ -2664,10 +2696,62 @@ export function registerSessionsRoutes(app, deps) {
     );
   }
 
+  // The providers the Refresh button and the background check ask, with
+  // their enablement and refresh functions (provider-model-refresh.mjs).
+  const providerRefreshTable = buildProviderRefreshTable({
+    getOpenAIProviderSettings,
+    refreshOpenAIProviderModels,
+    getClaudeProviderSettings,
+    refreshClaudeProviderModels,
+    getCursorProviderSettings,
+    refreshCursorProviderModels,
+    getGrokProviderSettings,
+    refreshGrokProviderModels,
+    deepseekSettingsService,
+    claudeApiSettingsService,
+    copilotModelDiscoveryService,
+    isClaudeSetUp: isClaudeModelRefreshSetUp,
+    isGrokSetUp: isGrokModelRefreshSetUp,
+  });
+
+  /** Models flagged new on the enabled providers: the Select Models menu dot. */
+  function countUnseenNewModels() {
+    let count = 0;
+    for (const settings of [
+      getOpenAIProviderSettings(),
+      getClaudeProviderSettings(),
+      getCursorProviderSettings(),
+      getGrokProviderSettings(),
+      getDeepSeekProviderSettings(),
+      getClaudeApiProviderSettings(),
+    ]) {
+      if (settings?.enabled === true && Array.isArray(settings.unseenModels)) count += settings.unseenModels.length;
+    }
+    const copilot = getCopilotModelState();
+    return count + (Array.isArray(copilot?.unseen) ? copilot.unseen.length : 0);
+  }
+
+  /**
+   * What models_updated carries: the catalog, the menu dot's count and, once,
+   * the models a refresh found for the first time (the toast).
+   */
+  function modelsUpdatedPayload(modelState, openAISettings = getOpenAIProviderSettings()) {
+    const newModels = modelRefreshLedger?.takeNewModels?.() || [];
+    return {
+      ...buildModelCatalogWithProviders(modelState, openAISettings),
+      unseenNewModelCount: countUnseenNewModels(),
+      ...(newModels.length ? { newModels } : {}),
+    };
+  }
+
   // A discovery that lands outside any route (the deferred boot refresh) still
   // has to reach connected pickers the way a snapshot POST does.
   copilotModelDiscoveryService?.setOnCatalogUpdated?.(() => {
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
+  });
+  // So does a background check that changed a provider's models.
+  modelRefreshScheduler?.setOnModelsChanged?.(() => {
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
   });
 
   // The client address as Express derives it through `trust proxy`: a
@@ -7152,8 +7236,12 @@ export function registerSessionsRoutes(app, deps) {
           runtimeSessionId: runtimeSession?.id || null,
           status: workerState?.status || 'ready',
         });
-        const pendingDepth = Number(queueCounts?.().pendingCount || 0);
-        sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
+        // A deferred start (the agent SDK still installs) has no worker to
+        // call idle: it launches when the install ends.
+        if (!ensureResult.deferred) {
+          const pendingDepth = Number(queueCounts?.().pendingCount || 0);
+          sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
+        }
       } else if (ownerSessionId) {
         // Same state as the 409 above: the conversation is committed, only the
         // worker is missing, so the client gets what it needs to open it.
@@ -7409,7 +7497,7 @@ export function registerSessionsRoutes(app, deps) {
       baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
       reconciliation,
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(
+    io.emit('models_updated', modelsUpdatedPayload(
       getModelCatalogState(),
       currentSettings,
     ));
@@ -7523,7 +7611,7 @@ export function registerSessionsRoutes(app, deps) {
       ...claudeBackgroundCommandLimitSettingsFields(currentSettings),
       reconciliation,
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('claude_settings_updated', settingsPayload);
     const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
       ? reconciliation.failedConversations
@@ -7646,7 +7734,7 @@ export function registerSessionsRoutes(app, deps) {
       console.log(`[claude-auth] model refresh after login failed: ${error?.message || error}`);
     }
     const settings = getClaudeProviderSettings();
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('claude_settings_updated', {
       configured: settings?.configured === true,
       enabled: settings?.enabled === true,
@@ -7738,7 +7826,7 @@ export function registerSessionsRoutes(app, deps) {
         console.log(`[cli-install] Grok model refresh after install failed: ${error?.message || error}`);
       }
       const settings = getGrokProviderSettings();
-      io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+      io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
       io.emit('grok_settings_updated', {
         configured: settings?.configured === true,
         enabled: settings?.enabled === true,
@@ -7755,7 +7843,7 @@ export function registerSessionsRoutes(app, deps) {
         console.log(`[cli-install] Claude model refresh after install failed: ${error?.message || error}`);
       }
       const settings = getClaudeProviderSettings();
-      io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+      io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
       io.emit('claude_settings_updated', {
         configured: settings?.configured === true,
         enabled: settings?.enabled === true,
@@ -7939,7 +8027,7 @@ export function registerSessionsRoutes(app, deps) {
       console.log(`[grok-auth] model refresh after login failed: ${error?.message || error}`);
     }
     const settings = getGrokProviderSettings();
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('grok_settings_updated', {
       configured: settings?.configured === true,
       enabled: settings?.enabled === true,
@@ -8040,7 +8128,7 @@ export function registerSessionsRoutes(app, deps) {
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
       reconciliation,
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('grok_settings_updated', settingsPayload);
     const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
       ? reconciliation.failedConversations
@@ -8176,7 +8264,7 @@ export function registerSessionsRoutes(app, deps) {
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
       reconciliation,
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('cursor_settings_updated', settingsPayload);
     const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
       ? reconciliation.failedConversations
@@ -8270,7 +8358,7 @@ export function registerSessionsRoutes(app, deps) {
         failedConversations,
       },
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('deepseek_settings_updated', settingsPayload);
     return res.json({
       ok: true,
@@ -8324,7 +8412,7 @@ export function registerSessionsRoutes(app, deps) {
         failedConversations,
       },
     };
-    io.emit('models_updated', buildModelCatalogWithProviders(getModelCatalogState()));
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('claude_api_settings_updated', settingsPayload);
     try { claudeApiStopLedger?.clearAll?.(); } catch {}
     try { checkClaudeApiCap('settings'); } catch {}
@@ -8910,9 +8998,19 @@ export function registerSessionsRoutes(app, deps) {
     });
   });
 
+  // Each provider tab's switch, "New" tags and fallback warning.
+  function modelStateFields(settings) {
+    return {
+      autoEnableNew: settings?.autoEnableNew !== false,
+      unseen: Array.isArray(settings?.unseenModels) ? settings.unseenModels : [],
+      fallback: settings?.fallback === true,
+    };
+  }
+
   function buildModelVariantCatalogPayloadForRoute() {
     const rows = typeof listModelVariantRows === 'function' ? listModelVariantRows() : [];
     const modelState = getModelCatalogState();
+    const openAISettings = getOpenAIProviderSettings();
     const claudeSettings = getClaudeProviderSettings();
     const cursorSettings = getCursorProviderSettings();
     const grokSettings = getGrokProviderSettings();
@@ -8926,11 +9024,21 @@ export function registerSessionsRoutes(app, deps) {
         contextLimitsByModel: modelState.contextLimitsByModel || {},
         modelMetadataByModel: modelState.modelMetadataByModel || {},
       }),
+      copilotModelState: getCopilotModelState(),
+      openaiModels: openAISettings?.enabled === true
+        ? {
+            defaultModel: openAISettings.model,
+            availableModels: Array.isArray(openAISettings.availableModels) ? openAISettings.availableModels : [],
+            enabledModels: Array.isArray(openAISettings.models) ? openAISettings.models : [],
+            ...modelStateFields(openAISettings),
+          }
+        : null,
       claudeModels: claudeSettings?.enabled === true
         ? {
             defaultModel: claudeSettings.model,
             availableModels: Array.isArray(claudeSettings.availableModels) ? claudeSettings.availableModels : [],
             enabledModels: Array.isArray(claudeSettings.models) ? claudeSettings.models : [],
+            ...modelStateFields(claudeSettings),
           }
         : null,
       cursorModels: cursorSettings?.enabled === true
@@ -8938,6 +9046,7 @@ export function registerSessionsRoutes(app, deps) {
             defaultModel: cursorSettings.model,
             availableModels: Array.isArray(cursorSettings.availableModels) ? cursorSettings.availableModels : [],
             enabledModels: Array.isArray(cursorSettings.models) ? cursorSettings.models : [],
+            ...modelStateFields(cursorSettings),
           }
         : null,
       grokModels: grokSettings?.enabled === true
@@ -8945,6 +9054,7 @@ export function registerSessionsRoutes(app, deps) {
             defaultModel: grokSettings.model,
             availableModels: Array.isArray(grokSettings.availableModels) ? grokSettings.availableModels : [],
             enabledModels: Array.isArray(grokSettings.models) ? grokSettings.models : [],
+            ...modelStateFields(grokSettings),
           }
         : null,
       deepseekModels: deepseekSettings?.enabled === true
@@ -8952,6 +9062,7 @@ export function registerSessionsRoutes(app, deps) {
             defaultModel: deepseekSettings.model,
             availableModels: Array.isArray(deepseekSettings.availableModels) ? deepseekSettings.availableModels : [],
             enabledModels: Array.isArray(deepseekSettings.models) ? deepseekSettings.models : [],
+            ...modelStateFields(deepseekSettings),
           }
         : null,
       // The Select Models → Claude API tab: its own list, "[1m]" ids included
@@ -8962,6 +9073,7 @@ export function registerSessionsRoutes(app, deps) {
             availableModels: Array.isArray(claudeApiSettings.availableModels) ? claudeApiSettings.availableModels : [],
             enabledModels: Array.isArray(claudeApiSettings.models) ? claudeApiSettings.models : [],
             discovered: claudeApiSettings.discovered === true,
+            ...modelStateFields(claudeApiSettings),
           }
         : null,
     };
@@ -8978,101 +9090,28 @@ export function registerSessionsRoutes(app, deps) {
       return res.status(501).json({ error: 'Model refresh is unavailable' });
     }
     try {
-      const openAISettings = getOpenAIProviderSettings();
-      const claudeSettings = getClaudeProviderSettings();
-      const cursorSettings = getCursorProviderSettings();
-      const grokSettings = getGrokProviderSettings();
-      const deepseekSettings = getDeepSeekProviderSettings();
-      const claudeApiSettings = getClaudeApiProviderSettings();
-      const refreshTasks = [
+      // The help-text CLI refresh beside every enabled provider's discovery
+      // (provider-model-refresh.mjs; Copilot discovery gates itself on an
+      // installed CLI). Only a failed CLI refresh fails the request.
+      const [cliRefresh, providerRefresh] = await Promise.allSettled([
         refreshModelVariantCatalogFromCli(),
-        openAISettings?.enabled === true
-          ? refreshOpenAIProviderModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        claudeSettings?.enabled === true
-          ? refreshClaudeProviderModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        cursorSettings?.enabled === true
-          ? refreshCursorProviderModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        grokSettings?.enabled === true
-          ? refreshGrokProviderModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        // Copilot SDK discovery self-gates on an installed CLI (skipped:true
-        // when there is none), so unlike the providers above it has no
-        // enablement flag to check here.
-        typeof copilotModelDiscoveryService?.refresh === 'function'
-          ? copilotModelDiscoveryService.refresh('manual-refresh')
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        deepseekSettings?.enabled === true && deepseekSettingsService
-          ? deepseekSettingsService.refreshModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-        claudeApiSettings?.enabled === true && claudeApiSettingsService
-          ? claudeApiSettingsService.refreshModels()
-          : Promise.resolve({ ok: true, skipped: true, models: [], error: null }),
-      ];
-      const [
-        cliRefresh, openAIRefresh, claudeRefresh, cursorRefresh, grokRefresh, copilotDiscoveryRefresh, deepseekRefresh, claudeApiRefresh,
-      ] = await Promise.allSettled(refreshTasks);
+        refreshProviderModels({ table: providerRefreshTable, reason: 'manual-refresh' }),
+      ]);
       if (cliRefresh.status === 'rejected') throw cliRefresh.reason;
-      const openAIModelDiscovery = openAIRefresh.status === 'fulfilled'
-        ? openAIRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(openAISettings?.models) ? openAISettings.models : [],
-            error: openAIRefresh.reason?.message || 'OpenAI model discovery failed',
-          };
-      const claudeModelDiscovery = claudeRefresh.status === 'fulfilled'
-        ? claudeRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(claudeSettings?.models) ? claudeSettings.models : [],
-            error: claudeRefresh.reason?.message || 'Claude model discovery failed',
-          };
-      const cursorModelDiscovery = cursorRefresh.status === 'fulfilled'
-        ? cursorRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(cursorSettings?.models) ? cursorSettings.models : [],
-            error: cursorRefresh.reason?.message || 'Cursor model discovery failed',
-          };
-      const grokModelDiscovery = grokRefresh.status === 'fulfilled'
-        ? grokRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(grokSettings?.models) ? grokSettings.models : [],
-            error: grokRefresh.reason?.message || 'Grok model discovery failed',
-          };
-      const deepseekModelDiscovery = deepseekRefresh.status === 'fulfilled'
-        ? deepseekRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(deepseekSettings?.models) ? deepseekSettings.models : [],
-            error: deepseekRefresh.reason?.message || 'DeepSeek model discovery failed',
-          };
-      const claudeApiModelDiscovery = claudeApiRefresh.status === 'fulfilled'
-        ? claudeApiRefresh.value
-        : {
-            ok: false,
-            models: Array.isArray(claudeApiSettings?.models) ? claudeApiSettings.models : [],
-            error: claudeApiRefresh.reason?.message || 'Claude API model discovery failed',
-          };
-      const copilotModelDiscovery = copilotDiscoveryRefresh.status === 'fulfilled'
-        ? copilotDiscoveryRefresh.value
-        : { ok: false, models: [], error: copilotDiscoveryRefresh.reason?.message || 'Copilot model discovery failed' };
-      io.emit('models_updated', buildModelCatalogWithProviders(
+      const results = providerRefresh.status === 'fulfilled' ? providerRefresh.value.results : {};
+      io.emit('models_updated', modelsUpdatedPayload(
         getModelCatalogState(),
       ));
       return res.json({
         ok: true,
         ...buildModelVariantCatalogPayloadForRoute(),
-        openAIModelDiscovery,
-        claudeModelDiscovery,
-        cursorModelDiscovery,
-        grokModelDiscovery,
-        deepseekModelDiscovery,
-        claudeApiModelDiscovery,
-        copilotModelDiscovery,
+        openAIModelDiscovery: results.openai,
+        claudeModelDiscovery: results.claude,
+        cursorModelDiscovery: results.cursor,
+        grokModelDiscovery: results.grok,
+        deepseekModelDiscovery: results.deepseek,
+        claudeApiModelDiscovery: results['claude-api'],
+        copilotModelDiscovery: results.github,
       });
     } catch (error) {
       return res.status(500).json({
@@ -9087,17 +9126,102 @@ export function registerSessionsRoutes(app, deps) {
     if (typeof setEnabledModelVariants !== 'function') {
       return res.status(501).json({ error: 'Model variant updates are unavailable' });
     }
-    const enabledVariantIds = Array.isArray(req.body?.enabledVariantIds)
+    const hasVariantIds = Array.isArray(req.body?.enabledVariantIds);
+    const autoEnableNew = req.body?.autoEnableNew;
+    if (autoEnableNew !== undefined && typeof autoEnableNew !== 'boolean') {
+      return res.status(400).json({ error: 'autoEnableNew must be true or false' });
+    }
+    if (!hasVariantIds && autoEnableNew === undefined) {
+      return res.status(400).json({ error: 'No model variant update provided' });
+    }
+    const enabledVariantIds = hasVariantIds
       ? req.body.enabledVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
-    setEnabledModelVariants(enabledVariantIds);
-    io.emit('models_updated', buildModelCatalogWithProviders(
+    // Every row off would leave the pickers with the fallback model only.
+    if (hasVariantIds && !enabledVariantIds.length) {
+      return res.status(400).json({ error: 'Select at least one model variant' });
+    }
+    // The rows the browser drew: only those change (an older page sends none).
+    const shownVariantIds = Array.isArray(req.body?.shownVariantIds)
+      ? req.body.shownVariantIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : null;
+    if (hasVariantIds) setEnabledModelVariants(enabledVariantIds, shownVariantIds ? { shownVariantIds } : undefined);
+    if (typeof autoEnableNew === 'boolean') setCopilotAutoEnableNew?.(autoEnableNew);
+    io.emit('models_updated', modelsUpdatedPayload(
       getModelCatalogState(),
     ));
     return res.json({
       ok: true,
       ...buildModelVariantCatalogPayloadForRoute(),
     });
+  });
+
+  // Select Models was opened: every provider's "New" flags clear.
+  app.post('/api/model-variants/seen', auth, (req, res) => {
+    ensureSessionId(req, res);
+    const markers = [
+      () => markCopilotModelsSeen(),
+      () => markProviderModelsSeen('openai'),
+      () => markProviderModelsSeen('claude'),
+      () => markProviderModelsSeen('cursor'),
+      () => markProviderModelsSeen('grok'),
+      () => deepseekSettingsService?.markModelsSeen?.() === true,
+      () => claudeApiSettingsService?.markModelsSeen?.() === true,
+    ];
+    let changed = false;
+    for (const mark of markers) {
+      try {
+        if (mark() === true) changed = true;
+      } catch {
+        /* one provider's map does not hold up the others */
+      }
+    }
+    if (changed) {
+      io.emit('models_updated', modelsUpdatedPayload(
+        getModelCatalogState(),
+      ));
+    }
+    return res.json({ ok: true, unseenNewModelCount: countUnseenNewModels() });
+  });
+
+  // "Check for new models" (Settings → General → Models): the switch, the
+  // interval, the providers left out, and each enabled provider's last check.
+  function modelRefreshSettingsPayload(settings) {
+    const last = modelRefreshLedger?.readLast?.() || {};
+    const lastOf = (id) => (last[id] ? { at: last[id].at, ok: last[id].ok, error: last[id].error } : null);
+    const ask = (id, gate) => {
+      try {
+        return providerRefreshTable[id]?.[gate]?.() === true;
+      } catch {
+        return false;
+      }
+    };
+    // Every switched-on provider; one that is not set up is not checked and
+    // says so.
+    const providers = MODEL_REFRESH_PROVIDERS
+      .filter(({ id }) => ask(id, 'isEnabled'))
+      .map(({ id, label }) => ({ id, label, setUp: ask(id, 'isSetUp'), last: lastOf(id) }));
+    return {
+      auto: settings.auto,
+      intervalHours: settings.intervalHours,
+      intervalChoices: [...MODEL_REFRESH_INTERVAL_HOURS_CHOICES],
+      default: { auto: DEFAULT_MODEL_REFRESH_AUTO, intervalHours: DEFAULT_MODEL_REFRESH_INTERVAL_HOURS },
+      excluded: settings.excluded,
+      providers,
+      last: Object.fromEntries(Object.keys(last).map((id) => [id, { at: last[id].at, ok: last[id].ok }])),
+    };
+  }
+
+  app.get('/api/model-refresh-settings', auth, (_req, res) => {
+    if (!modelRefreshSettings) return res.status(501).json({ error: 'Model refresh settings are unavailable' });
+    return res.json(modelRefreshSettingsPayload(modelRefreshSettings.get()));
+  });
+
+  app.post('/api/model-refresh-settings', auth, (req, res) => {
+    if (!modelRefreshSettings) return res.status(501).json({ error: 'Model refresh settings are unavailable' });
+    const result = modelRefreshSettings.update(req.body);
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    return res.json(modelRefreshSettingsPayload(result.settings));
   });
 
   app.get('/api/models', auth, (req, res) => {
@@ -9121,6 +9245,8 @@ export function registerSessionsRoutes(app, deps) {
       claudeContextTiersByModel: modelState.claudeContextTiersByModel || {},
       claudeApiContextTiersByModel: modelState.claudeApiContextTiersByModel || {},
       providersByModel: modelState.providersByModel || {},
+      // Models flagged new in Select Models: the menu item's dot.
+      unseenNewModelCount: countUnseenNewModels(),
       stale: modelState.stale,
       metadataValid: modelState.metadataValid === true,
       reasoningMetadataValid: modelState.reasoningMetadataValid === true,
@@ -9142,7 +9268,7 @@ export function registerSessionsRoutes(app, deps) {
       source: source || 'relay-extension',
       error,
     });
-    io.emit('models_updated', buildModelCatalogWithProviders(
+    io.emit('models_updated', modelsUpdatedPayload(
       getModelCatalogState(),
     ));
     res.json({

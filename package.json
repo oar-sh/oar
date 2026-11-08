@@ -1,6 +1,6 @@
 {
   "name": "@oar-sh/oar",
-  "version": "0.9.23",
+  "version": "0.9.24",
   "type": "module",
   "description": "OAR — Open Agent Relay: drive your local coding agents from any browser",
   "license": "MIT",
@@ -58,20 +58,22 @@
     "test:e2e:raw": "node ./node_modules/@playwright/test/cli.js test --config tests/playwright.config.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.319",
-    "@cursor/sdk": "1.3.1",
-    "@github/copilot-sdk": "1.0.29",
     "better-sqlite3": "13.0.3",
     "express": "5.3.0",
     "qrcode-terminal": "0.12.0",
     "socket.io": "4.8.4",
     "web-push": "3.6.7",
-    "ws": "8.22.1",
-    "zod": "4.6.7"
+    "ws": "8.22.1"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
+    "@anthropic-ai/sdk": "0.116.0",
+    "@cursor/sdk": "1.3.1",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@playwright/test": "^1.60.0",
-    "jsdom": "^30.0.1"
+    "jsdom": "^30.0.1",
+    "koffi": "3.3.4",
+    "zod": "4.6.7"
   },
   "overrides": {
     "undici": "6.28.0"

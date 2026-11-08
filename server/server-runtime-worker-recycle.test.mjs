@@ -128,6 +128,33 @@ test('the recycle stops and launches under the relay-wide launch mutex the sessi
   assert.doesNotMatch(routesSource, /createKeyedMutex/);
 });
 
+test('the recycle knows the agent-SDK kinds from the launch gate\'s own map', () => {
+  const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
+  // Only where the SDK comes from the store: a checkout's own node_modules
+  // survive a restart on new code (staleWorkerLosesAgentSdk).
+  assert.match(service, /isAgentSdkWorker: \(worker\) => staleWorkerLosesAgentSdk\(worker\?\.kind, \{ sdkForWorkerKind: agentSdkForWorkerKind, fromCheckout: \(sdk\) => agentSdkFromCheckout\(sdk\) \}\),/);
+  assert.match(runtimeSource, /import \{ agentSdkForWorkerKind, [^}]*\} from '\.\/services\/session-worker-launch-service\.mjs';/);
+});
+
+test('a worker hello registers the process with its kind and build id, then runs the recycle sweep, before the hello asks for work', () => {
+  const socket = sliceBetween('const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({', '\n});');
+  assert.match(socket, /\n  onWorkerHello: noteSessionWorkerHello,\n/);
+  const hello = sliceBetween('function noteSessionWorkerHello(', '\n}\n');
+  assert.match(hello, /if \(featureFlags\?\.SESSION_WORKER_ROUTING_ENABLED !== true \|\| runtimeShutdownStarted\) return;/);
+  assert.match(hello, /if \(sessionWorkerSupervisor\?\.isKillBlocked\?\.\(sid\) !== true\) \{/);
+  // An entry with no process behind it (a launch the agent SDK gate
+  // deferred) is made ready, as a heartbeat would.
+  assert.match(hello, /if \(!worker \|\| worker\.status === 'new' \|\| \(!worker\.workerId && !worker\.pid\)\) \{/);
+  const register = hello.indexOf("status: 'ready',\n        pid: statedPid || worker?.pid || null,");
+  const stated = hello.indexOf('...(buildId ? { buildId } : {})');
+  const sweep = hello.indexOf('void workerRecycleService.sweepNow();');
+  assert.ok(register !== -1 && stated !== -1 && sweep !== -1);
+  assert.ok(register < stated && stated < sweep, 'registered, then the kind and build id, then the sweep');
+  // The service's start sweeps at once; the hello sweep only while it runs.
+  const serviceSource = fs.readFileSync(path.join(__dirname, 'services', 'worker-recycle-service.mjs'), 'utf8');
+  assert.match(serviceSource, /function sweepNow\(\) \{\n    if \(!started\) return Promise\.resolve\(\);/);
+});
+
 test('the recycle\'s quiet window reads the session\'s last delivery or turn end from the queue', () => {
   const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
   assert.match(service, /quietSince: \(sid\) => \{\n    const at = Date\.parse\(stmts\.getOwnerLastActivityAt\?\.get\?\.\(sid\)\?\.last_activity_at \|\| ''\);\n    return Number\.isFinite\(at\) \? at : null;\n  \},/);

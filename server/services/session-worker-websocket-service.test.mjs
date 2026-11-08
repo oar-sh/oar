@@ -678,6 +678,52 @@ test('a worker\'s stated build id is reported once per change, and a malformed o
   service.stop();
 });
 
+test('every worker hello is reported with the socket\'s identity, kind and build id before the hello asks for work', async () => {
+  const httpServer = new EventEmitter();
+  const order = [];
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async (request) => { order.push(['work', request.sessionId]); return { message: null }; },
+    onWorkerHello: (hello) => order.push(['hello', hello]),
+  });
+  service.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  const socket = lastWss.sockets.at(-1);
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-hello-hook', pid: 93, kind: 'cursor', buildId: '0.9.20+aaaaaaaaaaaa' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, [
+    ['hello', { sessionId: 'sdk-hello-hook', pid: 93, kind: 'cursor', buildId: '0.9.20+aaaaaaaaaaaa' }],
+    ['work', 'sdk-hello-hook'],
+  ]);
+  // A ready reports no hello; a repeated hello reports again.
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-hello-hook', pid: 93 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-hello-hook', pid: 93 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(order.filter(([step]) => step === 'hello').length, 2);
+  assert.deepEqual(order.filter(([step]) => step === 'hello').at(-1)[1], { sessionId: 'sdk-hello-hook', pid: 93, kind: 'cursor', buildId: '0.9.20+aaaaaaaaaaaa' });
+  // A worker that states nothing reports nulls; a hook that throws costs
+  // the hello nothing.
+  const throwing = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
+    requestWork: async (request) => { order.push(['work', request.sessionId]); return { message: null }; },
+    onWorkerHello: (hello) => { order.push(['hello', hello]); throw new Error('boom'); },
+  });
+  throwing.start();
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  lastWss.sockets.at(-1).emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-bare', pid: 94 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order.slice(-2), [['hello', { sessionId: 'sdk-bare', pid: 94, kind: null, buildId: null }], ['work', 'sdk-bare']]);
+  service.stop();
+  throwing.stop();
+});
+
 test('the liveness window is 90 s, three missed idle beats', () => {
   assert.equal(WORKER_SOCKET_LIVENESS_MAX_SILENCE_MS, 90_000);
 });

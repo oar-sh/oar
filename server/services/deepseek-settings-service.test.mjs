@@ -140,13 +140,56 @@ test('the composer list keeps the default model and only models that are offered
   });
   const settings = service(store);
   settings.update(parseDeepSeekSettingsUpdateRequest({ model: 'deepseek-v4-pro', enabledModels: ['deepseek-v5-preview', 'deepseek-retired'] }));
-  assert.deepEqual(JSON.parse(store.values.get(DEEPSEEK_ENABLED_MODELS_SETTING_KEY)), ['deepseek-v5-preview', 'deepseek-retired']);
+  // The old allowlist is no longer written; the model map holds the choice.
+  assert.equal(store.values.has(DEEPSEEK_ENABLED_MODELS_SETTING_KEY), false);
   const current = settings.getSettings();
   assert.equal(current.model, 'deepseek-v4-pro');
   assert.deepEqual(current.models, ['deepseek-v4-pro', 'deepseek-v5-preview']);
-  // An empty choice means every offered model.
+  // An empty choice leaves the default model alone, never every model.
   settings.update(parseDeepSeekSettingsUpdateRequest({ enabledModels: [] }));
-  assert.deepEqual(settings.getSettings().models, ['deepseek-v4-pro', 'deepseek-flash', 'deepseek-v5-preview']);
+  assert.deepEqual(settings.getSettings().models, ['deepseek-v4-pro']);
+  assert.equal(settings.getSettings().fallback, false);
+});
+
+test('an allowlist saved before the model map shows the same models', () => {
+  const store = createStore({
+    [DEEPSEEK_API_KEY_SETTING_KEY]: TEST_KEY,
+    [DEEPSEEK_MODELS_SETTING_KEY]: JSON.stringify(['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v5-preview']),
+    [DEEPSEEK_ENABLED_MODELS_SETTING_KEY]: JSON.stringify(['deepseek-v5-preview']),
+  });
+  const current = service(store).getSettings();
+  assert.deepEqual(current.models, ['deepseek-flash', 'deepseek-v5-preview']);
+  assert.equal(current.autoEnableNew, true);
+  assert.deepEqual(current.unseenModels, []);
+  assert.equal(store.values.get(DEEPSEEK_ENABLED_MODELS_SETTING_KEY), JSON.stringify(['deepseek-v5-preview']));
+});
+
+test('a model found later follows the switch and a model turned off stays off', async () => {
+  const store = createStore({ [DEEPSEEK_API_KEY_SETTING_KEY]: TEST_KEY });
+  const fetches = { ids: ['deepseek-flash', 'deepseek-v4-pro'] };
+  const settings = service(store, { fetchImpl: async (...args) => modelsFetch(fetches.ids)(...args) });
+  await settings.refreshModels();
+  settings.update(parseDeepSeekSettingsUpdateRequest({ enabledModels: ['deepseek-flash'], autoEnableNew: false }));
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash']);
+  fetches.ids = ['deepseek-flash', 'deepseek-v5-preview'];
+  const refreshed = await settings.refreshModels();
+  assert.deepEqual(refreshed.newModels, [{ id: 'deepseek-v5-preview', on: false }]);
+  assert.deepEqual(settings.getSettings().unseenModels, ['deepseek-v5-preview']);
+  fetches.ids = ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v5-preview'];
+  assert.deepEqual((await settings.refreshModels()).newModels, []);
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash']);
+  assert.equal(settings.markModelsSeen(), true);
+  assert.deepEqual(settings.getSettings().unseenModels, []);
+  settings.update(parseDeepSeekSettingsUpdateRequest({ enabledModels: ['deepseek-flash', 'deepseek-v4-pro'] }));
+  // The switch alone leaves every model as it is.
+  settings.update(parseDeepSeekSettingsUpdateRequest({ autoEnableNew: true }));
+  assert.equal(settings.getSettings().autoEnableNew, true);
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash', 'deepseek-v4-pro']);
+});
+
+test('autoEnableNew must be a boolean', () => {
+  assert.equal(parseDeepSeekSettingsUpdateRequest({ autoEnableNew: 'yes' }).ok, false);
+  assert.deepEqual(parseDeepSeekSettingsUpdateRequest({ autoEnableNew: false }), { ok: true, remove: false, autoEnableNew: false });
 });
 
 test('the key cannot be removed while a DeepSeek conversation has a message or a queued one', () => {
@@ -170,6 +213,18 @@ test('the key cannot be removed while a DeepSeek conversation has a message or a
   assert.equal(removed.keyChanged, true);
   assert.equal(store.values.has(DEEPSEEK_API_KEY_SETTING_KEY), false);
   assert.equal(service(store).getSettings().enabled, false);
+});
+
+test('removing the key keeps which models are on for when it comes back', async () => {
+  const store = createStore({ [DEEPSEEK_API_KEY_SETTING_KEY]: TEST_KEY });
+  const settings = service(store, { fetchImpl: modelsFetch(['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v5-preview']) });
+  await settings.refreshModels();
+  settings.update(parseDeepSeekSettingsUpdateRequest({ model: 'deepseek-flash', enabledModels: ['deepseek-v5-preview'] }));
+  assert.equal(settings.update({ remove: true }).ok, true);
+  assert.ok(store.values.has('deepseek_model_state'));
+  settings.update(parseDeepSeekSettingsUpdateRequest({ apiKey: OTHER_KEY }));
+  await settings.refreshModels();
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash', 'deepseek-v5-preview']);
 });
 
 test('discovery stores the DeepSeek ids it is given and keeps the old list on failure', async () => {
@@ -319,4 +374,21 @@ test('the starting balance is stored with the time it was set; saved again uncha
   assert.equal(store.values.has(DEEPSEEK_STARTING_BALANCE_SETTING_KEY), false);
   assert.equal(store.values.has(DEEPSEEK_STARTING_BALANCE_SET_AT_SETTING_KEY), false);
   assert.deepEqual([at().describe().startingBalance, at().describe().startingBalanceSetAt], [null, null]);
+});
+
+test('a save changes only the models the modal drew: one a refresh added meanwhile stays on', async () => {
+  const store = createStore({ [DEEPSEEK_API_KEY_SETTING_KEY]: TEST_KEY });
+  const listed = { ids: ['deepseek-flash', 'deepseek-v4-pro'] };
+  const settings = service(store, { fetchImpl: async (...args) => modelsFetch(listed.ids)(...args) });
+  await settings.refreshModels();
+  const drawn = settings.getSettings().availableModels;
+  listed.ids = ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v5-preview'];
+  await settings.refreshModels();
+  assert.ok(settings.getSettings().models.includes('deepseek-v5-preview'));
+  settings.update(parseDeepSeekSettingsUpdateRequest({ enabledModels: ['deepseek-flash'], shownModels: drawn }));
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash', 'deepseek-v5-preview']);
+  // An older page sends no shown list: the offered list is what it showed.
+  settings.update(parseDeepSeekSettingsUpdateRequest({ enabledModels: ['deepseek-flash'] }));
+  assert.deepEqual(settings.getSettings().models, ['deepseek-flash']);
+  assert.equal(parseDeepSeekSettingsUpdateRequest({ shownModels: 'deepseek-flash' }).ok, false);
 });

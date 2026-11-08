@@ -112,6 +112,7 @@ function adopt(install, overrides = {}) {
     platform: 'win32',
     isProcessAlive: () => false,
     processStartedAt: () => null,
+    imageNameOf: () => 'node.exe',
     bootTime: 0,
     now: () => NOW,
     logger: { log: (line) => install.logs.push(line) },
@@ -510,6 +511,8 @@ test('a relay that may still run on the earlier folder stops the start; a stale 
   const cases = [
     { label: 'alive since the lock', alive: true, startedAt: Date.parse(lockedAt) - 1000, bootTime: 0, refused: true },
     { label: 'alive, start time unknown', alive: true, startedAt: null, bootTime: 0, refused: true },
+    // Windows without koffi: the pid now runs another program.
+    { label: 'alive, start time unknown, not Node', alive: true, startedAt: null, image: 'svchost.exe', bootTime: 0, refused: false },
     { label: 'dead', alive: false, startedAt: null, bootTime: 0, refused: false },
     { label: 'pid reused after the lock', alive: true, startedAt: Date.parse(lockedAt) + 60_000, bootTime: 0, refused: false },
     { label: 'lock from before the last boot', alive: true, startedAt: null, bootTime: Date.parse(lockedAt) + 1000, refused: false },
@@ -522,6 +525,7 @@ test('a relay that may still run on the earlier folder stops the start; a stale 
       const result = adopt(install, {
         isProcessAlive: () => scenario.alive,
         processStartedAt: () => scenario.startedAt,
+        imageNameOf: () => scenario.image || 'node.exe',
         bootTime: scenario.bootTime,
       });
       assert.equal(result.status, scenario.refused ? 'refused' : 'adopted', scenario.label);

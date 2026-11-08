@@ -28,7 +28,13 @@
 //   * curated ids only seed an EMPTY catalog; once an authoritative snapshot
 //     (a running engine or the server-side discovery) has listed the models,
 //     anything absent from it is marked `unavailable` (enabled rows stay
-//     listed so a picker can show them greyed; disabled ones are pruned).
+//     listed so a picker can show them greyed; disabled ones are pruned);
+//   * with a model map (`copilot_model_state`, provider-model-state.mjs) a row
+//     seen for the first time starts as the user would expect: off when the
+//     user turned that row off before (a pruned row is remembered), like the
+//     model's other rows for a new effort level, and as the "Turn new models
+//     on automatically" switch says for a whole new model, which is also
+//     flagged new. Without one (tests, older wiring) new rows start off.
 import { humanizeModelLabel } from '../public/app/model-selector-options.mjs';
 import { latestModelCatalogRefresh } from '../../shared/model-catalog-freshness.mjs';
 import {
@@ -39,6 +45,7 @@ import {
 import { KNOWN_REASONING_EFFORTS, MODEL_PICKER_CATEGORIES } from '../../shared/model-descriptors.mjs';
 import { copilotCatalogIndexByModel, inferCopilotVendor } from '../../shared/copilot-model-order.mjs';
 import { selectModelIdsForVariantRefresh } from '../../shared/model-refresh.mjs';
+import { decideNewCopilotVariant, migrateCopilotModelState } from './provider-model-state.mjs';
 
 export const SUPPORTED_REASONING_EFFORTS = [...KNOWN_REASONING_EFFORTS];
 /**
@@ -471,6 +478,14 @@ export function createModelVariantCatalogService({
   autoModelSentinel = 'auto',
   // (args: string[]) => Promise<string>; the `copilot help` text fallback.
   runCopilotCliCommand = async () => '',
+  // { readCopilot(), writeCopilot(state) } (provider-model-state.mjs); null
+  // keeps the old rule: every new row starts off.
+  modelStateStore = null,
+  // (baseModelIds, on) — whole new models were added (the toast).
+  onNewModels = () => {},
+  // ({ source }) — a snapshot that read the runtime's real list arrived
+  // (counts as a Copilot model refresh).
+  onAuthoritativeSnapshot = () => {},
 } = {}) {
   const DEFAULT_MODEL = String(defaultModel || 'gpt-5.4-mini').trim() || 'gpt-5.4-mini';
   const AUTO_MODEL_SENTINEL = String(autoModelSentinel || 'auto');
@@ -509,6 +524,56 @@ export function createModelVariantCatalogService({
   function listEnabledModelVariantRows() {
     if (!modelSelectorSql?.listEnabledVariants?.all) return [];
     return modelSelectorSql.listEnabledVariants.all().map((row) => normalizeModelVariantRow(row)).sort(compareVariantRows);
+  }
+
+  /**
+   * The Copilot model map, built from the table the first time (every model
+   * there known, every disabled row remembered as off). Null without a store.
+   */
+  function loadCopilotModelState(rows = null) {
+    if (!modelStateStore) return null;
+    try {
+      const stored = modelStateStore.readCopilot();
+      if (stored) return stored;
+      const migrated = migrateCopilotModelState(rows || listModelVariantRows());
+      modelStateStore.writeCopilot(migrated);
+      return migrated;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveCopilotModelState(state) {
+    try {
+      modelStateStore?.writeCopilot?.(state);
+    } catch {
+      /* the rows are written; the map catches up on the next change */
+    }
+  }
+
+  /** `{ autoEnableNew, unseen }` for Select Models and the menu dot. */
+  function getCopilotModelState() {
+    const state = loadCopilotModelState();
+    const bases = new Set(listModelVariantRows().map((row) => row.baseModelId));
+    return {
+      autoEnableNew: state ? state.autoEnableNew : false,
+      unseen: state ? state.unseen.filter((baseModelId) => bases.has(baseModelId)) : [],
+    };
+  }
+
+  function setCopilotAutoEnableNew(value) {
+    const state = loadCopilotModelState();
+    if (!state || typeof value !== 'boolean') return getCopilotModelState();
+    saveCopilotModelState({ ...state, autoEnableNew: value });
+    return getCopilotModelState();
+  }
+
+  /** Clears the "New" flags; true when one was set. */
+  function markCopilotModelsSeen() {
+    const state = loadCopilotModelState();
+    if (!state || !state.unseen.length) return false;
+    saveCopilotModelState({ ...state, unseen: [] });
+    return true;
   }
 
   /** Stored metadata per base model (first row wins; all rows carry the same). */
@@ -772,12 +837,21 @@ export function createModelVariantCatalogService({
     const existingEnabled = new Map(existingRows.map((row) => [row.variantId, row.enabled ? 1 : 0]));
     const incomingIds = new Set(normalizedEntries.map((entry) => entry.variantId));
     const incomingBaseIds = new Set(normalizedEntries.map((entry) => entry.baseModelId));
+    const enabledBaseIds = new Set(existingRows.filter((row) => row.enabled).map((row) => row.baseModelId));
+    const modelState = loadCopilotModelState(existingRows);
+    const newBaseIds = new Set();
+    const prunedDisabledIds = new Set();
     const nowIso = new Date().toISOString();
     const tx = db.transaction(() => {
       for (const entry of normalizedEntries) {
-        const enabled = preserveEnabled && existingEnabled.has(entry.variantId)
-          ? existingEnabled.get(entry.variantId)
-          : (entry.enabled ? 1 : 0);
+        let enabled = entry.enabled ? 1 : 0;
+        if (preserveEnabled && existingEnabled.has(entry.variantId)) {
+          enabled = existingEnabled.get(entry.variantId);
+        } else if (modelState && !existingEnabled.has(entry.variantId)) {
+          const decision = decideNewCopilotVariant(modelState, entry, { siblingEnabled: enabledBaseIds.has(entry.baseModelId) });
+          enabled = decision.enabled ? 1 : 0;
+          if (decision.newModel) newBaseIds.add(entry.baseModelId);
+        }
         runVariantUpsert(entry, enabled, nowIso);
       }
       const orphanedEnabledBases = new Set();
@@ -788,6 +862,7 @@ export function createModelVariantCatalogService({
             // The runtime told us this model's exact levels; a row for a
             // level it does not offer is stale, not "unavailable".
             if (row.enabled) orphanedEnabledBases.add(row.baseModelId);
+            else prunedDisabledIds.add(row.variantId);
             modelSelectorSql.deleteVariant.run(row.variantId);
           } else {
             runVariantUpsert({ ...row, releaseStatus: 'unavailable' }, row.enabled, nowIso);
@@ -801,6 +876,8 @@ export function createModelVariantCatalogService({
         }
         // Variants that are both disabled and fully absent from the incoming
         // base set are no longer relevant; prune them so they do not linger.
+        // The model map remembers them as off for when they come back.
+        prunedDisabledIds.add(row.variantId);
         modelSelectorSql.deleteVariant.run(row.variantId);
       }
       // A selection must not silently vanish because its effort level did:
@@ -822,6 +899,21 @@ export function createModelVariantCatalogService({
       }
     });
     tx();
+    if (modelState) {
+      saveCopilotModelState({
+        ...modelState,
+        knownModels: [...new Set([...modelState.knownModels, ...incomingBaseIds])],
+        disabledVariants: [...new Set([...modelState.disabledVariants, ...prunedDisabledIds])],
+        unseen: [...new Set([...modelState.unseen, ...newBaseIds])],
+      });
+      if (newBaseIds.size) {
+        try {
+          onNewModels([...newBaseIds], modelState.autoEnableNew);
+        } catch {
+          /* the toast is best-effort */
+        }
+      }
+    }
     recomputeSortOrder();
     return getModelVariantSelectorState();
   }
@@ -839,23 +931,49 @@ export function createModelVariantCatalogService({
     return reconcileModelVariantRows(entries, { source, error, preserveEnabled, absentBasePolicy: 'reconcile', knownEffortBases });
   }
 
-  function setEnabledModelVariants(variantIds = []) {
+  /**
+   * The Select Models save. With `shownVariantIds` (the rows the browser
+   * drew) only those rows are set, on when listed in `variantIds`; every
+   * other row keeps its state, so a row a refresh added after the modal was
+   * drawn is not turned off. Without it (an older page) the list is the whole
+   * enabled set, as before.
+   */
+  function setEnabledModelVariants(variantIds = [], { shownVariantIds = null } = {}) {
     if (!modelSelectorSql?.disableAllVariants?.run || !modelSelectorSql?.enableVariant?.run) {
       return getModelVariantSelectorState();
     }
     const nextEnabled = new Set(
       Array.isArray(variantIds) ? variantIds.map((value) => String(value || '').trim()).filter(Boolean) : [],
     );
+    // Turning every row off would leave the pickers with the fallback model
+    // only; the route refuses it, and so does this.
+    if (!nextEnabled.size) return getModelVariantSelectorState();
     const existingRows = listModelVariantRows();
+    const shown = Array.isArray(shownVariantIds)
+      ? new Set(shownVariantIds.map((value) => String(value || '').trim()).filter(Boolean))
+      : null;
+    const touchedRows = shown ? existingRows.filter((row) => shown.has(row.variantId)) : existingRows;
+    const modelState = loadCopilotModelState(existingRows);
     const nowIso = new Date().toISOString();
     const tx = db.transaction(() => {
-      modelSelectorSql.disableAllVariants.run(nowIso);
-      for (const row of existingRows) {
-        if (!nextEnabled.has(row.variantId)) continue;
-        modelSelectorSql.enableVariant.run(nowIso, row.variantId);
+      if (!shown) modelSelectorSql.disableAllVariants.run(nowIso);
+      for (const row of touchedRows) {
+        if (nextEnabled.has(row.variantId)) modelSelectorSql.enableVariant.run(nowIso, row.variantId);
+        else if (shown) modelSelectorSql.disableVariant.run(nowIso, row.variantId);
       }
     });
     tx();
+    if (modelState) {
+      // A row turned on is forgotten as off; a row turned off is remembered.
+      const touchedIds = new Set(touchedRows.map((row) => row.variantId));
+      saveCopilotModelState({
+        ...modelState,
+        disabledVariants: [...new Set([
+          ...modelState.disabledVariants.filter((variantId) => !(touchedIds.has(variantId) && nextEnabled.has(variantId))),
+          ...touchedRows.filter((row) => !nextEnabled.has(row.variantId)).map((row) => row.variantId),
+        ])],
+      });
+    }
     return getModelVariantSelectorState();
   }
 
@@ -897,6 +1015,13 @@ export function createModelVariantCatalogService({
       refreshedAt: receivedMetadata ? new Date().toISOString() : modelCatalog.refreshedAt,
       error: snapshot.error ? String(snapshot.error).trim().slice(0, 300) : null,
     };
+    if (authoritative) {
+      try {
+        onAuthoritativeSnapshot({ source });
+      } catch {
+        /* the refresh clock is best-effort */
+      }
+    }
     if (modelSelectorSql?.upsertVariant?.run) {
       const existingRows = listModelVariantRows();
       const stored = storedMetadataByModel(existingRows);
@@ -1074,6 +1199,7 @@ export function createModelVariantCatalogService({
       updateSortOrderForBase: db.prepare(`UPDATE model_variants SET sort_order = ? WHERE base_model_id = ?`),
       disableAllVariants: db.prepare(`UPDATE model_variants SET enabled = 0, updated_at = ?`),
       enableVariant: db.prepare(`UPDATE model_variants SET enabled = 1, updated_at = ? WHERE variant_id = ?`),
+      disableVariant: db.prepare(`UPDATE model_variants SET enabled = 0, updated_at = ? WHERE variant_id = ?`),
       deleteVariant: db.prepare(`DELETE FROM model_variants WHERE variant_id = ?`),
       getSelectorState: db.prepare(`SELECT source, refreshed_at, error, updated_at FROM model_selector_state WHERE id = 1 LIMIT 1`),
       upsertSelectorState: db.prepare(`
@@ -1153,6 +1279,9 @@ export function createModelVariantCatalogService({
     }
     normalizeLegacyVariantIdsTx();
     recomputeSortOrder();
+    // The model map of an install from before it is built from the table as
+    // it stands now, before any snapshot adds a row.
+    loadCopilotModelState();
   }
 
   return {
@@ -1175,6 +1304,9 @@ export function createModelVariantCatalogService({
     getModelVariantSelectorState,
     upsertModelVariantCatalogEntries,
     setEnabledModelVariants,
+    getCopilotModelState,
+    setCopilotAutoEnableNew,
+    markCopilotModelsSeen,
     refreshModelVariantCatalogFromCli,
     parseModelsFromHelpConfigOutput,
     parseReasoningEffortsFromHelpOutput,

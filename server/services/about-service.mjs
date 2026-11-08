@@ -24,9 +24,10 @@ export { readGitCommit, resolveBuildCommit };
 export const ABOUT_TOTALS_CACHE_MS = 60_000;
 export const ABOUT_MESSAGE_CHUNK_ROWS = 10_000;
 
-// The packages each provider's workers run on, read from node_modules once.
+// The agent SDKs each provider's workers run on, by provider and store id
+// (agent-sdk-store.mjs). Copilot has none of its own: its workers load the
+// SDK the Copilot CLI ships, so its row names the CLI version only.
 export const ABOUT_PROVIDER_SDK_PACKAGES = Object.freeze({
-  github: '@github/copilot-sdk',
   claude: '@anthropic-ai/claude-agent-sdk',
   cursor: '@cursor/sdk',
 });
@@ -302,6 +303,7 @@ async function fileSize(fsImpl, filePath) {
  * @param {() => boolean} [deps.isRelayCliOnline] the Copilot relay CLI is connected
  * @param {() => object[]} [deps.listWorkers] the session worker registry's entries
  * @param {() => object|null} [deps.getUpdateState] buildUpdateStatePayload()
+ * @param {() => object|null} [deps.getAgentSdkStatus] the agent SDK store's snapshot(); its `installed` versions come first
  * @param {object} [deps.sdkVersions] package version by provider id; read from node_modules when absent
  * @param {() => object|null} [deps.describeBackups] the database backups (db-backup-service.mjs describeBackups)
  */
@@ -320,6 +322,7 @@ export function createAboutService({
   isRelayCliOnline = () => false,
   listWorkers = () => [],
   getUpdateState = () => null,
+  getAgentSdkStatus = null,
   sdkVersions = null,
   isPidAlive = defaultIsPidAlive,
   fsImpl = fs,
@@ -332,7 +335,23 @@ export function createAboutService({
   let resolvedSdkVersions = sdkVersions;
   const providerForConversation = db.prepare(`SELECT provider_type FROM runtime_sessions WHERE conversation_id = ?`);
 
-  function sdkVersionFor(providerId) {
+  // The store's installed versions, read per answer (an install or a
+  // reinstall changes them under a running relay); null without a store.
+  function readAgentSdkSnapshot() {
+    if (typeof getAgentSdkStatus !== 'function') return null;
+    try {
+      return getAgentSdkStatus()?.sdks || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The store's folder first, then the package's own node_modules: the order
+  // agent-sdk-loader.mjs loads them in (a git checkout runs its
+  // devDependency until the store has the pinned folder).
+  function sdkVersionFor(providerId, agentSdks) {
+    const installed = String(agentSdks?.[providerId]?.installed || '').trim();
+    if (installed) return installed;
     if (!resolvedSdkVersions) {
       resolvedSdkVersions = {};
       for (const [id, packageName] of Object.entries(ABOUT_PROVIDER_SDK_PACKAGES)) {
@@ -385,6 +404,7 @@ export function createAboutService({
     const settings = getProviderSettings() || {};
     const cli = getCachedCliProviders() || {};
     const relayCliOnline = isRelayCliOnline() === true;
+    const agentSdks = readAgentSdkSnapshot();
     const rows = [];
     for (const id of Object.keys(ABOUT_PROVIDER_LABELS)) {
       const entry = settings[id];
@@ -395,15 +415,15 @@ export function createAboutService({
       const viaRelayCli = id === 'openai' || (id === 'github' && engine === 'extension');
       const runningWorkers = workerCounts.get(id) || 0;
       const cliRow = PROVIDER_CLI_IDS[id] ? cli[PROVIDER_CLI_IDS[id]] : null;
-      const showSdk = id !== 'github' || engine === 'sdk';
+      const sdkPackage = ABOUT_PROVIDER_SDK_PACKAGES[id] || null;
       rows.push({
         id,
         label: ABOUT_PROVIDER_LABELS[id],
         engine,
         cliVersion: cliRow?.installed ? (cliRow.version || null) : null,
         cliCheckedAt: cliRow?.checkedAt || null,
-        sdkPackage: showSdk ? (ABOUT_PROVIDER_SDK_PACKAGES[id] || null) : null,
-        sdkVersion: showSdk ? sdkVersionFor(id) : null,
+        sdkPackage,
+        sdkVersion: sdkPackage ? sdkVersionFor(id, agentSdks) : null,
         state: viaRelayCli
           ? (relayCliOnline ? 'online' : 'offline')
           : (runningWorkers > 0 ? 'online' : 'idle'),

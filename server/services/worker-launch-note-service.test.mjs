@@ -119,3 +119,41 @@ test('the note text clips a long cause and names the window', () => {
   const stopped = buildWorkerLaunchNoteText({ type: 'stopped', lifecycle: lifecycle({ retryCount: 1 }), retryWindowMs: 5 * 60_000 });
   assert.match(stopped, /after 5 minutes \(1 try\)/);
 });
+
+test('an agent SDK install before the first launch is a note of the episode, closed when the worker starts', () => {
+  const store = fakeStore();
+  const service = createWorkerLaunchNoteService({
+    db: store.db,
+    stmts: store.stmts,
+    emit: () => {},
+    resolveConversationId: () => 'conv-1',
+    logger: { log() {} },
+  });
+  assert.equal(service.handle({ type: 'installing', sdkSessionId: 'sess-1', lifecycle: { sdkLabel: 'Cursor SDK' } }), true);
+  const [noteId, note] = [...store.messages.entries()][0];
+  assert.equal(store.kinds.get(noteId), WORKER_LAUNCH_NOTE_KINDS.installing);
+  assert.match(note.text, /^⏳ Installing the Cursor SDK on the relay host, once for this version\./);
+  service.handle({ type: 'launched', sdkSessionId: 'sess-1', lifecycle: { launchAt: '2026-10-01T15:00:00.000Z' } });
+  assert.equal(store.kinds.get(noteId), WORKER_LAUNCH_NOTE_KINDS.started);
+  assert.equal(service.openEpisode('sess-1'), null);
+});
+
+test('the same note again is neither written nor broadcast', () => {
+  const store = fakeStore();
+  const emitted = [];
+  const service = createWorkerLaunchNoteService({
+    db: store.db,
+    stmts: store.stmts,
+    emit: (event, payload) => emitted.push(event),
+    resolveConversationId: () => 'conv-1',
+    logger: { log() {} },
+  });
+  // A launch deferred on every prime pass while the SDK installs.
+  for (let pass = 0; pass < 4; pass += 1) service.handle({ type: 'installing', sdkSessionId: 'sess-1', lifecycle: { sdkLabel: 'Claude Agent SDK' } });
+  assert.equal(store.messages.size, 1);
+  assert.equal(store.updates.length, 0, 'no rewrite of the same text');
+  assert.deepEqual(emitted, ['assistant_message']);
+  service.handle({ type: 'launched', sdkSessionId: 'sess-1', lifecycle: { launchAt: '2026-10-01T15:00:00.000Z' } });
+  assert.equal(store.updates.length, 1);
+  assert.deepEqual(emitted, ['assistant_message', 'message_updated']);
+});

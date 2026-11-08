@@ -49,8 +49,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // steering state, the worker replacement and the recycle service) took it
 // to 597. 610 until 2026-11-04; the 0.9.21 round took it to 607, and an
 // idle relay that wakes less (its idle timers, the worker keepalive, the
-// queue wake hook) to 610. 640 leaves room for the 0.9.22 work.
-const MAX_ENTRIES = 640;
+// queue wake hook) to 610. 640 leaves room for the 0.9.22 work. 660 until
+// 2026-11-07; the agent SDKs installed on demand (their pins folders, the
+// store, the loader and the Settings rows) took it to 630 and beyond.
+const MAX_ENTRIES = 660;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -68,8 +70,14 @@ const MAX_ENTRIES = 640;
 // until 2026-10-30; 0.9.20 released at 9,372,499 bytes (99.31 % of it), the
 // worker recycle took it to 9,427,816 (99.9 %), and its fix round would have
 // gone over. 9.5 MiB
-// leaves room for the fixes that follow.
-const MAX_UNPACKED_BYTES = 9.5 * 1024 * 1024;
+// until 2026-11-07; the 0.9.22 work took it to 9,894,346 bytes (99.3 %), and
+// the model refresh (the model maps, the refresh ledger, the background check
+// and their Select Models and Settings parts) to 9,982,126, just over. 10 MiB
+// leaves room for the fixes that follow; the pins folders of the agent SDKs
+// installed on demand (three lockfiles, about 70 KB) take a part of it. The
+// SDKs themselves left the install, which is far smaller for it: this ceiling
+// counts only OAR's own files.
+const MAX_UNPACKED_BYTES = 10 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },
@@ -114,6 +122,15 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
   assert.deepEqual(violations, [], `forbidden entries in the npm tarball:\n${violations.join('\n')}`);
 
   for (const required of ['bin/oar.js', 'server/server.js', 'README.md', 'CHANGELOG.md', 'LICENSE', 'package.json']) {
+    assert.ok(paths.includes(required), `tarball is missing ${required}`);
+  }
+  // The pins the relay installs the agent SDKs (and koffi) from.
+  for (const required of [
+    'server/agent-sdks/claude/package.json', 'server/agent-sdks/claude/package-lock.json', 'server/agent-sdks/claude/entry.mjs',
+    'server/agent-sdks/cursor/package.json', 'server/agent-sdks/cursor/package-lock.json', 'server/agent-sdks/cursor/entry.mjs',
+    'server/agent-sdks/cursor/entry-sqlite.mjs',
+    'server/agent-sdks/koffi/package.json', 'server/agent-sdks/koffi/package-lock.json', 'server/agent-sdks/koffi/entry.cjs',
+  ]) {
     assert.ok(paths.includes(required), `tarball is missing ${required}`);
   }
   assert.ok(

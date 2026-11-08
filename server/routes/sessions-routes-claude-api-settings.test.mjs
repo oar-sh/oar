@@ -521,6 +521,9 @@ test('model variants list the Claude API models while the provider is on', async
     availableModels: ['claude-sonnet-5-5'],
     enabledModels: ['claude-sonnet-5-5'],
     discovered: true,
+    autoEnableNew: true,
+    unseen: [],
+    fallback: false,
   });
   const off = createHarness({ claudeApiSettingsService: createClaudeApiService().service });
   assert.equal((await callRoute(route(off.app, 'GET', '/api/model-variants'))).body.claudeApiModels, null);
