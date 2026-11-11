@@ -191,7 +191,7 @@ where supported (with standalone fallback), and hides install/fullscreen header 
 When opened in a regular browser tab, the in-app **Install** button remains available
 in the chat header (shown as `⬇` on small screens).
 
-You can rename the installed app label from **⚙️ Settings → Relay name** (paired relays know this relay by the same name).
+You can rename the installed app label from **⚙️ Settings → Relays → Relay name** (paired relays know this relay by the same name).
 The name is stored on the relay (app settings) and served in the web app manifest
 to every browser and origin (LAN and tunnel agree), so future installs pick it up
 immediately and already-installed Android apps receive it through Chrome's normal

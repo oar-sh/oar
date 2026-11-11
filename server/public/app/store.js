@@ -5,6 +5,7 @@ import { resolveRelayDotState } from './relay-dot-state.mjs';
 import { readRepoBrowserPreferences } from './repo-browser-preferences.mjs';
 import { isChatInteractionHeld } from './selection-guard.mjs';
 import { nextSubagentStatus } from './subagent-fold.mjs';
+import { useMathMarkdown } from './markdown-math.mjs';
 import { useStrictStrikethrough } from './markdown-strikethrough.mjs';
 import { parseGroupFoldChoices, pruneGroupFoldChoices } from './conversation-group-state.mjs';
 import { isPhoneLandscapeLayout, shouldCollapseListAfterPick, syncPhoneLandscapeAttribute } from './phone-landscape.mjs';
@@ -205,6 +206,7 @@ const CONVERSATION_SCROLL_STORAGE_PREFIX = 'copilot_message_scroll_';
 if (globalThis.marked && typeof globalThis.marked.setOptions === 'function') {
   globalThis.marked.setOptions({ breaks: true });
   useStrictStrikethrough(globalThis.marked);
+  useMathMarkdown(globalThis.marked);
 } else {
   console.warn('[store] marked unavailable; markdown rendering will use plain-text fallback.');
 }

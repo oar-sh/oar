@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
 
-// "Tool lines shown while an agent works" (Settings › General › Appearance),
+// "Tool lines shown while an agent works" (Settings › Appearance),
 // against the shared e2e relay. A turn is queued and taken off the queue; its
 // tool lines are posted through the routes a session worker uses (no CLI runs
 // on the test server): 12 main-agent lines between 3 sub-agents × 150 lines.
@@ -189,19 +189,19 @@ test.describe("live tool lines", () => {
     }
   });
 
-  test("the setting sits in Settings › General › Appearance", async ({ page }) => {
+  test("the setting sits in Settings › Appearance", async ({ page }) => {
     await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
     await page.waitForFunction(() => typeof window.openSettingsModal === "function");
     await page.evaluate(() => window.localStorage.removeItem("copilot_live_activity_cap"));
     for (const [name, viewport] of [["phone", PHONE], ["desktop", DESKTOP]]) {
       await page.setViewportSize(viewport);
-      await page.evaluate(() => window.openSettingsModal("general"));
+      await page.evaluate(() => window.openSettingsModal("appearance"));
       const slider = page.locator("#live-activity-cap-slider");
       await expect(slider).toBeVisible();
       await expect(slider).toHaveValue("50");
       await expect(page.locator("#live-activity-cap-value")).toHaveText("50 lines");
-      await expect(page.locator("#settings-section-appearance").locator("#live-activity-cap-slider")).toHaveCount(1);
-      await shoot(page, `settings-appearance-${name}`, page.locator("#settings-section-appearance-title"));
+      await expect(page.locator("#settings-panel-appearance").locator("#live-activity-cap-slider")).toHaveCount(1);
+      await shoot(page, `settings-appearance-${name}`, page.locator("#appearance-browser-note"));
     }
     // The far end is no limit, and it is stored.
     const slider = page.locator("#live-activity-cap-slider");

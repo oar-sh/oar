@@ -332,3 +332,104 @@ test('a plan-only session\'s new plan card recommends "Approve plan", whatever w
   assert.equal(await run({ planOnly: false }), 'autopilot_fleet');
   assert.equal(await run({ planOnly: true, boardType: 'generic' }), 'autopilot_fleet');
 });
+// ─── The plan on a new card ───────────────────────────────────────────
+
+async function storedBoardBody({ body, context }) {
+  const inserted = [];
+  const deps = makeRouteDeps({
+    io: { emit() {} },
+    uuidv4: () => 'board-new',
+    DEFAULT_RELAY_MODE: 'agent',
+    normalizeRelayMode: (value) => (['plan', 'agent', 'autopilot'].includes(String(value || '')) ? String(value) : null),
+    formatRelayBoardRow: (row) => row,
+    stmts: {
+      findQById: { get: () => ({ id: 'q-1', status: 'processing', conversation_id: 'conv-1', relay_mode: 'plan' }) },
+      findBoardByMessageType: { get: () => null },
+      insertBoard: { run: (...args) => inserted.push(args) },
+      getBoard: { get: () => ({ id: 'board-new' }) },
+      getConvAnyStatus: { get: () => ({ id: 'conv-1', status: 'active', plan_only: null }) },
+    },
+  });
+  const routes = captureRoutes(deps, registerRelayBoardRoutes);
+  const { status } = await invokeRoute(routes, 'POST', '/api/relay-board', {
+    body: { queueId: 'q-1', conversationId: 'conv-1', boardType: 'plan_ready', title: 'T'.repeat(13_000), body, context },
+  });
+  assert.equal(status, 200);
+  // insertBoard's title and body arguments.
+  return { title: inserted[0][6], body: inserted[0][7] };
+}
+
+test('a plan longer than 12,000 characters is stored whole', async () => {
+  const plan = `# Plan\n\n${'1. A step of the plan, written out in full.\n'.repeat(560)}Last line of the plan.`;
+  assert.ok(plan.length > 24_000);
+  const stored = await storedBoardBody({ body: plan });
+  assert.equal(stored.body, plan);
+  assert.equal(stored.title.length, 12_000, 'the title keeps its limit');
+});
+
+test('a plan past 200,000 characters is cut at a line break and says how much is missing', async () => {
+  const line = '1. A step of the plan, written out in full.\n';
+  const plan = line.repeat(Math.ceil(250_000 / line.length)).trimEnd();
+  const stored = await storedBoardBody({ body: plan, context: { source: 'exit_plan_mode', planFilePath: '/home/dev/plans/long.md' } });
+  const [kept, note] = stored.body.split('\n\n… cut here: ');
+  assert.ok(kept.length <= 200_000 && kept.length > 199_000);
+  assert.ok(kept.endsWith('written out in full.'), 'no step is cut in two');
+  assert.equal(note, `${plan.length - kept.length} more characters; the whole plan is in \`/home/dev/plans/long.md\`.`);
+
+  const unnamed = await storedBoardBody({ body: plan });
+  assert.ok(unnamed.body.endsWith(`… cut here: ${plan.length - kept.length} more characters.`));
+
+  const oneLine = await storedBoardBody({ body: 'x'.repeat(250_000) });
+  assert.ok(oneLine.body.startsWith('x'.repeat(200_000)));
+  assert.ok(oneLine.body.endsWith('\n\n… cut here: 50000 more characters.'));
+});
+
+test('a cut inside a code block closes the block, so the note is not shown as code', async () => {
+  const code = `Steps:\n\n\`\`\`\`sh\n${'echo one more line of the script\n'.repeat(8_000)}\`\`\`\`\n\nDone.`;
+  assert.ok(code.length > 200_000);
+  const stored = await storedBoardBody({ body: code });
+  assert.match(stored.body, /echo one more line of the script\n````\n\n… cut here: \d+ more characters\.$/);
+  // A block closed before the cut needs nothing.
+  const closed = await storedBoardBody({ body: `\`\`\`sh\necho done\n\`\`\`\n\n${'A step of the plan.\n'.repeat(13_000)}` });
+  assert.match(closed.body, /A step of the plan\.\n\n… cut here: \d+ more characters\.$/);
+});
+
+test('the block closed after a cut is the one that is open: nested, tilde and labelled fences', async () => {
+  const filler = 'echo one more line of the script\n'.repeat(8_000);
+  const closedWith = async (head) => {
+    const stored = await storedBoardBody({ body: `${head}${filler}` });
+    const match = /echo one more line of the script(\n[`~]+)?\n\n… cut here: \d+ more characters\.$/.exec(stored.body);
+    assert.ok(match, head);
+    return (match[1] || '').trim();
+  };
+  // Four backticks around a three-backtick block that is closed: the outer one is open.
+  assert.equal(await closedWith('````md\n```js\nlet a;\n```\n'), '````');
+  // Four backticks with a three-backtick line inside: still the outer one, nothing nested.
+  assert.equal(await closedWith('````md\n```js\n'), '````');
+  // A tilde line does not close a backtick block, and a tilde block closes with tildes.
+  assert.equal(await closedWith('```\n~~~\n'), '```');
+  assert.equal(await closedWith('~~~~ sh\n```\n'), '~~~~');
+  // A fence line with a label cannot close: the block opened by ```md is still open.
+  assert.equal(await closedWith('```md\n```js\n'), '```');
+  // Closed blocks, a too-short closer, and a backtick line that is no fence.
+  assert.equal(await closedWith('```md\ntext\n```\n~~~\ntext\n~~~\n'), '');
+  assert.equal(await closedWith('````\ntext\n```\n'), '````');
+  assert.equal(await closedWith('``` a `b` c\n'), '');
+  assert.equal(await closedWith('Steps:\n\n    ```\n'), '', 'four blanks: an indented code line, no fence');
+});
+
+test('fences are found in a plan with Windows line ends', async () => {
+  const cut = await storedBoardBody({ body: `\`\`\`js\r\n${'echo x\r\n'.repeat(30_000)}` });
+  assert.match(cut.body, /echo x\n```\n\n… cut here: \d+ more characters\.$/);
+  // A closed backtick block, then an open tilde block: the tilde one is closed.
+  const tilde = await storedBoardBody({ body: `\`\`\`\r\na\r\n\`\`\`\r\n~~~~\r\n${'b\r\n'.repeat(70_000)}` });
+  assert.match(tilde.body, /b\n~~~~\n\n… cut here: \d+ more characters\.$/);
+  // Closed blocks need nothing.
+  const closed = await storedBoardBody({ body: `\`\`\`js\r\nlet a;\r\n\`\`\`\r\n${'A step of the plan.\r\n'.repeat(13_000)}` });
+  assert.match(closed.body, /A step of the plan\.\n\n… cut here: \d+ more characters\.$/);
+});
+
+test('a cut never leaves half a character', async () => {
+  const stored = await storedBoardBody({ body: `${'x'.repeat(199_999)}${'🙂'.repeat(30_000)}` });
+  assert.ok(stored.body.startsWith(`${'x'.repeat(199_999)}\n\n… cut here: `));
+});

@@ -21,6 +21,51 @@ function normalizeBoardText(value, fallback = '') {
   return text.slice(0, 12_000);
 }
 
+// A plan is shown whole on its card: the old shared limit of 12,000 characters
+// cut a longer one in mid-sentence and left no mark. Past this size the card
+// says how much is missing.
+const BOARD_BODY_MAX_CHARS = 200_000;
+
+/**
+ * The code fence still open at the end of `text`, as the characters that
+ * close it, or ''. By the Markdown rules: a fence is three or more backticks
+ * or tildes behind at most three spaces (a backtick fence's info string holds
+ * no backtick); it is closed by a line of the same character, at least as
+ * long, with nothing but blanks behind it. Lines inside it open nothing.
+ */
+function openCodeFence(text) {
+  let open = null;
+  // A plan file read on Windows ends its lines with CRLF.
+  for (const line of text.split(/\r?\n/)) {
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!fence) continue;
+    const [, run, rest] = fence;
+    if (!open) {
+      if (run[0] === '`' && rest.includes('`')) continue;
+      open = { char: run[0], length: run.length };
+    } else if (run[0] === open.char && run.length >= open.length && !rest.trim()) {
+      open = null;
+    }
+  }
+  return open ? open.char.repeat(open.length) : '';
+}
+
+function normalizeBoardBody(value, context) {
+  const text = String(value || '').trim();
+  if (text.length <= BOARD_BODY_MAX_CHARS) return text;
+  const lineBreak = text.lastIndexOf('\n', BOARD_BODY_MAX_CHARS);
+  let kept = text.slice(0, lineBreak > BOARD_BODY_MAX_CHARS / 2 ? lineBreak : BOARD_BODY_MAX_CHARS);
+  // Not half a character.
+  if (/[\uD800-\uDBFF]$/.test(kept)) kept = kept.slice(0, -1);
+  kept = kept.trimEnd();
+  // A cut inside a code block would put the note into the code: close the block first.
+  const fence = openCodeFence(kept);
+  const openFence = fence ? `\n${fence}` : '';
+  const planFilePath = String(context?.planFilePath || '').trim();
+  const where = planFilePath ? `; the whole plan is in \`${planFilePath}\`` : '';
+  return `${kept}${openFence}\n\n… cut here: ${text.length - kept.length} more characters${where}.`;
+}
+
 function normalizeBoardType(value) {
   const text = String(value || '').trim().toLowerCase();
   if (!text) return 'generic';
@@ -197,7 +242,7 @@ export function registerRelayBoardRoutes(app, deps) {
       normalizedBoardType,
       relayMode,
       normalizeBoardText(title, 'Plan ready for review'),
-      normalizeBoardText(body, ''),
+      normalizeBoardBody(body, boardContext),
       normalizedActions.length ? JSON.stringify(normalizedActions) : null,
       normalizedRecommended,
       boardContext ? JSON.stringify(boardContext) : null,

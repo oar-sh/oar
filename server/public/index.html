@@ -211,18 +211,17 @@
 <title>OAR — Open Agent Relay</title>
 <script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
 <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/mhchem.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/katex.min.css" integrity="sha384-WwGtaC6ywCHxA5cstpj/3+xIZvTez8dq2IcBQaXRkenHZ7FVVq1ZROtURwfbtTlG" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/katex.min.js" integrity="sha384-a1WQdjRj162i159OYq041X6I4K8NenkrI09LlPmiHg0YOb7CR+wJOraXwK9abpnE" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/contrib/mhchem.min.js" integrity="sha384-fB8BH//9nBzROkMUsu/Dr35jWHIbnKesUo9rW0hfEgw8mZGnkAyBAjKX9F98OVuo" crossorigin="anonymous"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/nginx.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/x86asm.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.10.0/lib/xterm-addon-fit.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" integrity="sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" integrity="sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn" crossorigin="anonymous"></script>
 <script>
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
@@ -1978,6 +1977,8 @@
   }
   .settings-section:first-child .settings-section-title { margin-top: 0; }
   .settings-section-title + .settings-row { margin-top: 0; }
+  /* Settings → Appearance: the one line saying where its settings live. */
+  #appearance-browser-note { margin-bottom: calc(8px * var(--ui-scale)); }
   /* A row inside a column block: the block's full width; the lead row (the
      provider's on/off toggle) keeps a small gap to the fields below. */
   .settings-row-full { width: 100%; }
@@ -2429,6 +2430,9 @@
      The anchor class comes from JS rather than :has() so positioning works
      everywhere the transcript renders. */
   pre.has-code-copy { position: relative; }
+  /* The button gets a strip of its own above the first line, so a long line
+     never runs under it. */
+  pre.has-code-copy > code { padding-top: calc(0.72rem + 12px * var(--ui-scale) + 4px); }
   .code-copy-btn {
     position: absolute;
     top: calc(4px * var(--ui-scale));
@@ -2470,8 +2474,8 @@
     vertical-align: bottom;
     -webkit-overflow-scrolling: touch;
   }
-  .katex-error {
-    color: var(--danger);
+  /* A formula KaTeX could not set is shown as its source, line breaks kept. */
+  .math-source {
     white-space: pre-wrap;
   }
   .msg-bubble code:not(pre code) {
@@ -5066,8 +5070,7 @@
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: calc(6px * var(--ui-scale)); padding: calc(2px * var(--ui-scale)) calc(4px * var(--ui-scale)); font-size: var(--fs-meta-sm);
   }
-  .remote-relays-self-name-row { display: flex; align-items: baseline; gap: calc(5px * var(--ui-scale)); flex-wrap: wrap; }
-  .remote-relays-self-name { font-family: var(--mono, monospace); color: var(--text); }
+  #settings-panel-relays #pwa-app-name-input,
   #remote-relays-public-url-input,
   #remote-relays-add-url-input,
   #remote-relays-add-token-input {
@@ -8845,6 +8848,16 @@
         data-settings-tab="general"
       >General</button>
       <button
+        id="settings-tab-appearance"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-appearance"
+        tabindex="-1"
+        data-settings-tab="appearance"
+      >Appearance</button>
+      <button
         id="settings-tab-providers"
         class="settings-tab"
         type="button"
@@ -8914,68 +8927,6 @@
         aria-labelledby="settings-tab-general"
         data-settings-panel="general"
       >
-        <section class="settings-section" id="settings-section-appearance" aria-labelledby="settings-section-appearance-title">
-          <h3 class="settings-section-title" id="settings-section-appearance-title">Appearance</h3>
-          <div class="settings-row">
-            <label for="theme-select">Theme</label>
-            <select id="theme-select" onchange="updateTheme(this.value)">
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-            </select>
-          </div>
-          <div class="settings-row" style="margin-bottom: 0;">
-            <label for="font-scale-select">Text scaling</label>
-            <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling"></select>
-          </div>
-          <div class="settings-row settings-gap">
-            <label for="thoughts-expanded-toggle">Expand thoughts while an agent works</label>
-            <input
-              id="thoughts-expanded-toggle"
-              type="checkbox"
-              onchange="updateThoughtsExpandedSetting(this.checked)"
-              aria-label="Expand thoughts while an agent works"
-              checked
-            >
-          </div>
-          <div class="settings-help settings-gap-xs">Open thoughts in the live turn, in sub-agent bubbles and in the sub-agent viewer. Saved in this browser.</div>
-          <div class="settings-row settings-row-column settings-gap">
-            <label for="live-activity-cap-slider">Tool lines shown while an agent works <span id="live-activity-cap-value">50 lines</span></label>
-            <input
-              id="live-activity-cap-slider"
-              type="range"
-              min="10"
-              max="510"
-              step="10"
-              value="50"
-              aria-label="Tool lines shown while an agent works"
-              aria-valuetext="50 lines"
-              oninput="previewLiveActivityCap(this.value)"
-              onchange="updateLiveActivityCap(this.value)"
-            >
-          </div>
-          <div class="settings-help settings-gap-xs">Per agent: the main agent and each sub-agent keep this many of their newest tool lines in the live bubble. The relay keeps up to 500 per agent. Saved in this browser.</div>
-          <div class="settings-row settings-gap">
-            <label for="stream-view-toggle">Stream view: thoughts, tool calls and the reply in order</label>
-            <input
-              id="stream-view-toggle"
-              type="checkbox"
-              onchange="updateStreamViewSetting(this.checked)"
-              aria-label="Stream view: thoughts, tool calls and the reply in order"
-            >
-          </div>
-          <div class="settings-help settings-gap-xs">Turns recorded before this version keep the grouped layout. Saved in this browser.</div>
-          <div class="settings-row settings-gap">
-            <label for="show-suspend-host-toggle">Show Suspend host action</label>
-            <input
-              id="show-suspend-host-toggle"
-              type="checkbox"
-              onchange="updateShowSuspendHostSetting(this.checked)"
-              aria-label="Show Suspend host action"
-              checked
-            >
-          </div>
-          <div class="settings-help settings-gap-xs">Shows or hides the menu action in this browser only. Suspend works only when the relay runs on Windows; a queued suspend still shows its banner here either way.</div>
-        </section>
         <section class="settings-section" id="settings-section-reading" aria-labelledby="settings-section-reading-title">
           <h3 class="settings-section-title" id="settings-section-reading-title">Reading</h3>
           <div class="settings-row settings-gap">
@@ -9090,44 +9041,8 @@
           <div id="model-refresh-providers" class="settings-gap" role="group" aria-label="Providers checked for new models"></div>
           <div class="settings-help settings-gap-xs">The relay asks each switched-on provider for its model list this often. A provider whose list was refreshed in the meantime (Refresh in Select Models, a settings save, a sign-in) waits a full interval again, and a failed check is tried again after an hour at the earliest. Whether a new model starts on is set per provider in Select Models. A setting of this relay.</div>
         </section>
-        <section class="settings-section" id="settings-section-relay" aria-labelledby="settings-section-relay-title">
-          <h3 class="settings-section-title" id="settings-section-relay-title">This relay</h3>
-          <div class="settings-row settings-row-column settings-gap">
-            <label for="pwa-app-name-input">Relay name</label>
-            <input
-              id="pwa-app-name-input"
-              type="text"
-              maxlength="60"
-              placeholder="OAR"
-              aria-label="Relay name"
-              onchange="updatePwaAppName(this.value)"
-            >
-            <div class="settings-help">Shown to other relays and used as the installed app's name. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name. A setting of this relay.</div>
-          </div>
-          <div class="settings-row settings-gap">
-            <label for="restart-resume-toggle">After a relay restart, tell interrupted sessions to carry on</label>
-            <input
-              id="restart-resume-toggle"
-              type="checkbox"
-              onchange="updateRestartResumeSettingFromToggle(this.checked)"
-              aria-label="After a relay restart, tell interrupted sessions to carry on"
-            >
-          </div>
-          <div class="settings-help settings-gap-xs">Most turns a restart interrupts run again by themselves. A turn that cannot (the agent had already taken the message, or had started on its own after a background task) just stops. With this on, such a session gets one relay note once the relay is back, saying when it restarted and asking the agent to check what it was doing and carry on. Your message is never sent again; idle, archived and usage-limit-paused sessions get nothing. Off by default; a setting of this relay.</div>
-          <div class="settings-row settings-gap">
-            <label for="relay-restart-max-wait-select">Ask after a queued relay restart has waited</label>
-            <select id="relay-restart-max-wait-select" onchange="updateRelayRestartMaxWaitSetting(this.value)" aria-label="Ask after a queued relay restart has waited">
-              <option value="5">5 min</option>
-              <option value="10">10 min</option>
-              <option value="15">15 min</option>
-              <option value="30" selected>30 min</option>
-              <option value="60">1 h</option>
-              <option value="120">2 h</option>
-              <option value="240">4 h</option>
-              <option value="0">No limit</option>
-            </select>
-          </div>
-          <div class="settings-help settings-gap-xs">A queued relay restart waits for the running turns, and new messages wait for the restart. After this long the banner asks whether to restart now, keep waiting or cancel; it never restarts while the turns run, and still restarts as soon as they end. No limit waits until the turns end. A setting of this relay.</div>
+        <section class="settings-section" id="settings-section-computer" aria-labelledby="settings-section-computer-title">
+          <h3 class="settings-section-title" id="settings-section-computer-title">This computer</h3>
           <div class="settings-row settings-row-column settings-gap">
             <label for="default-session-workspace-root-input">Default CWD for new sessions</label>
             <input
@@ -9203,6 +9118,80 @@
             <button id="update-outcome-dismiss-btn" class="chat-title-action-btn" type="button" onclick="dismissUpdateOutcome()">Dismiss</button>
           </div>
         </section>
+      </div>
+      <div
+        id="settings-panel-appearance"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-appearance"
+        data-settings-panel="appearance"
+        hidden
+      >
+        <div id="appearance-browser-note" class="settings-help">These settings are kept in this browser; other devices keep their own.</div>
+        <div class="settings-row">
+          <label for="theme-select">Theme</label>
+          <select id="theme-select" onchange="updateTheme(this.value)" aria-describedby="appearance-browser-note">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+          </select>
+        </div>
+        <div class="settings-row" style="margin-bottom: 0;">
+          <label for="font-scale-select">Text scaling</label>
+          <select id="font-scale-select" onchange="updateFontScaleFromSelect(this.value)" aria-label="Text scaling" aria-describedby="appearance-browser-note"></select>
+        </div>
+        <div class="settings-row settings-gap">
+          <label for="thoughts-expanded-toggle">Expand thoughts while an agent works</label>
+          <input
+            id="thoughts-expanded-toggle"
+            aria-describedby="appearance-browser-note"
+            type="checkbox"
+            onchange="updateThoughtsExpandedSetting(this.checked)"
+            aria-label="Expand thoughts while an agent works"
+            checked
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">Open thoughts in the live turn, in sub-agent bubbles and in the sub-agent viewer.</div>
+        <div class="settings-row settings-row-column settings-gap">
+          <label for="live-activity-cap-slider">Tool lines shown while an agent works <span id="live-activity-cap-value">50 lines</span></label>
+          <input
+            id="live-activity-cap-slider"
+            aria-describedby="appearance-browser-note"
+            type="range"
+            min="10"
+            max="510"
+            step="10"
+            value="50"
+            aria-label="Tool lines shown while an agent works"
+            aria-valuetext="50 lines"
+            oninput="previewLiveActivityCap(this.value)"
+            onchange="updateLiveActivityCap(this.value)"
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">Per agent: the main agent and each sub-agent keep this many of their newest tool lines in the live bubble. The relay keeps up to 500 per agent.</div>
+        <div class="settings-row settings-gap">
+          <label for="stream-view-toggle">Stream view: thoughts, tool calls and the reply in order</label>
+          <input
+            id="stream-view-toggle"
+            aria-describedby="appearance-browser-note"
+            type="checkbox"
+            onchange="updateStreamViewSetting(this.checked)"
+            aria-label="Stream view: thoughts, tool calls and the reply in order"
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">Turns recorded before this version keep the grouped layout.</div>
+        <div class="settings-row settings-gap">
+          <label for="show-suspend-host-toggle">Show Suspend host action</label>
+          <input
+            id="show-suspend-host-toggle"
+            aria-describedby="appearance-browser-note"
+            type="checkbox"
+            onchange="updateShowSuspendHostSetting(this.checked)"
+            aria-label="Show Suspend host action"
+            checked
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">Shows or hides the menu action in this browser only. Suspend works only when the relay runs on Windows; a queued suspend still shows its banner here either way.</div>
       </div>
       <div
         id="settings-panel-providers"
@@ -9936,11 +9925,16 @@
         hidden
       >
         <div id="remote-relays-self-section" class="settings-row settings-row-column settings-gap">
-          <label>This relay</label>
-          <div class="remote-relays-self-name-row">
-            <span id="remote-relays-self-name" class="remote-relays-self-name">—</span>
-            <span class="settings-help">Change it under General → Relay name.</span>
-          </div>
+          <label for="pwa-app-name-input">Relay name</label>
+          <input
+            id="pwa-app-name-input"
+            type="text"
+            maxlength="60"
+            placeholder="OAR"
+            aria-label="Relay name"
+            onchange="updatePwaAppName(this.value)"
+          >
+          <div class="settings-help">Shown to other relays and used as the installed app's name. On Android, a rename reaches an already-installed app after a short delay, with one confirmation prompt showing the new name. A setting of this relay.</div>
         </div>
         <div class="settings-row settings-row-column settings-gap">
           <label for="remote-relays-public-url-input">Public address</label>
@@ -9958,6 +9952,30 @@
           <div class="settings-help">How other relays reach this one — the address you open this relay at from another device. Needed for "Also add this relay there".</div>
           <div id="remote-relays-self-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
         </div>
+        <div class="settings-row settings-gap">
+          <label for="restart-resume-toggle">After a relay restart, tell interrupted sessions to carry on</label>
+          <input
+            id="restart-resume-toggle"
+            type="checkbox"
+            onchange="updateRestartResumeSettingFromToggle(this.checked)"
+            aria-label="After a relay restart, tell interrupted sessions to carry on"
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">Most turns a restart interrupts run again by themselves. A turn that cannot (the agent had already taken the message, or had started on its own after a background task) just stops. With this on, such a session gets one relay note once the relay is back, saying when it restarted and asking the agent to check what it was doing and carry on. Your message is never sent again; idle, archived and usage-limit-paused sessions get nothing. Off by default; a setting of this relay.</div>
+        <div class="settings-row settings-gap">
+          <label for="relay-restart-max-wait-select">Ask after a queued relay restart has waited</label>
+          <select id="relay-restart-max-wait-select" onchange="updateRelayRestartMaxWaitSetting(this.value)" aria-label="Ask after a queued relay restart has waited">
+            <option value="5">5 min</option>
+            <option value="10">10 min</option>
+            <option value="15">15 min</option>
+            <option value="30" selected>30 min</option>
+            <option value="60">1 h</option>
+            <option value="120">2 h</option>
+            <option value="240">4 h</option>
+            <option value="0">No limit</option>
+          </select>
+        </div>
+        <div class="settings-help settings-gap-xs">A queued relay restart waits for the running turns, and new messages wait for the restart. After this long the banner asks whether to restart now, keep waiting or cancel; it never restarts while the turns run, and still restarts as soon as they end. No limit waits until the turns end. A setting of this relay.</div>
         <div class="settings-row settings-gap">
           <label for="remote-relays-inbound-toggle">Accept prompts from other relays' agents</label>
           <input

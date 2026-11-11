@@ -41,6 +41,7 @@ test('relay modes map to SDK permission modes', () => {
 test('every mode teaches media embedding; ask and autopilot add their nudge on top', () => {
   for (const mode of ['plan', 'agent', 'ask', 'autopilot']) {
     assert.match(systemPromptForRelayMode(mode).append, /image, video, or audio clip inline/);
+    assert.match(systemPromptForRelayMode(mode).append, /write it in TeX between dollar signs/);
   }
   assert.match(systemPromptForRelayMode('ask').append, /Prioritize clarification questions/);
   assert.match(systemPromptForRelayMode('autopilot').append, /Keep moving unless user input/);

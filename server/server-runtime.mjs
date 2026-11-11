@@ -2401,6 +2401,8 @@ function setPwaAppName(rawValue) {
   } else {
     stmts.deleteAppSetting.run(PWA_APP_NAME_SETTING_KEY);
   }
+  // Settings open on another device show the new name (Settings › Relays).
+  try { remoteRelayRegistry.notifySelfChanged(); } catch {}
   return { ok: true, appName: normalized.value };
 }
 

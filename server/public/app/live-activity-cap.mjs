@@ -1,6 +1,6 @@
-// "Tool lines shown while an agent works" (Settings › General ›
-// Appearance): how many of its newest tool lines each agent of a running
-// turn keeps in the live bubble, the main agent and every sub-agent apart.
+// "Tool lines shown while an agent works" (Settings › Appearance): how many
+// of its newest tool lines each agent of a running turn keeps in the live
+// bubble, the main agent and every sub-agent apart.
 // A setting of this browser, kept in localStorage like the scroll-on-send
 // one. The slider runs from 10 to 500 by 10 and has one more step at the far
 // end, no limit (stored as '0'). The document and the storage are passed in

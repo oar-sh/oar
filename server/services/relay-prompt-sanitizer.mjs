@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 
 const DEFAULT_RELAY_TOOL_GUIDANCE = [
@@ -148,6 +149,11 @@ const MEDIA_EMBED_BLOCK_PATTERN = new RegExp(
   whitespaceFlexiblePattern(renderMediaEmbedInstructionBlock()),
   'gi',
 );
+// The formula guidance (shared/math-instructions.mjs) rides right behind it.
+const MATH_BLOCK_PATTERN = new RegExp(
+  whitespaceFlexiblePattern(renderMathInstructionBlock()),
+  'gi',
+);
 
 // A steered message's hidden note (shared/steer-note.mjs) leads the prompt the
 // runtime stored, right after any mode marker. Matched by its stable opening
@@ -167,6 +173,7 @@ function stripLeadingRelayNotes(text) {
 export function stripRelayPromptContext(text, relayMode = '', attachments = []) {
   const value = stripAttachmentPromptArtifacts(text)
     .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
+    .replace(MATH_BLOCK_PATTERN, '')
     .trim();
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);

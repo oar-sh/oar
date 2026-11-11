@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
-// "Stream view" in Settings › General › Appearance, and its 🧠 mirror.
+// "Stream view" in Settings › Appearance, and its 🧠 mirror.
 // Rendered against the real index.html.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const dom = new JSDOM(indexHtml, { url: 'http://localhost/' });
@@ -18,15 +18,15 @@ const { syncThoughtsExpandedToggle, isThoughtsExpanded } = await import('./thoug
 
 const toggle = () => document.getElementById('stream-view-toggle');
 
-test('the toggle sits in Settings › General › Appearance, off by default, with its help line', () => {
+test('the toggle sits in Settings › Appearance, off by default, with its help line', () => {
   assert.equal(document.querySelectorAll('#settings-modal [id="stream-view-toggle"]').length, 1);
-  assert.equal(toggle().closest('.settings-section')?.id, 'settings-section-appearance');
+  assert.equal(toggle().closest('[data-settings-panel]')?.id, 'settings-panel-appearance');
   assert.equal(toggle().type, 'checkbox');
   assert.equal(toggle().checked, false);
   assert.equal(toggle().getAttribute('onchange'), 'updateStreamViewSetting(this.checked)');
   assert.equal(document.querySelector('label[for="stream-view-toggle"]').textContent, 'Stream view: thoughts, tool calls and the reply in order');
   const help = toggle().closest('.settings-row').nextElementSibling;
-  assert.equal(help.textContent, 'Turns recorded before this version keep the grouped layout. Saved in this browser.');
+  assert.equal(help.textContent, 'Turns recorded before this version keep the grouped layout.');
   const following = dom.window.Node.DOCUMENT_POSITION_FOLLOWING;
   assert.ok(document.getElementById('live-activity-cap-slider').compareDocumentPosition(toggle()) & following);
   assert.ok(toggle().compareDocumentPosition(document.getElementById('show-suspend-host-toggle')) & following);

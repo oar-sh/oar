@@ -102,6 +102,16 @@ test('the self name is the relay name, else the injected hostname', () => {
   assert.equal(setup({ selfName: '' }).registry.selfName(), 'devbox');
 });
 
+test('the owner\'s self block names the default, and a relay-name change is announced', () => {
+  const { registry, events } = setup();
+  assert.equal(registry.selfPayload().name, 'win-test');
+  assert.equal(registry.selfPayload().defaultName, 'devbox');
+  assert.equal('defaultName' in registry.selfIdentity(), false, 'other relays never see it');
+  registry.notifySelfChanged();
+  assert.equal(events.at(-1).event, REMOTE_RELAY_SOCKET_EVENT);
+  assert.equal(events.at(-1).payload.self.defaultName, 'devbox');
+});
+
 test('selfIdentity reports the injected platform and version, the protocol and that it takes images', () => {
   const { registry } = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.publicUrl]: JSON.stringify('https://relay-a.example.test') } });
   assert.deepEqual(registry.selfIdentity(), {

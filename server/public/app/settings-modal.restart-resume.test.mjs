@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
 // "After a relay restart, tell interrupted sessions to carry on" in
-// Settings › General: off in the markup and until the relay says otherwise;
+// Settings › Relays: off in the markup and until the relay says otherwise;
 // a change posts `{ enabled }`. Rendered against the real index.html.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const dom = new JSDOM(indexHtml, { url: 'http://localhost/' });
@@ -25,8 +25,8 @@ function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-test('the toggle sits in Settings › General, off by default', () => {
-  assert.ok(toggle().closest('#settings-panel-general'), 'in the General tab');
+test('the toggle sits in Settings › Relays, off by default', () => {
+  assert.ok(toggle().closest('#settings-panel-relays'), 'in the Relays tab');
   assert.equal(toggle().checked, false);
   assert.match(document.querySelector('label[for="restart-resume-toggle"]').textContent, /After a relay restart, tell interrupted sessions to carry on/);
 });

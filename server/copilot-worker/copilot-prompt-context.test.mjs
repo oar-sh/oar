@@ -68,6 +68,7 @@ test('the heavy guidance rides along only when the relay mode changes', async ()
   const first = await buildCommitted(build, { relayMode: 'agent' });
   assert.match(first, /Use ask_user/);
   assert.match(first, /Embedding media in replies/);
+  assert.match(first, /Formulas in replies/);
 
   // Same mode again: the marker stays, the instructions do not repeat.
   const second = await buildCommitted(build, { relayMode: 'agent' });

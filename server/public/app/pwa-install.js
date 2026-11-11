@@ -17,6 +17,7 @@ let pwaAppName = '';
 // background GET must never repaint over a just-saved name, and a second edit
 // must never be dropped in favor of an older in-flight save.
 let pwaAppNameRequestSeq = 0;
+let pwaAppNameSavesInFlight = 0;
 
 function matchesDisplayMode(query) {
   try {
@@ -354,20 +355,40 @@ export function syncPwaAppNameInput() {
   });
 }
 
+/** The relay name as this page last read or saved it ('' for none). */
+export function currentPwaAppName() {
+  return pwaAppName;
+}
+
+/** True while this page's own rename is on its way to the relay. */
+export function isPwaAppNameSaveInFlight() {
+  return pwaAppNameSavesInFlight > 0;
+}
+
 export async function updatePwaAppName(rawValue) {
   const seq = ++pwaAppNameRequestSeq;
-  const result = await updatePwaAppNameSetting(rawValue);
+  pwaAppNameSavesInFlight += 1;
+  let result;
+  try {
+    result = await updatePwaAppNameSetting(rawValue);
+  } finally {
+    pwaAppNameSavesInFlight -= 1;
+  }
   if (!result || typeof result.appName !== 'string') {
     alert('Failed to update the relay name.');
     if (seq === pwaAppNameRequestSeq) paintPwaAppNameInput();
     return;
   }
-  if (seq !== pwaAppNameRequestSeq) return; // a newer edit owns the UI now
-  pwaAppName = result.appName;
+  // The rename is saved whatever came in meanwhile (a newer edit, or a read
+  // the relay's own announcement of it started): say so either way. Only the
+  // field is left to whichever request is newest.
+  if (seq === pwaAppNameRequestSeq) {
+    pwaAppName = result.appName;
+    paintPwaAppNameInput();
+  }
   showTransientRelayNotice(result.appName
     ? `Relay name updated to "${result.appName}".`
     : 'Relay name reset to default.');
-  paintPwaAppNameInput();
   // The same name is what paired relays see (GET /api/relay/identity); the
   // Relays tab re-reads it, including the host-name fallback for an empty one.
   window.dispatchEvent(new CustomEvent('oar:relay-name-changed', { detail: { name: result.appName } }));

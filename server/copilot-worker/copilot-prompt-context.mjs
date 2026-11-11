@@ -25,6 +25,7 @@ import {
   applyPreviewInstructions,
   createPreviewInstructionsProvider,
 } from '../../shared/preview-instructions.mjs';
+import { applyMathInstructions } from '../../shared/math-instructions.mjs';
 import { applyMediaEmbedInstructions } from '../../shared/media-embed-instructions.mjs';
 import { buildModePrompt } from '../../shared/worker-runtime/prompt-context.mjs';
 import { loadRelayInstructionsFromFile } from '../../shared/worker-runtime/config-loader.mjs';
@@ -84,7 +85,7 @@ export function createCopilotPromptContextBuilder({
           .then(() => getPreviewInstructions({ conversationId: String(message?.conversationId || '') }))
           .catch(() => '')
         : '';
-      instructions = applyMediaEmbedInstructions(applyPreviewInstructions(toolInstructions, previewBlock));
+      instructions = applyMathInstructions(applyMediaEmbedInstructions(applyPreviewInstructions(toolInstructions, previewBlock)));
     }
     const prefix = buildModePrompt(relayMode, instructions, { includeInstructions });
     return {

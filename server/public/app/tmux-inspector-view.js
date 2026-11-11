@@ -14,17 +14,22 @@ let inspectorState = {
   listenersBound: false,
 };
 
-const XTERM_STYLE_CANDIDATES = [
-  'https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.min.css',
-  'https://unpkg.com/xterm@5.5.0/css/xterm.min.css',
+// The files index.html loads, and unpkg as the fallback: one package version
+// and one hash per file, so either CDN must serve the same bytes.
+const XTERM_STYLE_INTEGRITY = 'sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP';
+const XTERM_SCRIPT_INTEGRITY = 'sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/';
+const XTERM_FIT_SCRIPT_INTEGRITY = 'sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn';
+export const XTERM_STYLE_CANDIDATES = [
+  { url: 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css', integrity: XTERM_STYLE_INTEGRITY },
+  { url: 'https://unpkg.com/@xterm/xterm@5.5.0/css/xterm.css', integrity: XTERM_STYLE_INTEGRITY },
 ];
-const XTERM_SCRIPT_CANDIDATES = [
-  'https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js',
-  'https://unpkg.com/xterm@5.5.0/lib/xterm.min.js',
+export const XTERM_SCRIPT_CANDIDATES = [
+  { url: 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js', integrity: XTERM_SCRIPT_INTEGRITY },
+  { url: 'https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.js', integrity: XTERM_SCRIPT_INTEGRITY },
 ];
-const XTERM_FIT_SCRIPT_CANDIDATES = [
-  'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.10.0/lib/xterm-addon-fit.min.js',
-  'https://unpkg.com/xterm-addon-fit@0.10.0/lib/xterm-addon-fit.min.js',
+export const XTERM_FIT_SCRIPT_CANDIDATES = [
+  { url: 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js', integrity: XTERM_FIT_SCRIPT_INTEGRITY },
+  { url: 'https://unpkg.com/@xterm/addon-fit@0.10.0/lib/addon-fit.js', integrity: XTERM_FIT_SCRIPT_INTEGRITY },
 ];
 
 let xtermLoadPromise = null;
@@ -64,7 +69,7 @@ function stripAnsiControlCodes(input = '') {
     .replace(/\r(?!\n)/g, '');
 }
 
-function loadScript(src) {
+function loadScript(src, integrity = '') {
   return new Promise((resolve, reject) => {
     const timeoutMs = 3500;
     let settled = false;
@@ -101,6 +106,10 @@ function loadScript(src) {
     }
     const script = document.createElement('script');
     script.src = src;
+    if (integrity) {
+      script.integrity = integrity;
+      script.crossOrigin = 'anonymous';
+    }
     script.async = true;
     script.onload = () => {
       script.dataset.loaded = 'true';
@@ -114,9 +123,9 @@ function loadScript(src) {
   });
 }
 
-function ensureStylesheet(urlCandidates = []) {
-  for (const href of urlCandidates) {
-    const hrefText = String(href || '').trim();
+function ensureStylesheet(candidates = []) {
+  for (const { url, integrity } of candidates) {
+    const hrefText = String(url || '').trim();
     if (!hrefText) continue;
     const already = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
       .some((node) => String(node.getAttribute('href') || '').trim() === hrefText);
@@ -124,6 +133,10 @@ function ensureStylesheet(urlCandidates = []) {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
     link.href = hrefText;
+    if (integrity) {
+      link.integrity = integrity;
+      link.crossOrigin = 'anonymous';
+    }
     document.head.appendChild(link);
     return;
   }
@@ -131,11 +144,11 @@ function ensureStylesheet(urlCandidates = []) {
 
 async function loadFirstSuccessful(candidates = []) {
   let lastError = null;
-  for (const candidate of candidates) {
-    const src = String(candidate || '').trim();
+  for (const { url, integrity } of candidates) {
+    const src = String(url || '').trim();
     if (!src) continue;
     try {
-      await loadScript(src);
+      await loadScript(src, integrity);
       return true;
     } catch (error) {
       lastError = error;

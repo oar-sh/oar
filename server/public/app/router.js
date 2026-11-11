@@ -7,7 +7,7 @@ import {
   WORKSPACE_FILE_EXTENSIONS,
   serverPlatform,
 } from './store.js';
-import { scanInlineDollars, splitAtLiteralDollars } from './math-dollars.mjs';
+import { mathAppliesTo, setMathEnabled, texForKatex } from './markdown-math.mjs';
 
 export function workspaceMentionRegex() {
   return /(?:[A-Za-z]:[\\/])?(?:\.{1,2}[\\/])?(?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,16}/g;
@@ -261,6 +261,9 @@ function isAllowedPreviewAttribute(tagName, name, value) {
     return (tagName === 'video' || tagName === 'audio') && isSafePreviewUrl(value, false);
   }
   if (name === 'alt') return tagName === 'img';
+  // The formula placeholders of markdown-math.mjs, filled in by renderMathInHtml.
+  if (name === 'data-math') return tagName === 'span' && (value === 'inline' || value === 'display');
+  if (name === 'data-tex') return tagName === 'span';
   if (name === 'controls' || name === 'muted' || name === 'loop') {
     return (tagName === 'video' || tagName === 'audio') && value === '';
   }
@@ -372,262 +375,71 @@ export function sanitizePreviewHtml(html) {
   return template.innerHTML;
 }
 
-const COMPATIBILITY_DISPLAY_MATH_COMMAND = /\\(?:frac|sqrt|sum|prod|int|iint|iiint|lim|log|ln|sin|cos|tan|theta|alpha|beta|gamma|delta|lambda|mu|pi|sigma|phi|omega|vec|hat|bar|overline|underline|left|right|begin|end|text|mathrm|mathbf|mathbb|mathcal|ce)\b/i;
-const INLINE_MATH_COMMAND = /\\(?:frac|sqrt|sum|prod|int|iint|iiint|lim|log|ln|sin|cos|tan|cot|sec|csc|arcsin|arccos|theta|alpha|beta|gamma|delta|lambda|mu|pi|rho|sigma|phi|omega|Omega|Gamma|Delta|Lambda|Pi|Sigma|Phi|Psi|Omega|vec|hat|bar|overline|underline|left|right|text|mathrm|mathbf|mathbb|mathcal|operatorname|circ|degree|times|cdot|pm|mp|leq|geq|neq|approx|equiv|infty|partial|nabla|forall|exists|rightarrow|longmapsto|to|mapsto|ce)\b/;
-const STRICT_INLINE_SCRIPT = /(?:\^[{]|\^[-+]?\d|_[{]|_[-+]?\d)/;
-const URL_LIKE_TEXT = /\b(?:https?|ftp):\/\/|www\./i;
-const MARKDOWN_ESCAPABLE_TEX_CHARACTERS = new Set(Array.from('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'));
+// Rendered formulas by mode and TeX; null for one KaTeX refused. A streaming
+// reply is rendered again with every delta, and its earlier formulas come
+// from here.
+const MATH_HTML_CACHE_MAX = 500;
+const mathHtmlCache = new Map();
 
-function isStrictInlineMathCandidate(value) {
-  const text = String(value || '').trim();
-  if (!text || text.length > 240 || URL_LIKE_TEXT.test(text)) return false;
-  return INLINE_MATH_COMMAND.test(text) || STRICT_INLINE_SCRIPT.test(text);
-}
-
-function findClosingParenthesis(source, openingIndex) {
-  let depth = 0;
-  for (let index = openingIndex; index < source.length; index += 1) {
-    if (source[index] === '\\') {
-      index += 1;
-      continue;
-    }
-    if (source[index] === '(') depth += 1;
-    if (source[index] === ')') {
-      depth -= 1;
-      if (depth === 0) return index;
-    }
+function katexHtml(tex, display) {
+  const key = `${display ? 'd' : 'i'}${tex}`;
+  if (mathHtmlCache.has(key)) return mathHtmlCache.get(key);
+  let html = null;
+  try {
+    html = globalThis.katex.renderToString(texForKatex(tex), {
+      displayMode: display,
+      throwOnError: true,
+      // Set, not left to KaTeX's default ('warn'): input LaTeX would not
+      // take, and a character KaTeX has no metrics for (an emoji), is set
+      // as well as it can be, without a console warning per render.
+      strict: 'ignore',
+      trust: false,
+      // A command KaTeX does not trust (\href, \url, \includegraphics) is
+      // set as its own name, in this colour: the text's, not red.
+      errorColor: 'inherit',
+    });
+  } catch {
+    // Nothing KaTeX can set (an unknown command, a syntax error): the source
+    // stays as it was written. Prose that got past the delimiter rules ends
+    // here too, so it never shows as a broken formula.
   }
-  return -1;
+  if (mathHtmlCache.size >= MATH_HTML_CACHE_MAX) mathHtmlCache.clear();
+  mathHtmlCache.set(key, html);
+  return html;
 }
-
-function normalizeInlineMathDelimiters(line) {
-  let output = '';
-  let index = 0;
-  let inCode = false;
-  // Only real dollar maths is skipped over; a price's `$` opens nothing.
-  const dollarMathEnds = new Map(scanInlineDollars(line).spans);
-
-  while (index < line.length) {
-    const char = line[index];
-    if (char === '`') {
-      inCode = !inCode;
-      output += char;
-      index += 1;
-      continue;
-    }
-    if (inCode) {
-      output += char;
-      index += 1;
-      continue;
-    }
-    if (char === '$' && dollarMathEnds.has(index)) {
-      const closeIndex = dollarMathEnds.get(index);
-      output += line.slice(index, closeIndex + 1);
-      index = closeIndex + 1;
-      continue;
-    }
-    if (char === '\\' && line[index + 1] === '(') {
-      const closeIndex = line.indexOf('\\)', index + 2);
-      if (closeIndex >= 0) {
-        output += `$${line.slice(index + 2, closeIndex).trim()}$`;
-        index = closeIndex + 2;
-        continue;
-      }
-    }
-    if (char !== '(' || line[index - 1] === '\\') {
-      output += char;
-      index += 1;
-      continue;
-    }
-    const closeIndex = findClosingParenthesis(line, index);
-    if (closeIndex < 0) {
-      output += char;
-      index += 1;
-      continue;
-    }
-    const candidate = line.slice(index + 1, closeIndex);
-    if (!isStrictInlineMathCandidate(candidate)) {
-      output += char;
-      index += 1;
-      continue;
-    }
-    output += `$${candidate.trim()}$`;
-    index = closeIndex + 1;
-  }
-
-  return output;
-}
-
-function protectMarkdownEscapesInMath(source) {
-  const lines = String(source ?? '').split('\n');
-  let inFence = false;
-
-  return lines.map((line) => {
-    if (/^\s*(?:`{3,}|~{3,})/.test(line)) {
-      inFence = !inFence;
-      return line;
-    }
-    if (inFence) return line;
-
-    let output = '';
-    let index = 0;
-    let inCode = false;
-    const dollarMathEnds = new Map(scanInlineDollars(line).spans);
-    while (index < line.length) {
-      if (line[index] === '`') {
-        inCode = !inCode;
-        output += line[index];
-        index += 1;
-        continue;
-      }
-      if (inCode || line[index] !== '$' || line[index - 1] === '\\') {
-        output += line[index];
-        index += 1;
-        continue;
-      }
-      const delimiter = line[index + 1] === '$' ? '$$' : '$';
-      // A single `$` that is a plain dollar sign (a price) opens no formula.
-      const closeIndex = delimiter === '$'
-        ? (dollarMathEnds.has(index) ? dollarMathEnds.get(index) : -1)
-        : line.indexOf(delimiter, index + delimiter.length);
-      if (closeIndex < 0) {
-        output += line[index];
-        index += 1;
-        continue;
-      }
-      const formula = line.slice(index + delimiter.length, closeIndex);
-      const protectedFormula = formula.replace(/\\(.)/g, (match, character) => (
-        MARKDOWN_ESCAPABLE_TEX_CHARACTERS.has(character) ? `\\\\${character}` : match
-      ));
-      output += `${delimiter}${protectedFormula}${delimiter}`;
-      index = closeIndex + delimiter.length;
-    }
-    return output;
-  }).join('\n');
-}
-
-export function normalizeMathDelimiters(source) {
-  const lines = String(source ?? '').split('\n');
-  const normalized = [];
-  let inFence = false;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    let line = lines[index];
-    if (/^\s*(?:`{3,}|~{3,})/.test(line)) {
-      inFence = !inFence;
-      normalized.push(line);
-      continue;
-    }
-    if (inFence || /^(?: {4}|\t)/.test(line)) {
-      normalized.push(line);
-      continue;
-    }
-
-    line = normalizeInlineMathDelimiters(line)
-      .replace(/\\\[([^\n]+?)\\\]/g, (_match, formula) => `$$${formula.trim()}$$`);
-    const delimiter = line.trim();
-    const closingDelimiter = delimiter === '$$'
-      ? '$$'
-      : delimiter === '\\['
-        ? '\\]'
-        : delimiter === '['
-          ? ']'
-          : '';
-    if (!closingDelimiter) {
-      normalized.push(line);
-      continue;
-    }
-
-    let closingIndex = index + 1;
-    while (closingIndex < lines.length && lines[closingIndex].trim() !== closingDelimiter) closingIndex += 1;
-    if (closingIndex >= lines.length) {
-      normalized.push(line);
-      continue;
-    }
-
-    const formula = lines.slice(index + 1, closingIndex).join('\n');
-    if (delimiter === '[' && !COMPATIBILITY_DISPLAY_MATH_COMMAND.test(formula)) {
-      normalized.push(line);
-      continue;
-    }
-    normalized.push(`$$${formula.trim().replace(/[ \t]*\n[ \t]*/g, ' ')}$$`);
-    index = closingIndex;
-  }
-
-  return protectMarkdownEscapesInMath(normalized.join('\n'));
-}
-
-const MATH_IGNORED_TAGS = ['pre', 'code', 'script', 'style', 'textarea', 'option', 'a'];
-const LITERAL_DOLLAR_CLASS = 'literal-dollar';
 
 /**
- * KaTeX's auto-render pairs any two `$` in a block, so "$5 … $9" would become
- * one formula. Each plain dollar sign (see math-dollars.mjs) is moved into a
- * span of its own that auto-render skips; with no partner in its text node,
- * it stays a dollar sign.
+ * Fills the formula placeholders of markdown-math.mjs with KaTeX's rendering.
+ * It runs after the sanitiser: KaTeX generates its own layout styles, which
+ * are necessary for fractions, scripts and matrices and which that pass would
+ * strip. Without KaTeX the placeholders stay, and read as the source.
  */
-function isolateLiteralDollars(container) {
-  const ignored = MATH_IGNORED_TAGS.join(',');
-  const walker = document.createTreeWalker(container, 4 /* NodeFilter.SHOW_TEXT */);
-  const textNodes = [];
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    if (node.nodeValue.includes('$') && !node.parentElement?.closest(ignored)) textNodes.push(node);
-  }
-  for (const node of textNodes) {
-    const parts = splitAtLiteralDollars(node.nodeValue);
-    if (!parts.some((part) => part.literal)) continue;
-    const fragment = document.createDocumentFragment();
-    for (const part of parts) {
-      if (!part.literal) {
-        fragment.appendChild(document.createTextNode(part.text));
-        continue;
-      }
-      const span = document.createElement('span');
-      span.className = LITERAL_DOLLAR_CLASS;
-      span.textContent = part.text;
-      fragment.appendChild(span);
-    }
-    node.parentNode.replaceChild(fragment, node);
-  }
-}
-
 function renderMathInHtml(html) {
-  const renderMathInElement = globalThis.renderMathInElement;
-  if (typeof renderMathInElement !== 'function' || !globalThis.document?.createElement) return html;
+  if (!html.includes('data-math=')) return html;
+  if (typeof globalThis.katex?.renderToString !== 'function' || !globalThis.document?.createElement) return html;
 
   const container = document.createElement('div');
   container.innerHTML = html;
-  try {
-    isolateLiteralDollars(container);
-    renderMathInElement(container, {
-      delimiters: [
-        { left: '$$', right: '$$', display: true },
-        { left: '\\[', right: '\\]', display: true },
-        { left: '\\(', right: '\\)', display: false },
-        { left: '$', right: '$', display: false },
-      ],
-      ignoredTags: MATH_IGNORED_TAGS,
-      ignoredClasses: [LITERAL_DOLLAR_CLASS],
-      throwOnError: false,
-      strict: 'ignore',
-      trust: false,
-    });
-  } catch (error) {
-    console.warn('[markdown] could not render mathematical notation', error);
-    return html;
+  for (const placeholder of container.querySelectorAll('span[data-math]')) {
+    const display = placeholder.getAttribute('data-math') === 'display';
+    const rendered = katexHtml(placeholder.getAttribute('data-tex') || '', display);
+    placeholder.removeAttribute('data-tex');
+    if (rendered === null) placeholder.classList.add('math-source');
+    else placeholder.innerHTML = rendered;
   }
-  // The original Markdown was sanitized before this pass. KaTeX generates its own
-  // layout styles, which are necessary for fractions, scripts, and matrices.
   return container.innerHTML;
 }
 
 export function renderMarkdownPreview(source, allowEmbeddedHtml) {
-  const sourceText = normalizeMathDelimiters(source);
+  const sourceText = String(source ?? '');
   const fallbackEscaped = `<p>${escHtml(sourceText).replace(/\n/g, '<br>')}</p>`;
   const markdown = globalThis.marked;
   if (!markdown || typeof markdown.parse !== 'function' || typeof markdown.Renderer !== 'function') {
     return fallbackEscaped;
   }
+  // A message without a maths delimiter, or a very long one, is parsed
+  // without the maths rules.
+  setMathEnabled(mathAppliesTo(sourceText));
   if (allowEmbeddedHtml) {
     const parsed = markdown.parse(sourceText);
     if (typeof parsed !== 'string') return fallbackEscaped;

@@ -874,7 +874,7 @@ test('ask/autopilot nudges ride on the message text and dedupe until the mode ch
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
   // First delivered prompt of the worker also carries the one-time media-embed
   // guidance, ahead of the mode nudge.
-  assert.match(started[0].message.text, /^## Embedding media in replies[\s\S]*\[Relay mode: ask\][\s\S]*hello$/);
+  assert.match(started[0].message.text, /^## Embedding media in replies[\s\S]*## Formulas in replies[\s\S]*\[Relay mode: ask\][\s\S]*hello$/);
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
   assert.equal(started[1].message.text, 'hello', 'same mode must not re-inject');
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', relayMode: 'agent' } });

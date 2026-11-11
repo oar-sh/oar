@@ -123,6 +123,8 @@ function stripAttachmentPromptArtifacts(text) {
 // served to the browser and cannot import shared/, so the block is matched
 // structurally — the heading plus its single paragraph — rather than verbatim.
 const MEDIA_EMBED_BLOCK_PATTERN = /##\s*Embedding media in replies\s+[\s\S]*?(?=\n\s*\n|$)/gi;
+// The formula guidance (shared/math-instructions.mjs) follows it, in the same shape.
+const MATH_BLOCK_PATTERN = /##\s*Formulas in replies\s+[\s\S]*?(?=\n\s*\n|$)/gi;
 
 // A steered message's hidden note (shared/steer-note.mjs) leads the prompt the
 // runtime stored, right after any mode marker. Matched by its stable opening
@@ -166,6 +168,7 @@ export function stripRelayPromptContext(text, relayMode = '', options = {}) {
   const origin = options && typeof options === 'object' ? options.origin : null;
   const value = stripAttachmentPromptArtifacts(text)
     .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
+    .replace(MATH_BLOCK_PATTERN, '')
     .trim();
   if (!value) return '';
   const patterns = buildPromptPrefixPatterns(relayMode);

@@ -1,8 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
 
-// The settings modal was split from one long scrolling column into four tab
-// panels (General | Providers | Previews | Notifications) with per-provider
+// The settings modal was split from one long scrolling column into tab
+// panels (General | Appearance | Providers | … ) with per-provider
 // sub-tabs. settings-modal.js still looks every control up by ID, so the
 // restructure is only safe as long as each legacy ID survives the move — that
 // is what the bulk of this spec pins down.
@@ -135,8 +135,9 @@ const LEGACY_SETTINGS_IDS = [
   "update-outcome-dismiss-btn",
   // Relays (remote relays, added with the tab — settings-modal.js and
   // remote-relays-settings.js look these up by ID too)
+  // remote-relays-self-name, a read-only copy of the relay name, went when
+  // the name field itself (pwa-app-name-input, above) moved to this tab.
   "settings-panel-relays",
-  "remote-relays-self-name",
   "remote-relays-public-url-input",
   "remote-relays-self-status",
   "remote-relays-inbound-toggle",
@@ -160,7 +161,7 @@ const LEGACY_SETTINGS_IDS = [
   "settings-shares-status",
 ];
 
-const TABS = ["general", "providers", "relays", "previews", "shares", "notifications", "features"];
+const TABS = ["general", "appearance", "providers", "relays", "previews", "shares", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-api", "claude-cloud", "grok", "cursor", "deepseek"];
@@ -211,7 +212,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders seven top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders eight top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 
@@ -220,7 +221,8 @@ test.describe("tabbed settings modal", () => {
     await expectActiveTab(page, "general");
 
     // A control from the visible panel is reachable; one from a hidden panel is not.
-    await expect(page.locator("#theme-select")).toBeVisible();
+    await expect(page.locator("#scroll-on-send-toggle")).toBeVisible();
+    await expect(page.locator("#theme-select")).toBeHidden();
     await expect(page.locator("#push-enabled-toggle")).toBeHidden();
 
     for (const tab of TABS) {
@@ -302,6 +304,34 @@ test.describe("tabbed settings modal", () => {
     await expectActiveProviderTab(page, "grok");
   });
 
+  test("a browser that last had General open still opens there, with Appearance one tab along", async ({ page }) => {
+    await loadApp(page);
+    // The remembered tab from before Appearance had a tab of its own.
+    await page.evaluate(() => localStorage.setItem("copilot_settings_tab", "general"));
+    await loadApp(page);
+    await openSettings(page);
+    await expectActiveTab(page, "general");
+    await expect(page.locator("#settings-tab-appearance")).toHaveText("Appearance");
+
+    await page.locator("#settings-tab-appearance").click();
+    await expectActiveTab(page, "appearance");
+    await expect(page.locator("#appearance-browser-note")).toBeVisible();
+    for (const id of ["theme-select", "font-scale-select", "thoughts-expanded-toggle", "live-activity-cap-slider", "stream-view-toggle", "show-suspend-host-toggle"]) {
+      await expect(page.locator(`#settings-panel-appearance #${id}`)).toBeVisible();
+    }
+    expect(await page.evaluate(() => localStorage.getItem("copilot_settings_tab"))).toBe("appearance");
+
+    // The relay's own name and restart settings: at the top of Relays.
+    await openSettings(page, "relays");
+    for (const id of ["pwa-app-name-input", "restart-resume-toggle", "relay-restart-max-wait-select"]) {
+      await expect(page.locator(`#settings-panel-relays #${id}`)).toBeVisible();
+    }
+    // An old deep link to General lands on General.
+    await page.evaluate(() => window.closeSettingsModal());
+    await openSettings(page, "general");
+    await expectActiveTab(page, "general");
+  });
+
   test("Settings takes the focus on open; Escape closes it and reaches nothing under it", async ({ page }) => {
     await loadApp(page);
     await page.locator("#new-conv-btn").focus();
@@ -309,7 +339,7 @@ test.describe("tabbed settings modal", () => {
     // The selected tab has the focus, so the arrows and Escape work at once.
     await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("settings-tab-general");
     await page.keyboard.press("ArrowRight");
-    await expectActiveTab(page, "providers");
+    await expectActiveTab(page, "appearance");
 
     // What lies underneath listens on the document; none of it hears this Escape.
     await page.evaluate(() => {

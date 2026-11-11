@@ -8,7 +8,7 @@
  * The request waits until no turn is processing (relay-shutdown-gate.mjs);
  * while it waits, no pending row is handed to a worker. A turn that runs for
  * hours would hold every session's new messages for hours, so the wait has a
- * maximum (Settings › General). Past it the relay does not force anything:
+ * maximum (Settings › Relays). Past it the relay does not force anything:
  * the request stays queued and turns into a question — restart now, keep
  * waiting another period, or cancel — that the banner shows and a push
  * notification announces once. Only the user, or an API caller that says

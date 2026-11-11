@@ -32,7 +32,7 @@ const RELAY_WIDE_ENTRIES = [
   "chat-menu-settings",
   "chat-menu-about",
   "chat-menu-restart-relay",
-  // Shown by default; Settings → General can hide it.
+  // Shown by default; Settings → Appearance can hide it.
   "chat-menu-suspend-host",
 ];
 

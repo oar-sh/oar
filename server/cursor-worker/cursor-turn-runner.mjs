@@ -20,6 +20,7 @@ import {
   cursorSubagentRosterFingerprint,
 } from './cursor-subagent-roster.mjs';
 import { createAskUserBridge } from '../../shared/ask-user-bridge.mjs';
+import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { resolveFallbackContextLimitTokens } from '../../shared/context-window-fallbacks.mjs';
@@ -586,7 +587,8 @@ export function createCursorTurnRunner({
       await ensureAgentHandle(message, model);
       const userMessage = buildUserMessageImpl(message);
       const modeNudge = cursorModeNudge(message.relayMode, lastNudgedRelayMode);
-      const mediaGuidance = mediaGuidanceSent ? '' : renderMediaEmbedInstructionBlock();
+      // The formula notation rides with it, for the same reason.
+      const mediaGuidance = mediaGuidanceSent ? '' : `${renderMediaEmbedInstructionBlock()}\n\n${renderMathInstructionBlock()}`;
       if (modeNudge || mediaGuidance) {
         userMessage.text = [mediaGuidance, modeNudge, userMessage.text].filter(Boolean).join('\n\n');
       }

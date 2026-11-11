@@ -876,6 +876,8 @@ export function createClaudeSessionRunner({
         modelUsage: null,
       },
       planBoardPosted: false,
+      // The CLI handed a plan over (ExitPlanMode), whether or not a card came of it.
+      planBoardRequested: false,
       // The CLI process the turn ran in, as its usage report names it: taken
       // from the process here and again when the context is made active, and
       // read from the context at finalize — a late continuation flush
@@ -1569,6 +1571,7 @@ export function createClaudeSessionRunner({
         state: ctx.state,
         responseModel,
         planBoardPosted: ctx.planBoardPosted,
+        planBoardRequested: ctx.planBoardRequested,
         consumedSteerIds,
       });
     }
@@ -3789,6 +3792,7 @@ export function createClaudeSessionRunner({
       onExitPlanMode: async (input) => {
         const ctx = processRef.activeCtx || processRef.pendingDelivered[0]?.ctx || null;
         if (!ctx?.message?.id) return false;
+        ctx.planBoardRequested = true;
         const posted = await publisher.publishPlanBoard(ctx.message, input);
         if (posted) ctx.planBoardPosted = true;
         return posted;

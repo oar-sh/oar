@@ -6,7 +6,6 @@ import {
   classifyClaudeResultFailure,
   claudeFailureGuidance,
 } from './claude-turn-failure.mjs';
-import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.mjs';
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
@@ -34,9 +33,10 @@ export function isStaleAttemptError(error) {
 export { buildSteerSettleFailure, steerSettleFailureText };
 export const STEER_SETTLE_FAILED_TEXT = steerSettleFailureText('folded');
 
-export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}) {
+export function buildClaudePlanReadyBoardPayload({ message, planText = '', planFilePath = '' } = {}) {
   const summary = String(planText || '').trim();
   if (!summary) return null;
+  const filePath = String(planFilePath || '').trim();
   return {
     queueId: message?.id,
     messageId: message?.id,
@@ -52,6 +52,8 @@ export function buildClaudePlanReadyBoardPayload({ message, planText = '' } = {}
       queueMessageId: message?.id || null,
       conversationId: message?.conversationId || null,
       relayMode: message?.relayMode || 'agent',
+      // Named on the card when the relay has to cut a very long plan.
+      ...(filePath ? { planFilePath: filePath } : {}),
     },
   };
 }
@@ -797,13 +799,13 @@ export function createClaudeTurnPublisher({
    * Post the plan-ready review board for an ExitPlanMode interception. The CLI
    * sends both `plan` and `planFilePath`; the inline plan is authoritative, the
    * plan file covers CLI versions that stop inlining it. Returns false when no
-   * plan text could be recovered so the caller's plan-shaped-final-text
-   * fallback still gets a chance to post the board.
+   * plan text could be recovered, so the turn's reply can stand in for it
+   * (see publishCompletedTurn).
    */
   async function publishPlanBoard(message, input) {
     let planText = String(input?.plan || input?.summary || '').trim();
+    const planFilePath = String(input?.planFilePath || '').trim();
     if (!planText) {
-      const planFilePath = String(input?.planFilePath || '').trim();
       if (planFilePath) {
         try {
           planText = String(fs.readFileSync(planFilePath, 'utf8') || '').trim();
@@ -812,7 +814,7 @@ export function createClaudeTurnPublisher({
         }
       }
     }
-    const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText });
+    const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText, planFilePath });
     if (!boardPayload) return false;
     await api('POST', '/api/relay-board', boardPayload).catch((error) => {
       dbg('plan board publish failed', error?.message || String(error));
@@ -822,18 +824,30 @@ export function createClaudeTurnPublisher({
 
   /**
    * Publish a completed (non-error, non-aborted) turn: final stream snapshot,
-   * plan-mode fallback board, response row. Mirrors the pre-session-process
-   * turn runner's tail exactly.
+   * plan-mode fallback board, response row.
+   *
+   * A plan card comes only from a plan hand-over (ExitPlanMode). The fallback
+   * covers one case: the CLI handed a plan over but its text could not be
+   * read, so the reply is the plan. A reply is never taken for a plan because
+   * of its list lines: in a session that stays in plan mode, every status
+   * reply with two bullets got a card.
    */
-  async function publishCompletedTurn({ message, state, responseModel, planBoardPosted, consumedSteerIds = null }) {
+  async function publishCompletedTurn({
+    message,
+    state,
+    responseModel,
+    planBoardPosted,
+    planBoardRequested = false,
+    consumedSteerIds = null,
+  }) {
     const result = state.result;
     const finalText = String(
       state.resultTexts.join('\n\n') || result?.text || state.lastStreamedText || '',
     ).trim();
     if (
-      !planBoardPosted
+      planBoardRequested
+      && !planBoardPosted
       && String(message.relayMode || '').trim().toLowerCase() === 'plan'
-      && countPlanLikeLines(finalText) >= 2
     ) {
       const boardPayload = buildClaudePlanReadyBoardPayload({ message, planText: finalText });
       if (boardPayload) {

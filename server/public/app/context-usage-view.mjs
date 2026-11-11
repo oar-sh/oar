@@ -356,7 +356,7 @@ const THOUGHTS_EXPANDED_CHOICES = Object.freeze([
 ]);
 
 /**
- * The mirror of Settings › General "Expand thoughts while an agent works", for
+ * The mirror of Settings › Appearance "Expand thoughts while an agent works", for
  * every provider. A setting of this browser, so nothing goes to the relay:
  * the buttons write thoughts-preference.mjs and both places follow it.
  *
@@ -390,7 +390,7 @@ const STREAM_VIEW_CHOICES = Object.freeze([
 ]);
 
 /**
- * The mirror of Settings › General "Stream view", for every provider. A
+ * The mirror of Settings › Appearance "Stream view", for every provider. A
  * setting of this browser (stream-view-preference.mjs); nothing goes to the
  * relay.
  *

@@ -112,7 +112,7 @@ Enabling Claude also runs model discovery against the Agent SDK and adds the dis
 What Claude conversations support:
 
 - Per-message model and reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`), changeable between turns, plus **Ultracode** on models that support `xhigh` — `xhigh` effort *and* multi-agent workflow orchestration, at a matching jump in token use
-- All four relay modes — `plan` maps to the SDK's plan permission mode and produces a **Plan ready** board, `ask` and `autopilot` adjust the system prompt
+- All four relay modes — `plan` maps to the SDK's plan permission mode and produces a **Plan ready** board when the agent hands its plan over (see [the plan card](web-ui.md#relay-modes)), `ask` and `autopilot` adjust the system prompt
 - Image and file attachments (images up to 5 MB are inlined; larger files are passed as paths for Claude to read)
 - Question cards (including multi-select), thinking/thought streams, live reply streaming, and nested subagent bubbles
 - **Mid-turn steering** with **Steer** / **Queue**, **Stop** on the reply bubble, and **Resend** for steered messages a Stop cut off (see [While a turn runs](web-ui.md#while-a-turn-runs))

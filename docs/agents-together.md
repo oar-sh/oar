@@ -22,7 +22,7 @@ but removing a relay does not revoke a token it already holds: rotate the token 
 that is already paired keeps the address and token stored for it when it introduces itself again;
 change those in **Settings → Relays**.
 
-A relay's name is the **Relay name** under **General** (it also names the installed app); when it
+A relay's name is the **Relay name** under **Relays** (it also names the installed app); when it
 is empty, the machine's hostname is used.
 
 **Mention a relay to unlock it.** Agents can see which relays are paired, but a relay stays
@@ -36,7 +36,10 @@ the conversation, whatever prompts arrive in it later.
 relay is open to the conversation from then on, within what **Agents may** allows, so the agent
 that was asked can answer, ask back or report later. A prompt from an agent never unlocks any
 other relay. A prompt that already crossed two relays is not passed on to a third one unless you
-unlocked that relay yourself; reading and waiting are never limited. When the agent of a
+unlocked that relay yourself; reading and waiting are never limited. A session that an agent on a
+paired relay started can always send to the session that started it, also when its turn acts on
+prompts from sessions on its own relay, so its report gets back the way its work came; another
+session on that relay, a third relay, or a new session is still held to the limit. When the agent of a
 conversation has sent 30 prompts to agents on other relays without a message from you, the next
 one asks you first with a question card; **Allow** starts the count again.
 

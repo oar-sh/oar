@@ -10,6 +10,7 @@ import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../ser
 import { OAR_MCP_SERVER_NAME, buildOarMcpServerLaunch, isOarMcpServerDisabled } from '../mcp/oar-mcp-server.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
 import { fetchRemoteRelayInflight } from '../../shared/remote-relay-tool-core.mjs';
+import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
 import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
@@ -476,7 +477,8 @@ export function createGrokTurnRunner({
       : await Promise.resolve()
         .then(() => getPreviewInstructions?.({ conversationId: message.conversationId || sdkSessionId || '' }))
         .catch(() => '');
-    const mediaBlock = mediaInstructionsSent ? '' : renderMediaEmbedInstructionBlock();
+    // The formula notation rides with the media block, once per worker.
+    const mediaBlock = mediaInstructionsSent ? '' : `${renderMediaEmbedInstructionBlock()}\n\n${renderMathInstructionBlock()}`;
     const promptText = [previewBlock, mediaBlock, modeNudge, userText].filter(Boolean).join('\n\n');
     const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
 

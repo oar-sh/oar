@@ -114,10 +114,16 @@ test('two threads writing to one turn at the same time never get the same number
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-turn-seq-'));
   try {
     const file = path.join(dir, 'fixture.db');
-    makeDb(file).close();
+    // WAL, as the relay opens its database: readers never wait for the
+    // writer, so only the writes race. In rollback-journal mode the schema
+    // reads of one thread's setup starved behind the other's commits.
+    const setup = makeDb(file);
+    setup.pragma('journal_mode = WAL');
+    setup.close();
     const repoUrl = new URL('./question-repository.mjs', import.meta.url).href;
-    // Each thread writes 60 rows as fast as it can; the two race for the
-    // write lock the whole time.
+    // Both threads prepare their statements first and start together; then
+    // each writes 60 rows as fast as it can, and the two race for the write
+    // lock the whole time.
     const source = `
       import { workerData, parentPort } from 'node:worker_threads';
       const { default: Database } = await import(workerData.sqliteUrl);
@@ -125,6 +131,10 @@ test('two threads writing to one turn at the same time never get the same number
       const db = new Database(workerData.file);
       db.pragma('busy_timeout = 5000');
       const repo = createQuestionRepository(db);
+      await new Promise((resolve) => {
+        parentPort.once('message', resolve);
+        parentPort.postMessage('ready');
+      });
       for (let n = 0; n < 60; n += 1) {
         db.transaction(() => {
           const turnSeq = repo.nextTurnSeq('q-race');
@@ -138,12 +148,17 @@ test('two threads writing to one turn at the same time never get the same number
       db.close();
       parentPort.postMessage('done');
     `;
-    const run = (kind) => new Promise((resolve, reject) => {
+    const workers = ['activity', 'thought'].map((kind) => {
       const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(source)}`), { workerData: { file, repoUrl, sqliteUrl: import.meta.resolve('better-sqlite3'), kind } });
-      worker.once('message', resolve);
-      worker.once('error', reject);
+      const failed = new Promise((resolve, reject) => worker.once('error', reject));
+      const next = (expected) => Promise.race([failed, new Promise((resolve) => worker.once('message', resolve))])
+        .then((message) => assert.equal(message, expected));
+      return { worker, next };
     });
-    await Promise.all([run('activity'), run('thought')]);
+    await Promise.all(workers.map(({ next }) => next('ready')));
+    const done = workers.map(({ next }) => next('done'));
+    for (const { worker } of workers) worker.postMessage('go');
+    await Promise.all(done);
     const db = new Database(file);
     const given = [
       ...db.prepare(`SELECT turn_seq FROM relay_activity WHERE queue_message_id = 'q-race'`).all(),

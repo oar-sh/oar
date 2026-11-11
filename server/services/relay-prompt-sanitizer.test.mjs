@@ -37,6 +37,13 @@ test('stripRelayPromptContext drops the injected media-embed guidance block verb
   assert.equal(output, 'hello');
 });
 
+test('stripRelayPromptContext drops the formula guidance block that follows it', async () => {
+  const { renderMediaEmbedInstructionBlock } = await import('../../shared/media-embed-instructions.mjs');
+  const { renderMathInstructionBlock } = await import('../../shared/math-instructions.mjs');
+  const input = `${renderMediaEmbedInstructionBlock()}\n\n${renderMathInstructionBlock()}\n\n[Relay mode: agent] what is $x^2$ for x = 3?`;
+  assert.equal(stripRelayPromptContext(input, 'agent'), 'what is $x^2$ for x = 3?');
+});
+
 test('a steered message\'s hidden note is stripped, with or without a mode marker before it', () => {
   const note = '[Sent while you were still working on my previous message. If that request is not finished yet, finish it too; do not drop it unless this message says so.]';
   assert.equal(stripRelayPromptContext(`${note}\n\nalso do X`), 'also do X');

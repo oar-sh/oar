@@ -4,8 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
-// "Tool lines shown while an agent works" in Settings › General ›
-// Appearance. Rendered against the real index.html.
+// "Tool lines shown while an agent works" in Settings › Appearance.
+// Rendered against the real index.html.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const dom = new JSDOM(indexHtml, { url: 'http://localhost/' });
 const { document } = dom.window;
@@ -16,9 +16,9 @@ const { LIVE_ACTIVITY_CAP_STORAGE_KEY, syncLiveActivityCapSlider, updateLiveActi
 const slider = () => document.getElementById('live-activity-cap-slider');
 const value = () => document.getElementById('live-activity-cap-value');
 
-test('the slider sits in Settings › General › Appearance at 50 lines, 10…500 plus no limit', () => {
+test('the slider sits in Settings › Appearance at 50 lines, 10…500 plus no limit', () => {
   assert.equal(document.querySelectorAll('#settings-modal [id="live-activity-cap-slider"]').length, 1);
-  assert.equal(slider().closest('.settings-section')?.id, 'settings-section-appearance');
+  assert.equal(slider().closest('[data-settings-panel]')?.id, 'settings-panel-appearance');
   assert.equal(slider().type, 'range');
   assert.equal(slider().min, '10');
   assert.equal(slider().max, '510');
@@ -31,7 +31,7 @@ test('the slider sits in Settings › General › Appearance at 50 lines, 10…5
   const help = slider().closest('.settings-row').nextElementSibling;
   assert.ok(help.classList.contains('settings-help'));
   assert.match(help.textContent, /^Per agent: the main agent and each sub-agent keep this many of their newest tool lines/);
-  assert.match(help.textContent, /The relay keeps up to 500 per agent\. Saved in this browser\.$/);
+  assert.match(help.textContent, /The relay keeps up to 500 per agent\.$/);
 });
 
 test('it comes after the thoughts toggle and before the Suspend host row', () => {

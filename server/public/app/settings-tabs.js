@@ -1,9 +1,13 @@
 import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
 
 const SETTINGS_TAB_STORAGE_KEY = 'copilot_settings_tab';
+export const SETTINGS_TAB_SHOWN_EVENT = 'oar:settings-tab-shown';
 const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 
-const SETTINGS_TABS = ['general', 'providers', 'relays', 'previews', 'shares', 'notifications', 'features'];
+// General leads: `SETTINGS_TABS[0]` is the tab a first-time visitor lands on.
+// A remembered tab or a deep link to General still lands there after its
+// Appearance block got a tab of its own.
+const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'previews', 'shares', 'notifications', 'features'];
 // Copilot leads: it is the default provider, and `SETTINGS_PROVIDER_TABS[0]`
 // is also the sub-tab a first-time visitor lands on.
 const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'claude-api', 'claude-cloud', 'grok', 'cursor', 'deepseek'];
@@ -122,8 +126,13 @@ export function selectSettingsTab(tab, providerTab) {
   ensureSettingsTabsBound();
   const nextTab = normalizeTab(tab, SETTINGS_TABS) || storedSettingsTab();
   const nextProviderTab = normalizeTab(providerTab, SETTINGS_PROVIDER_TABS) || storedProviderTab();
+  const previousTab = document.querySelector('#settings-modal [data-settings-tab][aria-selected="true"]')?.dataset.settingsTab;
   if (applyTabState('data-settings-tab', 'data-settings-panel', nextTab)) {
     writeLocalStorage(SETTINGS_TAB_STORAGE_KEY, nextTab);
+    // A tab switched to re-reads what it shows (Relays: the relay name).
+    if (nextTab !== previousTab && typeof window !== 'undefined' && window.CustomEvent) {
+      window.dispatchEvent(new window.CustomEvent(SETTINGS_TAB_SHOWN_EVENT, { detail: { tab: nextTab } }));
+    }
   }
   if (applyTabState('data-settings-provider-tab', 'data-settings-provider-panel', nextProviderTab)) {
     writeLocalStorage(SETTINGS_PROVIDER_TAB_STORAGE_KEY, nextProviderTab);

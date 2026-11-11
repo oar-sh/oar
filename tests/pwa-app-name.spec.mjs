@@ -22,7 +22,7 @@ async function fetchManifest(request, baseURL, query = "") {
 }
 
 async function setAppNameViaUi(page, value) {
-  await page.evaluate(() => window.openSettingsModal("general"));
+  await page.evaluate(() => window.openSettingsModal("relays"));
   await expect(page.locator("#settings-modal")).toHaveClass(/visible/);
   const input = page.locator("#pwa-app-name-input");
   await input.fill(value);
@@ -55,6 +55,20 @@ test.describe("pwa app name", () => {
 
     // Clearing the input reverts the manifest to the default name.
     await setAppNameViaUi(page, "");
+    await expect.poll(async () => (await fetchManifest(request, baseURL)).name).toBe("OAR");
+  });
+
+  test("each rename made here says so, several in a row", async ({ page, request, baseURL }) => {
+    await loadApp(page);
+    // The relay announces a rename to every open page before it answers the
+    // one that made it; that page still says the name was saved.
+    for (const name of ["Rename One", "Rename Two", "Rename Three", "Rename Four"]) {
+      await setAppNameViaUi(page, name);
+      await expect(page.locator("#relay-toast")).toHaveText(`Relay name updated to "${name}".`);
+      await expect(page.locator("#pwa-app-name-input")).toHaveValue(name);
+    }
+    await setAppNameViaUi(page, "");
+    await expect(page.locator("#relay-toast")).toHaveText("Relay name reset to default.");
     await expect.poll(async () => (await fetchManifest(request, baseURL)).name).toBe("OAR");
   });
 

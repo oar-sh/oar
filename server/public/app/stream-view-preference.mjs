@@ -1,4 +1,4 @@
-// "Stream view" (Settings › General › Appearance, and its mirror in the 🧠
+// "Stream view" (Settings › Appearance, and its mirror in the 🧠
 // modal): an agent turn's thoughts, tool calls and reply as one list in the
 // order they happened, live and in the finished message. A setting of this
 // browser, kept in localStorage like the thoughts one; off unless switched

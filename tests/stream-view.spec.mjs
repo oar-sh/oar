@@ -167,7 +167,7 @@ test.describe("stream view", () => {
       }
 
       // Switching it in Settings changes the transcript at once.
-      await page.evaluate(() => window.openSettingsModal("general"));
+      await page.evaluate(() => window.openSettingsModal("appearance"));
       await page.locator("#stream-view-toggle").check();
       await page.keyboard.press("Escape");
       await expect(page.locator(".msg.assistant .msg-turn-stream > *")).toHaveCount(7);

@@ -850,6 +850,59 @@ test('the hop limit stops a prompt on its way to a third relay, and reading is n
   assert.equal(alsoRefused.body.code, CODES.hopLimit);
 });
 
+// A session another relay's agent created, whose turn acts on a prompt from a
+// session of its own relay (or on that and its creator's prompt together):
+// the origins are not the creator's alone, so `answering` does not hold, and
+// the hops the prompts carried in are past the limit. Its report to the
+// session that created it went nowhere.
+test('a session an agent created may always send to the session that created it, and to no other relay', async () => {
+  const reportingSession = (originRelayIds) => {
+    const fixture = setup({
+      relays: [LINUX, { ...SPARE, permission: 'full', lastStatus: 'online' }],
+      unlocked: [],
+      contacts: [LINUX.relayId, SPARE.relayId],
+      caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 1, originRelayIds },
+    });
+    fixture.local.addConversation({ id: 'c-1', title: 'reporting session', origin: { kind: 'agent', relayId: LINUX.relayId, relayName: 'linux-test', conversationId: 'conv-1', hops: REMOTE_RELAY_LIMITS.hopLimit } });
+    withSession(fixture.remote);
+    fixture.remote.addConversation({ id: 'conv-other', title: 'another session there' });
+    return fixture;
+  };
+  for (const originRelayIds of [['relay-self-id'], [LINUX.relayId, 'relay-self-id']]) {
+    const { run, remote } = reportingSession(originRelayIds);
+    const sent = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+    assert.equal(sent.status, 200, `${originRelayIds}: ${JSON.stringify(sent.body)}`);
+    // The hop count still grows: the creator's relay sees how far it came.
+    assert.equal(remote.callsTo('POST', '/api/message')[0].hops, REMOTE_RELAY_LIMITS.hopLimit + 2);
+
+    // Another session on the creator's relay is not the creator.
+    const elsewhere = await run('send', { relay: 'linux-test', session: 'conv-other', text: PROMPT, wait_seconds: 0 });
+    assert.equal(elsewhere.body.code, CODES.hopLimit, originRelayIds.join(','));
+    // Nor is a third relay.
+    const third = await run('send', { relay: 'spare-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+    assert.equal(third.body.code, CODES.hopLimit, originRelayIds.join(','));
+    // Nor a new session on the creator's relay.
+    const created = await run('create_session', { relay: 'linux-test', text: PROMPT, wait_seconds: 0 });
+    assert.equal(created.body.code, CODES.hopLimit, originRelayIds.join(','));
+  }
+});
+
+test('a session the user started gets no creator exemption: a two-hop chain is still refused', async () => {
+  const { run, local, remote } = setup({
+    unlocked: [],
+    contacts: [LINUX.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit, originRelayIds: ['relay-self-id'] },
+  });
+  local.addConversation({ id: 'c-1', title: 'own session' });
+  withSession(remote);
+  const refused = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(refused.body.code, CODES.hopLimit);
+  // A session an agent of this relay created names this relay, not linux-test.
+  local.conversations.get('c-1').origin = { kind: 'agent', relayId: 'relay-self-id', conversationId: 'conv-1', local: true, hops: 0 };
+  const stillRefused = await run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(stillRefused.body.code, CODES.hopLimit);
+});
+
 test('after 30 prompts to other agents without a word from the user, the user is asked', async () => {
   const humans = { latest: 'm-human-1' };
   const { run, remote, approvals, clock } = setup({ humans });

@@ -98,8 +98,8 @@ test.describe.serial("Settings → Relays with a second relay", () => {
     await loadApp(page);
     await openRelaysTab(page);
 
-    // This relay: its name (edited under General) and the public address.
-    await expect(page.locator("#remote-relays-self-name")).toHaveText("win-test");
+    // This relay: its name (edited here) and the public address.
+    await expect(page.locator("#pwa-app-name-input")).toBeVisible();
     await expect(page.locator("#remote-relays-inbound-toggle")).toBeChecked();
     const publicUrl = page.locator("#remote-relays-public-url-input");
     await publicUrl.fill(relayBaseUrl());

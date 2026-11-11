@@ -4127,6 +4127,24 @@ export function createRemoteRelayDispatcher({
     return null;
   }
 
+  /**
+   * Is `session` on `relay` the session whose agent created this conversation
+   * (its origin, which an agent of this relay never sets for a paired one)?
+   */
+  function sendsToCreator(conversationId, relay, session) {
+    if (relay.local === true || !toText(relay.relayId) || !toText(session)) return false;
+    let origin = null;
+    try {
+      origin = repository.getConversationOrigin?.(conversationId) || null;
+    } catch {
+      return false;
+    }
+    return !!origin && origin.local !== true
+      && toText(origin.relayId) === toText(relay.relayId)
+      && !!toText(origin.conversationId)
+      && toText(origin.conversationId) === toText(session);
+  }
+
   async function runRelayAction({ conversationId, action, args, req, signal, waitNote }) {
     const target = await resolveTarget(args.relay);
     if (!target.relay) return target.failure;
@@ -4189,7 +4207,11 @@ export function createRemoteRelayDispatcher({
     const origins = Array.isArray(caller.originRelayIds) ? caller.originRelayIds.map(toText) : [];
     const answering = !!toText(relay.relayId) && origins.length > 0
       && origins.every((id) => id === toText(relay.relayId));
-    if (write && access !== 'user' && !answering && hops > REMOTE_RELAY_LIMITS.hopLimit) {
+    // A session another relay's agent created may always send to the session
+    // that created it, whatever else its turn acts on (a prompt of a session
+    // on this relay, say): its reports go back the way its work came.
+    if (write && access !== 'user' && !answering && hops > REMOTE_RELAY_LIMITS.hopLimit
+      && !(action === 'send' && sendsToCreator(conversationId, relay, args.session))) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.hopLimit,
         `This turn acts on a prompt from another relay's agent (hop ${hops - 1}); passing it on to relay "${relay.name}" would pass the limit of ${REMOTE_RELAY_LIMITS.hopLimit} hops. The user can allow it by mentioning @${relay.name} in this conversation.`,
         { relay: relay.name }));

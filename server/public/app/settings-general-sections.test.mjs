@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
 // Settings › General reads as headed groups. Rendered against the real
-// index.html: the six sections in order, every control in exactly one of
+// index.html: the five sections in order, every control in exactly one of
 // them, nothing loose in the panel.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const { document } = new JSDOM(indexHtml).window;
@@ -13,7 +13,6 @@ const { document } = new JSDOM(indexHtml).window;
 const panel = () => document.getElementById('settings-panel-general');
 
 const EXPECTED = [
-  ['appearance', 'Appearance', ['theme-select', 'font-scale-select', 'thoughts-expanded-toggle', 'live-activity-cap-slider', 'stream-view-toggle', 'show-suspend-host-toggle']],
   ['reading', 'Reading', ['scroll-on-send-toggle', 'conversation-window-retention-slider']],
   ['turns', 'Turns and tasks', [
     'turn-ceiling-slider',
@@ -22,17 +21,15 @@ const EXPECTED = [
     'subagent-record-retention-select',
   ]],
   ['models', 'Models', ['model-refresh-auto-toggle', 'model-refresh-interval-select', 'model-refresh-providers']],
-  ['relay', 'This relay', [
-    'pwa-app-name-input',
-    'restart-resume-toggle',
-    'relay-restart-max-wait-select',
+  ['computer', 'This computer', [
     'default-session-workspace-root-input',
     'windows-autostart-setting',
+    'agent-sdk-koffi-row',
   ]],
   ['updates', 'Updates', ['update-auto-check-toggle', 'update-check-now-btn', 'update-available-card', 'update-outcome']],
 ];
 
-test('General holds the six sections in order, each with its title', () => {
+test('General holds the five sections in order, each with its title', () => {
   const sections = [...panel().children];
   assert.deepEqual(sections.map((el) => el.id), EXPECTED.map(([name]) => `settings-section-${name}`));
   for (const [index, [name, title]] of EXPECTED.entries()) {
@@ -88,7 +85,8 @@ test('relay rows say whose setting they are', () => {
     assert.ok(help.classList.contains('settings-help'), `${id} has a help line`);
     assert.match(help.textContent, /a setting of this relay\.$/i, id);
   }
-  for (const id of ['thoughts-expanded-toggle', 'live-activity-cap-slider', 'stream-view-toggle', 'scroll-on-send-toggle', 'conversation-window-retention-slider']) {
+  // Per-browser rows outside the Appearance tab, whose one line says it for all.
+  for (const id of ['scroll-on-send-toggle', 'conversation-window-retention-slider']) {
     assert.match(document.getElementById(id).closest('.settings-row').nextElementSibling.textContent, /Saved in this browser\.$/, id);
   }
   // Models: one help line under the switch, the interval and the providers.

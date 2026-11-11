@@ -27,6 +27,26 @@ test('browser stripRelayPromptContext handles datetime and system reminder wrapp
   assert.equal(output, 'Ask clarifying questions first');
 });
 
+test('browser stripRelayPromptContext drops the formula guidance block behind the media one', () => {
+  const input = [
+    '## Embedding media in replies',
+    '',
+    'To show the user an image, video, or audio clip inline in a reply, write a markdown image whose target is the absolute path.',
+    '',
+    '## Formulas in replies',
+    '',
+    'To show a formula in a reply, write it in TeX between dollar signs: $E = mc^2$ inside a sentence.',
+    '',
+    '[Relay mode: ask] Prioritize clarification questions before implementation work.',
+    '',
+    'what is $x^2$ for x = 3?',
+  ].join('\n');
+  const output = stripRelayPromptContext(input, 'ask');
+  assert.doesNotMatch(output, /in replies/);
+  assert.doesNotMatch(output, /^\[Relay mode/);
+  assert.match(output, /what is \$x\^2\$ for x = 3\?$/);
+});
+
 test('browser stripRelayPromptContext drops a leading media-embed guidance block', () => {
   const input = [
     '## Embedding media in replies',

@@ -265,7 +265,7 @@ export function renderRestartConfirmBody(picture = {}, { maxWaitMs = 0 } = {}) {
     parts.push(`<p>The restart waits until these running turns end:</p>`);
     parts.push(listHtml(sessions.map((entry) => sessionItemHtml(entry, Number(entry?.turns) > 1 ? `(${entry.turns} turns)` : ''))));
     parts.push(`<p>Until then new messages are held${heldCount ? ` (${plural(heldCount, 'message')} already waiting)` : ''}; they run after the restart. `
-      + `${Number(maxWaitMs) > 0 ? `After ${escHtml(formatMaxWait(maxWaitMs))} the banner asks whether to restart now, keep waiting or cancel.` : 'There is no time limit on the wait (Settings › General).'}</p>`);
+      + `${Number(maxWaitMs) > 0 ? `After ${escHtml(formatMaxWait(maxWaitMs))} the banner asks whether to restart now, keep waiting or cancel.` : 'There is no time limit on the wait (Settings › Relays).'}</p>`);
   } else {
     parts.push(`<p>Nothing is running: the relay restarts at once${heldCount ? `, and the ${plural(heldCount, 'waiting message')} run after it` : ''}.</p>`);
   }
@@ -503,7 +503,7 @@ export async function cancelQueuedRelayRestart() {
   });
 }
 
-// ─── Settings › General: the maximum wait ────────────────────────────────────
+// ─── Settings › Relays: the maximum wait ─────────────────────────────────────
 // Mirrors server/services/relay-restart-queue.mjs (the browser cannot import
 // it); the select's options are the allowed values.
 let maxWaitMinutes = 30;

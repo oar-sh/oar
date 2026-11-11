@@ -25,13 +25,24 @@ function toPidList(rows, extraPid) {
 // read: the caller must not pretend it stopped what it could not see. The
 // registry's pid counts only while that process is alive: a worker that is
 // gone is stopped already (on Windows its stop call alone could fail).
+//
+// On POSIX the list is every process with its command line, so a live worker
+// of the session is on it as long as its argv carries the session id within
+// ps's width (procps-ng cuts `args` at 128 KiB even with -ww), and the
+// registry's pid counts only when it is: a pid that is alive but not listed
+// is no worker of this session. It is
+// the old worker's pid handed to another process (another user's, which no
+// signal reaches, or one of the relay user's own, which the stop would
+// kill), or the worker ended and its parent has not reaped it yet (a zombie
+// answers signal 0 and has no command line left).
 async function enumeratePids({ sdkSessionId, worker, processInspector, platform, isPidAliveImpl }) {
   const rows = platform === 'win32'
     ? await processInspector?.findWindowsProcessTreeForSessionAsync?.(sdkSessionId, { fresh: true })
     : await processInspector?.findProcessesForSessionAsync?.(sdkSessionId, { fresh: true });
   const listed = toPidList(rows || []);
   const workerPid = Number(worker?.pid);
-  const workerAlive = Number.isInteger(workerPid) && workerPid > 0 && (listed.includes(workerPid) || isPidAliveImpl(workerPid));
+  const workerAlive = Number.isInteger(workerPid) && workerPid > 0
+    && (listed.includes(workerPid) || (platform === 'win32' && isPidAliveImpl(workerPid)));
   return workerAlive ? toPidList(rows || [], workerPid) : listed;
 }
 
@@ -98,6 +109,36 @@ export async function stopSessionWorkerProcesses({
 
   const survivors = (list) => list.filter((pid) => isPidAliveImpl(pid));
 
+  // POSIX: a signal no process takes (ESRCH) is ignored; one it is not ours
+  // to send (EPERM: another user's process) is remembered and the others
+  // still get theirs; the re-check below decides about that pid.
+  const refused = new Map();
+  const signal = (pid, name) => {
+    try {
+      killImpl(pid, name);
+    } catch (error) {
+      const code = String(error?.code || '');
+      if (code === 'EPERM') refused.set(pid, error);
+      else if (code !== 'ESRCH') throw error;
+    }
+  };
+
+  // POSIX: a pid that outlived the stop counts only while a fresh list still
+  // shows it as the session's. The list matches command lines, so a match
+  // can be a process that was ending anyway (a shell that carried the
+  // session's arguments, another user's one included), and a process that
+  // ended but is not reaped yet (a zombie) still answers signal 0 with no
+  // command line left. A list that cannot be read changes nothing.
+  const stillListed = async (list) => {
+    if (platform === 'win32' || !list.length) return list;
+    try {
+      const fresh = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
+      return list.filter((pid) => fresh.includes(pid) && isPidAliveImpl(pid));
+    } catch {
+      return list;
+    }
+  };
+
   const waitFor = async (list, timeoutMs) => {
     const deadline = nowMs() + Math.max(0, Number(timeoutMs) || 0);
     let remaining = survivors(list);
@@ -114,13 +155,7 @@ export async function stopSessionWorkerProcesses({
       // Stop-Process -Force, so there is no gentler first pass to attempt.
       await stopWindowsPids(processInspector, pids);
     } else {
-      for (const pid of pids) {
-        try {
-          killImpl(pid, 'SIGTERM');
-        } catch (error) {
-          if (String(error?.code || '') !== 'ESRCH') throw error;
-        }
-      }
+      for (const pid of pids) signal(pid, 'SIGTERM');
       // The tmux session can outlive its child after SIGTERM.
       killTmuxSessionImpl?.(sid);
     }
@@ -140,13 +175,7 @@ export async function stopSessionWorkerProcesses({
       escalationTargets = [...new Set([...remainingPids, ...rediscovered.filter((pid) => isPidAliveImpl(pid))])];
       await stopWindowsPids(processInspector, escalationTargets);
     } else {
-      for (const pid of escalationTargets) {
-        try {
-          killImpl(pid, 'SIGKILL');
-        } catch (error) {
-          if (String(error?.code || '') !== 'ESRCH') throw error;
-        }
-      }
+      for (const pid of escalationTargets) signal(pid, 'SIGKILL');
     }
   } catch (error) {
     return done({
@@ -158,15 +187,18 @@ export async function stopSessionWorkerProcesses({
     });
   }
 
-  remainingPids = await waitFor(escalationTargets, escalationTimeoutMs);
+  remainingPids = await stillListed(await waitFor(escalationTargets, escalationTimeoutMs));
   if (remainingPids.length) {
+    // A refused signal is the reason only when every survivor refused one;
+    // a survivor that took its signals and lives on is a timeout.
+    const refusal = remainingPids.every((pid) => refused.has(pid)) ? refused.get(remainingPids[0]) : null;
     return done({
       ok: false,
       pids,
       remainingPids,
       escalated: true,
-      timedOut: true,
-      error: `worker-stop-timeout:${remainingPids.join(',')}`,
+      timedOut: !refusal,
+      error: refusal ? (refusal.message || 'Failed to stop the CLI') : `worker-stop-timeout:${remainingPids.join(',')}`,
     });
   }
   return done({ pids, escalated: true });

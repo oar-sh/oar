@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
 
-// "Expand thoughts while an agent works" (Settings › General › Appearance,
+// "Expand thoughts while an agent works" (Settings › Appearance,
 // mirrored in the 🧠 modal), against the shared e2e relay. A turn is queued
 // and taken off the queue; its thoughts are posted through the routes a
 // session worker uses (no CLI runs on the test server).
@@ -169,14 +169,14 @@ test.describe("thoughts setting", () => {
       await page.setViewportSize(PHONE);
       await page.keyboard.press("Escape");
 
-      await page.evaluate(() => window.openSettingsModal("general"));
+      await page.evaluate(() => window.openSettingsModal("appearance"));
       const toggle = page.locator("#thoughts-expanded-toggle");
       await expect(toggle).toBeChecked();
       await toggle.uncheck();
       expect(await page.evaluate(() => window.localStorage.getItem("copilot_thoughts_expanded"))).toBe("0");
       for (const viewport of [["phone", PHONE], ["desktop", DESKTOP]]) {
         await page.setViewportSize(viewport[1]);
-        await shoot(page, `settings-appearance-${viewport[0]}`, page.locator("#settings-section-appearance-title"));
+        await shoot(page, `settings-appearance-${viewport[0]}`, page.locator("#appearance-browser-note"));
       }
     } finally {
       stopBeating();

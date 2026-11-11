@@ -683,3 +683,59 @@ test('the token post never holds the turn: a hanging or failing post, or a throw
     assert.ok(calls.includes('/api/claude-plan-usage'), `${mode}: ${calls.join(', ')}`);
   }
 });
+
+// ─── The plan card ────────────────────────────────────────────────────
+
+function planCardPublisher() {
+  const boards = [];
+  const publisher = createClaudeTurnPublisher({
+    api: async (method, routePath, body) => { if (routePath === '/api/relay-board') boards.push(body); return { ok: true }; },
+  });
+  return { boards, publisher };
+}
+const planMessage = { ...message, relayMode: 'plan' };
+const bulletReply = 'Both answers are in:\n\n- the first one is settled\n- the second one too\n- nothing else is open';
+const replyState = (text) => ({ result: { text }, resultTexts: [text], lastStreamedText: '' });
+
+test('a plan-mode reply with list lines is not taken for a plan: no card without a hand-over', async () => {
+  const { boards, publisher } = planCardPublisher();
+  await publisher.publishCompletedTurn({ message: planMessage, state: replyState(bulletReply), responseModel: 'claude-sonnet-5' });
+  await publisher.publishCompletedTurn({
+    message: planMessage, state: replyState(bulletReply), responseModel: 'claude-sonnet-5', planBoardPosted: false, planBoardRequested: false,
+  });
+  assert.deepEqual(boards, []);
+});
+
+test('a hand-over whose plan text cannot be read takes the reply for the plan', async () => {
+  const { boards, publisher } = planCardPublisher();
+  assert.equal(await publisher.publishPlanBoard(planMessage, { plan: '', planFilePath: '/home/dev/plans/not-there.md' }), false);
+  assert.deepEqual(boards, [], 'nothing to show yet');
+  await publisher.publishCompletedTurn({
+    message: planMessage, state: replyState(bulletReply), responseModel: 'claude-sonnet-5', planBoardPosted: false, planBoardRequested: true,
+  });
+  assert.equal(boards.length, 1);
+  assert.equal(boards[0].boardType, 'plan_ready');
+  assert.equal(boards[0].body, bulletReply);
+  assert.equal(boards[0].context.source, 'plan-mode-fallback');
+});
+
+test('a hand-over with its plan posts one card, and the finished turn adds none', async () => {
+  const { boards, publisher } = planCardPublisher();
+  const posted = await publisher.publishPlanBoard(planMessage, { plan: '1. Rename the module\n2. Move its test', planFilePath: '/home/dev/plans/rename.md' });
+  assert.equal(posted, true);
+  await publisher.publishCompletedTurn({
+    message: planMessage, state: replyState(bulletReply), responseModel: 'claude-sonnet-5', planBoardPosted: posted, planBoardRequested: true,
+  });
+  assert.equal(boards.length, 1);
+  assert.equal(boards[0].body, '1. Rename the module\n2. Move its test');
+  assert.equal(boards[0].context.source, 'exit_plan_mode');
+  assert.equal(boards[0].context.planFilePath, '/home/dev/plans/rename.md', 'the relay can name the file when it cuts a long plan');
+});
+
+test('a hand-over outside plan mode gets no stand-in card from the reply', async () => {
+  const { boards, publisher } = planCardPublisher();
+  await publisher.publishCompletedTurn({
+    message, state: replyState(bulletReply), responseModel: 'claude-sonnet-5', planBoardPosted: false, planBoardRequested: true,
+  });
+  assert.deepEqual(boards, []);
+});

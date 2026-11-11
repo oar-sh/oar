@@ -1,4 +1,4 @@
-// "Expand thoughts while an agent works" (Settings › General, and its mirror
+// "Expand thoughts while an agent works" (Settings › Appearance, and its mirror
 // in the 🧠 modal). A setting of this browser, kept in localStorage like the
 // scroll-on-send one. On unless switched off: it decides whether a thought
 // starts open in the live turn, in a live sub-agent bubble and in the

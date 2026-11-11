@@ -481,7 +481,7 @@ test('a disabled preview lane omits the preview block; the media guidance still 
     message: { id: 'msg-p2', conversationId: 'conv-preview-off', text: 'show me the app', relayMode: 'agent' },
   });
   assert.doesNotMatch(prompts[0], /Preview servers/);
-  assert.match(prompts[0], /^## Embedding media in replies[\s\S]*show me the app$/);
+  assert.match(prompts[0], /^## Embedding media in replies[\s\S]*## Formulas in replies[\s\S]*show me the app$/);
   await runner.handlePendingPayload({
     message: { id: 'msg-p2b', conversationId: 'conv-preview-off', text: 'again', relayMode: 'agent' },
   });

@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createCopilotSdkSessionRunner } from './copilot-sdk-session-process.mjs';
+import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -443,9 +444,9 @@ export function expectedPromptPrefix(mode = 'agent', { includeInstructions = tru
     ask: 'Prioritize clarification questions before doing any implementation work. If the request is ambiguous or underspecified, pause and ask through the web relay before making assumptions. Do not make broad assumptions when a question would materially change the result. These instructions remain in effect until relay mode changes.',
     autopilot: 'Act directly on the request and use tools when needed. Keep moving unless user input is truly blocking. These instructions remain in effect until relay mode changes.',
   }[mode];
-  // The guidance turns also carry the media-embed capability block, appended
-  // by applyMediaEmbedInstructions in copilot-prompt-context.mjs.
-  return `${marker} ${instructions} ${renderMediaEmbedInstructionBlock()}`;
+  // The guidance turns also carry the media-embed capability block and the
+  // formula block, appended in copilot-prompt-context.mjs.
+  return `${marker} ${instructions} ${renderMediaEmbedInstructionBlock()}\n\n${renderMathInstructionBlock()}`;
 }
 
 /** The message body with the relay-context prefix in front, as sent. */

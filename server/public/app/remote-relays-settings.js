@@ -23,6 +23,8 @@ import {
   upsertRemoteRelay,
 } from './remote-relays-store.mjs';
 import { REMOTE_RELAY_PERMISSIONS, normalizeRemoteRelayPermission } from './remote-relay-shared.mjs';
+import { currentPwaAppName, isPwaAppNameSaveInFlight, syncPwaAppNameInput } from './pwa-install.js';
+import { SETTINGS_TAB_SHOWN_EVENT } from './settings-tabs.js';
 
 export const REMOTE_RELAY_PERMISSION_LABELS = Object.freeze({
   read: 'Read only',
@@ -54,6 +56,9 @@ let listLoadFailed = false;
 const rowBusy = new Map();
 let listRenderDeferred = false;
 let listFocusBound = false;
+// The relay's name as the last snapshot had it: a change made elsewhere is
+// read into the Relay name field.
+let lastSelfName = null;
 
 function el(id) {
   return document.getElementById(id);
@@ -164,12 +169,10 @@ function setStatusLine(id, state, text) {
 }
 
 function renderSelfSection() {
-  const snapshot = getRemoteRelaysSnapshot();
-  const nameEl = el('remote-relays-self-name');
-  if (nameEl) {
-    const name = String(snapshot?.self?.name || '').trim();
-    nameEl.textContent = name || '—';
-  }
+  // Empty, the field shows the name the relay goes by then (its host name).
+  const nameInput = el('pwa-app-name-input');
+  const defaultName = String(getRemoteRelaysSnapshot()?.self?.defaultName || '').trim();
+  if (nameInput && defaultName) nameInput.placeholder = defaultName;
   const input = el('remote-relays-public-url-input');
   if (input) {
     input.placeholder = browserSelfUrl() || 'https://…';
@@ -590,7 +593,25 @@ export function resetRemoteRelaysSettingsForTests() {
   addInFlight = false;
   listLoadFailed = false;
   listRenderDeferred = false;
+  lastSelfName = null;
   rowBusy.clear();
+}
+
+// A rename on another device (the relay announces it with the list) or the
+// Relays tab coming into view reads the name again; the field keeps what is
+// being typed in it (pwa-install.js).
+function refreshRelayNameOnChange(snapshot) {
+  const name = typeof snapshot?.self?.name === 'string' ? snapshot.self.name : null;
+  if (name === null) return;
+  const changed = lastSelfName !== null && name !== lastSelfName;
+  lastSelfName = name;
+  if (!changed) return;
+  // This page's own rename: its answer paints the field.
+  if (isPwaAppNameSaveInFlight()) return;
+  // A name this page already has (an empty one goes by the default).
+  const known = currentPwaAppName() || String(snapshot.self.defaultName || '');
+  if (name === known) return;
+  syncPwaAppNameInput();
 }
 
 // The relay's own settings ride along in the list payload's `self` (GET and
@@ -608,11 +629,17 @@ function applySelfSettingsFromSnapshot(snapshot) {
 // Live: a remote_relays_updated event (or any other store change) repaints.
 subscribeRemoteRelays((snapshot) => {
   applySelfSettingsFromSnapshot(snapshot);
+  refreshRelayNameOnChange(snapshot);
   renderRemoteRelaysSection();
 });
 
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener(RELAY_NAME_CHANGED_EVENT, () => {
+    void refreshRemoteRelays();
+  });
+  window.addEventListener(SETTINGS_TAB_SHOWN_EVENT, (event) => {
+    if (event?.detail?.tab !== 'relays') return;
+    syncPwaAppNameInput();
     void refreshRemoteRelays();
   });
 }

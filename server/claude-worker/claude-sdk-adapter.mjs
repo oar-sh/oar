@@ -3,6 +3,7 @@ import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
 import { PERSON_ONLY_QUESTION_SOURCE } from '../../shared/relay-asks.mjs';
+import { MATH_INSTRUCTION_TEXT } from '../../shared/math-instructions.mjs';
 import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
@@ -205,10 +206,12 @@ export function longCommandInstructionText(backgroundCommandLimitMs = null) {
 export function systemPromptForRelayMode(relayMode, { backgroundCommandLimitMs = null } = {}) {
   const mode = String(relayMode || 'agent').trim().toLowerCase();
   // The media-embed capability rides every session — unlike the mode nudges it
-  // is renderer knowledge the model cannot discover any other way. The long
-  // command note rides every session too: the limit is the relay's setting.
+  // is renderer knowledge the model cannot discover any other way; so is the
+  // notation the web app renders formulas from. The long command note rides
+  // every session too: the limit is the relay's setting.
   const append = [
     MEDIA_EMBED_INSTRUCTION_TEXT,
+    MATH_INSTRUCTION_TEXT,
     longCommandInstructionText(backgroundCommandLimitMs),
     MODE_SYSTEM_PROMPT_APPEND[mode],
   ]
@@ -792,8 +795,9 @@ const EXIT_PLAN_DENY_MESSAGE = 'Plan received — it is shown to the user in the
   + 'End the turn now with a short closing message and do not start implementing; '
   + 'the user\'s decision will arrive as a new message.';
 // When the handler could not surface a board (no plan text reached it), the
-// model must restate the plan as its final message: plan-shaped final text
-// triggers the runner's fallback board, so the user still gets the review UI.
+// model must restate the plan as its final message: after a hand-over without
+// a card, the turn's reply is posted as the plan (publishCompletedTurn), so
+// the user still gets the review UI.
 const EXIT_PLAN_DENY_NO_BOARD_MESSAGE = 'Plan received, but it could not be shown for review. '
   + 'Restate the complete plan as your final message, then end the turn without implementing; '
   + 'the user\'s decision will arrive as a new message.';

@@ -177,7 +177,7 @@ function setup(state = {}) {
         events.push(`registry-removed:${sid}`);
       },
     },
-    sessionWorkerProcessInspector: {
+    sessionWorkerProcessInspector: state.sessionWorkerProcessInspector || {
       findProcessesForSessionAsync: () => (state.processPids || []).map((processId) => ({ processId })),
     },
     sessionWorkerStopOverrides: {
@@ -468,6 +468,56 @@ test('archiving a conversation whose worker is gone archives it, with no stop ca
   assert.deepEqual(stopCalls, []);
   assert.ok(events.includes('registry-removed:sdk-1'));
   assert.ok(events.includes('emit:conversation_archived:conv-1'));
+});
+
+// Linux: an idle session with no worker running answered 409 several times
+// in a row. The registry's pid of its ended worker was alive as another
+// process (another user's: no signal reaches it), or the process list
+// matched a process that carried the session's arguments and ended by
+// itself, unsignallable or not reaped yet. None of them is the worker.
+test('archiving on Linux a conversation whose worker is gone archives it: a reused pid or a match that ends is no worker', async () => {
+  const cases = {
+    'the registry pid is another user\'s process now': {
+      worker: { status: 'ready', pid: 4242 },
+      alivePids: [4242],
+      reads: [[]],
+      refuse: true,
+    },
+    'another user\'s shell matched and ended': {
+      worker: { status: 'ready', pid: 4242 },
+      alivePids: [5150],
+      reads: [[5150], []],
+      refuse: true,
+    },
+    'a matched process ended but is not reaped yet': {
+      worker: null,
+      alivePids: [5150],
+      reads: [[5150], []],
+      survivors: true,
+    },
+  };
+  for (const [name, { reads, refuse, ...state }] of Object.entries(cases)) {
+    let read = 0;
+    const signalled = [];
+    const { archive, events } = setup({
+      ...state,
+      sessionWorkerProcessInspector: {
+        findProcessesForSessionAsync: async () => reads[Math.min(read++, reads.length - 1)].map((processId) => ({ processId })),
+      },
+      ...(refuse ? {
+        stopOverrides: {
+          killImpl: (pid) => {
+            signalled.push(pid);
+            throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' });
+          },
+        },
+      } : {}),
+    });
+    const response = await archive();
+    assert.equal(response.statusCode, 200, `${name}: ${JSON.stringify(response.body)}`);
+    assert.ok(events.includes('emit:conversation_archived:conv-1'), name);
+    assert.ok(!signalled.includes(4242) && !events.includes('kill:4242'), `${name}: the old worker's pid is not signalled`);
+  }
 });
 
 test('a worker that survives the stop is not archived, and the reason is logged', async (t) => {

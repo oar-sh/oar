@@ -232,8 +232,10 @@ export function createRemoteRelayRegistry({
     };
   }
 
+  // For this relay's own Settings only, never for other relays: `defaultName`
+  // is the name it goes by while the relay name is empty.
   function selfPayload() {
-    return { ...selfIdentity(), ...getSelfSettings() };
+    return { ...selfIdentity(), ...getSelfSettings(), defaultName: toText(hostname) || 'OAR' };
   }
 
   function emitChange() {
@@ -622,8 +624,12 @@ export function createRemoteRelayRegistry({
     instanceId,
     selfName,
     selfIdentity,
+    selfPayload,
     getSelfSettings,
     setSelfSettings,
+    // The relay name lives outside the registry: its setter calls this so
+    // every open Settings sees the new name.
+    notifySelfChanged: emitChange,
     getAgentSessionsSettings,
     setAgentSessionsSettings,
     list,

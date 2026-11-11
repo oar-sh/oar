@@ -3,6 +3,148 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.26] — 2026-11-11
+
+Highlights: formulas from their delimiters only, and Settings sorted by
+where they live. Replies render a formula only when it is written as
+`$…$`, `\(…\)`, `$$…$$`, `\[…\]` or a fenced `math` block, so an id in
+parentheses, a Windows path, a price or a shell variable stays text, a
+formula KaTeX cannot read is shown as written instead of in red, and
+the agent is told the notation that renders, except in Claude Cloud
+chats and on the Copilot Extension engine. KaTeX moves to 0.19.1.
+Theme, text scaling and the live-turn settings get an Appearance tab of
+their own, and the relay name and the two restart settings move to
+Relays, where an empty name shows the host name the relay goes by and a
+rename made on another device shows at once. In Claude, Claude API and
+DeepSeek chats a plan card comes only from a plan the agent hands over,
+and a plan card shows up to 200,000 characters of the plan instead of
+12,000. Archive and delete no longer fail on Linux and macOS for a
+worker that has already ended, a session an agent on a paired relay
+started can always report back to it, and the tmux console draws a real
+terminal.
+
+### Added
+
+- **Fenced `math` blocks.** A code block with the language `math` is a
+  displayed formula once it is closed.
+- **Agents are told how to write formulas.** Once per session, the agent
+  of a Claude, Claude API, DeepSeek, Cursor or Grok chat, and of a
+  Copilot or OpenAI chat on the SDK engine, learns that `$…$` in a
+  sentence and `$$…$$` on lines of their own render (`\(…\)` and `\[…\]`
+  too), that TeX in bare parentheses or brackets does not, and that a
+  dollar amount stays text. Claude Cloud chats and the Copilot Extension
+  engine do not get the note. The prompt a transcript shows leaves the
+  note out.
+
+### Changed
+
+- **Settings: an Appearance tab, and the relay's own settings on
+  Relays.** Theme, Text scaling, Expand thoughts while an agent works,
+  Tool lines shown while an agent works, Stream view and Show Suspend
+  host action move from General to the new Appearance tab right after
+  it, under one line that says they are kept in this browser; Jump to
+  the end when I send a message and Messages kept per conversation stay
+  in General's Reading block. Relay name moves to the top of Relays,
+  above Public address, and After a relay restart, tell interrupted
+  sessions to carry on and Ask after a queued relay restart has waited
+  follow right below Public address; what stays of General's "This
+  relay" block (Default CWD, Autostart, the Windows helper) is headed
+  "This computer". Every setting keeps its value and default, and a
+  remembered tab or a link to General still opens General.
+- **Formulas are read from their delimiters only.** `$…$` and `\(…\)`
+  inside a sentence, `$$…$$` and `\[…\]` as a display, and a fenced
+  `math` block; nothing is guessed from TeX in bare parentheses or
+  brackets any more. On one line `\[ … \]` needs a space inside both
+  ends, so `\[1\]` and `\[x\]` are escaped brackets. A `$` opens a
+  formula only where maths is written that way, so prices (`$5 and $9`,
+  `$5/$10`), shell variables (`$HOME/$PATH`) and Windows paths stay
+  text, and `\$` is always a dollar sign. Code spans and code blocks
+  never hold a formula. A formula KaTeX cannot parse is shown as
+  written, in the normal text colour, and a percent sign in a one-line
+  formula is shown. A message over 100,000 characters renders no
+  formulas. The rules are in
+  [Formulas in replies](docs/web-ui.md#formulas-in-replies).
+- **KaTeX 0.19.1.** The page loads KaTeX 0.19.1 (was 0.16.22) and its
+  chemistry extension from jsDelivr, as before, now with integrity hashes;
+  its auto-render script is no longer loaded. KaTeX is not in the npm
+  package: a browser that cannot reach jsDelivr shows every formula as
+  written.
+- **A plan card comes from a plan hand-over only** in Claude, Claude API
+  and DeepSeek chats. A plan-mode reply with two or more list lines no
+  longer gets a "Plan ready for review" card, so a session that stays in
+  plan mode no longer puts the buttons under every status reply. When the
+  plan of a hand-over cannot be read, the reply stands in for it. Cursor,
+  Grok, Copilot and OpenAI (BYOK) chats keep the card for such replies.
+
+### Fixed
+
+- **The whole plan on the plan card.** The card cut every plan at 12,000
+  characters, without a mark. It now keeps up to 200,000; a longer plan
+  is cut, at a line break where it can, and ends with a line that says
+  how much is missing and, where the agent named it, the file that holds
+  the whole plan. A cut inside a code block closes the block first, also
+  in a plan file with Windows line ends.
+- **Archive and delete no longer fail for a worker that has ended**
+  (Linux and macOS). Archiving or deleting an idle conversation could
+  answer "Couldn't stop this conversation's session" again and again:
+  the relay counted the old process id of a worker that had ended, by
+  then another program's, and processes that were ending by themselves.
+  Those no longer count, and a process the relay may not signal no longer
+  keeps it from stopping the others. A worker that really survives the
+  stop still leaves the conversation as it was.
+- **A session an agent on a paired relay started can always report
+  back.** Its send to the session that started it was refused with
+  `REMOTE_RELAY_HOP_LIMIT` when its turn also acted on a prompt from a
+  session on its own relay. Another session on that relay, a third relay
+  and `create_session` are still held to the limit.
+- **The relay name in Settings.** An empty Relay name showed "OAR" as its
+  placeholder; it now shows the host name, the name paired relays know
+  the relay by then. A rename made on another device shows in an open
+  Settings without reopening it.
+- **The tmux console draws a terminal.** 🖥️ Inspect tmux console asked
+  jsDelivr and unpkg for xterm.js versions that were never published, so
+  it always fell back to plain text. It now loads `@xterm/xterm` 5.5.0
+  and `@xterm/addon-fit` 0.10.0 from jsDelivr, with integrity hashes,
+  and only the two scripts from unpkg when jsDelivr fails; a browser
+  that reaches neither still gets the plain text.
+- **A long line in a code block no longer runs under its Copy button**,
+  which has a strip of its own above the first line.
+
+### Upgrade notes
+
+- **No migration.** As before, the relay copies its database to the
+  backups folder before the first start of a new version; nothing else
+  waits.
+- **Sessions still on 0.9.25's worker wait one worker start.** A session
+  whose worker still runs the old code is given a new worker between
+  turns, as in 0.9.25: a Claude, Claude API, DeepSeek or Cursor session
+  outside a git checkout before its next message, any other once its
+  agent has been idle for about 10 minutes. Its agent learns the formula
+  notation with the new worker, and Claude, Claude API and DeepSeek
+  chats get the new plan-card rule with it.
+- **Your settings stay as they were.** The Appearance settings are kept
+  in the browser under the same keys, and the relay's own settings in its
+  database; only their place in Settings changes.
+- **Older replies follow the new formula rules** when they are shown
+  again: a parenthesis 0.9.25 drew as a formula is text now, TeX
+  written in bare parentheses shows as written, and a one-line
+  `\[x^2\]` without a space inside its ends is read as escaped brackets.
+- **KaTeX and xterm.js load in the browser,** not from the relay: from
+  jsDelivr, and the two xterm.js scripts, not its stylesheet, also from
+  unpkg; neither is in the npm package. A browser without access to them
+  shows formulas as written and the tmux console as plain text, whatever
+  the relay host can reach.
+- **Mixed versions work together.** The report-back rule is checked by
+  the relay the started session runs on: that one needs 0.9.26, the relay
+  of the session that started it may run 0.9.25.
+- **Going back to 0.9.25** needs no database step. Install it with
+  `oar update --to 0.9.25` or `npm install -g @oar-sh/oar@0.9.25` (in a
+  git checkout: `git checkout v0.9.25`, then a relay restart). The
+  settings go back to their old places with their values; a browser that
+  last had Appearance open opens General. Formulas follow 0.9.25's rules
+  again, Claude plan-mode replies with list lines get cards again, and
+  plan cards made on 0.9.26 keep their whole plan.
+
 ## [0.9.25] — 2026-11-09
 
 Highlights: a media gallery, and agents that make images. Every picture,

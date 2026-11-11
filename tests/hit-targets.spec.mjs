@@ -280,6 +280,9 @@ test.describe.serial("tap targets keep the 28px floor", () => {
         await page.evaluate(() => window.openSettingsModal("general"));
         await expect(page.locator("#settings-panel-general")).toBeVisible();
         await expectSettingsPanel(page, "#settings-panel-general");
+        await page.evaluate(() => window.openSettingsModal("appearance"));
+        await expect(page.locator("#settings-panel-appearance")).toBeVisible();
+        await expectSettingsPanel(page, "#settings-panel-appearance");
         for (const provider of ["copilot", "openai", "claude", "claude-api", "claude-cloud", "grok", "cursor", "deepseek"]) {
           await page.evaluate((tab) => window.openSettingsModal("providers", tab), provider);
           await expect(page.locator(`#settings-provider-panel-${provider}`)).toBeVisible();

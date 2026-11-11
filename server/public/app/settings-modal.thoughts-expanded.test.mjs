@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 
-// "Expand thoughts while an agent works" in Settings › General › Appearance,
+// "Expand thoughts while an agent works" in Settings › Appearance,
 // and its mirror in the 🧠 modal. Rendered against the real index.html.
 const indexHtml = await readFile(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
 const dom = new JSDOM(indexHtml, { url: 'http://localhost/' });
@@ -23,17 +23,16 @@ const { renderThoughtsPreferenceHtml } = await import('./context-usage-view.mjs'
 const toggle = () => document.getElementById('thoughts-expanded-toggle');
 const store = dom.window.localStorage;
 
-test('the toggle sits in Settings › General › Appearance, on by default', () => {
+test('the toggle sits in Settings › Appearance, on by default', () => {
   assert.equal(document.querySelectorAll('#settings-modal [id="thoughts-expanded-toggle"]').length, 1);
-  assert.equal(toggle().closest('.settings-section')?.id, 'settings-section-appearance');
+  assert.equal(toggle().closest('[data-settings-panel]')?.id, 'settings-panel-appearance');
   assert.equal(toggle().type, 'checkbox');
   assert.equal(toggle().checked, true);
   assert.equal(toggle().getAttribute('onchange'), 'updateThoughtsExpandedSetting(this.checked)');
   assert.equal(document.querySelector('label[for="thoughts-expanded-toggle"]').textContent, 'Expand thoughts while an agent works');
   const help = toggle().closest('.settings-row').nextElementSibling;
   assert.ok(help.classList.contains('settings-help'));
-  assert.match(help.textContent, /live turn, in sub-agent bubbles and in the sub-agent viewer/);
-  assert.match(help.textContent, /Saved in this browser\.$/);
+  assert.match(help.textContent, /live turn, in sub-agent bubbles and in the sub-agent viewer\.$/);
 });
 
 test('it comes after text scaling and before the Suspend host row', () => {

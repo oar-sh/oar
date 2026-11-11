@@ -73,12 +73,14 @@ const WIN = {
   tokenMode: 'custom',
   httpWarning: 'Plain http on loopback (for example an SSH port forward).',
 };
-const SELF = { relayId: 'relay-a', name: 'win-test', version: '0.9.4', platform: 'win32', publicUrl: 'https://relay-a.example.test', inboundEnabled: true };
+const SELF = { relayId: 'relay-a', name: 'win-test', version: '0.9.4', platform: 'win32', publicUrl: 'https://relay-a.example.test', inboundEnabled: true, defaultName: 'devbox' };
 
 // ─── A scripted relay ────────────────────────────────────────────────────────
 const requests = [];
 let listPayload = { relays: [LINUX, WIN], self: SELF };
 let relaySettings = { publicUrl: 'https://relay-a.example.test', inboundEnabled: true };
+let pwaAppName = 'win-test';
+let onPwaAppNamePost = null;
 const addAnswers = [];
 
 function reply(status, body) {
@@ -94,6 +96,13 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
   if (url.pathname === '/api/remote-relays' && method === 'POST') {
     const [status, answer] = addAnswers.shift() || [500, { ok: false, error: 'no scripted answer' }];
     return reply(status, answer);
+  }
+  if (url.pathname === '/api/settings/pwa-app-name' && method === 'GET') return reply(200, { appName: pwaAppName, defaultName: 'OAR' });
+  if (url.pathname === '/api/settings/pwa-app-name' && method === 'POST') {
+    pwaAppName = body.appName;
+    // The relay announces the rename (remote_relays_updated) before it answers.
+    onPwaAppNamePost?.(pwaAppName);
+    return reply(200, { appName: pwaAppName, defaultName: 'OAR' });
   }
   if (url.pathname === '/api/settings/remote-relays' && method === 'GET') return reply(200, relaySettings);
   if (url.pathname === '/api/settings/remote-relays' && method === 'POST') {
@@ -164,24 +173,141 @@ test('the Relays tab is a deep-linkable settings tab', () => {
   assert.equal(el('settings-tab-relays').textContent.trim(), 'Relays');
 });
 
-test('General shows the PWA app name as "Relay name", ids unchanged', () => {
+test('Relays leads with the editable "Relay name" (the PWA app name), ids unchanged', () => {
   const label = document.querySelector('label[for="pwa-app-name-input"]');
   assert.equal(label.textContent.trim(), 'Relay name');
   const input = el('pwa-app-name-input');
   assert.equal(input.getAttribute('aria-label'), 'Relay name');
   assert.match(input.parentElement.querySelector('.settings-help').textContent, /^Shown to other relays and used as the installed app's name\./);
+  assert.equal(input.closest('[data-settings-panel]').id, 'settings-panel-relays');
+  assert.equal(input.closest('#remote-relays-self-section'), el('settings-panel-relays').firstElementChild);
+  // The name is edited here only: no read-only copy pointing elsewhere.
+  assert.equal(document.querySelectorAll('[id="pwa-app-name-input"]').length, 1);
+  assert.equal(el('remote-relays-self-name'), null);
+  assert.doesNotMatch(el('settings-panel-relays').textContent, /Change it under General/);
 });
 
-test('"This relay" shows the name, the public address and the inbound switch', async () => {
+test('"This relay": name, public address, the restart settings, then the inbound switch', async () => {
   await freshSection();
-  assert.equal(el('remote-relays-self-name').textContent, 'win-test');
-  assert.match(el('remote-relays-self-name').parentElement.textContent, /Change it under General → Relay name/);
+  const order = ['pwa-app-name-input', 'remote-relays-public-url-input', 'restart-resume-toggle', 'relay-restart-max-wait-select', 'remote-relays-inbound-toggle'];
+  for (let i = 1; i < order.length; i += 1) {
+    assert.ok(el(order[i - 1]).compareDocumentPosition(el(order[i])) & document.defaultView.Node.DOCUMENT_POSITION_FOLLOWING, `${order[i - 1]} before ${order[i]}`);
+    assert.ok(el(order[i]).closest('#settings-panel-relays'), `${order[i]} in Relays`);
+  }
   assert.equal(el('remote-relays-public-url-input').value, 'https://relay-a.example.test');
   // Opened on localhost: no useful default to offer another relay.
   assert.equal(el('remote-relays-public-url-input').placeholder, 'https://…');
   assert.equal(el('remote-relays-inbound-toggle').checked, true);
   assert.equal(el('remote-relays-inbound-toggle').disabled, false);
   assert.equal(document.querySelector('label[for="remote-relays-inbound-toggle"]').textContent.trim(), 'Accept prompts from other relays\' agents');
+});
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test('an empty Relay name shows the name the relay goes by then, not "OAR"', async () => {
+  await freshSection();
+  assert.equal(el('pwa-app-name-input').placeholder, 'devbox');
+  store.setRemoteRelaysSnapshot({ relays: [LINUX], self: { ...SELF, defaultName: 'devbox-2' } });
+  assert.equal(el('pwa-app-name-input').placeholder, 'devbox-2');
+});
+
+test('a rename on another device reaches the field, but not while it is being typed in', async () => {
+  await freshSection();
+  const input = el('pwa-app-name-input');
+  input.blur();
+  // The relay announces the new name with the list (remote_relays_updated).
+  pwaAppName = 'renamed-elsewhere';
+  requests.length = 0;
+  store.setRemoteRelaysSnapshot({ relays: [LINUX], self: { ...SELF, name: 'renamed-elsewhere' } });
+  await tick();
+  assert.ok(requests.some((r) => r.method === 'GET' && r.path === '/api/settings/pwa-app-name'), 'the name is read again');
+  assert.equal(input.value, 'renamed-elsewhere');
+
+  // Same name again: nothing to read.
+  requests.length = 0;
+  store.setRemoteRelaysSnapshot({ relays: [LINUX], self: { ...SELF, name: 'renamed-elsewhere' } });
+  await tick();
+  assert.equal(requests.some((r) => r.path === '/api/settings/pwa-app-name'), false);
+
+  // Typing: the field keeps what is typed.
+  input.focus();
+  input.value = 'half-typ';
+  pwaAppName = 'renamed-again';
+  store.setRemoteRelaysSnapshot({ relays: [LINUX], self: { ...SELF, name: 'renamed-again' } });
+  await tick();
+  assert.equal(input.value, 'half-typ');
+  input.blur();
+  pwaAppName = 'win-test';
+});
+
+test('your own renames each say so and tell the Relays tab; the announcement starts no read', async () => {
+  await freshSection();
+  const pwa = await import('./pwa-install.js');
+  const told = [];
+  const listen = (event) => told.push(event.detail.name);
+  window.addEventListener(settings.RELAY_NAME_CHANGED_EVENT, listen);
+  onPwaAppNamePost = (name) => {
+    listPayload = { relays: [LINUX], self: { ...SELF, name } };
+    store.setRemoteRelaysSnapshot(listPayload);
+  };
+  try {
+    for (const name of ['Mine 1', 'Mine 2', 'Mine 3']) {
+      requests.length = 0;
+      await pwa.updatePwaAppName(name);
+      assert.equal(el('relay-toast').textContent, `Relay name updated to "${name}".`, name);
+      assert.equal(el('pwa-app-name-input').value, name);
+      await tick();
+      assert.equal(requests.some((r) => r.method === 'GET' && r.path === '/api/settings/pwa-app-name'), false, `${name}: no read of a name this page saved`);
+    }
+    assert.deepEqual(told, ['Mine 1', 'Mine 2', 'Mine 3']);
+  } finally {
+    onPwaAppNamePost = null;
+    listPayload = { relays: [LINUX, WIN], self: SELF };
+    window.removeEventListener(settings.RELAY_NAME_CHANGED_EVENT, listen);
+    pwaAppName = 'win-test';
+  }
+});
+
+test('a rename still says so when a read of the name started while it was saved', async () => {
+  await freshSection();
+  const pwa = await import('./pwa-install.js');
+  const told = [];
+  const listen = (event) => told.push(event.detail.name);
+  window.addEventListener(settings.RELAY_NAME_CHANGED_EVENT, listen);
+  // A read that overtakes the save (it bumps the request sequence).
+  onPwaAppNamePost = () => pwa.syncPwaAppNameInput();
+  try {
+    await pwa.updatePwaAppName('Overtaken');
+    assert.equal(el('relay-toast').textContent, 'Relay name updated to "Overtaken".');
+    assert.deepEqual(told, ['Overtaken']);
+    // The read, the newest request, paints the field.
+    await tick();
+    assert.equal(el('pwa-app-name-input').value, 'Overtaken');
+  } finally {
+    onPwaAppNamePost = null;
+    window.removeEventListener(settings.RELAY_NAME_CHANGED_EVENT, listen);
+    pwaAppName = 'win-test';
+  }
+});
+
+test('switching to the Relays tab reads the relay name again', async () => {
+  await freshSection();
+  const input = el('pwa-app-name-input');
+  input.blur();
+  selectSettingsTab('general');
+  pwaAppName = 'renamed-meanwhile';
+  requests.length = 0;
+  selectSettingsTab('relays');
+  await tick();
+  assert.ok(requests.some((r) => r.method === 'GET' && r.path === '/api/settings/pwa-app-name'));
+  assert.ok(requests.some((r) => r.method === 'GET' && r.path === '/api/remote-relays'));
+  assert.equal(input.value, 'renamed-meanwhile');
+  // Already on Relays: selecting it again reads nothing.
+  requests.length = 0;
+  selectSettingsTab('relays');
+  await tick();
+  assert.equal(requests.some((r) => r.path === '/api/settings/pwa-app-name'), false);
+  pwaAppName = 'win-test';
 });
 
 test('each remote renders its dot, name, host, version, last seen and controls', async () => {
@@ -234,8 +360,6 @@ test('unknown and error states get grey and red dots with the reason as tooltip'
   assert.equal(row('rr-1').querySelector('.remote-relay-dot').title, 'Not checked yet');
   assert.equal(row('rr-2').querySelector('.remote-relay-dot').dataset.status, 'unauthorized');
   assert.equal(row('rr-2').querySelector('.remote-relay-dot').title, 'The other relay rejected the token (401)');
-  // The socket snapshot kept "self" from the earlier load.
-  assert.equal(el('remote-relays-self-name').textContent, 'win-test');
 });
 
 test('an empty list says so', async () => {

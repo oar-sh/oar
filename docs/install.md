@@ -20,6 +20,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
 | `cloudflared` (optional) | the built-in Cloudflare tunnel | Not included; install it yourself (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)) |
 | Python 3, make and a C++ compiler | only where better-sqlite3 ships no SQLite binding: Android (Termux), 32-bit ARM, FreeBSD | OAR builds the binding there with `oar build-native` (see [npm](#npm)). On Termux: `pkg install python clang make` |
+| Internet access in the browser (optional) | Markdown, code colours, formulas and the tmux console | The page loads marked, highlight.js, KaTeX 0.19.1 and xterm.js (`@xterm/xterm` 5.5.0 with `@xterm/addon-fit` 0.10.0) from jsDelivr and cdnjs, KaTeX and xterm.js with integrity hashes; none of them comes with OAR, and the relay host needs no access for them. A browser that cannot reach them shows replies as plain text, code without colours, formulas as they were written, and **🖥️ Inspect tmux console** as plain text without colours (for the xterm.js scripts the console tries unpkg before it gives up; the stylesheet comes from jsDelivr only) |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions you can watch from the browser (**🖥️ Inspect tmux console**). Without tmux they run as plain background processes |
 
 ## macOS and Linux
@@ -44,7 +45,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.25 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.26 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -57,7 +58,7 @@ Read it before you run it: [oar.sh/install](https://oar.sh/install).
 irm oar.sh/install.ps1 | iex
 ```
 
-The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.25'` before the command.
+The PowerShell installer (PowerShell 5 or newer) expects Node.js 22.13 or newer to be installed: it checks Node.js, runs `npm install -g @oar-sh/oar`, then `oar setup`. It reads the same `OAR_VERSION`, `OAR_CHANNEL`, and `OAR_DRY_RUN` variables, for example `$env:OAR_VERSION = '0.9.26'` before the command.
 
 ## npm
 
@@ -168,7 +169,7 @@ Claude, Claude API and DeepSeek chats run on the Claude Agent SDK, Cursor chats 
 
 **What is installed.** Each SDK, and the Windows helper, is installed with `npm ci` from a lockfile that comes with OAR, at exact versions and with npm's scripts disabled, into a new folder that is moved into place once it is complete. A folder counts as installed only when the marker file written last lists its files with their sizes and they match; a half-finished or damaged one is installed again.
 
-**The Windows helper.** On Windows the relay's check that only one relay runs per data folder reads process start times through koffi, which is downloaded on demand too (only on Windows, at every start while it is missing). Its row is **⚙️ Settings → General → This relay → Windows helper**. Like the SDKs, it is installed without scripts: its native binary comes prebuilt in koffi's platform package (`@koromix/koffi-win32-x64` or `-arm64`), which npm picks by itself. Until koffi is there, the check falls back to a simpler test: a lock whose owner's start time is unknown is taken as stale when it was written before the last boot, or when its process id now belongs to a program other than Node.js. The start after koffi arrived has the full check again.
+**The Windows helper.** On Windows the relay's check that only one relay runs per data folder reads process start times through koffi, which is downloaded on demand too (only on Windows, at every start while it is missing). Its row is **⚙️ Settings → General → This computer → Windows helper**. Like the SDKs, it is installed without scripts: its native binary comes prebuilt in koffi's platform package (`@koromix/koffi-win32-x64` or `-arm64`), which npm picks by itself. Until koffi is there, the check falls back to a simpler test: a lock whose owner's start time is unknown is taken as stale when it was written before the last boot, or when its process id now belongs to a program other than Node.js. The start after koffi arrived has the full check again.
 
 **Platforms.** An SDK is there only where its vendor publishes a build. Without one, the provider's row says *Not available on this platform* and nothing is retried. In the table, *has a build* means the vendor publishes one and npm picks it for that platform; the on-demand install was not tried there yet.
 

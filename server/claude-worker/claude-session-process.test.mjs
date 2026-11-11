@@ -458,6 +458,47 @@ test('ExitPlanMode board falls back to the plan file when input.plan is empty', 
   assert.equal(board.body.actions[0].id, 'approve_only');
 });
 
+test('a hand-over whose plan cannot be read: the turn\'s reply becomes the plan card', async () => {
+  const stub = makeApiStub();
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+  });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+  turn.emit(initMessage('native-1'));
+  await waitFor(() => capturedCanUseTool, { label: 'canUseTool wired' });
+  const decision = await capturedCanUseTool('ExitPlanMode', { plan: '', planFilePath: '/home/dev/plans/not-there.md' }, {});
+  assert.equal(decision.behavior, 'deny');
+  assert.match(decision.message, /Restate the complete plan as your final message/);
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/relay-board'), undefined, 'nothing to show yet');
+  turn.emit(resultMessage('The plan, restated as one paragraph without any list.', 'native-1'));
+  await pending;
+  turn.endInput();
+  const boards = stub.calls.filter((call) => call.routePath === '/api/relay-board');
+  assert.equal(boards.length, 1);
+  assert.equal(boards[0].body.boardType, 'plan_ready');
+  assert.equal(boards[0].body.body, 'The plan, restated as one paragraph without any list.');
+  assert.equal(boards[0].body.context.source, 'plan-mode-fallback');
+});
+
+test('a plan-mode turn that ends without a hand-over posts no plan card, list lines or not', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({ stub, startImpl: () => turn });
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('Both answers are in:\n\n- the first one is settled\n- the second one too', 'native-1'));
+  await pending;
+  turn.endInput();
+  assert.equal(stub.calls.find((call) => call.routePath === '/api/relay-board'), undefined);
+  assert.ok(stub.calls.find((call) => call.routePath === '/api/response'), 'the reply itself went out');
+});
+
 test('plan board payload requires plan text', () => {
   assert.equal(buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '' }), null);
   const payload = buildClaudePlanReadyBoardPayload({ message: baseMessage, planText: '1. a\n2. b' });

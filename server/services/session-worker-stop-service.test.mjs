@@ -259,6 +259,111 @@ test('a registry pid that is alive is still stopped when the list does not show 
   assert.deepEqual(stopCalls, [[81, 4242]]);
 });
 
+// The process list holds every process with its command line, so a live
+// worker is always on it; the registry's pid that is not is someone else's
+// process now (or an unreaped zombie), and no signal goes to it.
+test('posix: a registry pid that is alive but not listed is not the worker: nothing to stop', async () => {
+  for (const code of [null, 'EPERM']) {
+    const calls = [];
+    const result = await stopSessionWorkerProcesses({
+      sdkSessionId: SID,
+      worker: { pid: 4242 },
+      platform: 'linux',
+      processInspector: { findProcessesForSessionAsync: async () => [] },
+      isPidAliveImpl: () => true,
+      killImpl: (pid, signal) => {
+        calls.push([pid, signal]);
+        if (code) throw Object.assign(new Error('operation not permitted'), { code });
+      },
+      ...fakeClock(),
+    });
+    assert.equal(result.ok, true, String(code));
+    assert.deepEqual(result.pids, [], String(code));
+    assert.deepEqual(calls, [], String(code));
+  }
+});
+
+// The list matches command lines: a shell that carried the session's
+// arguments can be on it while it ends by itself, another user's included
+// (no signal reaches it), and a process killed but not reaped yet answers
+// signal 0 though it is gone from the list.
+test('posix: a match that is gone from a fresh list by the re-check counts as stopped; the others get their signals', async () => {
+  const cases = {
+    'another user\'s ending shell': (pid) => { if (pid === 5150) throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' }); },
+    'an unreaped zombie': () => {},
+  };
+  for (const [name, refuse] of Object.entries(cases)) {
+    const calls = [];
+    let reads = 0;
+    const result = await stopSessionWorkerProcesses({
+      sdkSessionId: SID,
+      platform: 'linux',
+      processInspector: {
+        findProcessesForSessionAsync: async () => (reads++ === 0 ? [{ processId: 5150 }, { processId: 61 }] : []),
+      },
+      // 61 dies on SIGTERM; 5150 answers signal 0 throughout.
+      isPidAliveImpl: (pid) => pid === 5150 || !calls.some(([p]) => p === pid),
+      killImpl: (pid, signal) => {
+        refuse(pid);
+        calls.push([pid, signal]);
+      },
+      gracefulTimeoutMs: 100,
+      escalationTimeoutMs: 100,
+      ...fakeClock(),
+    });
+    assert.equal(result.ok, true, `${name}: ${JSON.stringify(result)}`);
+    assert.deepEqual(result.remainingPids, [], name);
+    assert.ok(calls.some(([pid, signal]) => pid === 61 && signal === 'SIGTERM'), `${name}: the other pid was signalled`);
+    assert.equal(reads, 2, `${name}: the list was read again before giving up`);
+  }
+});
+
+test('posix: a match a fresh list still shows after the stop is not stopped, and the reason says why', async () => {
+  const denied = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    platform: 'linux',
+    processInspector: { findProcessesForSessionAsync: async () => [{ processId: 71 }] },
+    isPidAliveImpl: () => true,
+    killImpl: () => { throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' }); },
+    gracefulTimeoutMs: 100,
+    escalationTimeoutMs: 100,
+    ...fakeClock(),
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.timedOut, false);
+  assert.deepEqual(denied.remainingPids, [71]);
+  assert.match(denied.error, /not permitted/);
+  // One refused and one that took its signals and lives on: a timeout.
+  const mixed = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    platform: 'linux',
+    processInspector: { findProcessesForSessionAsync: async () => [{ processId: 71 }, { processId: 73 }] },
+    isPidAliveImpl: () => true,
+    killImpl: (pid) => { if (pid === 71) throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' }); },
+    gracefulTimeoutMs: 100,
+    escalationTimeoutMs: 100,
+    ...fakeClock(),
+  });
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.timedOut, true);
+  assert.deepEqual(mixed.remainingPids, [71, 73]);
+  assert.match(mixed.error, /^worker-stop-timeout:71,73$/);
+  // An unreadable second list changes nothing: the survivor stays one.
+  let reads = 0;
+  const unreadable = await stopSessionWorkerProcesses({
+    sdkSessionId: SID,
+    platform: 'linux',
+    processInspector: { findProcessesForSessionAsync: async () => { if (reads++) throw new Error('ps failed'); return [{ processId: 72 }]; } },
+    isPidAliveImpl: () => true,
+    killImpl: () => {},
+    gracefulTimeoutMs: 100,
+    escalationTimeoutMs: 100,
+    ...fakeClock(),
+  });
+  assert.equal(unreadable.ok, false);
+  assert.match(unreadable.error, /^worker-stop-timeout:72$/);
+});
+
 test('isProcessAlive: signal 0 reaches it; EPERM is alive, anything else is not', async () => {
   assert.equal(isProcessAlive(process.pid), true, 'this process');
   const child = spawn(process.execPath, ['-e', '']);

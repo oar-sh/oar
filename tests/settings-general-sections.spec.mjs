@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
 
-// Settings › General in headed sections: the six titles show in order on a
+// Settings › General in headed sections: the five titles show in order on a
 // phone and a desktop, and Models holds its controls. With OAR_E2E_SCREENSHOT_DIR set, the panel is shot at
-// its top and with "This relay" scrolled up, dark and light.
+// its top and with "This computer" scrolled up, dark and light.
 
-const SECTIONS = ["Appearance", "Reading", "Turns and tasks", "Models", "This relay", "Updates"];
+const SECTIONS = ["Reading", "Turns and tasks", "Models", "This computer", "Updates"];
 const VIEWPORTS = [
   { name: "phone", width: 390, height: 844 },
   { name: "desktop", width: 1280, height: 900 },
@@ -21,12 +21,12 @@ async function openGeneral(page) {
 }
 
 for (const viewport of VIEWPORTS) {
-  test(`General shows its six section titles in order (${viewport.name})`, async ({ page }) => {
+  test(`General shows its five section titles in order (${viewport.name})`, async ({ page }) => {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await openGeneral(page);
     const titles = page.locator("#settings-panel-general > .settings-section > .settings-section-title");
     await expect(titles).toHaveText(SECTIONS);
-    for (const id of ["theme-select", "scroll-on-send-toggle", "turn-ceiling-slider", "model-refresh-auto-toggle", "pwa-app-name-input", "update-auto-check-toggle"]) {
+    for (const id of ["scroll-on-send-toggle", "turn-ceiling-slider", "model-refresh-auto-toggle", "default-session-workspace-root-input", "update-auto-check-toggle"]) {
       await page.locator(`#${id}`).scrollIntoViewIfNeeded();
       await expect(page.locator(`#${id}`)).toBeVisible();
     }
@@ -34,12 +34,15 @@ for (const viewport of VIEWPORTS) {
     const shotDir = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim();
     if (!shotDir) return;
     for (const theme of ["dark", "light"]) {
-      await page.locator("#theme-select").scrollIntoViewIfNeeded();
-      await page.locator("#theme-select").selectOption(theme);
-      await page.locator("#settings-section-appearance-title").scrollIntoViewIfNeeded();
+      // The theme select lives on the Appearance tab now.
+      await page.evaluate((value) => {
+        window.updateTheme(value);
+        document.getElementById("theme-select").value = value;
+      }, theme);
+      await page.locator("#settings-section-reading-title").scrollIntoViewIfNeeded();
       await page.screenshot({ path: `${shotDir}/general-${viewport.name}-${theme}-top.png` });
-      await page.evaluate(() => document.getElementById("settings-section-relay-title").scrollIntoView({ block: "start" }));
-      await page.screenshot({ path: `${shotDir}/general-${viewport.name}-${theme}-relay.png` });
+      await page.evaluate(() => document.getElementById("settings-section-computer-title").scrollIntoView({ block: "start" }));
+      await page.screenshot({ path: `${shotDir}/general-${viewport.name}-${theme}-computer.png` });
     }
   });
 }

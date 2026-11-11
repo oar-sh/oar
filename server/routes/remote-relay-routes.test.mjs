@@ -177,6 +177,9 @@ test('GET /api/remote-relays lists public entries and the self block, never a to
   assert.equal(response.body.self.name, 'win-test');
   assert.equal(response.body.self.inboundEnabled, true);
   assert.equal(response.body.self.publicUrl, '');
+  // The name an empty relay name falls back to, for this relay's Settings
+  // (GET /api/relay/identity above, what other relays read, has no such field).
+  assert.equal(response.body.self.defaultName, 'devbox');
   assertNoToken(response);
 });
 

@@ -44,7 +44,7 @@ export function registerRemoteRelayRoutes(app, deps) {
   app.get('/api/remote-relays', auth, (_req, res) => {
     res.json({
       relays: registry.listPublic(),
-      self: { ...registry.selfIdentity(), ...registry.getSelfSettings() },
+      self: registry.selfPayload(),
     });
   });
 
