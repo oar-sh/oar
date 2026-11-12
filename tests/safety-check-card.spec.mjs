@@ -5,6 +5,8 @@ import { expect, test } from "@playwright/test";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 import { createAskUserBridge } from "../shared/ask-user-bridge.mjs";
 import { createCanUseTool } from "../server/claude-worker/claude-sdk-adapter.mjs";
+import { readRelaySecretsFile, relaySecretsPath } from "../server/services/owner-secret-store.mjs";
+import { mintAgentTokenWithKey } from "../shared/relay-credentials.mjs";
 
 // A Claude session's Safety check card: the CLI's canUseTool call is the
 // test double, the adapter and the question bridge are the real ones, and the
@@ -21,6 +23,17 @@ const PERSON_ONLY_OPTIONS = {
   suppressAlwaysAllowRule: true,
   toolUseID: "toolu_sample_1",
   requestId: "req-sample-1",
+};
+// A sensitive-file Safety check: `safetyCheck` without the person-only flag,
+// offered with the CLI's "accept edits" switch (which the card ignores).
+const SENSITIVE_PATH = "/srv/sample-app/work/.bashrc";
+const SENSITIVE_OPTIONS = {
+  suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+  blockedPath: SENSITIVE_PATH,
+  decisionReason: `Claude requested permissions to edit ${SENSITIVE_PATH} which is a sensitive file.`,
+  decisionReasonType: "safetyCheck",
+  toolUseID: "toolu_sample_2",
+  requestId: "req-sample-2",
 };
 
 test.describe.serial("the Safety check card", () => {
@@ -87,6 +100,29 @@ test.describe.serial("the Safety check card", () => {
     return card;
   }
 
+  // A session's agent token, as its worker gets it (OAR_AGENT_TOKEN): made
+  // from the test relay's agent key. Never printed.
+  function sessionAgentToken(conversationId) {
+    const { secrets } = readRelaySecretsFile(relaySecretsPath(relay.dataDir));
+    expect(Boolean(secrets?.agentKey), "the test relay has an agent key").toBe(true);
+    return mintAgentTokenWithKey(secrets.agentKey, { kind: "session", subject: conversationId });
+  }
+
+  // Signs the page in as the person with a single-use sign-in link, so it
+  // holds a browser session (an oars1_ cookie) and never the relay token.
+  async function signInPage(page, conversationId) {
+    const minted = await api("/api/auth/signin-codes", { method: "POST", body: {} });
+    expect(minted.status).toBe(200);
+    await page.goto(`${relay.baseUrl}/?signin=${encodeURIComponent(minted.payload.code)}&conv=${encodeURIComponent(conversationId)}`);
+    await page.waitForFunction(() => typeof window.toggleInboxView === "function");
+    await expect(page.locator("#app")).toHaveClass(/visible/);
+    await expect(page.locator("#auth-gate")).toBeHidden();
+    expect(new URL(page.url()).searchParams.has("signin"), "the code left the address").toBe(false);
+    const cookies = await page.context().cookies(relay.baseUrl);
+    expect(cookies.some((cookie) => cookie.value.startsWith("oars1_")), "a browser session cookie").toBe(true);
+    expect(cookies.some((cookie) => cookie.value.includes(relay.token)), "never the relay token").toBe(false);
+  }
+
   async function openInbox(page) {
     const button = page.locator("#inbox-btn");
     const reachable = () => button.evaluate((node) => {
@@ -136,7 +172,9 @@ test.describe.serial("the Safety check card", () => {
     expect((read.payload?.pendingQuestions || []).map((question) => question.id)).not.toContain(card.id);
     const agentAnswer = await tool(sessions.other, "answer_question", { relay: "this", question_id: card.id, choices: ["Allow once"] });
     expect(agentAnswer.status).toBe(403);
-    expect(String(agentAnswer.payload?.error || "")).toMatch(/this card is the user's to answer/);
+    // No agent answers any card (agent auth), this one least of all.
+    expect(agentAnswer.payload?.code).toBe("AUTH_PERSON_REQUIRED");
+    expect(String(agentAnswer.payload?.error || "")).toMatch(/Only the person can answer questions; ask them in the relay UI\./);
 
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}&conv=${encodeURIComponent(turn.conversationId)}`);
@@ -160,6 +198,59 @@ test.describe.serial("the Safety check card", () => {
     await expect(inInbox.locator(".inbox-answer-text")).toHaveCount(0);
     await inInbox.locator('.inbox-choice[data-choice="Allow once"]').click();
     expect(await decision).toEqual({ behavior: "allow", updatedInput: input });
+  });
+
+  test("desktop: a sensitive-file card shows the file and the change, agents refused, Allow once allows once", async ({ page }) => {
+    const turn = await conversationWithRunningTurn(`add an alias to the sample shell profile ${suffix}`);
+    const input = { file_path: SENSITIVE_PATH, content: 'export PATH="$HOME/bin:$PATH"\nalias ll="ls -l"' };
+    const decision = canUseToolFor(turn)("Write", input, { ...SENSITIVE_OPTIONS, signal: new AbortController().signal });
+    const card = await pendingCard(turn.conversationId);
+    expect(card.choices).toEqual(["Allow once", "Deny"]);
+    expect(card.context.kind).toBe("sensitive-file");
+    expect(card.context.personOnly).toBe(true);
+
+    // No agent answers it: not another session's relay_tool, and not the
+    // card's own session with its worker's agent token, on the answer route
+    // or by dismissing it.
+    const agentAnswer = await tool(sessions.other, "answer_question", { relay: "this", question_id: card.id, choices: ["Allow once"] });
+    expect(agentAnswer.status).toBe(403);
+    expect(agentAnswer.payload?.code).toBe("AUTH_PERSON_REQUIRED");
+    const ownAgent = { Authorization: `Bearer ${sessionAgentToken(turn.conversationId)}` };
+    for (const action of ["answer", "dismiss"]) {
+      const refused = await api(`/api/relay-question/${encodeURIComponent(card.id)}/${action}`, { method: "POST", headers: ownAgent, body: { answer: "Allow once" } });
+      expect(refused.status, action).toBe(403);
+      expect(refused.payload?.code, action).toBe("AUTH_PERSON_REQUIRED");
+    }
+
+    // The person answers in a signed-in page: a browser session, never the
+    // relay token in the address.
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await signInPage(page, turn.conversationId);
+
+    // Reason, then the file, then the fenced change; two choices, no reply box.
+    const inSession = page.locator(".relay-question-container", { hasText: "Safety check" });
+    await expect(inSession).toBeVisible();
+    const body = await inSession.locator(".relay-question-body").innerText();
+    expect(body).toContain("Claude Code marks this file as sensitive");
+    const reasonAt = body.indexOf(`Reason: ${SENSITIVE_OPTIONS.decisionReason}`);
+    const fileAt = body.indexOf(`File: ${SENSITIVE_PATH}`);
+    const changeAt = body.indexOf("Change, 2 lines:");
+    expect(reasonAt).toBeGreaterThan(-1);
+    expect(fileAt).toBeGreaterThan(reasonAt);
+    expect(changeAt).toBeGreaterThan(fileAt);
+    expect(body).toContain('│ export PATH="$HOME/bin:$PATH" ⏎');
+    expect(body).toContain('│ alias ll="ls -l"');
+    await expect(inSession.locator("textarea")).toHaveCount(0);
+    const answerSent = page.waitForRequest((request) => request.method() === "POST"
+      && new URL(request.url()).pathname.endsWith(`/api/relay-question/${encodeURIComponent(card.id)}/answer`));
+    await inSession.getByRole("button", { name: "Allow once" }).click();
+    const sent = await answerSent;
+    expect("authorization" in sent.headers(), "answered with the browser session, no Bearer").toBe(false);
+    expect(/^oark1_/.test(sent.headers()["x-oar-session-proof"] || ""), "the session's proof key went with the cookie").toBe(true);
+    expect((await sent.response())?.status()).toBe(200);
+    const allowed = await decision;
+    expect(allowed).toEqual({ behavior: "allow", updatedInput: input });
+    expect("updatedPermissions" in allowed).toBe(false);
   });
 
   test("phone: the Inbox card denies on Deny", async ({ page }) => {

@@ -3,7 +3,6 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { spawn, spawnSync } from 'child_process';
@@ -13,12 +12,14 @@ import {
   migrateStateToOarRoot,
 } from '../server/services/oar-state-migration-service.mjs';
 import { readConfiguredDataDir, resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
+import { RELAY_STOP_EXIT_CODE } from '../server/relay-exit-codes.mjs';
 import { RESCUE_DIR_NAME, TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
 import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from '../server/services/native-addon-build-service.mjs';
 import { DB_FILE_NAME, DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile } from '../server/services/database-file.mjs';
 import { BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE, backupDatabase, configWarnings, describeBackups, sanitizeReason } from '../server/services/db-backup-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
 import { createAgentSdkStore } from '../server/services/agent-sdk-store.mjs';
+import { ROTATED_VIA, createOwnerSecretStore } from '../server/services/owner-secret-store.mjs';
 import {
   getLauncherLogDir,
   getLegacyManagedConfigDir,
@@ -27,8 +28,8 @@ import {
   resolveStateLayout,
 } from '../server/services/oar-state-layout.mjs';
 import {
-  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, describeAgentSdks, describeRelayAddress, DOCTOR_PROBES,
-  generateAuthToken, listSystemdDropIns, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderAgentSdkLines,
+  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, cliAgentToken, describeAgentSdks, describeRelayAddress, DOCTOR_PROBES,
+  listSystemdDropIns, ownerTokenState, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderAgentSdkLines,
   renderDoctorReport,
   resolveNpmInvocation, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
 } from '../server/services/oar-cli-helpers.mjs';
@@ -263,10 +264,10 @@ function ensureGlobalExtensionWrapper({ packageRoot, env = process.env, logger =
   return { targetDir, targetFilePath, sourceEntryPath };
 }
 
-function createDefaultConfig({ port = 3333, token = '' } = {}) {
+// No authToken: the relay keeps its owner token as a hash in its data folder.
+function createDefaultConfig({ port = 3333 } = {}) {
   const parsedPort = Number.parseInt(String(port || ''), 10);
   return {
-    authToken: String(token || '').trim() || randomUUID(),
     port: Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 3333,
     localhostOnly: true,
     pollIntervalMs: 3000,
@@ -288,15 +289,13 @@ function resolveConfigPaths({ packageRoot, env = process.env, layout = null } = 
   return { seedPath, configPath: seedPath || managedPath };
 }
 
-function resolveLauncherConfig({ packageRoot, env = process.env, relayToken = '', relayPort = 3333, portOverride = null, layout = null } = {}) {
+function resolveLauncherConfig({ packageRoot, env = process.env, relayPort = 3333, portOverride = null, layout = null } = {}) {
   const { seedPath, configPath } = resolveConfigPaths({ packageRoot, env, layout });
   const seedConfig = readJsonFile(seedPath) || {};
   const runtimeConfig = {
     ...createDefaultConfig({ port: relayPort }),
     ...seedConfig,
   };
-  if (relayToken) runtimeConfig.authToken = relayToken;
-  if (!String(runtimeConfig.authToken || '').trim()) runtimeConfig.authToken = randomUUID();
   // An explicit --port wins over the config for this run: the server gets it
   // on argv, and only a config this command creates saves it.
   runtimeConfig.port = normalizePort(portOverride) ?? normalizePort(runtimeConfig.port) ?? normalizePort(relayPort) ?? 3333;
@@ -432,7 +431,13 @@ export async function launchRelay({
   // The relay on that port says whether it runs: a lock file says nothing
   // about the port, and can outlive its relay. On a --port other than the
   // config's the lock is left alone: its relay may run on the config's port.
-  const probe = { statusUrl, token: runtimeConfig.config.authToken, fetchImpl };
+  // The data folder the relay below runs on, and the cli agent token derived
+  // from its agent key: what this launcher calls the relay with ('' until the
+  // relay has run once; looked up again while it starts).
+  const launchDataDir = resolveRelayStateDirs({ env, layout }).dataDir
+    || resolveDataDir({ env, configPath: runtimeConfig.configPath, serverDir });
+  const tokenNow = () => cliAgentToken({ dataDir: launchDataDir });
+  const probe = { statusUrl, token: tokenNow(), fetchImpl };
   const answer = configPort && port !== configPort
     ? await probeRelayPort(probe)
     : await probeRelayBehindLock({ ...probe, lockPath, port, isProcessAliveImpl, lockGraceMs, logger });
@@ -469,7 +474,9 @@ export async function launchRelay({
     logger.log(`Copilot relay is already running at ${statusUrl}.`);
   } else {
     logger.log(`Starting Copilot relay from ${cwd}...`);
-    const serverArgs = [path.join(serverDir, 'server.js'), '--token', runtimeConfig.config.authToken, '--port', String(runtimeConfig.config.port)];
+    // No --token: argv is visible to local processes, and the relay keeps its
+    // own token (a --token still works, with a warning).
+    const serverArgs = [path.join(serverDir, 'server.js'), '--port', String(runtimeConfig.config.port)];
     const logDir = getLauncherLogDir(baseEnv);
     const serverLogPath = path.join(logDir, 'server.log');
     const serverErrPath = path.join(logDir, 'server-err.log');
@@ -507,7 +514,7 @@ export async function launchRelay({
         }
         try {
           const res = await fetchImpl(statusUrl, {
-            headers: { Authorization: `Bearer ${runtimeConfig.config.authToken}` },
+            headers: { Authorization: `Bearer ${tokenNow()}` },
           });
           if (res && res.ok) {
             resolve(true);
@@ -679,11 +686,14 @@ function systemdUnitPath(homeDir = os.homedir()) {
   return path.join(homeDir, '.config', 'systemd', 'user', 'oar.service');
 }
 
+// `token` may be a function: a relay that starts for the first time makes
+// the agent key the token is derived from.
 async function waitForRelay({ statusUrl, token, fetchImpl = globalThis.fetch, deadlineMs = 20_000, stillStarting = () => true } = {}) {
   const deadline = Date.now() + deadlineMs;
   for (;;) {
     try {
-      const res = await fetchImpl(statusUrl, { headers: { Authorization: `Bearer ${token}` } });
+      const value = typeof token === 'function' ? token() : token;
+      const res = await fetchImpl(statusUrl, { headers: { Authorization: `Bearer ${value}` } });
       if (res && res.ok) return true;
     } catch {
       // retry
@@ -787,11 +797,18 @@ export async function ensureRelayRunning({
   lockPath = path.join(layout.dataDir, 'relay-server.lock'),
 } = {}) {
   const port = normalizePort(config?.port) ?? 3333;
-  const token = String(config?.authToken || '').trim();
+  // The cli agent token of the relay's data folder, looked up again while a
+  // first start makes it.
+  // A checkout's service runs on the checkout's own folders, not on paths
+  // of this shell (CHECKOUT_UNPINNED_ENV).
+  const ensureDataDir = layout.checkout
+    ? resolveDataDir({ env: { ...env, COPILOT_WEB_RELAY_DATA_DIR: '' }, configPath, serverDir: path.join(packageRoot, 'server') })
+    : resolveRelayStateDirs({ env, layout }).dataDir || layout.dataDir;
+  const token = () => cliAgentToken({ dataDir: ensureDataDir });
   const statusUrl = `http://localhost:${port}/api/status`;
   const logDir = getLauncherLogDir(env, layout);
   const answer = await probeRelayBehindLock({
-    statusUrl, token, lockPath, port, fetchImpl, isProcessAliveImpl, lockGraceMs, logger,
+    statusUrl, token: token(), lockPath, port, fetchImpl, isProcessAliveImpl, lockGraceMs, logger,
   });
   if (answer === 'oar') return { ok: true, how: 'already', logDir };
   if (answer === 'bringing-over') return { ok: false, how: 'bringing-over', logDir, takeover: readTakeover(lockPath, isProcessAliveImpl) };
@@ -845,6 +862,10 @@ export async function ensureRelayRunning({
   const ok = await waitForRelay({ statusUrl, token, fetchImpl, deadlineMs: readyWaitMs, stillStarting: () => child.exitCode === null });
   const takeover = ok ? null : readTakeover(lockPath, isProcessAliveImpl);
   if (takeover) return { ok: false, how: 'bringing-over', logDir, takeover };
+  // 78: the relay stopped on purpose (an unreadable relay-secrets.json, a
+  // database that needs a decision); its reason is its last log line, and
+  // starting it again cannot help.
+  if (!ok && child.exitCode === RELAY_STOP_EXIT_CODE) return { ok: false, how: 'detached', logDir, stoppedOnPurpose: true };
   return { ok, how: 'detached', logDir, ...(ok ? {} : { lock: heldLock(lockPath, isProcessAliveImpl) }) };
 }
 
@@ -920,9 +941,52 @@ function relayDataDir(ctx, paths) {
   return resolveRelayStateDirs({ env: ctx.env, layout: paths.layout }).dataDir || paths.dataDir;
 }
 
-function endpointOf(config) {
+/**
+ * `oar setup --new-token` writes the relay database's record of the owner
+ * hash itself, so the relay's next start does not take the rotation for a
+ * change outside OAR (owner-secret-store.mjs, reconcileWithSettings). No
+ * database yet: nothing to record, the first start writes it. A failure is
+ * said, and the rotation stands.
+ */
+async function recordOwnerHashInDatabase(ctx, dataDir, secretStore) {
+  const file = resolveDatabaseFile(dataDir);
+  if (file.created || file.dangling.length) return true;
+  let db = null;
+  let failure = null;
+  try {
+    const Database = (await import('better-sqlite3')).default;
+    db = new Database(file.path, { fileMustExist: true, timeout: 5000 });
+    const upsert = db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`);
+    const written = secretStore.recordOwnerHash({
+      writeSetting: (key, value) => {
+        try {
+          upsert.run(key, value, new Date().toISOString());
+        } catch (error) {
+          failure = error;
+          throw error;
+        }
+      },
+    });
+    if (written) return true;
+  } catch (error) {
+    failure = error;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+  ctx.logger.error(`[oar] The new token is in force, but ${file.path} could not record it (${failure?.code || failure?.message || failure || 'unknown error'}): the relay's next start reports the token as changed outside OAR. Dismiss that notice if this was you.`);
+  return false;
+}
+
+// The relay's port from the config, and the cli agent token the `oar` CLI
+// calls it with (derived from the relay's agent key; never the owner token).
+function endpointOf(config, token = '') {
   const port = normalizePort(config?.port) ?? 3333;
-  return { port, token: String(config?.authToken || '').trim(), statusUrl: `http://localhost:${port}/api/status` };
+  return { port, token: String(token || '').trim(), statusUrl: `http://localhost:${port}/api/status` };
+}
+
+function cliTokenOf(ctx, paths) {
+  return cliAgentToken({ dataDir: relayDataDir(ctx, paths) });
 }
 
 /**
@@ -932,12 +996,14 @@ function endpointOf(config) {
  * keeps in `relay-previous.json` until the relay has restarted (`stale`).
  */
 async function findRelay(ctx, paths) {
-  const endpoint = endpointOf(paths.config);
+  const token = cliTokenOf(ctx, paths);
+  const endpoint = endpointOf(paths.config, token);
   const found = await readRelayStatus({ ...endpoint, fetchImpl: ctx.fetchImpl });
   const previous = readJsonFile(paths.previousPath);
   if (previous) {
     if (found.answer !== 'oar') {
-      const before = endpointOf(previous);
+      // The agent key does not change with the owner token: the same token.
+      const before = endpointOf(previous, token);
       const earlier = await readRelayStatus({ ...before, fetchImpl: ctx.fetchImpl });
       if (earlier.answer === 'oar') return { ...earlier, endpoint: before, stale: true };
     }
@@ -971,6 +1037,11 @@ async function requestShutdown(ctx, endpoint, restart, { immediate = false } = {
       body: JSON.stringify({ restart, reason: 'oar-cli', requestedBy: 'oar-cli', ...(immediate ? { immediate: true } : {}) }),
       signal: AbortSignal.timeout(5000),
     });
+    if (response?.status === 403) {
+      // The CLI calls with an agent token, which may only queue a restart.
+      ctx.logger.error(`[oar] The relay refused: ${restart ? 'restarting it without waiting' : 'stopping it'} is for you to do in the web UI (︙ → Restart web relay), since the oar command holds an agent token, not the relay token.`);
+      return null;
+    }
     if (!response?.ok) return null;
     const queue = (await Promise.resolve(response.json?.()).catch(() => null))?.queue || {};
     const busy = ['pendingCount', 'processingCount', 'parkedCount'].some((key) => Number(queue[key]) > 0);
@@ -1003,7 +1074,7 @@ function restartService(ctx) {
  */
 async function restartRelay(ctx, paths, { old, viaService, answered = true, now = false }) {
   const { logger, fetchImpl } = ctx;
-  const next = endpointOf(paths.config);
+  const next = endpointOf(paths.config, cliTokenOf(ctx, paths));
   if (viaService && (now || !answered)) {
     if (!restartService(ctx)) return { ok: false, reason: 'service' };
   } else if (!(await requestShutdown(ctx, old, true, { immediate: now }))) {
@@ -1369,7 +1440,9 @@ function startRelay(ctx, paths) {
  * Prints the relay URL and what goes with it. A QR code is printed only for
  * an address a phone can reach, and only where `qr` asks for one.
  */
-async function showAddress(ctx, paths, { qr = false, tunnelBase = '' } = {}) {
+// `token`: a relay token made just now (`oar setup`), shown once in the links;
+// otherwise the address alone (no file holds a token to show).
+async function showAddress(ctx, paths, { qr = false, tunnelBase = '', token = '' } = {}) {
   const { logger } = ctx;
   const lan = paths.config.localhostOnly === false;
   const address = describeRelayAddress({
@@ -1377,6 +1450,7 @@ async function showAddress(ctx, paths, { qr = false, tunnelBase = '' } = {}) {
     lanAddress: primaryLanAddress(ctx.interfaces),
     wslNat: lan && isWslNat(ctx),
     tunnelBase,
+    token,
   });
   const printQr = async (url) => {
     const code = qr && url ? await ctx.qrImpl(url) : null;
@@ -1402,6 +1476,10 @@ function reportRelayStart(result, logger) {
   if (result.how === 'port-taken') return;
   if (result.how === 'bringing-over') {
     logger.log(takeoverLine(result.takeover, result.logDir));
+    return;
+  }
+  if (!result.ok && result.stoppedOnPurpose) {
+    logger.error?.(`[oar] The relay stopped on purpose; the reason is the last line of ${path.join(result.logDir, 'server-err.log')}. Fix that, then run: oar start`);
     return;
   }
   if (!result.ok) {
@@ -1455,7 +1533,7 @@ export async function runStart(options = {}) {
   const result = await startRelay(ctx, paths);
   reportRelayStart(result, logger);
   if (result.ok) await showAddress(ctx, paths);
-  warnWindowsPort(ctx, endpointOf(paths.config).port);
+  warnWindowsPort(ctx, endpointOf(paths.config, '').port);
   if (result.how === 'bringing-over') return { code: 0, reason: 'bringing-over' };
   return { code: result.ok ? 0 : 1, reason: result.ok ? 'started' : 'server-not-ready' };
 }
@@ -1471,10 +1549,35 @@ function stopService(ctx, paths) {
 }
 
 /**
+ * The confirmation before something that cuts running turns off (`stop
+ * --now`, `restart --now`, `uninstall`): `--yes` on the command line, else a
+ * y/N question on a terminal. Without a terminal and without `--yes` the
+ * command is refused. This is friction, not a boundary (a process of the
+ * same user can end the relay anyway; docs/security.md).
+ *
+ * Returns null to go ahead, or the result to return.
+ */
+async function confirmCutOff(ctx, question, command) {
+  if (ctx.argv.includes('--yes')) return null;
+  if (!ctx.stdin?.isTTY) {
+    ctx.logger.error(`[oar] No terminal to ask on. To go ahead without the question, run: ${command} --yes`);
+    return { code: 1, reason: 'needs-yes' };
+  }
+  if (await ctx.prompter.yesNo(question, { defaultYes: false })) return null;
+  ctx.logger.log('[oar] Not confirmed. Nothing was changed.');
+  return { code: 1, reason: 'not-confirmed' };
+}
+
+const STOP_NOW_QUESTION = 'Stop the relay now? Running turns are cut off.';
+const RESTART_NOW_QUESTION = 'Restart the relay now? Running turns are cut off.';
+
+/**
  * `oar stop` — the relay stops itself once no turn is running, under the
  * service too (its unit stays enabled). `--now` under the service, or a
  * service whose relay does not answer: systemd stops it at once. `--now` of
- * any other relay asks it to stop without waiting.
+ * any other relay asks it to stop without waiting. The relay takes a stop
+ * from the cli agent token over loopback only; `--now` asks first on a
+ * terminal and needs `--yes` without one.
  */
 export async function runStop(options = {}) {
   const ctx = cliContext(options);
@@ -1484,7 +1587,11 @@ export async function runStop(options = {}) {
   if (missing) return missing;
   const now = ctx.argv.includes('--now');
   const viaService = (await serviceState(ctx, paths)) === 'active';
-  if (viaService && now) return stopService(ctx, paths);
+  if (viaService && now) {
+    const refused = await confirmCutOff(ctx, STOP_NOW_QUESTION, `${oarCommand(paths)} stop --now`);
+    if (refused) return refused;
+    return stopService(ctx, paths);
+  }
   const relay = await findRelay(ctx, paths);
   if (viaService && relay.answer !== 'oar') return stopService(ctx, paths);
   if (relay.answer === 'none') {
@@ -1492,6 +1599,10 @@ export async function runStop(options = {}) {
     return { code: 0, reason: 'not-running' };
   }
   if (relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
+  if (now) {
+    const refused = await confirmCutOff(ctx, STOP_NOW_QUESTION, `${oarCommand(paths)} stop --now`);
+    if (refused) return refused;
+  }
   if (!(await requestShutdown(ctx, relay.endpoint, false, { immediate: now }))) {
     if (viaService) return stopService(ctx, paths);
     logger.error('[oar] The relay did not accept the stop request.');
@@ -1523,8 +1634,13 @@ export async function runRestart(options = {}) {
   const relay = await findRelay(ctx, paths);
   if (!viaService && relay.answer === 'none') return runStart(options);
   if (!viaService && relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
+  const now = ctx.argv.includes('--now');
+  if (now) {
+    const refused = await confirmCutOff(ctx, RESTART_NOW_QUESTION, `${oarCommand(paths)} restart --now`);
+    if (refused) return refused;
+  }
   const outcome = await restartRelay(ctx, paths, {
-    old: relay.endpoint, viaService, answered: relay.answer === 'oar', now: ctx.argv.includes('--now'),
+    old: relay.endpoint, viaService, answered: relay.answer === 'oar', now,
   });
   if (outcome.ok) await showAddress(ctx, paths);
   return { code: outcome.ok ? 0 : 1, reason: outcome.reason };
@@ -1556,6 +1672,8 @@ async function collectStatus(ctx, paths = installPaths(ctx)) {
       env: ctx.env, platform: ctx.platform, configBaseDir: path.join(ctx.packageRoot, 'server'),
     });
   status.tunnel = tunnel === 'off' || tunnel === 'disabled' ? '' : tunnel;
+  // Stored as a hash only: whether there is one, never the token.
+  status.ownerToken = ownerTokenState({ dataDir: relayDataDir(ctx, paths) });
   const holder = createWindowsPortCheck(ctx)(port);
   if (holder) status.warnings.push(windowsPortWarning(port, holder));
   return status;
@@ -1579,16 +1697,123 @@ export async function runStatus(options = {}) {
     logger.log(`[oar] Service: ${{ active: 'installed, running', installed: 'installed', none: 'not installed', other: 'not installed (oar.service belongs to another OAR install)' }[status.service]}`);
   }
   if (status.tunnel) logger.log(`[oar] Tunnel: ${status.tunnel}`);
+  logger.log(`[oar] Owner token: ${status.ownerToken}`);
   for (const warning of status.warnings) logger.log(`[oar] ${warning}`);
   return { code: status.relay === 'running' ? 0 : 3, reason: `relay-${status.relay}` };
 }
 
-/** `oar url` — the relay URL, a QR code where a phone can reach it, and the tunnel address a running relay reports. */
+/**
+ * `oar agent-token` — prints a `cli` agent token for scripts on this host
+ * (`Authorization: Bearer <token>`): the routes agents may use, such as group
+ * moves and a queued restart. Never the relay (owner) token, which no file
+ * holds. Inside a session, OAR_AGENT_TOKEN is already set.
+ */
+export async function runAgentToken(options = {}) {
+  const ctx = cliContext(options);
+  const paths = installPaths(ctx);
+  const token = cliTokenOf(ctx, paths);
+  if (!token) {
+    ctx.logger.error('[oar] No agent token yet: the relay makes its agent key at its first start (oar start).');
+    return { code: 1, reason: 'no-agent-key' };
+  }
+  ctx.logger.log(token);
+  return { code: 0, reason: 'agent-token' };
+}
+
+/** `HH:MM` of an ISO time, in local time. */
+function clockTime(iso) {
+  const at = new Date(iso);
+  if (!Number.isFinite(at.getTime())) return '';
+  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * `oar url --sign-in` (agent auth §13.2, 2c): a single-use sign-in link for
+ * one more browser, printed once with its QR code. Only in a terminal (stdin
+ * and stdout; `--yes` does not stand in for one), never with OAR_AGENT_TOKEN
+ * in the environment (an agent's shell), and only from a running relay of
+ * this install, which makes the code for the cli agent token straight over
+ * loopback (POST /api/auth/signin-codes/terminal, 3 per 10 minutes).
+ *
+ * Friction, not a boundary: a process of the user's can call the route with
+ * `oar agent-token` (docs/security.md). Every other browser is told of the
+ * new sign-in, by notice and push, "via the terminal".
+ */
+async function printSignInLink(ctx, paths) {
+  const { logger } = ctx;
+  if (!ctx.stdin?.isTTY || !ctx.stdout?.isTTY) {
+    logger.error('[oar] oar url --sign-in prints a sign-in link only in a terminal (stdin and stdout); --yes does not change that. In the web UI: Settings → Security → Sign in another device.');
+    return { code: 1, reason: 'needs-terminal' };
+  }
+  if (String(ctx.env?.OAR_AGENT_TOKEN || '').trim()) {
+    logger.error('[oar] OAR_AGENT_TOKEN is set: this looks like an agent\'s shell. Run oar url --sign-in in a terminal of your own, or use Settings → Security → Sign in another device.');
+    return { code: 1, reason: 'agent-env' };
+  }
+  const relay = await findRelay(ctx, paths);
+  if (relay.answer !== 'oar') {
+    logger.error(relay.answer === 'taken'
+      ? `[oar] Port ${relay.endpoint.port} is in use by another program, or by a relay with another token; no sign-in link.`
+      : '[oar] The relay is not running, so it cannot make a sign-in link. Start it with: oar start');
+    return { code: 1, reason: relay.answer === 'taken' ? 'port-taken' : 'not-running' };
+  }
+  if (relay.stale) {
+    logger.error('[oar] The relay runs with its earlier settings; restart it first (oar restart), then ask for the link again.');
+    return { code: 1, reason: 'relay-stale' };
+  }
+  let response = null;
+  try {
+    response = await ctx.fetchImpl(`http://localhost:${relay.endpoint.port}/api/auth/signin-codes/terminal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${relay.endpoint.token}` },
+      body: '{}',
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    response = null;
+  }
+  const answer = response ? await Promise.resolve(response.json?.()).catch(() => null) : null;
+  if (!response?.ok || !answer?.code) {
+    const why = response?.status === 429
+      ? `at most 3 sign-in links in 10 minutes${Number(answer?.retryAfterSeconds) > 0 ? `; try again in ${Math.ceil(Number(answer.retryAfterSeconds) / 60)} min` : ''}`
+      : response?.status === 403 || response?.status === 404
+        ? 'this relay does not make sign-in links for the oar command (an older version, or a proxy in between); use Settings → Security → Sign in another device'
+        : 'no answer';
+    logger.error(`[oar] The relay made no sign-in link: ${why}.`);
+    return { code: 1, reason: response?.status === 429 ? 'rate-limited' : 'refused' };
+  }
+  // The address a phone reaches: the tunnel, else the LAN address, else
+  // this machine's (said so).
+  const lan = paths.config.localhostOnly === false;
+  const remoteUrl = String(relay.status?.readyBanner?.remoteUrl || '').replace(/\/+$/, '');
+  const address = describeRelayAddress({
+    config: paths.config,
+    lanAddress: primaryLanAddress(ctx.interfaces),
+    wslNat: lan && isWslNat(ctx),
+    tunnelBase: remoteUrl ? `${remoteUrl}${relay.status.remotePath || ''}` : '',
+  });
+  const reachable = address.tunnelUrl || address.qrUrl;
+  const base = String(reachable || address.url).replace(/\/+$/, '');
+  const link = `${base}/?signin=${encodeURIComponent(answer.code)}`;
+  logger.log('');
+  logger.log(`[oar] Sign-in link: ${link}`);
+  const qr = reachable ? await ctx.qrImpl(link) : null;
+  if (qr) logger.log(qr);
+  if (!reachable) logger.log('[oar] That address is this machine\'s only; a phone needs LAN access (oar setup --lan) or a tunnel.');
+  logger.log(`[oar] Works once, until ${clockTime(answer.expiresAt)}; a new code replaces this one. Anyone who sees this can sign in as you.`);
+  return { code: 0, reason: 'sign-in-link' };
+}
+
+/**
+ * `oar url` — the relay URL, a QR code where a phone can reach it, and the
+ * tunnel address a running relay reports. Never a token link (no file holds
+ * the token); `--sign-in` prints a single-use sign-in link instead.
+ */
 export async function runUrl(options = {}) {
   const ctx = cliContext(options);
   const paths = installPaths(ctx);
   const missing = requireConfig(ctx, paths);
   if (missing) return missing;
+  if (ctx.argv.includes('--sign-in')) return printSignInLink(ctx, paths);
   const relay = await findRelay(ctx, paths);
   const remoteUrl = String(relay.status?.readyBanner?.remoteUrl || '').replace(/\/+$/, '');
   await showAddress(ctx, paths, { qr: true, tunnelBase: remoteUrl ? `${remoteUrl}${relay.status.remotePath || ''}` : '' });
@@ -1741,12 +1966,18 @@ function strictPort(text) {
 }
 
 /**
- * `oar setup` — writes the config: auth token, access (this machine only or
- * LAN) and port. In a terminal it asks, showing the current value; `--port`,
- * `--lan`, `--local` and `--new-token` set a value without a question, and
- * `--defaults` keeps (or, for a new config, picks) everything. A running relay
- * is restarted when one of the three changed. `--start` is the installer's
- * mode: it also installs the service where it can and starts the relay.
+ * `oar setup` — writes the config: access (this machine only or LAN) and
+ * port, and looks after the relay token. In a terminal it asks, showing the
+ * current value; `--port`, `--lan` and `--local` set a value without a
+ * question, and `--defaults` keeps (or, for a new config, picks) everything.
+ * A running relay is restarted when something changed. `--start` is the
+ * installer's mode: it also installs the service where it can and starts the
+ * relay.
+ *
+ * The relay token is never in the config: its hash lives in the relay's data
+ * folder (relay-secrets.json). A fresh install gets a new token, shown once.
+ * `--new-token` makes a new one through rotateOwnerToken; it needs a terminal
+ * and the typed word NEW (friction against agents, not a boundary).
  */
 export async function runSetup(options = {}) {
   const ctx = cliContext(options);
@@ -1800,10 +2031,38 @@ export async function runSetup(options = {}) {
     return holder ? `Port ${port} is in use on Windows (${holder}).` : null;
   };
 
-  let token = String(existing?.authToken || '').trim();
-  if (!token || has('--new-token')
-    || (ask && await prompter.yesNo('New auth token? It signs every device out.', { defaultYes: false }))) {
-    token = generateAuthToken();
+  // The relay token: the store in the relay's data folder. A config from
+  // before this version gives its token up here as the relay would.
+  const secretStore = createOwnerSecretStore({ dataDir: relayDataDir(ctx, paths), logger: { log() {}, warn: (line) => logger.log(line) } });
+  const hadSecrets = secretStore.load() === 'ok';
+  const wantsNewToken = has('--new-token')
+    || (ask && hadSecrets && await prompter.yesNo('New relay token? The current one stops working.', { defaultYes: false }));
+  let newToken = '';
+  if (wantsNewToken) {
+    // Input and output both: a token is never replaced without being shown,
+    // and never shown where it would land in a file or a pipe.
+    if (!ctx.stdin?.isTTY || !ctx.stdout?.isTTY) {
+      logger.error('[oar] --new-token needs a terminal: run it yourself, in a terminal on this host, without redirecting its input or output. Nothing was changed.');
+      return { code: 1, reason: 'new-token-needs-terminal' };
+    }
+    const typed = String(await prompter.line('Type NEW to make a new relay token (the current one stops working): ') || '').trim();
+    if (typed !== 'NEW') {
+      logger.error('[oar] No new token: NEW was not typed. Nothing was changed.');
+      return { code: 1, reason: 'new-token-not-confirmed' };
+    }
+  }
+  if (!hadSecrets) {
+    const boot = secretStore.bootstrap({ config: existing || {}, configPath: paths.configPath, previousPath: paths.previousPath });
+    newToken = boot.generatedToken || '';
+  }
+  if (wantsNewToken && !newToken) {
+    try {
+      newToken = secretStore.rotateOwnerToken({ reason: 'oar setup --new-token', via: ROTATED_VIA.cli }).token;
+    } catch (error) {
+      logger.error(`[oar] The new token could not be stored (${error?.code || error?.message || error}). Nothing was changed.`);
+      return { code: 1, reason: 'new-token-failed' };
+    }
+    await recordOwnerHashInDatabase(ctx, relayDataDir(ctx, paths), secretStore);
   }
 
   let lan = existing?.localhostOnly === false;
@@ -1841,10 +2100,12 @@ export async function runSetup(options = {}) {
     }
   }
 
-  const config = { ...buildDefaultConfig({ token }), ...(existing || {}), authToken: token, localhostOnly: !lan, port };
+  const { authToken: _movedOut, ...kept } = existing || {};
+  const config = { ...buildDefaultConfig(), ...kept, localhostOnly: !lan, port };
   // What the running relay would have to pick up. Its own status says how it
-  // listens, whatever the config said when it started.
-  const endpointChanged = running && (token !== old.token || port !== old.port);
+  // listens, whatever the config said when it started. A new token takes
+  // effect when it restarts (it reads the hash at start).
+  const endpointChanged = running && (Boolean(newToken) || port !== old.port);
   const changed = endpointChanged || (running && lan !== (relay.status.localhostOnly === false));
   fs.mkdirSync(path.dirname(paths.configPath), { recursive: true });
   fs.writeFileSync(paths.configPath, `${JSON.stringify(config, null, 2)}\n`);
@@ -1854,9 +2115,9 @@ export async function runSetup(options = {}) {
   logger.log(`[oar] Wrote ${paths.configPath}`);
   paths = { ...paths, config };
   if (endpointChanged) {
-    // Until the relay has restarted it answers only on its earlier port and token.
+    // Until the relay has restarted it answers only on its earlier port.
     fs.mkdirSync(paths.dataDir, { recursive: true });
-    fs.writeFileSync(paths.previousPath, `${JSON.stringify({ port: old.port, authToken: old.token })}\n`, { mode: 0o600 });
+    fs.writeFileSync(paths.previousPath, `${JSON.stringify({ port: old.port })}\n`, { mode: 0o600 });
   }
 
   // Autostart: as --autostart says, else in a terminal on Windows the
@@ -1887,7 +2148,18 @@ export async function runSetup(options = {}) {
     outcome = { ok: started.ok, reason: started.ok ? 'setup-complete' : 'server-not-ready' };
   }
 
-  await showAddress(ctx, paths, { qr: true });
+  // Shown once, and only to a terminal: setup run by a script or an agent
+  // may write to a log that agents can read. Without a terminal the token is
+  // stored as a hash only, and `oar setup --new-token` in a terminal makes
+  // one that can be seen.
+  const showToken = Boolean(newToken) && Boolean(ctx.stdout?.isTTY);
+  await showAddress(ctx, paths, { qr: true, token: showToken ? newToken : '' });
+  if (showToken) {
+    logger.log(`[oar] Relay token (shown once, keep it in your password manager): ${newToken}`);
+  } else if (newToken) {
+    logger.log('[oar] A new relay token was made and stored as a hash; it is not printed without a terminal. To get one you can see, run in a terminal on this host: oar setup --new-token');
+  }
+  if (newToken && running && !outcome?.ok) logger.log('[oar] The new token works once the relay has restarted: oar restart');
   warnWindowsPort(ctx, port, windowsHolder);
   if (autostart?.code) {
     logger.error('[oar] The config is written; the autostart step did not go through (see above).');
@@ -2121,6 +2393,8 @@ export async function runUninstall(options = {}) {
     logger.error('[oar] This is a git checkout — there is no global package to uninstall.');
     return { code: 1, reason: 'git-checkout' };
   }
+  const refused = await confirmCutOff(ctx, 'Uninstall OAR? The relay stops and the package is removed (the data stays unless --purge).', `oar uninstall${ctx.argv.includes('--purge') ? ' --purge' : ''}`);
+  if (refused) return refused;
   const plan = ctx.argv.includes('--purge') ? purgePlan(ctx, paths) : null;
   const done = [];
   const left = ['the package'];
@@ -2259,7 +2533,7 @@ export async function runDoctor(options = {}) {
     }
   });
 
-  const port = endpointOf(paths.config).port;
+  const port = endpointOf(paths.config, '').port;
   const holder = paths.config ? createWindowsPortCheck(ctx)(port) : null;
   const backups = describeBackups({ layout: paths.layout, serverDir: path.join(ctx.packageRoot, 'server'), dataDir, config: paths.config });
   ctx.logger.log(renderDoctorReport({
@@ -2279,6 +2553,7 @@ export async function runDoctor(options = {}) {
     // The relay resolves a relative cloudflaredTunnel.binary against server/.
     tunnel: describeConfiguredTunnel(paths.config?.cloudflaredTunnel, { env: ctx.env, configBaseDir: path.join(ctx.packageRoot, 'server') }),
     agentSdks: describeAgentSdks({ env: ctx.env, platform: ctx.platform }),
+    ownerToken: ownerTokenState({ dataDir: relayDataDir(ctx, paths) }),
   }));
   return { code: 0, reason: 'doctor' };
 }
@@ -2312,14 +2587,22 @@ export async function runSdk(options = {}) {
     shown = text;
   });
   try {
-    const started = store.install(id, { force: argv.includes('--reinstall'), reason: 'oar sdk install' });
+    const reinstall = argv.includes('--reinstall');
+    const started = store.install(id, { force: reinstall, reason: 'oar sdk install' });
     if (!started.ok) {
       ctx.logger.error(`[oar] ${started.error}`);
       return { code: 1, reason: 'sdk-install-failed' };
     }
     const status = started.ready ? started.status : await store.ensure(id, { reason: 'oar sdk install', retryFailed: true });
     if (status?.state !== 'ready') {
-      ctx.logger.error(`[oar] ${status?.label || id}: ${status?.error || 'not installed'}`);
+      // A failed reinstall leaves the folder it was to replace: still valid,
+      // still the one the relay uses, but not what was asked for.
+      const kept = reinstall ? store.readyDir?.(id) : null;
+      const label = status?.label || id;
+      const why = status?.error || 'not installed';
+      ctx.logger.error(kept
+        ? `[oar] ${label}: the reinstall failed: ${why}. The installed folder ${kept} stays in use.`
+        : `[oar] ${label}: ${why}`);
       return { code: 1, reason: 'sdk-install-failed' };
     }
     ctx.logger.log(`[oar] ${status.label} ${status.installed} is ready in ${status.dir}.`);
@@ -2483,7 +2766,8 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
     logger.log('[oar] No running relay detected — the update loads on the next start.');
     return { code: 0, reason: 'updated' };
   }
-  const token = String(running.lock?.token || config?.authToken || '').trim();
+  // The cli agent token: a queued restart is what an agent token may ask for.
+  const token = cliAgentToken({ dataDir: layout.checkout ? resolveDataDir({ env, configPath, serverDir: path.join(packageRoot, 'server') }) : layout.dataDir });
   try {
     const response = await fetchImpl(`http://localhost:${port}/api/relay/shutdown`, {
       method: 'POST',
@@ -2563,6 +2847,7 @@ const COMMANDS = {
   restart: runRestart,
   status: runStatus,
   url: runUrl,
+  'agent-token': runAgentToken,
   setup: runSetup,
   service: runService,
   autostart: runAutostart,

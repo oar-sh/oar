@@ -43,7 +43,7 @@ test('guard blocks a worker path carrying cf-ray', () => {
 test('guard allows a worker path from a local peer without proxy traces', () => {
   const guard = createTunnelWorkerPathGuard({ logger: quietLogger });
   const { res, nextCalled } = runRequest(guard, {
-    url: '/api/session-worker/ws?token=abc',
+    url: '/api/session-worker/ws?sessionId=sdk-1',
     headers: { host: '127.0.0.1:3333' },
     socket: LOCAL_PEER,
   });
@@ -199,4 +199,16 @@ test('guard leaves shared routes untouched behind a path prefix too', () => {
     headers: { 'cf-ray': 'ray' },
   });
   assert.equal(nextCalled, true);
+});
+
+test('a blocked worker request or upgrade is logged by its path only: a ?token= value never reaches the log', () => {
+  const lines = [];
+  const guard = createTunnelWorkerPathGuard({ logger: { warn: (line) => lines.push(String(line)), log: (line) => lines.push(String(line)) } });
+  // Made at run time; compared, never printed.
+  const token = `tok-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  const url = `/api/session-worker/ws?sessionId=conv-q&token=${token}&pid=7`;
+  assert.equal(guard.handleUpgrade({ url, headers: { 'cf-ray': 'ray' } }, createSocket()), true);
+  assert.equal(runRequest(guard, { url, headers: { 'cf-ray': 'ray' } }).res.statusCode, 403);
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every((line) => line.includes('/api/session-worker/ws') && !line.includes(token) && !line.includes('token=')));
 });

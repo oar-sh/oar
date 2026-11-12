@@ -11,7 +11,10 @@ import {
   INBOX_REMOTE_CHANGED_EVENT,
   RELAY_ASK_SOCKET_EVENT,
   buildAskCard,
+  buildCardItem,
   buildPlanItem,
+  answerThereUrl,
+  canAnswerThere,
   captureInboxFolds,
   createCoalescedRefresh,
   inboxFoldKey,
@@ -118,6 +121,14 @@ test('sections: per relay, pending newest first, answered in the last day under 
   const root = renderInbox(doc, { relays, now: NOW });
   assert.deepEqual([...root.querySelectorAll('.inbox-relay-name')].map((node) => node.textContent), ['bench-relay (this relay)', 'lab-relay', 'gone-relay']);
   assert.equal(root.querySelector('.inbox-relay[data-relay-id="r-gone"] .inbox-relay-unreachable').textContent, 'Not reachable: offline');
+  // A relay added one way shares no Inbox by design: its note, nothing alarming.
+  const withOneWay = renderInbox(doc, { relays: [...relays, { id: 'r-one', name: 'one-way-relay', reachable: true, oneWay: true, note: 'Added one way: use Re-pair.', items: [] }], now: NOW });
+  const oneWay = withOneWay.querySelector('.inbox-relay[data-relay-id="r-one"]');
+  assert.equal(oneWay.querySelector('.inbox-relay-note').textContent, 'Added one way: use Re-pair.');
+  assert.equal(oneWay.querySelector('.inbox-relay-unreachable'), null);
+  // An empty paired relay without a note is left out, as before.
+  const quiet = renderInbox(doc, { relays: [...relays, { id: 'r-empty', name: 'empty-relay', items: [] }], now: NOW });
+  assert.equal(quiet.querySelector('.inbox-relay[data-relay-id="r-empty"]'), null);
   assert.equal(root.querySelectorAll('.inbox-divider').length, 1);
   assert.equal(root.querySelector('.inbox-filter-option.active').dataset.inboxFilter, 'all');
 });
@@ -377,4 +388,138 @@ test('a paired relay\'s approval says what it is about; one from a relay without
   assert.equal(card('card-7').querySelector('.inbox-item-kind').textContent, 'Loop guard · the session waits');
   assert.equal(card('card-8').querySelector('.inbox-item-kind').textContent, 'Approval · the session waits');
   assert.equal(card('card-9').querySelector('.inbox-item-kind').textContent, 'Approval · the session waits', 'no inherited name passes for a variant');
+});
+
+test('a paired relay\'s ask is read-only here with "Open there"; the switch brings the answer buttons back', () => {
+  const relays = [
+    { ...SELF, items: [ask('mine', { options: ['Yes', 'No'] })] },
+    { ...LAB, items: [
+      ask('far', { options: ['Ship', 'Wait'], recommendation: 'Wait', detail: 'Why' }),
+      ask('far-done', { status: 'answered', answer: 'Ship', answeredAt: minutesAgo(3), createdAt: minutesAgo(9) }),
+    ] },
+    { id: 'r-nourl', name: 'no-address', reachable: true, items: [ask('blind')] },
+  ];
+  const root = renderInbox(doc, { relays, now: NOW });
+  const far = root.querySelector('[data-relay-id="r-lab"] [data-item-id="far"]');
+  assert.equal(far.querySelector('.inbox-item-question').textContent, 'Question far?', 'the question still shows');
+  assert.equal(far.querySelector('details.inbox-item-detail').textContent.includes('Why'), true);
+  assert.equal(far.querySelectorAll('button[data-inbox-action]').length, 0, 'no answer, choice or dismiss button');
+  assert.equal(far.querySelector('.inbox-answer-text'), null, 'no answer field');
+  const open = far.querySelector('.inbox-open-there-button');
+  assert.equal(open.textContent, 'Open there');
+  assert.equal(open.href, 'https://relay-b.example.test/?conv=conv-far');
+  assert.equal(open.target, '_blank');
+  assert.equal(open.rel, 'noopener noreferrer');
+  assert.equal(open.title, 'Answer it on lab-relay');
+  // Settled: what came of it, nothing to open for.
+  const done = root.querySelector('[data-item-id="far-done"]');
+  assert.equal(done.querySelector('.inbox-open-there-button'), null);
+  assert.equal(done.querySelector('.inbox-item-outcome').textContent, 'Answered: Ship');
+  // A relay that gave no address: a note instead of a link.
+  const blind = root.querySelector('[data-item-id="blind"]');
+  assert.equal(blind.querySelector('.inbox-open-there-button'), null);
+  assert.equal(blind.querySelector('.inbox-item-note').textContent, 'Answer it on that relay.');
+  // This relay's own ask keeps its buttons.
+  const mine = root.querySelector('[data-item-id="mine"]');
+  assert.deepEqual([...mine.querySelectorAll('.inbox-choice')].map((node) => node.dataset.choice), ['Yes', 'No']);
+  assert.equal(mine.querySelector('.inbox-open-there-button'), null);
+
+  // PAIRED_ASKS_ANSWER_OVER_PAIRING on: today's behaviour, answered through the pairing.
+  const answering = renderInbox(doc, { relays, now: NOW, pairedAnswers: true });
+  const farAgain = answering.querySelector('[data-item-id="far"]');
+  assert.deepEqual({ ...farAgain.querySelector('.inbox-answer').dataset }, { relayId: 'r-lab', itemId: 'far', inboxAction: 'answer' });
+  assert.equal(farAgain.querySelector('.inbox-open-there-button'), null);
+});
+
+test('a paired relay\'s refused claim is one notice in this relay\'s Inbox: what happened, Settings → Relays, Dismiss', () => {
+  const notice = {
+    id: 'relay-refusal:rr-1',
+    kind: 'relay_notice',
+    status: 'pending',
+    createdAt: new Date(NOW - 60_000).toISOString(),
+    relayEntryId: 'rr-1',
+    relayName: 'lab-relay',
+    question: 'lab-relay sent a request claiming to be another relay; it was refused.',
+    detail: 'A paired relay can only speak for itself.',
+  };
+  const relays = [{ ...SELF, items: [notice] }];
+  assert.equal(inboxPendingCount(relays), 1);
+  const root = renderInbox(doc, { relays, now: NOW });
+  const card = root.querySelector('.inbox-relay-notice');
+  assert.ok(card);
+  assert.equal(card.querySelector('.inbox-item-kind').textContent, 'Relay notice');
+  assert.equal(card.querySelector('.inbox-item-question').textContent, notice.question);
+  assert.equal(card.querySelector('[data-inbox-action="relay-settings"]').dataset.relayEntryId, 'rr-1');
+  assert.equal(card.querySelector('[data-inbox-action="relay-notice-dismiss"]').textContent, 'Dismiss');
+});
+
+// ─── Answer in a popup (agent auth §13.2, 1a) ────────────────────────────────
+
+const LAB_LINK = { ...LAB, answerLink: true };
+
+test('answerThereUrl: http(s) only, the relay\'s own origin, an integer option, an id of a question\'s shape', () => {
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'ask_abc123', 1), 'https://relay-b.example.test/?answer=ask_abc123&option=1');
+  assert.equal(answerThereUrl('https://relay-b.example.test/oar/', 'q-1', 0), 'https://relay-b.example.test/oar/?answer=q-1&option=0');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'q-1'), 'https://relay-b.example.test/?answer=q-1', 'no option: nothing preselected');
+  assert.equal(answerThereUrl('javascript:alert(1)', 'q-1', 0), '');
+  assert.equal(answerThereUrl('ftp://relay-b.example.test', 'q-1', 0), '');
+  assert.equal(answerThereUrl('https://user:pw@relay-b.example.test', 'q-1', 0), '');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'q-1', 0, { origin: 'https://relay-c.example.test' }), '', 'a foreign origin');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'q-1', 1.5), '');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'q-1', -1), '');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'q-1', '1'), '', 'a string is no integer');
+  assert.equal(answerThereUrl('https://relay-b.example.test', '../evil', 0), '');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'a b', 0), '');
+  assert.equal(answerThereUrl('https://relay-b.example.test', 'x'.repeat(161), 0), '');
+  // Whatever the id, the address stays on the relay.
+  assert.equal(new URL(answerThereUrl('https://relay-b.example.test', 'q:1.2_3-4', 0)).origin, 'https://relay-b.example.test');
+});
+
+test('a paired relay with answerLink: option buttons that open it there, "answers on", and "Open there" still', () => {
+  const relays = [{ ...LAB_LINK, items: [ask('ask_far001', { options: ['Ship', 'Wait'] })] }];
+  const root = renderInbox(doc, { relays, now: NOW });
+  const card = root.querySelector('[data-item-id="ask_far001"]');
+  const buttons = [...card.querySelectorAll('[data-inbox-action="answer-there"]')];
+  assert.deepEqual(buttons.map((node) => node.textContent), ['Ship', 'Wait']);
+  assert.deepEqual({ ...buttons[1].dataset }, {
+    inboxAction: 'answer-there', relayId: 'r-lab', itemId: 'ask_far001', option: '1', url: 'https://relay-b.example.test/?answer=ask_far001&option=1',
+  });
+  assert.equal(card.querySelector('.inbox-answer-there-hint').textContent, 'answers on lab-relay');
+  assert.equal(card.querySelector('.inbox-open-there-button').textContent, 'Open there');
+  assert.equal(card.querySelector('.inbox-answer-text'), null, 'nothing is typed here');
+  assert.equal(card.querySelectorAll('[data-inbox-action="choice"], [data-inbox-action="answer"]').length, 0, 'nothing answered through the pairing');
+  // The same relay without the capability (an older version): "Open there" only.
+  const old = renderInbox(doc, { relays: [{ ...LAB, items: relays[0].items }], now: NOW });
+  assert.equal(old.querySelectorAll('[data-inbox-action="answer-there"]').length, 0);
+  assert.equal(old.querySelector('.inbox-open-there-button').textContent, 'Open there');
+});
+
+test('popup buttons: plain ask_user cards and approvals yes; plan, structured and multi-select cards keep "Open there"', () => {
+  const card = (id, extra) => ({ id, kind: 'ask_user', session: { id: 'conv-1', title: 'S' }, question: 'Q?', options: ['A', 'B'], status: 'pending', createdAt: minutesAgo(1), ...extra });
+  const plain = buildCardItem(doc, card('q-plain'), { relay: LAB_LINK, now: NOW });
+  assert.deepEqual([...plain.querySelectorAll('[data-inbox-action="answer-there"]')].map((node) => node.dataset.option), ['0', '1']);
+  // A paired relay's approval comes without its choices: one button, chosen there.
+  const approval = buildCardItem(doc, { id: 'q-appr', kind: 'approval', session: { id: 'conv-1', title: 'S' }, question: '', summary: 'start a session', status: 'pending', createdAt: minutesAgo(1) }, { relay: LAB_LINK, now: NOW });
+  const one = [...approval.querySelectorAll('[data-inbox-action="answer-there"]')];
+  assert.equal(one.length, 1);
+  assert.equal(one[0].textContent, 'Answer there');
+  assert.equal(one[0].dataset.option, undefined);
+  assert.equal(one[0].dataset.url, 'https://relay-b.example.test/?answer=q-appr');
+  for (const extra of [{ structured: true }, { multiSelect: true }]) {
+    const node = buildCardItem(doc, card('q-x', extra), { relay: LAB_LINK, now: NOW });
+    assert.equal(node.querySelectorAll('[data-inbox-action="answer-there"]').length, 0, JSON.stringify(extra));
+    assert.equal(node.querySelector('.inbox-open-there-button').textContent, 'Open there');
+  }
+  const plan = buildPlanItem(doc, { id: 'b-1', kind: 'plan', title: 'Plan', session: { id: 'conv-1', title: 'S' }, status: 'pending', createdAt: minutesAgo(1) }, { relay: LAB_LINK, now: NOW });
+  assert.equal(plan.querySelectorAll('[data-inbox-action="answer-there"]').length, 0);
+  // The rule itself.
+  assert.equal(canAnswerThere(card('q-1'), LAB_LINK), true);
+  assert.equal(canAnswerThere(card('q-1'), LAB), false, 'no capability');
+  assert.equal(canAnswerThere(card('q-1'), SELF), false, 'this relay answers here');
+  assert.equal(canAnswerThere(card('q-1', { status: 'answered' }), LAB_LINK), false);
+  assert.equal(canAnswerThere(card('q-1', { options: [] }), LAB_LINK), false, 'a typed answer is given there');
+  assert.equal(canAnswerThere(card('bad id'), LAB_LINK), false);
+  // A relay entry with no usable address: "Open there"'s note, no buttons.
+  const blind = buildCardItem(doc, card('q-2'), { relay: { ...LAB_LINK, url: '' }, now: NOW });
+  assert.equal(blind.querySelectorAll('[data-inbox-action="answer-there"]').length, 0);
 });

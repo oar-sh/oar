@@ -59,7 +59,9 @@ import { createRelaySingletonGuard, currentBootId, lockHolderMayRun, processIden
  *
  * Install, under the lock:
  *   1. copy the pins (as this relay read them at start) into
- *      `<folder>.partial-<hex>` beside the final folder (one volume);
+ *      `<folder>.partial-<hex>` beside the final folder (one volume), the
+ *      shipped pin.json and pin-lock.json as package.json and
+ *      package-lock.json (AGENT_SDK_PIN_FILES);
  *   2. `npm ci` there, from the lockfile, without install scripts, with the
  *      host's npm config but none a parent process put in the environment;
  *   3. check the files; write the marker (the files and their sizes) last;
@@ -298,6 +300,9 @@ export function createAgentSdkStore({
       logSeq: 0,
       error: null,
       kind: null,
+      // A Reinstall that failed over a folder that still checks out: the row
+      // settles back to ready, so this is all that tells the failure.
+      reinstallFailure: null,
       retryAt: null,
       attempts: 0,
       heldBy: null,
@@ -366,6 +371,7 @@ export function createAgentSdkStore({
       entry.state = AGENT_SDK_STATES.MISSING;
       entry.installed = null;
       entry.dir = null;
+      entry.reinstallFailure = null;
     }
     return entry;
   }
@@ -384,6 +390,7 @@ export function createAgentSdkStore({
       logSeq: entry.logSeq,
       error: entry.error,
       kind: entry.kind,
+      reinstallFailure: entry.state === AGENT_SDK_STATES.READY && entry.reinstallFailure ? { ...entry.reinstallFailure } : null,
       retryAt: entry.retryAt ? new Date(entry.retryAt).toISOString() : null,
       attempts: entry.attempts,
       heldBy: entry.heldBy,
@@ -882,9 +889,9 @@ export function createAgentSdkStore({
     entry.retryTimer?.unref?.();
   }
 
-  function settleWaiters(entry) {
+  // `value`: the outcome to hand over, when the entry no longer says it.
+  function settleWaiters(entry, value = publicStatus(entry)) {
     const waiters = entry.waiters.splice(0);
-    const value = publicStatus(entry);
     for (const resolve of waiters) resolve(value);
   }
 
@@ -898,18 +905,29 @@ export function createAgentSdkStore({
     entry.heldBy = null;
     entry.finishedAt = new Date(now()).toISOString();
     entry.lastAttemptAt = entry.finishedAt;
-    if (kind === AGENT_SDK_FAILURE_KINDS.PLATFORM) {
-      transition(entry, AGENT_SDK_STATES.UNSUPPORTED, { error: message, kind });
-    } else {
-      transition(entry, AGENT_SDK_STATES.ERROR, { error: message, kind });
+    // What the waiters learn, taken before the emit: a failed reinstall over
+    // a folder that still checks out is settled back to ready by the first
+    // status() after it, so the entry no longer says that it failed.
+    const state = kind === AGENT_SDK_FAILURE_KINDS.PLATFORM ? AGENT_SDK_STATES.UNSUPPORTED : AGENT_SDK_STATES.ERROR;
+    // Kept for the rows (Settings): a cancelled reinstall is no failure.
+    entry.reinstallFailure = session.force && kind !== AGENT_SDK_FAILURE_KINDS.CANCELLED
+      ? { error: message, kind, at: entry.finishedAt }
+      : null;
+    Object.assign(entry, { state, error: message, kind });
+    const failed = publicStatus(entry);
+    transition(entry, state, { error: message, kind });
+    if (state === AGENT_SDK_STATES.ERROR) {
       if (kind === AGENT_SDK_FAILURE_KINDS.NETWORK) scheduleRetry(entry);
-      if (entry.retryAt) emit();
+      if (entry.retryAt) {
+        failed.retryAt = new Date(entry.retryAt).toISOString();
+        emit();
+      }
     }
     if (kind !== AGENT_SDK_FAILURE_KINDS.CANCELLED) {
       persist(entry.id, { hash: pinOf(entry.id).hash, error: message, kind, attempts: entry.attempts, lastAttemptAt: entry.lastAttemptAt });
     }
     log(`${entry.id}: ${message}`);
-    settleWaiters(entry);
+    settleWaiters(entry, failed);
   }
 
   // The clean-up only under the lock: a folder another process installed
@@ -931,6 +949,7 @@ export function createAgentSdkStore({
     entry.finishedAt = new Date(now()).toISOString();
     entry.lastAttemptAt = entry.finishedAt;
     entry.attempts = 0;
+    entry.reinstallFailure = null;
     clearRetry(entry);
     persist(entry.id, null);
     const dir = readyDir(entry.id);
@@ -973,6 +992,7 @@ export function createAgentSdkStore({
     const partial = path.join(sdkDir(entry.id), `${pin.dirName}.partial-${crypto.randomBytes(3).toString('hex')}`);
     try {
       fsImpl.mkdirSync(partial, { recursive: true });
+      // pin.files is keyed by the npm names: package.json, package-lock.json.
       for (const [name, bytes] of Object.entries(pin.files)) fsImpl.writeFileSync(path.join(partial, name), bytes);
     } catch (error) {
       return fail(entry, session, `The SDK folder could not be written (${error?.code || error?.message || error}).`, AGENT_SDK_FAILURE_KINDS.OTHER, { lock, partial });
@@ -1081,6 +1101,7 @@ export function createAgentSdkStore({
     entry.startedAt = new Date(now()).toISOString();
     entry.finishedAt = null;
     entry.heldBy = null;
+    entry.reinstallFailure = null;
     transition(entry, AGENT_SDK_STATES.INSTALLING, { error: null, kind: null });
     log(`${entry.id}: installing ${entry.pinned} (${reason})`);
     runInstall(entry, session).catch((error) => fail(entry, session, error?.message || String(error), AGENT_SDK_FAILURE_KINDS.OTHER));

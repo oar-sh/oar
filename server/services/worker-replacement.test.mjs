@@ -5,9 +5,10 @@ import { createWorkerReplacement, createWorkerReplacementFence, workerReleaseHol
 import { createSessionWorkerRegistry } from './session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './session-worker-supervisor-service.mjs';
 
-function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { ok: true } } = {}) {
+function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { ok: true }, alive = () => false, identity = async () => null } = {}) {
   const calls = [];
   const warnings = [];
+  const identityReads = [];
   const worker = { sdkSessionId: 'sid-1-abcdef', pid: 4242, status: 'ready' };
   const registry = {
     getWorker: (sid) => { calls.push(['getWorker', sid]); return worker; },
@@ -21,7 +22,7 @@ function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { 
     ensureWorker: async (sid, options) => { calls.push(['ensureWorker', sid, options]); return ensureResult; },
   };
   const inspector = { name: 'inspector' };
-  const isProcessAlive = () => false;
+  const isProcessAlive = alive;
   const killTmuxSession = () => {};
   let stopArgs = null;
   const replacement = createWorkerReplacement({
@@ -35,11 +36,15 @@ function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { 
       return stopResult;
     },
     isProcessAlive,
+    readProcessIdentity: async (pid, options) => {
+      identityReads.push([pid, options]);
+      return identity(pid, options);
+    },
     killTmuxSession,
     logger: { log() {}, warn: (line) => warnings.push(line) },
     logPrefix: () => '[relay] TEST ',
   });
-  return { replacement, calls, warnings, worker, inspector, isProcessAlive, killTmuxSession, stopArgs: () => stopArgs };
+  return { replacement, calls, warnings, identityReads, worker, inspector, isProcessAlive, killTmuxSession, stopArgs: () => stopArgs };
 }
 
 const names = (calls) => calls.map(([name]) => name);
@@ -78,6 +83,22 @@ test('a stop marks the session killed, waits out a pending start, stops every pr
   assert.deepEqual(app.warnings, []);
 });
 
+test('a stop reads the worker\'s identity before it ends the process, and hands back its pid and start time', async () => {
+  const app = setup({ identity: async (pid) => ({ pid, startTime: '987654', commandLine: 'node claude-session-worker.mjs --session-id sid-1-abcdef' }) });
+  assert.deepEqual(await app.replacement.stopWorker('sid-1-abcdef'), { ok: true, identity: { pid: 4242, startTime: '987654' } });
+  assert.deepEqual(app.identityReads, [[4242, {}]]);
+  // The stop gets it too, to check a pid its process list did not show
+  // before it kills it (Windows).
+  assert.deepEqual(app.stopArgs().workerIdentity, { pid: 4242, startTime: '987654', commandLine: 'node claude-session-worker.mjs --session-id sid-1-abcdef' });
+  assert.equal(typeof app.stopArgs().readProcessIdentityImpl, 'function');
+  // A start time that could not be read: no identity, the caller keeps the pid.
+  const unknown = setup({ identity: async (pid) => ({ pid, startTime: null, commandLine: null }) });
+  assert.deepEqual(await unknown.replacement.stopWorker('sid-1-abcdef'), { ok: true });
+  // A reader that throws is nothing known, not a failed stop.
+  const throwing = setup({ identity: async () => { throw new Error('ps missing'); } });
+  assert.deepEqual(await throwing.replacement.stopWorker('sid-1-abcdef'), { ok: true });
+});
+
 test('a stop that leaves processes behind clears the killed marker, warns, and keeps the entry', async () => {
   const app = setup({ stopResult: { ok: false, error: 'worker-survived-stop', remainingPids: [4242, 4243] } });
   assert.deepEqual(await app.replacement.stopWorker('sid-1-abcdef'), {
@@ -89,6 +110,77 @@ test('a stop that leaves processes behind clears the killed marker, warns, and k
   assert.deepEqual(app.calls[4][2], { resetKilledMarker: true });
   assert.equal(app.warnings.length, 1);
   assert.match(app.warnings[0], /^\[relay\] TEST STOP FAILED session=sid-1-ab worker-survived-stop remaining=4242,4243 — kill marker cleared/);
+});
+
+const OURS = 'node claude-session-worker.mjs --session-id sid-1-abcdef';
+
+test('a stop that never saw the registry\'s live worker is no stop: the entry stays, the marker goes, the caller retries', async () => {
+  // The process list showed no worker of the session (a command line it does
+  // not know as a worker's), and the registry's pid still runs as the
+  // session's worker: its command line names the session, its start time is
+  // the one read before the stop.
+  const identity = async (pid) => ({ pid, startTime: '1000', commandLine: OURS });
+  const app = setup({ stopResult: { ok: true, pids: [] }, alive: (pid) => pid === 4242, identity });
+  assert.deepEqual(await app.replacement.stopWorker('sid-1-abcdef'), {
+    ok: false,
+    error: 'worker-not-in-process-list',
+    remainingPids: [4242],
+  });
+  assert.deepEqual(names(app.calls), ['getWorker', 'markKilled', 'cancelPendingStart', 'stopSessionWorkerProcesses', 'clearRestartSchedule']);
+  assert.deepEqual(app.calls[4][2], { resetKilledMarker: true });
+  assert.match(app.warnings[0], /STOP FAILED session=sid-1-ab worker-not-in-process-list remaining=4242 — kill marker cleared/);
+  // Read before the stop, then fresh after it.
+  assert.deepEqual(app.identityReads, [[4242, {}], [4242, { fresh: true }]]);
+
+  // keepKilled keeps the marker on this failure too.
+  const archived = setup({ stopResult: { ok: true, pids: [] }, alive: () => true, identity });
+  assert.equal((await archived.replacement.stopWorker('sid-1-abcdef', { keepKilled: true })).error, 'worker-not-in-process-list');
+  assert.equal(archived.calls.some(([name]) => name === 'clearRestartSchedule'), false);
+
+  // A pid the list did show and the stop waited out counts as stopped (a
+  // zombie not yet reaped answers signal 0), and so does a registry pid
+  // that is gone.
+  const listed = setup({ stopResult: { ok: true, pids: [4242] }, alive: () => true, identity });
+  assert.equal((await listed.replacement.stopWorker('sid-1-abcdef')).ok, true);
+  const gone = setup({ stopResult: { ok: true, pids: [] }, alive: () => false, identity });
+  assert.equal((await gone.replacement.stopWorker('sid-1-abcdef')).ok, true);
+  assert.equal(gone.calls.some(([name]) => name === 'removeWorker'), true);
+});
+
+test('a live pid that is not the session\'s worker any more is not blamed: the worker is gone', async () => {
+  const cases = {
+    // The pid handed out again: another start time than before the stop.
+    'another start time': (() => {
+      let reads = 0;
+      return async (pid) => ({ pid, startTime: (reads += 1) === 1 ? '1000' : '2000', commandLine: OURS });
+    })(),
+    // Another process: its command line names no session, or another one.
+    'another command line': async (pid) => ({ pid, startTime: '1000', commandLine: '/usr/bin/python3 -m http.server' }),
+    'another session': async (pid) => ({ pid, startTime: '1000', commandLine: 'node claude-session-worker.mjs --session-id sid-2-fedcba' }),
+    // A zombie: no command line left.
+    'a zombie': async (pid) => ({ pid, startTime: '1000', commandLine: '' }),
+    // Gone between the signal-0 check and the read.
+    'gone by the read': async (pid, options) => (options?.fresh ? null : { pid, startTime: '1000', commandLine: OURS }),
+  };
+  for (const [name, identity] of Object.entries(cases)) {
+    const app = setup({ stopResult: { ok: true, pids: [] }, alive: () => true, identity });
+    const result = await app.replacement.stopWorker('sid-1-abcdef');
+    assert.equal(result.ok, true, name);
+    assert.equal(app.calls.some(([call]) => call === 'removeWorker'), true, name);
+    assert.deepEqual(app.warnings, [], name);
+  }
+});
+
+test('a live pid nothing could be read about is no stop, and is not named', async () => {
+  for (const identity of [
+    async (pid) => ({ pid, startTime: null, commandLine: null }),
+    async () => { throw new Error('ps missing'); },
+  ]) {
+    const app = setup({ stopResult: { ok: true, pids: [] }, alive: () => true, identity });
+    assert.deepEqual(await app.replacement.stopWorker('sid-1-abcdef'), { ok: false, error: 'worker-not-in-process-list', remainingPids: [] });
+    assert.match(app.warnings[0], /STOP FAILED session=sid-1-ab worker-not-in-process-list — kill marker cleared/);
+    assert.equal(app.calls.some(([call]) => call === 'removeWorker'), false);
+  }
 });
 
 test('a stop that throws is a failure with the error text and no remaining pids', async () => {
@@ -169,6 +261,7 @@ test('lifting the killed marker does not lift the fence: clearRestartSchedule({ 
     registry,
     supervisor,
     stopSessionWorkerProcesses: async () => ({ ok: true }),
+    isProcessAlive: () => false,
     fence,
     logger: { log() {}, warn() {} },
   });

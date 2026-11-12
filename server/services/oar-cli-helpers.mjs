@@ -18,14 +18,39 @@ import {
   resolveAgentSdkRoot,
 } from './agent-sdk-paths.mjs';
 import { formatMegabytes } from './db-backup-service.mjs';
+import { readRelaySecretsFile, relaySecretsPath } from './owner-secret-store.mjs';
+import { AGENT_TOKEN_KINDS, agentKeyBytes, mintAgentTokenWithKey, mintOwnerToken } from '../../shared/relay-credentials.mjs';
 
+/** A new owner token (`oaro1_…`); only its hash is ever stored. */
 export function generateAuthToken() {
-  return randomBytes(32).toString('base64url');
+  return mintOwnerToken(randomBytes);
 }
 
-export function buildDefaultConfig({ token = generateAuthToken(), port = 3333, localhostOnly = true } = {}) {
+// `oar url` prints the address without a token link: the owner token is kept
+// only as a hash, so there is no token to put in one. Owner decision
+// pending; flipping this alone changes nothing until a readable token exists.
+export const OAR_URL_TOKEN_LINK = false;
+
+/**
+ * The `cli` agent token of the relay whose data folder is `dataDir`, derived
+ * from its agent key: what the `oar` CLI calls the relay with (status,
+ * queued restarts). '' until the relay has run once. Never the owner token.
+ */
+export function cliAgentToken({ dataDir, fsImpl = fs } = {}) {
+  const read = readRelaySecretsFile(relaySecretsPath(dataDir), { fsImpl });
+  const key = agentKeyBytes(read.secrets?.agentKey);
+  return key ? mintAgentTokenWithKey(key, { kind: AGENT_TOKEN_KINDS.cli }) : '';
+}
+
+/** Whether the relay of `dataDir` has an owner token (only its hash is stored). */
+export function ownerTokenState({ dataDir, fsImpl = fs } = {}) {
+  const read = readRelaySecretsFile(relaySecretsPath(dataDir), { fsImpl });
+  return read.status === 'ok' ? 'set (hashed)' : 'not set yet (the relay makes one at its first start; or: oar setup)';
+}
+
+// No authToken: the relay keeps the owner token as a hash in its data folder.
+export function buildDefaultConfig({ port = 3333, localhostOnly = true } = {}) {
   return {
-    authToken: token,
     port,
     localhostOnly,
     pollIntervalMs: 3000,
@@ -46,21 +71,24 @@ export function primaryLanAddress(interfaces = os.networkInterfaces()) {
   return null;
 }
 
-export function relayUrl({ config, lanAddress = null } = {}) {
+/** The relay's address; with a `token` (one just made, shown once) the sign-in link. */
+export function relayUrl({ config, lanAddress = null, token = '' } = {}) {
   const host = !config?.localhostOnly && lanAddress ? lanAddress : 'localhost';
-  const token = String(config?.authToken || '').trim();
-  return `http://${host}:${config?.port || 3333}/?token=${encodeURIComponent(token)}`;
+  const signIn = String(token || '').trim();
+  return `http://${host}:${config?.port || 3333}/${signIn ? `?token=${encodeURIComponent(signIn)}` : ''}`;
 }
 
 /**
  * What `oar setup` and `oar url` print about the relay's address. `qrUrl` is
  * set only for an address a phone can reach: the LAN address when LAN access
  * is on, and never one that is internal to WSL. `tunnelUrl` is the address a
- * running relay reports for its tunnel, with the token added.
+ * running relay reports for its tunnel. Only a `token` just made (`oar setup`
+ * shows a new one once) goes into the links; no file holds one to read back.
  */
-export function describeRelayAddress({ config, lanAddress = null, wslNat = false, tunnelBase = '' } = {}) {
+export function describeRelayAddress({ config, lanAddress = null, wslNat = false, tunnelBase = '', token = '' } = {}) {
   const lan = config?.localhostOnly === false;
-  const url = relayUrl({ config: { ...config, localhostOnly: !lan }, lanAddress });
+  const signIn = String(token || '').trim();
+  const url = relayUrl({ config: { ...config, localhostOnly: !lan }, lanAddress, token: signIn });
   const lines = [`[oar] Relay URL: ${url}`];
   let qrUrl = null;
   if (!lan) {
@@ -72,8 +100,9 @@ export function describeRelayAddress({ config, lanAddress = null, wslNat = false
   } else {
     qrUrl = url;
   }
+  if (!signIn) lines.push('[oar] Sign in with your relay token (keep it in your password manager). Lost it? oar setup --new-token');
   const base = String(tunnelBase || '').trim().replace(/\/+$/, '');
-  const tunnelUrl = base ? `${base}/?token=${encodeURIComponent(String(config?.authToken || '').trim())}` : null;
+  const tunnelUrl = base ? `${base}/${signIn ? `?token=${encodeURIComponent(signIn)}` : ''}` : null;
   return { url, lines, qrUrl, tunnelUrl };
 }
 
@@ -83,18 +112,19 @@ const COMMAND_OPTIONS = { '--setup': 'setup', '--start': 'start', '--stop': 'sto
 const CLI_COMMANDS = {
   menu: {},
   start: {},
-  stop: { flags: ['--now'] },
-  restart: { flags: ['--now'] },
+  stop: { flags: ['--now', '--yes'] },
+  restart: { flags: ['--now', '--yes'] },
   status: {},
-  url: {},
+  url: { flags: ['--sign-in', '--yes'] },
   doctor: {},
   backup: { values: ['--reason'] },
   help: {},
   version: {},
   setup: { flags: ['--lan', '--local', '--new-token', '--defaults', '--start'], values: ['--port', '--migrate-from', '--autostart'] },
+  'agent-token': {},
   service: { words: ['install', 'remove', 'status'], flags: ['--replace'] },
   autostart: { words: ['signin', 'boot', 'off', 'status'], flags: ['--replace'] },
-  uninstall: { flags: ['--purge'] },
+  uninstall: { flags: ['--purge', '--yes'] },
   update: { flags: ['--beta'], values: ['--to'] },
   'build-native': { flags: ['--force'] },
   sdk: { words: ['install', 'status'], words2: [...AGENT_SDK_IDS], flags: ['--reinstall'] },
@@ -107,11 +137,16 @@ export function usageText() {
     '',
     '  oar                    Menu in a terminal; status and this text elsewhere',
     '  oar start              Start the relay in the background',
-    '  oar stop [--now]       Stop the relay (waits for running turns; --now does not)',
-    '  oar restart [--now]    Restart the relay (waits for running turns; --now does not)',
+    '  oar stop [--now [--yes]]',
+    '                         Stop the relay (waits for running turns; --now does not, and asks first)',
+    '  oar restart [--now [--yes]]',
+    '                         Restart the relay (waits for running turns; --now does not, and asks first)',
     '  oar status             Is the relay running, on which port, as a service',
-    '  oar url                Relay URL, with a QR code when a phone can reach it',
-    '  oar setup              Auth token, access, port and autostart; asks, or takes',
+    '  oar url [--sign-in]    Relay URL, with a QR code when a phone can reach it;',
+    '                         --sign-in: a link (and QR code) that signs one browser in, once, for 10 minutes',
+    '                         (in a terminal only; the other browsers are told)',
+    '  oar agent-token        Print an agent token for scripts on this host (never the relay token)',
+    '  oar setup              Relay token, access, port and autostart; asks, or takes',
     '                         [--port <port>] [--lan | --local] [--new-token] [--autostart signin|boot|off]',
     '                         [--defaults] [--start]',
     '  oar autostart signin | boot | off | status [--replace]',
@@ -120,8 +155,9 @@ export function usageText() {
     '  oar service install | remove | status [--replace]',
     '                         Start the relay at boot and keep it running (Linux: a systemd user service);',
     '                         --replace replaces a hand-made unit, keeping a copy',
-    '  oar uninstall [--purge]',
+    '  oar uninstall [--purge] [--yes]',
     '                         Remove autostart and the package; the data stays (--purge deletes it)',
+    '                         --yes: no question (needed without a terminal, for --now too)',
     '  oar copilot [--port <port>] [--install-extension] [--no-install-extension] [-- gh copilot args...]',
     '                         Relay plus a Copilot terminal session',
     '  oar doctor             Check the install and the provider CLIs',
@@ -564,6 +600,8 @@ export function renderDoctorReport({
   warnings = [],
   tunnel = '',
   agentSdks = null,
+  // ownerTokenState(): the owner token is stored as a hash, never shown.
+  ownerToken = '',
 }) {
   const yesNo = (v) => (v ? 'yes' : 'no');
   const lines = [
@@ -575,7 +613,7 @@ export function renderDoctorReport({
   ];
   if (config) {
     lines.push(`  port          : ${config.port ?? 3333} (localhostOnly: ${yesNo(config.localhostOnly !== false)})`);
-    lines.push(`  auth token    : ${String(config.authToken || '').trim() ? 'set' : 'MISSING'}`);
+    lines.push(`  owner token   : ${ownerToken || 'set (hashed)'}`);
     // `tunnel` is the caller's finding (describeConfiguredTunnel: is the tunnel
     // on, and is there a cloudflared to run it); without one, the config's word.
     const tunnelConfig = config.cloudflaredTunnel || {};

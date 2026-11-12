@@ -97,7 +97,8 @@ test("reopening the modal while queued offers to cancel instead of confirming", 
   await page.evaluate(async () => {
     await fetch("/api/host/suspend", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // The page's own request: the cookie and the session's key.
+      headers: { "Content-Type": "application/json", "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" },
       body: JSON.stringify({ requestedBy: "e2e" }),
     });
   });

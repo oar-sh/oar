@@ -1,3 +1,4 @@
+import { isRelayApiUrl, sessionProofHeaders } from './session-proof.mjs';
 import { resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
 import { normalizeReadingAnchor } from './transcript-reading-anchor.mjs';
 import { recordCliLifecycleEvent, recordRelayLifecycleEvent } from './status-store.mjs';
@@ -500,8 +501,14 @@ export function hasPendingUserMessageForConversation(conversationId) {
   return false;
 }
 
-export function authHeaders() {
-  return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+// Every API request the page makes: the session's proof key (the session
+// itself is the HttpOnly cookie; session-proof.mjs says why both), or a
+// Bearer token when one is set. `url` is the full address the request goes
+// to; anything but this relay's own `${BASE}/api/` gets neither (and a call
+// without one gets nothing).
+export function authHeaders(url) {
+  if (!isRelayApiUrl(url, BASE)) return {};
+  return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : sessionProofHeaders(url, BASE);
 }
 
 export function setToken(value) {

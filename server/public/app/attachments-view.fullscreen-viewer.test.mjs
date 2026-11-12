@@ -99,7 +99,7 @@ test('a gallery is built from the folder a file was opened from, and stepped by 
   assert.match(source, /horizontalEnabled: \(\) => Boolean\(filePreviewState\.gallery\) && imageZoomAtRest\(\)/);
   assert.match(source, /if \(swipe === 'left'\) void stepFilePreviewGallery\(1\);\s*else if \(swipe === 'right'\) void stepFilePreviewGallery\(-1\);/);
   // Neighbours are fetched ahead and their images primed under the viewer's own address.
-  assert.match(source, /function prefetchGalleryNeighbors\(\) \{[\s\S]*?galleryNeighbors\(gallery\)[\s\S]*?image\.src = previewRawHref\(source/);
+  assert.match(source, /function prefetchGalleryNeighbors\(\) \{[\s\S]*?galleryNeighbors\(gallery\)[\s\S]*?signFileUrls\(\[previewRawHref\(source[\s\S]*?image\.src = href/);
   assert.match(functionBody(source, 'closeFilePreview'), /galleryPayloadCache\.clear\(\)/);
 });
 
@@ -133,4 +133,20 @@ test('the viewer fills the screen with floating chrome, and the three open paths
   }
   assert.match(functionBody(source, 'openUploadedAttachmentViewer'), /showFilePreviewModal\(\)/);
   assert.doesNotMatch(source, /if \(event\.target\.id === 'file-preview-modal'\) closeFilePreview\(\)/, 'there is no backdrop to click any more');
+});
+
+// Files by path load natively with a file capability (`k`, file-capability.mjs):
+// the viewer asks for it alongside the preview, draws its media and links
+// with it, and its media never load an address without one.
+test('the viewer\'s file media, download and new-tab addresses carry their file capability', () => {
+  const render = functionBody(source, 'renderFilePreview');
+  assert.match(render, /const rawHref = withCachedFileCapability\(previewRawHref\(/);
+  for (const media of ['audioHref', 'imageHref', 'videoHref']) {
+    assert.match(render, new RegExp(`\\$\\{fileSrcAttribute\\(${media}\\)\\}`), media);
+    assert.doesNotMatch(render, new RegExp(`src="\\$\\{escHtml\\(${media}\\)\\}"`), media);
+  }
+  assert.match(render, /buildDownloadLink\(\{ href: rawHref/);
+  assert.match(render, /data-viewer-open-tab="\$\{escHtml\(inlineHref\)\}"/);
+  assert.match(source, /async function openFilePreviewFromSource\([\s\S]*?const capability = signFileUrls\(\[previewRawHref\(source, normalized, null\)\]\)[\s\S]*?await capability;[\s\S]*?renderFilePreview\(\)/);
+  assert.match(functionBody(source, 'renderAttachmentMarkup'), /<img \$\{fileSrcAttribute\(rawUrl\)\}/);
 });

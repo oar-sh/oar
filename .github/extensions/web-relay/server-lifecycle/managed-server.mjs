@@ -7,7 +7,6 @@ export function createManagedServerLifecycle({
   spawn,
   killProcessTree,
   delay,
-  token,
   logDir,
   serverDir,
   serverLogPath,
@@ -63,8 +62,8 @@ export function createManagedServerLifecycle({
       return {
         type: "token-mismatch",
         error: markNonRetryable(new Error(
-          `Web relay is running on :${RELAY_PORT} but rejected this token (401). `
-          + "Set matching authToken values in extension/server config or restart the relay with --token."
+          `Web relay is running on :${RELAY_PORT} but rejected this extension's agent token (401). `
+          + "Start the Copilot CLI from an OAR session (it sets OAR_AGENT_TOKEN), or check that this extension and the relay share one data folder."
         )),
       };
     }
@@ -281,10 +280,6 @@ export function createManagedServerLifecycle({
           // Not running yet.
         }
 
-        if (!token) {
-          throw new Error("No auth token available to start the web server");
-        }
-
         fs.mkdirSync(logDir, { recursive: true });
         managedServerStdoutFd = fs.openSync(serverLogPath, "a");
         managedServerStderrFd = fs.openSync(serverErrPath, "a");
@@ -294,7 +289,9 @@ export function createManagedServerLifecycle({
         managedServerOwned = true;
         stoppedOnPurpose = false;
         startedOwnedProcess = true;
-        const serverArgs = ["server.js", RELAY_SUPERVISED_FLAG, "--token", token];
+        // No --token: the relay keeps its owner token as a hash in its data
+        // folder, and this extension calls it with an agent token.
+        const serverArgs = ["server.js", RELAY_SUPERVISED_FLAG];
         if (legacyOwnerPidWatchdog) {
           serverArgs.push("--owner-pid", String(process.pid));
         }

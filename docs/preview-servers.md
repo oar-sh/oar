@@ -115,8 +115,8 @@ Three ways in, all backed by the same API:
 
 ```bash
 curl -sX POST http://127.0.0.1:3333/api/previews \
-  -H "authorization: Bearer $RELAY_TOKEN" -H 'content-type: application/json' \
-  -d '{"conversationId":"<conv>","port":5173,"label":"web app"}'
+  -H "authorization: Bearer $OAR_AGENT_TOKEN" -H 'content-type: application/json' \
+  -d '{"port":5173,"label":"web app"}'
 # → {"url":"https://preview.example.com/test_<token>/","basePath":"/test_<token>/"}
 
 npm run dev -- --base=/test_<token>/
@@ -137,12 +137,15 @@ every request that names a conversation — the `conversationId` query, or the
 server send; a conversation's id and its session id count as the same
 conversation.
 
-Known limit: agents authenticate with the same relay token as you do, so
-the scope is declared by the request, not proven. A request that names no
-conversation still gets the relay-wide answer, and one can name any
-conversation. The scope keeps the tools and the taught calls
-honest; it is not a wall against an agent that reads the relay token and
-calls the API by hand.
+An agent calls with its session's agent token (`OAR_AGENT_TOKEN`), which is
+bound to its conversation: the relay takes the scope from the token, not from
+the request. Without a conversation named it lists, publishes and closes that
+conversation's previews only; naming another one gets 403
+`AUTH_PERSON_REQUIRED`, and the `cli` agent token (`oar agent-token`) gets no
+previews at all. Only the relay token and your signed-in browser get the
+relay-wide view. This keeps agents' tools apart; it is not a wall against an
+agent that sets out to act as another session (see
+[What agent tokens do not close](security.md#what-agent-tokens-do-not-close)).
 
 Previews never expire, and they survive a relay restart (an update, a queued
 restart, a crash): the relay keeps them in its database and restores them when
@@ -227,7 +230,7 @@ outputs, mockups, single HTML files, coverage reports.
 Relative asset paths work as-is. Root-absolute ones (`/assets/app.js`) do not —
 same subfolder-root contract as port previews.
 
-All three require the relay token and are only on the relay port. The preview
+All three need a credential of the relay (an agent token only for its own conversation) and are only on the relay port. The preview
 listener itself has no management surface at all.
 
 ## Making an app work under a subfolder

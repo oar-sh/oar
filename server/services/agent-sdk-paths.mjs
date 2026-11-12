@@ -24,6 +24,23 @@ import { resolveOarRoot } from './oar-state-root.mjs';
  */
 
 export const AGENT_SDK_PINS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'agent-sdks');
+/**
+ * The pins folder's manifests under the names an install gives them (keys)
+ * and the names the package ships them under (values). A package.json in the
+ * tarball reads as a package of its own to a dependency scanner, which then
+ * lists the SDKs as OAR's dependencies. The store writes them back under the
+ * npm names before `npm ci`, and the hash covers the npm names, so the
+ * rename changes no installed folder.
+ */
+export const AGENT_SDK_PIN_FILES = Object.freeze({
+  'package.json': 'pin.json',
+  'package-lock.json': 'pin-lock.json',
+});
+
+/** The file a pins folder ships under for `name` as an install names it. */
+export function agentSdkPinFileName(name) {
+  return Object.prototype.hasOwnProperty.call(AGENT_SDK_PIN_FILES, name) ? AGENT_SDK_PIN_FILES[name] : name;
+}
 export const AGENT_SDK_MARKER = 'oar-sdk.json';
 export const AGENT_SDK_LEASES_DIR = '.leases';
 // Bumped when the folder layout or the marker changes meaning.
@@ -96,7 +113,9 @@ const pinCache = new Map();
  * The pin of an SDK for this host: the pins folder's files as read once
  * (an `oar update` replaces them under a running relay, which goes on
  * installing what it was started with), the pinned version and the folder
- * name, `<version>-<first 8 hex of the content hash>`.
+ * name, `<version>-<first 8 hex of the content hash>`. `files` is keyed by
+ * the names an install uses (package.json, package-lock.json, entries),
+ * whatever AGENT_SDK_PIN_FILES ships them as; the hash covers those names.
  */
 export function readAgentSdkPin(id, { pinsDir = AGENT_SDK_PINS_DIR, fsImpl = fs, host = hostPlatform() } = {}) {
   const descriptor = getAgentSdkDescriptor(id);
@@ -108,7 +127,7 @@ export function readAgentSdkPin(id, { pinsDir = AGENT_SDK_PINS_DIR, fsImpl = fs,
   const files = {};
   const hash = crypto.createHash('sha256').update(`oar-sdk-store:${AGENT_SDK_STORE_FORMAT}\0${host.platform}\0${host.arch}\0${host.libc || ''}\0`);
   for (const name of names) {
-    files[name] = fsImpl.readFileSync(path.join(folder, name));
+    files[name] = fsImpl.readFileSync(path.join(folder, agentSdkPinFileName(name)));
     hash.update(`${name}\0`).update(files[name]).update('\0');
   }
   const packageJson = JSON.parse(files['package.json'].toString('utf8'));

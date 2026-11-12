@@ -69,8 +69,11 @@ import { STREAM_VIEW_CHANGE_EVENT, isStreamViewEnabled, syncStreamViewToggle, up
 import { previewWindowRetention, syncWindowRetentionSlider, updateWindowRetention } from './conversation-window-retention.mjs';
 import { conversationPayloadCache, mergeReloadIntoWindow } from './conversation-payload-cache.mjs';
 import {
+  apiFetch,
   verifyExistingSession,
   verifyToken,
+  onSignedOut,
+  announceDeviceId,
   refreshWorkspaceRootHints,
   loadUsageSummary,
   getClaudeAuthStatus,
@@ -170,12 +173,17 @@ import { initEmojiPicker, toggleEmojiPicker } from './emoji-view.js';
 import { initSlashAutocomplete } from './slash-autocomplete.mjs';
 import { initMentionAutocomplete } from './mention-autocomplete.mjs';
 import { consumeConversationDeepLink } from './conversation-deep-link.mjs';
+import { consumeSettingsDeepLink, requestSettingsTab } from './settings-deep-link.mjs';
+import { ANSWER_THERE_SIGNED_OUT, answerThereSignInHint, isSignedOutRefusal, startAnswerThere } from './answer-there.js';
+import { renderLinkedPlainText } from './router.js';
 import {
   addRemoteRelayFromForm,
+  revealAddRemoteRelayForm,
   saveRemoteRelayPublicUrl,
   showRemoteRelayTokenField,
   toggleRemoteRelayInbound,
 } from './remote-relays-settings.js';
+import { hideSecurityNotices, startSecurityNotices } from './security-settings.js';
 import { dataTransferHasFiles } from './composer-paste.mjs';
 import { isReasoningOffUnsupported, reasoningEffortOptionLabel, reasoningEffortOptionTitle } from './reasoning-effort-labels.mjs';
 import {
@@ -306,12 +314,18 @@ import {
   autoCompactWindowFromIndex,
   formatAutoCompactWindowLabel,
 } from './auto-compact-window-options.mjs';
+import {
+  autoCompactCloseSaveAction,
+  rememberAutoCompactCloseSave,
+  takeAutoCompactCloseSave,
+} from './auto-compact-close-save.mjs';
 import { renderPlanUsageHtml, renderPlanUsageCardHtml, planUsageSubtitle, normalizeUsageProvider } from './plan-usage-view.mjs';
 import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
 import { FONT_SCALE_CHANGE_EVENT, getUiScale, initFontScaling, updateFontScaleFromSelect } from './font-scaling.js';
 import { initClientDiagnostics, recordStatusEvent } from './status-store.mjs';
 import { isStatusViewActive, leaveStatusView, toggleStatusView } from './status-view.mjs';
 import { installExternalLinkPolicy, openExternalNavigation } from './external-link-policy.mjs';
+import { configureFileCapabilities, installFileCapabilityPolicy } from './file-capability.mjs';
 import {
   initCwdPicker,
   openChangeCwdModal,
@@ -682,6 +696,12 @@ function getTokenFromUrl() {
   return new URLSearchParams(window.location.search).get('token');
 }
 
+// A `?signin=oarc1_…` link (Settings → Security → Sign in another device):
+// a single-use code, exchanged like the token and taken out of the address.
+function getSignInCodeFromUrl() {
+  return new URLSearchParams(window.location.search).get('signin');
+}
+
 function resolveAuthCookiePath() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
     ? window.__COPILOT_APP_CONFIG.basePath.trim()
@@ -725,8 +745,9 @@ function consumeLegacyPersistedAuthToken() {
 
 function stripTokenFromUrl() {
   const url = new URL(window.location.href);
-  if (!url.searchParams.has('token')) return;
+  if (!url.searchParams.has('token') && !url.searchParams.has('signin')) return;
   url.searchParams.delete('token');
+  url.searchParams.delete('signin');
   history.replaceState(null, document.title, `${url.pathname}${url.search}${url.hash}`);
 }
 
@@ -903,6 +924,12 @@ function initPushNotificationClientHooks() {
   window.__pushNotificationHooksBound = true;
   navigator.serviceWorker.addEventListener('message', (event) => {
     const data = event.data || {};
+    // A new sign-in's notification: Settings at the tab it names (an
+    // allowlisted one only); over the sign-in box, after the sign-in.
+    if (data.type === 'copilot-open-settings') {
+      requestSettingsTab(data.tab, { isAuthGateVisible, open: openSettingsModal });
+      return;
+    }
     if (data.type !== 'copilot-open-conversation') return;
     const conversationId = String(data.conversationId || '').trim();
     if (!conversationId) return;
@@ -915,6 +942,59 @@ function initPushNotificationClientHooks() {
 // badge) open that conversation at load.
 function consumePushConversationDeepLink() {
   return consumeConversationDeepLink();
+}
+
+// ?settings=<tab>[&add-relay=1]: Settings at that tab (and the "Add a relay"
+// form), nothing more; read with the conversation link, opened once the app
+// has loaded.
+function openSettingsDeepLink({ tab = '', addRelay = false } = {}) {
+  if (!tab) return;
+  openSettingsModal(tab);
+  if (addRelay) revealAddRemoteRelayForm();
+}
+
+// ?answer=<id>&option=<n>: a question of this relay, opened from a paired
+// relay's Inbox (answer-there.js). Its card text goes through the card
+// renderer's own linking. Both calls go through apiFetch, which sends the
+// session's proof key; a refusal that means "signed out" (no key with the
+// cookie, say) opens the sign-in box, with "Sign in to <relay> to answer",
+// and the view comes back after the sign-in.
+function startAnswerThereFromLocation() {
+  return startAnswerThere({
+    relayName: String(window.__COPILOT_APP_CONFIG?.relayName || '').trim(),
+    renderText: renderLinkedPlainText,
+    fetchQuestion: async (id) => {
+      let refusal = null;
+      const payload = await apiFetch(`/api/relay-question/${encodeURIComponent(id)}`, {
+        onErrorResponse: async (res) => {
+          refusal = { status: Number(res?.status) || 0, code: '' };
+          try { refusal.code = String((await res.json())?.code || ''); } catch {}
+        },
+      });
+      if (payload) return payload.question || null;
+      return refusal && isSignedOutRefusal(refusal.status, refusal.code) ? ANSWER_THERE_SIGNED_OUT : null;
+    },
+    postAnswer: async (id, body) => {
+      let status = 0;
+      let error = '';
+      let code = '';
+      const response = await apiFetch(`/api/relay-question/${encodeURIComponent(id)}/answer`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        onErrorResponse: async (res) => {
+          status = Number(res?.status) || 0;
+          try {
+            const answer = await res.json();
+            error = String(answer?.error || '');
+            code = String(answer?.code || '');
+          } catch {}
+        },
+      });
+      if (response) return { ok: true, status: 200 };
+      return { ok: false, status, error, signedOut: isSignedOutRefusal(status, code) };
+    },
+    onSignedOut: () => handleSignedOut(null),
+  }).catch((error) => { console.warn('[answer-there] failed', error); return null; });
 }
 
 function handleForegroundTransition(reason, { immediate = false } = {}) {
@@ -1603,12 +1683,39 @@ function clearModelMetadataHardFail() {
   }
 }
 
+// Set once the app has started; a sign-in after "This browser was signed
+// out" then reloads the page instead of starting the app a second time.
+let appStartedOnce = false;
+// How long the start waits for the security notices before it opens a
+// conversation (they still show when they come later).
+const SECURITY_NOTICES_START_WAIT_MS = 1500;
+const SIGNED_OUT_MESSAGE = 'This browser was signed out';
+
+function isAuthGateVisible() {
+  return document.getElementById('auth-gate')?.style.display === 'flex';
+}
+
+// A 401 on a regular call: the session no longer counts. The sign-in gate
+// opens with the reason, instead of the app failing silently. Settings and
+// the dialogs lie over the page (fixed, above #app): they close first, or the
+// gate would open unseen behind them. `message`: this browser signed itself
+// out (Settings → Security).
+function handleSignedOut(_url = null, { message = '' } = {}) {
+  if (!appStartedOnce || isAuthGateVisible()) return;
+  try { closeSummaryModal(); } catch {}
+  try { closeSettingsModal(); } catch {}
+  hideSecurityNotices();
+  showAuthGate(message || SIGNED_OUT_MESSAGE);
+}
+
 async function startAppWithErrorHandling() {
   try {
     await initApp();
+    appStartedOnce = true;
     // Post-auth: move a legacy per-browser install app name to the relay so
     // manifest fetches (Android WebAPK checks included) stop reverting it.
     void adoptLegacyPwaAppName();
+    void replayAutoCompactCloseSave().catch(() => {});
     return true;
   } catch (error) {
     console.error('[bootstrap] initApp failed', error);
@@ -3726,6 +3833,16 @@ function commitAutoCompactDraft({ pageClosing = false } = {}) {
   if (!conversationId || window === undefined) return;
   if (conversationId === autoCompactControlConversationId && window === autoCompactControlStoredWindow) return;
   if (pageClosing) {
+    // Kept for the next start too: the browser may drop the request below
+    // with the page (auto-compact-close-save.mjs).
+    if (conversationId === autoCompactControlConversationId) {
+      rememberAutoCompactCloseSave(pageLocalStorage(), {
+        conversationId,
+        window,
+        base: autoCompactControlStoredWindow,
+        nowMs: Date.now(),
+      });
+    }
     // Sent at once, not queued behind an earlier save: the request has to
     // leave before the page does.
     void saveAutoCompactWindow(conversationId, window, '', { pageClosing: true });
@@ -3740,6 +3857,39 @@ function commitAutoCompactDraft({ pageClosing = false } = {}) {
   void run.finally(() => {
     if (autoCompactWindowUpdateInFlight === run) autoCompactWindowUpdateInFlight = null;
   });
+}
+
+function pageLocalStorage() {
+  try { return window.localStorage || null; } catch { return null; }
+}
+
+// Once after start: a window slider save a closing page kept is sent again
+// while the relay still holds what that page saw (auto-compact-close-save.mjs).
+async function replayAutoCompactCloseSave() {
+  if (appSharedMode) return;
+  const storage = pageLocalStorage();
+  const entry = takeAutoCompactCloseSave(storage, { nowMs: Date.now() });
+  if (!entry) return;
+  const payload = await loadContextSummary(entry.conversationId);
+  if (!payload) {
+    // No answer: kept for the next start (until it is too old).
+    rememberAutoCompactCloseSave(storage, { ...entry, nowMs: entry.at });
+    return;
+  }
+  if (autoCompactCloseSaveAction(entry, payload.autoCompactWindow ?? null) !== 'send') return;
+  const previous = autoCompactWindowUpdateInFlight || Promise.resolve();
+  const run = previous
+    .catch(() => {})
+    .then(() => updateConversationPreferences(entry.conversationId, {
+      clientId: CLIENT_ID,
+      autoCompactWindow: entry.window,
+    }));
+  autoCompactWindowUpdateInFlight = run;
+  try {
+    await run;
+  } finally {
+    if (autoCompactWindowUpdateInFlight === run) autoCompactWindowUpdateInFlight = null;
+  }
 }
 
 // Same lifecycle as the auto-compact control: the modal body is re-rendered
@@ -5506,6 +5656,13 @@ function showAuthGate(error = '') {
   document.getElementById('auth-gate').style.display = 'flex';
   document.getElementById('app').classList.remove('visible');
   showAuthError(error);
+  // Opened from a paired relay's Inbox (?answer=): say what signing in is for.
+  const context = document.getElementById('auth-context');
+  if (context) {
+    const text = answerThereSignInHint(window.location.href, window.__COPILOT_APP_CONFIG?.relayName);
+    context.textContent = text;
+    context.hidden = !text;
+  }
   // The start screen hands its logo over to the box first (installed app);
   // focusing earlier would open the keyboard and move the box under it.
   const focusToken = () => document.getElementById('token-input')?.focus();
@@ -5532,6 +5689,13 @@ async function initApp() {
   initClientDiagnostics();
   installExternalLinkPolicy({ onFallback: showExternalLinkFallback });
   const sharedMode = isSharedReaderMode();
+  // Files by path load natively with a file capability (`k`), asked for
+  // with the session's key; a shared page has no session to ask with.
+  configureFileCapabilities({
+    base: BASE,
+    mint: (urls) => apiFetch('/api/files/capability', { method: 'POST', body: JSON.stringify({ urls }) }),
+  });
+  if (!sharedMode) installFileCapabilityPolicy();
   appSharedMode = sharedMode;
   initNetworkLifecycleHandling();
   setForegroundNetworkWorkEnabled(document.visibilityState === 'visible');
@@ -5955,6 +6119,16 @@ async function initApp() {
   void initOutboxFallbackReplay();
   // Read before anything opens: the address then follows the open session.
   const pushConversationId = consumePushConversationDeepLink();
+  const settingsLink = consumeSettingsDeepLink();
+  // The security notices (a new relay token recommended, the token changed
+  // outside OAR, new sign-ins): the person's own page only, never a shared
+  // view. Asked for before a conversation opens, so their row is in place
+  // when the transcript is first laid out instead of pushing it down a
+  // moment later; a slow answer does not hold the start up for long.
+  await Promise.race([
+    startSecurityNotices().catch(() => []),
+    new Promise((resolve) => { setTimeout(resolve, SECURITY_NOTICES_START_WAIT_MS); }),
+  ]);
   await loadConversations({ openLast: !pushConversationId });
   // The sidebar's "watched" badges follow the subscriptions.
   onRelayEventSubscriptionsChanged(() => renderConvList());
@@ -5984,6 +6158,10 @@ async function initApp() {
   })) {
     document.getElementById('msg-input').focus();
   }
+  // Links that open UI over the app: Settings at a tab, or a question to
+  // answer (a popup from a paired relay's Inbox).
+  openSettingsDeepLink(settingsLink);
+  void startAnswerThereFromLocation();
 }
 
 async function doAuth() {
@@ -5994,6 +6172,11 @@ async function doAuth() {
   if (result?.ok) {
     setToken('');
     tokenInput.value = '';
+    // Signed in again after "This browser was signed out": start afresh.
+    if (appStartedOnce) {
+      window.location.reload();
+      return;
+    }
     await startAppWithErrorHandling();
   } else {
     showAuthError(resolveAuthErrorMessage(result));
@@ -6019,7 +6202,8 @@ async function bootstrap() {
     await startAppWithErrorHandling();
     return;
   }
-  const urlToken = getTokenFromUrl();
+  onSignedOut(handleSignedOut);
+  const urlToken = getTokenFromUrl() || getSignInCodeFromUrl();
   if (urlToken) stripTokenFromUrl();
   // Back and forward walk the sessions opened, and back closes an open
   // overlay first (session-history.mjs).
@@ -6066,6 +6250,9 @@ async function bootstrap() {
   if (existingSession?.ok) {
     setToken('');
     await startAppWithErrorHandling();
+    // Once after start: a session made without this browser's device id
+    // (an old browser's upgrade) learns it.
+    void announceDeviceId();
     return;
   }
   if (bootstrapToken) {
@@ -6074,7 +6261,11 @@ async function bootstrap() {
     showAuthGate(resolveAuthErrorMessage(existingSession));
     return;
   }
-  showAuthGate();
+  // The cookie this browser had no longer counts (signed out elsewhere,
+  // expired, or the relay token was replaced), or it came without its
+  // session key (site data cleared): signed out, never a new key for it.
+  const signedOutCode = ['AUTH_SIGNED_OUT', 'AUTH_SESSION_PROOF'].includes(existingSession?.payload?.code);
+  showAuthGate(signedOutCode ? SIGNED_OUT_MESSAGE : '');
 }
 
 window.updateTheme = updateTheme;

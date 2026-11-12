@@ -20,7 +20,6 @@ function createClient(fetchImpl, overrides = {}) {
   return createRemoteRelayClient({
     fetchImpl,
     getOwnRelayId: () => OWN_RELAY_ID,
-    getOwnToken: () => OWN_TOKEN,
     ...overrides,
   });
 }
@@ -34,14 +33,17 @@ function recordingFetch(respond = () => jsonResponse({ ok: true })) {
   return { calls, fetchImpl };
 }
 
-const relayA = { name: 'linux-test', url: 'https://relay-a.example.test/oar', tokenMode: 'own' };
+// A relay this one holds a token for (`OWN_TOKEN` is just another stored token
+// now: this relay's own owner token is never sent, it is kept only as a hash).
+const relayA = { name: 'linux-test', url: 'https://relay-a.example.test/oar', tokenMode: 'custom', token: OWN_TOKEN };
 const relayB = { name: 'win-test', url: 'https://relay-b.example.test', tokenMode: 'custom', token: CUSTOM_TOKEN };
 
-test('tokenFor uses the own token unless the remote has a custom one', () => {
+test('tokenFor is the token stored for that relay; an `own` entry sends none (this relay\'s token is never sent)', () => {
   const client = createClient(async () => jsonResponse({}));
   assert.equal(client.tokenFor(relayA), OWN_TOKEN);
   assert.equal(client.tokenFor(relayB), CUSTOM_TOKEN);
   assert.equal(client.tokenFor({ url: relayA.url, tokenMode: 'custom' }), '', 'custom without a token has none');
+  assert.equal(client.tokenFor({ url: relayA.url, tokenMode: 'own' }), '', 'no own token to send');
 });
 
 test('a request sends only the documented headers and keeps the path prefix', async () => {
@@ -97,17 +99,17 @@ test('the address policy is re-checked before anything is sent', async () => {
   const { calls, fetchImpl } = recordingFetch();
   const client = createClient(fetchImpl);
   await assert.rejects(
-    client.request({ url: 'http://relay-a.example.test', tokenMode: 'own' }, 'GET', '/api/status'),
+    client.request({ url: 'http://relay-a.example.test', tokenMode: 'custom', token: CUSTOM_TOKEN }, 'GET', '/api/status'),
     { code: REMOTE_RELAY_ERROR_CODES.unsupported },
   );
   await assert.rejects(
-    client.request({ url: 'ftp://relay-a.example.test', tokenMode: 'own' }, 'GET', '/api/status'),
+    client.request({ url: 'ftp://relay-a.example.test', tokenMode: 'custom', token: CUSTOM_TOKEN }, 'GET', '/api/status'),
     { code: REMOTE_RELAY_ERROR_CODES.unsupported },
   );
   assert.equal(calls.length, 0);
 
-  await client.request({ url: 'http://127.0.0.1:13352', tokenMode: 'own' }, 'GET', '/api/status');
-  await client.request({ url: 'http://192.168.10.20:3333', tokenMode: 'own' }, 'GET', '/api/status');
+  await client.request({ url: 'http://127.0.0.1:13352', tokenMode: 'custom', token: CUSTOM_TOKEN }, 'GET', '/api/status');
+  await client.request({ url: 'http://192.168.10.20:3333', tokenMode: 'custom', token: CUSTOM_TOKEN }, 'GET', '/api/status');
   assert.equal(calls.length, 2, 'loopback and private http is allowed');
 });
 
@@ -122,8 +124,8 @@ test('paths must stay under the relay base', async () => {
 
 test('without a token nothing is sent', async () => {
   const { calls, fetchImpl } = recordingFetch();
-  const client = createClient(fetchImpl, { getOwnToken: () => '' });
-  await assert.rejects(client.request(relayA, 'GET', '/api/status'), { code: REMOTE_RELAY_ERROR_CODES.unauthorized });
+  const client = createClient(fetchImpl);
+  await assert.rejects(client.request({ ...relayA, tokenMode: 'own', token: undefined }, 'GET', '/api/status'), { code: REMOTE_RELAY_ERROR_CODES.unauthorized });
   assert.equal(calls.length, 0);
 });
 
@@ -237,14 +239,30 @@ test('probe reads the identity route and normalises it', async () => {
     publicUrl: 'https://relay-b.example.test',
     protocol: 1,
     inbound: false,
+    peerKeys: false,
+    answerLink: false,
+    inboundKeys: false,
   });
   assert.equal(calls[0].url, 'https://relay-b.example.test/api/relay/identity');
   assert.equal(calls[0].options.headers.Authorization, `Bearer ${CUSTOM_TOKEN}`);
 });
 
-test('probe without a token uses the own token and names a nameless relay by host', async () => {
+test('probe reads capabilities.answerLink: true only when the relay says so', async () => {
+  const { fetchImpl } = recordingFetch(() => jsonResponse({
+    relayId: 'relay-remote-0003', name: 'linux-test', remoteRelays: { protocol: 2 }, capabilities: { answerLink: true },
+  }));
+  assert.equal((await createClient(fetchImpl).probe('https://relay-b.example.test', CUSTOM_TOKEN)).answerLink, true);
+  const { fetchImpl: odd } = recordingFetch(() => jsonResponse({
+    relayId: 'relay-remote-0003', name: 'linux-test', remoteRelays: { protocol: 2 }, capabilities: { answerLink: 'yes' },
+  }));
+  assert.equal((await createClient(odd).probe('https://relay-b.example.test', CUSTOM_TOKEN)).answerLink, false);
+});
+
+test('probe without a token sends nothing (no own token to fall back on); with one it names a nameless relay by host', async () => {
   const { calls, fetchImpl } = recordingFetch(() => jsonResponse({ relayId: 'r-2', name: '', remoteRelays: {} }));
-  const identity = await createClient(fetchImpl).probe('https://relay-b.example.test', '');
+  await assert.rejects(createClient(fetchImpl).probe('https://relay-b.example.test', ''), { code: REMOTE_RELAY_ERROR_CODES.unauthorized });
+  assert.equal(calls.length, 0);
+  const identity = await createClient(fetchImpl).probe('https://relay-b.example.test', OWN_TOKEN);
   assert.equal(calls[0].options.headers.Authorization, `Bearer ${OWN_TOKEN}`);
   assert.equal(identity.name, 'relay-b.example.test');
   assert.equal(identity.protocol, 1);
@@ -297,4 +315,24 @@ test('probe surfaces a wrong token as unauthorized, identity route or fallback',
 test('probe refuses an answer that is not an identity object', async () => {
   const client = createClient(async () => jsonResponse(['not', 'an', 'identity']));
   await assert.rejects(client.probe('https://relay-b.example.test', CUSTOM_TOKEN), { code: REMOTE_RELAY_ERROR_CODES.unsupported });
+});
+
+test('a held entry gets no credential at all: its owner token is not sent either', async () => {
+  const { calls, fetchImpl } = recordingFetch(() => jsonResponse({ relayId: 'r-2', name: 'win-test', remoteRelays: { protocol: 2 } }));
+  const client = createClient(fetchImpl);
+  const hold = { reason: 'relayId', relayId: 'relay-other-id', url: relayB.url, at: null };
+  const held = [
+    // Another relay answered at its address: a token is still stored (no key yet).
+    { ...relayB, protocol: 2, identityHold: hold },
+    // The address is not the one it was keyed at.
+    { ...relayB, protocol: 2, keyUrl: 'https://relay-c.example.test' },
+  ];
+  for (const relay of held) {
+    assert.equal(client.tokenFor(relay), '');
+    await assert.rejects(client.request(relay, 'GET', '/api/status'), (error) => error.code === REMOTE_RELAY_ERROR_CODES.unauthorized && /identity changed/.test(error.message));
+    await assert.rejects(client.probe(relay.url, CUSTOM_TOKEN, { relay }), (error) => /identity changed/.test(error.message));
+  }
+  assert.equal(calls.length, 0, 'nothing reached the held address');
+  // The same address keyed: the token goes as before.
+  assert.equal(client.tokenFor({ ...relayB, keyUrl: 'HTTPS://Relay-B.Example.Test/' }), CUSTOM_TOKEN);
 });

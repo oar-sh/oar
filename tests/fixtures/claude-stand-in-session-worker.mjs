@@ -72,7 +72,8 @@ writeJson(recordFile, record);
 
 const config = readConfig(configPath);
 const serverUrl = `http://127.0.0.1:${Number(config.port) || 3333}`;
-const token = String(config.authToken || '').trim();
+// The agent token the relay gives every session (the config holds no token).
+const token = String(process.env.OAR_AGENT_TOKEN || '').trim();
 const buildId = resolveBuildId(repoRoot).id;
 const workerKind = record.kind || 'claude';
 const log = (...parts) => console.log(`[claude stand-in ${new Date().toISOString()}]`, ...parts);

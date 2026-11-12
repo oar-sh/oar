@@ -90,7 +90,7 @@ function startRelay(t) {
   t.after(() => service.stop());
 
   function connect(sessionId) {
-    httpServer.emit('upgrade', { url: `/api/session-worker/ws?token=tok&sessionId=${sessionId}&pid=${process.pid}`, headers: { host: 'localhost' } }, {}, Buffer.alloc(0));
+    httpServer.emit('upgrade', { url: `/api/session-worker/ws?sessionId=${sessionId}&pid=${process.pid}`, headers: { host: 'localhost', authorization: 'Bearer tok' } }, {}, Buffer.alloc(0));
     const socket = lastWss.sockets.at(-1);
     socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
     return socket;

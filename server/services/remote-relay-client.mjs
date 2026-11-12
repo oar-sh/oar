@@ -6,6 +6,8 @@ import {
   REMOTE_RELAY_LIMITS,
   checkRemoteRelayUrlPolicy,
 } from '../../shared/remote-relay-contract.mjs';
+import { PEER_KEY_PREFIX } from '../../shared/relay-credentials.mjs';
+import { identityHeld, usablePeerToken } from './remote-relay-peer-keys.mjs';
 
 // The outbound HTTP client a relay uses to call the OTHER relays it is paired
 // with (plan §5.3). Deliberately separate from the worker `api` helper: that
@@ -17,6 +19,13 @@ import {
 // The token must never leave for a host the user did not configure, so
 // redirects are refused rather than followed, and the address policy
 // (https, or http only on loopback/private ranges) is re-checked per call.
+//
+// Peer keys: a relay at protocol 2 that gave this one a key is called with
+// that key, never with an owner token. After a call with it worked the hook
+// drops the owner token held for that relay; a 401 or PEER_KEY_REQUIRED on
+// it asks once for a new key and retries once. A PEER_KEY_REQUIRED on a call
+// made without a key is passed to the `required` hook (the row then says to
+// add that relay again from its link).
 
 const IDENTITY_PATH = '/api/relay/identity';
 const LEGACY_STATUS_PATH = '/api/status';
@@ -56,6 +65,12 @@ function hostOf(url) {
 function relayLabel(relay) {
   const name = toText(relay?.name) || hostOf(relay?.url);
   return name ? `Relay "${name}"` : 'The remote relay';
+}
+
+/** Does `relay` hold a key from that relay which that relay refused? */
+function heldKeyRefused(relay) {
+  return toText(relay?.peerToken).startsWith(PEER_KEY_PREFIX)
+    && (relay.peerTokenState === 'revoked' || relay.peerTokenState === 'gone');
 }
 
 function isPlainObject(value) {
@@ -130,13 +145,17 @@ export function remoteRelayHttpError(relay, status, body) {
   return httpError(relay, status, body);
 }
 
-function httpError(relay, status, body) {
+// `credential` is what the refused request carried: 'key' (the key that
+// relay gave this one, `oarp1_…`) or 'token' (a relay token). A 401 says
+// which, so the row and the agent read what to fix.
+function httpError(relay, status, body, { credential = 'token' } = {}) {
   const remoteError = isPlainObject(body) && toText(body.error) ? toText(body.error).slice(0, REMOTE_ERROR_TEXT_MAX) : null;
   const remoteCode = isPlainObject(body) && toText(body.code) ? toText(body.code).slice(0, 100) : null;
   const extras = { status, detail: remoteCode, remoteError, remoteBody: isPlainObject(body) ? body : null };
   const label = relayLabel(relay);
   if (status === 401) {
-    return new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, `${label} rejected the token (401)`, extras);
+    const refused = credential === 'key' ? 'the key it gave this relay' : 'the token';
+    return new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, `${label} rejected ${refused} (401)`, extras);
   }
   if (status === 403 && remoteCode === REMOTE_RELAY_ERROR_CODES.inboundDisabled) {
     return new RemoteRelayError(
@@ -147,6 +166,13 @@ function httpError(relay, status, body) {
   }
   if (status === 404) {
     return new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.notFound, `${label}: not found${remoteError ? ` (${remoteError})` : ''}`, extras);
+  }
+  if (status === 403 && [
+    REMOTE_RELAY_ERROR_CODES.peerScope,
+    REMOTE_RELAY_ERROR_CODES.peerKeyRequired,
+    REMOTE_RELAY_ERROR_CODES.originMismatch,
+  ].includes(remoteCode)) {
+    return new RemoteRelayError(remoteCode, `${label} refused: ${remoteError || remoteCode}`, extras);
   }
   return new RemoteRelayError(
     `${REMOTE_RELAY_ERROR_CODES.httpPrefix}${status}`,
@@ -173,20 +199,40 @@ function normalizeIdentity(identity, host) {
     // A relay that serves the identity route speaks at least protocol 1.
     protocol: Number.isInteger(protocol) && protocol >= 0 ? protocol : 1,
     inbound: remoteRelays.inbound !== false,
+    peerKeys: remoteRelays.peerKeys === true,
+    // Its page answers `?answer=<id>&option=<n>` after the person confirms.
+    answerLink: isPlainObject(identity.capabilities) && identity.capabilities.answerLink === true,
+    // It gives a relay that adds it one way a key of its own (0.9.27).
+    inboundKeys: remoteRelays.inboundKeys === true,
   };
 }
 
 export function createRemoteRelayClient({
   fetchImpl = globalThis.fetch,
   getOwnRelayId = () => '',
-  getOwnToken = () => '',
   timeoutMs: defaultTimeoutMs = REMOTE_RELAY_LIMITS.requestTimeoutMs,
   maxBytes = REMOTE_RELAY_LIMITS.responseMaxBytes,
 } = {}) {
+  // `{ worked(relay), refused(relay) → Promise<entry|null>, required(relay) }` from the
+  // peer-key service (set once it exists).
+  let peerKeyHooks = null;
+
+  function setPeerKeyHooks(hooks) {
+    peerKeyHooks = hooks || null;
+  }
+
+  // The credential for that relay: its key for this relay when it gave one
+  // and speaks protocol 2, else the token stored for it. This relay's own
+  // owner token is never sent: it is kept only as a hash (an `own` entry
+  // from before was given the token as its own when it moved out of the
+  // config; `none` sends none). A held entry (its identity changed) gets
+  // nothing: neither key nor token goes to that address until the owner
+  // confirms.
   function tokenFor(relay) {
-    return relay?.tokenMode === 'custom'
-      ? toText(relay?.token)
-      : toText(getOwnToken?.());
+    if (identityHeld(relay)) return '';
+    const peerToken = usablePeerToken(relay);
+    if (peerToken) return peerToken;
+    return relay?.tokenMode === 'custom' ? toText(relay?.token) : '';
   }
 
   /** The request URL: the stored base (with its path prefix) plus `path` and `query`. */
@@ -223,7 +269,35 @@ export function createRemoteRelayClient({
    * token?, name? }). Resolves to the parsed JSON body (null when empty);
    * rejects with a RemoteRelayError.
    */
-  async function request(relay, method, path, { body, query, hops = 1, timeoutMs } = {}) {
+  async function request(relay, method, path, options = {}) {
+    const peerToken = usablePeerToken(relay);
+    const retry = options.peerKeyRetry !== false && !!peerToken && !!peerKeyHooks;
+    try {
+      const answer = await requestOnce(relay, method, path, options);
+      if (peerToken && options.peerKeyRetry !== false) {
+        try { peerKeyHooks?.worked?.(relay); } catch {}
+      }
+      return answer;
+    } catch (error) {
+      const refusedKey = error instanceof RemoteRelayError && (
+        error.code === REMOTE_RELAY_ERROR_CODES.unauthorized
+        || error.code === REMOTE_RELAY_ERROR_CODES.peerKeyRequired
+      ) && Number(error.status) > 0;
+      // Refused for want of a key, and none was sent: nothing to retry with
+      // (the health loop asks with a token held for it); the row says so.
+      if (!peerToken && options.peerKeyRetry !== false
+        && error instanceof RemoteRelayError && error.code === REMOTE_RELAY_ERROR_CODES.peerKeyRequired) {
+        try { peerKeyHooks?.required?.(relay); } catch {}
+      }
+      if (!retry || !refusedKey) throw error;
+      let fresh = null;
+      try { fresh = await peerKeyHooks.refused(relay); } catch { fresh = null; }
+      if (!fresh) throw error;
+      return request(fresh, method, path, { ...options, peerKeyRetry: false });
+    }
+  }
+
+  async function requestOnce(relay, method, path, { body, query, hops = 1, timeoutMs } = {}) {
     const target = buildUrl(relay, path, query);
     const policy = checkRemoteRelayUrlPolicy(target);
     if (!policy.ok) {
@@ -231,6 +305,18 @@ export function createRemoteRelayClient({
     }
     const token = tokenFor(relay);
     if (!token) {
+      // Its identity changed (another address, or another relay answers
+      // there): nothing held for it, key or token, is sent until the owner
+      // confirms.
+      if (identityHeld(relay)) {
+        throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, `${relayLabel(relay)}: its identity changed, so nothing this relay holds for it is sent; confirm it in Settings → Relays`, { detail: 'identity held' });
+      }
+      // The key that relay gave this one was refused there (revoked, or it no
+      // longer lists this relay), and no token is held for it: the refusal is
+      // what stands, not "no token" (the row keeps saying Re-add from link).
+      if (heldKeyRefused(relay)) {
+        throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, `${relayLabel(relay)} rejected the key it gave this relay (401)`, { detail: 'key refused' });
+      }
       throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, `${relayLabel(relay)} has no token configured`);
     }
     if (typeof fetchImpl !== 'function') {
@@ -285,7 +371,9 @@ export function createRemoteRelayClient({
     }
     const parsed = parseJson(text);
 
-    if (status < 200 || status >= 300) throw httpError(relay, status, parsed.value);
+    if (status < 200 || status >= 300) {
+      throw httpError(relay, status, parsed.value, { credential: token.startsWith(PEER_KEY_PREFIX) ? 'key' : 'token' });
+    }
     if (!parsed.ok) {
       throw new RemoteRelayError(
         REMOTE_RELAY_ERROR_CODES.unsupported,
@@ -301,10 +389,14 @@ export function createRemoteRelayClient({
    * check. A relay that predates remote relays (the identity route answers
    * 404) is described from /api/status and its PWA app name: protocol 0.
    */
-  async function probe(baseUrl, token, { timeoutMs } = {}) {
+  async function probe(baseUrl, token, { timeoutMs, relay: entry = null } = {}) {
     const url = toText(baseUrl).replace(/\/+$/, '');
     const host = hostOf(url);
-    const relay = token ? { url, tokenMode: 'custom', token } : { url, tokenMode: 'own' };
+    // A registry entry probes with its own credential (its key when it has
+    // one); a pasted link with the token given.
+    const relay = entry && toText(entry.url).replace(/\/+$/, '') === url
+      ? entry
+      : (token ? { url, tokenMode: 'custom', token } : { url, tokenMode: 'none' });
     const unexpected = () => new RemoteRelayError(
       REMOTE_RELAY_ERROR_CODES.unsupported,
       `${relayLabel(relay)} did not answer like an OAR relay`,
@@ -337,5 +429,5 @@ export function createRemoteRelayClient({
     };
   }
 
-  return { tokenFor, request, probe };
+  return { tokenFor, request, probe, setPeerKeyHooks };
 }

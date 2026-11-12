@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 
 import { createDeepSeekUsageImportService } from '../services/deepseek-usage-import.mjs';
 import { DEEPSEEK_USAGE_IMPORT_CURRENCY_WAIT_MS, DEEPSEEK_USAGE_IMPORT_MAX_BYTES, registerDeepSeekUsageImportRoutes } from './deepseek-usage-import-routes.mjs';
+import { asOwner } from '../services/relay-principal-test-harness.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.resolve(here, '..', '..', 'tests', 'fixtures', 'deepseek-usage-export');
@@ -27,7 +28,8 @@ async function callRoute(handlers, req = {}) {
     status(code) { this.statusCode = code; return this; },
     json(payload) { this.body = payload; return this; },
   };
-  const request = Object.assign(req, { body: req.body || {}, headers: req.headers || {} });
+  // The relay's user, as `auth` would have tagged the request.
+  const request = asOwner(Object.assign(req, { body: req.body || {}, headers: req.headers || {} }));
   for (const handler of handlers) {
     let next = false;
     await handler(request, response, () => { next = true; });

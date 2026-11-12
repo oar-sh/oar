@@ -61,6 +61,7 @@ const ORIGIN = {
   provider: 'claude',
   model: 'claude-sonnet-5',
   hops: 1,
+  verified: true,
 };
 const HEADER_TEXT = withRemotePromptHeader('run the suite and report back', ORIGIN);
 

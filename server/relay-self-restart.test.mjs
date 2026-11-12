@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
 import { relayRuntimeNodeFlags } from './relay-heap-guard.mjs';
-import { RELAY_RUNTIME_FLAG, runDirectRelaySupervisor, spawnRelayRuntime } from './relay-self-restart.mjs';
+import { RELAY_RUNTIME_FLAG, runDirectRelaySupervisor, spawnRelayRuntime, withoutTokenArg } from './relay-self-restart.mjs';
+import { RELAY_RESTART_EXIT_CODE } from './relay-exit-codes.mjs';
 
 const MINUTE = 60 * 1000;
 
@@ -295,4 +296,36 @@ test('spawnRelayRuntime still starts the runtime when the heap guard throws', ()
   });
   assert.deepEqual(args, ['--enable-source-maps', '/home/dev/oar/server/server.js', RELAY_RUNTIME_FLAG]);
   assert.deepEqual(logs.filter((line) => line.includes('heap')), ['[relay] starting the runtime without heap flags: no statfs']);
+});
+
+test('--token goes to the first runtime only: a restart or a crash relaunches without it', async () => {
+  const secret = `t-${process.pid}-${Date.now()}`;
+  const launches = [];
+  const exits = [RELAY_RESTART_EXIT_CODE, 1, 0];
+  await runDirectRelaySupervisor({
+    hosting: { systemd: false },
+    spawnSyncImpl: NO_SYSTEMCTL,
+    scriptPath: 'server.js',
+    args: ['--port', '4999', '--token', secret, '--owner-pid', '7'],
+    spawnImpl: (_command, argv) => {
+      launches.push(argv);
+      const child = Object.assign(new EventEmitter(), { pid: launches.length, exitCode: null, stdout: null, stderr: null });
+      const code = exits[launches.length - 1];
+      setImmediate(() => child.emit('exit', code, null));
+      return child;
+    },
+    nodeFlags: () => ({ flags: [] }),
+    delay: async () => {},
+    exitImpl: () => {},
+    logger: { log() {}, error() {} },
+    signals: new EventEmitter(),
+  });
+  assert.equal(launches.length, 3);
+  assert.equal(launches[0].includes(secret), true, 'the first start may move it into relay-secrets.json');
+  for (const argv of launches.slice(1)) {
+    assert.equal(argv.includes('--token'), false);
+    assert.equal(argv.includes(secret), false);
+    assert.deepEqual(argv.slice(argv.indexOf(RELAY_RUNTIME_FLAG) + 1), ['--port', '4999', '--owner-pid', '7'], 'the other arguments stay');
+  }
+  assert.deepEqual(withoutTokenArg(['--token=x', '--port', '1', '--token']), ['--port', '1']);
 });

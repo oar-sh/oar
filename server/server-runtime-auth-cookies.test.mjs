@@ -11,12 +11,19 @@ test('server runtime scopes auth/session cookies to the configured remote path',
   assert.match(source, /const COOKIE_PATH = remotePath \|\| '\/';/);
   assert.match(source, /\$\{SESSION_COOKIE\}=\$\{encodeURIComponent\(sessionId\)\}; Path=\$\{COOKIE_PATH\}; SameSite=Lax/);
   assert.match(source, /cookieName: AUTH_COOKIE,\s*cookiePath: COOKIE_PATH,/);
-  assert.match(authSource, /\$\{cookieName\}=\$\{encodeURIComponent\(expected\)\}; Path=\$\{cookiePath\}; Max-Age=2592000; SameSite=Lax; HttpOnly/);
+  // The cookie holds a browser session secret, never the owner token. Host-only
+  // (never a Domain attribute): sibling hosts of one domain share no cookie.
+  // Max-Age runs to the session's idle or absolute expiry, whichever is first.
+  assert.match(authSource, /\$\{cookieName\}=\$\{secret\}; Path=\$\{cookiePath\}; Max-Age=\$\{maxAge\}; SameSite=Lax; HttpOnly\$\{secureAttr\}/);
+  assert.match(authSource, /const maxAge = browserSessions\?\.cookieMaxAgeSeconds\?\.\(row\) \?\? 0;/);
+  assert.doesNotMatch(authSource, /issueOwnerCookie/);
+  assert.doesNotMatch(authSource, /Domain=/i);
   assert.match(authSource, /\$\{cookieName\}=; Path=\$\{cookiePath\}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; HttpOnly/);
 });
 
-test('cookie parsing keeps the first duplicate cookie value', () => {
-  assert.match(source, /if \(!key \|\| Object\.prototype\.hasOwnProperty\.call\(cookies, key\)\) continue;/);
+test('cookie parsing: the runtime uses the shared parser (first duplicate kept, a malformed % skipped)', () => {
+  assert.match(source, /import \{ parseCookies \} from '\.\/services\/cookie-header\.mjs';/);
+  assert.doesNotMatch(source, /function parseCookies\(/);
 });
 
 test('shared viewer tracking enforces bounded caps', () => {

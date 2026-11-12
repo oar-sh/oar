@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { createWorkerRecycleService, isWorkerOnOtherBuild, RECYCLE_HOLDS } from './worker-recycle-service.mjs';
+import { createWorkerRecycleService, isWorkerOnOtherBuild, RECYCLE_HOLDS, workerRecycleStuckNoteText } from './worker-recycle-service.mjs';
 import { sweepArchivedWorkers } from './worker-recycle-service.mjs';
 import { createWorkerReplacementFence } from './worker-replacement.mjs';
 import { createKeyedMutex } from './keyed-mutex-service.mjs';
@@ -322,6 +325,100 @@ test('a failing stop backs off, doubling to the cap, and warns once naming the s
   assert.match(app.logs.find((line) => line.includes('failed')), /^\[worker-recycle\] stop failed sid-stuc \(1\): worker-survived-stop; retrying in 1s$/);
 });
 
+test('a stop that stays stuck tells the person once per streak, with the old worker\'s pids', async () => {
+  const stuck = [];
+  let stopOk = false;
+  const app = setup({
+    workers: [worker('sid-stuck-note', { pid: 4321 })],
+    stop: async (sid, opts, { registry }) => {
+      if (!stopOk) return { ok: false, error: 'worker-not-in-process-list', remainingPids: [4321] };
+      registry.delete(sid);
+      return { ok: true };
+    },
+    options: { retryBaseMs: 1_000, retryMaxMs: 4_000, stuckAfter: 3, onStuck: (note) => stuck.push(note) },
+  });
+  await app.service.sweep();
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(stuck, [], 'two tries: no note yet');
+  await app.clock.advance(2_000);
+  await app.service.sweep();
+  assert.deepEqual(stuck, [{ sdkSessionId: 'sid-stuck-note', step: 'stop', error: 'worker-not-in-process-list', attempts: 3, pids: [4321], archived: false }]);
+  await app.clock.advance(4_000);
+  await app.service.sweep();
+  assert.equal(stuck.length, 1, 'one note per streak');
+  // The stop goes through at last: the streak ends with the recycle.
+  stopOk = true;
+  await app.clock.advance(4_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.at(-1), ['launch', 'sid-stuck-note']);
+  assert.equal(stuck.length, 1);
+});
+
+test('the stuck note names only the pids the stop verified, never the registry\'s pid on its own', async () => {
+  const stuck = [];
+  const app = setup({
+    workers: [worker('sid-unverified', { pid: 4321 }), worker('sid-archived-stuck', { pid: 4322 })],
+    archived: (sid) => sid === 'sid-archived-stuck',
+    // The stop could not tell what the process at 4321 is: it names none.
+    stop: async () => ({ ok: false, error: 'worker-not-in-process-list', remainingPids: [] }),
+    options: { stuckAfter: 1, onStuck: (note) => stuck.push(note) },
+  });
+  await app.service.sweep();
+  assert.deepEqual(stuck.map(({ sdkSessionId, pids }) => [sdkSessionId, pids]).sort(), [
+    ['sid-archived-stuck', []],
+    ['sid-unverified', []],
+  ]);
+});
+
+test('the troubleshooting guide\'s wait matches the default backoff, and sends nobody to another user\'s process', async () => {
+  // Defaults: the three tries before the fence drops are two backoffs apart.
+  const app = setup({
+    workers: [worker('sid-guide')],
+    stop: async () => ({ ok: false, error: 'worker-survived-stop' }),
+  });
+  await app.service.sweep();
+  await app.clock.advance(5_000);
+  await app.service.sweep();
+  const waits = app.logs
+    .map((line) => line.match(/^\[worker-recycle\] stop failed sid-guid \(\d\): worker-survived-stop; retrying in (\d+)s$/)?.[1])
+    .filter(Boolean)
+    .map(Number);
+  assert.deepEqual(waits, [5, 10]);
+  const guide = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs', 'troubleshooting.md'), 'utf8');
+  const from = guide.indexOf("## A chat's old worker does not stop");
+  assert.notEqual(from, -1, 'the section the stuck note names');
+  const section = guide.slice(from, guide.indexOf('\n## ', from + 1));
+  assert.match(section, new RegExp(`about ${waits[0] + waits[1]} seconds of backoff between them plus the time the three stops take`));
+  assert.doesNotMatch(section, /sudo/);
+});
+
+test('a throwing stuck note is only a warning', async () => {
+  const app = setup({
+    workers: [worker('sid-stuck-throw')],
+    stop: async () => ({ ok: false, error: 'worker-survived-stop' }),
+    options: { stuckAfter: 1, onStuck: () => { throw new Error('no database'); } },
+  });
+  await app.service.sweep();
+  assert.match(app.warns.at(-1), /^\[worker-recycle\] stuck note for sid-stuc failed: no database$/);
+});
+
+test('the stuck note names the old worker and how to stop it by hand, per platform', () => {
+  const stuck = { sdkSessionId: 'sid-note-fixture', step: 'stop', error: 'worker-not-in-process-list', attempts: 3, pids: [4321] };
+  const posix = workerRecycleStuckNoteText(stuck, { platform: 'linux' });
+  assert.match(posix, /^⚠️ The relay could not stop this chat's old worker \(pid 4321\) to restart it on the updated code: 3 tries failed \(worker-not-in-process-list\)\./);
+  assert.match(posix, /stop it by hand \(`kill 4321`\); a relay restart does not end it/);
+  assert.match(posix, /"A chat's old worker does not stop" in the troubleshooting guide\.$/);
+  const windows = workerRecycleStuckNoteText({ ...stuck, pids: [4321, 4322] }, { platform: 'win32' });
+  assert.match(windows, /old worker \(pids 4321, 4322\)/);
+  assert.match(windows, /\(`taskkill \/PID 4321 \/T \/F`, `taskkill \/PID 4322 \/T \/F`\)/);
+  // No pid known: how to find it.
+  assert.match(workerRecycleStuckNoteText({ ...stuck, pids: [] }, { platform: 'linux' }), /the node process with `--session-id sid-note-fixture` in its command line/);
+  // A launch or a probe that stays stuck: no process to stop.
+  const launch = workerRecycleStuckNoteText({ ...stuck, step: 'launch', error: 'spawn-failed', pids: [] });
+  assert.match(launch, /could not restart this chat's worker on the updated code: 3 tries failed \(last: launch: spawn-failed\)\. .*restart the relay\.$/);
+});
+
 test('a failed launch is retried after the backoff without a second stop; success resets the failures', async () => {
   let launchOk = false;
   const app = setup({
@@ -344,6 +441,210 @@ test('a failed launch is retried after the backoff without a second stop; succes
   assert.equal(app.service.status().recycled, 1);
 });
 
+test('a launch that names the stopped pid is no recycle: the fence stays, and the retry stops the session again before it launches', async () => {
+  const fence = createWorkerReplacementFence();
+  let adopt = true;
+  const app = setup({
+    workers: [worker('sid-adopt', { pid: 42, buildId: OLD })],
+    // The launch joined a start that reused the stopped process from a
+    // process list read before the stop: the registry names pid 42 again.
+    launch: async (sid, { registry, defaultLaunch }) => {
+      if (!adopt) return defaultLaunch(sid);
+      registry.set(sid, worker(sid, { pid: 42, buildId: OLD }));
+      return { ok: true };
+    },
+    options: { retryBaseMs: 1_000, fence },
+  });
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', 'sid-adopt'], ['launch', 'sid-adopt']]);
+  assert.equal(app.logs.some((line) => line.includes('recycled sid-adop')), false, 'nothing claimed');
+  assert.equal(app.logs.at(-1), '[worker-recycle] launch failed sid-adop (1): the launch named the stopped pid 42; retrying in 1s');
+  assert.equal(fence.isHeld('sid-adopt', 42), true, 'the stopped pid gets no work');
+  assert.equal(app.service.status().recycled, 0);
+
+  // Nothing tells what runs at pid 42 (no reader): the retry stops the
+  // session again, then launches, so it never has two processes.
+  adopt = false;
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls.slice(2), [['stop', 'sid-adopt'], ['launch', 'sid-adopt']]);
+  assert.ok(app.logs.includes('[worker-recycle] stopped sid-adop pid 42 again before the launch: the process there could not be told from the stopped one'));
+  assert.equal(app.logs.at(-1), '[worker-recycle] recycled sid-adop pid 42→501');
+  assert.equal(fence.isHeld('sid-adopt', 42), false);
+  assert.equal(app.service.status().recycled, 1);
+});
+
+// One recycle of a worker at pid 42 whose launch names pid 42 again, as a
+// worker that has not said hello yet (no build id); `current` is what the
+// identity reader finds there after the launch.
+async function launchOnStoppedPid({ sid, stoppedStartTime = '1000', current, buildId = null }) {
+  const reads = [];
+  const app = setup({
+    workers: [worker(sid, { pid: 42, buildId: OLD })],
+    stop: async (id, opts, { registry }) => {
+      registry.delete(id);
+      return stoppedStartTime ? { ok: true, identity: { pid: 42, startTime: stoppedStartTime } } : { ok: true };
+    },
+    launch: async (id, { registry }) => { registry.set(id, worker(id, { pid: 42, buildId })); return { ok: true }; },
+    options: { retryBaseMs: 1_000, readProcessIdentity: async (pid) => { reads.push(pid); return current; } },
+  });
+  await app.service.sweep();
+  return { app, reads };
+}
+
+test('a launch that names the stopped pid is a new worker only by another start time and the session\'s command line, or by this relay\'s build id', async () => {
+  const commandLine = (sid) => `node /home/dev/oar/server/claude-worker/claude-session-worker.mjs --session-id ${sid}`;
+  // The same start time: the stopped process.
+  let run = await launchOnStoppedPid({ sid: 'sid-same', current: { pid: 42, startTime: '1000', commandLine: commandLine('sid-same') } });
+  assert.deepEqual(run.reads, [42]);
+  assert.equal(run.app.logs.at(-1), '[worker-recycle] launch failed sid-same (1): the launch named the stopped pid 42; retrying in 1s');
+  // A start time that cannot be read now proves nothing.
+  run = await launchOnStoppedPid({ sid: 'sid-unread', current: { pid: 42, startTime: null, commandLine: null } });
+  assert.match(run.app.logs.at(-1), /launch failed sid-unre \(1\): the launch named the stopped pid 42;/);
+  // Nor one the stop could not read.
+  run = await launchOnStoppedPid({ sid: 'sid-nostart', stoppedStartTime: null, current: { pid: 42, startTime: '2000', commandLine: commandLine('sid-nostart') } });
+  assert.match(run.app.logs.at(-1), /launch failed sid-nost \(1\): the launch named the stopped pid 42;/);
+  // A pid no process has is no worker either.
+  run = await launchOnStoppedPid({ sid: 'sid-gone', current: null });
+  assert.match(run.app.logs.at(-1), /launch failed sid-gone \(1\): the launch named the stopped pid 42, which no process has;/);
+  // Another start time, but not a process of the session (its command line
+  // names none, or cannot be read): the pid went elsewhere, no new worker.
+  run = await launchOnStoppedPid({ sid: 'sid-foreign', current: { pid: 42, startTime: '2000', commandLine: '/usr/sbin/cron -f' } });
+  assert.match(run.app.logs.at(-1), /launch failed sid-fore \(1\): the launch named the stopped pid 42;/);
+  run = await launchOnStoppedPid({ sid: 'sid-blind', current: { pid: 42, startTime: '2000', commandLine: null } });
+  assert.match(run.app.logs.at(-1), /launch failed sid-blin \(1\): the launch named the stopped pid 42;/);
+  // Another start time and the session's: a new process that got the pid.
+  run = await launchOnStoppedPid({ sid: 'sid-new', current: { pid: 42, startTime: '2000', commandLine: commandLine('sid-new') } });
+  assert.equal(run.app.logs.at(-1), '[worker-recycle] recycled sid-new pid 42→42');
+  assert.equal(run.app.service.status().recycled, 1);
+  // The registry entry states this relay's build: the new worker (the
+  // stopped one was stale), whatever the start times say.
+  run = await launchOnStoppedPid({ sid: 'sid-build', buildId: RELAY, current: { pid: 42, startTime: '1000', commandLine: commandLine('sid-build') } });
+  assert.deepEqual(run.reads, [], 'the build id decides');
+  assert.equal(run.app.logs.at(-1), '[worker-recycle] recycled sid-buil pid 42→42');
+});
+
+test('the start time of the old pid unreadable: one worker results, never a second spawn while the first lives', async () => {
+  const sid = 'sid-one-worker';
+  // The session's processes, as the host runs them.
+  const alive = new Set([42]);
+  let most = alive.size;
+  let nextPid = 42;
+  const spawned = [];
+  const app = setup({
+    workers: [worker(sid, { pid: 42, buildId: OLD })],
+    // The stop ends every process of the session; it could not read the old
+    // worker's start time.
+    stop: async (id, opts, { registry }) => { alive.clear(); registry.delete(id); return { ok: true }; },
+    // A detached spawn: a process of its own, whatever else runs. The first
+    // one gets the stopped worker's pid, handed out again.
+    launch: async (id, { registry }) => {
+      const pid = nextPid;
+      nextPid += 1;
+      alive.add(pid);
+      most = Math.max(most, alive.size);
+      spawned.push(pid);
+      registry.set(id, worker(id, { pid, buildId: null }));
+      return { ok: true };
+    },
+    options: {
+      retryBaseMs: 1_000,
+      readProcessIdentity: async (pid) => (alive.has(pid)
+        ? { pid, startTime: `start-${pid}`, commandLine: `node /home/dev/oar/server/claude-worker/claude-session-worker.mjs --session-id ${sid}` }
+        : null),
+    },
+  });
+  await app.service.sweep();
+  assert.deepEqual(spawned, [42]);
+  assert.match(app.logs.at(-1), /launch failed sid-one- \(1\): the launch named the stopped pid 42;/, 'not told apart from the stopped one');
+
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', sid], ['launch', sid], ['stop', sid], ['launch', sid]]);
+  assert.deepEqual(spawned, [42, 43]);
+  assert.equal(most, 1, 'never two processes for the session');
+  assert.deepEqual([...alive], [43]);
+  assert.equal(app.logs.at(-1), '[worker-recycle] recycled sid-one- pid 42→43');
+
+  await app.clock.advance(60_000);
+  await app.service.sweep();
+  assert.equal(app.calls.length, 4, 'done: nothing more');
+});
+
+test('the retry of a launch that named the stopped pid: this relay\'s build id ends it, a gone process needs no second stop', async () => {
+  // The worker at pid 42 says hello before the retry: it is the new one.
+  let run = await launchOnStoppedPid({ sid: 'sid-hello', stoppedStartTime: null, current: { pid: 42, startTime: '2000', commandLine: null } });
+  assert.match(run.app.logs.at(-1), /launch failed sid-hell \(1\)/);
+  run.app.registry.set('sid-hello', worker('sid-hello', { pid: 42, buildId: RELAY }));
+  await run.app.clock.advance(1_000);
+  await run.app.service.sweep();
+  assert.deepEqual(run.app.calls, [['stop', 'sid-hello'], ['launch', 'sid-hello']], 'neither stopped nor launched again');
+  assert.equal(run.app.logs.at(-1), '[worker-recycle] recycled sid-hell pid 42→42 (on this build)');
+  assert.equal(run.app.service.status().recycled, 1);
+
+  // No process has pid 42 any more: the retry launches without a stop.
+  run = await launchOnStoppedPid({ sid: 'sid-ended', current: null });
+  await run.app.clock.advance(1_000);
+  await run.app.service.sweep();
+  assert.deepEqual(run.app.calls.map(([kind]) => kind), ['stop', 'launch', 'launch']);
+});
+
+test('another start lands on the stopped pid while a failed launch backs off: the retry leaves the session one worker', async () => {
+  const sid = 'sid-backoff-start';
+  const commandLine = `node /home/dev/oar/server/claude-worker/claude-session-worker.mjs --session-id ${sid}`;
+  for (const { stoppedStartTime, expect } of [
+    // The stop could not read the old start time: the process there cannot
+    // be told from the stopped one, so it is stopped before the launch.
+    { stoppedStartTime: null, expect: { calls: ['stop', 'launch', 'stop', 'launch'], alive: [43] } },
+    // Another start time and the session's: that start's worker is the new
+    // one, and no launch follows.
+    { stoppedStartTime: 'start-old', expect: { calls: ['stop', 'launch'], alive: [42] } },
+  ]) {
+    const alive = new Set([42]);
+    let most = alive.size;
+    let launchOk = false;
+    let nextPid = 43;
+    const spawn = (registry, pid) => {
+      alive.add(pid);
+      most = Math.max(most, alive.size);
+      // Before its first heartbeat: no build id yet.
+      registry.set(sid, worker(sid, { pid, buildId: null }));
+    };
+    const app = setup({
+      workers: [worker(sid, { pid: 42, buildId: OLD })],
+      stop: async (id, opts, { registry }) => {
+        alive.clear();
+        registry.delete(id);
+        return stoppedStartTime ? { ok: true, identity: { pid: 42, startTime: stoppedStartTime } } : { ok: true };
+      },
+      // The recycle's own launch fails first; its retry is a detached spawn.
+      launch: async (id, { registry }) => {
+        if (!launchOk) return { ok: false, error: 'spawn-failed' };
+        spawn(registry, nextPid);
+        nextPid += 1;
+        return { ok: true };
+      },
+      options: {
+        retryBaseMs: 1_000,
+        readProcessIdentity: async (pid) => (alive.has(pid) ? { pid, startTime: `start-${pid}`, commandLine } : null),
+      },
+    });
+    await app.service.sweep();
+    assert.match(app.logs.at(-1), /launch failed sid-back \(1\): spawn-failed;/);
+    assert.deepEqual([...alive], []);
+    // During the backoff another start (the queue's) brings a worker up, and
+    // the stopped worker's pid is handed out to it.
+    spawn(app.registry, 42);
+    launchOk = true;
+    await app.clock.advance(1_000);
+    await app.service.sweep();
+    assert.deepEqual(app.calls.map(([kind]) => kind), expect.calls, `stopped start time ${stoppedStartTime}`);
+    assert.equal(most, 1, 'never two processes for the session');
+    assert.deepEqual([...alive], expect.alive);
+    assert.equal(app.service.status().recycled, 1);
+  }
+});
+
 test('a launch owed is dropped when another path brought a new worker up meanwhile', async () => {
   const app = setup({
     workers: [worker('sid-primed', { pid: 42 })],
@@ -358,19 +659,22 @@ test('a launch owed is dropped when another path brought a new worker up meanwhi
 });
 
 test('one recycle per pid: an entry the stop left behind is never stopped again; a new pid is judged by its own id', async () => {
+  const reads = [];
   const app = setup({
     workers: [worker('sid-pid', { pid: 42 })],
     // The stop went through but a late heartbeat re-listed the old pid, and
     // the launch keeps failing.
+    // The stopped process is gone: no process has pid 42.
     stop: async () => ({ ok: true }),
     launch: async () => ({ ok: false, error: 'spawn-failed' }),
-    options: { retryBaseMs: 1_000 },
+    options: { retryBaseMs: 1_000, readProcessIdentity: async (pid) => { reads.push(pid); return null; } },
   });
   await app.service.sweep();
   assert.deepEqual(app.calls, [['stop', 'sid-pid'], ['launch', 'sid-pid']]);
   await app.clock.advance(1_000);
   await app.service.sweep();
   assert.deepEqual(app.calls.slice(2), [['launch', 'sid-pid']], 'pid 42 is not stopped twice; only the launch is retried');
+  assert.deepEqual(reads, [42, 42], 'each launch reads the pid the entry names');
 
   app.registry.set('sid-pid', worker('sid-pid', { pid: 43, buildId: RELAY }));
   await app.clock.advance(2_000);
@@ -432,7 +736,7 @@ test('a session recycled under one relay build is eligible again under the next'
     listWorkers: () => Array.from(registry.values()),
     getWorker: (sid) => registry.get(sid) || null,
     hasHeartbeated: () => true,
-    stopWorker: async (sid) => { calls.push(['stop', sid, relayBuildId]); return { ok: true }; },
+    stopWorker: async (sid) => { calls.push(['stop', sid, relayBuildId]); registry.delete(sid); return { ok: true }; },
     launchWorker: async (sid) => {
       calls.push(['launch', sid, relayBuildId]);
       registry.set(sid, worker(sid, { pid: 100 + calls.length, buildId: OLD }));

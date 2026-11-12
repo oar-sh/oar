@@ -70,7 +70,10 @@ export function createAskUserBridge({
   // `source` / `rationale` override the bridge-wide card identity for one ask
   // (the Claude worker's safety-check approvals are not clarifications), and
   // `allowFreeform: false` makes a card answered by its choices alone.
-  async function askSingleQuestion(entry, { signal, source, rationale, allowFreeform } = {}) {
+  // `kind` names a card's variant within its source (the Claude worker's
+  // sensitive-file Safety check), and `personOnly: true` marks a card no
+  // agent may answer.
+  async function askSingleQuestion(entry, { signal, source, rationale, allowFreeform, kind, personOnly } = {}) {
     const activeMsg = typeof getActiveMessage === 'function' ? getActiveMessage() : null;
     const choices = entry.options.map((option) => option.label);
     const promptParts = [entry.question];
@@ -102,6 +105,8 @@ export function createAskUserBridge({
         relayMode: activeMsg?.relayMode || 'agent',
         header: entry.header || undefined,
         multiSelect: entry.multiSelect || undefined,
+        ...(typeof kind === 'string' && kind ? { kind } : {}),
+        ...(personOnly === true ? { personOnly: true } : {}),
       },
     };
     const questionId = await createRelayQuestion({ api, payload: questionPayload, sleep, signal, dbg });
@@ -109,7 +114,7 @@ export function createAskUserBridge({
     return waitForRelayQuestionAnswer(questionId, { signal });
   }
 
-  async function handleAskUserQuestion(input, { signal, source, rationale, allowFreeform } = {}) {
+  async function handleAskUserQuestion(input, { signal, source, rationale, allowFreeform, kind, personOnly } = {}) {
     const questions = normalizeQuestions(input);
     if (!questions.length) {
       return { answers: {}, structuredAnswers: {}, timedOut: false };
@@ -121,7 +126,7 @@ export function createAskUserBridge({
     const structuredAnswers = {};
     let timedOut = false;
     for (const entry of questions) {
-      const result = await askSingleQuestion(entry, { signal, source, rationale, allowFreeform });
+      const result = await askSingleQuestion(entry, { signal, source, rationale, allowFreeform, kind, personOnly });
       answers[entry.question] = result.answer;
       if (result.structuredAnswer) structuredAnswers[entry.question] = result.structuredAnswer;
       if (entry.rawQuestion && entry.rawQuestion !== entry.question) {

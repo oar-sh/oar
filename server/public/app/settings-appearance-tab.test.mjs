@@ -30,7 +30,7 @@ const APPEARANCE_IDS = [
 
 test('Appearance is the second tab, right after General', () => {
   const tabs = [...document.querySelectorAll('#settings-modal [data-settings-tab]')];
-  assert.deepEqual(tabs.map((tab) => tab.dataset.settingsTab), ['general', 'appearance', 'providers', 'relays', 'previews', 'shares', 'notifications', 'features']);
+  assert.deepEqual(tabs.map((tab) => tab.dataset.settingsTab), ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications', 'features']);
   const tab = el('settings-tab-appearance');
   assert.equal(tab.textContent.trim(), 'Appearance');
   assert.equal(tab.getAttribute('role'), 'tab');

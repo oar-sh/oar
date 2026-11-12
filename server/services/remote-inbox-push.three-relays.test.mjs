@@ -8,6 +8,7 @@ import { registerRelayAskRoutes } from '../routes/relay-ask-routes.mjs';
 import { createPushDispatchService } from './push-dispatch-service.mjs';
 import { createRemoteInboxWatchService } from './remote-inbox-watch-service.mjs';
 import { createRemoteRelayCallerContext } from './remote-relay-caller-context.mjs';
+import { asPeer } from './relay-principal-test-harness.mjs';
 
 // Three-relay check, in process: relays A, B and C, each with its
 // own database, push service (web-push stubbed: what each one sends is
@@ -71,7 +72,11 @@ function makeRelay(name, { pushOn = false } = {}) {
     db,
     stmts: createQuestionRepository(db),
     formatQuestionRow,
-    remoteRelayInbound: { listRelays: () => [], selfNames: () => [name], inboundEnabled: () => true },
+    remoteRelayInbound: {
+      listRelays: () => ['a', 'b', 'c'].map((other) => ({ id: `entry-${other}-id`, relayId: `${other}-id`, name: `${other}-id`, url: `https://${other}-id.example.test` })),
+      selfNames: () => [name],
+      inboundEnabled: () => true,
+    },
     questionNotice: (id) => push.questionNotice(id),
   });
   /** A paired relay's GET, handled here in process, as it would be over HTTP. */
@@ -81,7 +86,10 @@ function makeRelay(name, { pushOn = false } = {}) {
     let status = 200;
     let body = null;
     const res = { setHeader() {}, status(code) { status = code; return res; }, json(payload) { body = payload; return res; } };
-    await handler({ headers: { 'x-oar-remote-origin': fromRelayId, 'x-oar-remote-hops': '1' }, params: {}, body: {}, query: Object.fromEntries(new URLSearchParams(search)) }, res);
+    // The paired relay signs in with its own key (peer keys).
+    const req = asPeer({ headers: { 'x-oar-remote-origin': fromRelayId, 'x-oar-remote-hops': '1' }, params: {}, body: {}, query: Object.fromEntries(new URLSearchParams(search)) },
+      { id: `entry-${fromRelayId}`, relayId: fromRelayId, name: fromRelayId, url: `https://${fromRelayId}.example.test` });
+    await handler(req, res);
     if (status !== 200) throw Object.assign(new Error(`HTTP ${status}`), { status });
     return body;
   }

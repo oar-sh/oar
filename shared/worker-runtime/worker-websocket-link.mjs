@@ -25,12 +25,13 @@ function resolveSocketStateValue(socket, stateName, fallback) {
   return fallback;
 }
 
-function toWebSocketUrl(serverUrl, token, getSessionId, getPid) {
+// The token goes in the upgrade's Authorization header, never in the URL:
+// the relay reads it nowhere else.
+function toWebSocketUrl(serverUrl, getSessionId, getPid) {
   const source = new URL(String(serverUrl || "http://localhost:3333"));
   source.protocol = source.protocol === "https:" ? "wss:" : "ws:";
   source.pathname = "/api/session-worker/ws";
   source.search = "";
-  if (token) source.searchParams.set("token", token);
   const sessionId = normalizeText(typeof getSessionId === "function" ? getSessionId() : null);
   if (sessionId) source.searchParams.set("sessionId", sessionId);
   const pid = normalizePositiveInt(typeof getPid === "function" ? getPid() : null);
@@ -384,8 +385,11 @@ export function createWorkerWebSocketLink({
     clearReconnectTimer();
     let socket = null;
     try {
-      const url = toWebSocketUrl(serverUrl, token, getSessionId, getPid);
-      socket = new WebSocketImpl(url);
+      const url = toWebSocketUrl(serverUrl, getSessionId, getPid);
+      // Node's WebSocket (undici) and the `ws` package both take headers here.
+      socket = token
+        ? new WebSocketImpl(url, { headers: { Authorization: `Bearer ${token}` } })
+        : new WebSocketImpl(url);
     } catch (error) {
       // A socket that fails in its constructor raises no events: nothing but
       // this would ever try again.

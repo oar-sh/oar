@@ -57,8 +57,12 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // the composer's image module and controls and the placeholder in the
 // client); the image cost and presets work that follows adds about eight
 // (the price table, the spend contract, the presets, their services and
-// client parts).
-const MAX_ENTRIES = 680;
+// client parts). 720 since 2026-11-11: agent auth (the route policy, the
+// principals, the owner secret store, browser sessions and their
+// migration, the auth routes, Settings → Security) took it to 678; the
+// peer keys that follow it add their own. 760 since 2026-11-12: 0.9.27
+// features (auth, peer keys, security UI) took it to 694 entries.
+const MAX_ENTRIES = 760;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -85,7 +89,11 @@ const MAX_ENTRIES = 680;
 // counts only OAR's own files. 10.5 MiB since 2026-11-08: the image work
 // (agent images, previews, and next the cost and presets) took it to
 // 10,528,735 with previews; about 150 KB more is expected for the cost part.
-const MAX_UNPACKED_BYTES = 10.5 * 1024 * 1024;
+// 11 MiB since 2026-11-11: agent auth took it to 10,894,931 (98.9 % of
+// 10.5 MiB), and the peer keys that follow it would go over. 12 MiB since
+// 2026-11-12: 0.9.27 features (auth, peer keys, security UI); 99.0 % at
+// 11 MiB (11,414,620 bytes).
+const MAX_UNPACKED_BYTES = 12 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },
@@ -135,13 +143,18 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
   }
   // The pins the relay installs the agent SDKs (and koffi) from.
   for (const required of [
-    'server/agent-sdks/claude/package.json', 'server/agent-sdks/claude/package-lock.json', 'server/agent-sdks/claude/entry.mjs',
-    'server/agent-sdks/cursor/package.json', 'server/agent-sdks/cursor/package-lock.json', 'server/agent-sdks/cursor/entry.mjs',
+    'server/agent-sdks/claude/pin.json', 'server/agent-sdks/claude/pin-lock.json', 'server/agent-sdks/claude/entry.mjs',
+    'server/agent-sdks/cursor/pin.json', 'server/agent-sdks/cursor/pin-lock.json', 'server/agent-sdks/cursor/entry.mjs',
     'server/agent-sdks/cursor/entry-sqlite.mjs',
-    'server/agent-sdks/koffi/package.json', 'server/agent-sdks/koffi/package-lock.json', 'server/agent-sdks/koffi/entry.cjs',
+    'server/agent-sdks/koffi/pin.json', 'server/agent-sdks/koffi/pin-lock.json', 'server/agent-sdks/koffi/entry.cjs',
   ]) {
     assert.ok(paths.includes(required), `tarball is missing ${required}`);
   }
+  // One npm manifest, the package's own: dependency scanners read every
+  // package.json in a tarball, and a pins folder's would list the SDKs as
+  // dependencies of OAR (the pins ship as pin.json and pin-lock.json).
+  const manifests = paths.filter((p) => /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json)$/.test(p));
+  assert.deepEqual(manifests, ['package.json'], `npm manifests besides the package's own:\n${manifests.join('\n')}`);
   assert.ok(
     paths.some((p) => p.startsWith('.github/extensions/web-relay/')),
     'tarball is missing the Copilot CLI extension',

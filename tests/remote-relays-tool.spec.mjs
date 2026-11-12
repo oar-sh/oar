@@ -76,11 +76,14 @@ test.describe.serial("relay_tool tool between two relays", () => {
     await api(relayB.baseUrl, relayB.token, "/api/settings/pwa-app-name", { method: "POST", body: { appName: "linux-test" } });
     await api(relayBaseUrl(), relayToken(), "/api/settings/pwa-app-name", { method: "POST", body: { appName: "win-test" } });
     await api(relayBaseUrl(), relayToken(), "/api/settings/remote-relays", { method: "POST", body: { publicUrl: relayBaseUrl() } });
+    // Paired both ways: each relay signs in to the other with a key of its
+    // own, so a prompt from A is verified on B (origin binding).
     const added = await api(relayBaseUrl(), relayToken(), "/api/remote-relays", {
       method: "POST",
-      body: { url: relayB.baseUrl, token: relayB.token, pairBack: false },
+      body: { url: relayB.baseUrl, token: relayB.token },
     });
     expect(added.payload?.ok, JSON.stringify(added.payload)).toBe(true);
+    expect(added.payload?.pairedBack, JSON.stringify(added.payload)).toBe(true);
     // A session on B for A's agent to find, read and prompt.
     conversationOnB = await newConversation(relayB.baseUrl, relayB.token, "report builder: collect the numbers");
   });
@@ -147,12 +150,7 @@ test.describe.serial("relay_tool tool between two relays", () => {
   });
 
   test("the agent that was asked can answer on the relay the prompt came from, without a mention", async () => {
-    // B knows A as a paired relay too; nobody mentioned A on B.
-    const paired = await api(relayB.baseUrl, relayB.token, "/api/remote-relays", {
-      method: "POST",
-      body: { url: relayBaseUrl(), token: relayToken(), pairBack: false },
-    });
-    expect(paired.payload?.ok, JSON.stringify(paired.payload)).toBe(true);
+    // B knows A from the pairing (both ways, with keys); nobody mentioned A on B.
     const toolOnB = (conversationId, action, args = {}) => api(relayB.baseUrl, relayB.token, "/api/remote-relays/tool", {
       method: "POST",
       body: { conversationId, action, args },
@@ -186,7 +184,7 @@ test.describe.serial("relay_tool tool between two relays", () => {
       expect(locked.status).toBe(403);
       expect(locked.payload.code).toBe("REMOTE_RELAY_LOCKED");
     } finally {
-      await removeAllRemotes(relayB.baseUrl, relayB.token);
+      // B keeps its entry for A: A calls B with the key B issued for it.
     }
   });
 

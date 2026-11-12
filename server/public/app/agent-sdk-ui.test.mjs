@@ -197,6 +197,44 @@ test('a cancelled install is not shown as a failure', () => {
   assert.equal(partOf(id, 'log-details').open, false);
 });
 
+test('a failed Reinstall says so, while the row stays ready on the folder it kept', async () => {
+  fresh();
+  const dir = '/srv/fixture/sdks/claude/0.3.10-1a2b3c4d';
+  const ready = { state: 'ready', installed: '0.3.10', folder: '0.3.10-1a2b3c4d', dir };
+  applyAgentSdkState(snapshot({ claude: sdk('claude', { ...ready, startedAt: '2026-04-01T09:00:00.000Z', log: 'done\n', logSeq: 3 }) }));
+  const startedAt = '2026-04-01T10:00:00.000Z';
+  answer = () => ({ status: 200, body: { ok: true, reused: false, ready: false, ...snapshot({ claude: sdk('claude', { ...ready, state: 'installing', startedAt, active: true, canInstall: false }) }) } });
+  await runAgentSdkAction('claude', 'reinstall');
+  assert.deepEqual(requests.at(-1).body, { sdk: 'claude', reinstall: true });
+
+  // The broadcast once npm failed: the store settles the row back to ready.
+  const error = 'npm error 407 Proxy Authentication Required.';
+  applyAgentSdkState(snapshot({ claude: sdk('claude', {
+    ...ready,
+    startedAt,
+    finishedAt: '2026-04-01T10:01:00.000Z',
+    error: null,
+    kind: null,
+    reinstallFailure: { error, kind: 'other', at: '2026-04-01T10:01:00.000Z' },
+    log: 'npm error code E407\n',
+    logSeq: 4,
+  }) }));
+  for (const id of CLAUDE_ROWS) {
+    assert.equal(partOf(id, 'status').textContent, 'Installed · pinned 0.3.10 · installed 0.3.10', id);
+    assert.equal(partOf(id, 'status').dataset.state, 'active', id);
+    assert.equal(partOf(id, 'note').hidden, false, id);
+    assert.equal(partOf(id, 'note').textContent, `Reinstall failed: npm error 407 Proxy Authentication Required. ${dir} stays in use.`, id);
+    assert.equal(partOf(id, 'note').dataset.state, 'error', id);
+    assert.deepEqual(visibleButtons(id), ['Reinstall'], id);
+    assert.equal(partOf(id, 'log-summary').textContent, 'Failed · install log', id);
+    assert.equal(partOf(id, 'log-details').open, true, id);
+  }
+
+  // The next install clears it.
+  applyAgentSdkState(snapshot({ claude: sdk('claude', { ...ready, state: 'installing', startedAt: '2026-04-01T11:00:00.000Z', active: true }) }));
+  assert.equal(partOf('agent-sdk-claude-row', 'note').hidden, true);
+});
+
 test('not available on this platform: no button', () => {
   fresh();
   applyAgentSdkState(snapshot({ cursor: sdk('cursor', { state: 'unsupported', support: 'no', kind: 'platform', canInstall: false, error: 'Cursor SDK is not available on this platform (android-arm64).' }) }));

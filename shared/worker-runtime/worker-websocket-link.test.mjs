@@ -5,8 +5,9 @@ import { createWorkerWebSocketLink } from "./worker-websocket-link.mjs";
 class FakeWebSocket {
   static instances = [];
 
-  constructor(url) {
+  constructor(url, init = undefined) {
     this.url = url;
+    this.init = init;
     this.OPEN = 1;
     this.CONNECTING = 0;
     this.CLOSED = 3;
@@ -107,7 +108,9 @@ test("worker websocket link sends ready and processes delivered queue messages",
   link.start();
   assert.equal(FakeWebSocket.instances.length, 1);
   const socket = FakeWebSocket.instances[0];
-  assert.match(socket.url, /token=tok/);
+  // The token rides in the upgrade's Authorization header, never in the URL.
+  assert.doesNotMatch(socket.url, /token=/);
+  assert.equal(socket.init?.headers?.Authorization, 'Bearer tok');
   assert.match(socket.url, /sessionId=sdk-1/);
   assert.match(socket.url, /pid=4242/);
 

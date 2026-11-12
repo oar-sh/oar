@@ -49,14 +49,17 @@ test('win32 relay: bare absolute path src resolves to the drive-file route inste
   setServerPlatform('win32');
   const img = sanitizedElement('<img src="C:\\Users\\dev\\shot.png">');
   assert.equal(img.tagName, 'IMG');
-  assert.equal(img.getAttribute('src'), '/api/drives/file?path=C%3A%2FUsers%2Fdev%2Fshot.png');
+  // A file by path waits for its capability (`k`): no src, nothing loads yet.
+  assert.equal(img.getAttribute('src'), null);
+  assert.equal(img.getAttribute('data-oar-file-src'), '/api/drives/file?path=C%3A%2FUsers%2Fdev%2Fshot.png');
 });
 
 test('win32 relay: bare-path media becomes a player pointing at the drive-file route', () => {
   setServerPlatform('win32');
   const video = sanitizedElement('<img src="C:\\Users\\dev\\demo.mp4" alt="demo">');
   assert.equal(video.tagName, 'VIDEO');
-  assert.equal(video.getAttribute('src'), '/api/drives/file?path=C%3A%2FUsers%2Fdev%2Fdemo.mp4');
+  assert.equal(video.getAttribute('src'), null);
+  assert.equal(video.getAttribute('data-oar-file-src'), '/api/drives/file?path=C%3A%2FUsers%2Fdev%2Fdemo.mp4');
   assert.equal(video.getAttribute('controls'), '');
 });
 
@@ -67,7 +70,7 @@ test('linux relay: a foreign-platform path degrades to a dead workspace href, ne
   // treatment rewriteLocalAssetUrlsInNode gives such paths elsewhere.
   const img = sanitizedElement('<img src="C:\\Users\\dev\\shot.png" alt="x">');
   assert.equal(img.tagName, 'IMG');
-  assert.equal(img.getAttribute('src'), '/api/files/Users/dev/shot.png');
+  assert.equal(img.getAttribute('data-oar-file-src'), '/api/files/Users/dev/shot.png');
 });
 
 test('unsafe srcs are still stripped and data images still allowed', () => {
@@ -109,12 +112,13 @@ test('post-insert rewriter now covers video and audio srcs', () => {
   const root = document.createElement('div');
   root.innerHTML = '<video src="/home/dev/demo.mp4"></video><audio src="/home/dev/note.mp3"></audio>';
   rewriteLocalAssetUrlsInNode(root, { preferDrive: true });
+  assert.equal(root.querySelector('video').getAttribute('src'), null);
   assert.equal(
-    root.querySelector('video').getAttribute('src'),
+    root.querySelector('video').getAttribute('data-oar-file-src'),
     '/api/drives/file?path=%2Fhome%2Fdev%2Fdemo.mp4',
   );
   assert.equal(
-    root.querySelector('audio').getAttribute('src'),
+    root.querySelector('audio').getAttribute('data-oar-file-src'),
     '/api/drives/file?path=%2Fhome%2Fdev%2Fnote.mp3',
   );
 });
@@ -134,4 +138,60 @@ test('parseAppFileHref recognizes own file hrefs and nothing else', async () => 
   assert.equal(parseAppFileHref('data:image/png;base64,AAAA'), null);
   assert.equal(parseAppFileHref('/api/previews'), null);
   assert.equal(parseAppFileHref(''), null);
+});
+
+test('with a capability in the cache, a file src carries its k at once', async () => {
+  setServerPlatform('linux');
+  const { configureFileCapabilities, resetFileCapabilities, signFileUrls } = await import('./file-capability.mjs');
+  resetFileCapabilities();
+  const exp = (Math.floor(Date.now() / 1000) + 600).toString(36);
+  const k = `fc1.bs_test.${exp}.${'m'.repeat(43)}`;
+  configureFileCapabilities({ base: '', mint: async (urls) => ({ urls: urls.map((url) => `${url}${url.includes('?') ? '&' : '?'}k=${k}`) }) });
+  await signFileUrls(['/api/drives/file?path=%2Fhome%2Fdev%2Fshot.png']);
+  const img = sanitizedElement('<img src="/home/dev/shot.png">');
+  // The bare path is resolved by the post-insert rewriter on Linux; the route form directly:
+  const direct = sanitizedElement('<img src="/api/drives/file?path=%2Fhome%2Fdev%2Fshot.png">');
+  assert.equal(direct.getAttribute('src'), `/api/drives/file?path=%2Fhome%2Fdev%2Fshot.png&k=${k}`);
+  assert.equal(direct.getAttribute('data-oar-file-src'), null);
+  assert.equal(img.getAttribute('src'), '/home/dev/shot.png');
+  resetFileCapabilities();
+  configureFileCapabilities({ mint: null });
+});
+
+test('a workspace file link drawn again carries the k the page holds for it', async () => {
+  setServerPlatform('linux');
+  const { linkifyWorkspaceMentionsInNode, renderLinkedPlainText } = await import('./router.js');
+  const { configureFileCapabilities, resetFileCapabilities, signFileUrls } = await import('./file-capability.mjs');
+  const linkedHref = () => {
+    const host = document.createElement('div');
+    host.textContent = 'Please read README.md first.';
+    linkifyWorkspaceMentionsInNode(host);
+    return host.querySelector('a')?.getAttribute('href') || '';
+  };
+  const plainHref = () => {
+    const host = document.createElement('div');
+    host.innerHTML = renderLinkedPlainText('Please read README.md first.');
+    return host.querySelector('a')?.getAttribute('href') || '';
+  };
+  const rewrittenHref = () => {
+    const host = document.createElement('div');
+    host.innerHTML = '<a href="README.md">readme</a>';
+    rewriteLocalAssetUrlsInNode(host);
+    return host.querySelector('a')?.getAttribute('href') || '';
+  };
+  resetFileCapabilities();
+  // No k yet: the plain address, which the document policy signs later.
+  assert.equal(linkedHref(), '/api/files/README.md');
+  assert.equal(plainHref(), '/api/files/README.md');
+  assert.equal(rewrittenHref(), '/api/files/README.md');
+  const exp = (Math.floor(Date.now() / 1000) + 600).toString(36);
+  const k = `fc1.bs_test.${exp}.${'m'.repeat(43)}`;
+  configureFileCapabilities({ base: '', mint: async (urls) => ({ urls: urls.map((url) => `${url}?k=${k}`) }) });
+  await signFileUrls(['/api/files/README.md']);
+  // Once the page holds one, every builder puts it in at once: the same text renders the same.
+  assert.equal(linkedHref(), `/api/files/README.md?k=${k}`);
+  assert.equal(plainHref(), `/api/files/README.md?k=${k}`);
+  assert.equal(rewrittenHref(), `/api/files/README.md?k=${k}`);
+  resetFileCapabilities();
+  configureFileCapabilities({ mint: null });
 });

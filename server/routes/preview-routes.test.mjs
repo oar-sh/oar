@@ -9,6 +9,7 @@ import {
 } from '../services/preview-registry-service.mjs';
 import { createMemoryPreviewStore } from '../services/preview-store.mjs';
 import { createPreviewScopeResolver, registerPreviewRoutes } from './preview-routes.mjs';
+import { CLI_AGENT_PRINCIPAL, asAgent, asOwner, withPrincipal } from '../services/relay-principal-test-harness.mjs';
 
 const AUTH_TOKEN = 'test-relay-token';
 
@@ -31,11 +32,22 @@ async function startApi({
   const app = express();
   app.use(express.json());
   // Stand-in for the runtime's auth middleware: same contract (bearer token or
-  // 401), without pulling the whole server runtime into a route test.
+  // 401, the request tagged with who it is), without pulling the whole server
+  // runtime into a route test. `agent:<conversation>` stands for that
+  // session's agent token, `agent:` for the cli one.
   const auth = (req, res, next) => {
     const presented = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    if (presented !== AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
-    next();
+    if (presented === AUTH_TOKEN) {
+      asOwner(req);
+      return next();
+    }
+    if (presented.startsWith('agent:')) {
+      const conversationId = presented.slice('agent:'.length);
+      if (conversationId) asAgent(req, conversationId);
+      else withPrincipal(req, CLI_AGENT_PRINCIPAL);
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
   };
   registerPreviewRoutes(app, {
     auth,
@@ -442,4 +454,48 @@ test('the scope resolver keeps the named id and survives a failing lookup', () =
   assert.deepEqual(resolve('conv-9'), ['conv-9']);
   assert.deepEqual(resolve(''), []);
   assert.deepEqual(createPreviewScopeResolver()('conv-9'), ['conv-9']);
+});
+
+// ─── Agent tokens (agent auth §2.2: previews of the token's own conversation)
+
+test('an agent token lists, publishes and closes its own conversation\'s previews only, whatever it names', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+  const { own, other } = await seedTwoConversations(api);
+  const agent = 'agent:conv-1';
+
+  // No scope named, or the header of another session: still its own only.
+  const listed = await api.call('/api/previews', { token: agent });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.body.previews.map((entry) => entry.targetPort), [5001]);
+  const viaHeader = await api.call('/api/previews', { token: agent, headers: { 'x-relay-conversation-id': 'conv-2' } });
+  assert.deepEqual(viaHeader.body.previews.map((entry) => entry.targetPort), [5001]);
+  const named = await api.call('/api/previews?conversationId=conv-2', { token: agent });
+  assert.equal(named.status, 403);
+  assert.equal(named.body.code, 'AUTH_PERSON_REQUIRED');
+
+  // Publishing: its own conversation by default, another one refused.
+  const published = await api.call('/api/previews', { method: 'POST', token: agent, body: { port: 5003 } });
+  assert.equal(published.status, 200, JSON.stringify(published.body));
+  assert.equal(published.body.preview.conversationId, 'conv-1');
+  const foreign = await api.call('/api/previews', { method: 'POST', token: agent, body: { conversationId: 'conv-2', port: 5004 } });
+  assert.equal(foreign.status, 403);
+
+  // Closing: another conversation's preview is refused even without a scope named.
+  const closeOther = await api.call(`/api/previews/${other}`, { method: 'DELETE', token: agent });
+  assert.equal(closeOther.status, 403);
+  const closeOwn = await api.call(`/api/previews/${own}`, { method: 'DELETE', token: agent });
+  assert.equal(closeOwn.status, 200);
+  assert.deepEqual(api.registry.list().map((entry) => entry.targetPort).sort(), [5002, 5003]);
+});
+
+test('the cli agent token (no conversation) gets no previews; the owner keeps the relay-wide view', async (t) => {
+  const api = await startApi();
+  t.after(() => api.close());
+  await seedTwoConversations(api);
+  const cli = await api.call('/api/previews', { token: 'agent:' });
+  assert.equal(cli.status, 403);
+  assert.equal((await api.call('/api/previews', { method: 'POST', token: 'agent:', body: { conversationId: 'conv-1', port: 5009 } })).status, 403);
+  const owner = await api.call('/api/previews');
+  assert.deepEqual(owner.body.previews.map((entry) => entry.targetPort), [5001, 5002]);
 });

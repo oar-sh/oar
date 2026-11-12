@@ -11,13 +11,22 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 
 import { launchRelay } from '../bin/oar.js';
+import { cliAgentToken } from './services/oar-cli-helpers.mjs';
 
 function makeCheckout(t, config) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-launcher-port-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, '.git'));
   fs.mkdirSync(path.join(root, 'server', 'data'), { recursive: true });
-  if (config) fs.writeFileSync(path.join(root, 'server', 'config.json'), JSON.stringify(config));
+  if (config) {
+    fs.writeFileSync(path.join(root, 'server', 'config.json'), JSON.stringify(config));
+    // A relay that ran here: its agent key, which the launcher's token comes from.
+    fs.writeFileSync(path.join(root, 'server', 'data', 'relay-secrets.json'), JSON.stringify({
+      version: 1,
+      owner: { hash: 'a'.repeat(64), createdAt: '2026-01-01T00:00:00.000Z', rotatedAt: null, legacyPlaintext: false },
+      agentKey: Buffer.from(`${root}-agent-key-material-xx`).toString('base64url'),
+    }));
+  }
   return root;
 }
 
@@ -119,9 +128,11 @@ test('--help does not advertise a --token flag the launcher never reads', async 
 const relayStatus = () => ({ ok: true, json: async () => ({ cliOnline: false }) });
 
 // Runs the launcher beside a lock file whose process id is alive, with a fake
-// relay answering on `relayPort` for `relayToken`.
-async function runBesideLock(t, { argv = [], relayPort = null, relayToken = 'test-token', spawnSyncImpl = ghInstalled } = {}) {
-  const root = makeCheckout(t, { authToken: 'test-token', port: 4567 });
+// relay answering on `relayPort` for the checkout's cli agent token.
+// `foreignRelay`: the relay there has another agent key (another install).
+async function runBesideLock(t, { argv = [], relayPort = null, spawnSyncImpl = ghInstalled, foreignRelay = false } = {}) {
+  const root = makeCheckout(t, { port: 4567 });
+  const relayToken = foreignRelay ? 'oara1_c.another' : cliAgentToken({ dataDir: path.join(root, 'server', 'data') });
   const lockPath = path.join(root, 'server', 'data', 'relay-server.lock');
   fs.writeFileSync(lockPath, JSON.stringify({ pid: 4242, startedAt: '2031-01-01T00:00:00.000Z' }));
   const spawned = [];
@@ -218,7 +229,7 @@ test('on a --port other than the config\'s the lock is left alone', async (t) =>
 });
 
 test('another program, or a relay with another token, on the port stops the launcher', async (t) => {
-  const { result, spawned, lines } = await runBesideLock(t, { relayPort: 4567, relayToken: 'another-token' });
+  const { result, spawned, lines } = await runBesideLock(t, { relayPort: 4567, foreignRelay: true });
   assert.deepEqual({ code: result.code, reason: result.reason }, { code: 1, reason: 'port-taken' });
   assert.deepEqual(spawned, []);
   assert.match(lines.join('\n'), /Port 4567 is in use by another program/);

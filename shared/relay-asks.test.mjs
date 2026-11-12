@@ -2,9 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLOUD_PERMISSION_QUESTION_SOURCE,
   RELAY_ASK_LIMITS,
   PERSON_ONLY_QUESTION_SOURCE,
   REMOTE_RELAY_APPROVAL_SOURCE,
+  isPersonOnlyCard,
   isPersonOnlyQuestion,
   isRelayAskId,
   normalizeRelayAskAnswer,
@@ -77,4 +79,23 @@ test('isPersonOnlyQuestion knows a Safety check card by its context source alone
   for (const context of [{ source: 'AskUserQuestion' }, { source: REMOTE_RELAY_APPROVAL_SOURCE }, { header: 'Safety check' }, {}, null, undefined, 'ClaudeSafetyCheck']) {
     assert.equal(isPersonOnlyQuestion(context), false, JSON.stringify(context));
   }
+});
+
+test('isPersonOnlyCard: asks, relay approvals, Safety checks, cloud permissions and personOnly cards; ordinary cards are not', () => {
+  const envelope = (context) => ({ request: JSON.stringify({ request: null, context, allowFreeform: false }) });
+  assert.equal(isPersonOnlyCard({ id: 'ask_abc123', kind: 'ask' }), true);
+  assert.equal(isPersonOnlyCard({ id: 'ask_abc123' }), true);
+  assert.equal(isPersonOnlyCard({ context: { source: REMOTE_RELAY_APPROVAL_SOURCE } }), true);
+  assert.equal(isPersonOnlyCard({ context: { source: PERSON_ONLY_QUESTION_SOURCE } }), true);
+  assert.equal(isPersonOnlyCard({ context: { source: PERSON_ONLY_QUESTION_SOURCE, kind: 'sensitive-file', personOnly: true } }), true);
+  assert.equal(isPersonOnlyCard({ context: { source: CLOUD_PERMISSION_QUESTION_SOURCE } }), true);
+  assert.equal(isPersonOnlyCard({ context: { source: 'Anything', personOnly: true } }), true);
+  // A stored row keeps its context in the request envelope.
+  assert.equal(isPersonOnlyCard(envelope({ source: PERSON_ONLY_QUESTION_SOURCE })), true);
+  assert.equal(isPersonOnlyCard(envelope({ source: CLOUD_PERMISSION_QUESTION_SOURCE })), true);
+  assert.equal(isPersonOnlyCard(envelope({ header: 'Question' })), false);
+  assert.equal(isPersonOnlyCard({ id: 'q-1', context: { header: 'Which theme?' } }), false);
+  assert.equal(isPersonOnlyCard({ id: 'q-1', context: { personOnly: 'yes' } }), false, 'only a real true');
+  assert.equal(isPersonOnlyCard({ request: '{not json' }), false);
+  assert.equal(isPersonOnlyCard(null), false);
 });

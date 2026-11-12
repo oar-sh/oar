@@ -21,6 +21,8 @@
 // only id, name and member count.
 
 import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+import { notPerson } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 import { GROUP_NAME_MAX } from '../repositories/conversation-group-repository.mjs';
 import { resolveConversationTitle } from './sessions-routes.mjs';
 
@@ -34,7 +36,17 @@ export function registerConversationGroupRoutes(app, deps) {
     remoteRelayInbound = null,
   } = deps;
 
+  // Creating, renaming and dissolving groups: the person only (an agent
+  // token is refused by `auth` already; another relay's request here).
   function refuseRemote(req, res) {
+    if (!notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) return false;
+    res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.', code: AUTH_ERROR_CODES.personRequired });
+    return true;
+  }
+
+  // Moving a session into an existing group or out of one: the person, or an
+  // agent token (host-local scripts, agent auth §0.2); never another relay.
+  function refuseRemoteMove(req, res) {
     if (!readRemoteRelayRequest(req, remoteRelayInbound).remote) return false;
     res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.' });
     return true;
@@ -132,7 +144,7 @@ export function registerConversationGroupRoutes(app, deps) {
   // it the row joins a hand-ordered group first, under the head, as the menu
   // does (and the next drag renumbers).
   app.put('/api/conversation/:id/group', auth, (req, res) => {
-    if (refuseRemote(req, res)) return;
+    if (refuseRemoteMove(req, res)) return;
     if (!conversationGroups?.enabled) return unavailable(res);
     const body = req.body || {};
     const conversationId = String(req.params.id || '').trim();
@@ -144,8 +156,17 @@ export function registerConversationGroupRoutes(app, deps) {
     const leaving = 'groupId' in body && body.groupId === null;
     const groupId = leaving ? '' : String(body.groupId || '').trim();
     if (!groupId && !leaving) return res.status(400).json({ ok: false, error: 'groupId is required' });
-    const placing = 'beforeConversationId' in body;
-    const result = placing
+    // An agent moves a session into a group that exists (a name or id that
+    // does not is refused, nothing is made) and never reorders by hand; an
+    // owner's group it empties stays.
+    const agent = notPerson(req);
+    if (agent && groupId && !conversationGroups.getGroup(groupId)) {
+      return res.status(404).json({ ok: false, error: 'group-not-found: an agent may move a session only into an existing group; creating groups is the user\'s.' });
+    }
+    const placing = !agent && 'beforeConversationId' in body;
+    const result = agent
+      ? conversationGroups.setMembership(conversationId, groupId || null, undefined, { keepOwnerGroups: true })
+      : placing
       ? conversationGroups.moveConversation(conversationId, {
         groupId: groupId || null,
         beforeConversationId: body.beforeConversationId == null ? null : String(body.beforeConversationId).trim() || null,
@@ -165,10 +186,12 @@ export function registerConversationGroupRoutes(app, deps) {
 
   // DELETE /api/conversation/:id/group — move a conversation out of its group.
   app.delete('/api/conversation/:id/group', auth, (req, res) => {
-    if (refuseRemote(req, res)) return;
+    if (refuseRemoteMove(req, res)) return;
     if (!conversationGroups?.enabled) return unavailable(res);
     const conversationId = String(req.params.id || '').trim();
-    const result = conversationGroups.setMembership(conversationId, null);
+    const result = notPerson(req)
+      ? conversationGroups.setMembership(conversationId, null, undefined, { keepOwnerGroups: true })
+      : conversationGroups.setMembership(conversationId, null);
     if (!result.ok) return res.status(404).json({ ok: false, error: result.error });
     if (result.changed) emitChanged(result.previousGroupId, [conversationId]);
     return res.json({ ok: true, previousGroupId: result.previousGroupId || null, changed: result.changed === true });

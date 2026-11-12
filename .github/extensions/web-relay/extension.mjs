@@ -10,12 +10,11 @@ import { joinSession } from "@github/copilot-sdk/extension";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
-import { generateHighEntropyToken } from "./utils/token-generation.mjs";
 import { delay, killProcessTree, sleep } from "./utils/process-utils.mjs";
 import {
   carryOverPackageConfig,
   resolveRelayPaths,
-  loadTokenFromConfig,
+  loadAgentToken,
   loadRelayInstructionsFromFile,
   resolveRelayServerUrl,
 } from "./runtime/config-loader.mjs";
@@ -52,8 +51,6 @@ import { resolveWorkspaceRootPath } from "./runtime/workspace-root.mjs";
 const POLL_MS      = 10_000;
 const HEARTBEAT_MS = 10_000;
 
-const TOKEN_FALLBACK = generateHighEntropyToken();
-
 const {
   CONFIG_PATH,
   RELAY_TOOLS_PATH,
@@ -72,9 +69,15 @@ const SERVER_URL = resolveRelayServerUrl({ configPath: CONFIG_PATH });
 const SERVER_START_TIMEOUT_MS = 20_000;
 const NODE_BIN = process.env.COPILOT_WEB_RELAY_NODE || "node";
 
-const CONFIG_TOKEN = loadTokenFromConfig(CONFIG_PATH);
-const TOKEN = CONFIG_TOKEN || TOKEN_FALLBACK;
-const TOKEN_WAS_GENERATED = !CONFIG_TOKEN;
+// An agent token, never the owner token: this session's OAR_AGENT_TOKEN, else
+// (an extension started by hand) the cli token derived from the relay's
+// secrets file. A relay this extension starts itself makes that file first,
+// so an empty token is looked up again until there is one.
+let agentToken = loadAgentToken({ env: process.env, configPath: CONFIG_PATH, serverDir: SERVER_DIR });
+function currentToken() {
+  if (!agentToken) agentToken = loadAgentToken({ env: process.env, configPath: CONFIG_PATH, serverDir: SERVER_DIR });
+  return agentToken;
+}
 const RELAY_TOOL_INSTRUCTIONS = loadRelayInstructionsFromFile(RELAY_TOOLS_PATH);
 const QUESTION_POLL_MS = 1500;
 const MAX_TOOL_DETAIL_LENGTH = 140;
@@ -88,7 +91,7 @@ const { dbg } = createDebugLogger({ logDir: LOG_DIR });
 if (CARRIED_OVER_CONFIG) dbg("copied the relay config", CARRIED_OVER_CONFIG, "to", CONFIG_PATH);
 const api = createApiClient({
   serverUrl: SERVER_URL,
-  token: TOKEN,
+  token: currentToken,
   getHeaders: () => ({
     "X-Relay-Process-Pid": String(process.pid),
     "X-Relay-Parent-Pid": String(process.ppid),
@@ -120,7 +123,6 @@ const managedServerLifecycle = createManagedServerLifecycle({
   spawn,
   killProcessTree,
   delay,
-  token: TOKEN,
   logDir: LOG_DIR,
   serverDir: SERVER_DIR,
   serverLogPath: SERVER_LOG_PATH,
@@ -150,11 +152,11 @@ process.on("SIGTERM", () => {
   void gracefulShutdown("SIGTERM");
 });
 
-if (!TOKEN) {
-  console.warn("[web-relay] No authToken found in server/config.json; API calls will fail until configured.");
+if (!agentToken) {
+  dbg("no agent token yet (no OAR_AGENT_TOKEN, no relay secrets file); looked up again once the relay runs");
 }
 
-dbg("extension.mjs loaded, TOKEN:", TOKEN ? TOKEN.slice(0,3)+"***" : "(none)");
+dbg("extension.mjs loaded, agent token:", agentToken ? "present" : "(none)");
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let activeMsg       = null;   // the web message currently being processed
@@ -579,7 +581,7 @@ function startWorkerWebSocketLink() {
   if (!pollingLoopController || workerWebSocketLink) return;
   workerWebSocketLink = createWorkerWebSocketLink({
     serverUrl: SERVER_URL,
-    token: TOKEN,
+    token: currentToken(),
     dbg,
     getPid: () => process.pid,
     getSessionReady: () => sessionReady,
@@ -745,7 +747,8 @@ function summarizeRelayConnection(status, readyBanner) {
     || "unavailable"
   ).trim();
   const remoteUrl = String(readyBanner?.remoteUrl || "").trim();
-  const authText = `token=${TOKEN}`;
+  // Never the token itself: it would land in the session's transcript.
+  const authText = "agent token (OAR_AGENT_TOKEN)";
   const pollingUrl = String(readyBanner?.pollingUrl || `${SERVER_URL}/api/pending`).trim();
   return {
     localUrl,
@@ -768,7 +771,7 @@ function buildFallbackReadyBannerFromStatus(status = null) {
   const tunnelEnabled = status?.sshTunnel?.enabled === true;
   const tunnelHost = String(status?.sshTunnel?.host || "").trim();
   const remoteUrl = tunnelEnabled && tunnelHost ? `https://${tunnelHost.slice(0, 30)}/` : null;
-  const authText = `token=${TOKEN}`;
+  const authText = "agent token (OAR_AGENT_TOKEN)";
 
   const fmt = (label, value) => `║  ${String(label || "").padEnd(11)}${String(value || "").padEnd(46)}║`;
   return {
@@ -816,7 +819,7 @@ async function renderRelayReadyBannerFromStatus(status, { force = false } = {}) 
   const suppress = bannerStateStore.shouldSuppress({
     sessionId: String(session?.sessionId || "").trim() || "unknown",
     bannerKey: nextKey || "fallback-banner",
-    token: TOKEN,
+    token: currentToken(),
     force,
   });
   if (suppress.suppress) {
@@ -841,7 +844,7 @@ async function renderRelayReadyBannerFromStatus(status, { force = false } = {}) 
   bannerStateStore.markShown({
     sessionId: String(session?.sessionId || "").trim() || "unknown",
     bannerKey: nextKey || "fallback-banner",
-    token: TOKEN,
+    token: currentToken(),
   });
 }
 
@@ -889,11 +892,10 @@ session = await joinSessionWithRetry({
         dbg("onSessionStart activation failed:", e?.message || String(e));
       }
       try {
-        await session.log(`🔐 Web relay token: ${TOKEN}`, { ephemeral: true });
         await session.log(
-          TOKEN_WAS_GENERATED
-            ? "🔐 Token source: generated for this CLI session"
-            : "🔐 Token source: server/config.json",
+          currentToken()
+            ? "🔐 Web relay: signed in with this session's agent token"
+            : "🔐 Web relay: no agent token yet (OAR_AGENT_TOKEN is not set and the relay has not started)",
           { ephemeral: true }
         );
         await session.log("🌐 Web relay loaded — worker websocket delivery enabled with heartbeat maintenance", { ephemeral: true });

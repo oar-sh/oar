@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { applySafeServedContentHeaders } from './safe-served-content.mjs';
+import { FILE_CAPABILITY_REQUEST_KEY } from './file-capability.mjs';
+import { AUTH_ERROR_CODES, AUTH_FILE_CAPABILITY_MESSAGE } from '../../shared/relay-route-policy.mjs';
 
 /**
  * A short token that changes whenever the file's bytes may have changed
@@ -78,6 +80,13 @@ export function sendOwnFile(res, absolutePath, next) {
  * its bytes (an upload addressed by its hash): such an answer may be kept.
  */
 export function serveFileWithRangeSupport(req, res, filePath, meta, { safeName, cacheDelete = null, fsImpl = fs, cacheControl = '' } = {}) {
+  // A request `auth` let through on a file capability (`k`) is sent a file
+  // only once its route has checked the capability against this very file.
+  const capability = req?.[FILE_CAPABILITY_REQUEST_KEY];
+  if (capability && (capability.verified !== true || capability.verifiedPath !== filePath)) {
+    res.status(403).json({ error: AUTH_FILE_CAPABILITY_MESSAGE, code: AUTH_ERROR_CODES.fileCapability });
+    return;
+  }
   const realName = safeName || path.basename(filePath).replace(/"/g, '');
   const name = downloadNameOverride(req.query?.as, realName) || realName;
   const rangeHeader = req.headers['range'];

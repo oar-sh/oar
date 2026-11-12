@@ -188,9 +188,12 @@ test.describe.serial("relay event subscriptions across relays", () => {
     relayB = await startRelayServer({ token: randomUUID() });
     expect((await apiA("/api/settings/pwa-app-name", { method: "POST", body: { appName: "win-test" } })).status).toBe(200);
     expect((await apiB("/api/settings/pwa-app-name", { method: "POST", body: { appName: "linux-test" } })).status).toBe(200);
-    // One way: A knows B; B knows nobody.
-    const added = await apiA("/api/remote-relays", { method: "POST", body: { url: relayB.baseUrl, token: relayB.token, pairBack: false } });
+    // Both ways, with keys: a subscription belongs to the relay that signs in
+    // with its own key (origin binding), so B has to list A.
+    expect((await apiA("/api/settings/remote-relays", { method: "POST", body: { publicUrl: relayA.baseUrl } })).status).toBe(200);
+    const added = await apiA("/api/remote-relays", { method: "POST", body: { url: relayB.baseUrl, token: relayB.token } });
     expect(added.payload?.ok, JSON.stringify(added.payload)).toBe(true);
+    expect(added.payload?.pairedBack, JSON.stringify(added.payload)).toBe(true);
     pairingId = added.payload.relay.id;
     olderRelay = await startOlderRelay(relayB.token);
     const older = await apiA("/api/remote-relays", { method: "POST", body: { url: olderRelay.baseUrl, token: relayB.token, pairBack: false } });
@@ -215,8 +218,8 @@ test.describe.serial("relay event subscriptions across relays", () => {
     relayB = null;
   });
 
-  test("a one-way pairing; locked until the user names the relay; refused while it takes no agents", async () => {
-    expect((await apiB("/api/remote-relays")).payload.relays).toEqual([]);
+  test("paired both ways with keys; locked until the user names the relay; refused while it takes no agents", async () => {
+    expect((await apiB("/api/remote-relays")).payload.relays.map((relay) => [relay.name, relay.peerKeyConfirmed])).toEqual([["win-test", true]]);
     const refused = await tool(locked.conversationId, "subscribe", { sessions: [builder.conversationId] });
     expect(refused.status).toBe(403);
     expect(refused.payload.code).toBe("REMOTE_RELAY_LOCKED");

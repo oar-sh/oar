@@ -1,4 +1,5 @@
 import { versionedFileHref } from './file-version.mjs';
+import { deferFileSrc, setFileSrc, withCachedFileCapability } from './file-capability.mjs';
 import {
   BASE,
   escHtml,
@@ -367,6 +368,9 @@ export function sanitizePreviewHtml(html) {
         element.removeAttribute(attr.name);
       }
     }
+    // A file by path loads with a file capability (`k`); without a cached
+    // one the address waits in data-oar-file-src (file-capability.mjs).
+    if (tagName === 'img' || tagName === 'video' || tagName === 'audio') deferFileSrc(element);
     if (tagName === 'a') {
       element.setAttribute('target', '_blank');
       element.setAttribute('rel', 'noopener noreferrer');
@@ -377,13 +381,22 @@ export function sanitizePreviewHtml(html) {
 
 // Rendered formulas by mode and TeX; null for one KaTeX refused. A streaming
 // reply is rendered again with every delta, and its earlier formulas come
-// from here.
+// from here. Only formulas set without macros are kept: one that defines a
+// macro, or is set while the message has defined any, is set afresh each
+// time, so no entry stands for a rendering under other definitions.
 const MATH_HTML_CACHE_MAX = 500;
 const mathHtmlCache = new Map();
+const DEFINES_MACRO = /\\(?:def|gdef|edef|xdef|newcommand|renewcommand|providecommand|let|futurelet|global)\b/;
 
-function katexHtml(tex, display) {
+/**
+ * `macros` is the message's own object: KaTeX writes `\def`, `\gdef` and
+ * `\newcommand` into it (globalGroup), so a later formula of the same
+ * message can use them. Nothing of it outlives one rendering.
+ */
+function katexHtml(tex, display, macros) {
+  const cacheable = Object.keys(macros).length === 0 && !DEFINES_MACRO.test(tex);
   const key = `${display ? 'd' : 'i'}${tex}`;
-  if (mathHtmlCache.has(key)) return mathHtmlCache.get(key);
+  if (cacheable && mathHtmlCache.has(key)) return mathHtmlCache.get(key);
   let html = null;
   try {
     html = globalThis.katex.renderToString(texForKatex(tex), {
@@ -397,15 +410,36 @@ function katexHtml(tex, display) {
       // A command KaTeX does not trust (\href, \url, \includegraphics) is
       // set as its own name, in this colour: the text's, not red.
       errorColor: 'inherit',
+      macros,
+      globalGroup: true,
     });
   } catch {
     // Nothing KaTeX can set (an unknown command, a syntax error): the source
     // stays as it was written. Prose that got past the delimiter rules ends
     // here too, so it never shows as a broken formula.
   }
+  if (!cacheable) return html;
   if (mathHtmlCache.size >= MATH_HTML_CACHE_MAX) mathHtmlCache.clear();
   mathHtmlCache.set(key, html);
   return html;
+}
+
+// Punctuation straight behind an inline formula: it stays on the formula's
+// line, instead of opening the next one alone.
+const TRAILING_MARKS = /^[.,;:!?)\]}…"'”’»。，、；：！？）]{1,3}/;
+
+function keepTrailingMarksWithFormula(placeholder) {
+  const next = placeholder.nextSibling;
+  if (!next || next.nodeType !== 3) return;
+  const marks = TRAILING_MARKS.exec(next.data);
+  if (!marks) return;
+  const wrapper = document.createElement('span');
+  wrapper.className = 'math-tail';
+  placeholder.parentNode.insertBefore(wrapper, placeholder);
+  wrapper.appendChild(placeholder);
+  wrapper.appendChild(document.createTextNode(marks[0]));
+  next.data = next.data.slice(marks[0].length);
+  if (!next.data) next.remove();
 }
 
 /**
@@ -420,12 +454,19 @@ function renderMathInHtml(html) {
 
   const container = document.createElement('div');
   container.innerHTML = html;
+  // The macros this message defines, in document order; fresh for every
+  // rendering, so nothing carries over to another message or a later delta.
+  const macros = {};
   for (const placeholder of container.querySelectorAll('span[data-math]')) {
     const display = placeholder.getAttribute('data-math') === 'display';
-    const rendered = katexHtml(placeholder.getAttribute('data-tex') || '', display);
+    const rendered = katexHtml(placeholder.getAttribute('data-tex') || '', display, macros);
     placeholder.removeAttribute('data-tex');
-    if (rendered === null) placeholder.classList.add('math-source');
-    else placeholder.innerHTML = rendered;
+    if (rendered === null) {
+      placeholder.classList.add('math-source');
+      continue;
+    }
+    placeholder.innerHTML = rendered;
+    if (!display) keepTrailingMarksWithFormula(placeholder);
   }
   return container.innerHTML;
 }
@@ -488,7 +529,9 @@ export function buildLinkedTextFragment(text) {
   while ((match = regex.exec(source)) !== null) {
     const mention = match[0];
     const workspacePath = workspaceFilePathFromText(mention);
-    const href = workspacePath ? workspaceFileHrefFromPath(workspacePath) : '';
+    // A link drawn again carries the `k` the page already holds for it
+    // (file-capability.mjs), so the same text renders the same.
+    const href = workspacePath ? withCachedFileCapability(workspaceFileHrefFromPath(workspacePath)) : '';
     if (!workspacePath || !href) continue;
     if (match.index > lastIndex) {
       fragment.appendChild(document.createTextNode(source.slice(lastIndex, match.index)));
@@ -584,7 +627,7 @@ export function rewriteLocalAssetUrlsInNode(root, options = {}) {
   for (const img of images) {
     const rawSrc = img.getAttribute('src') || '';
     const nextSrc = resolveLocalAssetUrl(rawSrc, { preferDrive });
-    if (nextSrc) img.setAttribute('src', nextSrc);
+    if (nextSrc) setFileSrc(img, nextSrc);
   }
   if (!rewriteAnchors) return;
   const anchors = Array.from(root.querySelectorAll('a[href]'));
@@ -592,7 +635,7 @@ export function rewriteLocalAssetUrlsInNode(root, options = {}) {
     const rawHref = anchor.getAttribute('href') || '';
     const nextHref = resolveLocalAssetUrl(rawHref, { preferDrive });
     if (!nextHref) continue;
-    anchor.setAttribute('href', nextHref);
+    anchor.setAttribute('href', withCachedFileCapability(nextHref));
     anchor.setAttribute('target', '_blank');
     anchor.setAttribute('rel', 'noopener noreferrer');
   }
@@ -607,7 +650,7 @@ export function renderLinkedPlainText(text) {
   while ((match = regex.exec(source)) !== null) {
     const mention = match[0];
     const workspacePath = workspaceFilePathFromText(mention);
-    const href = workspacePath ? workspaceFileHrefFromPath(workspacePath) : '';
+    const href = workspacePath ? withCachedFileCapability(workspaceFileHrefFromPath(workspacePath)) : '';
     html += escHtml(source.slice(lastIndex, match.index));
     if (workspacePath && href) {
       html += `<a href="${escHtml(href)}" class="workspace-file-link" data-workspace-path="${escHtml(workspacePath)}" target="_blank" rel="noopener noreferrer">${escHtml(mention)}</a>`;

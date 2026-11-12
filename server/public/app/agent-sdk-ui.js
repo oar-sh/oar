@@ -108,10 +108,24 @@ function formatRetryTime(iso) {
   }
 }
 
+// A Reinstall that failed over a folder that still checks out: the row stays
+// ready (that folder is what the relay goes on using), with the failure here.
+function reinstallFailureOf(status) {
+  if (normalizeState(status?.state) !== 'ready') return null;
+  const failure = status.reinstallFailure;
+  return failure && typeof failure === 'object' && String(failure.error || '').trim() ? failure : null;
+}
+
 /** The line under the row: the error, the next automatic retry. */
 export function agentSdkNoteText(status) {
   if (!status || typeof status !== 'object') return '';
   const state = normalizeState(status.state);
+  const reinstall = reinstallFailureOf(status);
+  if (reinstall) {
+    const reason = String(reinstall.error).trim().replace(/\.+$/, '');
+    const folder = String(status.dir || status.folder || '').trim() || 'The installed folder';
+    return `Reinstall failed: ${reason}. ${folder} stays in use.`;
+  }
   const parts = [];
   // "Not available" is the whole story already in the status line.
   const error = String(status.error || '').trim();
@@ -136,7 +150,9 @@ export function agentSdkActions(status, { reinstall = true } = {}) {
 }
 
 export function agentSdkLogSummary(status) {
-  const word = status?.kind === 'cancelled' ? 'Cancelled' : (LOG_WORDS[normalizeState(status?.state)] || 'Install');
+  const word = status?.kind === 'cancelled' ? 'Cancelled'
+    : reinstallFailureOf(status) ? LOG_WORDS.error
+      : (LOG_WORDS[normalizeState(status?.state)] || 'Install');
   return `${word} · install log`;
 }
 
@@ -234,7 +250,8 @@ export function renderAgentSdkRows() {
   const expand = new Set();
   for (const id of AGENT_SDK_IDS) {
     const status = sdkState.sdks?.[id];
-    if (!status || normalizeState(status.state) !== 'error' || !status.log) continue;
+    const failed = normalizeState(status?.state) === 'error' || !!reinstallFailureOf(status);
+    if (!status || !failed || !status.log) continue;
     const signature = `${status.startedAt || ''}|${status.finishedAt || ''}`;
     if (expandedFailures.get(id) === signature) continue;
     expandedFailures.set(id, signature);

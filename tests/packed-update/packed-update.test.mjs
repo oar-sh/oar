@@ -41,10 +41,13 @@
  *
  * The npm cache is the one npm uses here (npm_config_cache is passed on to
  * the installs and to the relays' SDK store). The setup puts the Claude SDK
- * pins (and koffi's on Windows) in it with `npm cache add --prefer-offline`,
- * and the relays install with npm_config_prefer_offline=true: the first run
- * downloads them once (the Claude SDK's platform package is the bulk, about a
- * hundred MB), later runs read the cache. Without a registry and without that
+ * pins (and koffi's on Windows) in it with `npm cache add --prefer-offline`
+ * (once more with `--prefer-online` when a stale cached packument names no
+ * such version, as for the global installs), and the relays install with
+ * npm_config_prefer_offline=true, through npm-ci-online-retry.mjs (the same
+ * one online repeat):
+ * the first run downloads them once (the Claude SDK's platform package is the
+ * bulk, about a hundred MB), later runs read the cache. Without a registry and without that
  * cache every case is skipped, with the reason.
  *
  * The packs are of commits (OLD_REF, SDK_IN_PACKAGE_REF, and NEW_REF =
@@ -70,6 +73,8 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 
 import { buildRelayServerEnv, repoRoot, reserveFreePort, sleep, waitForServerReady } from "../relay-server-harness.mjs";
+import { addToNpmCache, npmPreferringOffline } from "./npm-cache-add.mjs";
+import { writeNpmCiLauncher } from "./npm-ci-online-retry.mjs";
 
 // 0.9.19 as released (the merge before the db-file work) and this branch.
 const OLD_REF = "30e3605";
@@ -231,11 +236,29 @@ const isNewInstall = (prefix) => Boolean(prefix) && fs.existsSync(path.join(pack
 // no install script left in its tree, and its `oar update` passes no
 // --allow-scripts.
 const OLD_ALLOW_SCRIPTS_ARG = "--allow-scripts=better-sqlite3,koffi";
+// From the cache, and once online when a stale cached packument names no
+// such version (ETARGET; npm-cache-add.mjs).
 async function npmInstallGlobal({ prefix, tgz, stateRoot, allowScripts = null }) {
   fs.mkdirSync(prefix, { recursive: true });
-  return npm([
+  return npmPreferringOffline(npm, [
     "install", "-g", "--prefix", prefix, ...(allowScripts ? [allowScripts] : []), "--no-audit", "--no-fund", "--prefer-offline", tgz,
   ], { cwd: root, env: { ...hostlessEnv(), OAR_STATE_ROOT: stateRoot, ...npmEnv() } });
+}
+
+/**
+ * The relays' SDK store installs from the cache (npm_config_prefer_offline),
+ * where a stale cached packument can name no such version as well. In this
+ * test only, the store's install command is npm-ci-online-retry.mjs: the
+ * store's own `npm ci`, once more online on ETARGET. The relay's code is not
+ * changed for it (the command is the store's existing install hook).
+ */
+function sdkInstallEnv(state, pkg) {
+  const launcher = writeNpmCiLauncher({
+    dir: path.join(state.stateRoot, "sdk-npm-ci"),
+    packageDir: pkg,
+    platform: process.platform, // host-platform: the launcher runs on this host
+  });
+  return { COPILOT_WEB_RELAY_AGENT_SDK_INSTALL_COMMAND: launcher };
 }
 
 function npmEnv() {
@@ -523,18 +546,22 @@ function hostSpecsOf(lock) {
 /**
  * Puts what the relay's SDK store will install (the Claude pins, koffi's on
  * Windows; as the new tree `newSrc` has them) in the npm cache, from the
- * cache when it is there. A failure for want of a registry sets the suite's
- * skip reason.
+ * cache when it is there, and once online when a stale cached packument
+ * names no such version (ETARGET; npm-cache-add.mjs). A failure for want of
+ * a registry sets the suite's skip reason.
  */
 async function warmAgentSdkCache(newSrc) {
   const ids = ["claude", ...(process.platform === "win32" ? ["koffi"] : [])]; // host-platform: the packed install runs on this host
   const specs = [];
   for (const id of ids) {
-    const lock = fs.readFileSync(path.join(newSrc, "server", "agent-sdks", id, "package-lock.json"), "utf8");
+    // pin-lock.json; package-lock.json in a tree from before the rename.
+    const folder = path.join(newSrc, "server", "agent-sdks", id);
+    const lockFile = ["pin-lock.json", "package-lock.json"].map((name) => path.join(folder, name)).find((file) => fs.existsSync(file));
+    const lock = fs.readFileSync(lockFile || path.join(folder, "pin-lock.json"), "utf8");
     specs.push(...hostSpecsOf(JSON.parse(lock)));
   }
   try {
-    await npm(["cache", "add", "--prefer-offline", ...specs], { cwd: root, env: { ...hostlessEnv(), ...npmEnv() } });
+    await addToNpmCache(npm, specs, { cwd: root, env: { ...hostlessEnv(), ...npmEnv() } });
   } catch (error) {
     const code = String(error.output || error.message).match(NETWORK_FAILURE)?.[1];
     if (!code) throw error;
@@ -549,7 +576,9 @@ async function warmAgentSdkCache(newSrc) {
  * COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: it records its pid first (for the
  * clean-up), then the SDK folder it was launched with, loads the SDK through
  * the package's own loader (what the real worker's adapter does) and stays
- * up a while, so the relay's launch check sees it running.
+ * up a while, so the relay's launch check sees it running. Its file name
+ * ends in `-session-worker`, as every node worker's does: the relay's process
+ * lookup (session-worker-process-service.mjs) finds a worker by that name.
  */
 function writeStubWorker(state, pkg) {
   const dir = path.join(state.stateRoot, "worker-stub");
@@ -557,7 +586,7 @@ function writeStubWorker(state, pkg) {
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(recordsDir, { recursive: true });
   const loaderUrl = pathToFileURL(path.join(pkg, "server", "agent-sdk-loader.mjs")).href;
-  const script = path.join(dir, "claude-worker-stand-in.mjs");
+  const script = path.join(dir, "claude-stand-in-session-worker.mjs");
   fs.writeFileSync(script, `import fs from "node:fs";
 import path from "node:path";
 
@@ -605,14 +634,17 @@ const readRecords = (recordsDir) => (fs.existsSync(recordsDir)
  * fails, as a real worker's does when its SDK cannot start the CLI.
  *
  * It records its pid first (for the clean-up), then what it was launched
- * with and every delivery, in <recordsDir>/<pid>.json.
+ * with and every delivery, in <recordsDir>/<pid>.json. Its file name ends in
+ * `-session-worker`, as a real worker's does: on POSIX the relay finds the
+ * processes it stops by that name in the process list, and a stand-in it
+ * could not find would never be stopped by the recycle.
  */
 function writeLiveStubWorker(state, pkg) {
   const dir = path.join(state.stateRoot, "worker-stub");
   const recordsDir = path.join(state.stateRoot, "worker-records");
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(recordsDir, { recursive: true });
-  const script = path.join(dir, "claude-worker-live-stand-in.mjs");
+  const script = path.join(dir, "claude-live-stand-in-session-worker.mjs");
   fs.writeFileSync(script, `import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -624,7 +656,7 @@ const at = process.argv.indexOf("--session-id");
 const sessionId = at >= 0 ? process.argv[at + 1] : null;
 const load = (rel) => import(pathToFileURL(path.join(pkg, ...rel.split("/"))).href);
 // All of its code, loaded now: an update may take the package's files later.
-const [{ resolveRelayServerUrl, loadTokenFromConfig }, { createApiClient }, { createWorkerWebSocketLink }, { createHeartbeatController }, { resolveBuildId }] = await Promise.all([
+const [{ resolveRelayServerUrl, loadAgentToken, loadTokenFromConfig }, { createApiClient }, { createWorkerWebSocketLink }, { createHeartbeatController }, { resolveBuildId }] = await Promise.all([
   load("shared/worker-runtime/config-loader.mjs"),
   load("shared/worker-runtime/api-client.mjs"),
   load("shared/worker-runtime/worker-websocket-link.mjs"),
@@ -654,7 +686,11 @@ save();
 
 const configPath = String(process.env.COPILOT_WEB_RELAY_CONFIG || "");
 const serverUrl = resolveRelayServerUrl({ configPath });
-const token = loadTokenFromConfig(configPath);
+// The session's agent token (this version); a package from before it read the
+// owner token from the config.
+const token = String(process.env.OAR_AGENT_TOKEN || "").trim()
+  || (typeof loadAgentToken === "function" ? loadAgentToken({ env: process.env, configPath }) : "")
+  || (typeof loadTokenFromConfig === "function" ? loadTokenFromConfig(configPath) : "");
 const api = createApiClient({
   serverUrl,
   token,
@@ -950,8 +986,10 @@ describe("packed npm updates (0.9.19, 0.9.23) -> this branch", () => {
       // Workers launched by the relay, with the stand-in for Claude's.
       COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
       COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: stub.script,
-      // The SDKs from the cache the setup filled.
+      // The SDKs from the cache the setup filled, and once online for a
+      // version a stale cached packument does not know (sdkInstallEnv).
       npm_config_prefer_offline: "true",
+      ...sdkInstallEnv(state, pkg),
     };
 
     const paths = await storePathsOf(pkg);
@@ -991,7 +1029,8 @@ describe("packed npm updates (0.9.19, 0.9.23) -> this branch", () => {
     // The next start, with a turn queued for the conversation: the launch
     // gate passes the ready folder, the worker loads the SDK from it.
     addPendingTurn(dbFile, fixture);
-    const second = await startInstalledRelay({ pkg, state, allowSpawn: true, env: relayEnv });
+    // The same token: once relay-secrets.json exists a --token that differs is ignored.
+    const second = await startInstalledRelay({ pkg, state, allowSpawn: true, env: relayEnv, token: first.token });
     let record;
     try {
       record = await waitForWorkerRecord(second, stub.recordsDir);
@@ -1048,6 +1087,7 @@ describe("packed npm updates (0.9.19, 0.9.23) -> this branch", () => {
       COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
       COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: stub.script,
       npm_config_prefer_offline: "true",
+      ...sdkInstallEnv(state, pkg),
     };
     const deliveryOf = (id) => () => {
       for (const record of readRecords(stub.recordsDir)) {

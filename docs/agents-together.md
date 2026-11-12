@@ -11,16 +11,96 @@ server. An agent in any session can then work on the other relay when you ask it
 read its sessions, prompt one, start a new one, wait for the reply, and pass a question the
 remote agent asks back to you.
 
-**Pairing.** Open **Settings → Relays** and paste the other relay's web address (the URL you
-open it with in the browser). OAR checks the address with its own token, or with a
-`?token=` the pasted link carries, and asks for a token only when that fails. It reads the
+**Pairing.** Open **Settings → Relays** and paste the other relay's pairing link (its web
+address with `?token=` and its relay token; the dialog of **Generate new relay token** in its
+Settings → Security has **Copy pairing link**) or its plain web address. OAR checks the address with the token the link carries, and asks for that relay's token
+when the link carries none or it fails; this relay holds no token of its own to try. It reads the
 other relay's name from its API. With **Also add this relay there** checked, it introduces
 itself to the other relay using the address in **Public address**, so the pairing works in both
-directions. When the two relays use different tokens, that introduction hands over this relay's
-token, so the other relay's agents can then work here. Each side can remove the other on its own,
-but removing a relay does not revoke a token it already holds: rotate the token for that. A relay
-that is already paired keeps the address and token stored for it when it introduces itself again;
-change those in **Settings → Relays**.
+directions. The introduction carries no token: with OAR 0.9.27 or later on both relays each one
+gets a key of its own (below); an older relay is told to add this one by hand. Unchecked, the
+pairing is one way, and that works too: the token from the link is used for the add alone and
+never kept. The other relay gives this one a key of its own and lists it as **Inbound only** in
+its Settings → Relays (it never calls this relay, and its **Remove** revokes the key at once).
+This relay checks the key at the other relay's address and stores only the key, so its prompts
+arrive there verified, its Inbox, asks and session watches work as for any paired relay, and
+replacing the other relay's token does not break it. If anything of that fails, nothing is stored
+and the form says why; add again. Adding one way again replaces the key (the old one stops
+working). Here the row says **One way**; to make the pairing two-way, add the relay again with
+**Also add this relay there** checked (**Re-pair** opens that), or add this relay over there:
+either way the inbound-only entry becomes a normal one, with keys both ways and no second row. A
+relay older than 0.9.27 gives no such key: then this relay keeps its token, which opens
+everything there, and its prompts arrive there as **claimed** (unverified, below); the row says
+**Old version** (or **One way** for a build with keys but without inbound-only keys, where Re-pair
+adds this relay there and switches both to keys). Each side can
+remove the other on its own; removing a relay here does not remove this relay there. **Revoke
+key** stops that relay's key until you renew it, or until someone with this relay's pairing link
+(its relay token) adds it again. Only removing the relay *and* generating a new relay token here
+locks it out for good. A relay that is already paired keeps the address,
+relay id and token stored for it when it introduces itself again; change those in
+**Settings → Relays**.
+
+**Keys of their own (remote-relay protocol 2, OAR 0.9.27 and later).** Paired relays never hold
+each other's relay token for good. When you add a relay from its link, this relay uses the
+token from the link once: to introduce itself, to send the other relay a key it made for it, and
+to ask for one in return, which the other relay sends to this relay's **Public address** (never in
+the answer). Each key is checked back at the address the receiving relay has stored before it is
+kept, and this relay drops the other relay's token once its key has worked. From then on each
+relay signs in to the other with its key (`oarp1_…`; the issuing relay keeps only its SHA-256).
+Two relays that were paired before both ran 0.9.27 switch to keys by themselves within about a
+minute of both being upgraded, with no step of yours.
+
+- **The origin is the relay that signed in.** A prompt, a new session, an ask or a watch from a
+  paired relay names the relay its key belongs to, under the name you gave it here; what the
+  request says about the relay is not used. A key that claims to be another relay is refused
+  (`REMOTE_RELAY_ORIGIN_MISMATCH`), and so is a request on any other credential that claims to be
+  a relay that signs in with a key (`REMOTE_RELAY_PEER_KEY_REQUIRED`). Each refusal is logged,
+  counted on that relay's row ("N refused claims since start", until this relay restarts), and
+  the first one per relay puts one notice in this relay's Inbox.
+- **Unverified prompts open nothing.** A relay without a confirmed key here (an older OAR, a
+  one-way pairing, or a key not confirmed yet) still reaches its sessions here, and its prompts
+  arrive. They are stored as unverified, shown with a **claimed** tag, written with "(unverified)"
+  in the header line the agent reads, and they open nothing: no reply access, no hop allowance,
+  no creator send-back, no push suppression. Asks and session watches from such a relay are
+  refused with the same reason. The sending agent is told why and what fixes it
+  (`originVerified: false` and a notice in the answer). Stored prompts from before 0.9.27 read
+  as unverified too; contact comes back with the relay's next prompt on its key.
+- **Least privilege.** A key opens only the routes relays call each other on: identity and
+  status, models, usage and provider settings reads, sessions (list, read, prompt, create, stop,
+  archive, the settings of a session that relay started, a background task's output), relay
+  questions, asks, watches, the Inbox read and the key routes (`REMOTE_RELAY_PEER_ROUTES` in
+  `shared/remote-relay-contract.mjs`).
+  Everything else answers 403 `REMOTE_RELAY_PEER_SCOPE`: pairing, settings changes, files, switching a
+  session's billing, and answering or dismissing any card or ask. A key never counts as you: its
+  `owner_approved` is ignored, so it changes the settings only of sessions that relay started
+  here, and it never moves a session to another folder.
+- **Settings → Relays** says per relay **Keyed**, **Legacy token** (it still calls with this
+  relay's token: Re-pair), **Old version** (an OAR before 0.9.27: update it, then Re-pair),
+  **One way** (added with **Also add this relay there** off: that relay lists this one as inbound
+  only and gave it a key, so calls are verified and no token of it is held; adding it again from
+  its link with **Also add this relay there** checked makes it two-way. With a relay older than
+  0.9.27 there is no key: calls go on its token and arrive there as claimed), **Inbound only**
+  (a relay that added this one one way: it signs in here with a key this relay gave it, and this
+  relay never calls it; **Remove** revokes the key) or **Re-add from link** (it refuses this relay for want of a key it takes:
+  its key was revoked there, it no longer lists this relay, or this relay holds none; add it
+  again from its pairing link, which updates the entry), whether this relay holds its key, and
+  the refused claims. A refused call says what was refused: *Rejected the key it gave this relay
+  (401)* or *Rejected the token (401)*. **Re-pair** is one click: keys both
+  ways again. When this relay holds nothing that works there any more, or the other relay is
+  older, Re-pair opens **Add a relay** with its address filled in: paste its pairing link (or its
+  token) and the entry is updated in place. **Renew key** sends a new key, **Revoke key** voids it
+  at once (its earlier prompts lose their weight too) until you renew it or that relay adds this
+  one again from its pairing link. Keys are renewed every 30 days by
+  themselves; the previous one stays valid for 10 minutes after the new one is confirmed.
+- **A changed identity is held for you.** Once a relay was keyed, its address and relay id are
+  pinned (a relay this one holds a key from too, one way included). If another relay answers at
+  its address, or you change the address, its keys are revoked, nothing this relay holds for it
+  (the key it gave this relay, or a token) is sent there, and nothing is issued until you confirm (the row says **Identity changed**, with
+  **Confirm**, and Re-pair asks you). Setting the address back to the one it was keyed at lifts a
+  hold that only the address change set.
+- **Replacing this relay's token** no longer breaks a keyed pairing: keyed relays sign in with their
+  keys. Only relays without a key (older ones) need the new pairing link; the rotation lists them.
+
 
 A relay's name is the **Relay name** under **Relays** (it also names the installed app); when it
 is empty, the machine's hostname is used.
@@ -49,7 +129,9 @@ it was called `remote_relay`; OAR's MCP server still runs a call to the old name
 new one, and Claude's tool is `mcp__relay__relay_tool`. Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
-(also create sessions, change their settings, answer questions, stop turns, archive). In the *ask* and *plan* relay
+(also create sessions, change their settings, stop turns, archive). No setting lets an agent answer a
+question card, a Safety check or a plan card: those are yours alone (an agent token gets 403
+`AUTH_PERSON_REQUIRED`, a paired relay's key 403 `REMOTE_RELAY_PEER_SCOPE`). In the *ask* and *plan* relay
 modes, every write action first asks you with a question card. The agent of a
 plan-only conversation (see **Plan-only sessions** below) counts as a plan-mode caller, also during
 the one agent turn after **Approve plan**: its `create_session` defaults to plan too. For a session it starts, an agent
@@ -91,17 +173,18 @@ addresses or tokens), and
 `list_sessions` / `read_session` give each session's `state` (`running_turn`, `background_only` or
 `idle`) with its background agents and shell tasks, and the [session group](web-ui.md#session-groups)
 it is in. An agent can name an existing group (`group`, an id or name `relay_info` lists) when it
-creates a session, here or on a paired relay; an unknown group is refused and nothing is created.
-Renaming, dissolving and rearranging groups stays yours.
+creates a session, here or on a paired relay; for a group that is not there the session starts in no
+group and the agent is told so. Making, renaming, dissolving and rearranging groups stays yours.
 
 **Changing another session's settings.** With `update_session` an agent sets another session's
 model, reasoning effort, relay mode, auto-compact window, title, group, thinking, working folder or, on
 an image session, image defaults (see [below](#images-in-prompts-and-replies)) for its next turns, without prompting it, and gets back the settings and what changed. The checks are those
-of `send` (an unknown model is refused with the close matches); a group name that does not exist yet
-makes a new group, and `"none"` takes the session out of its group. A group you made is never removed
-this way: when an agent takes out its last session, the group stays, shown empty in your sidebar (rename
-or dissolve it from its menu; nothing removes it by itself), and agents can name it again. A group an
-agent made, by name or by starting sessions, goes once it is empty. A new folder restarts the session's CLI there and is
+of `send` (an unknown model is refused with the close matches); a group must exist already (a new name
+is refused with 403 `AUTH_PERSON_REQUIRED`: only you make groups), and `"none"` takes the session out of
+its group. A group you made is never removed this way: when an agent takes out its last session, the
+group stays, shown empty in your sidebar (rename or dissolve it from its menu; nothing removes it by
+itself), and agents can name it again. A group that formed when an agent started sessions goes once it
+is empty. A new folder restarts the session's CLI there and is
 refused while a turn or a background task runs. A mode set this way lasts until the next
 `update_session` that names another mode (a `send` that names a mode runs only that turn in it,
 and one without a mode leaves the session's mode as it is). An agent may change freely only a session its own conversation started (here, or on a paired
@@ -198,15 +281,15 @@ and reports back itself. Question cards still notify.
 
 **Accept prompts from other relays' agents** in **Settings → Relays** (on by default) leaves
 other relays' agents only reading when you switch it off. They are then refused when they prompt
-a session, start one, answer a question, stop a turn, cancel a queued message, archive or
+a session, start one, stop a turn, cancel a queued message, archive or
 unarchive a session, subscribe to sessions here, or fetch the events of a subscription. So a
 paired relay that [watches sessions](#watching-sessions) here gets no events while it is off;
 this relay keeps them, as during an outage, and delivers them once the switch is on again.
 Listing and reading sessions, a task's output, `wait`, `relay_info` and `usage` still work. This
 relay's own agents ([agent sessions](#agent-sessions)) are not affected.
 
-The calls go through your own relay, which holds the other relay's token: agents never see a
-token. Remote addresses must use `https://`; plain `http://` is accepted only for loopback (an
+The calls go through your own relay, which holds the other relay's key (or, for an older relay,
+its token): agents never see either. Remote addresses must use `https://`; plain `http://` is accepted only for loopback (an
 SSH port forward, for example) and private network ranges.
 
 ## Agent sessions
@@ -223,8 +306,8 @@ Agents may start and use sessions on this relay**. From then on this relay is th
 the relay list an agent sees, marked as its own; the agent names it by its **Relay name** or as
 `this`. It needs no mention, and **Agents may** and **Accept prompts from other relays' agents**
 do not apply to it. On this relay an agent can do what *full* allows on a paired one: list and
-read every session here, prompt one, start one, wait for it, answer its question, stop its turn
-and archive it. Switching the setting off closes this relay to the tool again.
+read every session here, prompt one, start one, wait for it, stop its turn and archive it (its
+question cards stay yours to answer). Switching the setting off closes this relay to the tool again.
 
 **The rules.**
 
@@ -239,7 +322,7 @@ and archive it. Switching the setting off closes this relay to the tool again.
   sessions on this relay, unless you allow it for that session: **Agents in this conversation may start
   sessions** in its 🧠 settings (shown for sessions an agent started). The other rules still apply to it,
   and no agent can set this switch.
-- **Not on itself.** An agent cannot prompt, stop, archive, wait for, answer or change the settings of
+- **Not on itself.** An agent cannot prompt, stop, archive, wait for or change the settings of
   the conversation it runs in.
 - The count of 30 prompts without a message from you (see above) includes prompts to sessions
   on this relay.
@@ -374,7 +457,8 @@ is removed.
 
 **On a paired relay** the relay must be unlocked in the conversation and allow at least reading,
 and the other relay must accept other relays' agents; nothing is asked there. This relay fetches
-the events every few seconds over the pairing (a pairing in one direction is enough), and their
+the events every few seconds over the pairing (the other relay has to list this one, with a key
+of its own: a pairing both ways), and their
 lines start with the other relay's name. If the link drops, the other relay keeps what happens
 (up to 500 events per subscription, for 7 days) and delivers it as one row tagged **replayed** once
 it answers again, questions and errors first, between "link lost" and "link restored". A relay
@@ -434,9 +518,10 @@ this relay looks for the answer there every few seconds while the ask is open.
 **The answer is yours.** The relay event that carries it is automated, like every relay event, and
 approves nothing else, but its answer is your own reply to that question. It never counts as your
 message for the limit on how many prompts agents may send each other before you write: answering
-an ask does not let agents go on longer without you. No agent can answer an ask, not with
-`answer_question` either: only you can, in its session or an Inbox (this relay's, or that of a
-relay paired with it).
+an ask does not let agents go on longer without you. No agent answers any question, an ask or a
+card: `answer_question` is refused (`AUTH_PERSON_REQUIRED`), and an agent token gets 403 on the
+answer routes. Only you answer, in its session or this relay's Inbox; a paired relay's questions
+are answered on that relay.
 
 ### The Inbox
 
@@ -449,12 +534,15 @@ day under a divider. Plan cards are listed too (see [the web UI](web-ui.md#relay
 relay's plan card shows only its title and status, with **Open there**, and is never answered
 over the pairing.
 
-You answer an ask here as in its session: an option, typed text, or **Dismiss**. That holds for
-an ask on a paired relay too: the answer goes there through the pairing. A card a session on this
-relay waits on is answered here as well (a card with several fields or several picks opens its
-session instead). A paired relay's cards, its approval cards above all, are answered only on that
-relay: the Inbox shows them with **Open there**. The pairing carries answers to asks only, never
-to a card, so a relay you paired with can never approve anything here.
+You answer an ask of this relay here as in its session: an option, typed text, or **Dismiss**. A
+card a session on this relay waits on is answered here as well (a card with several fields or
+several picks opens its session instead). A paired relay's asks and cards, its approval cards and
+Safety checks above all, are answered only on that relay, by you signed in there: the Inbox shows
+them with the question and its details, and **Open there**, which opens that relay's web UI on the
+session (`?conv=…`). When that relay runs OAR 0.9.27 or later, an ask, a plain card or an approval
+also gets option buttons that open the question on that relay in a small window, where you
+confirm the answer (see [the web UI](web-ui.md#notifications-and-the-app)). The pairing carries no
+answers, so a relay you paired with can never approve anything here, nor this one there.
 
 A paired relay's approval card says what it is about, never what the agent would send: its kind
 ("New session · the session waits", Loop guard, Write, Session settings, Watch, Start sessions)

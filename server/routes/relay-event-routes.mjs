@@ -74,6 +74,16 @@ export function registerRelayEventRoutes(app, deps) {
       });
       return null;
     }
+    // The subscriber is the relay that signed in with its key; a claim on
+    // another credential is refused with the reason (origin binding §6.3).
+    if (request.origin?.verified !== true) {
+      res.status(403).json({
+        error: request.unverifiedNotice || 'This route needs a paired relay signed in with its own key.',
+        code: REMOTE_RELAY_ERROR_CODES.peerKeyRequired,
+        originVerified: false,
+      });
+      return null;
+    }
     const subscriber = cleanSubscriberRelayId(request.origin?.relayId);
     if (!subscriber) {
       res.status(400).json({ error: 'The calling relay sent no relay id.', code: REMOTE_RELAY_ERROR_CODES.invalidInput });

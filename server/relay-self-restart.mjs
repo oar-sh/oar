@@ -11,6 +11,24 @@ import { detectRelayHosting } from './services/relay-restart-picture.mjs';
 export const RELAY_RUNTIME_FLAG = '--relay-runtime';
 export const RELAY_SUPERVISED_FLAG = '--supervised';
 
+/**
+ * The arguments without `--token <value>` (or `--token=<value>`). The runtime
+ * takes a command-line token on its first start only (owner-secret-store.mjs,
+ * the move into relay-secrets.json); every later start must not carry it, so
+ * a relaunch after a restart or a crash runs without it.
+ */
+export function withoutTokenArg(args = []) {
+  const out = [];
+  const list = Array.isArray(args) ? args : [];
+  for (let i = 0; i < list.length; i += 1) {
+    const arg = String(list[i]);
+    if (arg === '--token') { i += 1; continue; }
+    if (arg.startsWith('--token=')) continue;
+    out.push(list[i]);
+  }
+  return out;
+}
+
 function hasFlag(argv, flag) {
   return Array.isArray(argv) && argv.includes(flag);
 }
@@ -185,6 +203,10 @@ export async function runDirectRelaySupervisor({
     signals.on('SIGTERM', handleSigTerm);
   }
 
+  // `--token` goes to the first runtime only (see withoutTokenArg).
+  const relaunchArgs = withoutTokenArg(args);
+  let launches = 0;
+
   try {
     let crashCount = 0;
     while (true) {
@@ -199,7 +221,7 @@ export async function runDirectRelaySupervisor({
         env,
         cwd,
         scriptPath,
-        args,
+        args: launches === 0 ? args : relaunchArgs,
         execArgv,
         spawnImpl,
         stdio,
@@ -207,6 +229,7 @@ export async function runDirectRelaySupervisor({
         logger,
         nodeFlags,
       });
+      launches += 1;
       if (runtimeProc.stdout?.on) {
         runtimeProc.stdout.on('data', (chunk) => process.stdout.write(chunk));
       }

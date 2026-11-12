@@ -1,5 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,8 @@ import path from 'node:path';
 import {
   AGENT_SDK_LEASES_DIR,
   AGENT_SDK_MARKER,
+  AGENT_SDK_PIN_FILES,
+  AGENT_SDK_PINS_DIR,
   AGENT_SDK_STORE_FORMAT,
   agentSdkCheckedFiles,
   agentSdkSupport,
@@ -74,18 +77,21 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-/** A pins folder per SDK: package.json with exact deps, a small lockfile, entries. */
-function writePins(pinsDir, overrides = {}) {
+/**
+ * A pins folder per SDK: the manifest with exact deps (pin.json), a small
+ * lockfile (pin-lock.json), entries; `manifest` and `lock` rename those two.
+ */
+function writePins(pinsDir, overrides = {}, { manifest = 'pin.json', lock = 'pin-lock.json' } = {}) {
   for (const [id, base] of Object.entries(PIN_FIXTURES)) {
     const fixture = { ...base, ...(overrides[id] || {}) };
     const folder = path.join(pinsDir, id);
-    writeJson(path.join(folder, 'package.json'), { name: `fixture-${id}`, version: '0.0.0', private: true, dependencies: fixture.dependencies });
+    writeJson(path.join(folder, manifest), { name: `fixture-${id}`, version: '0.0.0', private: true, dependencies: fixture.dependencies });
     const packages = { '': { name: `fixture-${id}`, version: '0.0.0', dependencies: fixture.dependencies } };
     for (const [name, version] of Object.entries(fixture.dependencies)) packages[`node_modules/${name}`] = { version };
     for (const [name, constraints] of Object.entries(fixture.platformPackages)) {
       packages[`node_modules/${name}`] = { version: '1.0.0', optional: true, ...constraints };
     }
-    writeJson(path.join(folder, 'package-lock.json'), { name: `fixture-${id}`, lockfileVersion: 3, requires: true, packages });
+    writeJson(path.join(folder, lock), { name: `fixture-${id}`, lockfileVersion: 3, requires: true, packages });
     for (const [name, text] of Object.entries(fixture.entries)) fs.writeFileSync(path.join(folder, name), text);
   }
   return pinsDir;
@@ -156,6 +162,73 @@ test('readAgentSdkPin hashes the pins files and the host', () => {
   assert.notEqual(readAgentSdkPin('claude', { pinsDir: first, host: LINUX_X64_MUSL }).hash, base.hash, 'the libc counts');
   assert.notEqual(readAgentSdkPin('claude', { pinsDir: first, host: WIN32_X64 }).hash, base.hash, 'the platform counts');
   assert.notEqual(readAgentSdkPin('claude', { pinsDir: first, host: LINUX_ARM64 }).hash, base.hash, 'the arch counts');
+});
+
+// The pins ship as pin.json and pin-lock.json (a package.json in the tarball
+// reads as a dependency manifest to package scanners); the hash still covers
+// them as package.json and package-lock.json, the names an install writes, so
+// the rename moved no installed folder. These are the hashes the code before
+// the rename gave the same bytes under the old names.
+const PRE_RENAME_FIXTURE_HASHES = Object.freeze({
+  linux: { claude: '6bf0aabb8f99ba5ed75c2159cc57264603746be0338f4dfe1e1c845acf9efc97', cursor: 'bec06bbd924e7e48c35e4d300762fc5ac984b9f4678e181149593a0234324b0a', koffi: '34c339817fd73a2dd5587d2933cc62fb5a9950d7744f880bc73dbd70d27e3e3d' },
+  win32: { claude: '1dedce0d5afd362abb92ba31ddd69d1ce15dbefc2d1074235130551e01174989', cursor: '7fd66d37f23337808ad904ccaa0a4aafeca3bafd0ae286d3022745adc407c6f4', koffi: '438b46c83d9ad8816794e0dcfd6b0ac9b70413ac796ca8d90b4c65a10a867896' },
+});
+
+test('readAgentSdkPin reads pin.json and pin-lock.json and hashes them under the npm names', () => {
+  assert.deepEqual({ ...AGENT_SDK_PIN_FILES }, { 'package.json': 'pin.json', 'package-lock.json': 'pin-lock.json' });
+  const pinsDir = writePins(tempDir('pins'));
+  for (const [host, hashes] of [[LINUX_X64, PRE_RENAME_FIXTURE_HASHES.linux], [WIN32_X64, PRE_RENAME_FIXTURE_HASHES.win32]]) {
+    for (const [id, hash] of Object.entries(hashes)) {
+      assert.equal(readAgentSdkPin(id, { pinsDir, host }).hash, hash, `${id} on ${host.platform}: the hash before the rename`);
+    }
+  }
+  // What an install writes: the npm names, the shipped bytes.
+  const pin = readAgentSdkPin('koffi', { pinsDir, host: WIN32_X64 });
+  assert.deepEqual(Object.keys(pin.files).sort(), ['entry.cjs', 'package-lock.json', 'package.json']);
+  assert.deepEqual(pin.files['package.json'], fs.readFileSync(path.join(pinsDir, 'koffi', 'pin.json')));
+  assert.deepEqual(pin.files['package-lock.json'], fs.readFileSync(path.join(pinsDir, 'koffi', 'pin-lock.json')));
+  // A folder with only the npm names is no pins folder.
+  const npmNamed = writePins(tempDir('pins'), {}, { manifest: 'package.json', lock: 'package-lock.json' });
+  assert.throws(() => readAgentSdkPin('claude', { pinsDir: npmNamed, host: LINUX_X64 }), /ENOENT/);
+  assert.equal(findReadyAgentSdkDir('claude', { root: tempDir('root'), pinsDir: npmNamed, host: LINUX_X64 }), null);
+});
+
+// The package's own pins, hashed by the code before the rename (the first 8
+// hex name each installed folder). `pins` is a sha256 of the pin files they
+// were recorded from (pin.json, pin-lock.json and the entries, by their npm
+// names): a pin bump or a lock refresh at the same version (new transitive
+// dependencies) changes the folder hash on purpose, so the check covers only
+// the pins it was recorded with.
+const PRE_RENAME_SHIPPED = Object.freeze({
+  claude: { pins: '2babf98ffe1af7426d1e67d6f557fe7cb48dcc5712167b9637fe17a8610aabc1', linux: '9fe86740aa3b78c68956f7d3059c46241edbe851220ae4c8b39a153760f320db', win32: '8af9797a07c383497ecb7d4d15bfd6d73625848b825fa8ae3240bf818ff6a483', darwin: '48aa574ed735ae383b7741b3b258359c41db33da5d227e1370d32904cf5de54f' },
+  cursor: { pins: 'baebb288566c56b0f6c8bedb2375621760794dbc55d28b1998d645a1ac4c362c', linux: '05413dc3eebb45b2a7c9ada4888a5b3e9e3b7c72f3d10c58c18e9c013d615ade', win32: 'b20cf5963d1078679e4adc99d91cfc390ae7738125fe4a11d58214f40a2083e0', darwin: 'bd7d2f3f3ea46c45723dcd447a2bcbc1fd06df0194ff9bfac0b16eb7f4b9c7c0' },
+  koffi: { pins: 'c87f739de4fd69c7630ca1ff9406ec35240a990d4e257234f84ae0e2cfad0754', linux: '701c4ffdd6726a4b88ec86e38712c5bbee74fd8f75dc3be335a22ec3c5b8bc47', win32: 'dc9e2f37e23dc9b9ba6ccd1ecef3a4c29dd3739d8293b372ec37b6678badedf8', darwin: '6a6753171118f9d2c528ae75edd177cb4549be56720ed55bc56e844f5b3cb8d0' },
+});
+
+function pinFilesHash(pin) {
+  const hash = crypto.createHash('sha256');
+  for (const name of Object.keys(pin.files).sort()) hash.update(`${name}\0`).update(pin.files[name]).update('\0');
+  return hash.digest('hex');
+}
+
+test('the shipped pins keep the folders they had before the rename', (t) => {
+  const fresh = { readFileSync: fs.readFileSync };
+  const changed = [];
+  let checked = 0;
+  for (const [id, recorded] of Object.entries(PRE_RENAME_SHIPPED)) {
+    if (pinFilesHash(readAgentSdkPin(id, { pinsDir: AGENT_SDK_PINS_DIR, host: LINUX_X64, fsImpl: fresh })) !== recorded.pins) {
+      changed.push(id);
+      continue;
+    }
+    for (const host of [LINUX_X64, WIN32_X64, DARWIN_ARM64]) {
+      const pin = readAgentSdkPin(id, { pinsDir: AGENT_SDK_PINS_DIR, host, fsImpl: fresh });
+      assert.equal(pin.hash, recorded[host.platform], `${id} ${pin.version} on ${host.platform}: the hash before the rename`);
+      checked += 1;
+    }
+  }
+  const why = `the pins of ${changed.join(', ')} changed since the rename (a bump or a lock refresh), so their pre-rename folder hashes no longer apply`;
+  if (!checked) t.skip(why);
+  else if (changed.length) t.diagnostic(why);
 });
 
 test('readAgentSdkPin keeps the pins it read first while the files change under it', () => {

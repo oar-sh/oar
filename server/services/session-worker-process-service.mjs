@@ -1,6 +1,7 @@
 'use strict';
 
 import { execFile, execFileSync } from 'child_process';
+import { readFile } from 'fs/promises';
 
 import { collectProcessDescendants, isChildProcessOf } from '../../shared/worker-runtime/process-tree.mjs';
 import { windowsSystemToolPath } from '../../shared/windows-system-tools.mjs';
@@ -110,6 +111,8 @@ const SLOW_READ_MS = 2_000;
 // Stop-Process over a whole tree; generous, so a loaded box is not told
 // "not stopped" while PowerShell still works.
 const WINDOWS_STOP_TIMEOUT_MS = 30_000;
+// How long a POSIX `ps` (the process list, one process's identity) may run.
+const PS_TIMEOUT_MS = 5_000;
 
 function parsePosixProcessSnapshot(output) {
   const text = String(output || '').trim();
@@ -292,6 +295,209 @@ function looksLikeCopilotWorkerProcess(proc) {
     || cmd.includes('--resume');
 }
 
+// ─── Process identity ────────────────────────────────────────────────────────
+// A pid alone does not name a process: once one ends, its pid is handed out
+// again (on Windows within seconds). A process is its pid and the time it
+// started, so a worker a stop ended is never taken for the process that got
+// its pid next, and a process that only has a worker's old pid is never
+// stopped or blamed as that worker.
+
+/** Field 22 of /proc/<pid>/stat (starttime, clock ticks since boot), or null. */
+export function parseProcStatStartTime(text) {
+  const value = String(text || '');
+  // The command name (field 2) is in parentheses and may hold spaces and
+  // parentheses itself: the fields after it start after the last ')'.
+  const end = value.lastIndexOf(')');
+  if (end < 0) return null;
+  const rest = value.slice(end + 1).trim().split(/\s+/);
+  const startTime = rest[22 - 3];
+  return /^\d+$/.test(String(startTime || '')) ? startTime : null;
+}
+
+/** `ps -o lstart= -o args=` of one process: { startTime, commandLine }, or null. */
+export function parsePsStartAndArgs(output) {
+  const line = String(output || '').split(/\r?\n/).find((entry) => entry.trim());
+  if (!line) return null;
+  // lstart is five fields under LC_ALL=C: `Thu Nov 12 10:00:00 2026`.
+  const match = line.match(/^\s*(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)(?:\s+(.*))?$/);
+  if (!match) return { startTime: null, commandLine: null };
+  return { startTime: match[1].replace(/\s+/g, ' '), commandLine: String(match[2] || '').trim() };
+}
+
+function isMissingProcessError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  return code === 'ENOENT' || code === 'ESRCH';
+}
+
+/**
+ * Reads what a process is: `identityOf(pid, { fresh })` resolves to
+ * `{ pid, startTime, commandLine }`, or null when no process has the pid.
+ * Never rejects; what could not be read is null (`startTime` and
+ * `commandLine` both null: nothing is known about the process).
+ *
+ * `startTime` is compared for equality only, never across platforms:
+ * - Linux and Android (Termux): field 22 of /proc/<pid>/stat, clock ticks
+ *   since boot; the command line from /proc/<pid>/cmdline.
+ * - Windows: the process list's `createdAt` (ms since 1970), read through
+ *   `readProcessSnapshot({ fresh })` (the inspector's shared, cached read).
+ * - macOS and the other POSIX systems: `ps -o lstart= -o args= -p <pid>`.
+ */
+export function createProcessIdentityReader({
+  platform = process.platform,
+  readFileImpl = (file) => readFile(file, 'utf8'),
+  execFileImpl = execFile,
+  readProcessSnapshot = null,
+} = {}) {
+  const unknown = (pid) => ({ pid, startTime: null, commandLine: null });
+
+  async function fromProc(pid) {
+    let stat;
+    try {
+      stat = String(await readFileImpl(`/proc/${pid}/stat`));
+    } catch (error) {
+      return isMissingProcessError(error) ? null : unknown(pid);
+    }
+    let commandLine = null;
+    try {
+      commandLine = String(await readFileImpl(`/proc/${pid}/cmdline`)).split('\0').filter(Boolean).join(' ');
+    } catch (error) {
+      if (isMissingProcessError(error)) return null;
+    }
+    return { pid, startTime: parseProcStatStartTime(stat), commandLine };
+  }
+
+  function fromPs(pid) {
+    return new Promise((resolve) => {
+      try {
+        execFileImpl(
+          'ps',
+          ['-ww', '-o', 'lstart=', '-o', 'args=', '-p', String(pid)],
+          // A ps that hangs (a stuck process table read) must not hold the
+          // recycle or the stop: an answer that never comes is unknown.
+          { env: { ...process.env, LC_ALL: 'C' }, timeout: PS_TIMEOUT_MS },
+          (error, stdout) => {
+            const parsed = parsePsStartAndArgs(stdout);
+            // ps exits with 1 and prints nothing for a pid no process has.
+            if (!parsed) resolve(error && Number(error.code) === 1 ? null : unknown(pid));
+            else resolve({ pid, ...parsed });
+          },
+        );
+      } catch {
+        resolve(unknown(pid));
+      }
+    });
+  }
+
+  async function fromSnapshot(pid, fresh) {
+    if (typeof readProcessSnapshot !== 'function') return unknown(pid);
+    let snapshot;
+    try {
+      snapshot = await readProcessSnapshot({ fresh });
+    } catch {
+      return unknown(pid);
+    }
+    const found = (Array.isArray(snapshot) ? snapshot : [])
+      .map(normalizeWindowsProcess)
+      .find((proc) => proc.processId === pid);
+    if (!found) return null;
+    return { pid, startTime: found.createdAt > 0 ? String(found.createdAt) : null, commandLine: found.commandLine };
+  }
+
+  return async function identityOf(value, { fresh = false } = {}) {
+    const pid = Number(value);
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    try {
+      if (platform === 'win32') return await fromSnapshot(pid, fresh);
+      if (platform === 'linux' || platform === 'android') return await fromProc(pid);
+      return await fromPs(pid);
+    } catch {
+      return unknown(pid);
+    }
+  };
+}
+
+/** Whether two identities are known to be one process: same pid, same start time. */
+export function isSameProcess(left, right) {
+  return Boolean(left && right && left.pid === right.pid && left.startTime && left.startTime === right.startTime);
+}
+
+/**
+ * What the process now at a session worker's pid is, from its identity
+ * (`current`, createProcessIdentityReader) and the one read before
+ * (`before`, optional):
+ * - 'gone': no process has the pid;
+ * - 'other': another process (another start time, or a command line that
+ *   does not name the session: a pid handed out again, a zombie);
+ * - 'ours': a process of the session, whose command line names it;
+ * - 'unverified': nothing could be read about it.
+ */
+export function judgeSessionWorkerProcess(current, { sdkSessionId, before = null } = {}) {
+  if (!current) return 'gone';
+  if (before?.startTime && current.startTime && before.startTime !== current.startTime) return 'other';
+  if (typeof current.commandLine === 'string') {
+    const target = normalizeSessionId(sdkSessionId);
+    return target && parseSessionIdFromCommandLine(current.commandLine) === target ? 'ours' : 'other';
+  }
+  return 'unverified';
+}
+
+/**
+ * Whether a launch may reuse the process a process-list row names for a
+ * session (`row`, from a fresh read), by what is at its pid now (`current`,
+ * identityOfListedWorker: read after the row, or on Windows the row itself):
+ * a listed process can end and its pid go to another process in between.
+ * Reused only when the process there is the session's ('ours': its command
+ * line names the session and, where the row has one (Windows' createdAt),
+ * its start time is the row's).
+ * When nothing can be read about it ('unverified'), a process that runs
+ * (`isAlive(pid)`) is reused: a second launch beside it could give the
+ * session two workers.
+ */
+export function mayReuseSessionWorkerRow({ row, current, sdkSessionId, isAlive = () => false } = {}) {
+  const pid = Number(row?.processId);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (current && current.pid !== pid) return false;
+  const createdAt = Number(row?.createdAt);
+  const before = createdAt > 0 ? { pid, startTime: String(createdAt) } : null;
+  const verdict = judgeSessionWorkerProcess(current, { sdkSessionId, before });
+  if (verdict === 'ours') return true;
+  if (verdict !== 'unverified') return false;
+  try {
+    return isAlive(pid) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What the process a fresh process-list row names is, for
+ * mayReuseSessionWorkerRow (`current`). On Windows the row is the identity:
+ * it comes from a read of the whole list that began after the caller, with
+ * the process's start time (`createdAt`) and command line, and a second read
+ * would tell no more, only later. Elsewhere the row has no start time, and
+ * `identityOf(pid, { fresh: true })` (createProcessIdentityReader) is asked;
+ * what it cannot read is unknown.
+ */
+export async function identityOfListedWorker(row, { platform = process.platform, identityOf = null } = {}) {
+  const pid = Number(row?.processId);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const unknown = { pid, startTime: null, commandLine: null };
+  if (platform === 'win32') {
+    const createdAt = Number(row?.createdAt);
+    return {
+      pid,
+      startTime: createdAt > 0 ? String(createdAt) : null,
+      commandLine: typeof row?.commandLine === 'string' ? row.commandLine : null,
+    };
+  }
+  if (typeof identityOf !== 'function') return unknown;
+  try {
+    return await identityOf(pid, { fresh: true });
+  } catch {
+    return unknown;
+  }
+}
+
 export function createSessionWorkerProcessInspector({
   platform = process.platform,
   execFileSyncImpl = execFileSync,
@@ -404,7 +610,7 @@ export function createSessionWorkerProcessInspector({
       execFileImpl(
         'ps',
         ['-eo', 'pid=,ppid=,comm=,args=', '-ww'],
-        { maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER },
+        { maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER, timeout: PS_TIMEOUT_MS },
         (error, stdout) => {
           if (error) {
             reject(error);
@@ -420,10 +626,19 @@ export function createSessionWorkerProcessInspector({
     });
   }
 
-  // One read at a time; callers that arrive while it runs share it, and
-  // callers within the cache window after it share its result. What the
-  // last read did is kept for /api/status and the log.
+  // Callers that arrive while a read runs share it, and callers within the
+  // cache window after it share its result, unless they ask for a read that
+  // began after them (`fresh`, `notBefore`). Those wait for the next read,
+  // which begins once the running one ends and is shared by everyone who
+  // asks before it begins: one read at a time (on Windows a CIM query of
+  // seconds), however many fresh callers come. What the last read did is
+  // kept for /api/status and the log.
+  // The read started last: `{ promise, startedAtMs }`.
   let inFlightRead = null;
+  // The read that begins once inFlightRead ends: `{ promise }`, or null.
+  let nextRead = null;
+  // `{ atMs, startedAtMs, processes }` of the read that started last among
+  // those that finished.
   let cachedSnapshot = null;
   let lastRead = { at: null, durationMs: null, processes: null, error: null };
 
@@ -440,22 +655,15 @@ export function createSessionWorkerProcessInspector({
     }
   }
 
-  /**
-   * The process list, read off the thread. `fresh: true` skips the cache (not
-   * a read that is already running: joining it is still a read that started
-   * after the caller's spawn only if the caller waited — the launch poll
-   * retries, so joining is fine). Rejects when the list could not be read.
-   */
-  function readProcessSnapshot({ fresh = false } = {}) {
-    if (!fresh && cachedSnapshot && cacheMs > 0 && now() - cachedSnapshot.atMs <= cacheMs) {
-      return Promise.resolve(cachedSnapshot.processes);
-    }
-    if (inFlightRead) return inFlightRead;
+  function startRead() {
     const startedAtMs = now();
     const read = platform === 'win32' ? readWindowsProcessSnapshot() : readPosixProcessSnapshot();
-    inFlightRead = read.then(
+    const entry = { startedAtMs, promise: null };
+    entry.promise = read.then(
       (processes) => {
-        cachedSnapshot = { atMs: now(), processes };
+        if (!cachedSnapshot || cachedSnapshot.startedAtMs <= startedAtMs) {
+          cachedSnapshot = { atMs: now(), startedAtMs, processes };
+        }
         recordRead({ startedAtMs, processes });
         return processes;
       },
@@ -464,9 +672,50 @@ export function createSessionWorkerProcessInspector({
         throw error;
       },
     ).finally(() => {
-      inFlightRead = null;
+      if (inFlightRead === entry) inFlightRead = null;
     });
-    return inFlightRead;
+    inFlightRead = entry;
+    return entry.promise;
+  }
+
+  /**
+   * The process list, read off the thread. Rejects when the list could not be
+   * read.
+   *
+   * - `fresh: true`: a read that begins after the caller (`notBefore` is the
+   *   time of the call). A read already running began before the caller,
+   *   possibly before a stop or a spawn the caller has just seen through, and
+   *   can name a process that is gone (or miss one that is new).
+   * - `notBefore` (epoch ms, a time already past): the cache or a running
+   *   read is used only when that read began after this time; else the
+   *   caller waits for the next read.
+   * - neither: the cache within its window, else a running read, else a new
+   *   one.
+   *
+   * A read that began in the same millisecond as `notBefore` may have begun
+   * before it, and is not used. The next read is: it begins after the call.
+   */
+  function readProcessSnapshot({ fresh = false, notBefore = null } = {}) {
+    const calledAtMs = now();
+    const since = fresh
+      ? calledAtMs
+      : (notBefore === null || notBefore === undefined ? NaN : Number(notBefore));
+    const startedLateEnough = (startedAtMs) => !Number.isFinite(since) || startedAtMs > since;
+    if (cachedSnapshot && cacheMs > 0 && calledAtMs - cachedSnapshot.atMs <= cacheMs && startedLateEnough(cachedSnapshot.startedAtMs)) {
+      return Promise.resolve(cachedSnapshot.processes);
+    }
+    if (inFlightRead && startedLateEnough(inFlightRead.startedAtMs)) return inFlightRead.promise;
+    if (nextRead) return nextRead.promise;
+    if (!inFlightRead) return startRead();
+    // A read runs that began too early for this caller: the next one, after it.
+    const running = inFlightRead.promise.then(() => {}, () => {});
+    const entry = { promise: null };
+    entry.promise = running.then(() => {
+      if (nextRead === entry) nextRead = null;
+      return startRead();
+    });
+    nextRead = entry;
+    return entry.promise;
   }
 
   function getLastRead() {

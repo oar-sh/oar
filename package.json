@@ -1,6 +1,6 @@
 {
   "name": "@oar-sh/oar",
-  "version": "0.9.26",
+  "version": "0.9.27",
   "type": "module",
   "description": "OAR — Open Agent Relay: drive your local coding agents from any browser",
   "license": "MIT",
@@ -49,7 +49,7 @@
   "scripts": {
     "start": "node server/server.js",
     "copilot:relay": "gh copilot -- --allow-all",
-    "test": "node --import ./scripts/node-test-keep-alive.mjs --import ./scripts/node-test-worktree-guard.mjs --test \"server/**/*.test.mjs\" \"shared/**/*.test.mjs\" \".github/extensions/web-relay/**/*.test.mjs\" \"scripts/**/*.test.mjs\"",
+    "test": "node --import ./scripts/node-test-keep-alive.mjs --import ./scripts/node-test-worktree-guard.mjs --test \"server/**/*.test.mjs\" \"shared/**/*.test.mjs\" \".github/extensions/web-relay/**/*.test.mjs\" \"scripts/**/*.test.mjs\" \"tests/helpers/**/*.test.mjs\"",
     "test:agents:smoke": "node --test \"tests/agents/**/*.test.mjs\"",
     "test:packed-update": "node --test tests/packed-update/packed-update.test.mjs",
     "test:e2e": "node tests/run-e2e.mjs",

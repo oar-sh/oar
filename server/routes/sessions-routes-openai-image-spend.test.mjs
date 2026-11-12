@@ -15,6 +15,7 @@ import {
 } from './sessions-routes.mjs';
 import { OPENAI_IMAGE_PRESETS_PATH, OPENAI_IMAGE_SPEND_SETTING_KEYS } from '../../shared/openai-image-spend.mjs';
 import { OPENAI_IMAGE_PRESETS_SETTING_KEY, OPENAI_IMAGE_PRESET_LIMITS } from '../../shared/openai-image-presets.mjs';
+import { asOwner } from '../services/relay-principal-test-harness.mjs';
 
 // The owner's settings of OpenAI image spend (the daily cap and "Allow for
 // today" on POST /api/settings/openai), the presets routes, and the OpenAI
@@ -81,7 +82,7 @@ function setup({ openAISettings = OPENAI_ON, spendState = null, spendThrows = nu
       status(code) { captured.status = code; return res; },
       json(payload) { captured.body = payload; return res; },
     };
-    await handler({ body, headers, query, params, socket: {} }, res);
+    await handler(asOwner({ body, headers, query, params, socket: {} }), res);
     return captured;
   };
   const setting = (key) => {

@@ -141,7 +141,7 @@ test("tiles: a video gets its address in view, remote and archived are marked, a
   await view.locator('[data-media-filter="session"]').selectOption(sessions.kinds);
   await expect(view.locator(".media-tile")).toHaveCount(2);
   const video = view.locator(".media-tile video");
-  await expect(video).toHaveAttribute("src", /\/api\/media\/\d+\/content#t=0\.1$/);
+  await expect(video).toHaveAttribute("src", /\/api\/media\/\d+\/content\?t=[A-Za-z0-9_-]{22}#t=0\.1$/);
   await expect(view.locator(".media-tile-play")).toHaveCount(1);
   await expect(view.locator(".media-tile img")).toHaveAttribute("src", "http://127.0.0.1:9/remote-sketch.png");
   await expect(view.locator(".media-tile-badge").filter({ hasText: "🌐" })).toHaveCount(1);

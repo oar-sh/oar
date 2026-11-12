@@ -22,7 +22,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
-import { loadTokenFromConfig, resolveRelayServerUrl } from '../../shared/worker-runtime/config-loader.mjs';
+import { loadAgentToken, resolveRelayServerUrl } from '../../shared/worker-runtime/config-loader.mjs';
 import {
   PREVIEW_TOOL_DESCRIPTION,
   PREVIEW_TOOL_INPUT_SCHEMA,
@@ -386,7 +386,9 @@ export async function runOarMcpServer({
     const configPath = toText(env?.COPILOT_WEB_RELAY_CONFIG)
       || path.resolve(path.dirname(MODULE_PATH), '..', 'config.json');
     const serverUrl = resolveRelayServerUrl({ configPath, env });
-    const token = loadTokenFromConfig(configPath);
+    // OAR_AGENT_TOKEN when the CLI passed its environment on, else derived
+    // for this server's conversation; never the owner token.
+    const token = loadAgentToken({ env, configPath, conversationId });
     api = createApiClientImpl({
       serverUrl,
       token,

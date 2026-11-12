@@ -83,14 +83,14 @@ test('a relay-level Claude login token is a secret of the two Claude workers and
   for (const kind of ['claude-cloud', 'claude']) {
     assert.deepEqual(
       workerSecretEnvVarsFor({ COPILOT_WEB_RELAY_WORKER_KIND: kind }),
-      ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'],
+      ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'OAR_AGENT_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'],
       kind,
     );
   }
   for (const kind of ['', 'cursor', 'grok', 'copilot-sdk', 'unknown-kind']) {
     assert.deepEqual(
       workerSecretEnvVarsFor(kind ? { COPILOT_WEB_RELAY_WORKER_KIND: kind } : {}),
-      ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY'],
+      ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'OAR_AGENT_TOKEN'],
       kind || 'copilot',
     );
   }

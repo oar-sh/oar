@@ -6,8 +6,17 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import express from 'express';
 
+import crypto from 'node:crypto';
+
 import { applySchema } from '../db-schema.mjs';
 import { registerMediaRoutes } from './media-routes.mjs';
+import { createMediaRepository } from '../repositories/media-repository.mjs';
+import { createProtectedRelayFiles } from '../services/relay-protected-files.mjs';
+import { createMediaTags, deriveMediaTagKey } from '../services/media-tag.mjs';
+import { createAuthFailureLockout, createRelayAuth } from '../services/relay-auth.mjs';
+import { createBrowserSessionService, createSignInCodes } from '../services/browser-session-service.mjs';
+import { createLocalRequestCheck } from '../services/request-boundary.mjs';
+import { migrateBrowserSessions } from '../migrations/0041-browser-sessions.mjs';
 
 // Real files on disk under a temp folder, so the paths have the host's shape.
 const hostPlatform = process.platform; // host-platform: served files are real files of this machine
@@ -18,8 +27,8 @@ function isoAt(minute) {
   return new Date(Date.UTC(2026, 9, 1, 10, minute)).toISOString();
 }
 
-async function startRelay(t, { authorized = true } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'media-routes-'));
+async function startRelay(t, { authorized = true, isProtectedFile, auth = null, mount = null, spies = null } = {}) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'media-routes-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(dir, 'uploads'));
   const file = (name, bytes = PNG) => {
@@ -31,12 +40,22 @@ async function startRelay(t, { authorized = true } = {}) {
   db.pragma('foreign_keys = ON');
   applySchema(db);
   const app = express();
+  mount?.(app);
+  // `spies` counts every look-up and file call the routes make.
+  const count = (name, fn) => (...args) => {
+    if (spies) spies[name] = (spies[name] || 0) + 1;
+    return fn(...args);
+  };
+  const repository = createMediaRepository(db);
   const routes = registerMediaRoutes(app, {
-    auth: (_req, res, next) => (authorized ? next() : res.status(401).json({ error: 'Unauthorized' })),
+    auth: auth || ((_req, res, next) => (authorized ? next() : res.status(401).json({ error: 'Unauthorized' }))),
     db,
-    uploadPathForSha: (sha) => path.join(dir, 'uploads', sha),
+    uploadPathForSha: count('uploadPathForSha', (sha) => path.join(dir, 'uploads', sha)),
     platform: hostPlatform,
     startIndexer: false,
+    repository: { ...repository, getMediaItem: count('getMediaItem', (id) => repository.getMediaItem(id)) },
+    isProtectedFile: count('isProtectedFile', (filePath) => (isProtectedFile ? isProtectedFile(dir, filePath) : false)),
+    resolveGeneratedImagePath: count('resolveGeneratedImagePath', () => null),
   });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
@@ -57,7 +76,9 @@ async function startRelay(t, { authorized = true } = {}) {
       .run(id, conv, role, text, attachments ? JSON.stringify(attachments) : null, isoAt(minute), kind);
   };
   const md = (target) => `![shot](${target.replace(/\\/g, '/')})`;
-  return { db, dir, file, get, json, addConversation, addMessage, md, routes };
+  // The route's address for an id, with its tag (what the listing hands out).
+  const contentUrl = (id) => routes.mediaTags.contentUrlFor(id);
+  return { db, dir, file, get, json, addConversation, addMessage, md, routes, contentUrl };
 }
 
 test('a session gallery lists each picture once at its newest message, newest first', async (t) => {
@@ -78,7 +99,7 @@ test('a session gallery lists each picture once at its newest message, newest fi
     ['m1', 'b.png', 1, 'agent', 'embedded'],
   ]);
   assert.equal(body.items[0].contentUrl, `/api/upload/${SHA}/content`);
-  assert.match(body.items[1].contentUrl, /^\/api\/media\/\d+\/content$/);
+  assert.match(body.items[1].contentUrl, /^\/api\/media\/\d+\/content\?t=[A-Za-z0-9_-]{22}$/);
   assert.equal(body.items[1].path, path.resolve(a));
   assert.equal(body.nextCursor, null);
   assert.deepEqual(body.indexing, { pending: 0 });
@@ -215,7 +236,7 @@ test('content: ids only, never a path from the request; stored paths are re-chec
   for (const url of ['/api/media/abc/content', '/api/media/1.5/content', '/api/media/-1/content', `/api/media/${'9'.repeat(20)}/content`]) {
     assert.equal((await relay.get(url)).status, 400, url);
   }
-  assert.equal((await relay.get('/api/media/424242/content')).status, 404);
+  assert.equal((await relay.get(relay.contentUrl(424242))).status, 404);
   const insert = relay.db.prepare(`INSERT INTO media_items (message_id, conversation_id, ordinal, role, sender, origin, locator_kind, locator,
     identity_key, category, media_kind, mime, name, message_ts) VALUES ('m1', 'c1', ?, 'assistant', 'agent', 'embedded', ?, ?, ?, 'media', 'image', 'image/png', 'x.png', ?)`);
   const real = relay.file('real.png');
@@ -231,7 +252,7 @@ test('content: ids only, never a path from the request; stored paths are re-chec
   insert.run(21, 'upload_sha', '../../etc/passwd', 'sha:x', isoAt(1));
   const ids = relay.db.prepare(`SELECT id FROM media_items ORDER BY ordinal`).all().map((row) => row.id);
   for (const id of ids) {
-    assert.equal((await relay.get(`/api/media/${id}/content`)).status, 404, `item ${id}`);
+    assert.equal((await relay.get(relay.contentUrl(id))).status, 404, `item ${id}`);
   }
 });
 
@@ -241,7 +262,7 @@ test('Windows: a stored path on a drive the relay does not list is hidden and no
   relay.addMessage('m1', 'c1', { text: relay.md(relay.file('a.png')) });
   const app = express();
   let listings = 0;
-  registerMediaRoutes(app, {
+  const windowsRoutes = registerMediaRoutes(app, {
     auth: (_req, _res, next) => next(),
     db: relay.db,
     uploadPathForSha: () => '',
@@ -261,11 +282,11 @@ test('Windows: a stored path on a drive the relay does not list is hidden and no
   assert.deepEqual(body.items, []);
   assert.equal(body.missingHidden, 1);
   const id = relay.db.prepare(`SELECT id FROM media_items`).get().id;
-  assert.equal((await fetch(`${base}/api/media/${id}/content`)).status, 404);
+  assert.equal((await fetch(`${base}${windowsRoutes.mediaTags.contentUrlFor(id)}`)).status, 404);
   assert.equal(listings, 1, 'the drive list is cached');
 });
 
-test('content: a local picture must be what its name says; attached files keep their type', async (t) => {
+test('content: a local picture must be what its name says; a local file of another kind is not served here', async (t) => {
   const relay = await startRelay(t);
   relay.addConversation('c1');
   const fake = relay.file('fake.png', Buffer.from('#!/bin/sh\necho not a picture\n'));
@@ -280,17 +301,18 @@ test('content: a local picture must be what its name says; attached files keep t
   assert.deepEqual(Object.keys(byName), ['logo.svg']);
   assert.equal(listed.missingHidden, 2);
   const idOf = (name) => relay.db.prepare(`SELECT id FROM media_items WHERE name = ?`).get(name).id;
-  assert.equal((await relay.get(`/api/media/${idOf('fake.png')}/content`)).status, 404);
-  assert.equal((await relay.get(`/api/media/${idOf('movie.mp4')}/content`)).status, 404);
+  assert.equal((await relay.get(relay.contentUrl(idOf('fake.png')))).status, 404);
+  assert.equal((await relay.get(relay.contentUrl(idOf('movie.mp4')))).status, 404);
   const logo = await relay.get(byName['logo.svg'].contentUrl);
   assert.equal(logo.status, 200);
   assert.equal(logo.headers.get('content-type'), 'image/svg+xml');
   assert.equal(logo.headers.get('x-content-type-options'), 'nosniff');
   assert.match(logo.headers.get('content-security-policy') || '', /sandbox/);
-  const [file] = (await relay.json('/api/media?category=file')).body.items;
-  const notes = await relay.get(file.contentUrl);
-  assert.equal(notes.status, 200);
-  assert.match(notes.headers.get('content-disposition') || '', /^attachment/);
+  // An attached text file by path: not listed, not served (it opens by path, with a file capability).
+  const files = (await relay.json('/api/media?category=file')).body;
+  assert.deepEqual(files.items, []);
+  assert.equal(files.missingHidden, 1);
+  assert.equal((await relay.get(relay.contentUrl(idOf('notes.txt')))).status, 404);
 });
 
 test('content: a link is followed only to a target that passes the same checks', { skip: process.platform === 'win32' }, async (t) => {
@@ -304,7 +326,141 @@ test('content: a link is followed only to a target that passes the same checks',
   const byName = Object.fromEntries(items.map((item) => [item.name, item]));
   assert.equal((await relay.get(byName['link.png'].contentUrl)).status, 200);
   const env = relay.db.prepare(`SELECT id FROM media_items WHERE name = 'env.png'`).get();
-  assert.equal((await relay.get(`/api/media/${env.id}/content`)).status, 404);
+  assert.equal((await relay.get(relay.contentUrl(env.id))).status, 404);
+});
+
+test('content: the relay\'s own secrets and database are never served, even when a message names them', async (t) => {
+  // The relay's data folder sits in the temp folder; its secrets file and
+  // database are named by an attached-file reference and by a picture link.
+  const relay = await startRelay(t, {
+    isProtectedFile: (dir, filePath) => createProtectedRelayFiles({
+      dataDir: path.join(dir, 'data'),
+      configPath: path.join(dir, 'config.json'),
+      files: () => [path.join(dir, 'data', 'oar.db')],
+    }).isProtected(filePath),
+  });
+  fs.mkdirSync(path.join(relay.dir, 'data'));
+  const secrets = relay.file(path.join('data', 'relay-secrets.json'), Buffer.from('{"fixture":true}'));
+  const database = relay.file(path.join('data', 'oar.db'), PNG);
+  const notes = relay.file('notes.txt', Buffer.from('plain notes'));
+  relay.addConversation('c1');
+  relay.addMessage('m1', 'c1', {
+    role: 'user',
+    attachments: [
+      { name: 'relay-secrets.json', type: 'application/json', path: secrets, source: 'reference' },
+      { name: 'notes.txt', type: 'text/plain', path: notes, source: 'reference' },
+    ],
+  });
+  // A picture link to the database (whose bytes here look like a picture):
+  // refused for being the database, not for its bytes.
+  const viaLink = process.platform !== 'win32'; // host-platform: symlinks need no privilege off Windows
+  if (viaLink) {
+    fs.symlinkSync(database, path.join(relay.dir, 'db.png'));
+    relay.addMessage('m2', 'c1', { text: relay.md(path.join(relay.dir, 'db.png')) });
+  }
+  // Attached files by path are not served here at all (a picture or a video only).
+  const files = (await relay.json('/api/media?category=file')).body;
+  assert.deepEqual(files.items, []);
+  assert.equal(files.missingHidden, 2);
+  const idOf = (name) => relay.db.prepare(`SELECT id FROM media_items WHERE name = ?`).get(name).id;
+  if (viaLink) assert.deepEqual((await relay.json('/api/media')).body.items, []);
+  if (viaLink) {
+    const response = await relay.get(relay.contentUrl(idOf('db.png')));
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).code, 'FILE_PROTECTED');
+  }
+  for (const name of ['relay-secrets.json', 'notes.txt']) {
+    assert.equal((await relay.get(relay.contentUrl(idOf(name)))).status, 404, name);
+  }
+});
+
+test('content: an id opens nothing without its tag, whoever asks; nothing is looked up before the tag is checked', async (t) => {
+  // Real relay-auth and browser sessions: GET /api/media/:id/content goes on
+  // the cookie alone (no proof key), so the tag is all that stands between
+  // a replayed cookie and every id. Every credential is made here and never printed.
+  const ownerToken = crypto.randomUUID();
+  const sessionsDb = new Database(':memory:');
+  migrateBrowserSessions(sessionsDb);
+  const sessions = createBrowserSessionService({ db: sessionsDb, logger: { log() {}, warn() {} } });
+  const relayAuth = createRelayAuth({
+    app: null,
+    verifyOwnerToken: (value) => value === ownerToken,
+    browserSessions: sessions,
+    signInCodes: createSignInCodes(),
+    cookieName: 'copilot_auth',
+    parseCookies: () => ({}),
+    appendSetCookie: (res, value) => {
+      const existing = res.getHeader('Set-Cookie');
+      res.setHeader('Set-Cookie', existing ? [].concat(existing, value) : value);
+    },
+    localRequestCheck: createLocalRequestCheck(),
+    lockout: createAuthFailureLockout(),
+    logger: { log() {}, warn() {} },
+  });
+  const spies = {};
+  const relay = await startRelay(t, {
+    auth: relayAuth.auth,
+    spies,
+    mount: (app) => {
+      app.use(express.json());
+      app.post('/api/auth/session', relayAuth.signIn);
+    },
+  });
+  relay.addConversation('c1');
+  const names = ['n1.png', 'n2.png', 'n3.png', 'n4.png'];
+  relay.addMessage('m1', 'c1', { text: names.map((name) => relay.md(relay.file(name))).join(' ') });
+  const signIn = await relay.get('/api/auth/session', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({ deviceId: crypto.randomUUID() }),
+  });
+  assert.equal(signIn.status, 200);
+  const cookie = (signIn.headers.getSetCookie().find((line) => line.startsWith('copilot_auth=')) || '').split(';')[0];
+  const { proof } = await signIn.json();
+  const asCookie = { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'same-origin' } };
+  const asPage = { headers: { Cookie: cookie, 'X-OAR-Session-Proof': proof, 'Sec-Fetch-Site': 'same-origin' } };
+  const asOwner = { headers: { Authorization: `Bearer ${ownerToken}` } };
+
+  const listed = await relay.get('/api/media', asPage);
+  assert.equal(listed.status, 200);
+  const items = (await listed.json()).items;
+  assert.equal(items.length, names.length);
+  const ids = relay.db.prepare(`SELECT id FROM media_items ORDER BY id`).all().map((row) => row.id);
+  for (const item of items) assert.ok(item.contentUrl === relay.contentUrl(item.id), 'every address carries its tag');
+  const tagOf = (id) => new URL(relay.contentUrl(id), 'http://relay.invalid').searchParams.get('t');
+
+  // Sequential ids with the cookie alone, without a tag or with a wrong one:
+  // 404, as for an id that does not exist; the owner token and the page too.
+  for (const key of Object.keys(spies)) delete spies[key];
+  const last = Math.max(...ids);
+  const wrong = 'A'.repeat(22);
+  for (let id = 1; id <= last + 2; id += 1) {
+    for (const suffix of ['', '?t=', `?t=${wrong}`, `?t=${tagOf(id).slice(0, 21)}`, `?t=${tagOf(id)}x`]) {
+      for (const as of [asCookie, asPage, asOwner]) {
+        assert.equal((await relay.get(`/api/media/${id}/content${suffix}`, as)).status, 404, `${id}${suffix ? ' with a bad tag' : ' without a tag'}`);
+      }
+    }
+    // The tag of id n opens neither n + 1 nor n - 1.
+    for (const other of [id - 1, id + 1]) {
+      if (other < 1) continue;
+      assert.equal((await relay.get(`/api/media/${other}/content?t=${tagOf(id)}`, asCookie)).status, 404, `tag of ${id} on ${other}`);
+    }
+  }
+  assert.deepEqual(spies, {}, 'no look-up and no file call before the tag is checked');
+
+  // With its tag, each one opens on the cookie alone.
+  for (const id of ids) {
+    const response = await relay.get(relay.contentUrl(id), asCookie);
+    assert.equal(response.status, 200, `id ${id}`);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
+  }
+  assert.equal(spies.getMediaItem, ids.length);
+  // The tag is stable (the browser may keep the picture) and its own:
+  // another key (an agentKey rotated) makes other tags.
+  assert.equal(relay.contentUrl(ids[0]), relay.contentUrl(ids[0]));
+  const rotated = createMediaTags({ getKey: () => deriveMediaTagKey(crypto.randomBytes(32)) });
+  assert.notEqual(rotated.contentUrlFor(ids[0]), relay.contentUrl(ids[0]));
+  assert.equal((await relay.get(rotated.contentUrlFor(ids[0]), asCookie)).status, 404);
 });
 
 test('content of a deleted session is gone; every route needs the relay login', async (t) => {

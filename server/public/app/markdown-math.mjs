@@ -26,6 +26,10 @@
 //   its closer. One that opens at the end of a line ("So: $$") runs to a line
 //   that is the closer alone. One of `. , ; :` may follow the closer.
 // - Nothing but dots is no formula: `$...$` is talk about the notation.
+// - A bare `\begin{env}` at the start of a line, for an environment KaTeX
+//   sets as a display (align, cases, pmatrix …), is a display up to the line
+//   that ends with its `\end{env}`, nesting counted. `\begin{itemize}` and a
+//   `\begin` inside a sentence are text.
 // What KaTeX then refuses is shown as the source it was (router.js).
 
 const MAX_INLINE_CHARS = 1000;
@@ -45,6 +49,26 @@ const BLANK_REST = /^[ \t]*(?:\n|$)/;
 const FENCE_LINE = /^\s*(?:`{3,}|~{3,})/;
 const CLOSING_LINE = /^(.*?)(\$\$|\\\])([.,;:]?)[ \t]*$/;
 const MATH_FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*math[ \t]*(?:\n|$)/;
+const ENVIRONMENT_OPEN = /^\\begin\{([A-Za-z]+\*?)\}/;
+
+/**
+ * The environments the bundled KaTeX (0.19.1, src/environments) sets in
+ * display mode. A bare `\begin{…}` of any other name (document, itemize,
+ * tabular, multline) is text.
+ */
+export const MATH_ENVIRONMENTS = Object.freeze([
+  'equation', 'equation*',
+  'align', 'align*', 'aligned', 'split',
+  'alignat', 'alignat*', 'alignedat',
+  'gather', 'gather*', 'gathered',
+  'cases', 'dcases', 'rcases', 'drcases',
+  'matrix', 'pmatrix', 'bmatrix', 'Bmatrix', 'vmatrix', 'Vmatrix',
+  'matrix*', 'pmatrix*', 'bmatrix*', 'Bmatrix*', 'vmatrix*', 'Vmatrix*',
+  'smallmatrix', 'subarray',
+  'array', 'darray',
+  'CD',
+]);
+const MATH_ENVIRONMENT_SET = new Set(MATH_ENVIRONMENTS);
 
 function isSpace(char) {
   return char === undefined || char === '' || /\s/.test(char);
@@ -175,6 +199,57 @@ function matchDisplayOverLines(src, closer, { closerAlone = false, memo = null }
   return { raw: src.slice(0, hit.texEnd + closer.length), rawEnd: hit.end, tex, display: true, trail: hit.trail };
 }
 
+/** Whether the `\` at `index` is a command's own, not the second half of `\\`. */
+function commandAt(text, index) {
+  let backslashes = 0;
+  for (let i = index - 1; i >= 0 && text[i] === '\\'; i -= 1) backslashes += 1;
+  return backslashes % 2 === 0;
+}
+
+/**
+ * A bare environment, `src` starting with `\begin{env}` for one of
+ * MATH_ENVIRONMENTS: a display up to the line that ends with the matching
+ * `\end{env}` (environments of the same name inside it are counted; one of
+ * `. , ; :` may follow). A blank line, a code fence or the size cap ends the
+ * search, as for `$$`. The TeX is the source as written, `\begin` to `\end`.
+ * @returns {{ raw: string, rawEnd: number, tex: string, display: true, trail: string } | null}
+ */
+function matchEnvironment(src) {
+  const open = ENVIRONMENT_OPEN.exec(src);
+  if (!open || !MATH_ENVIRONMENT_SET.has(open[1])) return null;
+  const begin = `\\begin{${open[1]}}`;
+  const end = `\\end{${open[1]}}`;
+  let depth = 0;
+  let lineStart = 0;
+  while (lineStart < src.length && lineStart <= MAX_DISPLAY_CHARS) {
+    let lineEnd = src.indexOf('\n', lineStart);
+    if (lineEnd < 0) lineEnd = src.length;
+    const line = src.slice(lineStart, lineEnd);
+    if (lineStart > 0 && (!line.trim() || FENCE_LINE.test(line))) return null;
+    let at = 0;
+    while (at < line.length) {
+      const nextBegin = line.indexOf(begin, at);
+      const nextEnd = line.indexOf(end, at);
+      if (nextBegin < 0 && nextEnd < 0) break;
+      if (nextBegin >= 0 && (nextEnd < 0 || nextBegin < nextEnd)) {
+        if (commandAt(line, nextBegin)) depth += 1;
+        at = nextBegin + begin.length;
+        continue;
+      }
+      at = nextEnd + end.length;
+      if (!commandAt(line, nextEnd)) continue;
+      depth -= 1;
+      if (depth > 0) continue;
+      const closing = /^([.,;:]?)[ \t]*$/.exec(line.slice(at));
+      if (!closing) return null;
+      const texEnd = lineStart + at;
+      return { raw: src.slice(0, texEnd), rawEnd: lineEnd, tex: src.slice(0, texEnd), display: true, trail: closing[1] };
+    }
+    lineStart = lineEnd + 1;
+  }
+  return null;
+}
+
 /**
  * The formula `src` starts with, or null. `prev` is the character before it
  * ('' at the start of the text). `atLineStart` says whether only blanks stand
@@ -187,6 +262,13 @@ export function matchInlineMath(src, prev = '', { atLineStart = !prev || prev ==
   if (first !== '$' && first !== '\\') return null;
   if (!boundaryBefore(prev)) return null;
   const opener = text.slice(0, 2);
+
+  if (text.startsWith('\\begin{')) {
+    // A bare environment is a display only where it starts its line.
+    if (!atLineStart) return null;
+    const environment = matchEnvironment(text);
+    return environment ? { raw: environment.raw, tex: environment.tex, display: true } : null;
+  }
 
   if (opener === '\\(') {
     const close = findCloser(text, 2, '\\)', MAX_INLINE_CHARS, 1);
@@ -256,6 +338,18 @@ export function matchMathBlock(src) {
   const text = String(src ?? '');
   const fence = matchMathFence(text);
   if (fence) return fence;
+  const bare = /^ {0,3}(?=\\begin\{)/.exec(text);
+  if (bare) {
+    const environment = matchEnvironment(text.slice(bare[0].length));
+    if (!environment) return null;
+    return {
+      raw: text.slice(0, Math.min(text.length, bare[0].length + environment.rawEnd + 1)),
+      source: environment.raw,
+      tex: environment.tex,
+      display: true,
+      trail: environment.trail,
+    };
+  }
   const open = /^ {0,3}(\$\$|\\\[)/.exec(text);
   if (!open) return null;
   const closer = open[1] === '$$' ? '$$' : '\\]';
@@ -284,7 +378,8 @@ export function texForKatex(tex) {
 /** Whether `source` holds anything a formula could start with. */
 export function sourceHasMathDelimiters(source) {
   const text = String(source ?? '');
-  return text.includes('$') || text.includes('\\(') || text.includes('\\[') || /(?:`{3,}|~{3,})[ \t]*math/.test(text);
+  return text.includes('$') || text.includes('\\(') || text.includes('\\[') || text.includes('\\begin{')
+    || /(?:`{3,}|~{3,})[ \t]*math/.test(text);
 }
 
 /** Maths applies to `source`: it has a delimiter and is not over the size cap. */
@@ -354,11 +449,16 @@ function inlineMathTokenizer(src, tokens) {
   return match ? { type: 'mathInline', ...match } : undefined;
 }
 
-/** The index of the next `$`, `\(` or `\[` in `src`, or undefined. */
+function opensAt(src, index) {
+  const next = src[index + 1];
+  return next === '(' || next === '[' || src.startsWith('\\begin{', index);
+}
+
+/** The index of the next `$`, `\(`, `\[` or `\begin{` in `src`, or undefined. */
 function nextOpenerIndex(src) {
   const dollar = src.indexOf('$');
   let backslash = src.indexOf('\\');
-  while (backslash >= 0 && (dollar < 0 || backslash < dollar) && src[backslash + 1] !== '(' && src[backslash + 1] !== '[') {
+  while (backslash >= 0 && (dollar < 0 || backslash < dollar) && !opensAt(src, backslash)) {
     // `\\(` is an escaped backslash before a parenthesis, not an opener.
     backslash = src.indexOf('\\', backslash + (src[backslash + 1] === '\\' ? 2 : 1));
   }

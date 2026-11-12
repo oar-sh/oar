@@ -7,6 +7,7 @@ import { createSessionRepository } from '../repositories/session-repository.mjs'
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createImageConversationRepository } from '../repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { asOwner } from '../services/relay-principal-test-harness.mjs';
 
 // update_session `image`: an OpenAI image session's defaults, stored per
 // conversation (image_sessions.defaults_json) through PATCH
@@ -103,7 +104,7 @@ function setup({ modelState = CATALOG, openAISettings = OPENAI_ON } = {}) {
       status(code) { captured.status = code; return res; },
       json(payload) { captured.body = payload; return res; },
     };
-    await handler({ body, headers: {}, query, params, socket: {} }, res);
+    await handler(asOwner({ body, headers: {}, query, params, socket: {} }), res);
     return captured;
   };
   const bootstrap = (body) => call('POST /api/conversation/bootstrap', { body: { title: 'Poster draft', relayMode: 'agent', ...body } });

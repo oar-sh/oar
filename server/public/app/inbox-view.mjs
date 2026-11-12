@@ -12,6 +12,9 @@
 // inbox-view.test.mjs asserts they match.
 
 import { boardOutcomeLine } from './relay-board-inline.mjs';
+import { ANSWER_THERE_QID_PATTERN, answerThereUrl } from './remote-relay-links.mjs';
+
+export { answerThereUrl };
 
 export const RELAY_ASK_SOCKET_EVENT = 'relay_ask_updated';
 export const INBOX_REMOTE_CHANGED_EVENT = 'inbox_remote_changed';
@@ -113,8 +116,13 @@ export function inboxSections(relays, { filter = 'all', now = Date.now() } = {})
         name: toText(relay?.name) || toText(relay?.id),
         self: relay?.self === true,
         url: toText(relay?.url),
+        // Its page answers `?answer=` (capabilities.answerLink): popup buttons.
+        answerLink: relay?.answerLink === true,
         reachable: relay?.reachable !== false,
         error: toText(relay?.error),
+        // A relay that shares no Inbox with this one by design (added one
+        // way): one quiet line, no "Not reachable".
+        note: toText(relay?.note),
       },
       pending,
       closed,
@@ -285,10 +293,90 @@ function outcomeLine(doc, item, mode = 'inbox') {
 }
 
 /**
+ * A paired relay's pending item, answered on that relay by its person:
+ * "Open there" opens that relay's web UI on the item's session (`?conv=`),
+ * or a note when the relay gave no address.
+ */
+function openThereActions(doc, item, relay) {
+  const url = inboxSessionUrl(relay?.url, item?.session?.id);
+  const actions = el(doc, 'div', 'inbox-item-actions');
+  if (url) {
+    const link = el(doc, 'a', 'inbox-open-there inbox-open-there-button', 'Open there');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.title = `Answer it on ${toText(relay?.name) || 'that relay'}`;
+    actions.append(link);
+  } else {
+    actions.append(el(doc, 'span', 'inbox-item-note', 'Answer it on that relay.'));
+  }
+  return actions;
+}
+
+/**
+ * Whether a paired relay's pending item gets option buttons that open it on
+ * that relay in a popup (agent auth §13.2, 1a): the relay says its page
+ * takes `?answer=` (answerLink), and the item is an ask, a plain ask_user
+ * card with options, or an approval. A plan card, a card with fields and a
+ * multi-select card keep "Open there" alone.
+ */
+export function canAnswerThere(item, relay) {
+  if (!relay || relay.self || relay.answerLink !== true) return false;
+  if (toText(item?.status) !== 'pending') return false;
+  if (!ANSWER_THERE_QID_PATTERN.test(toText(item?.id))) return false;
+  const kind = toText(item?.kind);
+  if (kind === 'plan' || kind === 'relay_notice' || item?.structured || item?.multiSelect) return false;
+  // A paired relay's approval comes without its choices: one button, the
+  // choice is made there.
+  if (kind === 'approval') return true;
+  return Array.isArray(item?.options) && item.options.some((option) => toText(option));
+}
+
+/**
+ * The popup buttons of `canAnswerThere`: one per option (that option
+ * preselected there, nothing answered by the click), or one "Answer there"
+ * for an approval, then "answers on <relay>" and "Open there". Null when no
+ * address can be built.
+ */
+function answerThereActions(doc, item, relay) {
+  const options = Array.isArray(item?.options) ? item.options.map(toText).filter(Boolean) : [];
+  const relayName = toText(relay?.name) || 'that relay';
+  const data = { inboxAction: 'answer-there', relayId: relay?.id, itemId: item?.id };
+  const wrap = el(doc, 'div', 'inbox-answer-there');
+  const row = el(doc, 'div', 'inbox-item-options');
+  if (options.length && toText(item?.kind) !== 'approval') {
+    for (const [index, option] of options.entries()) {
+      const url = answerThereUrl(relay?.url, item?.id, index);
+      if (!url) return null;
+      const node = button(doc, 'inbox-choice inbox-answer-there-choice', option, { ...data, option: index, url });
+      node.setAttribute('aria-label', `${option} (answers on ${relayName}, in a new window)`);
+      row.append(node);
+    }
+  } else {
+    const url = answerThereUrl(relay?.url, item?.id);
+    if (!url) return null;
+    const node = button(doc, 'inbox-choice inbox-answer-there-choice', 'Answer there', { ...data, url });
+    node.setAttribute('aria-label', `Answer on ${relayName}, in a new window`);
+    row.append(node);
+  }
+  wrap.append(row);
+  const actions = openThereActions(doc, item, relay);
+  actions.prepend(el(doc, 'span', 'inbox-answer-there-hint', `answers on ${relayName}`));
+  wrap.append(actions);
+  return wrap;
+}
+
+/** "Open there", or the popup buttons and "Open there" when the item can be answered in one. */
+function remoteActions(doc, item, relay) {
+  return (canAnswerThere(item, relay) && answerThereActions(doc, item, relay)) || openThereActions(doc, item, relay);
+}
+
+/**
  * A question that does not block, as a card: in the Inbox (`mode` "inbox",
  * with its session and relay), in its session ("session") or in the
  * session's 📓 panel ("panel": its Details open). `answerable`: the buttons
- * answer it (this relay's, or a paired relay's ask).
+ * answer it (this relay's ask, or a paired relay's while the pairing carries
+ * answers); a paired relay's ask that is not shows "Open there" instead.
  */
 export function buildAskCard(doc, item, { relay = null, mode = 'inbox', now = Date.now(), answerable = true } = {}) {
   const card = el(doc, 'article', `inbox-item inbox-ask${mode === 'session' ? ' relay-ask-card' : ''}`);
@@ -315,6 +403,11 @@ export function buildAskCard(doc, item, { relay = null, mode = 'inbox', now = Da
   }
   const outcome = outcomeLine(doc, item, mode);
   if (outcome) card.append(outcome);
+  // A paired relay's ask this relay may not answer: read-only, "Open there".
+  if (item.status === 'pending' && !answerable && relay && !relay.self && mode === 'inbox') {
+    card.append(remoteActions(doc, item, relay));
+    return card;
+  }
   if (item.status === 'pending' && answerable) {
     const data = { relayId: relay?.id || 'self', itemId: item.id };
     if (options.length) {
@@ -374,18 +467,7 @@ export function buildCardItem(doc, item, { relay = null, now = Date.now() } = {}
   if (outcome) card.append(outcome);
   if (item.status !== 'pending') return card;
   if (!relay?.self) {
-    const url = inboxSessionUrl(relay?.url, item?.session?.id);
-    const actions = el(doc, 'div', 'inbox-item-actions');
-    if (url) {
-      const link = el(doc, 'a', 'inbox-open-there inbox-open-there-button', 'Open there');
-      link.href = url;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      actions.append(link);
-    } else {
-      actions.append(el(doc, 'span', 'inbox-item-note', 'Answer it on that relay.'));
-    }
-    card.append(actions);
+    card.append(remoteActions(doc, item, relay));
     return card;
   }
   const options = Array.isArray(item.options) ? item.options.map(toText).filter(Boolean) : [];
@@ -444,18 +526,7 @@ export function buildPlanItem(doc, item, { relay = null, now = Date.now() } = {}
     return card;
   }
   if (!relay?.self) {
-    const url = inboxSessionUrl(relay?.url, item?.session?.id);
-    const actions = el(doc, 'div', 'inbox-item-actions');
-    if (url) {
-      const link = el(doc, 'a', 'inbox-open-there inbox-open-there-button', 'Open there');
-      link.href = url;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      actions.append(link);
-    } else {
-      actions.append(el(doc, 'span', 'inbox-item-note', 'Answer it on that relay.'));
-    }
-    card.append(actions);
+    card.append(openThereActions(doc, item, relay));
     return card;
   }
   const recommended = toText(item.recommendedAction).toLowerCase();
@@ -472,14 +543,40 @@ export function buildPlanItem(doc, item, { relay = null, now = Date.now() } = {}
   return card;
 }
 
-function buildItem(doc, item, relay, now) {
-  if (item.kind === 'ask') return buildAskCard(doc, item, { relay, now, mode: 'inbox', answerable: true });
+/**
+ * This relay's own notice of a paired relay's refused claim (origin binding):
+ * what happened, a way to the relay's entry in Settings → Relays, Dismiss.
+ */
+function buildRelayNoticeItem(doc, item, { relay, now }) {
+  const card = el(doc, 'article', 'inbox-item inbox-relay-notice');
+  card.dataset.kind = 'relay_notice';
+  card.dataset.itemId = toText(item.id);
+  card.append(headLine(doc, item, { relay, now, label: 'Relay notice' }));
+  card.append(el(doc, 'p', 'inbox-item-question', toText(item.question)));
+  if (toText(item.detail)) card.append(el(doc, 'p', 'inbox-item-detail', toText(item.detail)));
+  const row = el(doc, 'div', 'inbox-item-actions');
+  row.append(button(doc, 'inbox-choice inbox-relay-notice-open', 'Open Settings → Relays', { inboxAction: 'relay-settings', relayEntryId: toText(item.relayEntryId) }));
+  row.append(button(doc, 'inbox-dismiss inbox-relay-notice-dismiss', 'Dismiss', { inboxAction: 'relay-notice-dismiss', relayEntryId: toText(item.relayEntryId) }));
+  card.append(row);
+  return card;
+}
+
+function buildItem(doc, item, relay, now, pairedAnswers = false) {
+  if (item.kind === 'relay_notice') return buildRelayNoticeItem(doc, item, { relay, now });
+  if (item.kind === 'ask') {
+    const answerable = relay?.self === true || pairedAnswers === true;
+    return buildAskCard(doc, item, { relay, now, mode: 'inbox', answerable });
+  }
   if (item.kind === 'plan') return buildPlanItem(doc, item, { relay, now });
   return buildCardItem(doc, item, { relay, now });
 }
 
-/** The whole Inbox: the filter, then one group per relay. */
-export function renderInbox(doc, { relays = [], filter = 'all', now = Date.now(), loading = false } = {}) {
+/**
+ * The whole Inbox: the filter, then one group per relay. `pairedAnswers`
+ * (GET /api/inbox): a paired relay's asks are answered from here; off (the
+ * default), they show read-only with "Open there".
+ */
+export function renderInbox(doc, { relays = [], filter = 'all', now = Date.now(), loading = false, pairedAnswers = false } = {}) {
   const root = el(doc, 'section', 'status-view inbox-view');
   root.setAttribute('aria-label', 'Inbox');
   const bar = el(doc, 'div', 'inbox-filter');
@@ -504,15 +601,20 @@ export function renderInbox(doc, { relays = [], filter = 'all', now = Date.now()
       continue;
     }
     if (!section.pending.length && !section.closed.length) {
+      if (!section.relay.self && section.relay.note) {
+        group.append(el(doc, 'p', 'inbox-empty inbox-relay-note', section.relay.note));
+        root.append(group);
+        continue;
+      }
       if (!section.relay.self) continue;
       group.append(el(doc, 'p', 'inbox-empty', loading ? 'Loading…' : 'Nothing waits for you here.'));
     }
-    for (const item of section.pending) group.append(buildItem(doc, item, section.relay, now));
+    for (const item of section.pending) group.append(buildItem(doc, item, section.relay, now, pairedAnswers));
     if (section.closed.length) {
       const divider = el(doc, 'div', 'inbox-divider', 'Answered in the last day');
       divider.setAttribute('role', 'separator');
       group.append(divider);
-      for (const item of section.closed) group.append(buildItem(doc, item, section.relay, now));
+      for (const item of section.closed) group.append(buildItem(doc, item, section.relay, now, pairedAnswers));
     }
     anything = anything || section.pending.length > 0 || section.closed.length > 0;
     root.append(group);

@@ -1,5 +1,6 @@
 'use strict';
 
+import { timingSafeEqual } from 'node:crypto';
 import { URL } from 'url';
 import { normalizeBuildId } from '../../shared/build-id.mjs';
 
@@ -21,33 +22,42 @@ export function buildAcceptedWorkerPaths(pathPrefix) {
   return Array.from(new Set([basePath, prefixed]));
 }
 
-function parseCookies(header) {
-  const out = {};
-  for (const part of String(header || '').split(/;\s*/)) {
-    if (!part) continue;
-    const idx = part.indexOf('=');
-    if (idx < 0) continue;
-    const key = part.slice(0, idx).trim();
-    const value = part.slice(idx + 1).trim();
-    if (!key) continue;
-    out[key] = decodeURIComponent(value);
+// The worker's credential: `Authorization: Bearer …` on the upgrade. Never
+// the browser cookie (the worker socket is no browser's, agent auth §2.2).
+// A `?token=` (a token in a URL ends up in logs) counts only as the owner
+// token of a worker started before agent tokens, which has no other way to
+// send it and would otherwise be stranded after the upgrade; an agent token
+// there is refused. A new owner token closes those sockets and ends that.
+// TRANSITIONAL: this `?token=` is removed in the next version. Until then
+// every use is logged by the credential's shape, never its value, and the
+// upgrade's URL loses the value before anything else can log it
+// (redactTokenQuery).
+function readAuthTokenFromUpgrade(req) {
+  const header = req?.headers?.authorization;
+  const value = String((Array.isArray(header) ? header[0] : header) || '').replace(/^Bearer(?:\s+|$)/i, '').trim();
+  if (value) return { token: value, viaQuery: false };
+  const host = String(req?.headers?.host || 'localhost');
+  let query = null;
+  try {
+    query = normalizeText(new URL(String(req?.url || ''), `http://${host}`).searchParams.get('token'));
+  } catch {
+    query = null;
   }
-  return out;
+  return query ? { token: query, viaQuery: true } : { token: null, viaQuery: false };
 }
 
-function readAuthTokenFromUpgrade(req) {
-  const host = String(req?.headers?.host || 'localhost');
-  let parsedUrl = null;
-  try {
-    parsedUrl = new URL(String(req?.url || ''), `http://${host}`);
-  } catch {
-    parsedUrl = null;
-  }
-  const authHeader = String(req?.headers?.authorization || '').replace(/^Bearer\s+/i, '').trim();
-  const queryToken = normalizeText(parsedUrl?.searchParams?.get('token'));
-  const cookies = parseCookies(req?.headers?.cookie);
-  const cookieToken = normalizeText(cookies.copilot_auth);
-  return authHeader || queryToken || cookieToken || null;
+const TOKEN_QUERY_PATTERN = /([?&]token=)[^&#]*/gi;
+const TOKEN_QUERY_TEST = /[?&]token=/i;
+
+/** A request URL with every `token=` value replaced, for anything that logs it. */
+export function redactTokenQuery(url) {
+  return String(url ?? '').replace(TOKEN_QUERY_PATTERN, '$1[redacted]');
+}
+
+/** What a credential looks like, for a log line: its prefix, or that it has none. */
+export function credentialShape(token) {
+  const prefix = /^oar[a-z]1_/.exec(String(token || ''));
+  return prefix ? `${prefix[0]}…` : 'an unprefixed value';
 }
 
 function normalizeQueueSnapshot(value) {
@@ -105,6 +115,13 @@ export const WORKER_PROTOCOL_CAPABILITIES = Object.freeze(['worker-unready', 'st
 export function createSessionWorkerWebSocketService({
   WebSocketServerImpl,
   httpServer,
+  // `authorizeUpgrade({ token, sessionId })`, asked on every upgrade (never
+  // captured at start): false to refuse, true for a credential that may open
+  // any session's socket (a legacy owner token), or `(sessionId) => boolean`
+  // for one bound to a session (an agent token), which the socket's later
+  // identity frames must keep to. Without it, `authToken` is compared in
+  // constant time.
+  authorizeUpgrade = null,
   authToken,
   queueCounts,
   touchCli = () => {},
@@ -229,6 +246,14 @@ export function createSessionWorkerWebSocketService({
       || (meta.pid && claimedPid && claimedPid !== meta.pid)) {
       logWarn(`[worker-ws] identity rebind rejected for ${String(meta.sessionId || 'unknown').slice(0, 8)} claimed=${String(claimedSessionId || 'none').slice(0, 8)}`);
       removeSocket(ws, 'identity-rebind');
+      try { ws.close(); } catch {}
+      return false;
+    }
+    // A socket opened with a session-bound credential binds only to that
+    // session (an agent token of one conversation never serves another).
+    if (!meta.sessionId && claimedSessionId && typeof meta.mayBind === 'function' && meta.mayBind(claimedSessionId) !== true) {
+      logWarn(`[worker-ws] identity bind rejected: the token is not this session's (claimed=${String(claimedSessionId).slice(0, 8)})`);
+      removeSocket(ws, 'identity-unauthorized');
       try { ws.close(); } catch {}
       return false;
     }
@@ -526,13 +551,52 @@ export function createSessionWorkerWebSocketService({
     return acceptedPaths.includes(pathname);
   }
 
+  // null to refuse; else `{ mayBind }` (null: any session).
+  function upgradeAuthorization({ token, viaQuery }, identity) {
+    if (typeof authorizeUpgrade === 'function') {
+      let answer = false;
+      try {
+        answer = authorizeUpgrade({ token: String(token || ''), sessionId: identity?.sessionId || '' });
+      } catch {
+        answer = false;
+      }
+      // true: a credential for any session, the owner token of a worker
+      // started before agent tokens. A rotation drops those sockets.
+      if (answer === true) return { mayBind: null, ownerToken: true };
+      // An agent token is taken from the header only.
+      if (viaQuery) return null;
+      if (typeof answer !== 'function') return null;
+      if (identity?.sessionId && answer(identity.sessionId) !== true) return null;
+      return { mayBind: answer };
+    }
+    const presented = Buffer.from(String(token || ''), 'utf8');
+    const expected = Buffer.from(String(authToken || ''), 'utf8');
+    const ok = presented.length > 0 && presented.length === expected.length && timingSafeEqual(presented, expected);
+    return ok ? { mayBind: null, ownerToken: true } : null;
+  }
+  const upgradeAuthorizations = new WeakMap();
+
   function handleUpgrade(req, socket, head) {
     if (!matchesPath(req)) return false;
-    const token = readAuthTokenFromUpgrade(req);
-    if (String(token || '') !== String(authToken || '')) {
+    const presented = readAuthTokenFromUpgrade(req);
+    // The URL keeps no token value past this point (ws, its errors, the
+    // connection handler and every log see the redacted one).
+    if (TOKEN_QUERY_TEST.test(String(req?.url || ''))) {
+      try { req.url = redactTokenQuery(req.url); } catch {}
+    }
+    const identity = parseUpgradeIdentity(req);
+    const authorization = upgradeAuthorization(presented, identity);
+    if (presented.viaQuery) {
+      const who = `${String(identity.sessionId || 'unknown').slice(0, 8)} pid=${identity.pid || 'unknown'}`;
+      logWarn(authorization
+        ? `[worker-ws] worker ${who} opened its socket with the owner token in the URL (?token=, ${credentialShape(presented.token)}): a worker started before agent tokens. Transitional, removed in the next version; restarting the worker moves it to its agent token.`
+        : `[worker-ws] worker ${who} refused: a ?token= in the URL (${credentialShape(presented.token)}) is taken only as an old worker's owner token. Transitional, removed in the next version.`);
+    }
+    if (!authorization) {
       rejectUpgrade(socket);
       return true;
     }
+    upgradeAuthorizations.set(req, authorization);
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
@@ -545,6 +609,8 @@ export function createSessionWorkerWebSocketService({
     clientState.set(ws, {
       sessionId: identity.sessionId,
       pid: identity.pid,
+      mayBind: upgradeAuthorizations.get(req)?.mayBind || null,
+      ownerToken: upgradeAuthorizations.get(req)?.ownerToken === true,
       ready: false,
       delivering: false,
       connectedAt: nowIso(),
@@ -747,10 +813,26 @@ export function createSessionWorkerWebSocketService({
     return false;
   }
 
+  /**
+   * The owner token was replaced: the sockets that opened with it (workers
+   * started before agent tokens) close now, as the old token no longer
+   * opens anything. Sockets opened with an agent token stay. The count.
+   */
+  function dropOwnerTokenSockets() {
+    let dropped = 0;
+    for (const socket of [...clients]) {
+      if (clientState.get(socket)?.ownerToken !== true) continue;
+      try { socket.close(4001, 'owner token replaced'); } catch {}
+      dropped += 1;
+    }
+    return dropped;
+  }
+
   return {
     start,
     stop,
     status,
+    dropOwnerTokenSockets,
     emitQueueChanged,
     notifyQueueChanged,
     emitDraining,

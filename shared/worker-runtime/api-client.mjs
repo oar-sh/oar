@@ -86,6 +86,8 @@ function requestWithoutTimeout({ url, method, headers, payload, signal }) {
   });
 }
 
+// `token`: the relay credential (an agent token), or a function that returns
+// it, asked on every request (a token that only exists once the relay ran).
 export function createApiClient({ serverUrl, token, getHeaders }) {
   /**
    * `options.longCall`: a call the relay may legitimately hold open for many
@@ -98,7 +100,7 @@ export function createApiClient({ serverUrl, token, getHeaders }) {
     const extraHeaders = typeof getHeaders === "function" ? (getHeaders() || {}) : {};
     const headers = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${typeof token === "function" ? (token() || "") : token}`,
       ...extraHeaders,
     };
     const payload = method !== "GET" ? JSON.stringify(body || {}) : undefined;

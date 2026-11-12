@@ -59,6 +59,10 @@ import { createRemoteRelayClient } from './services/remote-relay-client.mjs';
 import { createRemoteRelayLoopbackClient } from './services/remote-relay-loopback.mjs';
 import { createRemoteRelayRegistry } from './services/remote-relay-registry-service.mjs';
 import { createRemoteRelayPairing } from './services/remote-relay-pairing.mjs';
+import { createPeerKeyService } from './services/remote-relay-peer-keys.mjs';
+import { INBOX_REMOTE_CHANGED_EVENT } from '../shared/relay-asks.mjs';
+import { originCarriesWeight as remoteOriginCarriesWeight } from './services/remote-relay-inbound.mjs';
+import { parseRemoteRelayOriginJson } from './repositories/remote-relay-repository.mjs';
 import { createRemoteRelayCallerContext } from './services/remote-relay-caller-context.mjs';
 import { createRemoteRelayDispatcher } from './services/remote-relay-dispatcher.mjs';
 import { createDeleteArchiveService } from './services/delete-archive-service.mjs';
@@ -81,7 +85,7 @@ import { createClaudeBillingSwitchService, normalizeClaudeBilling } from './serv
 import { createClaudeBillingSwapService } from './services/claude-billing-swap-service.mjs';
 import { createWorkerReplacement, createWorkerReplacementFence } from './services/worker-replacement.mjs';
 import { sessionLaunchMutex } from './services/session-launch-mutex-service.mjs';
-import { createWorkerRecycleService, sweepArchivedWorkers } from './services/worker-recycle-service.mjs';
+import { createWorkerRecycleService, sweepArchivedWorkers, workerRecycleStuckNoteText } from './services/worker-recycle-service.mjs';
 import { createClaudeApiUsageService } from './services/claude-api-usage-service.mjs';
 import { createTokenUsageService } from './services/token-usage-service.mjs';
 import { createOpenAIImageSpendService } from './services/openai-image-spend-service.mjs';
@@ -160,9 +164,12 @@ import { createCursorSessionRootResolver } from './services/cursor-session-root-
 import { createGitChangesService } from './services/git-changes-service.mjs';
 import { createRelaySingletonGuard } from './services/relay-singleton-guard.mjs';
 import { startRelayMemoryLog } from './relay-heap-guard.mjs';
-import { TAKEOVER_PROGRESS_FILE, adoptEarlierDatabase, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
+import { TAKEOVER_PROGRESS_FILE, adoptEarlierDatabase, earlierDatabaseFolders, lostPackageDatabaseWarning, packageDatabaseEvidence } from './services/earlier-database-service.mjs';
 import { checkDatabaseFile, resolveDatabaseFile, settleDatabaseFile } from './services/database-file.mjs';
-import { describeBackups, describeNextBackup, maybeBackupBeforeStart, writeDbLastRun } from './services/db-backup-service.mjs';
+import { describeBackups, describeNextBackup, maybeBackupBeforeStart, resolveBackupDir, writeDbLastRun } from './services/db-backup-service.mjs';
+import { createFileCapabilities } from './services/file-capability.mjs';
+import { createMediaTags } from './services/media-tag.mjs';
+import { createProtectedRelayFiles } from './services/relay-protected-files.mjs';
 import { resolveStateLayout } from './services/oar-state-layout.mjs';
 import { ensureDataDirs, resolveDataDir, resolveUploadDir, resolveUploadReadDirs, uploadPathInDirs } from './services/data-dir-resolution.mjs';
 import { mergeStrayMigratedUploads } from './services/oar-state-migration-service.mjs';
@@ -171,7 +178,7 @@ import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-ser
 import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
 import { createSessionWorkerRegistry, normalizeWorkerKind } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
-import { createSessionWorkerProcessInspector } from './services/session-worker-process-service.mjs';
+import { createProcessIdentityReader, createSessionWorkerProcessInspector, identityOfListedWorker, mayReuseSessionWorkerRow } from './services/session-worker-process-service.mjs';
 import { agentSdkForWorkerKind, applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli, resolveWorkerKind } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
@@ -191,6 +198,17 @@ import {
   resolveTunnelMarkerHeaders,
 } from './services/request-boundary.mjs';
 import { createRelayAuth } from './services/relay-auth.mjs';
+// A malformed `%` skips that cookie; a name sent twice keeps the first.
+import { parseCookies } from './services/cookie-header.mjs';
+import { createBrowserSessionService, createSignInCodes } from './services/browser-session-service.mjs';
+import { createSessionRevocationEffects, registerAuthRoutes, requestBaseUrl } from './routes/auth-routes.mjs';
+import { createSignInNoticeService, signInNoticeRecipients } from './services/signin-notice-service.mjs';
+import { createOwnerTokenUseTracker } from './services/owner-token-use.mjs';
+import { qrMatrix } from './services/qr-matrix.mjs';
+import { injectAppConfig } from './services/app-shell-config.mjs';
+import { RELAY_SECRETS_UNREADABLE, announceGeneratedToken, createOwnerSecretStore } from './services/owner-secret-store.mjs';
+import { principalOf } from './services/relay-principal.mjs';
+import { AGENT_TOKEN_ENV, AGENT_TOKEN_KINDS, AGENT_TOKEN_PREFIX, isRelayCredential } from '../shared/relay-credentials.mjs';
 import { guardUpgradeSocket } from './services/upgrade-socket-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createWindowsBootAutostartService } from './services/windows-boot-autostart-service.mjs';
@@ -1562,8 +1580,9 @@ async function refreshGrokProviderModels() {
   }
 }
 
+// No authToken: the owner token lives as a hash in <dataDir>/relay-secrets.json
+// (services/owner-secret-store.mjs).
 const DEFAULT_CONFIG = {
-  authToken: '',
   port: 3333,
   pollIntervalMs: 3000,
   conversationSessionMode: 'isolated',
@@ -1930,24 +1949,52 @@ const CURATED_MODEL_IDS = [
 ];
 
 let config = { ...DEFAULT_CONFIG };
-relayConsoleLog?.setSecrets(() => [config.authToken]);
 if (fs.existsSync(CONFIG_PATH)) {
   try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) }; }
   catch (e) { console.error('Failed to read config.json, using defaults.'); }
 } else {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
-// config.json stores the auth token in plaintext; keep it owner-only regardless
-// of how it was created (umask, an older build, or a manual edit). Best-effort:
+// Keep config.json owner-only regardless of how it was created (umask, an
+// older build that kept the token there, or a manual edit). Best-effort:
 // chmod is a no-op on filesystems that don't support POSIX modes.
 try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
 
-// --token <value> on the command line overrides config.json (in-memory only, not persisted)
-const tokenArgIdx = process.argv.indexOf('--token');
-if (tokenArgIdx !== -1 && process.argv[tokenArgIdx + 1]) {
-  config.authToken = process.argv[tokenArgIdx + 1];
-  console.log(`[server] Auth token set via --token argument (not persisted to config.json)`);
+// The owner token: a hash in <dataDir>/relay-secrets.json. The first start of
+// this version moves it out of config.json (and relay-previous.json), or out
+// of a `--token <value>` when the config has none. Once the file exists a
+// `--token` is ignored with a warning (argv is visible to local processes,
+// and a supervisor of an earlier version passes its old one on to every
+// restart); the person is asked to stop and start the relay once. Nothing
+// below reads a plain owner token again.
+const ownerSecretStore = createOwnerSecretStore({ dataDir: DATA_DIR, logger: console });
+{
+  const tokenArgIdx = process.argv.indexOf('--token');
+  const argvToken = tokenArgIdx !== -1 ? String(process.argv[tokenArgIdx + 1] || '') : '';
+  let boot;
+  try {
+    boot = ownerSecretStore.bootstrap({
+      config,
+      configPath: CONFIG_PATH,
+      argvToken,
+      previousPath: path.join(DATA_DIR, 'relay-previous.json'),
+    });
+  } catch (error) {
+    // A secrets file that exists but cannot be read is never replaced: the
+    // relay stops on purpose (the supervisors do not retry this code).
+    if (error?.code !== RELAY_SECRETS_UNREADABLE) throw error;
+    console.error(`[startup] ${error.message} Exiting with code ${RELAY_STOP_EXIT_CODE}.`);
+    process.exit(RELAY_STOP_EXIT_CODE);
+  }
+  // The legacy value is known on this boot only: it is redacted from the log
+  // by value; prefixed credentials are redacted by their shape.
+  const legacy = ownerSecretStore.legacyTokenThisBoot();
+  const argvSecret = argvToken.trim();
+  relayConsoleLog?.setSecrets(() => [legacy, argvSecret].filter(Boolean));
+  // Shown once, and only to a terminal (owner-secret-store.mjs).
+  announceGeneratedToken(boot.generatedToken, { isTTY: Boolean(process.stdout.isTTY) });
 }
+delete config.authToken;
 
 // --port <number> on the command line overrides config.json (in-memory only, not persisted)
 const portArgIdx = process.argv.indexOf('--port');
@@ -1970,12 +2017,6 @@ if (managedOwnerPid) {
   console.log(`[server] Managed owner PID watchdog enabled: ${managedOwnerPid}`);
 }
 
-// Generate a random token if none is provided and token not given on CLI
-if (!config.authToken || config.authToken === DEFAULT_CONFIG.authToken) {
-  config.authToken = uuidv4();
-  console.log(`[server] Generated random auth token (in-memory only): ${config.authToken}`);
-}
-
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -1990,7 +2031,8 @@ function isProcessAlive(pid) {
 const relaySingletonGuard = createRelaySingletonGuard({
   lockPath: RELAY_LOCK_PATH,
   pid: process.pid,
-  token: config.authToken,
+  // The SHA-256 of the owner token, as the lock always stored it.
+  tokenHash: ownerSecretStore.ownerTokenHash(),
   logger: console,
 });
 try {
@@ -2032,7 +2074,7 @@ let earlierDatabase;
       configPath: CONFIG_PATH,
       packageRoot: REPO_ROOT,
       Database,
-      authToken: config.authToken,
+      ownerTokenHash: ownerSecretStore.ownerTokenHash(),
       logger: console,
     });
   } catch (error) {
@@ -2538,6 +2580,36 @@ function resolveConversationRecord({ conversationId = '', sdkSessionId = '' } = 
   const sid = String(sdkSessionId || '').trim();
   if (!sid || typeof stmts.getConvBySdkSessionId?.get !== 'function') return null;
   return stmts.getConvBySdkSessionId.get(sid) || null;
+}
+
+// One conversation, whichever id names it (its own or its SDK session's):
+// an agent token's subject is a conversation id, a worker names its session.
+function conversationIdOf(id) {
+  const text = String(id || '').trim();
+  if (!text) return '';
+  const record = resolveConversationRecord({ conversationId: text, sdkSessionId: text });
+  if (record?.id) return String(record.id);
+  // A session id the runtime binding knows before the conversation row does.
+  let runtimeSession = null;
+  try { runtimeSession = stmts.getRuntimeSessionBySdkSessionId?.get?.(text) || null; } catch {}
+  return String(runtimeSession?.conversation_id || text);
+}
+function sameConversation(left, right) {
+  const a = String(left || '').trim();
+  const b = String(right || '').trim();
+  if (!a || !b) return false;
+  return a === b || conversationIdOf(a) === conversationIdOf(b);
+}
+// The agent token a session's processes get (OAR_AGENT_TOKEN), bound to its
+// conversation; '' when the relay has no agent key.
+function agentTokenForConversation(id) {
+  const conversationId = conversationIdOf(id);
+  if (!conversationId) return '';
+  try {
+    return ownerSecretStore.mintAgentToken({ kind: AGENT_TOKEN_KINDS.session, subject: conversationId });
+  } catch {
+    return '';
+  }
 }
 
 function isConversationSessionRunning(sdkSessionId) {
@@ -3257,6 +3329,9 @@ const activeDeviceTracker = createActiveDeviceTracker({
 const pushDispatchService = createPushDispatchService({
   db,
   webpush,
+  // Origin binding: only a turn whose origin carries weight skips the
+  // "reply ready" push (the registry is declared further down).
+  originCarriesWeight: (json) => remoteOriginCarriesWeight(parseRemoteRelayOriginJson(json), (id) => remoteRelayRegistry.get(id)),
   hasActiveDevice: () => activeDeviceTracker.hasActiveDevice(),
   recordStatusEvent: (type, details) => statusEventService.recordEvent(type, details),
   uuid: uuidv4,
@@ -3296,6 +3371,13 @@ const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   execFileSyncImpl: execFileSync,
   execFileImpl: execFile,
   logger: console,
+});
+// What the process at a pid is (its start time and command line): a pid is
+// handed out again once its process ends, and the worker recycle and the
+// stop must not take another process for a session's worker.
+const readWorkerProcessIdentity = createProcessIdentityReader({
+  platform: process.platform,
+  readProcessSnapshot: (options) => sessionWorkerProcessInspector.readProcessSnapshot(options),
 });
 function buildSessionWorkerLaunchEnv() {
   const normalizePathValue = (value) => {
@@ -3349,6 +3431,9 @@ function buildSessionWorkerLaunchEnv() {
   };
 
   const next = { ...process.env };
+  // Each session gets its own agent token (buildSessionWorkerLaunchEnvWithAgentToken);
+  // one this relay inherited (started from an agent's shell) is never passed on.
+  delete next[AGENT_TOKEN_ENV];
   if (!String(next.COPILOT_WEB_RELAY_ROOT || '').trim()) {
     next.COPILOT_WEB_RELAY_ROOT = REPO_ROOT;
   }
@@ -3513,12 +3598,30 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   if (!copilotSdkEngine) return openAiEnv;
   return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model });
 }
+// The session's environment plus its agent token: OAR_AGENT_TOKEN is what the
+// worker, its CLI, the CLI's tools and MCP servers authenticate with. It opens
+// only the routes agents may use (shared/relay-route-policy.mjs).
+function buildSessionWorkerLaunchEnvWithAgentToken(targetSessionId) {
+  const env = buildSessionWorkerLaunchEnvForSession(targetSessionId);
+  const normalizedTargetSessionId = String(targetSessionId || '').trim();
+  const runtimeSession = stmts.getRuntimeSessionBySdkSessionId.get(normalizedTargetSessionId)
+    || stmts.getRuntimeSessionByConversation.get(normalizedTargetSessionId)
+    || null;
+  const agentToken = agentTokenForConversation(runtimeSession?.conversation_id || normalizedTargetSessionId);
+  const next = { ...env };
+  delete next[AGENT_TOKEN_ENV];
+  if (agentToken) next[AGENT_TOKEN_ENV] = agentToken;
+  return next;
+}
 // Under a systemd user service, session workers start in scopes of their
 // own (worker-scope.mjs); asked once, at the first worker start.
 const workerScope = createWorkerScope({ hosting: detectRelayHosting(), log: (message) => console.log(`${runtimeLogPrefix()}${message}`) });
 const relayCliLauncherService = createRelayCliLauncherService({
   cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
-  env: sessionWorkerLaunchEnv,
+  env: (targetSessionId) => {
+    const agentToken = agentTokenForConversation(targetSessionId);
+    return agentToken ? { ...sessionWorkerLaunchEnv, [AGENT_TOKEN_ENV]: agentToken } : { ...sessionWorkerLaunchEnv };
+  },
   log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
   workerScope,
 });
@@ -3555,18 +3658,33 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   if (allowProcessReuse) {
     let liveWorker = null;
     try {
-      liveWorker = await sessionWorkerProcessInspector.findProcessForSessionAsync(normalizedTargetSessionId);
+      // Fresh: a cached list can be from before a stop, and name the process
+      // it ended (or the pid it had, handed to another process since).
+      liveWorker = await sessionWorkerProcessInspector.findProcessForSessionAsync(normalizedTargetSessionId, { fresh: true });
     } catch (error) {
       warnProcessListUnreadable(error);
     }
-    if (liveWorker?.processId) {
+    // The listed process can have ended since, and its pid gone to another
+    // process: reused only while the process at the pid is the session's by
+    // its identity (Windows: the row's start time; everywhere: a command line
+    // that names the session), not merely while some process has the pid.
+    // On Windows the fresh row is that identity; no second read.
+    const liveIdentity = liveWorker?.processId
+      ? await identityOfListedWorker(liveWorker, { platform: process.platform, identityOf: readWorkerProcessIdentity })
+      : null;
+    if (liveWorker?.processId && mayReuseSessionWorkerRow({
+      row: liveWorker,
+      current: liveIdentity,
+      sdkSessionId: normalizedTargetSessionId,
+      isAlive: (pid) => isProcessAlive(pid),
+    })) {
       const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
       console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
       return { workerId, pid: liveWorker.processId };
     }
   }
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
-  const workerLaunchEnv = buildSessionWorkerLaunchEnvForSession(normalizedTargetSessionId);
+  const workerLaunchEnv = buildSessionWorkerLaunchEnvWithAgentToken(normalizedTargetSessionId);
   // Synchronous: nothing between the gate and the launch can start a
   // second worker for the session.
   const agentSdkDir = agentSdkLaunchGate.check(normalizedTargetSessionId, resolveWorkerKind(workerLaunchEnv));
@@ -3582,6 +3700,7 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     execFileSyncImpl: execFileSync,
     processInspector: sessionWorkerProcessInspector,
     allowProcessReuse,
+    readProcessIdentity: readWorkerProcessIdentity,
     onProcessListError: warnProcessListUnreadable,
     log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
   });
@@ -4421,20 +4540,6 @@ function normalizeQuestionChoices(rawChoices) {
     .slice(0, 8);
 }
 
-function parseCookies(header) {
-  const cookies = {};
-  for (const part of String(header || '').split(/;\s*/)) {
-    if (!part) continue;
-    const idx = part.indexOf('=');
-    if (idx < 0) continue;
-    const key = part.slice(0, idx).trim();
-    if (!key || Object.prototype.hasOwnProperty.call(cookies, key)) continue;
-    const value = part.slice(idx + 1).trim();
-    cookies[key] = decodeURIComponent(value);
-  }
-  return cookies;
-}
-
 function appendSetCookie(res, cookieValue) {
   if (!res) return;
   const existing = res.getHeader('Set-Cookie');
@@ -4710,7 +4815,9 @@ function normalizeWorkspaceRelativePath(rawPath) {
   return parts.join(path.sep);
 }
 
-function resolveWorkspaceFilePath(rawPath, rootPath = null) {
+// `{ absolutePath, root }` of a workspace-relative path, by its string alone
+// (no link resolved, nothing under the root read); null for one outside it.
+function workspaceFileTarget(rawPath, rootPath = null) {
   const normalized = normalizeWorkspaceRelativePath(rawPath);
   if (!normalized) return null;
   const activeWorkspaceRoot = normalizeConversationWorkspaceRootPath(rootPath) || currentWorkspaceRootPath();
@@ -4718,6 +4825,19 @@ function resolveWorkspaceFilePath(rawPath, rootPath = null) {
   const relativeToRoot = path.relative(activeWorkspaceRoot, absolutePath);
   if (!relativeToRoot || relativeToRoot === '.') return null;
   if (relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) return null;
+  return { absolutePath, root: activeWorkspaceRoot };
+}
+
+// The path GET /api/files/* is asked for, as a string: what a file
+// capability is checked against before any link is resolved.
+function resolveWorkspaceFileTargetPath(rawPath, rootPath = null) {
+  return workspaceFileTarget(rawPath, rootPath)?.absolutePath || null;
+}
+
+function resolveWorkspaceFilePath(rawPath, rootPath = null) {
+  const target = workspaceFileTarget(rawPath, rootPath);
+  if (!target) return null;
+  const { absolutePath, root: activeWorkspaceRoot } = target;
   // Lexical containment is not enough: a symlink inside the workspace resolves to
   // a real path outside it and the serve path follows it. Match the tree/list
   // walkers' symlink rejection by verifying the real path stays within the root.
@@ -6316,14 +6436,17 @@ function computePwaShellVersion() {
 }
 
 function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
-  const appConfig = JSON.stringify({
+  const appConfig = {
     basePath: remotePath,
+    // The sign-in forms' username (agent auth §13.2, 2a): password managers
+    // keep the relay token under the relay's name. Public already through
+    // the manifest; '' while the relay has none of its own.
+    relayName: (() => { try { return getPwaAppName(); } catch { return ''; } })(),
     ...(appConfigOverrides && typeof appConfigOverrides === 'object' ? appConfigOverrides : {}),
-  });
+  };
   const version = computePwaShellVersion();
   const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
-  return source
-    .replace(APP_CONFIG_PLACEHOLDER, `window.__COPILOT_APP_CONFIG = ${appConfig};`)
+  return injectAppConfig(source, APP_CONFIG_PLACEHOLDER, appConfig)
     .replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
 }
 
@@ -7164,6 +7287,7 @@ function createRuntimeWorkerReplacement(tag) {
     processInspector: sessionWorkerProcessInspector,
     stopSessionWorkerProcesses,
     isProcessAlive,
+    readProcessIdentity: readWorkerProcessIdentity,
     killTmuxSession,
     logger: console,
     logPrefix: () => `${runtimeLogPrefix()}${tag} `,
@@ -7232,6 +7356,34 @@ function isWorkerSessionArchived(sid) {
 // is stopped for good. Its own replacement instance, so a failed stop says
 // WORKER RECYCLE rather than BILLING SWAP.
 const recycleWorkerReplacement = createRuntimeWorkerReplacement('WORKER RECYCLE');
+
+// The chat's note for a recycle that stays stuck (stuckAfter failed tries),
+// written as the billing swap's is: the warning alone is only in the log, and
+// a worker the relay cannot stop goes on serving the chat from old code.
+function workerSessionConversationId(sid) {
+  const runtime = stmts.getRuntimeSessionBySdkSessionId?.get?.(sid) || null;
+  return String(runtime?.conversation_id || stmts.getConvBySdkSessionId?.get?.(sid)?.id || '').trim() || null;
+}
+
+function noteWorkerRecycleStuck(stuck = {}) {
+  // An archived chat keeps no worker and is not read: the log's warning is enough.
+  if (stuck.archived) return;
+  const conversationId = workerSessionConversationId(stuck.sdkSessionId);
+  if (!conversationId) return;
+  const at = new Date().toISOString();
+  const messageId = uuidv4();
+  const text = workerRecycleStuckNoteText(stuck);
+  db.transaction(() => {
+    stmts.insertMsg.run(messageId, conversationId, 'assistant', text, null, null, null, at, null, null, null);
+    stmts.setMessageKind?.run?.('worker-recycle-stuck', messageId);
+    stmts.updateConvTime?.run?.(at, conversationId);
+  })();
+  io.emit('assistant_message', {
+    conversationId,
+    messageId,
+    message: { id: messageId, role: 'assistant', text, kind: 'worker-recycle-stuck', model: null, mode: null, attachments: [], timestamp: at },
+  });
+}
 const workerRecycleService = createWorkerRecycleService({
   relayBuildId: BUILD_ID,
   listWorkers: () => sessionWorkerRegistry.listWorkers(),
@@ -7261,6 +7413,11 @@ const workerRecycleService = createWorkerRecycleService({
   // The kinds the launch gate gives an agent SDK: once stale, recycled
   // without waiting for their CLI child, and fenced until then.
   isAgentSdkWorker: (worker) => staleWorkerLosesAgentSdk(worker?.kind, { sdkForWorkerKind: agentSdkForWorkerKind, fromCheckout: (sdk) => agentSdkFromCheckout(sdk) }),
+  // A recycle stuck for stuckAfter tries: a note in the chat.
+  onStuck: (stuck) => noteWorkerRecycleStuck(stuck),
+  // A launch that names the stopped worker's pid: the stopped process, or a
+  // new one that got its pid (another start time).
+  readProcessIdentity: (pid) => readWorkerProcessIdentity(pid, { fresh: true }),
   logger: console,
 });
 
@@ -7497,7 +7654,17 @@ const detachedWorkerWatch = createDetachedWorkerWatch({
 const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({
   WebSocketServerImpl: WebSocketServer,
   httpServer,
-  authToken: config.authToken,
+  // An agent token opens only its own session's socket; a worker started
+  // before this version still holds the owner token. Read on every upgrade.
+  authorizeUpgrade: ({ token }) => {
+    const value = String(token || '').trim();
+    if (value.startsWith(AGENT_TOKEN_PREFIX)) {
+      const agent = ownerSecretStore.verifyAgentToken(value);
+      if (!agent || agent.kind !== AGENT_TOKEN_KINDS.session) return false;
+      return (sessionId) => sameConversation(sessionId, agent.subject);
+    }
+    return ownerSecretStore.verifyOwnerToken(value);
+  },
   queueCounts,
   touchCli,
   noteWorkerHeartbeat: (sessionId) => {
@@ -7663,6 +7830,16 @@ app.use((req, res, next) => {
   if (isApiRequestPath(req.path)) res.setHeader('Cache-Control', 'no-store');
   next();
 });
+// The app shell (the page itself, a shared link's reader, "Preview as
+// shared") may be framed by this origin only: the CSP form of the
+// X-Frame-Options above, which browsers that honour CSP prefer (agent auth
+// §13.4, clickjacking). Only on the shell's HTML: a served file carries its
+// own CSP (safe-served-content.mjs; a PDF may be framed by this origin), and
+// the preview proxy is another listener with its own headers.
+const APP_SHELL_CSP = "frame-ancestors 'self'";
+function applyAppShellHeaders(res) {
+  res.setHeader('Content-Security-Policy', APP_SHELL_CSP);
+}
 app.get('/socket.io/socket.io.js', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   sendOwnFile(res, SOCKET_IO_CLIENT_JS_PATH, next);
@@ -7685,6 +7862,7 @@ app.get(['/', '/index.html'], (req, res, next) => {
   try {
     const html = renderIndexHtmlWithPwaVersion();
     res.setHeader('Cache-Control', 'no-store');
+    applyAppShellHeaders(res);
     res.type('html').send(html);
   } catch (error) {
     next(error);
@@ -7703,6 +7881,7 @@ app.get(['/shared/:token', '/shared/:token/'], (req, res, next) => {
       return;
     }
     const html = renderIndexHtmlWithPwaVersion({ sharedToken: shareToken });
+    applyAppShellHeaders(res);
     res.type('html').send(html);
   } catch (error) {
     next(error);
@@ -7717,6 +7896,7 @@ app.get(['/share-preview/:conversationId', '/share-preview/:conversationId/'], (
     const html = renderIndexHtmlWithPwaVersion({ sharePreviewConversationId });
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    applyAppShellHeaders(res);
     res.type('html').send(html);
   } catch (error) {
     next(error);
@@ -7826,14 +8006,12 @@ const remoteRelayRepository = (() => {
 const remoteRelayClient = createRemoteRelayClient({
   // A closure: the registry owning the instance id is declared just below.
   getOwnRelayId: () => remoteRelayRegistry.instanceId(),
-  getOwnToken: () => config.authToken,
 });
 const remoteRelayRegistry = createRemoteRelayRegistry({
   readSetting: readAppSettingValue,
   writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
   client: remoteRelayClient,
   repository: remoteRelayRepository,
-  getOwnToken: () => config.authToken,
   getSelfName: getPwaAppName,
   hostname: os.hostname(),
   platform: process.platform,
@@ -7868,20 +8046,68 @@ const remoteInboxWatchService = createRemoteInboxWatchService({
   emit: (event) => io.emit(event),
   logger: console,
 });
+// Peer keys: paired relays sign in with a key of their own, and the relay part
+// of a remote origin is the registry entry the key names.
+const remoteRelayPeerKeys = createPeerKeyService({
+  registry: remoteRelayRegistry,
+  client: remoteRelayClient,
+  logger: console,
+  // The local Inbox item on a relay's first refused claim.
+  onRefusalNotice: () => {
+    try { io.emit(INBOX_REMOTE_CHANGED_EVENT); } catch {}
+  },
+});
+remoteRelayRegistry.setPeerKeys(remoteRelayPeerKeys);
+remoteRelayClient.setPeerKeyHooks({
+  worked: (relay) => remoteRelayPeerKeys.noteHeldKeyWorked(relay),
+  refused: (relay) => remoteRelayPeerKeys.onHeldKeyRefused(relay),
+  required: (relay) => remoteRelayPeerKeys.noteKeyRequired(relay),
+});
 const remoteRelayPairing = createRemoteRelayPairing({
   registry: remoteRelayRegistry,
   client: remoteRelayClient,
-  getOwnToken: () => config.authToken,
+  basePath: remotePath,
+  peerKeys: remoteRelayPeerKeys,
 });
+// Stored origins from before origin binding read as unverified: one line per
+// start says how many.
+try {
+  const legacy = remoteRelayRepository?.countLegacyOrigins?.();
+  if (legacy && (legacy.messages || legacy.conversations)) {
+    console.log(`[remote-relays] ${legacy.messages} message and ${legacy.conversations} session origin${legacy.messages + legacy.conversations === 1 ? '' : 's'} from before paired relays had keys now read as unverified (they open nothing).`);
+  }
+} catch {}
+// The boot that moved the owner token out of the config knows it once: every
+// pairing that used "this relay's own token" gets it stored as its own. Only
+// that boot: a token put back into the config, or a --token that differs,
+// is not the one those pairings used.
+{
+  const legacyOwnerToken = ownerSecretStore.migratedOwnerToken();
+  if (legacyOwnerToken) {
+    try {
+      const converted = remoteRelayRegistry.convertOwnEntries(legacyOwnerToken);
+      if (converted) console.log(`[remote-relays] ${converted} paired relay${converted === 1 ? '' : 's'} now keep their token themselves (the relay's own token is stored as a hash only).`);
+    } catch (error) {
+      console.warn(`[remote-relays] Could not convert pairings that used this relay's own token: ${error?.message || error}`);
+    }
+  }
+}
 // What the inbound routes need: no tokens, only ids, names and state.
 const remoteRelayInbound = {
-  listRelays: () => remoteRelayRegistry.list().map(({ id, relayId, name, url, lastStatus, version }) => ({ id, relayId, name, url, lastStatus, version })),
+  listRelays: () => remoteRelayRegistry.list().map(({ id, relayId, name, url, lastStatus, version, protocol, epoch, identityHold }) => ({ id, relayId, name, url, lastStatus, version, protocol, epoch, identityHold: !!identityHold })),
   selfNames: () => [remoteRelayRegistry.selfName()],
   inboundEnabled: () => remoteRelayRegistry.getSelfSettings().inboundEnabled,
   recordUnlock: (conversationId, relayId, messageId) => remoteRelayRepository?.recordUnlock(conversationId, relayId, messageId) ?? false,
   describeRelay: (id) => {
     const relay = remoteRelayRegistry.get(id);
     return relay ? { id: relay.id, name: relay.name, online: relay.lastStatus === 'online', version: relay.version } : null;
+  },
+  // Any entry by id, inbound-only ones too (listRelays leaves those out:
+  // this relay never calls them, nor may its agents): what a verified
+  // origin's weight is checked against.
+  getRelay: (id) => {
+    const relay = remoteRelayRegistry.get(id);
+    return relay ? { id: relay.id, relayId: relay.relayId, name: relay.name, epoch: relay.epoch, identityHold: !!relay.identityHold } : null;
   },
   repository: remoteRelayRepository,
 };
@@ -7908,7 +8134,19 @@ const remoteRelayCallerContext = createRemoteRelayCallerContext({
 const remoteRelayLoopbackClient = createRemoteRelayLoopbackClient({
   handle: (req, res) => app(req, res),
   getOwnRelayId: () => remoteRelayRegistry.instanceId(),
-  getOwnToken: () => config.authToken,
+  // The calling agent's own token, never the owner token: its relay_tool
+  // calls to this relay get exactly its rights.
+  getCallerToken: ({ principal, conversationId } = {}) => {
+    try {
+      if (principal?.kind === 'agent' && principal.agentKind === AGENT_TOKEN_KINDS.cli) {
+        return ownerSecretStore.mintAgentToken({ kind: AGENT_TOKEN_KINDS.cli });
+      }
+      const subject = principal?.kind === 'agent' && principal.conversationId ? principal.conversationId : conversationId;
+      return agentTokenForConversation(subject);
+    } catch {
+      return '';
+    }
+  },
 });
 const remoteRelayDispatcher = createRemoteRelayDispatcher({
   registry: remoteRelayRegistry,
@@ -8007,7 +8245,47 @@ function withAgentSdkUpdate(service, reason) {
   });
 }
 
+// File capabilities (`k`): how the page loads a file by path natively
+// (services/file-capability.mjs). Signed with a key derived from the
+// agentKey; a capability counts only while its browser session lives.
+const fileCapabilities = createFileCapabilities({
+  getKey: () => ownerSecretStore.fileCapabilityKey(),
+  getSession: (id) => browserSessions?.get?.(id) || null,
+});
+// Media tags (`t`): what opens GET /api/media/:id/content (media-tag.mjs),
+// made with a key of their own derived from the agentKey.
+const mediaTags = createMediaTags({ getKey: () => ownerSecretStore.mediaTagKey() });
+// What no file route serves, whoever asks: the secrets, the database (here
+// and in the backup folder) and the config.
+// The backup folder is resolved again whenever config.dbBackups changes
+// (Settings can move it while the relay runs).
+let protectedBackupDir = { settings: undefined, dir: null };
+const protectedEarlierFolders = earlierDatabaseFolders({ dataDir: DATA_DIR, serverDir: __dirname, configPath: CONFIG_PATH, packageRoot: REPO_ROOT });
+const protectedRelayFiles = createProtectedRelayFiles({
+  dataDir: DATA_DIR,
+  configPath: CONFIG_PATH,
+  files: () => [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`, `${DB_PATH}-journal`],
+  backupDir: () => {
+    let settings = '';
+    try { settings = JSON.stringify(config?.dbBackups ?? null); } catch { settings = ''; }
+    if (protectedBackupDir.settings !== settings) {
+      let dir = null;
+      try {
+        dir = resolveBackupDir({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, config }).dir || null;
+      } catch {
+        dir = null;
+      }
+      protectedBackupDir = { settings, dir };
+    }
+    return protectedBackupDir.dir;
+  },
+  folders: () => protectedEarlierFolders,
+});
+
 const sharedRouteDeps = {
+  fileCapabilities,
+  mediaTags,
+  protectedRelayFiles,
   auth,
   isTrulyLocalRequest: localRequestCheck.isTrulyLocal,
   gitChangesService,
@@ -8017,6 +8295,10 @@ const sharedRouteDeps = {
   db,
   stmts,
   config,
+  // Agent auth: tokens for the relay's own calls, and "one conversation,
+  // whichever id names it" for the routes bound to an agent's conversation.
+  mintAgentToken: (conversationId) => agentTokenForConversation(conversationId),
+  sameConversation,
   runtimeState,
   uuidv4,
   ts,
@@ -8046,6 +8328,7 @@ const sharedRouteDeps = {
   readWorkspaceFileMeta,
   workspaceFileMetaCache,
   resolveWorkspaceFilePath,
+  resolveWorkspaceFileTargetPath,
   normalizeWorkspaceRelativePath,
   previewLanguageForWorkspaceFile,
   readWorkspaceFilePreviewBuffer,
@@ -8301,6 +8584,7 @@ registerRemoteRelayRoutes(app, {
   pairing: remoteRelayPairing,
   dispatcher: remoteRelayDispatcher,
   remoteRelayInbound,
+  peerKeys: remoteRelayPeerKeys,
 });
 registerRelayEventRoutes(app, {
   auth,
@@ -8332,6 +8616,7 @@ registerRelayAskRoutes(app, {
   remoteRelayRegistry,
   remoteRelayClient,
   questionNotice: (questionId) => pushDispatchService.questionNotice(questionId),
+  relayNotices: () => remoteRelayPeerKeys.refusalNoticeItems(),
 });
 registerRelayRestartRoutes(app, {
   auth,
@@ -8523,9 +8808,82 @@ function runtimeLogPrefix() {
 // Token check, wrong-token lockout and the Socket.IO handshake gate live in
 // services/relay-auth.mjs. `auth` stays a hoisted function: the route deps
 // above hand it out before this line runs.
+//
+// Browser sessions keep a browser signed in: the cookie holds a session
+// secret, browser_sessions (migration 0041) its hash. Without the table the
+// relay still takes Bearer sign-ins, and says so once.
+let browserSessions = null;
+try {
+  browserSessions = createBrowserSessionService({ db, logger: console });
+} catch (error) {
+  console.warn(`[auth] Browser sessions are unavailable (${error?.message || error}); browsers cannot stay signed in until the next start.`);
+}
+const signInCodes = createSignInCodes();
+// What signing a browser out does besides deleting its row: its sockets go,
+// and its device's push rows unless another session has that device. The
+// same for every way out: Sign out, a sign-in that replaces the session,
+// the 50-row cap and expiry.
+const sessionRevocationEffects = createSessionRevocationEffects({
+  browserSessions,
+  disconnectBrowserSessions: (ids) => disconnectBrowserSessionSockets(ids),
+  deletePushDevicesForDevice: (deviceId) => pushDispatchService.deleteDevicesForDevice(deviceId),
+  logger: console,
+});
+browserSessions?.setOnRemoved?.((rows) => sessionRevocationEffects(rows));
+// Expired rows go now (their devices' push rows with them) and hourly.
+try { browserSessions?.startCleanup?.(); } catch (error) {
+  console.warn(`[auth] browser session cleanup failed: ${error?.message || error}`);
+}
+// New sign-ins (agent auth §13.2, 2d): a notice for the other browsers, sent
+// to their open pages and pushed before the sign-in answers.
+const signInNotices = createSignInNoticeService({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  // The person's sockets only: the owner token, or a browser session that
+  // passed the handshake with its proof key.
+  emitToPersonSockets: (event, payload, { exceptSessionId = '' } = {}) => {
+    let sent = 0;
+    for (const socket of signInNoticeRecipients(io.of('/').sockets.values(), { exceptSessionId })) {
+      try { socket.emit(event, payload); sent += 1; } catch {}
+    }
+    return sent;
+  },
+  notifyPush: (notice) => pushDispatchService.notifyNewSignIn({
+    ...notice,
+    isLiveDevice: (deviceId) => browserSessions?.hasLiveDevice?.(deviceId, { exceptId: notice.sessionId }) === true,
+  }),
+  isSessionLive: (sessionId) => !!browserSessions?.get?.(sessionId),
+  logger: console,
+});
+// When the owner token was last used by something other than a browser page
+// (Settings → Security, the rotation dialog): `{ at, address }`, never the value.
+const ownerTokenUse = createOwnerTokenUseTracker({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  ownerHash: () => ownerSecretStore.ownerTokenHash(),
+  createdAt: () => ownerSecretStore.status().rotatedAt || ownerSecretStore.status().createdAt,
+  logger: console,
+});
 const relayAuth = createRelayAuth({
   app,
-  getAuthToken: () => config.authToken,
+  // The owner token is checked against its hash (relay-secrets.json), agent
+  // tokens against the agentKey; both are read live, so a rotation applies
+  // at once. Who may call which route: shared/relay-route-policy.mjs.
+  verifyOwnerToken: (value) => ownerSecretStore.verifyOwnerToken(value),
+  verifyAgentToken: (value) => ownerSecretStore.verifyAgentToken(value),
+  // A paired relay's key (remote-relay-peer-keys.mjs); a key retired less
+  // than 7 days ago still asks for a new one.
+  resolvePeerKey: (value, req) => remoteRelayPeerKeys.resolvePeerKey(value)
+    || (req?.route?.path === '/api/remote-relays/peer-key/request' ? remoteRelayPeerKeys.resolveRetiredKey(value) : null),
+  // Origin binding's refusals: a key claiming another relay, a claim of a
+  // keyed relay without its key; and a key's first use confirms it.
+  afterPrincipal: (req, res, principal) => remoteRelayPeerKeys.gate(req, res, principal),
+  allowedOrigins: Array.isArray(config.allowedOrigins) ? config.allowedOrigins : [],
+  browserSessions,
+  signInCodes,
+  onSessionsRevoked: (rows) => sessionRevocationEffects(rows),
+  onSessionCreated: ({ row, via, address }) => signInNotices.record({ row, via, address }),
+  onOwnerBearerUse: (use) => ownerTokenUse.record(use),
   cookieName: AUTH_COOKIE,
   cookiePath: COOKIE_PATH,
   parseCookies,
@@ -8536,6 +8894,42 @@ const relayAuth = createRelayAuth({
 function auth(req, res, next) {
   return relayAuth.auth(req, res, next);
 }
+
+// Drops the Socket.IO sockets of signed-out browser sessions.
+function disconnectBrowserSessionSockets(sessionIds) {
+  const ids = new Set((sessionIds || []).map((id) => String(id || '')).filter(Boolean));
+  if (!ids.size) return 0;
+  let dropped = 0;
+  for (const socket of io.of('/').sockets.values()) {
+    if (!ids.has(String(socket.data?.browserSessionId || ''))) continue;
+    try { socket.disconnect(true); dropped += 1; } catch {}
+  }
+  return dropped;
+}
+
+registerAuthRoutes(app, {
+  auth,
+  relayAuth,
+  browserSessions,
+  signInCodes,
+  ownerSecretStore,
+  remoteRelayRegistry,
+  signInNotices,
+  ownerTokenUse,
+  qrMatrix,
+  isTrulyLocalRequest: localRequestCheck.isTrulyLocal,
+  onSessionsRevoked: (rows) => sessionRevocationEffects(rows),
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  // The address links point at: the public URL set for pairing, else the
+  // one this request came in on.
+  publicBaseUrl: (req) => {
+    let configured = '';
+    try { configured = String(remoteRelayRegistry?.getSelfSettings?.()?.publicUrl || '').trim(); } catch {}
+    return configured || requestBaseUrl(req, remotePath || '');
+  },
+  logger: console,
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function getOrCreateConversation(id, firstLine) {
@@ -8797,6 +9191,35 @@ runtimeTimers.restoredTaskSettle?.unref?.();
 // `token` is not read (see services/relay-auth.mjs).
 io.use(relayAuth.socketMiddleware);
 
+// The owner token, seen from the database: a hash that changed with no OAR
+// rotation is reported (owner-secret-store.mjs, reconcileWithSettings), and
+// a rotation keeps the copy in step and drops the sockets that signed in
+// with the old token (browser sessions, once they exist, stay).
+ownerSecretStore.reconcileWithSettings({
+  readSetting: readAppSettingValue,
+  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+});
+ownerSecretStore.onRotate(() => {
+  ownerSecretStore.recordOwnerHash({
+    writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
+  });
+  // The old token's last non-browser use becomes `previous`.
+  ownerTokenUse.syncOwner();
+  // Sockets that signed in with the owner token itself go; browser sessions
+  // (socket.data.browserSessionId) stay.
+  let dropped = 0;
+  for (const socket of io.of('/').sockets.values()) {
+    if (socket.data?.principal?.kind !== 'owner') continue;
+    try { socket.disconnect(true); dropped += 1; } catch {}
+  }
+  console.log(`[auth] ${dropped} socket${dropped === 1 ? '' : 's'} signed in with the old owner token disconnected.`);
+  // Workers started before agent tokens opened their socket with the owner
+  // token: it no longer opens anything, so their open sockets close too.
+  let workers = 0;
+  try { workers = sessionWorkerWebSocketService.dropOwnerTokenSockets(); } catch {}
+  if (workers) console.log(`[auth] ${workers} worker socket${workers === 1 ? '' : 's'} opened with the old owner token closed.`);
+});
+
 io.engine.on('initial_headers', (headers, req) => {
   const sessionId = ensureSessionId(req);
   headers['Set-Cookie'] = `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; Path=${COOKIE_PATH}; SameSite=Lax`;
@@ -8807,9 +9230,13 @@ io.on('connection', (socket) => {
   // socket bypasses the io.use() token gate above. Re-validate here and drop it
   // on mismatch so a recovered session still requires the auth token (and a
   // rotated token takes effect immediately).
-  if (socket.recovered && !relayAuth.socketTokenValid(socket)) {
-    socket.disconnect(true);
-    return;
+  if (socket.recovered) {
+    const principal = relayAuth.socketPrincipal(socket);
+    if (!principal) {
+      socket.disconnect(true);
+      return;
+    }
+    relayAuth.tagSocket(socket, principal);
   }
   const cookies = parseCookies(socket.request.headers.cookie);
   socket.data.sessionId = socket.handshake.auth?.clientId || socket.handshake.query?.clientId || cookies[SESSION_COOKIE] || null;
@@ -8921,9 +9348,10 @@ const previewRegistry = createPreviewRegistry({
 const previewProxyServer = createPreviewProxyServer({
   registry: previewRegistry,
   logger: console,
-  // Withheld from forwarded requests so a previewed app never sees the relay
-  // token, even if a hand-crafted request carries it.
-  relayBearerTokens: [config.authToken],
+  // Withheld from forwarded requests so a previewed app never sees a relay
+  // credential, even if a hand-crafted request carries one: every prefixed
+  // one by its shape, a legacy owner token by its hash.
+  isRelayBearerToken: (value) => isRelayCredential(value) || ownerSecretStore.verifyOwnerToken(value),
 });
 const previewHealthProbe = createPreviewHealthProbe({ registry: previewRegistry });
 runtimeState.previewLane = {
@@ -9000,6 +9428,8 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   runtimeShutdownStarted = true;
   console.log(`${runtimeLogPrefix()}Runtime shutdown started (${reason}, exitCode=${runtimeShutdownExitCode})`);
   clearRuntimeTimers();
+  // The owner token's last non-browser use is written at most every 10 min.
+  try { ownerTokenUse.flush(); } catch {}
   // A queued host suspend is in-memory only; drop it loudly rather than let
   // the next runtime forget about it in silence.
   try { hostSuspendService.dispose({ reason }); } catch {}

@@ -23,7 +23,7 @@ import { repoRoot, startRelayServer } from "./relay-server-harness.mjs";
  */
 
 const fixtures = path.join(repoRoot, "server", "services", "fixtures");
-const pinOf = (sdk) => JSON.parse(fs.readFileSync(path.join(repoRoot, "server", "agent-sdks", sdk, "package.json"), "utf8"));
+const pinOf = (sdk) => JSON.parse(fs.readFileSync(path.join(repoRoot, "server", "agent-sdks", sdk, "pin.json"), "utf8"));
 const CURSOR_PINNED = pinOf("cursor").dependencies["@cursor/sdk"];
 const CLAUDE_PINNED = pinOf("claude").dependencies["@anthropic-ai/claude-agent-sdk"];
 

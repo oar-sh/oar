@@ -32,10 +32,9 @@ test('generated tokens are long, urlsafe, and unique', () => {
   assert.notEqual(a, b);
 });
 
-test('default config carries the documented defaults and a token', () => {
-  const config = buildDefaultConfig({ token: 't0k3n' });
+test('default config carries the documented defaults and no token (the relay keeps its hash)', () => {
+  const config = buildDefaultConfig();
   assert.deepEqual(config, {
-    authToken: 't0k3n',
     port: 3333,
     localhostOnly: true,
     pollIntervalMs: 3000,
@@ -58,11 +57,15 @@ test('primaryLanAddress skips internal and IPv6 entries', () => {
   assert.equal(primaryLanAddress({ lo: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }] }), null);
 });
 
-test('relayUrl uses the LAN address only when localhostOnly is off', () => {
-  const config = { authToken: 'a b', port: 4000, localhostOnly: false };
-  assert.equal(relayUrl({ config, lanAddress: '192.168.7.20' }), 'http://192.168.7.20:4000/?token=a%20b');
-  assert.equal(relayUrl({ config: { ...config, localhostOnly: true }, lanAddress: '192.168.7.20' }), 'http://localhost:4000/?token=a%20b');
-  assert.equal(relayUrl({ config }), 'http://localhost:4000/?token=a%20b');
+test('relayUrl uses the LAN address only when localhostOnly is off; a token only when one is given', () => {
+  const config = { port: 4000, localhostOnly: false };
+  assert.equal(relayUrl({ config, lanAddress: '192.168.7.20' }), 'http://192.168.7.20:4000/');
+  assert.equal(relayUrl({ config: { ...config, localhostOnly: true }, lanAddress: '192.168.7.20' }), 'http://localhost:4000/');
+  assert.equal(relayUrl({ config }), 'http://localhost:4000/');
+  // A token just made (oar setup shows it once) goes into the sign-in link.
+  assert.equal(relayUrl({ config, lanAddress: '192.168.7.20', token: 'a b' }), 'http://192.168.7.20:4000/?token=a%20b');
+  // A token left in a config from before this version is never put in a link.
+  assert.equal(relayUrl({ config: { ...config, authToken: 'legacy' } }), 'http://localhost:4000/');
 });
 
 test('systemd unit points at server.js with the state env pinned', () => {
@@ -353,9 +356,10 @@ test('doctor report renders both healthy and missing states without leaking the 
       { id: 'gh (Copilot)', ok: true, version: 'gh version 2.80.0' },
       { id: 'grok', ok: false },
     ],
+    ownerToken: 'set (hashed)',
   });
   assert.match(report, /OAR 0\.9\.0/);
-  assert.match(report, /auth token {4}: set/);
+  assert.match(report, /owner token {3}: set \(hashed\)/);
   assert.ok(!report.includes('super-secret'), 'token value must never render');
   assert.match(report, /tunnel {8}: managed/);
   assert.match(report, /2\.0 MB/);
@@ -456,26 +460,32 @@ test('the usage names every command', () => {
 });
 
 test('a QR code is offered only for an address a phone can reach', () => {
-  const lan = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: '192.168.7.20' });
+  const lan = describeRelayAddress({ config: { port: 3340, localhostOnly: false }, lanAddress: '192.168.7.20', token: 'tok' });
   assert.equal(lan.url, 'http://192.168.7.20:3340/?token=tok');
   assert.equal(lan.qrUrl, lan.url);
   assert.deepEqual(lan.lines, ['[oar] Relay URL: http://192.168.7.20:3340/?token=tok']);
 
-  const local = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: true }, lanAddress: '192.168.7.20' });
+  // Without a token just made: the address alone, and how to sign in.
+  const plain = describeRelayAddress({ config: { port: 3340, localhostOnly: false }, lanAddress: '192.168.7.20' });
+  assert.equal(plain.url, 'http://192.168.7.20:3340/');
+  assert.equal(plain.qrUrl, plain.url);
+  assert.match(plain.lines.at(-1), /Sign in with your relay token .*oar setup --new-token/);
+
+  const local = describeRelayAddress({ config: { port: 3340, localhostOnly: true }, lanAddress: '192.168.7.20', token: 'tok' });
   assert.equal(local.url, 'http://localhost:3340/?token=tok');
   assert.equal(local.qrUrl, null);
   assert.match(local.lines[1], /This machine only\. For a phone.*oar setup --lan.*tunnel/);
 
   // A config without the key listens on this machine only, as the server reads it.
-  assert.equal(describeRelayAddress({ config: { authToken: 'tok' }, lanAddress: '192.168.7.20' }).url, 'http://localhost:3333/?token=tok');
+  assert.equal(describeRelayAddress({ config: {}, lanAddress: '192.168.7.20', token: 'tok' }).url, 'http://localhost:3333/?token=tok');
 
-  const offline = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: null });
+  const offline = describeRelayAddress({ config: { port: 3340, localhostOnly: false }, lanAddress: null, token: 'tok' });
   assert.equal(offline.qrUrl, null);
   assert.match(offline.lines[1], /no network address/);
 });
 
 test('a LAN address inside WSL gets a note instead of a QR code', () => {
-  const wsl = describeRelayAddress({ config: { authToken: 'tok', port: 3340, localhostOnly: false }, lanAddress: '172.20.5.9', wslNat: true });
+  const wsl = describeRelayAddress({ config: { port: 3340, localhostOnly: false }, lanAddress: '172.20.5.9', wslNat: true, token: 'tok' });
   assert.equal(wsl.url, 'http://172.20.5.9:3340/?token=tok');
   assert.equal(wsl.qrUrl, null);
   assert.match(wsl.lines[1], /internal to WSL/);
@@ -483,13 +493,15 @@ test('a LAN address inside WSL gets a note instead of a QR code', () => {
   assert.match(wsl.lines[1], /mirrored networking/);
 });
 
-test('a tunnel address a relay reports gets the token and its own QR code', () => {
+test('a tunnel address a relay reports gets its own QR code, and a token only when one was just made', () => {
   const address = describeRelayAddress({
-    config: { authToken: 'tok en', port: 3340, localhostOnly: true },
+    config: { port: 3340, localhostOnly: true },
     tunnelBase: 'https://relay.example.com/oar/',
+    token: 'tok en',
   });
   assert.equal(address.tunnelUrl, 'https://relay.example.com/oar/?token=tok%20en');
-  assert.equal(describeRelayAddress({ config: { authToken: 'tok' } }).tunnelUrl, null);
+  assert.equal(describeRelayAddress({ config: { authToken: 'legacy' }, tunnelBase: 'https://relay.example.com/' }).tunnelUrl, 'https://relay.example.com/');
+  assert.equal(describeRelayAddress({ config: {} }).tunnelUrl, null);
 });
 
 test('doctor report shows the tunnel finding it is given instead of the bare config value', () => {

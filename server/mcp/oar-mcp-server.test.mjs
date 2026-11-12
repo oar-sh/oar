@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -20,6 +21,7 @@ import {
   REMOTE_RELAY_TOOL_INPUT_SCHEMA,
 } from '../../shared/remote-relay-contract.mjs';
 import { PREVIEW_TOOL_DESCRIPTION, PREVIEW_TOOL_INPUT_SCHEMA } from '../../shared/preview-tool-core.mjs';
+import { mintAgentTokenWithKey } from '../../shared/relay-credentials.mjs';
 
 const TOKEN = 'test-token-oar-mcp';
 const LOCKED = {
@@ -30,7 +32,7 @@ const LOCKED = {
 
 // ─── a fake relay ────────────────────────────────────────────────────────────
 
-async function startFakeRelay({ remoteCount = 1, hangTool = false } = {}) {
+async function startFakeRelay({ remoteCount = 1, hangTool = false, token = TOKEN } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -46,7 +48,7 @@ async function startFakeRelay({ remoteCount = 1, hangTool = false } = {}) {
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(payload));
       };
-      if (req.headers.authorization !== `Bearer ${TOKEN}`) return answer(401, { error: 'unauthorized' });
+      if (req.headers.authorization !== `Bearer ${token}`) return answer(401, { error: 'unauthorized' });
       if (req.method === 'GET' && req.url === '/api/remote-relays/summary') return answer(200, { count: remoteCount });
       if (req.method === 'POST' && req.url === '/api/remote-relays/tool') {
         if (hangTool) return undefined; // a remote turn that never ends
@@ -73,15 +75,16 @@ function writeRelayConfig() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-mcp-test-'));
   const configPath = path.join(dir, 'config.json');
   // The port is deliberately wrong: COPILOT_WEB_RELAY_SERVER_URL must win.
-  fs.writeFileSync(configPath, JSON.stringify({ authToken: TOKEN, port: 9 }));
-  return { configPath, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  // No token in it: the config never holds one.
+  fs.writeFileSync(configPath, JSON.stringify({ port: 9 }));
+  return { dir, configPath, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 // ─── a JSON-RPC client over the child's stdio ────────────────────────────────
 
-function startMcp({ args, env }) {
+function startMcp({ args, env, replaceEnv = false }) {
   const child = spawn(process.execPath, [OAR_MCP_SERVER_SCRIPT_PATH, ...args], {
-    env: { ...process.env, ...env },
+    env: replaceEnv ? env : { ...process.env, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const messages = [];
@@ -139,12 +142,29 @@ function startMcp({ args, env }) {
   };
 }
 
-async function withMcp({ remoteCount = 1, hangTool = false } = {}, run) {
-  const relay = await startFakeRelay({ remoteCount, hangTool });
+// `env`: the session's OAR_AGENT_TOKEN, as the relay sets it for every
+// session's processes; `derive`: none, the token comes from the relay's
+// secrets file in the data folder instead.
+async function withMcp({ remoteCount = 1, hangTool = false, derive = false } = {}, run) {
   const config = writeRelayConfig();
+  let token = TOKEN;
+  const extraEnv = { OAR_AGENT_TOKEN: TOKEN };
+  if (derive) {
+    const dataDir = path.join(config.dir, 'data');
+    fs.mkdirSync(dataDir, { recursive: true });
+    const agentKey = crypto.randomBytes(32).toString('base64url');
+    fs.writeFileSync(path.join(dataDir, 'relay-secrets.json'), JSON.stringify({ version: 1, owner: { hash: 'a'.repeat(64) }, agentKey }));
+    token = mintAgentTokenWithKey(agentKey, { kind: 's', subject: 'conv-mcp-1' });
+    delete extraEnv.OAR_AGENT_TOKEN;
+    extraEnv.COPILOT_WEB_RELAY_DATA_DIR = dataDir;
+  }
+  const relay = await startFakeRelay({ remoteCount, hangTool, token });
+  const env = { ...process.env, COPILOT_WEB_RELAY_CONFIG: config.configPath, COPILOT_WEB_RELAY_SERVER_URL: relay.url, ...extraEnv };
+  if (derive) delete env.OAR_AGENT_TOKEN;
   const mcp = startMcp({
     args: ['--conversation-id', 'conv-mcp-1'],
-    env: { COPILOT_WEB_RELAY_CONFIG: config.configPath, COPILOT_WEB_RELAY_SERVER_URL: relay.url },
+    env,
+    replaceEnv: true,
   });
   try {
     await run({ mcp, relay });
@@ -200,7 +220,7 @@ test('tools/list offers relay_tool and preview with the shared schemas', async (
   });
 });
 
-test('tools/call relay_tool forwards { conversationId, action, args } with the relay token', async () => {
+test('tools/call relay_tool forwards { conversationId, action, args } with the session\'s agent token', async () => {
   await withMcp({}, async ({ mcp, relay }) => {
     await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const called = await mcp.request('tools/call', {
@@ -507,4 +527,14 @@ test('the tool list waits for the registration decision, which fails closed', as
   assert.deepEqual((await undecided.listTools()).map((tool) => tool.name), ['preview']);
   const decided = createOarMcpServer({ api: async () => ({}), remoteRelay: Promise.resolve(true) });
   assert.deepEqual((await decided.listTools()).map((tool) => tool.name), ['relay_tool', 'preview']);
+});
+
+test('without OAR_AGENT_TOKEN the server derives its conversation\'s agent token from the relay\'s secrets file', async () => {
+  await withMcp({ derive: true }, async ({ mcp, relay }) => {
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const listed = await mcp.request('tools/list', {});
+    assert.ok(listed.result.tools.some((tool) => tool.name === 'relay_tool'), 'the summary call was accepted');
+    const forwarded = relay.requests.find((request) => request.url === '/api/remote-relays/summary');
+    assert.match(String(forwarded.headers.authorization), /^Bearer oara1_s\./);
+  });
 });

@@ -138,7 +138,7 @@ test('a new worker on a relay without idle-keepalive keeps 10 s', async (t) => {
 test('an older worker (hello + ready + ping every 10 s) is served once per ready by the new relay', async (t) => {
   const offers = [{ id: 'q-1', text: 'one' }, { id: 'q-2', text: 'two' }];
   const relay = await startRelay(t, { offers });
-  const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/api/session-worker/ws?token=${TOKEN}&sessionId=${SESSION}&pid=${process.pid}`);
+  const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/api/session-worker/ws?sessionId=${SESSION}&pid=${process.pid}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
   t.after(() => { try { socket.close(); } catch {} });
   const frames = [];
   socket.addEventListener('message', (event) => frames.push(JSON.parse(String(event.data))));

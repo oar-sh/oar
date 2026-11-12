@@ -44,7 +44,7 @@ import { repoRoot, startRelayServer } from "./relay-server-harness.mjs";
 
 const fixtures = path.join(repoRoot, "server", "services", "fixtures");
 const standInWorker = path.join(repoRoot, "tests", "fixtures", "claude-stand-in-session-worker.mjs");
-const CLAUDE_PIN = JSON.parse(fs.readFileSync(path.join(repoRoot, "server", "agent-sdks", "claude", "package.json"), "utf8"));
+const CLAUDE_PIN = JSON.parse(fs.readFileSync(path.join(repoRoot, "server", "agent-sdks", "claude", "pin.json"), "utf8"));
 const CLAUDE_PINNED = CLAUDE_PIN.dependencies["@anthropic-ai/claude-agent-sdk"];
 
 const MODEL = "claude-opus-5";

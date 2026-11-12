@@ -67,7 +67,10 @@ test("the first start of a new version backs the database up before its migratio
   const state = createStateRoot();
   roots.push(state.stateRoot);
   seedOldDatabase(state, "0.9.1");
-  let relay = await startRelayServer({ token: randomUUID(), state, ...SLOW_START });
+  // One token for both starts: once relay-secrets.json exists, a --token
+  // that differs is ignored.
+  const token = randomUUID();
+  let relay = await startRelayServer({ token, state, ...SLOW_START });
   try {
     expect(backups(state)).toHaveLength(1);
     const [file] = backups(state);
@@ -82,7 +85,7 @@ test("the first start of a new version backs the database up before its migratio
   }
   expect(tables(path.join(state.dataDir, "oar.db"))).toContain("conversations");
 
-  relay = await startRelayServer({ token: randomUUID(), state, port: relay.port, ...SLOW_START });
+  relay = await startRelayServer({ token, state, port: relay.port, ...SLOW_START });
   await relay.kill();
   expect(backups(state)).toHaveLength(1);
 });
@@ -91,9 +94,10 @@ test("three version changes with keep 2 leave the newest two", async () => {
   const state = createStateRoot();
   roots.push(state.stateRoot);
   seedOldDatabase(state, "0.9.1");
+  const token = randomUUID();
   for (const version of [null, "0.9.2", "0.9.3"]) {
     if (version) setLastRunVersion(state, version);
-    const relay = await startRelayServer({ token: randomUUID(), state, ...SLOW_START });
+    const relay = await startRelayServer({ token, state, ...SLOW_START });
     await relay.kill();
   }
   expect(backups(state).map((name) => name.replace(/\d{8}-\d{6}/, "T"))).toEqual([

@@ -12,7 +12,11 @@
  * whole of it (createWorkerReplacementFence).
  */
 
-import { stopSessionWorkerProcesses as defaultStopSessionWorkerProcesses } from './session-worker-stop-service.mjs';
+import {
+  isProcessAlive as defaultIsProcessAlive,
+  stopSessionWorkerProcesses as defaultStopSessionWorkerProcesses,
+} from './session-worker-stop-service.mjs';
+import { createProcessIdentityReader, judgeSessionWorkerProcess } from './session-worker-process-service.mjs';
 
 /**
  * What keeps a worker from being replaced now: null when nothing does, else
@@ -116,6 +120,10 @@ export function createWorkerReplacement({
   // isPidAliveImpl, killTmuxSessionImpl }) → { ok, error?, remainingPids? }.
   stopSessionWorkerProcesses = defaultStopSessionWorkerProcesses,
   isProcessAlive = undefined,
+  // (pid, { fresh }) → { pid, startTime, commandLine } | null: what the
+  // process at a pid is (session-worker-process-service.mjs). By default
+  // read from /proc, ps, or the inspector's process list on Windows.
+  readProcessIdentity = undefined,
   killTmuxSession = undefined,
   logger = console,
   // The caller's tag for its warnings ('BILLING SWAP', 'WORKER RECYCLE'), and
@@ -130,6 +138,28 @@ export function createWorkerReplacement({
   if (typeof stopSessionWorkerProcesses !== 'function') {
     throw new Error('createWorkerReplacement requires stopSessionWorkerProcesses');
   }
+  const identityReader = typeof readProcessIdentity === 'function'
+    ? readProcessIdentity
+    : createProcessIdentityReader({
+      readProcessSnapshot: typeof processInspector?.readProcessSnapshot === 'function'
+        ? (options) => processInspector.readProcessSnapshot(options)
+        : null,
+    });
+  // Never rejects: a reader that failed knows nothing about the process.
+  const identityOf = async (pid, options = {}) => {
+    try {
+      return await identityReader(pid, options);
+    } catch {
+      return { pid, startTime: null, commandLine: null };
+    }
+  };
+  const isWorkerPidAlive = (pid) => {
+    try {
+      return (typeof isProcessAlive === 'function' ? isProcessAlive : defaultIsProcessAlive)(pid) === true;
+    } catch {
+      return false;
+    }
+  };
 
   function prefix() {
     try {
@@ -141,7 +171,10 @@ export function createWorkerReplacement({
 
   /**
    * Stop every process of the session. `{ ok: true }` once they are all gone
-   * and the registry and the supervisor's health state are cleared; else
+   * and the registry and the supervisor's health state are cleared, with
+   * `identity`, the stopped worker's pid and start time as read before the
+   * stop, when it could be read (the recycle tells by it whether a launch
+   * named the stopped process or a new one that got its pid); else
    * `{ ok: false, error, remainingPids }`, and the caller retries with a
    * backoff.
    *
@@ -167,23 +200,44 @@ export function createWorkerReplacement({
       } catch {}
       return { ok: false, error, remainingPids };
     };
+    const workerPid = toFencePid(worker?.pid);
     let stopped = null;
+    let before = null;
     try {
       await supervisor?.cancelPendingStart?.(sid, { wait: true });
+      // What the worker's process is before the stop ends it.
+      if (workerPid) before = (await identityOf(workerPid)) || null;
       stopped = await stopSessionWorkerProcesses({
         sdkSessionId: sid,
         worker,
         processInspector,
         isPidAliveImpl: isProcessAlive,
+        readProcessIdentityImpl: identityReader,
+        workerIdentity: before,
         killTmuxSessionImpl: killTmuxSession,
       });
     } catch (error) {
       return backOff(String(error?.message || error || 'worker-stop-failed'));
     }
     if (!stopped?.ok) return backOff(stopped?.error || 'worker-survived-stop', stopped?.remainingPids || []);
+    // The registry's pid, alive though the process list never showed it. If
+    // it is still the session's worker (its command line names the session,
+    // its start time is the one read before the stop), the stop never
+    // reached it (a command line the list does not know as a worker's), and
+    // it goes on asking for the session's work: not a stop, since a
+    // replacement launched now would leave it serving beside the new one, or
+    // alone while that launch waits. A process that only has its pid now (a
+    // pid handed out again, a zombie) means the worker is gone. One nothing
+    // could be read about is no stop either, but its pid is not named.
+    const listed = Array.isArray(stopped.pids) && stopped.pids.map(Number).includes(workerPid);
+    if (workerPid && !listed && isWorkerPidAlive(workerPid)) {
+      const verdict = judgeSessionWorkerProcess(await identityOf(workerPid, { fresh: true }), { sdkSessionId: sid, before });
+      if (verdict === 'ours') return backOff('worker-not-in-process-list', [workerPid]);
+      if (verdict === 'unverified') return backOff('worker-not-in-process-list');
+    }
     registry?.removeWorker?.(sid);
     supervisor?.resetHealth?.(sid, { clearFailureCount: false });
-    return { ok: true };
+    return before?.startTime ? { ok: true, identity: { pid: before.pid, startTime: before.startTime } } : { ok: true };
   }
 
   /** Launch the session's worker, never reusing a live process: `{ ok, error }`. */

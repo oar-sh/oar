@@ -9,6 +9,8 @@ import {
   renderPushNotification,
   PUSH_EVENT_TYPES,
   PUSH_SEND_TIMEOUT_MS,
+  NEW_SIGNIN_COALESCE_MS,
+  NEW_SIGNIN_TAG,
 } from './push-dispatch-service.mjs';
 import { PUSH_SUBSCRIPTIONS_SCHEMA } from '../migrations/0003-push-subscriptions.mjs';
 import { questionCardHeadLabel } from '../public/app/conversation-provider-indicator.mjs';
@@ -37,12 +39,14 @@ function makeService(db, {
   hasActiveDevice = () => false,
   webpush = { sendNotification: async () => ({ statusCode: 201 }) },
   recordStatusEvent,
+  now,
 } = {}) {
   const statusEvents = [];
   const service = createPushDispatchService({
     db,
     webpush,
     hasActiveDevice,
+    ...(now ? { now } : {}),
     recordStatusEvent: recordStatusEvent || ((type, details) => statusEvents.push({ type, details })),
     uuid: nextUuid,
     logger: { warn: () => {} },
@@ -75,6 +79,7 @@ test('normalizePushPreferences fills safe defaults', () => {
     cliOffline: false,
     hostSuspend: true,
     relayRestart: true,
+    newSignIn: true,
   });
   assert.deepEqual(prefs.content, { includeTitle: false, preview: 'none', previewChars: 80 });
 });
@@ -213,6 +218,18 @@ test('ensurePushVapidKeys generates once and is stable afterwards', () => {
 });
 
 // ── Suppression ────────────────────────────────────────────────────────────
+
+test('deleteDevicesForDevice removes every subscription of one device (a signed-out browser), and only those', () => {
+  const db = makeDb();
+  const { service } = makeService(db);
+  subscribeDevice(service, { deviceId: 'phone', endpoint: 'https://push.example/phone-a' });
+  subscribeDevice(service, { deviceId: 'phone', endpoint: 'https://push.example/phone-b' });
+  subscribeDevice(service, { deviceId: 'laptop' });
+  assert.equal(service.deleteDevicesForDevice('phone'), 2);
+  assert.deepEqual(service.listDevices().map((device) => device.deviceId), ['laptop']);
+  assert.equal(service.deleteDevicesForDevice(''), 0);
+  assert.equal(service.deleteDevicesForDevice('phone'), 0);
+});
 
 test('dispatch is suppressed while any device is active', async () => {
   const db = makeDb();
@@ -727,4 +744,123 @@ test('a variant that is no listed one gets no label, whatever its name', () => {
     const payload = renderPushNotification({ type: 'question', relayName: 'relay-b', remoteKind: 'approval', variant, summary: 'S', data: {} }, normalizePushPreferences({}));
     assert.equal(payload.body, 'An Allow / Deny card waits there.', variant);
   }
+});
+
+// ── New sign-in (agent auth §13.2, 2d) ───────────────────────────────────────
+
+function recordingWebpush() {
+  const sent = [];
+  return {
+    sent,
+    webpush: {
+      sendNotification: async (subscription, payload) => {
+        sent.push({ endpoint: subscription.endpoint, payload: JSON.parse(payload) });
+        return { statusCode: 201 };
+      },
+    },
+  };
+}
+
+test('newSignIn: on by default, past the active-device suppression, started before notifyNewSignIn returns', async () => {
+  const db = makeDb();
+  const { sent, webpush } = recordingWebpush();
+  // A device is in the foreground: the new browser itself, typically.
+  const { service } = makeService(db, { webpush, hasActiveDevice: () => true });
+  subscribeDevice(service, { deviceId: 'phone' });
+  const pending = service.notifyNewSignIn({ noticeId: 'signin-abc', sessionId: 'bs_new', deviceId: 'tablet', label: 'Firefox on Linux', address: '198.51.100.7', via: 'terminal' });
+  assert.equal(sent.length, 1, 'the send is under way before the promise is awaited');
+  const result = await pending;
+  assert.equal(result.outcome, 'dispatched');
+  const { payload } = sent[0];
+  assert.equal(payload.tag, NEW_SIGNIN_TAG);
+  assert.equal(payload.title, 'New browser signed in');
+  assert.match(payload.body, /^Firefox on Linux, 198\.51\.100\.7, via the terminal\./);
+  assert.deepEqual(payload.data, { noticeId: 'signin-abc', count: 1, quiet: false, open: '?settings=security', signOutSessionId: 'bs_new', type: 'newSignIn' });
+});
+
+test('newSignIn: never to a device with no live session but the new one', async () => {
+  const db = makeDb();
+  const { sent, webpush } = recordingWebpush();
+  const { service } = makeService(db, { webpush });
+  subscribeDevice(service, { deviceId: 'phone' });
+  subscribeDevice(service, { deviceId: 'new-laptop' });
+  subscribeDevice(service, { deviceId: 'old-tablet' });
+  // Devices with a live session other than the new one.
+  const live = new Set(['phone']);
+  await service.notifyNewSignIn({ sessionId: 'bs_new', deviceId: 'new-laptop', via: 'code', isLiveDevice: (deviceId) => live.has(deviceId) });
+  assert.deepEqual(sent.map((entry) => entry.endpoint), ['https://push.example/phone']);
+  // Its own toggle still applies.
+  sent.length = 0;
+  service.updateDevice(service.listDevices().find((row) => row.deviceId === 'phone').id, { preferences: { events: { newSignIn: false } } });
+  assert.equal((await service.notifyNewSignIn({ sessionId: 'bs_two', deviceId: 'new-laptop', via: 'code', isLiveDevice: (deviceId) => live.has(deviceId) })).outcome, 'no-subscribers');
+});
+
+test('newSignIn: a new browser that claims the phone\'s device id does not silence the phone', async () => {
+  const db = makeDb();
+  const { sent, webpush } = recordingWebpush();
+  const { service } = makeService(db, { webpush });
+  subscribeDevice(service, { deviceId: 'phone' });
+  // The phone's own session, and the new one that copied its device id.
+  const sessions = [{ id: 'bs_phone', deviceId: 'phone' }, { id: 'bs_new', deviceId: 'phone' }];
+  const hasLiveDevice = (deviceId, exceptId) => sessions.some((row) => row.deviceId === deviceId && row.id !== exceptId);
+  const result = await service.notifyNewSignIn({
+    sessionId: 'bs_new',
+    deviceId: 'phone',
+    via: 'code',
+    isLiveDevice: (deviceId) => hasLiveDevice(deviceId, 'bs_new'),
+  });
+  assert.equal(result.outcome, 'dispatched');
+  assert.deepEqual(sent.map((entry) => entry.endpoint), ['https://push.example/phone']);
+});
+
+test('newSignIn: coalesced per 5 minutes under one tag; later ones replace it quietly, then a new window alerts again', async () => {
+  const db = makeDb();
+  const { sent, webpush } = recordingWebpush();
+  const clock = { now: 10_000_000 };
+  const { service } = makeService(db, { webpush, now: () => clock.now });
+  subscribeDevice(service, { deviceId: 'phone' });
+  await service.notifyNewSignIn({ sessionId: 'bs_a', label: 'Chrome on Android', via: 'token' });
+  clock.now += 60_000;
+  await service.notifyNewSignIn({ sessionId: 'bs_b', label: 'Safari on iPhone', via: 'code' });
+  clock.now += 60_000;
+  await service.notifyNewSignIn({ sessionId: 'bs_c', label: 'Edge on Windows', via: 'terminal' });
+  assert.deepEqual(sent.map((entry) => [entry.payload.tag, entry.payload.data.count, entry.payload.data.quiet]), [
+    [NEW_SIGNIN_TAG, 1, false],
+    [NEW_SIGNIN_TAG, 2, true],
+    [NEW_SIGNIN_TAG, 3, true],
+  ]);
+  assert.equal(sent[2].payload.title, '3 new browsers signed in');
+  assert.match(sent[2].payload.body, /Latest: Edge on Windows, via the terminal/);
+  assert.equal(sent[2].payload.data.signOutSessionId, undefined, 'no single session to sign out');
+  clock.now += NEW_SIGNIN_COALESCE_MS;
+  await service.notifyNewSignIn({ sessionId: 'bs_d', via: 'token' });
+  assert.deepEqual([sent[3].payload.data.count, sent[3].payload.data.quiet, sent[3].payload.data.signOutSessionId], [1, false, 'bs_d']);
+});
+
+test('newSignIn: the rows are read at once, so a sign-out that deletes them afterwards does not drop the push', async () => {
+  const db = makeDb();
+  const sent = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const webpush = { sendNotification: async (subscription) => { sent.push(subscription.endpoint); await gate; return { statusCode: 201 }; } };
+  const { service } = makeService(db, { webpush });
+  subscribeDevice(service, { deviceId: 'phone' });
+  const pending = service.notifyNewSignIn({ sessionId: 'bs_new', via: 'terminal' });
+  // "Sign out all other browsers" removes the phone's push rows.
+  assert.equal(service.deleteDevicesForDevice('phone'), 1);
+  release();
+  const result = await pending;
+  assert.deepEqual(sent, ['https://push.example/phone']);
+  assert.equal(result.sent, 1);
+});
+
+test('newSignIn: a sign-in no device hears of opens no window, so the next one still alerts with "Sign it out"', async () => {
+  const db = makeDb();
+  const { sent, webpush } = recordingWebpush();
+  const { service } = makeService(db, { webpush });
+  subscribeDevice(service, { deviceId: 'phone' });
+  // The phone's own sign-in: no other live session on it, nobody else to tell.
+  assert.equal((await service.notifyNewSignIn({ sessionId: 'bs_phone', deviceId: 'phone', via: 'token', isLiveDevice: () => false })).outcome, 'no-subscribers');
+  await service.notifyNewSignIn({ sessionId: 'bs_other', deviceId: 'laptop', via: 'terminal', isLiveDevice: (deviceId) => deviceId === 'phone' });
+  assert.deepEqual([sent[0].payload.data.count, sent[0].payload.data.quiet, sent[0].payload.data.signOutSessionId], [1, false, 'bs_other']);
 });

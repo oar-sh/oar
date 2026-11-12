@@ -111,6 +111,7 @@ test('the caller context comes from the live turn, the runtime binding and the c
     userMessageId: 'q-1',
     hops: 0,
     originRelayIds: [],
+    origins: [],
     origin: null,
   });
 });

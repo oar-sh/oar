@@ -30,6 +30,11 @@ export const REMOTE_RELAY_APPROVAL_SOURCE = 'remote_relay';
 // it is the user's to answer: never listed to an agent, never answered by
 // one, from this relay or another.
 export const PERSON_ONLY_QUESTION_SOURCE = 'ClaudeSafetyCheck';
+// The Safety check card's `context.kind` for an edit to a file Claude Code
+// marks as sensitive (.git/, .claude/, shell rc files, …). The card also
+// carries `context.personOnly: true`.
+export const SENSITIVE_FILE_QUESTION_KIND = 'sensitive-file';
+export const RELAY_QUESTION_CONTEXT_KINDS = Object.freeze([SENSITIVE_FILE_QUESTION_KIND]);
 export const RELAY_ASK_KIND = 'ask';
 
 export const RELAY_ASK_URGENCIES = Object.freeze(['normal', 'now']);
@@ -153,6 +158,49 @@ export function normalizeRelayAskAnswer(ask, { answer = '', choice = '' } = {}) 
 /** True for a Safety check card's context (a formatted question's or a stored request envelope's). */
 export function isPersonOnlyQuestion(context) {
   return !!context && typeof context === 'object' && toText(context.source) === PERSON_ONLY_QUESTION_SOURCE;
+}
+
+// The `context.source` of a Claude Cloud permission card
+// (claude-cloud-session-process.mjs): the person's, like a Safety check.
+export const CLOUD_PERMISSION_QUESTION_SOURCE = 'ClaudeCloudPermission';
+const PERSON_ONLY_SOURCES = new Set([
+  REMOTE_RELAY_APPROVAL_SOURCE,
+  PERSON_ONLY_QUESTION_SOURCE,
+  CLOUD_PERMISSION_QUESTION_SOURCE,
+]);
+
+function cardContext(card) {
+  if (!card || typeof card !== 'object') return null;
+  if (card.context && typeof card.context === 'object') return card.context;
+  // A stored row keeps the context in its request envelope.
+  if (typeof card.request === 'string' && card.request) {
+    try {
+      const envelope = JSON.parse(card.request);
+      return envelope && typeof envelope.context === 'object' ? envelope.context : null;
+    } catch {
+      return null;
+    }
+  }
+  if (card.request && typeof card.request === 'object' && card.request.context && typeof card.request.context === 'object') {
+    return card.request.context;
+  }
+  return null;
+}
+
+/**
+ * A card only the person may answer or dismiss (agent auth §2.3): an ask
+ * (relay_tool `ask`), a relay's Allow / Deny card on its own agent's call
+ * (`remote_relay`), a Safety check (sensitive files included), a Claude
+ * Cloud permission, and any card whose context says `personOnly: true`.
+ * Takes a formatted question, a stored row (context in `request`) or an ask.
+ */
+export function isPersonOnlyCard(card) {
+  if (!card || typeof card !== 'object') return false;
+  if (isRelayAskId(card.id) || toText(card.kind) === RELAY_ASK_KIND) return true;
+  const context = cardContext(card);
+  if (!context) return false;
+  if (context.personOnly === true) return true;
+  return PERSON_ONLY_SOURCES.has(toText(context.source));
 }
 
 /** The kind of a formatted question card (a row of /api/relay-questions). */

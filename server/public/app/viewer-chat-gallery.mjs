@@ -26,7 +26,8 @@ export function chatMediaItemFromNode(node, { parseAppFileHref } = {}) {
     };
   }
   if (String(node.tagName || '').toUpperCase() !== 'IMG') return null;
-  const src = String(node.getAttribute('src') || '').trim();
+  // A file whose capability is still on its way waits in data-oar-file-src.
+  const src = String(node.getAttribute('src') || node.getAttribute('data-oar-file-src') || '').trim();
   if (!src) return null;
   const target = parseAppFileHref?.(src) || null;
   if (target?.kind === 'drive') return { source: 'drives', path: target.path, name: baseName(target.path) };

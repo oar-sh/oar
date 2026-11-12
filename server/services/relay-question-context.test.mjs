@@ -62,3 +62,13 @@ test('an approval card\'s variant (a listed one only) and its bounded summary su
   assert.equal('summary' in dropped, false);
   assert.equal('variant' in sanitizeRelayQuestionContext({ source: 's', variant: ['write'] }), false);
 });
+
+test('a Safety check card keeps its listed kind and its person-only flag, only as sent by the worker', () => {
+  const context = sanitizeRelayQuestionContext({ source: 'ClaudeSafetyCheck', kind: 'sensitive-file', personOnly: true });
+  assert.equal(context.kind, 'sensitive-file');
+  assert.equal(context.personOnly, true);
+  assert.equal('kind' in sanitizeRelayQuestionContext({ source: 's', kind: 'something-else' }), false, 'a listed kind only');
+  assert.equal('kind' in sanitizeRelayQuestionContext({ source: 's', kind: ' sensitive-file ' }), false);
+  assert.equal('personOnly' in sanitizeRelayQuestionContext({ source: 's', personOnly: 'true' }), false, 'only a real boolean true');
+  assert.equal('personOnly' in sanitizeRelayQuestionContext({ source: 's', personOnly: false }), false);
+});

@@ -12,6 +12,7 @@ const PUSH_EVENT_CONTROL_IDS = {
   cliOffline: 'push-event-cli-offline-toggle',
   hostSuspend: 'push-event-host-suspend-toggle',
   relayRestart: 'push-event-relay-restart-toggle',
+  newSignIn: 'push-event-new-signin-toggle',
 };
 
 let pushUpdateInFlight = false;

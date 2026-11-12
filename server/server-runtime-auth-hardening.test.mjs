@@ -12,25 +12,29 @@ const source = fs.readFileSync(sourcePath, 'utf8');
 // HTTP in relay-auth.test.mjs); the runtime wires it in.
 const authSource = fs.readFileSync(fileURLToPath(new URL('./services/relay-auth.mjs', import.meta.url)), 'utf8');
 
-test('the auth token is compared in constant time (L1)', () => {
+test('the owner token is checked against its hash, agent tokens against the agent key, both in constant time (L1)', () => {
   assert.match(authSource, /export function tokensMatch\(/);
   assert.match(authSource, /crypto\.timingSafeEqual\(/);
-  // The HTTP and socket auth paths use the constant-time helper, not `===`.
-  assert.match(authSource, /if \(tokensMatch\(token, expected\)\)/);
-  assert.match(authSource, /return tokensMatch\(socketAuthToken\(socket\), getAuthToken\(\)\)/);
+  // The runtime hands the store's checks to auth; no plain owner token is kept.
+  assert.match(source, /verifyOwnerToken: \(value\) => ownerSecretStore\.verifyOwnerToken\(value\)/);
+  assert.match(source, /verifyAgentToken: \(value\) => ownerSecretStore\.verifyAgentToken\(value\)/);
+  assert.doesNotMatch(source, /config\.authToken(?!;)/, 'nothing reads a plain owner token from the config');
   assert.doesNotMatch(authSource, /token === /);
-  assert.match(source, /getAuthToken: \(\) => config\.authToken/);
+  const credentials = fs.readFileSync(fileURLToPath(new URL('../shared/relay-credentials.mjs', import.meta.url)), 'utf8');
+  assert.match(credentials, /crypto\.timingSafeEqual\(a, b\)/);
+  assert.match(credentials, /crypto\.timingSafeEqual\(expected, parsed\.mac\)/);
 });
 
 test('the auth token is read from neither the request body nor the query (M4)', () => {
-  assert.match(authSource, /const token = bearerToken\(req\.headers\) \|\| cookies\[cookieName\];/);
+  assert.match(authSource, /const bearer = bearerToken\(req\?\.headers\);/);
+  assert.match(authSource, /const values = \[\.\.\.new Set\(cookieValues\(headers\?\.cookie, cookieName\)/);
   assert.doesNotMatch(authSource, /req\.body\?\.token/);
   assert.doesNotMatch(authSource, /req\.query\.token/);
   assert.doesNotMatch(authSource, /handshake\?*\.query\?*\.token/);
 });
 
 test('a recovered socket re-validates the auth token (H2)', () => {
-  assert.match(source, /socket\.recovered && !relayAuth\.socketTokenValid\(socket\)/);
+  assert.match(source, /if \(socket\.recovered\) \{\s*const principal = relayAuth\.socketPrincipal\(socket\);\s*if \(!principal\) \{/);
   assert.match(source, /socket\.disconnect\(true\)/);
   assert.match(source, /io\.use\(relayAuth\.socketMiddleware\)/);
 });
@@ -44,6 +48,22 @@ test('baseline security headers are set on every response (M7)', () => {
   assert.match(source, /res\.setHeader\('X-Content-Type-Options', 'nosniff'\)/);
   assert.match(source, /res\.setHeader\('X-Frame-Options', 'SAMEORIGIN'\)/);
   assert.match(source, /res\.setHeader\('Referrer-Policy', 'no-referrer'\)/);
+});
+
+test('the app shell carries CSP frame-ancestors \'self\': the page, a shared link\'s reader and "Preview as shared" (§13.4)', () => {
+  assert.match(source, /const APP_SHELL_CSP = "frame-ancestors 'self'";/);
+  assert.match(source, /res\.setHeader\('Content-Security-Policy', APP_SHELL_CSP\)/);
+  // Every response that renders the shell sets it.
+  const shellRenders = source.match(/renderIndexHtmlWithPwaVersion\([^)]*\);[\s\S]{0,240}?res\.type\('html'\)\.send\(html\)/g) || [];
+  assert.equal(shellRenders.length, 3);
+  for (const block of shellRenders) assert.match(block, /applyAppShellHeaders\(res\);/);
+  for (const route of ["app.get(['/', '/index.html']", "app.get(['/shared/:token', '/shared/:token/']", "app.get(['/share-preview/:conversationId', '/share-preview/:conversationId/']"]) {
+    assert.ok(source.includes(route), route);
+  }
+  // A served file keeps its own CSP: a PDF may be framed by this origin.
+  const served = fs.readFileSync(fileURLToPath(new URL('./services/safe-served-content.mjs', import.meta.url)), 'utf8');
+  assert.match(served, /"default-src 'none'; frame-ancestors 'self'"/);
+  assert.match(served, /"default-src 'none'; sandbox; frame-ancestors 'none'"/);
 });
 
 test('the workspace serve path enforces real-path containment (M1)', () => {

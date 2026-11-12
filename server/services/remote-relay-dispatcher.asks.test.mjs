@@ -244,8 +244,9 @@ test('answer_question refuses an ask: only the user answers it', async () => {
   });
   const result = await run('answer_question', { relay: 'full-test', question_id: 'ask_there0001', choices: ['Yes'] });
   assert.equal(result.status, 403);
-  assert.match(result.body.error, /the user's to answer/);
-  assert.equal(remoteCalls.filter((entry) => entry.method === 'POST').length, 0, 'no answer was sent');
+  assert.equal(result.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.match(result.body.error, /Only the person can answer questions/);
+  assert.equal(remoteCalls.length, 0, 'nothing was read or sent');
 });
 
 test('read_session lists the pending asks of a session with their kind', async () => {

@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import fs from "fs";
+import os from "os";
 import path from "path";
 
 import {
@@ -11,6 +13,17 @@ import { snapshotWorktreeData, worktreeDataChanges } from "../scripts/worktree-d
 
 const playwrightCli = path.join(repoRoot, "node_modules", "@playwright", "test", "cli.js");
 const token = randomUUID();
+const relayLogReporter = path.join(repoRoot, "tests", "relay-log-reporter.mjs");
+
+// A --reporter given on the command line replaces the config's list, the
+// relay log reporter with it: it is added back.
+function withRelayLogReporter(args) {
+  return args.map((arg, index) => {
+    if (arg.startsWith("--reporter=")) return `${arg},${relayLogReporter}`;
+    if (index > 0 && args[index - 1] === "--reporter") return `${arg},${relayLogReporter}`;
+    return arg;
+  });
+}
 
 // A relay booted on an empty database has no provider known to be ready, so
 // the app points to Settings instead of offering a Copilot chat: the empty
@@ -35,12 +48,19 @@ async function main() {
   // Nothing a spec does may leave a database or a backup in this checkout.
   const worktreeBefore = snapshotWorktreeData(repoRoot);
 
+  // The relay's output, redacted, for the report of a spec that fails
+  // (relay-log-reporter.mjs). Kept when the run fails.
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "oar-e2e-relay-log-"));
+  const logFile = path.join(logDir, "relay.log");
+
   // Isolate the test server's state (db, singleton lock, uploads, config) from a
   // live relay running out of the same checkout. The env block that does the
   // isolating lives in relay-server-harness.mjs, shared with the specs that boot
   // their own differently-configured relay.
   const relay = await startRelayServer({
     token,
+    logFile,
+    logTailBytes: 64 * 1024,
     allowCli: Boolean(String(process.env.RELAY_E2E_ALLOW_CLI || "").trim()),
     // A cold start on a CI runner (a fresh checkout, the module cache empty)
     // takes longer than the harness's 30 s default.
@@ -52,6 +72,7 @@ async function main() {
     if (shutdownRequested) return;
     shutdownRequested = true;
     await relay.stop();
+    fs.rmSync(logDir, { recursive: true, force: true });
     process.exit(exitCode);
   };
 
@@ -62,7 +83,7 @@ async function main() {
 
   const testProc = spawn(
     process.execPath,
-    [playwrightCli, "test", "--config", "tests/playwright.config.mjs", ...process.argv.slice(2)],
+    [playwrightCli, "test", "--config", "tests/playwright.config.mjs", ...withRelayLogReporter(process.argv.slice(2))],
     {
       cwd: repoRoot,
       env: {
@@ -76,6 +97,7 @@ async function main() {
         RELAY_TEST_GROK_AUTH_FILE: relay.grokAuthFile,
         RELAY_TEST_GROK_LOGIN_AUTHORIZED_FILE: relay.grokLoginAuthorizedFile,
         RELAY_TEST_GROK_LOGIN_DENIED_FILE: relay.grokLoginDeniedFile,
+        RELAY_TEST_LOG_FILE: logFile,
       },
       stdio: "inherit",
       windowsHide: false,
@@ -91,6 +113,8 @@ async function main() {
   process.off("SIGTERM", onSigTerm);
   await stopProcess(relay.proc);
   relay.cleanupStateRoot();
+  if (testExitCode === 0) fs.rmSync(logDir, { recursive: true, force: true });
+  else console.error(`\nThe test relay's output (redacted): ${logFile}`);
   const leftBehind = worktreeDataChanges(worktreeBefore, snapshotWorktreeData(repoRoot));
   if (leftBehind.length) {
     console.error(`\nA spec left files in this checkout (use a temp folder; or a relay running from this checkout made them): ${leftBehind.join(", ")}`);

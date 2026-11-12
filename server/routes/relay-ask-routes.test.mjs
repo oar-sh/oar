@@ -6,6 +6,7 @@ import { applySchema } from '../db-schema.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
 import { createRelayAskService } from '../services/relay-ask-service.mjs';
 import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound.mjs';
+import { asAgent, asOwner, asPeer } from '../services/relay-principal-test-harness.mjs';
 import { RELAY_ASK_REMOTE_PATHS } from '../services/relay-ask-link-service.mjs';
 import { REMOTE_RELAY_ERROR_CODES as CODES } from '../../shared/remote-relay-contract.mjs';
 import { questionExpiresAt } from '../../shared/question-timeout.mjs';
@@ -22,6 +23,8 @@ const LEAD = 'conv-fixture-lead';
 const NOW = '2026-03-02T10:00:00.000Z';
 const PAIRED = { id: 'r-lab', relayId: 'instance-lab', name: 'lab-relay', url: 'https://relay-b.example.test', lastStatus: 'online' };
 const FROM_PAIRED = { 'x-oar-remote-origin': PAIRED.relayId, 'x-oar-remote-hops': '1' };
+// A second paired relay (its own key too).
+const OTHER = { id: 'r-other', relayId: 'instance-other', name: 'other-relay', url: 'https://relay-d.example.test', lastStatus: 'online' };
 
 function seed(db) {
   for (const [id, title] of [[SESSION, 'Cache layer'], [LEAD, 'Lead']]) {
@@ -59,7 +62,7 @@ function formatQuestionRow(row) {
   };
 }
 
-function boot({ inboundEnabled = true, client = null, boards = false, questionNotice = null } = {}) {
+function boot({ inboundEnabled = true, client = null, boards = false, questionNotice = null, pairedRelays = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   seed(db);
@@ -71,7 +74,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
     logger: { log() {}, warn() {} },
   });
   const remoteRelayInbound = {
-    listRelays: () => [PAIRED],
+    listRelays: () => [PAIRED, OTHER],
     selfNames: () => ['bench-relay'],
     inboundEnabled: () => inboundEnabled,
   };
@@ -104,7 +107,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
     relayAskService: asks,
     remoteRelayRegistry: {
       selfName: () => 'bench-relay',
-      list: () => [PAIRED, { id: 'r-gone', name: 'gone-relay', url: 'https://relay-c.example.test', lastStatus: 'offline' }],
+      list: () => pairedRelays || [PAIRED, { id: 'r-gone', name: 'gone-relay', url: 'https://relay-c.example.test', lastStatus: 'offline' }],
       get: (id) => (id === PAIRED.id ? PAIRED : null),
     },
     remoteRelayClient: client && {
@@ -116,7 +119,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
   };
   registerAskUserRoutes(app, deps);
   registerRelayAskRoutes(app, deps);
-  async function call(method, path, { body = {}, headers = {}, params = {}, query = {}, loopback = false } = {}) {
+  async function call(method, path, { body = {}, headers = {}, params = {}, query = {}, loopback = false, ownerToken = false } = {}) {
     const handler = routes.get(`${method} ${path}`);
     assert.ok(handler, `${method} ${path} is registered`);
     const captured = { status: 200, body: null };
@@ -126,7 +129,15 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
       json(payload) { captured.body = payload; return res; },
     };
     const req = { body, headers, params, query };
-    if (loopback) markRemoteRelayLoopbackRequest(req);
+    // Who `auth` would have said is calling: this relay's own relay_tool (the
+    // loopback) carries the calling agent's token; a paired relay its own key
+    // (the entry its origin header names); everyone else the owner token (a
+    // relay this one does not list, or an older one: its claim is unverified).
+    const claimed = String(headers['x-oar-remote-origin'] || '');
+    const pairedEntry = [PAIRED, OTHER].find((entry) => claimed && entry.relayId === claimed) || null;
+    if (loopback) asAgent(markRemoteRelayLoopbackRequest(req), body?.origin?.conversationId || 'loopback-caller');
+    else if (pairedEntry && !ownerToken) asPeer(req, pairedEntry);
+    else asOwner(req);
     await handler(req, res);
     // The Inbox routes answer after an await of their own.
     await new Promise((resolve) => setImmediate(resolve));
@@ -172,13 +183,14 @@ const QUESTION = { question: 'Which database?', options: ['Postgres', 'SQLite'],
 
 test('an approval-kind answer sent with the pairing token is refused, and the card stays open', async () => {
   const fx = boot();
-  // Through the route paired relays answer asks from their Inbox: not an ask, not found.
+  // The route paired relays answered asks through is closed: nothing is
+  // answered over the pairing (agent auth §2.2).
   for (const id of ['card-approval', 'card-ask-user']) {
     const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id, choice: 'Allow', answer: 'Allow' } });
-    assert.equal(answered.status, 404, id);
-    assert.equal(answered.body.code, CODES.notFound);
+    assert.equal(answered.status, 403, id);
+    assert.equal(answered.body.code, 'REMOTE_RELAY_PEER_SCOPE');
     const dismissed = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.dismiss, { headers: FROM_PAIRED, body: { id } });
-    assert.equal(dismissed.status, 404, id);
+    assert.equal(dismissed.status, 403, id);
   }
   // Through the question route with the pairing's headers, or an origin in the body.
   const direct = await fx.call('POST', '/api/relay-question/:id/answer', { headers: FROM_PAIRED, params: { id: 'card-approval' }, body: { answer: 'Allow' } });
@@ -196,7 +208,8 @@ test('an ask is answered and dismissed through the question routes by the user, 
   const ask = fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
   const fromAgent = await fx.call('POST', '/api/relay-question/:id/answer', { headers: FROM_PAIRED, params: { id: ask.id }, body: { answer: 'SQLite' } });
   assert.equal(fromAgent.status, 403);
-  assert.match(fromAgent.body.error, /only the user answers it/);
+  assert.match(fromAgent.body.error, /Only the person can answer questions/);
+  assert.equal(fromAgent.body.code, 'AUTH_PERSON_REQUIRED');
   const fromOwnAgent = await fx.call('POST', '/api/relay-question/:id/answer', { loopback: true, headers: { 'x-oar-remote-origin': 'instance-self' }, params: { id: ask.id }, body: { answer: 'SQLite' } });
   assert.equal(fromOwnAgent.status, 403, 'this relay\'s own agents neither');
   assert.equal(fx.asks.get(ask.id).status, 'pending');
@@ -269,10 +282,13 @@ test('a paired relay\'s agent asks here; that relay reads the outcome of its own
   assert.equal(status.body.asks[0].status, 'pending');
   const other = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.status, { headers: { 'x-oar-remote-origin': 'instance-other' }, body: { ids: [ask.id] } });
   assert.equal(other.body.asks[0].status, 'unknown', 'another relay learns nothing of it');
-  // The user there answers it from that relay's Inbox: an ask, so it is taken.
-  const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id: ask.id, choice: 'Postgres' } });
+  // That relay cannot answer it over the pairing; this relay's user answers it here.
+  const overPairing = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id: ask.id, choice: 'Postgres' } });
+  assert.equal(overPairing.status, 403, JSON.stringify(overPairing.body));
+  assert.equal(overPairing.body.code, 'REMOTE_RELAY_PEER_SCOPE');
+  assert.equal(fx.asks.get(ask.id).status, 'pending');
+  const answered = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id: ask.id }, body: { choice: 'Postgres' } });
   assert.equal(answered.status, 200, JSON.stringify(answered.body));
-  assert.equal(answered.body.ask.answeredVia, 'lab-relay');
   assert.deepEqual(fx.told.at(-1).notify, [SESSION]);
   const after = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.status, { headers: FROM_PAIRED, body: { ids: [ask.id] } });
   assert.deepEqual([after.body.asks[0].status, after.body.asks[0].answer], ['answered', 'Postgres']);
@@ -294,20 +310,30 @@ test('a paired relay\'s Inbox learns that a card was answered, never the answer;
   assert.equal(own.body.relays[0].items.find((item) => item.id === 'card-ask-user').answer, 'Dark, the secret theme');
 });
 
-test('a relay this one has no name for is named by what it calls itself; a paired relay by its name here', async () => {
+test('a relay without a key here (one-way, or an older OAR) is refused with the reason; a paired relay is named by its name here', async () => {
   const fx = boot();
   const oneWay = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, {
     headers: { 'x-oar-remote-origin': 'instance-unpaired' },
     body: { session: SESSION, question: 'Q?', asker: { conversationId: 'conv-far', relayName: 'far-relay\nx' } },
   });
-  assert.equal(oneWay.body.ask.askedBy.relay, 'far-relay x');
+  assert.equal(oneWay.status, 403);
+  assert.equal(oneWay.body.code, CODES.peerKeyRequired);
+  assert.equal(oneWay.body.originVerified, false);
+  assert.match(oneWay.body.error, /not paired with this relay/);
+  assert.match(oneWay.body.error, /Re-pair in Settings → Relays/);
+  // The paired relay on the owner token (an older OAR): unverified, refused.
+  const older = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, ownerToken: true, body: { session: SESSION, question: 'Q?' } });
+  assert.equal(older.status, 403);
+  assert.equal(older.body.code, CODES.peerKeyRequired);
   const paired = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, {
     headers: FROM_PAIRED,
     body: { session: SESSION, question: 'Q2?', asker: { relayName: 'claims-another-name' } },
   });
   assert.equal(paired.body.ask.askedBy.relay, 'lab-relay');
-  const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: { 'x-oar-remote-origin': 'instance-unpaired' }, body: { id: oneWay.body.ask.id, answer: 'ok', via: 'far-relay' } });
-  assert.equal(answered.body.ask.answeredVia, 'far-relay');
+  // It does not answer it over the pairing (agent auth §2.2).
+  const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id: paired.body.ask.id, answer: 'ok', via: 'far-relay' } });
+  assert.equal(answered.status, 403);
+  assert.equal(fx.asks.get(paired.body.ask.id).status, 'pending');
 });
 
 test('the paired routes take another relay\'s request only, under the inbound switch', async () => {
@@ -337,7 +363,20 @@ test('what a paired relay\'s Inbox gets of this relay: asks, cards to open here,
   });
 });
 
-test('the Inbox lists this relay and every paired relay that answers; an ask there is answered through the pairing', async () => {
+test('a relay added one way (it lists no entry for this one) is not asked for its Inbox: a quiet note, never "not reachable"', async () => {
+  const fx = boot({
+    pairedRelays: [{ ...PAIRED, peerTokenState: 'unlisted' }],
+    client: () => { throw new Error('unexpected'); },
+  });
+  const inbox = await fx.call('GET', '/api/inbox');
+  assert.equal(inbox.status, 200);
+  const lab = inbox.body.relays[1];
+  assert.deepEqual([lab.id, lab.reachable, lab.oneWay, lab.items.length, 'error' in lab], ['r-lab', true, true, 0, false]);
+  assert.equal(lab.note, 'Added one way: lab-relay shows its Inbox only to a relay it lists. To see it here, use Re-pair on relay "lab-relay" in Settings → Relays: it adds this relay there, and both relays then sign in to each other with keys.');
+  assert.deepEqual(fx.calls, [], 'nothing is sent to that relay');
+});
+
+test('the Inbox lists this relay and every paired relay that answers; an ask there is answered on that relay, not through the pairing', async () => {
   const remoteItem = { id: 'ask_there01', kind: 'ask', session: { id: 'conv-there', title: 'Far worker' }, question: 'Deploy?', options: ['Yes'], status: 'pending', createdAt: NOW };
   const fx = boot({
     client: (_relay, method, path, { body }) => {
@@ -352,10 +391,18 @@ test('the Inbox lists this relay and every paired relay that answers; an ask the
   assert.deepEqual(inbox.body.relays.map((relay) => [relay.id, relay.reachable, relay.items.length]), [['self', true, 3], ['r-lab', true, 1], ['r-gone', false, 0]]);
   assert.equal(inbox.body.relays[0].name, 'bench-relay');
   assert.equal(inbox.body.pending, 4);
+  // The page learns that a paired relay's asks are read-only here ("Open there").
+  assert.equal(inbox.body.pairedAnswers, false);
+  assert.equal(inbox.body.relays[1].url, 'https://relay-b.example.test');
+  // A relay whose identity did not say `capabilities.answerLink`: "Open there" only.
+  assert.equal(inbox.body.relays[1].answerLink, false);
   assert.deepEqual(fx.calls.map((entry) => entry.relay), ['r-lab'], 'an offline relay is not even asked');
+  const callsBefore = fx.calls.length;
   const answered = await fx.call('POST', '/api/inbox/relays/:relayId/asks/:id/answer', { params: { relayId: 'r-lab', id: 'ask_there01' }, body: { choice: 'Yes' } });
-  assert.equal(answered.status, 200, JSON.stringify(answered.body));
-  assert.deepEqual(fx.calls.at(-1), { relay: 'r-lab', method: 'POST', path: RELAY_ASK_REMOTE_PATHS.answer, body: { id: 'ask_there01', answer: '', choice: 'Yes', via: 'bench-relay' } });
+  assert.equal(answered.status, 409, JSON.stringify(answered.body));
+  assert.equal(answered.body.code, 'ANSWER_ON_THAT_RELAY');
+  assert.equal(answered.body.openUrl, 'https://relay-b.example.test');
+  assert.equal(fx.calls.length, callsBefore, 'nothing is sent to that relay');
   assert.equal((await fx.call('POST', '/api/inbox/relays/:relayId/asks/:id/answer', { params: { relayId: 'r-nope', id: 'x' } })).status, 404);
   assert.equal((await fx.call('GET', '/api/inbox', { headers: FROM_PAIRED })).status, 403, 'another relay\'s agent reads no Inbox');
 });
@@ -525,7 +572,7 @@ test('a session\'s card list reads the asks in it (listIn): none it asked elsewh
   assert.deepEqual((await fx.call('GET', '/api/relay-asks', { query: { conversationId: LEAD } })).body.asks.map((ask) => ask.question), ['For the lead?']);
 });
 
-test('a paired relay never gets an ask\'s queueId: ask, answer, dismiss, withdraw, status and its Inbox', async () => {
+test('a paired relay never gets an ask\'s queueId: ask, withdraw, status and its Inbox (answer and dismiss are closed)', async () => {
   const fx = boot();
   fx.asks.create({ conversationId: SESSION, createdBy: SESSION, question: 'Own?', queueId: 'q-turn' });
   const noQueue = (value, what) => assert.equal(JSON.stringify(value).includes('queueId'), false, what);
@@ -534,12 +581,11 @@ test('a paired relay never gets an ask\'s queueId: ask, answer, dismiss, withdra
   noQueue(asked.body, 'ask');
   assert.equal(fx.db.prepare(`SELECT queue_id FROM relay_asks WHERE id = ?`).get(asked.body.ask.id).queue_id, null, 'a paired relay\'s ask stores none');
   const answered = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.answer, { headers: FROM_PAIRED, body: { id: asked.body.ask.id, choice: 'SQLite' } });
-  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.equal(answered.status, 403, JSON.stringify(answered.body));
   noQueue(answered.body, 'answer');
   const second = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, body: { session: SESSION, question: 'Rename it?' } });
   const dismissed = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.dismiss, { headers: FROM_PAIRED, body: { id: second.body.ask.id } });
-  assert.equal(dismissed.status, 200, JSON.stringify(dismissed.body));
-  assert.equal(dismissed.body.ask.status, 'dismissed');
+  assert.equal(dismissed.status, 403, JSON.stringify(dismissed.body));
   noQueue(dismissed.body, 'dismiss');
   const third = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.ask, { headers: FROM_PAIRED, body: { session: SESSION, question: 'Later?' } });
   const withdrawn = await fx.call('POST', RELAY_ASK_REMOTE_PATHS.withdraw, { headers: FROM_PAIRED, body: { id: third.body.ask.id } });

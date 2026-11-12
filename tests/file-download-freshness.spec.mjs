@@ -116,6 +116,9 @@ test.describe("downloading a file that changed", () => {
     await openPreview();
     await expect(link).toHaveAttribute("href", /[?&]v=[0-9a-z]+-[0-9a-z]+/);
     await expect(link).toHaveAttribute("download", /^letter \(\d{4}-\d{4}\)\.pdf$/);
+    // The link carries the file's capability (`k`); the cookie alone opens nothing.
+    await expect(link).toHaveAttribute("href", /[?&]k=fc1\./);
+    expect((await page.request.get(fileUrl())).status()).toBe(403);
     const firstVersion = await versionOf();
 
     fs.writeFileSync(filePath, SECOND);

@@ -112,6 +112,30 @@ test('arrange with a filter: a matching member shows its head as context; a matc
   assert.deepEqual(byName.map((item) => `${item.kind}:${item.conversation?.id || '-'}`), ['head:-', 'member:hand-1']);
 });
 
+test('arrange with membersMustMatch (the 🔥 filter): a matching head shows only its matching members; a group with no match hides', () => {
+  const rows = [
+    { ...row('lead-a', 10, 'grp_a'), title: 'Release lead', active: true },
+    { ...row('child-a1', 30, 'grp_a'), title: 'Docs pass', active: false },
+    { ...row('child-a2', 20, 'grp_a'), title: 'Tests pass', active: true },
+    { ...row('solo', 25), title: 'Docs for the site', active: false },
+    { ...row('lead-b', 15, 'grp_b'), title: 'Quiet lead', active: false },
+    { ...row('child-b1', 14, 'grp_b'), title: 'Quiet member', active: false },
+  ];
+  const isActive = (r) => r.active === true;
+  const shape = (items) => items.map((item) => `${item.kind}:${item.conversation?.id || '-'}`);
+  const byHead = arrangeConversationList(rows, GROUPS, { isOpen: () => true, matches: isActive, membersMustMatch: true });
+  assert.deepEqual(shape(byHead), ['head:lead-a', 'member:child-a2']);
+  assert.equal(byHead[0].group.contextOnly, false);
+  // The head idle, a member active: the head as context, open.
+  const memberOnly = rows.map((r) => (r.id === 'lead-a' ? { ...r, active: false } : r));
+  const byMember = arrangeConversationList(memberOnly, GROUPS, { isOpen: () => false, matches: isActive, membersMustMatch: true });
+  assert.deepEqual(shape(byMember), ['head:lead-a', 'member:child-a2']);
+  assert.equal(byMember[0].group.contextOnly, true);
+  assert.equal(byMember[0].group.open, true);
+  // Without the option a matching head still brings the whole group (the title filter).
+  assert.deepEqual(shape(arrangeConversationList(rows, GROUPS, { matches: isActive })), ['head:lead-a', 'member:child-a1', 'member:child-a2']);
+});
+
 test('a cursor row that vanished inside a group: the next page serves that group again, whole, then the rest', () => {
   const rows = [
     row('lead-a', 10, 'grp_a'),

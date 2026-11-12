@@ -14,7 +14,19 @@ import { REMOTE_RELAY_APPROVAL_VARIANT_LABELS, remoteConversationUrl } from '../
  * reports outcomes through the status-events store instead.
  */
 
-export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline', 'hostSuspend', 'relayRestart']);
+export const PUSH_EVENT_TYPES = Object.freeze(['question', 'turnComplete', 'turnFailed', 'board', 'cliOffline', 'hostSuspend', 'relayRestart', 'newSignIn']);
+
+// A new browser signed in (agent auth §13.2, 2d): one notification, tag
+// NEW_SIGNIN_TAG. The first sign-in in a NEW_SIGNIN_COALESCE_MS window
+// alerts; later ones in the window are sent at once too, under the same tag
+// and marked `quiet`, so they replace it ("N new browsers signed in")
+// instead of ringing again. Nothing waits in memory for the window's end,
+// where a restart could lose it.
+export const NEW_SIGNIN_TAG = 'oar-new-signin';
+export const NEW_SIGNIN_COALESCE_MS = 5 * 60 * 1000;
+// What tapping the notification opens, relative to the app's scope.
+export const NEW_SIGNIN_OPEN_PATH = '?settings=security';
+const NEW_SIGNIN_VIA_LABELS = Object.freeze({ token: 'the relay token', code: 'a sign-in link', terminal: 'the terminal' });
 
 export const VAPID_PUBLIC_KEY_SETTING = 'push_vapid_public_key';
 export const VAPID_PRIVATE_KEY_SETTING = 'push_vapid_private_key';
@@ -52,6 +64,7 @@ const EVENT_LABELS = Object.freeze({
   cliOffline: { title: 'CLI offline', generic: 'The relay lost its connection to the CLI host.' },
   hostSuspend: { title: 'Host suspend', generic: 'The queued host suspend changed state.' },
   relayRestart: { title: 'Relay restart waiting', generic: 'The queued relay restart has waited its maximum time.' },
+  newSignIn: { title: 'New browser signed in', generic: 'A new browser signed in to this relay.' },
 });
 
 // A card on a paired relay: named by its kind and that relay.
@@ -69,7 +82,7 @@ function eventTitle(type, providerName, { relayName = null, remoteKind = null } 
 
 // System events carry their own body: no conversation text to preview, and
 // the body is the message itself regardless of the preview preference.
-const SYSTEM_BODY_TYPES = new Set(['hostSuspend', 'relayRestart']);
+const SYSTEM_BODY_TYPES = new Set(['hostSuspend', 'relayRestart', 'newSignIn']);
 
 function clampInt(value, min, max, fallback) {
   const numeric = Number(value);
@@ -126,7 +139,9 @@ export function renderPushNotification(event, preferences) {
 
   const remote = type === 'question' && String(event?.relayName || '').trim() !== '';
   const baseTitle = eventTitle(type, event?.providerName, { relayName: event?.relayName, remoteKind: event?.remoteKind }).slice(0, MAX_TITLE_CHARS);
-  let title = baseTitle;
+  // A new sign-in names how many signed in ("3 new browsers signed in").
+  const ownTitle = type === 'newSignIn' ? String(event?.title || '').trim() : '';
+  let title = ownTitle ? ownTitle.slice(0, MAX_TITLE_CHARS) : baseTitle;
   const conversationTitle = String(event?.conversationTitle || '').trim();
   if (prefs.content.includeTitle && conversationTitle) {
     title = `${baseTitle} — ${conversationTitle}`.slice(0, MAX_TITLE_CHARS);
@@ -161,11 +176,12 @@ export function renderPushNotification(event, preferences) {
 
   // A distinct tag per event so notifications stack instead of replacing each
   // other (decision: one notification per event, no coalescing).
+  // A new sign-in is the exception: one tag, so a later one replaces it.
   const tagSeed = String(data.tag || data.questionId || data.boardId || data.messageId || data.conversationId || Date.now());
   return {
     title,
     body,
-    tag: `oar-${type}-${tagSeed}`,
+    tag: type === 'newSignIn' ? NEW_SIGNIN_TAG : `oar-${type}-${tagSeed}`,
     timestamp: Date.now(),
     data,
   };
@@ -235,6 +251,9 @@ export function createPushDispatchService({
   uuid,
   logger = console,
   now = () => Date.now(),
+  // Origin binding: `(origin_json text) → boolean`, whether a stored origin
+  // carries weight. Only such a turn skips the "reply ready" push.
+  originCarriesWeight = null,
 }) {
   const sql = {
     listAll: db.prepare(`
@@ -257,6 +276,7 @@ export function createPushDispatchService({
     updateLabel: db.prepare(`UPDATE push_subscriptions SET device_label = ?, updated_at = ? WHERE id = ?`),
     updatePreferences: db.prepare(`UPDATE push_subscriptions SET preferences_json = ?, updated_at = ? WHERE id = ?`),
     delete: db.prepare(`DELETE FROM push_subscriptions WHERE id = ?`),
+    deleteByDeviceId: db.prepare(`DELETE FROM push_subscriptions WHERE device_id = ?`),
     markSuccess: db.prepare(`
       UPDATE push_subscriptions
       SET last_success_at = ?, last_error = NULL, failure_count = 0
@@ -342,6 +362,13 @@ export function createPushDispatchService({
     return { ok: result.changes > 0 };
   }
 
+  /** Removes every subscription of one device (a signed-out browser); returns how many. */
+  function deleteDevicesForDevice(deviceId) {
+    const normalized = String(deviceId || '').trim();
+    if (!normalized) return 0;
+    return sql.deleteByDeviceId.run(normalized).changes;
+  }
+
   function conversationTitle(conversationId) {
     const id = String(conversationId || '').trim();
     if (!id) return null;
@@ -369,7 +396,10 @@ export function createPushDispatchService({
     if (!id) return false;
     try {
       messageOriginStatement ??= db.prepare(`SELECT origin_json FROM messages WHERE id = ?`);
-      return String(messageOriginStatement.get(id)?.origin_json || '').trim() !== '';
+      const json = String(messageOriginStatement.get(id)?.origin_json || '').trim();
+      if (!json) return false;
+      // An unverified origin is pushed like the owner's own message.
+      return typeof originCarriesWeight === 'function' ? originCarriesWeight(json) === true : true;
     } catch {
       return false;
     }
@@ -445,35 +475,53 @@ export function createPushDispatchService({
     }
   }
 
+  // The subscriptions an event goes to: enabled, its toggle on, and through
+  // `includeRow` when given.
+  function recipientRows(type, includeRow = null) {
+    return sql.listAll.all().filter((row) => {
+      const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
+      if (!preferences.enabled || preferences.events[type] !== true) return false;
+      if (typeof includeRow !== 'function') return true;
+      try { return includeRow(row) === true; } catch { return false; }
+    });
+  }
+
   /**
    * Fire-and-forget push for one event. Never throws; suppression failures
    * fail closed (no push when the active-device state is unknown).
    */
-  async function dispatch({ type, conversationId = null, body = null, data = {}, providerName = null, relayName = null, remoteKind = null, variant = null, summary = null, conversationTitle: titleOf = null }) {
+  //
+  // `bypassActiveSuppression`: send even while a device is in the
+  // foreground (a new sign-in: the new browser itself is the active one).
+  // `includeRow(row)`: a further filter on the subscription rows. The rows
+  // are read and every send is started before the first await, so a push
+  // dispatched before a request answers is on its way whatever comes next
+  // (a sign-out deleting push rows included).
+  async function dispatch({ type, conversationId = null, body = null, title = null, data = {}, providerName = null, relayName = null, remoteKind = null, variant = null, summary = null, conversationTitle: titleOf = null, bypassActiveSuppression = false, includeRow = null }) {
     try {
       if (!PUSH_EVENT_TYPES.includes(type)) return { outcome: 'invalid-type' };
 
-      let active = true; // fail closed: unknown state suppresses
-      try {
-        active = hasActiveDevice() === true;
-      } catch {
-        active = true;
-      }
-      if (active) {
-        safeRecordStatusEvent('push-suppressed', { eventType: type, conversationId: conversationId || undefined });
-        return { outcome: 'suppressed' };
+      if (!bypassActiveSuppression) {
+        let active = true; // fail closed: unknown state suppresses
+        try {
+          active = hasActiveDevice() === true;
+        } catch {
+          active = true;
+        }
+        if (active) {
+          safeRecordStatusEvent('push-suppressed', { eventType: type, conversationId: conversationId || undefined });
+          return { outcome: 'suppressed' };
+        }
       }
 
-      const rows = sql.listAll.all().filter((row) => {
-        const preferences = normalizePushPreferences(parseJsonObject(row.preferences_json));
-        return preferences.enabled && preferences.events[type] === true;
-      });
+      const rows = recipientRows(type, includeRow);
       if (!rows.length) {
         return { outcome: 'no-subscribers' };
       }
 
       const event = {
         type,
+        title,
         conversationTitle: titleOf || conversationTitle(conversationId),
         providerName,
         relayName,
@@ -648,7 +696,71 @@ export function createPushDispatchService({
     return dispatch({ type: 'relayRestart', body: body || null, data: { relayRestartAt: Date.now() } });
   }
 
+  // The coalescing window of new sign-in pushes: { startedAt, count }.
+  let signInWindow = null;
+
+  /**
+   * A new browser session signed in (signin-notice-service.mjs). Pushed past
+   * the active-device suppression, only to devices that hold a live
+   * session other than the new one (`isLiveDevice(deviceId)`, which must
+   * leave the new session out). Coalesced per NEW_SIGNIN_COALESCE_MS, see
+   * NEW_SIGNIN_TAG. The sends are started before this returns.
+   *
+   * Payload `data` for the service worker: `type: 'newSignIn'`, `noticeId`
+   * (`signin-…`), `count` (sign-ins in the window), `quiet` (a replacement
+   * that should not alert again), `open` (NEW_SIGNIN_OPEN_PATH) and, for a
+   * single sign-in only, `signOutSessionId` (the "Sign it out" action:
+   * DELETE /api/auth/sessions/:id with the browser's cookie).
+   */
+  function notifyNewSignIn({ noticeId = '', sessionId = '', label = '', address = '', via = 'token', isLiveDevice = null } = {}) {
+    // The new browser names its own device id, so that id is never trusted
+    // here: a row is skipped only when its device holds no live session
+    // other than the new one (the caller's `isLiveDevice` leaves the new
+    // session out). A browser that claims another device's id still lets
+    // that device hear of it.
+    const includeRow = (row) => {
+      const device = String(row.device_id || '').trim();
+      if (typeof isLiveDevice !== 'function') return true;
+      return isLiveDevice(device) === true;
+    };
+    // Only a push that goes somewhere opens or extends the window: a
+    // sign-in no device hears of (the first browser, say) must not turn the
+    // next one into a quiet replacement.
+    let count = 1;
+    let reaches = true;
+    try { reaches = recipientRows('newSignIn', includeRow).length > 0; } catch { reaches = true; }
+    if (reaches) {
+      const at = now();
+      if (signInWindow && at - signInWindow.startedAt < NEW_SIGNIN_COALESCE_MS) {
+        signInWindow.count += 1;
+      } else {
+        signInWindow = { startedAt: at, count: 1 };
+      }
+      count = signInWindow.count;
+    }
+    const viaLabel = NEW_SIGNIN_VIA_LABELS[via] || NEW_SIGNIN_VIA_LABELS.token;
+    const who = [String(label || '').trim() || 'A browser', String(address || '').trim()].filter(Boolean).join(', ');
+    const body = count === 1
+      ? `${who}, via ${viaLabel}. Not you? Sign it out.`
+      : `${count} new browsers signed in within 5 minutes. Latest: ${who}, via ${viaLabel}.`;
+    return dispatch({
+      type: 'newSignIn',
+      title: count === 1 ? 'New browser signed in' : `${count} new browsers signed in`,
+      body,
+      bypassActiveSuppression: true,
+      includeRow,
+      data: {
+        noticeId: String(noticeId || '') || undefined,
+        count,
+        quiet: count > 1,
+        open: NEW_SIGNIN_OPEN_PATH,
+        signOutSessionId: count === 1 ? (String(sessionId || '') || undefined) : undefined,
+      },
+    });
+  }
+
   return {
+    notifyNewSignIn,
     notifyHostSuspend,
     notifyRelayRestart,
     listDevices,
@@ -656,6 +768,7 @@ export function createPushDispatchService({
     upsertSubscription,
     updateDevice,
     deleteDevice,
+    deleteDevicesForDevice,
     dispatch,
     notifyQuestion,
     questionNotice,

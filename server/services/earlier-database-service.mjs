@@ -89,6 +89,8 @@ function adopt({
   configPath = '',
   packageRoot,
   Database,
+  // The owner token's SHA-256 hex; `authToken` (plain, older callers) is hashed.
+  ownerTokenHash = '',
   authToken = '',
   env = process.env,
   platform = process.platform,
@@ -196,7 +198,7 @@ function adopt({
     const lock = readJson(fsImpl, path.join(earlierDir, 'relay-server.lock'));
     const defaultRoot = resolveOarRoot({ ...env, OAR_STATE_ROOT: '' }, platform);
     const ownRoot = normalize(layout.root) === normalize(defaultRoot)
-      || (!!lock?.tokenHash && lock.tokenHash === hashToken(authToken));
+      || (!!lock?.tokenHash && lock.tokenHash === (ownerTokenHash || hashToken(authToken)));
     if (ownRoot) {
       // 0.9.13 kept uploads in server/uploads whatever the data folder.
       const uploadDirs = [
@@ -336,6 +338,29 @@ export function lostPackageDatabaseWarning({ unpinnedLaunchers = [], earlierData
 export function isRetiredName(entry, packageName) {
   return entry.length === packageName.length + 10 && entry.startsWith(`.${packageName}-`)
     && /^[A-Za-z0-9]{8}$/.test(entry.slice(packageName.length + 2));
+}
+
+/**
+ * The folders the earlier-database takeover reads databases from or puts
+ * them in, besides the data folder (its rescue copies and staging folders
+ * are inside it): the folder the relay ran on without the pin (`server/data`
+ * or a config `dataDir`, where the original stays as
+ * `<name>.older-…`/`.adopted-…`), and `backups/` under the state root,
+ * where a replaced database goes. No file route serves a database file in
+ * them (relay-protected-files.mjs). Nothing is read from the disk but the
+ * config file's `dataDir`.
+ */
+export function earlierDatabaseFolders({ dataDir = '', serverDir = '', configPath = '', packageRoot, env = process.env, platform = process.platform } = {}) {
+  const folders = [];
+  const unpinned = { ...env };
+  for (const key of Object.keys(unpinned)) if (key.toUpperCase() === 'COPILOT_WEB_RELAY_DATA_DIR') delete unpinned[key];
+  try { folders.push(resolveDataDir({ env: unpinned, configPath, serverDir })); } catch {}
+  if (dataDir) folders.push(path.join(dataDir, RESCUE_DIR_NAME));
+  try {
+    const layout = resolveStateLayout({ packageRoot, env, platform });
+    if (layout?.root) folders.push(path.join(layout.root, 'backups'));
+  } catch {}
+  return [...new Set(folders.filter(Boolean).map((folder) => path.resolve(folder)))];
 }
 
 /**

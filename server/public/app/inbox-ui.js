@@ -7,11 +7,19 @@
 // The list comes from GET /api/inbox (this relay and every paired relay that
 // answers), again on every change of a question here (socket) and every
 // minute for the paired relays. Answering here is answering the card in its
-// session: this relay's through the question routes, a paired relay's ask
-// through this relay (POST /api/inbox/relays/:id/asks/:ask/answer); a paired
-// relay's cards open there.
+// session, through the question routes. A paired relay's asks and cards are
+// answered on that relay, by its person: they show read-only with "Open
+// there". Only while the relay says its pairing carries answers
+// (`pairedAnswers`, PAIRED_ASKS_ANSWER_OVER_PAIRING) is a paired relay's ask
+// answered through this relay (POST /api/inbox/relays/:id/asks/:ask/answer).
+//
+// A paired relay whose page takes `?answer=` (answerLink) gets option buttons
+// on its asks, plain cards and approvals: a click opens that relay's page in
+// a popup with the option preselected, where its person confirms (agent auth
+// §13.2, 1a). The popup has no opener, so the Inbox reloads when this window
+// is back in front.
 
-import { apiFetch, answerRelayQuestion } from './api-client.js';
+import { apiFetch, answerRelayQuestion, dismissRemoteRelayRefusalNotice } from './api-client.js';
 import { currentConvId, IS_SHARED_VIEW, setCurrentConv, showTransientRelayNotice } from './store.js';
 import { isStatusViewActive, leaveStatusView } from './status-view.mjs';
 import { actOnRelayBoard } from './relay-board-view.js';
@@ -35,8 +43,13 @@ let inboxActive = false;
 let previousConversationId = '';
 let relays = [];
 let loaded = false;
+// GET /api/inbox's `pairedAnswers`: whether a paired relay's asks are answered from here.
+let pairedAnswers = false;
 let filter = 'all';
 let refreshTimer = null;
+// A popup to answer on a paired relay was opened: reload when back in front.
+let answerThereOpen = false;
+let answerThereBound = false;
 let changeTimer = null;
 let clickBound = false;
 let started = false;
@@ -130,7 +143,7 @@ function renderInboxNow({ opening = false } = {}) {
   const focused = captureDrafts(host);
   if (host.querySelector('.inbox-view')) captureInboxFolds(openFolds, host);
   const top = opening ? inboxScrollTop : host.scrollTop;
-  host.replaceChildren(renderInbox(document, { relays, filter, now: Date.now(), loading: !loaded }));
+  host.replaceChildren(renderInbox(document, { relays, filter, now: Date.now(), loading: !loaded, pairedAnswers }));
   restoreDrafts(host, focused);
   restoreInboxFolds(openFolds, host);
   host.scrollTop = top;
@@ -141,15 +154,41 @@ function renderInboxNow({ opening = false } = {}) {
   }
 }
 
+/**
+ * The sessions of this relay a card waits in, as the Inbox lists them: an
+ * ask_user question, a Safety check, a plan card, a relay ask. The sidebar's
+ * 🔥 filter keeps these rows (paired relays' cards are theirs).
+ */
+export function getInboxWaitingConversationIds() {
+  const ids = new Set();
+  for (const relay of relays) {
+    if (relay?.self !== true) continue;
+    for (const item of Array.isArray(relay.items) ? relay.items : []) {
+      if (item?.status !== 'pending') continue;
+      const id = String(item?.session?.id || '').trim();
+      if (id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function waitingKey() {
+  return [...getInboxWaitingConversationIds()].sort().join('|');
+}
+
 async function loadInbox() {
   const response = await apiFetch('/api/inbox');
+  const waitingBefore = waitingKey();
   if (response && Array.isArray(response.relays)) {
     relays = response.relays;
+    pairedAnswers = response.pairedAnswers === true;
     loaded = true;
     pruneInboxFolds(openFolds, relays);
   }
   syncInboxBadge();
   renderInboxNow();
+  // The 🔥 filter of the sidebar reads the waiting sessions.
+  if (waitingKey() !== waitingBefore) window.renderConvList?.();
   return response;
 }
 
@@ -316,9 +355,46 @@ async function actOnPlanItem(data) {
   return !!(await actOnRelayBoard(data.boardId, data.actionId, { board }));
 }
 
+export const ANSWER_THERE_POPUP_FEATURES = 'popup,width=440,height=600,noopener,noreferrer';
+
+/**
+ * Opens a paired relay's page on one question in a popup: no opener, no
+ * referrer; nothing is answered until the person confirms there.
+ */
+export function openAnswerThere(url, { open = (...args) => window.open(...args) } = {}) {
+  const href = String(url || '');
+  if (!/^https?:\/\//i.test(href)) return false;
+  bindAnswerThereReturn();
+  answerThereOpen = true;
+  try {
+    open(href, '_blank', ANSWER_THERE_POPUP_FEATURES);
+  } catch {
+    answerThereOpen = false;
+    return false;
+  }
+  return true;
+}
+
+function answerThereReturned() {
+  if (!answerThereOpen || document.visibilityState === 'hidden') return;
+  answerThereOpen = false;
+  void refreshInbox();
+}
+
+function bindAnswerThereReturn() {
+  if (answerThereBound || typeof window === 'undefined') return;
+  answerThereBound = true;
+  window.addEventListener('focus', answerThereReturned);
+  document.addEventListener('visibilitychange', answerThereReturned);
+}
+
 async function handleAction(target) {
   const data = { ...target.dataset };
   const card = target.closest('.inbox-item');
+  if (data.inboxAction === 'answer-there') {
+    openAnswerThere(data.url);
+    return;
+  }
   if (data.inboxFilter) {
     filter = INBOX_FILTERS.includes(data.inboxFilter) ? data.inboxFilter : 'all';
     try { localStorage.setItem(FILTER_STORAGE_KEY, filter); } catch {}
@@ -341,11 +417,17 @@ async function handleAction(target) {
     }
     return;
   }
+  if (data.inboxAction === 'relay-settings') {
+    // The paired relay's entry in Settings → Relays.
+    window.openSettingsModal?.('relays');
+    return;
+  }
   const buttons = card ? [...card.querySelectorAll('button')] : [target];
   for (const node of buttons) node.disabled = true;
   let done = false;
   try {
-    if (data.inboxAction === 'choice') done = await answerAsk(card, data, { choice: data.choice });
+    if (data.inboxAction === 'relay-notice-dismiss') done = !!(await dismissRemoteRelayRefusalNotice(data.relayEntryId))?.ok;
+    else if (data.inboxAction === 'choice') done = await answerAsk(card, data, { choice: data.choice });
     else if (data.inboxAction === 'answer') done = await answerAsk(card, data);
     else if (data.inboxAction === 'dismiss') done = await answerAsk(card, data, { dismiss: true });
     else if (data.inboxAction === 'card-choice') done = await answerCard(card, data, { choice: data.choice });

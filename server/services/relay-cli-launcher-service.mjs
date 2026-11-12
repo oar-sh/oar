@@ -115,7 +115,8 @@ export function createRelayCliLauncherService({
     const launched = await launchSessionCli({
       targetSessionId,
       cwd: resolveCwd(targetSessionId),
-      env,
+      // A function gives each session its own environment (its agent token).
+      env: typeof env === 'function' ? env(targetSessionId) : env,
       platform,
       spawnImpl,
       execFileSyncImpl,

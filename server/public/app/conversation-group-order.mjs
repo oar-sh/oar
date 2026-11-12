@@ -210,6 +210,8 @@ export function pageConversationRows(rows, groups = null, { limit = 40, beforeCo
  * `isOpen(groupId, group)` decides the fold; `matches(row)` keeps rows that
  * match a filter (a group shows when any row matches: its head as context
  * with the matching members, or whole when the head or its name matches).
+ * With `membersMustMatch` (the 🔥 filter) a matching head no longer brings
+ * the whole group: only the members that match show under it.
  *
  * `keepVisibleId` is the open conversation: a member of a folded group with
  * that id still shows under its head, as `{ kind: 'member', kept: true }`.
@@ -224,8 +226,9 @@ export function arrangeConversationList(rows, groups = null, {
   groupNameMatches = null,
   emptyGroups = false,
   keepVisibleId = null,
+  membersMustMatch = false,
 } = {}) {
-  const items = arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId: toText(keepVisibleId) });
+  const items = arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId: toText(keepVisibleId), membersMustMatch });
   if (!emptyGroups || !groups) return items;
   const present = new Set((Array.isArray(rows) ? rows : []).map(rowGroupId).filter(Boolean));
   const entries = typeof groups.entries === 'function' && typeof groups.get === 'function' ? [...groups.entries()] : Object.entries(groups);
@@ -254,7 +257,7 @@ export function arrangeConversationList(rows, groups = null, {
   return out;
 }
 
-function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId = '' }) {
+function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, keepVisibleId = '', membersMustMatch = false }) {
   const ordered = orderConversationRows(rows, groups);
   const activity = groupActivityTimes(ordered);
   const items = [];
@@ -280,10 +283,10 @@ function arrangeGroupedRows(rows, groups, { isOpen, matches, groupNameMatches, k
     let contextOnly = false;
     if (matches) {
       headMatches = (headRow ? matches(headRow) : false) || (typeof groupNameMatches === 'function' && groupNameMatches(info, headRow));
-      if (!headMatches) {
+      if (!headMatches || membersMustMatch) {
         shownMembers = members.filter((candidate) => matches(candidate));
-        if (!shownMembers.length) continue;
-        contextOnly = true;
+        if (!headMatches && !shownMembers.length) continue;
+        contextOnly = !headMatches;
       }
     }
     const group = {

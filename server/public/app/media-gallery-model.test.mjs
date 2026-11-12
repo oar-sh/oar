@@ -9,6 +9,9 @@ import {
 } from './media-gallery-model.mjs';
 import { extendGallery, galleryCanStep, galleryPositionLabel } from './viewer-gallery.mjs';
 
+// The address the relay hands out: the route with the item's tag (a made-up one here).
+const mediaUrl = (id) => `/api/media/${id}/content?t=${`tag${id}`.padEnd(22, 'x')}`;
+
 const item = (id, extra = {}) => ({
   id,
   conversationId: 'c1',
@@ -21,7 +24,7 @@ const item = (id, extra = {}) => ({
   name: `p${id}.png`,
   timestamp: '2026-10-01T10:00:00.000Z',
   occurrences: 1,
-  contentUrl: `/api/media/${id}/content`,
+  contentUrl: mediaUrl(id),
   remoteUrl: null,
   path: `/srv/demo/p${id}.png`,
   archived: false,
@@ -32,7 +35,7 @@ test('a media item becomes an upload-style viewer item with its own address', ()
   assert.deepEqual(mediaViewerItem(item(3), '/base'), {
     key: 'media:3',
     source: 'upload',
-    href: '/base/api/media/3/content',
+    href: `/base${mediaUrl(3)}`,
     name: 'p3.png',
     mime: 'image/png',
     size: 0,

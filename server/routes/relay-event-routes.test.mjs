@@ -8,6 +8,7 @@ import { createSessionRepository } from '../repositories/session-repository.mjs'
 import { REMOTE_RELAY_ERROR_CODES as CODES } from '../../shared/remote-relay-contract.mjs';
 import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
 import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound.mjs';
+import { asAgent, asOwner, asPeer } from '../services/relay-principal-test-harness.mjs';
 import { createRelayEventService, servedWatcherKey } from '../services/relay-event-service.mjs';
 import { registerRelayEventRoutes } from './relay-event-routes.mjs';
 
@@ -15,6 +16,8 @@ import { registerRelayEventRoutes } from './relay-event-routes.mjs';
 // call them, the inbound switch, and what they store.
 
 const A_ID = 'relay-fixture-a';
+// The paired relay as this relay lists it; its requests come with its own key.
+const A_ENTRY = { id: 'rr-a', relayId: A_ID, name: 'relay-a', url: 'https://relay-a.example.test' };
 const BUILDER = 'conv-fixture-builder';
 const LOCAL_WATCHER = 'conv-fixture-local-watcher';
 
@@ -61,11 +64,13 @@ function setup({ inbound = true } = {}) {
   registerRelayEventRoutes(app, {
     auth: (_req, _res, next) => next(),
     relayEventService: service,
-    remoteRelayInbound: { listRelays: () => [], inboundEnabled: () => settings.inbound },
+    remoteRelayInbound: { listRelays: () => [A_ENTRY], inboundEnabled: () => settings.inbound },
   });
   const route = (key) => app.routes.get(key);
-  const fromRelay = (body, headers = {}) => ({ body, headers: { 'x-oar-remote-origin': A_ID, 'x-oar-remote-hops': '1', ...headers } });
-  return { db, service, settings, route, fromRelay };
+  const fromRelay = (body, headers = {}) => asPeer({ body, headers: { 'x-oar-remote-origin': A_ID, 'x-oar-remote-hops': '1', ...headers } }, A_ENTRY);
+  // The same relay on the owner token (an older OAR): its claim is unverified.
+  const fromOlderRelay = (body) => asOwner({ body, headers: { 'x-oar-remote-origin': A_ID, 'x-oar-remote-hops': '1' } });
+  return { db, service, settings, route, fromRelay, fromOlderRelay };
 }
 
 test('a paired relay subscribes, dry run first; what it names as watcher stays its own', async () => {
@@ -95,15 +100,22 @@ test('a paired relay subscribes, dry run first; what it names as watcher stays i
 });
 
 test('only another relay\'s request is taken, and only while the inbound switch is on', async () => {
-  const { service, settings, route, fromRelay } = setup();
+  const { service, settings, route, fromRelay, fromOlderRelay } = setup();
   const body = { watcher: { conversationId: 'conv-x' }, sessions: [BUILDER] };
   const browser = await callRoute(route('POST /api/relay-events/remote/subscribe'), { body });
   assert.equal(browser.statusCode, 403);
   assert.equal(browser.body.code, CODES.forbidden);
-  const own = await callRoute(route('POST /api/relay-events/remote/pull'), markRemoteRelayLoopbackRequest(fromRelay({})));
+  const own = await callRoute(route('POST /api/relay-events/remote/pull'), markRemoteRelayLoopbackRequest(asAgent({ body: {}, headers: { 'x-oar-remote-origin': A_ID } }, LOCAL_WATCHER)));
   assert.equal(own.statusCode, 403, 'this relay\'s own agents use the tool');
-  const nameless = await callRoute(route('POST /api/relay-events/remote/subscribe'), { body: { ...body, origin: { relayName: 'win-test' } } });
-  assert.equal(nameless.statusCode, 400);
+  // A claim on the owner token (an older OAR, or no key yet) is refused with the reason.
+  const nameless = await callRoute(route('POST /api/relay-events/remote/subscribe'), asOwner({ body: { ...body, origin: { relayName: 'win-test' } } }));
+  assert.equal(nameless.statusCode, 403);
+  assert.equal(nameless.body.code, CODES.peerKeyRequired);
+  const older = await callRoute(route('POST /api/relay-events/remote/subscribe'), fromOlderRelay(body));
+  assert.equal(older.statusCode, 403);
+  assert.equal(older.body.code, CODES.peerKeyRequired);
+  assert.equal(older.body.originVerified, false);
+  assert.match(older.body.error, /older than 0\.9\.27|no confirmed key/);
   settings.inbound = false;
   const closed = await callRoute(route('POST /api/relay-events/remote/subscribe'), fromRelay(body));
   assert.equal(closed.statusCode, 403);

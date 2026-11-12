@@ -10,7 +10,7 @@
  *   node relay.mjs                        # hidden CLI subprocess (default off Windows)
  *   node relay.mjs --foreground           # visible terminal window
  *   node relay.mjs --hidden               # force hidden stdio fallback
- *   node relay.mjs --token <newtoken>     # override auth token
+ *   node relay.mjs --token <token>        # override the agent token
  */
 
 import { fileURLToPath } from 'url';
@@ -33,6 +33,7 @@ import {
   normalizeContextLimitTokens,
 } from '../shared/model-descriptors.mjs';
 import { windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
+import { loadAgentToken } from '../shared/worker-runtime/config-loader.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,7 +67,8 @@ function parsePort(value, fallback = 3333) {
 const config = readConfig(configPath);
 const SERVER_PORT = parsePort(PORT_OVERRIDE, parsePort(config.port, 3333));
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
-const TOKEN = TOKEN_OVERRIDE || config.authToken || '';
+// An agent token (the cli one when started by hand), never the owner token.
+const TOKEN = TOKEN_OVERRIDE || loadAgentToken({ env: process.env, configPath, serverDir: __dirname });
 const RUNTIME_SESSION_POLICY = 'conversation-bound';
 const launchWorkspaceRoot = resolveStartupWorkspaceRoot(__dirname);
 

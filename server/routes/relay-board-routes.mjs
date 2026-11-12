@@ -2,6 +2,9 @@
 
 import { persistConversationPreferences, readPlanOnly } from '../services/conversation-preferences-service.mjs';
 import { fallbackReasoningEffort } from '../services/conversation-model-fallback.mjs';
+import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+import { notPerson } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES, AUTH_PERSON_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 import {
   PLAN_BOARD_APPROVE_ONLY,
   isPendingPlanBoard,
@@ -124,6 +127,7 @@ export function registerRelayBoardRoutes(app, deps) {
     formatRelayBoardRow,
     pushDispatchService,
     relayEventService,
+    remoteRelayInbound = null,
   } = deps;
 
   /**
@@ -258,6 +262,11 @@ export function registerRelayBoardRoutes(app, deps) {
   });
 
   app.post('/api/relay-board/:id/action', auth, (req, res) => {
+    // Settling a plan card is the person's (agent auth §2.2): never an agent's
+    // token, never another relay's request.
+    if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound || {}))) {
+      return res.status(403).json({ error: AUTH_PERSON_REQUIRED_MESSAGE, code: AUTH_ERROR_CODES.personRequired });
+    }
     const boardId = normalizeId(req.params.id);
     const actionId = normalizeId(req.body?.actionId || req.body?.action_id);
     const clientId = normalizeId(req.body?.clientId || req.body?.client_id);

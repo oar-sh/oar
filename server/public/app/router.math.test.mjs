@@ -25,7 +25,7 @@ globalThis.katex = katex;
 await import('katex/contrib/mhchem');
 
 const { renderMarkdownPreview } = await import('./router.js');
-const { MATH_MESSAGE_MAX_CHARS } = await import('./markdown-math.mjs');
+const { MATH_ENVIRONMENTS, MATH_MESSAGE_MAX_CHARS } = await import('./markdown-math.mjs');
 
 function render(source, allowEmbeddedHtml = false) {
   const box = document.createElement('div');
@@ -82,6 +82,128 @@ test('displays are set in display mode: $$ and \\[ \\] blocks, inside a sentence
     assert.deepEqual(rendered(box), [tex], source);
     assert.ok(box.querySelector('span[data-math="display"] > .katex-display'), source);
   }
+});
+
+// The bare environment a model wrote at the start of a line, without `$$`.
+const BARE_ALIGN = '\\begin{align*}\nf(x) &= (x+1)^2 - 1 \\\\\n&= x^2 + 2x \\\\\n&= x(x+2)\n\\end{align*}';
+
+test('a bare environment at the start of a line is set as a display, its source untouched', () => {
+  for (const source of [BARE_ALIGN, `The expansion:\n${BARE_ALIGN}\nSo it factors.`, `Before.\n\n${BARE_ALIGN}\n\nAfter.`]) {
+    const box = render(source);
+    assert.deepEqual(rendered(box), [BARE_ALIGN], source);
+    assert.ok(box.querySelector('span[data-math="display"] > .katex-display'), source);
+    assert.equal(box.querySelector('.math-source'), null, source);
+  }
+  assert.equal(text(render('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}.')).endsWith('.'), true);
+  // `$$` around an environment is read as before.
+  assert.deepEqual(rendered(render('$$\n\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}\n$$')), ['\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}']);
+});
+
+test('every accepted environment is one the bundled KaTeX sets in display mode', () => {
+  const body = (environment) => {
+    if (environment === 'CD') return 'A @>>> B';
+    if (/^(?:align(?:ed)?at\*?|alignedat)$/.test(environment)) return '{1} a &= b \\\\ c &= d';
+    if (/^(?:d?array|subarray)$/.test(environment)) return '{c} a \\\\ b';
+    if (/^equation\*?$/.test(environment)) return 'a = b';
+    return 'a & b \\\\ c & d';
+  };
+  for (const environment of MATH_ENVIRONMENTS) {
+    const source = `\\begin{${environment}}${body(environment)}\\end{${environment}}`;
+    const box = render(source);
+    assert.deepEqual(rendered(box), [source], environment);
+    assert.equal(box.querySelector('.math-source'), null, environment);
+  }
+  // What KaTeX does not know is prose, as before.
+  for (const source of ['\\begin{document}\ntext\n\\end{document}', '\\begin{itemize}\n\\item a\n\\end{itemize}', '\\begin{multline}\na \\\\\nb\n\\end{multline}']) {
+    assert.equal(render(source).querySelector('[data-math]'), null, source);
+  }
+});
+
+test('a bare environment is not read in a sentence, in code, or before its end arrives', () => {
+  for (const source of [
+    'See \\begin{align} inside a sentence \\end{align} here.',
+    'Run `\\begin{align} x \\end{align}` as code.',
+    '```latex\n\\begin{align}\nx &= 1\n\\end{align}\n```',
+    '\\begin{align*}\nf(x) &= (x+1)^2 - 1 \\\\\n&= x^2 + 2x',
+  ]) {
+    assert.equal(render(source).querySelector('[data-math]'), null, source);
+  }
+  // Still streaming: text, as an unclosed `$$` is; a formula once the end arrives.
+  const open = render('The expansion:\n\\begin{align*}\nf(x) &= (x+1)^2 - 1 \\\\\n&= x^2 + 2x');
+  assert.equal(open.innerHTML.trim(), '<p>The expansion:<br>\\begin{align*}<br>f(x) &amp;= (x+1)^2 - 1 \\<br>&amp;= x^2 + 2x</p>');
+  assert.deepEqual(rendered(render(`The expansion:\n${BARE_ALIGN}`)), [BARE_ALIGN]);
+});
+
+test('a bare environment KaTeX refuses is shown as written, its double backslashes intact', () => {
+  const source = '\\begin{align*}\nx &= \\nosuchmacro{y} \\\\\n&= z\n\\end{align*}';
+  const box = render(`${source}.\nNext.`);
+  assert.equal(box.querySelector('.katex'), null);
+  assert.equal(box.querySelector('span.math-source').textContent, source);
+  assert.equal(box.querySelector('span.math-source').getAttribute('data-math'), 'display');
+  assert.equal(box.textContent.trim(), `${source}.\nNext.`);
+});
+
+test('punctuation straight behind an inline formula stays with it', () => {
+  const box = render('Used to check recovery: $x^2 + y^2$. Then ($a_1$), and "$b$"; 函数$f(x)$。');
+  const tails = [...box.querySelectorAll('span.math-tail')];
+  assert.deepEqual(tails.map((tail) => tail.lastChild.textContent), ['.', '),', '";', '。']);
+  assert.ok(tails.every((tail) => tail.childNodes.length === 2 && tail.firstChild.matches('span[data-math="inline"]') && tail.firstChild.querySelector('.katex')));
+  assert.ok(tails.every((tail) => tail.lastChild.nodeType === 3));
+  assert.equal(text(box).startsWith('Used to check recovery: '), true);
+  assert.equal(text(box).endsWith('。'), true);
+  assert.deepEqual(rendered(box), ['x^2 + y^2', 'a_1', 'b', 'f(x)']);
+  // Curly quotes and an ellipsis; at most three marks go along.
+  assert.deepEqual([...render('“$p$”’ and $q$…!?) end').querySelectorAll('span.math-tail')].map((tail) => tail.lastChild.textContent), ['”’', '…!?']);
+});
+
+test('no wrapper where nothing follows the formula, around a display, or around a refused formula', () => {
+  assert.equal(render('Take $x$ and $y$ here').querySelector('.math-tail'), null);
+  assert.equal(render('$x$').querySelector('.math-tail'), null);
+  assert.equal(render('So $$x^2$$. Then\n$$\ny\n$$.').querySelector('.math-tail'), null);
+  assert.equal(render('Broken $\\nosuchmacro$. Fine.').querySelector('.math-tail'), null);
+  assert.equal(render('Take $x$<br>next').querySelector('.math-tail'), null);
+  assert.equal(render('Use $...$ for inline, and $5 or $6. Also `$x$`.').querySelector('.math-tail, [data-math]'), null);
+});
+
+test('macros a message defines carry over to its later formulas', () => {
+  const source = 'Let $\\def\\R{\\mathbb{R}}$ and $\\newcommand{\\vect}[1]{\\mathbf{#1}}$ and $\\gdef\\eps{\\varepsilon}$. '
+    + 'Then $\\R^2$, $\\vect{v}$ and $\\eps > 0$.';
+  const box = render(source);
+  assert.equal(box.querySelector('.math-source'), null, 'every formula is set');
+  assert.deepEqual(rendered(box).slice(3), ['\\R^2', '\\vect{v}', '\\eps > 0']);
+  assert.equal(box.querySelectorAll('.katex-html').length, 6);
+  // In document order: a use before its definition stays as written.
+  const early = render('First $\\foo$, then $\\def\\foo{x}$, then $\\foo$.');
+  assert.deepEqual([...early.querySelectorAll('.math-source')].map((span) => span.textContent), ['$\\foo$']);
+  assert.deepEqual(rendered(early), ['\\def\\foo{x}', '\\foo']);
+  // Through a display and a bare environment as well.
+  assert.equal(render('$$\\gdef\\half{\\frac12}$$\n\n\\begin{align}\nx &= \\half\n\\end{align}\n\nand $\\half$.').querySelector('.math-source'), null);
+});
+
+test('nothing of a message\'s macros leaks into another rendering, or into the cache', () => {
+  const alone = () => [...render('Here $\\lone$ stands.').querySelectorAll('.math-source')].map((span) => span.textContent);
+  assert.deepEqual(alone(), ['$\\lone$'], 'refused before any definition, and remembered as refused');
+  const defined = render('Let $\\def\\lone{\\ell}$; here $\\lone$ stands.');
+  assert.equal(defined.querySelector('.math-source'), null, 'set once defined, not served from the cache');
+  assert.deepEqual(alone(), ['$\\lone$'], 'the next rendering starts without macros');
+  assert.equal(render('Let $\\def\\lone{\\ell}$; here $\\lone$ stands.').querySelector('.math-source'), null, 'the definition takes effect on every rendering');
+  // A streaming re-render of the same text is the same HTML each time.
+  const streamed = 'Let $\\def\\lone{\\ell}$; here $\\lone$ stands';
+  assert.equal(renderMarkdownPreview(streamed, false), renderMarkdownPreview(`${streamed}.`, false).replace('stands.</p>', 'stands</p>'));
+});
+
+test('macros keep KaTeX\'s limits: no redefining a built-in, no endless expansion, nothing trusted', () => {
+  // \R is KaTeX's own: \newcommand refuses it and the built-in stays.
+  const builtIn = render('$\\newcommand{\\R}{x}$ and $\\R$.');
+  assert.deepEqual([...builtIn.querySelectorAll('.math-source')].map((span) => span.textContent), ['$\\newcommand{\\R}{x}$']);
+  assert.deepEqual(rendered(builtIn), ['\\R']);
+  // An expansion that never ends is stopped by maxExpand and shown as written.
+  const endless = render('$\\def\\grow{\\grow\\grow}$ then $\\grow$.');
+  assert.deepEqual([...endless.querySelectorAll('.math-source')].map((span) => span.textContent), ['$\\grow$']);
+  // A macro cannot smuggle in a link.
+  const link = render('$\\def\\go{\\href{https://example.com/}{y}}$ then $\\go$.');
+  assert.equal(link.querySelector('a'), null);
+  assert.doesNotMatch(link.innerHTML, /cc0000|color:\s*red/i);
 });
 
 test('what Markdown would eat stays in the formula: emphasis signs, a less-than sign, escapes', () => {

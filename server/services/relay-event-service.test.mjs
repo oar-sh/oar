@@ -254,6 +254,35 @@ test('a Safety check card is marked personOnly and named as the user\'s to answe
   assert.equal(JSON.parse(stored[0].payload_json).detail.personOnly, true);
 });
 
+test('a Safety check card gives watchers only its lead line, plus the File line for a sensitive-file edit', () => {
+  const { db, service, clock } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
+  const commandLead = 'Claude Code marks this as person-only: no rule or automatic approval may allow it. Allow it once?';
+  service.noteQuestion({
+    id: 'q-safety-command',
+    conversationId: BUILDER,
+    prompt: `${commandLead}\n\nReason: Dangerous rm operation\n\nBash command:\n│ rm -rf /srv/sample-app/work`,
+    choices: ['Allow once', 'Deny'],
+    context: { source: 'ClaudeSafetyCheck', personOnly: true },
+  });
+  const fileLead = 'Claude Code marks this file as sensitive: a change here can alter how git, your shell or your tools behave. Allow this edit once?';
+  service.noteQuestion({
+    id: 'q-safety-file',
+    conversationId: BUILDER,
+    prompt: `${fileLead}\n\nReason: Claude requested permissions to edit a sensitive file.\n\nFile: /srv/sample-app/work/.npmrc\n\nChange, 1 line:\n│ //registry.example.test/:_authToken=sample-token-value`,
+    choices: ['Allow once', 'Deny'],
+    context: { source: 'ClaudeSafetyCheck', personOnly: true, kind: 'sensitive-file' },
+  });
+  clock.advance(0);
+  const stored = db.prepare(`SELECT payload_json FROM relay_events WHERE type = 'question_asked' ORDER BY rowid`).all()
+    .map((row) => JSON.parse(row.payload_json).detail);
+  assert.equal(stored.length, 2);
+  assert.equal(stored[0].prompt, commandLead);
+  assert.equal(stored[1].prompt, `${fileLead}\n\nFile: /srv/sample-app/work/.npmrc`);
+  const text = eventMessages(db).map((message) => message.text).join('\n');
+  assert.doesNotMatch(text, /rm -rf|Dangerous rm|_authToken|sample-token-value|Reason:/);
+});
+
 test('a one-shot subscription with match fires on the matching reply only, then ends', () => {
   const { db, service, clock } = setup();
   const sub = service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER], events: ['turn_end'], once: true, match: 'tests? pass' });

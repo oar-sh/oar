@@ -10,6 +10,8 @@ import { createRequire } from 'node:module';
 import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
+import { OWNER_HASH_SETTING_KEY } from './owner-secret-store.mjs';
+import { OWNER_TOKEN_LAST_USE_SETTING_KEY } from './owner-token-use.mjs';
 import {
   DB_FILE_NAME,
   LEGACY_DB_FILE_NAME,
@@ -449,6 +451,8 @@ test('(d) a copilot.db with only start-up settings and no oar.db: nothing change
 
 test('the start-up allowlist is the keys and tables a real start writes, and nothing a user makes', () => {
   assert.deepEqual([...STARTUP_SETTING_KEYS].sort(), [
+    'auth_owner_token_hash',
+    'auth_owner_token_last_use',
     'claude_api_model_state',
     'claude_model_state',
     'copilot_model_state',
@@ -461,6 +465,8 @@ test('the start-up allowlist is the keys and tables a real start writes, and not
     'push_vapid_public_key',
     'relay_last_exit',
   ]);
+  assert.ok(STARTUP_SETTING_KEYS.includes(OWNER_HASH_SETTING_KEY), 'the owner hash copy every start writes');
+  assert.ok(STARTUP_SETTING_KEYS.includes(OWNER_TOKEN_LAST_USE_SETTING_KEY), 'the use record every start begins');
   assert.deepEqual([...STARTUP_TABLES].sort(), ['media_index_meta', 'model_selector_state', 'model_variants', 'relay_restart_orchestrator']);
   const dir = tempDir();
   try {

@@ -52,7 +52,9 @@ test.describe.serial("@relay mention autocomplete", () => {
     expect(named.status).toBe(200);
     const added = await api(relayBaseUrl(), relayToken(), "/api/remote-relays", {
       method: "POST",
-      body: { url: relayB.baseUrl, pairBack: false },
+      // Its own token, given with the address: this relay no longer reaches
+      // another with its own token (it keeps only that token's hash).
+      body: { url: relayB.baseUrl, token: relayB.token, pairBack: false },
     });
     expect(added.payload?.ok).toBe(true);
     expect(added.payload?.relay?.name).toBe("linux-test");

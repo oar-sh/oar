@@ -20,6 +20,7 @@ import {
   withoutHostClaudeSessionVariables,
 } from '../../shared/host-claude-session-env.mjs';
 import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
+import { createProcessIdentityReader, identityOfListedWorker, mayReuseSessionWorkerRow } from './session-worker-process-service.mjs';
 import {
   describeSpawnEnvironment,
   envPathKey,
@@ -716,6 +717,10 @@ export function getTmuxPanePid(sessionName, {
 export const WORKER_SECRET_ENV_VARS = Object.freeze([
   'COPILOT_PROVIDER_API_KEY',
   'CURSOR_API_KEY',
+  // The session's agent token (agent auth): every kind's, bound to the
+  // launch's conversation. Under tmux through the secret file like the keys,
+  // never on a command line other users of the host can read.
+  'OAR_AGENT_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'DEEPSEEK_API_KEY',
   'OAR_CLAUDE_API_KEY',
@@ -1131,6 +1136,10 @@ export async function launchSessionCli({
   // Windows console launch: resolves (and rotates) the worker log the worker
   // then writes itself; returns its path or null.
   prepareWorkerLogFileImpl = prepareWorkerLogFile,
+  // async (pid, { fresh }) → what the process at a pid is
+  // (createProcessIdentityReader); the reuse check asks it. None: one over
+  // /proc or ps, and on Windows over the inspector's list.
+  readProcessIdentity = null,
   // Told when the process list could not be read (the error); the launch
   // goes on without it.
   onProcessListError = null,
@@ -1163,6 +1172,15 @@ export async function launchSessionCli({
     }
   };
 
+  const identityOf = typeof readProcessIdentity === 'function'
+    ? readProcessIdentity
+    : createProcessIdentityReader({
+      platform,
+      readProcessSnapshot: typeof processInspector?.readProcessSnapshot === 'function'
+        ? (options) => processInspector.readProcessSnapshot(options)
+        : null,
+    });
+
   // Kill switch for test/e2e servers: a relay started with this env var must
   // never spawn real session workers (Copilot CLI clients or Claude workers).
   if (String(env?.COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN || '').trim()) {
@@ -1170,9 +1188,18 @@ export async function launchSessionCli({
   }
 
   if (allowProcessReuse) {
-    const liveProcess = await findLiveProcess();
+    // Fresh: a cached list can be from before a stop and name the process it
+    // ended, or a pid handed to another process since.
+    const liveProcess = await findLiveProcess({ fresh: true });
     const liveProcessPid = parsePositiveInt(liveProcess?.processId);
-    if (liveProcessPid && isPidAlive(liveProcessPid)) {
+    // The listed process can have ended since, its pid gone to another
+    // process: reused only by its identity (mayReuseSessionWorkerRow), not
+    // merely while some process has the pid. On Windows the fresh row is
+    // that identity; no second read.
+    const liveIdentity = liveProcessPid
+      ? await identityOfListedWorker(liveProcess, { platform, identityOf })
+      : null;
+    if (liveProcessPid && mayReuseSessionWorkerRow({ row: liveProcess, current: liveIdentity, sdkSessionId: target, isAlive: isPidAlive })) {
       return {
         pid: liveProcessPid,
         reused: true,

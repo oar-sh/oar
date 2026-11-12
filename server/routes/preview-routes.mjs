@@ -11,11 +11,15 @@
 // `X-Relay-Conversation-Id` header every worker and the OAR MCP server send —
 // is scoped to it: GET lists only its previews, DELETE refuses another
 // conversation's with a 403. Only a request with neither (the web UI's
-// Settings → Previews) gets the relay-wide view. Agent-side callers present the
-// same relay token as the owner, so this is a boundary for the tools, not
-// against a caller that deliberately leaves both out.
+// Settings → Previews) gets the relay-wide view.
+//
+// An agent token is bound to its conversation: it lists, publishes and closes
+// that conversation's previews only, whatever it names, and the relay-wide
+// view is the person's (agent auth §2.2).
 
 import { validateStaticRoot } from '../services/preview-static-handler.mjs';
+import { agentConversationOf, notPerson } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 
 /**
  * The conversation ids a named scope covers: the id itself, and — when it
@@ -88,12 +92,43 @@ export function registerPreviewRoutes(app, deps) {
     return Array.isArray(ids) && ids.length ? ids : [named];
   }
 
+  function scopeOf(id) {
+    const ids = resolveConversationScope(id);
+    return Array.isArray(ids) && ids.length ? ids : [id];
+  }
+
+  /**
+   * For an agent token: its own conversation's scope, or null after a 403
+   * (a cli token has no conversation; a named conversation that is not its
+   * own is refused). For the person: `{ scope: undefined }`, nothing forced.
+   */
+  function agentScope(req, res, named = '') {
+    if (!notPerson(req)) return { scope: undefined };
+    const own = agentConversationOf(req);
+    if (!own) {
+      res.status(403).json({ error: 'Previews belong to a conversation: use the agent token of that session (OAR_AGENT_TOKEN).', code: AUTH_ERROR_CODES.personRequired });
+      return null;
+    }
+    const scope = scopeOf(own);
+    const target = String(named || '').trim();
+    if (target && !scope.includes(target) && !scopeOf(target).includes(own)) {
+      res.status(403).json({
+        error: 'An agent works with its own conversation\'s previews only; the relay-wide list is the user\'s (Settings → Previews).',
+        code: AUTH_ERROR_CODES.personRequired,
+      });
+      return null;
+    }
+    return { scope, conversationId: own };
+  }
+
   // GET /api/previews — one conversation's live previews when scoped (see the
   // top of the file), else every one. Unscoped is what the settings "Live
   // previews" list uses: nothing expires on its own, so there has to be one
   // place that shows everything.
   app.get('/api/previews', auth, (req, res) => {
-    const scope = requestScope(req);
+    const forced = agentScope(req, res, String(req.query?.conversationId || '').trim());
+    if (!forced) return;
+    const scope = forced.scope || requestScope(req);
     const previews = scope
       ? previewRegistry.list().filter((entry) => scope.includes(entry.conversationId))
       : previewRegistry.list();
@@ -108,6 +143,11 @@ export function registerPreviewRoutes(app, deps) {
   // POST /api/previews — publish an already-listening local port, or a
   // directory the lane serves itself (static mode).
   app.post('/api/previews', auth, (req, res) => {
+    const forced = agentScope(req, res, String(req.body?.conversationId || '').trim());
+    if (!forced) return;
+    if (forced.conversationId && !String(req.body?.conversationId || '').trim()) {
+      req.body = { ...(req.body || {}), conversationId: forced.conversationId };
+    }
     if (previewRegistry.settings?.enabled !== true) return laneUnavailable(res);
 
     const dir = String(req.body?.dir || '').trim();
@@ -163,7 +203,9 @@ export function registerPreviewRoutes(app, deps) {
   // server behind it is untouched; it is a separate background task. A scoped
   // request may close only its own conversation's previews.
   app.delete('/api/previews/:token', auth, (req, res) => {
-    const scope = requestScope(req);
+    const forced = agentScope(req, res, String(req.query?.conversationId || '').trim());
+    if (!forced) return;
+    const scope = forced.scope || requestScope(req);
     if (scope) {
       const token = String(req.params?.token || '').trim();
       // list() also holds the stored previews a restart could not check yet.

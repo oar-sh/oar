@@ -7,13 +7,17 @@ import { fileVersionToken, serveFileWithRangeSupport } from '../services/file-se
 import { DATA_IMAGE_MAGIC as IMAGE_MAGIC, findDataImage, isPseudoFileSystemPath } from '../services/media-extract.mjs';
 import { sniffMimeType } from '../services/mime-sniffer.mjs';
 import { createMediaIndexService } from '../services/media-index-service.mjs';
+import { createMediaTags, mediaTagOf } from '../services/media-tag.mjs';
 import { applySafeServedContentHeaders } from '../services/safe-served-content.mjs';
+import { AUTH_ERROR_CODES, FILE_PROTECTED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 
 // The media gallery: the 🧠 Media tab of a session and the global Media view.
 // Owner only: every route sits behind `auth`; there is no shared-view or
 // remote-relay counterpart. Files are served by index id only, so a file
 // reaches the gallery only when a message really referenced it, and its
-// stored path is checked again on every request.
+// stored path is checked again on every request. The content route goes on
+// the cookie alone, so an id opens nothing without its tag (`t`,
+// services/media-tag.mjs): every `contentUrl` handed out carries it.
 
 const CONTENT_ADDRESSED_CACHE = 'private, max-age=31536000, immutable';
 const REVALIDATE_CACHE = 'private, no-cache';
@@ -34,6 +38,8 @@ const closeFile = (fd) => fs.close(fd, () => {});
 // O_NOFOLLOW where the platform has it: the checked path cannot become a link
 // between the check and the open.
 const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+// What openServable answers for one of the relay's own files.
+const PROTECTED = Symbol('protected relay file');
 
 /** The promise's value, or allback after ms; onLate(value) gets a value that came too late. */
 function withTimeout(promise, ms, fallback, onLate = () => {}) {
@@ -111,7 +117,13 @@ export function registerMediaRoutes(app, {
   db,
   uploadPathForSha,
   fetchBrowsableDrives = null,
+  // The relay's own secrets, database and config (services/relay-protected-files.mjs):
+  // never served, even when a message names one.
+  isProtectedFile = () => false,
   resolveGeneratedImagePath = () => null,
+  // `{ matches(id, tag), contentUrlFor(id) }`: the relay's, keyed from its
+  // agentKey; a key of this process when none is given.
+  mediaTags = createMediaTags(),
   platform = process.platform,
   repository = createMediaRepository(db),
   indexService = createMediaIndexService({ db, repository, platform }),
@@ -119,6 +131,10 @@ export function registerMediaRoutes(app, {
   now = () => Date.now(),
 } = {}) {
   let drivesCache = null;
+
+  function protectedFile(filePath) {
+    try { return isProtectedFile(filePath) === true; } catch { return true; }
+  }
 
   // Windows: the drive roots a stored path may live on, cached a minute
   // (listing them starts a process).
@@ -195,7 +211,7 @@ export function registerMediaRoutes(app, {
     };
     if (item.locatorKind === 'remote_url') out.remoteUrl = item.locator;
     else if (item.locatorKind === 'upload_sha') out.contentUrl = `/api/upload/${item.locator}/content`;
-    else out.contentUrl = `/api/media/${item.id}/content`;
+    else out.contentUrl = mediaTags.contentUrlFor(item.id);
     if (item.locatorKind === 'local_path') out.path = item.locator;
     return out;
   }
@@ -206,10 +222,14 @@ export function registerMediaRoutes(app, {
    * that passes them too), it is a regular file, and a local picture or video
    * is what its name says. One descriptor from the open on: the checks, the
    * first bytes and the bytes sent are of the same file. `null` when it may
-   * not be served (or a call on the drive took too long); the caller closes
-   * `fd`.
+   * not be served (or a call on the drive took too long), `PROTECTED` for
+   * one of the relay's own files; the caller closes `fd`.
    */
   async function openServable(item) {
+    // A local path is served only as a picture or a video: any other file a
+    // message names by path (a text, a PDF) opens by path with a file
+    // capability, never through this cookie-only route.
+    if (item.locatorKind === 'local_path' && item.category !== 'media') return null;
     let filePath = await filePathFor(item);
     if (!filePath) return null;
     if (item.locatorKind === 'local_path') {
@@ -217,13 +237,14 @@ export function registerMediaRoutes(app, {
       filePath = real ? await servableLocalPath(real) : '';
       if (!filePath) return null;
     }
+    if (protectedFile(filePath)) return PROTECTED;
     const fd = await withTimeout(openFile(filePath, OPEN_FLAGS), FS_TIMEOUT_MS, null, closeFile);
     if (fd === null || fd === undefined) return null;
     try {
       const stat = await withTimeout(fstatFile(fd), FS_TIMEOUT_MS, null);
       if (!stat?.isFile()) throw new Error('not a file');
       let contentType = item.mime || 'application/octet-stream';
-      if (item.locatorKind === 'local_path' && item.category === 'media') {
+      if (item.locatorKind === 'local_path') {
         contentType = sniffLocalMediaType(await readHead(fd), item);
         if (!contentType) throw new Error('not a picture or video');
       }
@@ -244,11 +265,12 @@ export function registerMediaRoutes(app, {
     const cached = servable.get(key);
     if (cached && now() - cached.at < SERVABLE_TTL_MS) return cached.ok;
     const opened = await openServable(item);
-    if (opened) closeFile(opened.fd);
+    const ok = Boolean(opened) && opened !== PROTECTED;
+    if (ok) closeFile(opened.fd);
     servable.delete(key);
-    servable.set(key, { ok: Boolean(opened), at: now() });
+    servable.set(key, { ok, at: now() });
     while (servable.size > SERVABLE_CACHE_MAX) servable.delete(servable.keys().next().value);
-    return Boolean(opened);
+    return ok;
   }
 
   function readFilters(query) {
@@ -313,6 +335,10 @@ export function registerMediaRoutes(app, {
   app.get('/api/media/:id/content', auth, async (req, res) => {
     const raw = String(req.params.id || '');
     if (!/^\d{1,15}$/.test(raw)) return res.status(400).json({ error: 'Invalid media id' });
+    // The tag first, whoever asks: nothing is looked up for an id without it.
+    let tagged = false;
+    try { tagged = mediaTags.matches(raw, mediaTagOf(req)) === true; } catch { tagged = false; }
+    if (!tagged) return res.status(404).json({ error: 'Not found' });
     const item = repository.getMediaItem(Number(raw));
     if (!item) return res.status(404).json({ error: 'Not found' });
     try {
@@ -329,6 +355,7 @@ export function registerMediaRoutes(app, {
         return res.end(bytes);
       }
       const opened = await openServable(item);
+      if (opened === PROTECTED) return res.status(403).json({ error: FILE_PROTECTED_MESSAGE, code: AUTH_ERROR_CODES.protectedFile });
       if (!opened) return res.status(404).json({ error: 'Not found' });
       const { fd, filePath, stat, contentType, contentAddressed } = opened;
       const version = fileVersionToken({ mtimeMs: stat.mtimeMs, size: stat.size });
@@ -357,5 +384,5 @@ export function registerMediaRoutes(app, {
   });
 
   if (startIndexer) indexService.start();
-  return { repository, indexService };
+  return { repository, indexService, mediaTags };
 }

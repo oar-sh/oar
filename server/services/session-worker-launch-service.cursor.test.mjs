@@ -162,6 +162,8 @@ test('worker secret env vars cover the copilot provider and cursor keys', () => 
   assert.deepEqual([...WORKER_SECRET_ENV_VARS], [
     'COPILOT_PROVIDER_API_KEY',
     'CURSOR_API_KEY',
+    // The session's agent token, every kind's (agent auth).
+    'OAR_AGENT_TOKEN',
     'CLAUDE_CODE_OAUTH_TOKEN',
     'DEEPSEEK_API_KEY',
     'OAR_CLAUDE_API_KEY',
@@ -385,7 +387,7 @@ test('copilot tmux command output is byte-identical: the unset prefix, then the 
     + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
     + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED OAR_AGENT_SDK_DIR_CLAUDE OAR_AGENT_SDK_DIR_CURSOR COPILOT_WORKSPACE_ROOT INIT_CWD "
     // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
-    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
+    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY OAR_AGENT_TOKEN CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
     + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
     // Then the host session's variables by family, from whatever the shell holds.
     + HOST_FAMILY_UNSET
@@ -430,7 +432,7 @@ test('claude tmux command output is byte-identical: the unset prefix, then the p
     + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
     + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED OAR_AGENT_SDK_DIR_CLAUDE OAR_AGENT_SDK_DIR_CURSOR COPILOT_WORKSPACE_ROOT INIT_CWD "
     // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
-    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
+    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY OAR_AGENT_TOKEN CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
     + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
     // Then the host session's variables by family, from whatever the shell holds.
     + HOST_FAMILY_UNSET

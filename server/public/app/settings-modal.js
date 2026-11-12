@@ -89,6 +89,7 @@ import { refreshCliInstallSections } from './cli-install-ui.js';
 import { refreshAgentSdkRows } from './agent-sdk-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
+import { hideSigninQr, refreshSecuritySection } from './security-settings.js';
 import { refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
 import { refreshSharedConversationsSection } from './shared-conversations-settings.js';
 import { syncScrollOnSendToggle } from './transcript-jump-bottom.mjs';
@@ -2165,6 +2166,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshPreviewsSection();
   void refreshSharedConversationsSection();
   void refreshRemoteRelaysSection();
+  void refreshSecuritySection();
   void refreshAgentSessionsSection();
   void refreshFeatureFlagsSection();
   void refreshUpdateSection();
@@ -2182,6 +2184,8 @@ export function closeSettingsModal() {
   const focusWasInside = !!modal?.contains(document.activeElement);
   modal?.classList.remove('visible');
   modal?.setAttribute('aria-hidden', 'true');
+  // A sign-in link's QR code is up only while Settings → Security is.
+  hideSigninQr();
   const back = settingsFocusBefore;
   settingsFocusBefore = null;
   // Focus goes back where it was (︙, the gear) when it was in the dialog;

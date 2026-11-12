@@ -6,6 +6,7 @@
 // services/deepseek-usage-import.mjs.
 
 import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+import { notPerson } from '../services/relay-principal.mjs';
 
 // The two files of a month come to well under a megabyte.
 export const DEEPSEEK_USAGE_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
@@ -45,7 +46,7 @@ export function registerDeepSeekUsageImportRoutes(app, deps) {
   }
 
   app.post('/api/deepseek-usage-import', auth, async (req, res) => {
-    if (readRemoteRelayRequest(req, remoteRelayInbound || {}).remote) {
+    if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound || {}))) {
       return res.status(403).json({ error: 'The DeepSeek usage export is imported by this relay\'s user only.' });
     }
     if (typeof deepseekUsageImportService?.importExport !== 'function') {

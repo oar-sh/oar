@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createSessionWorkerProcessInspector } from './session-worker-process-service.mjs';
+import {
+  createProcessIdentityReader,
+  createSessionWorkerProcessInspector,
+  identityOfListedWorker,
+  isSameProcess,
+  judgeSessionWorkerProcess,
+  mayReuseSessionWorkerRow,
+  parseProcStatStartTime,
+  parsePsStartAndArgs,
+} from './session-worker-process-service.mjs';
 
 test('process inspector finds posix session worker processes by session id', () => {
   const execFileSyncImpl = (command, args) => {
@@ -484,6 +493,22 @@ test('a windows process list that is not JSON at all says so', () => {
   );
 });
 
+test('identityOfListedWorker: on Windows the fresh row is the identity, with no read; elsewhere the reader is asked', async () => {
+  const reads = [];
+  const identityOf = async (pid, options) => { reads.push([pid, options]); return { pid, startTime: '42', commandLine: 'node x --session-id abc-123' }; };
+  const row = { processId: 7001, commandLine: 'node claude-session-worker.mjs --session-id abc-123', createdAt: 1762941600000 };
+  assert.deepEqual(await identityOfListedWorker(row, { platform: 'win32', identityOf }), { pid: 7001, startTime: '1762941600000', commandLine: row.commandLine });
+  assert.deepEqual(await identityOfListedWorker({ ...row, createdAt: 0 }, { platform: 'win32', identityOf }), { pid: 7001, startTime: null, commandLine: row.commandLine });
+  assert.deepEqual(reads, [], 'no read on Windows');
+  assert.equal(mayReuseSessionWorkerRow({ row, current: await identityOfListedWorker(row, { platform: 'win32' }), sdkSessionId: 'abc-123' }), true);
+
+  assert.deepEqual(await identityOfListedWorker({ processId: 4242 }, { platform: 'linux', identityOf }), { pid: 4242, startTime: '42', commandLine: 'node x --session-id abc-123' });
+  assert.deepEqual(reads, [[4242, { fresh: true }]]);
+  assert.deepEqual(await identityOfListedWorker({ processId: 4242 }, { platform: 'linux', identityOf: async () => { throw new Error('unreadable'); } }), { pid: 4242, startTime: null, commandLine: null });
+  assert.deepEqual(await identityOfListedWorker({ processId: 4242 }, { platform: 'darwin' }), { pid: 4242, startTime: null, commandLine: null });
+  assert.equal(await identityOfListedWorker({ processId: 0 }, { platform: 'win32' }), null);
+});
+
 // ─── the asynchronous readers (relay side) ───────────────────────────────────
 
 function windowsListJson(extra = []) {
@@ -531,6 +556,135 @@ test('concurrent async readers share one PowerShell run, and the cache serves th
   clock += 2_000;
   await inspector.findProcessForSessionAsync('abc-123');
   assert.equal(calls.length, 3, 'after the window the list is read again');
+});
+
+test('the POSIX process list is read with a bounded ps', async () => {
+  const runs = [];
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'linux',
+    execFileSyncImpl() { throw new Error('the synchronous reader must not run'); },
+    execFileImpl(command, args, options, callback) {
+      runs.push({ command, args, options });
+      callback(null, '4242 1 node node /home/dev/oar/server/claude-worker/claude-session-worker.mjs --session-id abc-123\n');
+    },
+  });
+  assert.equal((await inspector.findProcessForSessionAsync('abc-123', { fresh: true }))?.processId, 4242);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].command, 'ps');
+  assert.equal(runs[0].options.timeout, 5000);
+  assert.ok(runs[0].options.maxBuffer > 0);
+});
+
+test('a fresh read never joins a read that began before it; notBefore takes only a read begun after it', async () => {
+  let clock = 2_000_000;
+  let run = 0;
+  // Each run answers with its own list: the first one still names the
+  // session's old worker, the later ones its new one.
+  const { inspector, calls } = asyncWindowsInspector({
+    nowMs: () => clock,
+    snapshotCacheMs: 1_500,
+    output: () => {
+      run += 1;
+      return Buffer.from(JSON.stringify([{ processId: run === 1 ? 7001 : 7002, parentProcessId: 1, name: 'node.exe', commandLine: 'node claude-session-worker.mjs --session-id abc-123' }]));
+    },
+  });
+  // A read starts (a sweep, say) before the caller's stop and spawn are over.
+  const early = inspector.findProcessForSessionAsync('abc-123');
+  clock += 10;
+  const fresh = inspector.findProcessForSessionAsync('abc-123', { fresh: true });
+  // A caller without a wish joins the read already running.
+  const plain = inspector.findProcessForSessionAsync('abc-123');
+  const [a, b, c] = await Promise.all([early, fresh, plain]);
+  assert.equal(calls.length, 2, 'the fresh caller got a read of its own');
+  assert.equal(a?.processId, 7001);
+  assert.equal(b?.processId, 7002, 'the fresh read names what runs after the caller');
+  assert.equal(c?.processId, 7001);
+  // The cache holds the read that began last, whichever finished last.
+  assert.equal((await inspector.findProcessForSessionAsync('abc-123'))?.processId, 7002);
+  assert.equal(calls.length, 2);
+
+  // notBefore: the cached read (begun at 2_000_010) is used only for a time
+  // before it began.
+  assert.equal((await inspector.findProcessForSessionAsync('abc-123', { notBefore: 2_000_009 }))?.processId, 7002);
+  assert.equal(calls.length, 2, 'begun after notBefore: reused');
+  await inspector.findProcessForSessionAsync('abc-123', { notBefore: 2_000_010 });
+  assert.equal(calls.length, 3, 'begun at notBefore, possibly before it: read again');
+  // A read running since before notBefore is not joined either.
+  clock += 5;
+  const running = inspector.readProcessSnapshot({ fresh: true });
+  const later = inspector.readProcessSnapshot({ notBefore: clock });
+  await Promise.all([running, later]);
+  assert.equal(calls.length, 5);
+});
+
+test('fresh callers share one read that begins after them all: on Windows one CIM query at a time', async () => {
+  let clock = 3_000_000;
+  let run = 0;
+  let active = 0;
+  let most = 0;
+  let failNext = false;
+  const calls = [];
+  const inspector = createSessionWorkerProcessInspector({
+    platform: 'win32',
+    now: () => clock,
+    snapshotCacheMs: 1_500,
+    execFileSyncImpl() { throw new Error('the synchronous reader must not run'); },
+    execFileImpl(command, args, options, callback) {
+      calls.push(command);
+      run += 1;
+      const mine = run;
+      const fail = failNext;
+      failNext = false;
+      active += 1;
+      most = Math.max(most, active);
+      setTimeout(() => {
+        active -= 1;
+        if (fail) {
+          callback(new Error('powershell.exe timed out'));
+          return;
+        }
+        callback(null, Buffer.from(JSON.stringify([{ processId: 7000 + mine, parentProcessId: 1, name: 'node.exe', commandLine: 'node claude-session-worker.mjs --session-id abc-123' }])));
+      }, 5);
+    },
+  });
+  const pids = (list) => list.map((proc) => proc.processId);
+
+  // A read runs (a sweep, say); three fresh callers come while it does.
+  const early = inspector.readProcessSnapshot();
+  clock += 10;
+  const fresh = [
+    inspector.readProcessSnapshot({ fresh: true }),
+    inspector.findProcessesForSessionAsync('abc-123', { fresh: true }),
+    inspector.findWindowsProcessTreeForSessionAsync('abc-123', { fresh: true }),
+  ];
+  assert.equal(calls.length, 1, 'the next read waits for the running one');
+  const [first, ...rest] = await Promise.all([early, ...fresh]);
+  assert.deepEqual(pids(first), [7001]);
+  assert.deepEqual(rest.map(pids), [[7002], [7002], [7002]], 'all three share the read that began after them');
+  assert.equal(calls.length, 2);
+  assert.equal(most, 1, 'never two reads at once');
+
+  // Nothing runs: the first fresh caller starts a read at once, the ones
+  // after it (a millisecond later) share the next one.
+  clock += 10;
+  const a = inspector.readProcessSnapshot({ fresh: true });
+  assert.equal(calls.length, 3);
+  clock += 1;
+  const later = [inspector.readProcessSnapshot({ fresh: true }), inspector.readProcessSnapshot({ fresh: true })];
+  assert.deepEqual([pids(await a), ...(await Promise.all(later)).map(pids)], [[7003], [7004], [7004]]);
+  assert.equal(calls.length, 4);
+  assert.equal(most, 1);
+
+  // A running read that fails still lets the next one begin.
+  clock += 2_000;
+  failNext = true;
+  const failing = inspector.readProcessSnapshot();
+  clock += 10;
+  const afterFailure = inspector.readProcessSnapshot({ fresh: true });
+  await assert.rejects(failing, /timed out/);
+  assert.deepEqual(pids(await afterFailure), [7006]);
+  assert.equal(calls.length, 6);
+  assert.equal(most, 1);
 });
 
 test('the async read keeps the event loop running and records what it did', async () => {
@@ -614,4 +768,125 @@ test('stopWindowsPidsAsync runs the same stop script off the thread and reports 
     execFileImpl(_command, _args, _options, callback) { callback(new Error('Access denied')); },
   });
   await assert.rejects(failing.stopWindowsPidsAsync([1001]), /Access denied/);
+});
+
+// ─── Process identity ────────────────────────────────────────────────────────
+
+test('parseProcStatStartTime reads field 22, past a command name with spaces and parentheses', () => {
+  // Fields 3-21 then 22 (starttime) and a few more.
+  const tail = 'S 1 4100 4100 0 -1 4194560 3071 0 0 0 12 3 0 0 20 0 11 0 987654 1131913216 12544';
+  assert.equal(parseProcStatStartTime(`4242 (node) ${tail}`), '987654');
+  assert.equal(parseProcStatStartTime(`4242 (we(ird) name)) ${tail}`), '987654');
+  assert.equal(parseProcStatStartTime('4242 (node) S 1'), null);
+  assert.equal(parseProcStatStartTime(''), null);
+});
+
+test('parsePsStartAndArgs splits lstart from the command line', () => {
+  assert.deepEqual(
+    parsePsStartAndArgs('Thu Nov 12 10:00:00 2026     node claude-session-worker.mjs --session-id sid-ps\n'),
+    { startTime: 'Thu Nov 12 10:00:00 2026', commandLine: 'node claude-session-worker.mjs --session-id sid-ps' },
+  );
+  assert.deepEqual(parsePsStartAndArgs('Mon Nov  2 09:05:01 2026 '), { startTime: 'Mon Nov 2 09:05:01 2026', commandLine: '' });
+  assert.equal(parsePsStartAndArgs('\n'), null);
+  assert.deepEqual(parsePsStartAndArgs('garbled'), { startTime: null, commandLine: null });
+});
+
+test('identity on Linux and Termux: /proc stat and cmdline; a missing pid is null; an unreadable one unknown', async () => {
+  const stat = '4242 (node) S 1 4100 4100 0 -1 4194560 3071 0 0 0 12 3 0 0 20 0 11 0 987654 1131913216 12544';
+  for (const platform of ['linux', 'android']) {
+    const reads = [];
+    const identityOf = createProcessIdentityReader({
+      platform,
+      readFileImpl: async (file) => {
+        reads.push(file);
+        if (file === '/proc/4242/stat') return stat;
+        if (file === '/proc/4242/cmdline') return 'node\0/home/dev/oar/server/claude-session-worker.mjs\0--session-id\0sid-proc\0';
+        throw Object.assign(new Error('no such file'), { code: 'ENOENT' });
+      },
+      execFileImpl: () => { throw new Error('ps is not run on /proc systems'); },
+    });
+    assert.deepEqual(await identityOf(4242), {
+      pid: 4242,
+      startTime: '987654',
+      commandLine: 'node /home/dev/oar/server/claude-session-worker.mjs --session-id sid-proc',
+    }, platform);
+    assert.deepEqual(reads, ['/proc/4242/stat', '/proc/4242/cmdline'], platform);
+    assert.equal(await identityOf(4343), null, platform);
+    assert.equal(await identityOf(0), null, platform);
+  }
+  const denied = createProcessIdentityReader({
+    platform: 'linux',
+    readFileImpl: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+  });
+  assert.deepEqual(await denied(4242), { pid: 4242, startTime: null, commandLine: null });
+});
+
+test('identity on macOS: one ps run with lstart and args under the C locale; exit 1 with no output is no process', async () => {
+  const runs = [];
+  const identityOf = createProcessIdentityReader({
+    platform: 'darwin',
+    readFileImpl: async () => { throw new Error('/proc is not read on macOS'); },
+    execFileImpl: (command, args, options, callback) => {
+      runs.push({ command, args, locale: options?.env?.LC_ALL, timeout: options?.timeout });
+      if (args.at(-1) === '4242') callback(null, 'Thu Nov 12 10:00:00 2026 node claude-session-worker.mjs --session-id sid-mac\n', '');
+      else if (args.at(-1) === '4343') callback(Object.assign(new Error('exit 1'), { code: 1 }), '', '');
+      else callback(Object.assign(new Error('spawn ps ENOENT'), { code: 'ENOENT' }), '', '');
+    },
+  });
+  assert.deepEqual(await identityOf(4242), {
+    pid: 4242,
+    startTime: 'Thu Nov 12 10:00:00 2026',
+    commandLine: 'node claude-session-worker.mjs --session-id sid-mac',
+  });
+  // Bounded: a ps that hangs is an unknown, not a stalled recycle or stop.
+  assert.deepEqual(runs[0], { command: 'ps', args: ['-ww', '-o', 'lstart=', '-o', 'args=', '-p', '4242'], locale: 'C', timeout: 5000 });
+  assert.equal(await identityOf(4343), null);
+  assert.deepEqual(await identityOf(4444), { pid: 4444, startTime: null, commandLine: null });
+});
+
+test('identity on Windows: the process list\'s createdAt and command line, read as asked', async () => {
+  const asked = [];
+  let fail = false;
+  const identityOf = createProcessIdentityReader({
+    platform: 'win32',
+    readProcessSnapshot: async (options) => {
+      asked.push(options);
+      if (fail) throw new Error('windows-process-snapshot-unreadable');
+      return [
+        { processId: 4242, parentProcessId: 1, name: 'node.exe', commandLine: 'node claude-session-worker.mjs --session-id sid-win', createdAt: 1762941600000 },
+        { processId: 4343, parentProcessId: 1, name: 'svchost.exe', commandLine: '', createdAt: 0 },
+      ];
+    },
+  });
+  assert.deepEqual(await identityOf(4242, { fresh: true }), { pid: 4242, startTime: '1762941600000', commandLine: 'node claude-session-worker.mjs --session-id sid-win' });
+  assert.deepEqual(await identityOf(4343), { pid: 4343, startTime: null, commandLine: '' });
+  assert.equal(await identityOf(4444), null);
+  assert.deepEqual(asked, [{ fresh: true }, { fresh: false }, { fresh: false }]);
+  fail = true;
+  assert.deepEqual(await identityOf(4242), { pid: 4242, startTime: null, commandLine: null });
+  // No list to read: nothing is known.
+  assert.deepEqual(await createProcessIdentityReader({ platform: 'win32' })(4242), { pid: 4242, startTime: null, commandLine: null });
+});
+
+test('isSameProcess needs the pid and a known, equal start time', () => {
+  assert.equal(isSameProcess({ pid: 7, startTime: '100' }, { pid: 7, startTime: '100' }), true);
+  assert.equal(isSameProcess({ pid: 7, startTime: '100' }, { pid: 7, startTime: '101' }), false);
+  assert.equal(isSameProcess({ pid: 7, startTime: '100' }, { pid: 8, startTime: '100' }), false);
+  assert.equal(isSameProcess({ pid: 7, startTime: null }, { pid: 7, startTime: null }), false);
+  assert.equal(isSameProcess(null, { pid: 7, startTime: '100' }), false);
+});
+
+test('judgeSessionWorkerProcess: gone, another process, the session\'s own, or not known', () => {
+  const sdkSessionId = 'sid-judge';
+  const ours = { pid: 7, startTime: '100', commandLine: 'node claude-session-worker.mjs --session-id sid-judge' };
+  assert.equal(judgeSessionWorkerProcess(null, { sdkSessionId }), 'gone');
+  assert.equal(judgeSessionWorkerProcess(ours, { sdkSessionId }), 'ours');
+  assert.equal(judgeSessionWorkerProcess(ours, { sdkSessionId, before: { pid: 7, startTime: '100' } }), 'ours');
+  // Its pid handed out again: another start time.
+  assert.equal(judgeSessionWorkerProcess(ours, { sdkSessionId, before: { pid: 7, startTime: '99' } }), 'other');
+  // A process whose command line names another session, or none (a zombie).
+  assert.equal(judgeSessionWorkerProcess({ ...ours, commandLine: 'node claude-session-worker.mjs --session-id sid-else' }, { sdkSessionId }), 'other');
+  assert.equal(judgeSessionWorkerProcess({ ...ours, commandLine: '' }, { sdkSessionId }), 'other');
+  assert.equal(judgeSessionWorkerProcess({ pid: 7, startTime: null, commandLine: null }, { sdkSessionId }), 'unverified');
+  assert.equal(judgeSessionWorkerProcess({ pid: 7, startTime: '100', commandLine: null }, { sdkSessionId, before: { pid: 7, startTime: '100' } }), 'unverified');
 });

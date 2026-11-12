@@ -30,8 +30,15 @@ const CHECK_DIR_PREFIX = '.database-file-check-';
 // Since 0.9.24 a start also writes each provider's model map as it finds
 // it (provider-model-state.mjs) and the last model refresh. A version that
 // runs on copilot.db writes none of them; a start of this one, which the
-// browser test uses as its stand-in, writes several.
+// browser test uses as its stand-in, writes several. Since agent auth a
+// start also keeps a copy of the owner token's hash (owner-secret-store.mjs
+// OWNER_HASH_SETTING_KEY), to notice a token changed outside OAR: no one's
+// work either. And the owner token's use record (owner-token-use.mjs
+// OWNER_TOKEN_LAST_USE_SETTING_KEY), which every start begins when it
+// finds none, and which counts a script's use of the token, not a chat.
 export const STARTUP_SETTING_KEYS = Object.freeze([
+  'auth_owner_token_hash',
+  'auth_owner_token_last_use',
   'push_vapid_public_key',
   'push_vapid_private_key',
   'relay_last_exit',

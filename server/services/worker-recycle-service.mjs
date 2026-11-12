@@ -64,19 +64,23 @@
  * The launches are paced, at most `maxInFlight` at a time and one per
  * `minStartGapMs` on the relay: a deploy leaves every worker stale at once,
  * and each Node worker boot is a memory spike. A stop or a launch that fails
- * is retried with a backoff, and a session that keeps failing is named once
- * in a warning; nothing reaches the chat, since nothing of the conversation
- * is lost and the next message relaunches the worker anyway.
+ * is retried with a backoff, and a session that keeps failing (`stuckAfter`
+ * tries) is named once in a warning and once to the person (`onStuck`, a
+ * note in the chat): an old worker the relay cannot stop goes on serving the
+ * session from old code, which only a stop by hand ends.
  *
  * Storm guards: a worker whose build id equals the relay's is never touched,
  * a relay that does not know its own build id recycles nothing, a worker
  * process (pid) is recycled at most once, so a stale-looking entry the stop
- * left behind is never stopped again, and a session is recycled at most once
+ * left behind is never stopped again (only a retried launch stops the session
+ * once more first, when the registry names the stopped pid and the process
+ * there cannot be told from the stopped one), and a session is recycled at most once
  * per relay build id: a new process that still states another id (or none)
  * runs from a tree other than the relay's, and recycling it again would loop.
  */
 
 import { buildIdsDiffer, normalizeBuildId } from '../../shared/build-id.mjs';
+import { judgeSessionWorkerProcess } from './session-worker-process-service.mjs';
 import { createWorkerReplacementFence, workerReleaseHold } from './worker-replacement.mjs';
 
 const LOG_TAG = '[worker-recycle]';
@@ -124,6 +128,30 @@ export function isWorkerOnOtherBuild(worker, relayBuildId) {
   if (!relayId || !worker) return false;
   const workerId = normalizeBuildId(worker.buildId);
   return workerId ? buildIdsDiffer(workerId, relayId) : true;
+}
+
+/**
+ * The chat's note for a recycle that stays stuck (onStuck): what failed and,
+ * for a stop, the old worker's pids and how to stop them by hand
+ * (docs/troubleshooting.md, "A chat's old worker does not stop").
+ */
+export function workerRecycleStuckNoteText({ sdkSessionId = '', step, error, attempts, pids = [] } = {}, { platform = process.platform } = {}) {
+  const tries = `${attempts} ${attempts === 1 ? 'try' : 'tries'}`;
+  if (step !== 'stop') {
+    return `⚠️ The relay could not restart this chat's worker on the updated code: ${tries} failed (last: ${step}: ${error}). `
+      + 'It keeps trying, and the next message starts a worker as well. If it stays stuck, restart the relay.';
+  }
+  const named = pids.length ? ` (${pids.length === 1 ? 'pid' : 'pids'} ${pids.join(', ')})` : '';
+  const byHand = pids.length
+    ? (platform === 'win32'
+      ? pids.map((pid) => `\`taskkill /PID ${pid} /T /F\``).join(', ')
+      : `\`kill ${pids.join(' ')}\``)
+    : `the node process with \`--session-id ${sdkSessionId}\` in its command line`;
+  return `⚠️ The relay could not stop this chat's old worker${named} to restart it on the updated code: `
+    + `${tries} failed (${error}). The relay keeps trying. Meanwhile the old worker may go on serving this chat, and a message can fail `
+    + 'if the update removed the files it runs from. '
+    + `To clear it, stop it by hand (${byHand}); a relay restart does not end it, workers keep running through one. `
+    + 'See "A chat\'s old worker does not stop" in the troubleshooting guide.';
 }
 
 export function createWorkerRecycleService({
@@ -190,6 +218,21 @@ export function createWorkerRecycleService({
   // judged as any other worker. Its heartbeat sends one within a second of
   // a relay's hello.
   steeringWaitMs = 30_000,
+  // ({ sdkSessionId, step, error, attempts, pids, archived }) → void, once
+  // per streak when a session's recycle reaches stuckAfter failed tries, for
+  // a note the person sees (the warning alone is only in the relay's log).
+  // `pids`: the old worker's processes the stop verified as the session's
+  // and could not end, for a stop that failed (none when it verified none).
+  onStuck = () => {},
+  // async (pid) → { pid, startTime, commandLine } | null (no such process):
+  // what the process at a pid is now (session-worker-process-service.mjs). A
+  // launch that names the pid of the worker just stopped is a new worker only
+  // when that process runs with another start time (the pid handed out
+  // again) and its command line names the session.
+  // A retry of such a launch first stops the session again while the process
+  // there cannot be told from the stopped one, so the session never has two.
+  // None: nothing can be told, and such a launch is retried that way.
+  readProcessIdentity = null,
   logger = console,
 } = {}) {
   if (typeof stopWorker !== 'function' || typeof launchWorker !== 'function') {
@@ -243,6 +286,10 @@ export function createWorkerRecycleService({
         // The last pid this service stopped for the session: never stopped
         // again; a new pid is judged by its own build id.
         recycledPid: null,
+        // That process's identity, `{ pid, startTime }` (startTime null when
+        // the stop could not read it): a launch that names its pid is the
+        // stopped process only while the start time is the same.
+        recycledIdentity: null,
         // A recycle whose stop went through and whose launch has not yet:
         // `{ oldPid }`. The registry entry is gone by then, so the sweep
         // retries it from here.
@@ -292,7 +339,7 @@ export function createWorkerRecycleService({
     return Math.min(retryMaxMs, retryBaseMs * (2 ** (failures - 1)));
   }
 
-  function noteFailure(sid, state, step, error) {
+  function noteFailure(sid, state, step, error, { pids = [], archived = false } = {}) {
     state.failures += 1;
     const delay = backoffMs(state.failures);
     state.nextAttemptAt = now() + delay;
@@ -300,6 +347,12 @@ export function createWorkerRecycleService({
     if (state.failures >= stuckAfter && !state.stuckWarned) {
       state.stuckWarned = true;
       warn(`session ${sid} is stuck: ${state.failures} recycle attempts failed (last: ${step}: ${error}); retrying every ${Math.round(retryMaxMs / 1000)}s at most`);
+      const stuckPids = [...new Set((Array.isArray(pids) ? pids : []).map(toPid).filter(Boolean))];
+      try {
+        onStuck({ sdkSessionId: sid, step, error: String(error), attempts: state.failures, pids: stuckPids, archived: archived === true });
+      } catch (stuckError) {
+        warn(`stuck note for ${sid8(sid)} failed: ${errorText(stuckError, 'unknown')}`);
+      }
     }
   }
 
@@ -348,36 +401,88 @@ export function createWorkerRecycleService({
    */
   async function launch(sid, state) {
     await waitForLaunchSlot();
+    const oldPid = state.pendingLaunch?.oldPid ?? 'none';
     // Asked after the wait, which can be seconds long, and synchronously up to
     // the launch, so nothing changes between the answer and the launch.
-    let archived = false;
-    let current = null;
-    try {
-      archived = isArchived(sid) === true;
-      current = getWorker(sid) || null;
-    } catch (error) {
-      noteFailure(sid, state, 'probe', errorText(error, 'unknown'));
-      return;
-    }
-    const oldPid = state.pendingLaunch?.oldPid ?? 'none';
-    if (archived) {
-      // Archived since the stop: the session stays without a worker, and its
-      // killed marker (set by the stop) is left as the archive route leaves it.
-      endPendingLaunch(sid, state);
-      log(`stopped ${sid8(sid)} (archived)`);
-      return;
-    }
-    const livePid = toPid(current?.pid);
-    if (livePid && livePid !== state.recycledPid) {
-      // Another path (the primer, the next delivery) already brought a new
-      // worker up, on the relay's code since it started after the deploy. A
-      // launch now would stop it again (no process reuse), mid-boot or
-      // mid-turn: the job is done.
-      endPendingLaunch(sid, state);
-      recycled += 1;
-      recycledUnder.set(sid, relayId);
-      log(`recycled ${sid8(sid)} pid ${oldPid}→${livePid} (started elsewhere)`);
-      return;
+    // Returns whether the launch is still owed.
+    const stillOwed = () => {
+      let archived = false;
+      let current = null;
+      try {
+        archived = isArchived(sid) === true;
+        current = getWorker(sid) || null;
+      } catch (error) {
+        noteFailure(sid, state, 'probe', errorText(error, 'unknown'));
+        return false;
+      }
+      if (archived) {
+        // Archived since the stop: the session stays without a worker, and its
+        // killed marker (set by the stop) is left as the archive route leaves it.
+        endPendingLaunch(sid, state);
+        log(`stopped ${sid8(sid)} (archived)`);
+        return false;
+      }
+      const livePid = toPid(current?.pid);
+      if (livePid && livePid !== state.recycledPid) {
+        // Another path (the primer, the next delivery) already brought a new
+        // worker up, on the relay's code since it started after the deploy. A
+        // launch now would stop it again (no process reuse), mid-boot or
+        // mid-turn: the job is done.
+        endPendingLaunch(sid, state);
+        recycled += 1;
+        recycledUnder.set(sid, relayId);
+        log(`recycled ${sid8(sid)} pid ${oldPid}→${livePid} (started elsewhere)`);
+        return false;
+      }
+      return true;
+    };
+    if (!stillOwed()) return;
+    // The registry names the stopped pid. A process there that states this
+    // relay's build is the new worker (the stopped one was stale). Else what
+    // runs there is read, whatever put the entry there: a launch of this
+    // recycle that came up on the pid, another start (the queue's, while this
+    // one backed off) that landed on it before its first heartbeat, or the
+    // stop's own entry re-listed by a late heartbeat. A launch now (on a host
+    // without tmux a detached spawn) while a process of the session runs
+    // there would give it a second one, so such a process is stopped first.
+    // The stopped process, which the stop saw end, reads as gone: it is
+    // never stopped again.
+    const named = (() => { try { return getWorker(sid) || null; } catch { return null; } })();
+    if (state.recycledPid && toPid(named?.pid) === state.recycledPid) {
+      const pid = state.recycledPid;
+      if (statesRelayBuild(named)) {
+        endPendingLaunch(sid, state);
+        recycled += 1;
+        recycledUnder.set(sid, relayId);
+        log(`recycled ${sid8(sid)} pid ${oldPid}→${pid} (on this build)`);
+        return;
+      }
+      const there = await processAtStoppedPid(sid, state, pid);
+      if (there === 'new') {
+        endPendingLaunch(sid, state);
+        recycled += 1;
+        recycledUnder.set(sid, relayId);
+        log(`recycled ${sid8(sid)} pid ${oldPid}→${pid} (a new process)`);
+        return;
+      }
+      if (there === 'same') {
+        // The session's, or nothing could be read about it: stopped again,
+        // whichever it is, so the launch below is the session's only worker.
+        let stoppedAgain = null;
+        try {
+          stoppedAgain = await stopWorker(sid);
+        } catch (error) {
+          stoppedAgain = { ok: false, error: errorText(error, 'worker-stop-failed') };
+        }
+        if (!stoppedAgain?.ok) {
+          noteFailure(sid, state, 'stop', stoppedAgain?.error || 'unknown', { pids: stoppedAgain?.remainingPids || [] });
+          return;
+        }
+        // What the stop just ended is now the stopped process.
+        state.recycledIdentity = stoppedIdentity(pid, stoppedAgain);
+        log(`stopped ${sid8(sid)} pid ${pid} again before the launch: the process there could not be told from the stopped one`);
+        if (!stillOwed()) return;
+      }
     }
     lastLaunchAt = now();
     let launched = null;
@@ -390,12 +495,73 @@ export function createWorkerRecycleService({
       noteFailure(sid, state, 'launch', launched?.error || 'unknown');
       return;
     }
+    let launchedEntry = null;
+    try { launchedEntry = getWorker(sid) || null; } catch {}
+    const newPid = toPid(launchedEntry?.pid);
+    const notNew = newPid && newPid === state.recycledPid && !statesRelayBuild(launchedEntry)
+      ? await launchedStoppedPid(sid, state, newPid)
+      : null;
+    if (notNew) {
+      // The launch named the process just stopped (a start that joined one
+      // reusing it from a process list read before the stop), or a pid no
+      // process has: no new worker came up, so none is claimed. The fence
+      // stays, and the launch is retried (its retry reads the pid first).
+      noteFailure(sid, state, 'launch', notNew);
+      return;
+    }
     endPendingLaunch(sid, state);
     recycled += 1;
     recycledUnder.set(sid, relayId);
-    let newPid = null;
-    try { newPid = toPid(getWorker(sid)?.pid); } catch {}
     log(`recycled ${sid8(sid)} pid ${oldPid}→${newPid || 'pending'}`);
+  }
+
+  // A registry entry whose process states this relay's build id: never the
+  // stopped worker, which was stale.
+  function statesRelayBuild(entry) {
+    const id = normalizeBuildId(entry?.buildId);
+    return Boolean(id && relayId && !buildIdsDiffer(id, relayId));
+  }
+
+  /**
+   * What the process at the stopped worker's pid is now: a pid is handed out
+   * again once its process ends (on Windows within seconds), so a new worker
+   * can have it.
+   * - 'gone': no process has the pid;
+   * - 'new': a process of the session (its command line names it) whose
+   *   start time is known to differ from the stopped one's;
+   * - 'other': not a process of the session (its command line does not name
+   *   it: an ended process, a pid another program got);
+   * - 'same': the stopped process, or one that cannot be told apart from it
+   *   (a start time that could not be read on either side, no reader).
+   */
+  async function processAtStoppedPid(sid, state, pid) {
+    let current;
+    try {
+      current = typeof readProcessIdentity === 'function' ? await readProcessIdentity(pid) : undefined;
+    } catch {
+      current = undefined;
+    }
+    if (current === null) return 'gone';
+    const stopped = state.recycledIdentity;
+    const known = current || { pid, startTime: null, commandLine: null };
+    // The session's by its command line: what a new process at the pid must
+    // be too, or the pid went to another program.
+    const verdict = judgeSessionWorkerProcess(known, { sdkSessionId: sid });
+    const anotherStart = Boolean(stopped?.startTime && known.startTime && stopped.startTime !== known.startTime);
+    if (anotherStart && verdict === 'ours') return 'new';
+    return verdict === 'other' ? 'other' : 'same';
+  }
+
+  /**
+   * Why a launch that names the stopped worker's pid brought no new worker,
+   * or null when it did: new only when the process at the pid is
+   * (processAtStoppedPid) 'new'.
+   */
+  async function launchedStoppedPid(sid, state, pid) {
+    const there = await processAtStoppedPid(sid, state, pid);
+    if (there === 'new') return null;
+    if (there === 'gone') return `the launch named the stopped pid ${pid}, which no process has`;
+    return `the launch named the stopped pid ${pid}`;
   }
 
   // Whether the registry still names the process the sweep judged. The launch
@@ -407,6 +573,13 @@ export function createWorkerRecycleService({
     } catch {
       return false;
     }
+  }
+
+  // The stopped process as its stop read it: `{ pid, startTime }`.
+  function stoppedIdentity(pid, result) {
+    const identity = result?.identity;
+    const startTime = identity && toPid(identity.pid) === pid && identity.startTime ? String(identity.startTime) : null;
+    return { pid, startTime };
   }
 
   // The fence for `pid` is up when this starts (the sweep raised it).
@@ -424,11 +597,14 @@ export function createWorkerRecycleService({
           result = { ok: false, error: errorText(error, 'worker-stop-failed') };
         }
         if (!result?.ok) {
-          noteFailure(sid, state, 'stop', result?.error || 'unknown');
+          // Only the pids the stop verified as the session's: the
+          // registry's pid can belong to another process by now.
+          noteFailure(sid, state, 'stop', result?.error || 'unknown', { pids: result?.remainingPids || [] });
           return;
         }
         stopped = true;
         state.recycledPid = pid;
+        state.recycledIdentity = stoppedIdentity(pid, result);
         state.pendingLaunch = { oldPid: pid };
         await launch(sid, state);
       });
@@ -461,10 +637,11 @@ export function createWorkerRecycleService({
           stopped = { ok: false, error: errorText(error, 'worker-stop-failed') };
         }
         if (!stopped?.ok) {
-          noteFailure(sid, state, 'stop', stopped?.error || 'unknown');
+          noteFailure(sid, state, 'stop', stopped?.error || 'unknown', { pids: stopped?.remainingPids || [], archived: true });
           return;
         }
         state.recycledPid = pid;
+        state.recycledIdentity = stoppedIdentity(pid, stopped);
         noteSuccess(state);
         log(`stopped ${sid8(sid)} (archived)`);
       });

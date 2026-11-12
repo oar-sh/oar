@@ -62,7 +62,7 @@ test('worker websocket service authenticates upgrade requests', () => {
   });
 
   const handled = service.handleUpgrade(
-    { url: '/api/session-worker/ws?token=wrong', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer wrong' } },
     rawSocket,
     Buffer.alloc(0),
   );
@@ -82,12 +82,12 @@ test('worker websocket service accepts both root and prefixed worker websocket p
   });
 
   const rootHandled = service.handleUpgrade(
-    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
   const prefixedHandled = service.handleUpgrade(
-    { url: '/cpr2/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/cpr2/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -124,7 +124,7 @@ test('worker websocket service notifies connected clients on queue changes', asy
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-1&pid=99', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-1&pid=99', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -165,7 +165,7 @@ test('worker websocket service uses session identity from ready payload', async 
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -204,7 +204,7 @@ test('worker websocket service treats hello as readiness for delivery', async ()
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -235,7 +235,7 @@ test('worker websocket service records websocket heartbeat pings', async () => {
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -279,7 +279,7 @@ test('worker websocket service preserves readiness and closes on delivery send f
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-fail', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-fail', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -324,7 +324,7 @@ test('a ready check from a killed worker socket never asks for work', async () =
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -356,7 +356,7 @@ test('a live worker socket still gets work through the liveness probe', async ()
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-live&pid=4242', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-live&pid=4242', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -388,7 +388,7 @@ test('worker.unready withdraws a standing readiness so a hold draws no work', as
 
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-unready&pid=4242', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-unready&pid=4242', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -438,7 +438,7 @@ test('a worker socket closing invokes the death-detection hook with its identity
   });
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-dead&pid=4242', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -474,7 +474,7 @@ test('a frame claiming a different session identity closes the socket', async ()
   });
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-original&pid=101', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-original&pid=101', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -506,12 +506,12 @@ test('a newer socket for a session supersedes and closes the prior one', async (
   });
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-gen&pid=201', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-gen&pid=201', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-gen&pid=202', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-gen&pid=202', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -544,7 +544,7 @@ test('a stale socket no longer counts as live without a fresh heartbeat or live 
   });
   service.start();
   httpServer.emit('upgrade',
-    { url: '/api/session-worker/ws?token=secret-token&sessionId=sdk-stale&pid=301', headers: { host: 'localhost:3333' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-stale&pid=301', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -585,7 +585,7 @@ test('a worker\'s stated kind rides every delivery request from its socket, and 
     onWorkerKind: (sessionId, kind, pid) => kinds.push({ sessionId, kind, pid }),
   });
   service.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const socket = lastWss.sockets.at(-1);
   socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-kind', pid: 77, kind: 'claude-api' }));
   await new Promise((resolve) => setImmediate(resolve));
@@ -595,7 +595,7 @@ test('a worker\'s stated kind rides every delivery request from its socket, and 
   assert.ok(requests.every((request) => request.workerKind === 'claude-api'));
   assert.deepEqual(kinds, [{ sessionId: 'sdk-kind', kind: 'claude-api', pid: 77 }]);
   // A worker that says no kind asks without one.
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const quiet = lastWss.sockets.at(-1);
   quiet.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-quiet', pid: 78 }));
   await new Promise((resolve) => setImmediate(resolve));
@@ -613,7 +613,7 @@ test('both server.hello frames carry the relay build id, and leave the key out w
     buildId: '0.9.21+0123456789ab',
   });
   service.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const socket = lastWss.sockets.at(-1);
   socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-build', pid: 90 }));
   await new Promise((resolve) => setImmediate(resolve));
@@ -629,7 +629,7 @@ test('both server.hello frames carry the relay build id, and leave the key out w
     queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
   });
   bare.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const bareHello = JSON.parse(lastWss.sockets.at(-1).sent.find((payload) => payload.includes('"type":"server.hello"')));
   assert.equal(Object.hasOwn(bareHello, 'buildId'), false);
   bare.stop();
@@ -646,7 +646,7 @@ test('a worker\'s stated build id is reported once per change, and a malformed o
     onWorkerBuildId: (sessionId, buildId, pid) => reports.push({ sessionId, buildId, pid }),
   });
   service.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const socket = lastWss.sockets.at(-1);
   const send = async (frame) => {
     socket.emit('message', JSON.stringify({ sessionId: 'sdk-build', pid: 91, ...frame }));
@@ -669,7 +669,7 @@ test('a worker\'s stated build id is reported once per change, and a malformed o
   assert.equal(reports.length, 2);
 
   // A worker that states no build id reports nothing.
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const quiet = lastWss.sockets.at(-1);
   quiet.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-old', pid: 92 }));
   quiet.emit('message', JSON.stringify({ type: 'worker.ready', sessionId: 'sdk-old', pid: 92 }));
@@ -690,7 +690,7 @@ test('every worker hello is reported with the socket\'s identity, kind and build
     onWorkerHello: (hello) => order.push(['hello', hello]),
   });
   service.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   const socket = lastWss.sockets.at(-1);
   socket.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-hello-hook', pid: 93, kind: 'cursor', buildId: '0.9.20+aaaaaaaaaaaa' }));
   await new Promise((resolve) => setImmediate(resolve));
@@ -716,7 +716,7 @@ test('every worker hello is reported with the socket\'s identity, kind and build
     onWorkerHello: (hello) => { order.push(['hello', hello]); throw new Error('boom'); },
   });
   throwing.start();
-  httpServer.emit('upgrade', { url: '/api/session-worker/ws?token=secret-token', headers: { host: 'localhost:3333' } }, {}, Buffer.alloc(0));
+  httpServer.emit('upgrade', { url: '/api/session-worker/ws', headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } }, {}, Buffer.alloc(0));
   lastWss.sockets.at(-1).emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'sdk-bare', pid: 94 }));
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(order.slice(-2), [['hello', { sessionId: 'sdk-bare', pid: 94, kind: null, buildId: null }], ['work', 'sdk-bare']]);
@@ -741,7 +741,7 @@ test('the socket count is reported on connect, close and stop', () => {
   service.start();
   for (const sid of ['sdk-a', 'sdk-b']) {
     httpServer.emit('upgrade',
-      { url: `/api/session-worker/ws?token=secret-token&sessionId=${sid}&pid=7`, headers: { host: 'localhost:3333' } },
+      { url: `/api/session-worker/ws?sessionId=${sid}&pid=7`, headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
       {},
       Buffer.alloc(0),
     );
@@ -757,7 +757,7 @@ test('the socket count is reported on connect, close and stop', () => {
 
 function connectWorker(httpServer, sessionId) {
   httpServer.emit('upgrade',
-    { url: `/api/session-worker/ws?token=secret-token&sessionId=${sessionId}&pid=7`, headers: { host: 'localhost:3333' } },
+    { url: `/api/session-worker/ws?sessionId=${sessionId}&pid=7`, headers: { host: 'localhost:3333', authorization: 'Bearer secret-token' } },
     {},
     Buffer.alloc(0),
   );
@@ -964,4 +964,189 @@ test('notifyQueueChanged with nothing pending tries no dequeue and tells nobody'
   assert.equal(requests, before);
   assert.deepEqual(socket.sent, []);
   service.stop();
+});
+
+// ─── Agent tokens (agent auth: the worker socket is bound to the token's session)
+
+function boundService() {
+  const httpServer = new EventEmitter();
+  // The relay's rule (server-runtime.mjs): an agent token opens only its own
+  // session's socket; a legacy owner token any. Read on every upgrade.
+  let ownerToken = 'owner-before-upgrade';
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authorizeUpgrade: ({ token }) => {
+      if (token.startsWith('agent-of:')) {
+        const conversation = token.slice('agent-of:'.length);
+        return (sessionId) => sessionId === conversation;
+      }
+      return token === ownerToken;
+    },
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+  });
+  service.start();
+  // `token=` here is the test's shorthand: it goes in the Authorization
+  // header, the one place the relay reads it.
+  const upgrade = (query) => {
+    const rawSocket = { wrote: '', destroyed: false, write(value) { this.wrote += String(value); }, destroy() { this.destroyed = true; } };
+    const before = lastWss?.sockets?.length || 0;
+    const params = new URLSearchParams(query);
+    const token = params.get('token');
+    params.delete('token');
+    service.handleUpgrade({ url: `/api/session-worker/ws?${params}`, headers: { host: 'localhost:3333', ...(token ? { authorization: `Bearer ${token}` } : {}) } }, rawSocket, Buffer.alloc(0));
+    const opened = (lastWss?.sockets?.length || 0) > before ? lastWss.sockets.at(-1) : null;
+    return { rawSocket, ws: opened };
+  };
+  return { service, upgrade, rotate: (next) => { ownerToken = next; } };
+}
+
+test('an agent token opens its own session\'s worker socket only; another session\'s is refused', (t) => {
+  const { service, upgrade } = boundService();
+  t.after(() => service.stop());
+  const own = upgrade('token=agent-of:conv-x&sessionId=conv-x&pid=7');
+  assert.ok(own.ws, 'conversation X on X');
+  assert.equal(own.rawSocket.wrote, '');
+  const other = upgrade('token=agent-of:conv-x&sessionId=conv-y&pid=8');
+  assert.equal(other.ws, null, 'X\'s token on Y\'s worker socket');
+  assert.match(other.rawSocket.wrote, /401 Unauthorized/);
+});
+
+test('an agent-token socket opened without a session binds only to its own session', (t) => {
+  const { service, upgrade } = boundService();
+  t.after(() => service.stop());
+  const { ws } = upgrade('token=agent-of:conv-x&pid=7');
+  assert.ok(ws);
+  ws.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'conv-y', pid: 7 }));
+  assert.equal(ws.closeCalls, 1, 'claiming another session closes the socket');
+  const second = upgrade('token=agent-of:conv-x&pid=9').ws;
+  second.emit('message', JSON.stringify({ type: 'worker.hello', sessionId: 'conv-x', pid: 9 }));
+  assert.equal(second.closeCalls, 0);
+});
+
+test('a worker from before the upgrade still opens its socket with the owner token, until a rotation', (t) => {
+  const { service, upgrade, rotate } = boundService();
+  t.after(() => service.stop());
+  assert.ok(upgrade('token=owner-before-upgrade&sessionId=conv-z&pid=7').ws);
+  rotate('owner-after-rotation');
+  const refused = upgrade('token=owner-before-upgrade&sessionId=conv-z&pid=8');
+  assert.equal(refused.ws, null, 'read live: the old token fails at once');
+  assert.ok(upgrade('token=agent-of:conv-z&sessionId=conv-z&pid=9').ws, 'agent tokens survive the rotation');
+});
+
+test('the worker socket: the token from the Authorization header; never the browser cookie; a ?token= only as an old worker\'s owner token', (t) => {
+  for (const request of [
+    { url: '/api/session-worker/ws?sessionId=sdk-c&pid=7', headers: { host: 'localhost:3333', cookie: 'copilot_auth=secret-token' } },
+    { url: '/api/session-worker/ws?sessionId=sdk-e&pid=7', headers: { host: 'localhost:3333', authorization: 'Bearer' } },
+  ]) {
+    const service = createSessionWorkerWebSocketService({
+      WebSocketServerImpl: FakeWebSocketServer,
+      httpServer: new EventEmitter(),
+      authToken: 'secret-token',
+      queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    });
+    const rawSocket = { wrote: '', destroyed: false, write(value) { this.wrote += String(value); }, destroy() { this.destroyed = true; } };
+    assert.equal(service.handleUpgrade(request, rawSocket, Buffer.alloc(0)), true);
+    assert.match(rawSocket.wrote, /401 Unauthorized/, JSON.stringify(request.headers));
+    assert.equal(rawSocket.destroyed, true);
+  }
+  const { service, rotate } = boundService();
+  t.after(() => service.stop());
+  const raw = (url) => {
+    const rawSocket = { wrote: '', destroyed: false, write(value) { this.wrote += String(value); }, destroy() { this.destroyed = true; } };
+    const before = lastWss?.sockets?.length || 0;
+    service.handleUpgrade({ url, headers: { host: 'localhost:3333' } }, rawSocket, Buffer.alloc(0));
+    return { rawSocket, opened: (lastWss?.sockets?.length || 0) > before };
+  };
+  // An agent token in the URL is refused, its own session's too.
+  const agentInUrl = raw('/api/session-worker/ws?token=agent-of:conv-x&sessionId=conv-x&pid=7');
+  assert.equal(agentInUrl.opened, false);
+  assert.match(agentInUrl.rawSocket.wrote, /401 Unauthorized/);
+  // A worker from before agent tokens can only put the owner token there.
+  assert.equal(raw('/api/session-worker/ws?token=owner-before-upgrade&sessionId=conv-z&pid=8').opened, true);
+  rotate('owner-after-rotation');
+  assert.equal(raw('/api/session-worker/ws?token=owner-before-upgrade&sessionId=conv-z&pid=9').opened, false, 'not after a new owner token');
+});
+
+test('a rotation closes the worker sockets opened with the owner token; agent-token sockets stay', (t) => {
+  const { service, upgrade, rotate } = boundService();
+  t.after(() => service.stop());
+  const legacy = upgrade('token=owner-before-upgrade&sessionId=conv-z&pid=7').ws;
+  const agent = upgrade('token=agent-of:conv-x&sessionId=conv-x&pid=8').ws;
+  rotate('owner-after-rotation');
+  assert.equal(service.dropOwnerTokenSockets(), 1);
+  assert.equal(legacy.closeCalls, 1);
+  assert.equal(agent.closeCalls, 0);
+  assert.equal(service.dropOwnerTokenSockets(), 1, 'counted until its close event comes; closing again is harmless');
+});
+
+test('the worker socket\'s ?token= (transitional): only an old worker\'s owner token; agent tokens and the cookie refused; every use logged by shape, never the value; the URL loses the value before anything can log it', async (t) => {
+  const crypto = await import('node:crypto');
+  const { credentialShape, redactTokenQuery } = await import('./session-worker-websocket-service.mjs');
+  // Made at run time; compared, never printed.
+  const ownerToken = `oaro1_${crypto.randomBytes(32).toString('base64url')}`;
+  const legacyOwner = crypto.randomUUID();
+  const agentToken = `oara1_s.${crypto.randomBytes(8).toString('base64url')}.${crypto.randomBytes(16).toString('base64url')}`;
+  const sessionCookie = `oars1_${crypto.randomBytes(32).toString('base64url')}`;
+  const secrets = [ownerToken, legacyOwner, agentToken, sessionCookie];
+  const lines = [];
+  const logger = { warn: (line) => lines.push(String(line)), debug: (line) => lines.push(String(line)), log: (line) => lines.push(String(line)) };
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer: new EventEmitter(),
+    authorizeUpgrade: ({ token }) => {
+      if (token === agentToken) return (sessionId) => sessionId === 'conv-a';
+      return token === ownerToken || token === legacyOwner;
+    },
+    queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
+    logger,
+  });
+  service.start();
+  t.after(() => service.stop());
+  const upgrade = (url, headers = {}) => {
+    const req = { url, headers: { host: 'localhost:3333', ...headers } };
+    const rawSocket = { wrote: '', destroyed: false, write(value) { this.wrote += String(value); }, destroy() { this.destroyed = true; } };
+    const before = lastWss?.sockets?.length || 0;
+    service.handleUpgrade(req, rawSocket, Buffer.alloc(0));
+    return { req, rawSocket, opened: (lastWss?.sockets?.length || 0) > before };
+  };
+
+  // An old worker's owner token in the URL: accepted, logged as a transition, the URL redacted.
+  const old = upgrade(`/api/session-worker/ws?sessionId=conv-o&token=${encodeURIComponent(ownerToken)}&pid=7`);
+  assert.equal(old.opened, true);
+  assert.ok(!old.req.url.includes(ownerToken));
+  assert.equal(old.req.url, '/api/session-worker/ws?sessionId=conv-o&token=[redacted]&pid=7');
+  assert.equal(service.hasWorkerSocket('conv-o'), true, 'the identity still binds');
+  assert.match(lines.at(-1), /owner token in the URL \(\?token=, oaro1_…\).*removed in the next version/);
+  const legacy = upgrade(`/api/session-worker/ws?token=${legacyOwner}&sessionId=conv-l&pid=8`);
+  assert.equal(legacy.opened, true);
+  assert.match(lines.at(-1), /an unprefixed value/);
+
+  // An agent token in the URL, its own session's too: refused and logged.
+  const before = lines.length;
+  const agentInUrl = upgrade(`/api/session-worker/ws?sessionId=conv-a&pid=9&token=${agentToken}`);
+  assert.equal(agentInUrl.opened, false);
+  assert.match(agentInUrl.rawSocket.wrote, /401 Unauthorized/);
+  assert.equal(agentInUrl.req.url, '/api/session-worker/ws?sessionId=conv-a&pid=9&token=[redacted]');
+  assert.equal(lines.length, before + 1);
+  assert.match(lines.at(-1), /refused: a \?token= in the URL \(oara1_…\)/);
+
+  // The cookie opens nothing, a session's or the owner token's.
+  for (const value of [sessionCookie, ownerToken]) {
+    const viaCookie = upgrade('/api/session-worker/ws?sessionId=conv-c&pid=10', { cookie: `copilot_auth=${value}` });
+    assert.equal(viaCookie.opened, false);
+    assert.match(viaCookie.rawSocket.wrote, /401 Unauthorized/);
+  }
+  // The header: no warning.
+  const count = lines.length;
+  assert.equal(upgrade('/api/session-worker/ws?sessionId=conv-a&pid=11', { authorization: `Bearer ${agentToken}` }).opened, true);
+  assert.equal(lines.length, count);
+
+  // A rotation closes the sockets the owner token opened.
+  assert.equal(service.dropOwnerTokenSockets(), 2);
+
+  assert.ok(lines.length >= 3);
+  assert.ok(lines.every((line) => secrets.every((secret) => !line.includes(secret))), 'no log line holds a credential');
+  assert.equal(credentialShape(''), 'an unprefixed value');
+  assert.equal(redactTokenQuery('/x?a=1&TOKEN=abc#f'), '/x?a=1&TOKEN=[redacted]#f');
 });

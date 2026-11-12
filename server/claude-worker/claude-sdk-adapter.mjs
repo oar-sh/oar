@@ -2,7 +2,7 @@ import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 
 import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
 import { parseThinkingDisplay } from '../../shared/claude-thinking.mjs';
-import { PERSON_ONLY_QUESTION_SOURCE } from '../../shared/relay-asks.mjs';
+import { PERSON_ONLY_QUESTION_SOURCE, SENSITIVE_FILE_QUESTION_KIND } from '../../shared/relay-asks.mjs';
 import { MATH_INSTRUCTION_TEXT } from '../../shared/math-instructions.mjs';
 import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructions.mjs';
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
@@ -643,7 +643,8 @@ export async function readPlanUsage(turn, dbg = () => {}, { timeoutMs = 10000 } 
 // may answer them, so allow-all parity stops here. The SDK does not forward
 // the wire's `classifier_approvable`, so the safety-check kinds count only
 // together with `suppressAlwaysAllowRule`; a sensitive-file safety check
-// (an edit under .git/ or .claude/) carries no such flag and stays allowed.
+// (an edit under .git/ or .claude/) carries no such flag and gets the
+// sensitive-file card instead (isSensitiveFileAsk).
 // A user's `permissions.ask` rule (`matchedAskRule`) changes nothing: the
 // flags decide, and an ask that rule forced without them stays allowed.
 const PERSON_ONLY_REASON_TYPES = new Set(['safetyCheck', 'subcommandResults']);
@@ -667,10 +668,18 @@ export function isPersonOnlyAsk(options) {
     && options.suppressAlwaysAllowRule === true;
 }
 
-// Characters that hide or reorder text: C0 and C1 controls, bidi controls,
-// zero-width characters and the Unicode line separators. On the card each
-// one shows as a visible \u{XXXX} escape (the body is pre-wrap plain text).
-const INVISIBLE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g;
+// Characters that hide or reorder text: C0 and C1 controls, the soft hyphen,
+// the combining grapheme joiner (U+034F), the Hangul fillers (U+115F,
+// U+1160, U+3164, U+FFA0), the Mongolian vowel separator (U+180E), bidi
+// controls, zero-width characters, the Unicode line separators, the
+// invisible operators (U+2060-U+2064), the braille pattern blank (U+2800),
+// the variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF) and the tag
+// characters (U+E0000-U+E007F). The astral ranges need the `u` flag, which
+// matches each as one code point. On the card each one shows as a visible
+// \u{XXXX} escape (the body is pre-wrap plain text). This also escapes the
+// emoji presentation selector U+FE0F in a command; on a Safety check card,
+// seeing every hidden code point matters more than how an emoji looks.
+const INVISIBLE_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
 
 function escapeInvisible(text) {
   return String(text ?? '').replace(INVISIBLE_CHARACTERS, (char) => (
@@ -720,7 +729,7 @@ export function personOnlyQuestionText(toolName, input, decisionReason) {
   const reason = reasonLine(decisionReason);
   if (reason) parts.push(`Reason: ${reason}`);
   const count = lines.length > 1 ? `, ${lines.length} lines` : '';
-  parts.push(`${toolName || 'Tool'} ${subject.label}${count}:\n│ ${lines.join(' ⏎\n│ ')}`);
+  parts.push(`${escapeInvisible(toolName || 'Tool')} ${subject.label}${count}:\n│ ${lines.join(' ⏎\n│ ')}`);
   return parts.join('\n\n');
 }
 
@@ -732,7 +741,41 @@ function personOnlyDenyMessage(decisionReason, why) {
 
 // Allow/Deny card over the question bridge, no typed replies. Only the exact
 // "Allow once" allows, and never with `updatedPermissions`: the next such ask
-// asks again.
+// asks again. `deny(why, outcome)` words the refusal for the card's kind.
+async function askSafetyCheckCard({ askUserBridge, question, rationale, kind, input, signal, deny, onAllowed, dbg, dbgLabel }) {
+  if (!askUserBridge) return deny('the relay could not show the question', 'no-bridge');
+  let result;
+  try {
+    result = await askUserBridge.handleAskUserQuestion({
+      questions: [{
+        question,
+        header: 'Safety check',
+        options: [{ label: PERSON_ONLY_ALLOW_CHOICE }, { label: PERSON_ONLY_DENY_CHOICE }],
+      }],
+    }, {
+      signal,
+      source: PERSON_ONLY_QUESTION_SOURCE,
+      rationale,
+      allowFreeform: false,
+      personOnly: true,
+      ...(kind ? { kind } : {}),
+    });
+  } catch (error) {
+    if (signal?.aborted) return deny('the turn was stopped', 'aborted');
+    dbg(`${dbgLabel} bridge failed`, error?.message || String(error));
+    return deny('the relay could not show the question', 'bridge-failed');
+  }
+  if (signal?.aborted) return deny('the turn was stopped', 'aborted');
+  if (result?.timedOut) return deny('no answer came before the timeout', 'timed-out');
+  const answer = String(result?.answers?.[question] ?? '').trim();
+  if (answer === PERSON_ONLY_ALLOW_CHOICE) {
+    onAllowed();
+    return { behavior: 'allow', updatedInput: input };
+  }
+  if (!answer || answer === PERSON_ONLY_DENY_CHOICE) return deny('the user denied it', 'denied');
+  return deny(`the user denied it: ${capText(escapeInvisible(answer), PERSON_ONLY_TYPED_ANSWER_MAX)}`, 'denied-other');
+}
+
 async function askPersonOnly({ askUserBridge, toolName, input, options, signal, dbg }) {
   const reason = options?.decisionReason;
   const kind = options?.decisionReasonType || 'defaultToNo';
@@ -745,44 +788,130 @@ async function askPersonOnly({ askUserBridge, toolName, input, options, signal, 
     dbg('person-only ask', toolName, kind, 'too-long');
     return { behavior: 'deny', message: PERSON_ONLY_TOO_LONG_MESSAGE };
   }
-  if (!askUserBridge) return deny('the relay could not show the question', 'no-bridge');
-  const question = personOnlyQuestionText(toolName, input, reason);
-  let result;
-  try {
-    result = await askUserBridge.handleAskUserQuestion({
-      questions: [{
-        question,
-        header: 'Safety check',
-        options: [{ label: PERSON_ONLY_ALLOW_CHOICE }, { label: PERSON_ONLY_DENY_CHOICE }],
-      }],
-    }, {
-      signal,
-      source: PERSON_ONLY_QUESTION_SOURCE,
-      rationale: PERSON_ONLY_RATIONALE,
-      allowFreeform: false,
-    });
-  } catch (error) {
-    if (signal?.aborted) return deny('the turn was stopped', 'aborted');
-    dbg('person-only ask bridge failed', error?.message || String(error));
-    return deny('the relay could not show the question', 'bridge-failed');
+  return askSafetyCheckCard({
+    askUserBridge,
+    question: personOnlyQuestionText(toolName, input, reason),
+    rationale: PERSON_ONLY_RATIONALE,
+    input,
+    signal,
+    deny,
+    onAllowed: () => dbg('person-only ask', toolName, kind, 'allowed'),
+    dbg,
+    dbgLabel: 'person-only ask',
+  });
+}
+
+// A sensitive-file Safety check: a `safetyCheck` ask without the person-only
+// flag, which Claude Code raises for an edit to a file that can change how
+// git, a shell or a tool behaves (.git/, .claude/, .bashrc, .npmrc, …; the
+// set is the pinned CLI's, see docs/security.md). The relay keeps no path
+// list of its own: the reason type is the trigger, in every relay mode. The
+// card is the person's to answer (`personOnly`), allows once and never
+// offers "always allow"; the CLI's suggestions (setMode, addRules) are
+// ignored. A plan-mode plan file under ~/.claude/plans never reaches here:
+// the CLI allows the session's plan file before its sensitive-path check.
+export const SENSITIVE_FILE_CONTEXT_KIND = SENSITIVE_FILE_QUESTION_KIND;
+const SENSITIVE_FILE_QUESTION_LEAD = 'Claude Code marks this file as sensitive: a change here can alter how git, your shell or your tools behave. Allow this edit once?';
+const SENSITIVE_FILE_RATIONALE = 'Claude Code needs a person to approve a change to a sensitive file. Nothing changes until you choose.';
+export const SENSITIVE_FILE_TOO_LONG_MESSAGE = 'Not changed: too large to show for approval; make the change in smaller edits.';
+const SENSITIVE_FILE_PATH_IN_MESSAGE_MAX = 400;
+
+export function isSensitiveFileAsk(options) {
+  return !!options && typeof options === 'object'
+    && options.decisionReasonType === 'safetyCheck'
+    && !isPersonOnlyAsk(options);
+}
+
+function sensitiveFilePath(input, options) {
+  for (const value of [options?.blockedPath, input?.file_path, input?.notebook_path, input?.path]) {
+    if (typeof value === 'string' && value.trim()) return value;
   }
+  return '';
+}
+
+// The change as one or more labelled blocks of new text: Write's `content`,
+// Edit's `new_string`, each MultiEdit `edits[].new_string`, NotebookEdit's
+// `new_source`. A shell command the CLI flagged shows its command, as on the
+// person-only card. Any other tool shows its whole input as JSON, path or
+// not, so no payload of a tool the card does not know can hide behind the
+// File line; the same 8000-character limit applies.
+function sensitiveFileChangeBlocks(toolName, input) {
+  const tool = toolName || 'Tool';
+  if (typeof input?.content === 'string' && tool === 'Write') return [{ label: 'Change', text: input.content }];
+  if (typeof input?.new_string === 'string' && tool === 'Edit') return [{ label: 'Change', text: input.new_string }];
+  if (Array.isArray(input?.edits) && tool === 'MultiEdit') {
+    const edits = input.edits.map((edit) => (typeof edit?.new_string === 'string' ? edit.new_string : ''));
+    return edits.map((text, index) => ({ label: edits.length > 1 ? `Change ${index + 1} of ${edits.length}` : 'Change', text }));
+  }
+  if (typeof input?.new_source === 'string' && tool === 'NotebookEdit') return [{ label: 'Change', text: input.new_source }];
+  if (typeof input?.command === 'string') return [{ label: `${escapeInvisible(tool)} command`, text: input.command }];
+  let json = '';
+  try { json = JSON.stringify(input ?? {}); } catch { json = ''; }
+  return [{ label: `${escapeInvisible(tool)} input`, text: json }];
+}
+
+function sensitiveFileBlockText({ label, text }) {
+  if (text === '') return `${label}: (no new text)`;
+  const lines = subjectLines(text);
+  const count = `, ${lines.length} ${lines.length === 1 ? 'line' : 'lines'}`;
+  return `${label}${count}:\n│ ${lines.join(' ⏎\n│ ')}`;
+}
+
+function sensitiveFileTooLarge(toolName, input, options) {
+  const shown = escapeInvisible(sensitiveFilePath(input, options)).length
+    + sensitiveFileChangeBlocks(toolName, input)
+      .reduce((total, block) => total + subjectLines(block.text).join('\n').length, 0);
+  return shown > PERSON_ONLY_COMMAND_MAX;
+}
+
+export function sensitiveFileQuestionText(toolName, input, options) {
+  const parts = [SENSITIVE_FILE_QUESTION_LEAD];
+  const reason = reasonLine(options?.decisionReason);
+  if (reason) parts.push(`Reason: ${reason}`);
+  const filePath = sensitiveFilePath(input, options);
+  if (filePath) parts.push(`File: ${escapeInvisible(filePath)}`);
+  for (const block of sensitiveFileChangeBlocks(toolName, input)) parts.push(sensitiveFileBlockText(block));
+  return parts.join('\n\n');
+}
+
+function sensitiveFileDenyMessage(input, options, why) {
+  const filePath = sensitiveFilePath(input, options);
+  const subject = filePath ? capText(escapeInvisible(filePath), SENSITIVE_FILE_PATH_IN_MESSAGE_MAX) : 'this file';
+  return `Not changed: Claude Code marks ${subject} as a sensitive file and ${why}. `
+    + 'Do not work around it (no shell redirection, no other tool); ask the user.';
+}
+
+async function askSensitiveEdit({ askUserBridge, toolName, input, options, signal, dbg }) {
+  const deny = (why, outcome) => {
+    dbg('sensitive-file ask', toolName, outcome);
+    return { behavior: 'deny', message: sensitiveFileDenyMessage(input, options, why) };
+  };
   if (signal?.aborted) return deny('the turn was stopped', 'aborted');
-  if (result?.timedOut) return deny('no answer came before the timeout', 'timed-out');
-  const answer = String(result?.answers?.[question] ?? '').trim();
-  if (answer === PERSON_ONLY_ALLOW_CHOICE) {
-    dbg('person-only ask', toolName, kind, 'allowed');
-    return { behavior: 'allow', updatedInput: input };
+  if (sensitiveFileTooLarge(toolName, input, options)) {
+    dbg('sensitive-file ask', toolName, 'too-large');
+    return { behavior: 'deny', message: SENSITIVE_FILE_TOO_LONG_MESSAGE };
   }
-  if (!answer || answer === PERSON_ONLY_DENY_CHOICE) return deny('the user denied it', 'denied');
-  return deny(`the user denied it: ${capText(escapeInvisible(answer), PERSON_ONLY_TYPED_ANSWER_MAX)}`, 'denied-other');
+  return askSafetyCheckCard({
+    askUserBridge,
+    question: sensitiveFileQuestionText(toolName, input, options),
+    rationale: SENSITIVE_FILE_RATIONALE,
+    kind: SENSITIVE_FILE_CONTEXT_KIND,
+    input,
+    signal,
+    deny,
+    onAllowed: () => dbg('sensitive-file ask', toolName, 'allowed'),
+    dbg,
+    dbgLabel: 'sensitive-file ask',
+  });
 }
 
 /**
  * Build the `canUseTool` callback for one turn. Everything is auto-allowed
  * (parity with the Copilot workers' `--allow-all` posture) except the asks
- * Claude Code marks as person-only (an Allow/Deny relay card, see
- * isPersonOnlyAsk); the other interceptions are AskUserQuestion (bridged to
- * relay question cards) and ExitPlanMode (surfaces the plan_ready board).
+ * Claude Code marks as person-only and its other safety checks (an
+ * Allow/Deny relay card, see isPersonOnlyAsk and isSensitiveFileAsk); the
+ * other interceptions are AskUserQuestion (bridged to relay question cards)
+ * and ExitPlanMode (surfaces the plan_ready board).
  *
  * ExitPlanMode is DENIED after the board is posted: allowing it tells the CLI
  * the user approved the plan, and the same turn rolls straight into
@@ -811,6 +940,9 @@ export function createCanUseTool({
     const normalizedToolName = String(toolName || '').trim();
     if (isPersonOnlyAsk(options)) {
       return askPersonOnly({ askUserBridge, toolName: normalizedToolName, input, options, signal, dbg });
+    }
+    if (isSensitiveFileAsk(options)) {
+      return askSensitiveEdit({ askUserBridge, toolName: normalizedToolName, input, options, signal, dbg });
     }
     try {
       if (normalizedToolName === 'AskUserQuestion' && askUserBridge) {

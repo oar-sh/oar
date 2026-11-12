@@ -161,7 +161,7 @@ const LEGACY_SETTINGS_IDS = [
   "settings-shares-status",
 ];
 
-const TABS = ["general", "appearance", "providers", "relays", "previews", "shares", "notifications", "features"];
+const TABS = ["general", "appearance", "providers", "relays", "security", "previews", "shares", "notifications", "features"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-api", "claude-cloud", "grok", "cursor", "deepseek"];
@@ -212,7 +212,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders eight top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders nine top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 

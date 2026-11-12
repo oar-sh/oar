@@ -129,7 +129,15 @@ test.describe("poll diet", () => {
       const turn = page.locator(`.msg.assistant[data-message-id="${replies[3]}"]`);
       await expect(turn.locator(".msg-turn-stream")).toBeVisible();
       await expect(turn.locator(".msg-stream-omitted")).toHaveText("… 30 earlier tool lines omitted");
-      const snapshot = () => turn.evaluate((node) => node.querySelector(".msg-bubble").innerHTML);
+      // The tool lines name files, so the turn holds workspace file links. The
+      // page signs each one (`k`, file-capability.mjs) once it is in the
+      // document: the open load is read once all of them carry theirs. A `k`
+      // value is never printed: it reads as "k=…" in a snapshot (whether a
+      // link has one still shows).
+      const unsignedLinks = () => turn.evaluate((node) => [...node.querySelectorAll('.msg-bubble a[href*="/api/files/"]')]
+        .filter((link) => !new URL(link.getAttribute("href"), window.location.href).searchParams.get("k")).length);
+      await expect.poll(unsignedLinks, { timeout: 15_000 }).toBe(0);
+      const snapshot = () => turn.evaluate((node) => node.querySelector(".msg-bubble").innerHTML.replace(/([?;]k=)[^&"'<>\s]+/g, "$1…"));
       const opened = await snapshot();
 
       // Three polls that name the held replies.
@@ -160,7 +168,7 @@ test.describe("poll diet", () => {
           thoughts: bubble().querySelector(".msg-thoughts > summary")?.textContent.trim() || "",
         };
         window.updateStreamViewSetting(true);
-        return { grouped, stream: bubble().innerHTML };
+        return { grouped, stream: bubble().innerHTML.replace(/([?;]k=)[^&"'<>\s]+/g, "$1…") };
       }, replies[3]);
       expect(toggled.grouped).toEqual({ stream: false, tools: "🔧 Tool activity (200)", thoughts: `💭 Thoughts (${THOUGHTS})` });
       expect(toggled.stream).toBe(opened);

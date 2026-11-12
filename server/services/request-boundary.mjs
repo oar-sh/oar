@@ -23,6 +23,52 @@ export const DEFAULT_TUNNEL_MARKER_HEADERS = Object.freeze(['cf-ray']);
 // that a proxy was involved, never as an address.
 export const FORWARDING_HEADERS = Object.freeze(['x-forwarded-for', 'forwarded', 'x-real-ip']);
 
+// The stricter set for the `oar` command's stop over loopback: any trace of a
+// proxy, `X-Forwarded-Proto` included. A relay behind a reverse proxy on the
+// same host sees every public request come from 127.0.0.1.
+export const CLI_LOOPBACK_FORWARDING_HEADERS = Object.freeze([...FORWARDING_HEADERS, 'x-forwarded-proto']);
+
+/** The first proxy header of CLI_LOOPBACK_FORWARDING_HEADERS a request carries, or null. */
+export function cliForwardingHeaderOf(req) {
+  const headers = req?.headers;
+  if (!headers || typeof headers !== 'object') return null;
+  for (const name of CLI_LOOPBACK_FORWARDING_HEADERS) {
+    const value = headers[name];
+    if (value !== undefined && value !== null && String(Array.isArray(value) ? value.join(',') : value).trim() !== '') return name;
+  }
+  return null;
+}
+
+/**
+ * Whether a request is the `oar` command's own, straight over loopback: the
+ * `cli` agent token (principal kind 'agent', agentKind 'c'), a truly local
+ * request (`isTrulyLocal`: a loopback peer, no edge marker), and none of the
+ * proxy headers of CLI_LOOPBACK_FORWARDING_HEADERS. A same-host reverse proxy
+ * connects from 127.0.0.1 for every public request, so any one of them means
+ * "not the terminal".
+ *
+ * Used where the relay lets the oar command do more than an agent token
+ * otherwise may: stop the relay or restart it now (POST /api/relay/shutdown),
+ * and make a terminal sign-in code (POST /api/auth/signin-codes/terminal).
+ * Not a boundary against a process of the same user (docs/security.md); it
+ * keeps those calls off every path that crosses the network.
+ */
+export function isCliOverLoopback(principal, req, { isTrulyLocal = defaultLocalCheck().isTrulyLocal } = {}) {
+  if (principal?.kind !== 'agent' || principal.agentKind !== 'c') return false;
+  if (cliForwardingHeaderOf(req)) return false;
+  try {
+    return isTrulyLocal(req) === true;
+  } catch {
+    return false;
+  }
+}
+
+let sharedDefaultCheck = null;
+function defaultLocalCheck() {
+  sharedDefaultCheck ??= createLocalRequestCheck();
+  return sharedDefaultCheck;
+}
+
 function normalizeHeaderName(value) {
   return String(value || '').trim().toLowerCase();
 }

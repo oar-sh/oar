@@ -19,6 +19,9 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 1,
+  // A spec that fails gets the relay's output of its run printed after it
+  // (relay-log-reporter.mjs; run-e2e.mjs adds it to a --reporter list too).
+  reporter: [[process.env.CI ? "dot" : "list"], ["./relay-log-reporter.mjs"]],
   use: {
     baseURL,
     headless: true,

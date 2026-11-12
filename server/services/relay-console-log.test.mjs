@@ -85,6 +85,31 @@ test('a token is never written: not the relay\'s own and not one in a link', () 
   }
 });
 
+test('a file capability and a media tag are never written, in a link or on their own', () => {
+  const { consoleImpl, read, cleanup } = setup();
+  try {
+    // Made-up values of the right shapes.
+    const mac = 'Zq'.repeat(21) + 'Z';
+    const k = `fc1.sess_0123.${(1_900_000_000).toString(36)}.${mac}`;
+    const tag = 'Tg'.repeat(11);
+    consoleImpl.log(`GET /api/drives/file?path=%2Fhome%2Fdev%2Fa.png&k=${encodeURIComponent(k)} 200`);
+    consoleImpl.log(`GET /api/files/a.png?v=1&k=${k}&as=a.png 206`);
+    consoleImpl.warn(`capability ${k} refused`);
+    consoleImpl.log(`GET /api/media/42/content?t=${tag} 200`);
+    consoleImpl.log(`img src="/relay/api/media/7/content?retry=2&t=${tag}#t=0.1"`);
+    const text = read();
+    assert.equal(text.includes(mac), false, 'no capability MAC');
+    assert.equal(text.includes(tag), false, 'no media tag');
+    assert.match(text, /&k=\[capability\] 200/);
+    assert.match(text, /&k=\[capability\]&as=a\.png/);
+    assert.match(text, /capability \[capability\] refused/);
+    assert.match(text, /\/api\/media\/42\/content\?t=\[tag\] 200/);
+    assert.match(text, /\/api\/media\/7\/content\?retry=2&t=\[tag\]#t=0\.1/);
+  } finally {
+    cleanup();
+  }
+});
+
 test('the file is rotated at its size limit and the oldest copy is dropped', () => {
   const { consoleImpl, logPath, read, cleanup } = setup({ maxBytes: 200, keep: 2 });
   try {

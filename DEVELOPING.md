@@ -55,7 +55,7 @@ oar/
 ├── docs/                           # User guides behind the README, preview-server guide, Copilot BYOK notes, SDK feature tracker
 ├── scripts/                        # Proof, live-check and maintenance scripts (agent-sdk-lock.mjs writes the pins lockfiles)
 ├── server/
-│   ├── agent-sdks/                 # Pins of the agent SDKs (and koffi) the relay installs on demand: package.json, lockfile, entries
+│   ├── agent-sdks/                 # Pins of the agent SDKs (and koffi) the relay installs on demand: pin.json, pin-lock.json, entries
 │   ├── claude-api-worker/          # Claude API session worker (the Claude worker on a Claude Console API key)
 │   ├── claude-cloud-worker/        # Claude Cloud session worker (follows a cloud session's event stream; runs no agent itself)
 │   ├── claude-worker/              # Claude Agent SDK session worker (turn runner, ask-user bridge, attachments)
@@ -303,17 +303,24 @@ The relay installs them on demand (the user's side is in
 [Agent SDKs](docs/install.md#agent-sdks)).
 
 **Pins.** `server/agent-sdks/<sdk>/` (`claude`, `cursor`, `koffi`) is the only place a version is
-chosen. Each folder holds a private `package.json` with exact versions (Claude: the SDK and its
-peers `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk` and `zod`; Cursor: the SDK and `zod`;
-koffi alone), the `package-lock.json` that `npm ci` installs from, listing every platform's
+chosen. Each folder holds a private manifest `pin.json` with exact versions (Claude: the SDK and
+its peers `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk` and `zod`; Cursor: the SDK and `zod`;
+koffi alone), the lockfile `pin-lock.json` that `npm ci` installs from, listing every platform's
 optional packages, and the entry files (`entry.mjs`, Cursor's `entry-sqlite.mjs`, koffi's
-`entry.cjs`). A loader imports the entry by path, and its bare imports resolve from the installed
-folder's own `node_modules`: no `NODE_PATH`, no exports map to read.
+`entry.cjs`). The two are npm's `package.json` and `package-lock.json` under other names
+(`AGENT_SDK_PIN_FILES` in `agent-sdk-paths.mjs`): package scanners read every `package.json` in
+the tarball and would list the SDKs as OAR's dependencies. The store and
+`scripts/agent-sdk-lock.mjs` hand them to npm under the npm names, and the folder hash covers the
+npm names, so the rename changed no installed folder. `server/npm-pack-guard.test.mjs` fails on
+any `package.json` in the tarball but the root one. A loader imports the entry by path, and its
+bare imports resolve from the installed folder's own `node_modules`: no `NODE_PATH`, no exports
+map to read.
 
 **Store** (`server/services/agent-sdk-store.mjs`, layout in `agent-sdk-paths.mjs`). One folder per
 SDK, version and platform: `<state root>/sdks/<sdk>/<version>-<hash8>/`, or under `OAR_SDK_DIR`.
 The hash covers the pins folder's files and the platform. An install copies the pins into a
-`.partial-<hex>` folder, runs `npm ci --ignore-scripts` there (every SDK, koffi included: koffi's
+`.partial-<hex>` folder (`pin.json` and `pin-lock.json` as `package.json` and
+`package-lock.json`), runs `npm ci --ignore-scripts` there (every SDK, koffi included: koffi's
 binary comes from its prebuilt optional package `@koromix/koffi-win32-<arch>`, which needs no
 script) with the npm next to this Node, checks the files, writes the marker `oar-sdk.json` (the files and their
 sizes) last and renames the folder into place. Only the marker decides ready. A `.store.lock` per
@@ -349,11 +356,12 @@ install, unless `OAR_SDK_DIR` names another folder).
 
 **Bumping an SDK** (or one of its peers, or koffi):
 
-1. Edit the exact versions in `server/agent-sdks/<sdk>/package.json`.
+1. Edit the exact versions in `server/agent-sdks/<sdk>/pin.json`.
 2. On Linux, run `node scripts/agent-sdk-lock.mjs <sdk>`. It refuses to run elsewhere: npm on
    Windows leaves the `libc` field out of the Linux entries it writes, and `npm ci` from such a
-   lock installs the glibc and the musl build side by side. It also refuses a lock that holds
-   another version than `package.json`, a zod below 4.6.6, a musl build without
+   lock installs the glibc and the musl build side by side. It writes `pin-lock.json` (npm runs on
+   a copy named `package.json` in a temporary folder). It also refuses a lock that holds
+   another version than `pin.json`, a zod below 4.6.6, a musl build without
    `"libc": ["musl"]`, or a package with an install script (koffi's lock: exactly koffi, whose
    script the install never runs; its binary comes from `@koromix/koffi-win32-<arch>`).
 3. In the repository root, `npm i -D -E <package>@<the same version>` for every version you
@@ -364,7 +372,8 @@ install, unless `OAR_SDK_DIR` names another folder).
 4. Read the new lock's platform entries: every Linux build names its `libc`, and a vendor that
    added or dropped a platform changes what *Not available on this platform* covers (update the
    platform table in `docs/install.md`).
-5. Run `npm audit` in `server/agent-sdks/<sdk>/`.
+5. Run `npm audit` on a copy under the npm names (npm reads no `pin.json`):
+   `d=$(mktemp -d) && cp server/agent-sdks/<sdk>/pin.json "$d/package.json" && cp server/agent-sdks/<sdk>/pin-lock.json "$d/package-lock.json" && (cd "$d" && npm audit)`.
 6. For the Claude SDK, run the proof scripts of [Claude API workers](#claude-api-workers) again.
 
 The next relay start of a release with new pins installs them for the providers in use; a
@@ -1097,10 +1106,10 @@ Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 npm test
 ```
 
-Expected: **0 fail** everywhere; **9227 pass / 11 skip on Linux (0.9.26, 2026-11-11)** — the count
+Expected: **0 fail** everywhere; **9724 pass / 11 skip on Linux (0.9.27, 2026-11-12)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
 cmd launchers and their waits, schtasks and Windows PowerShell). Windows runs the same suite with **29 skips** that
-are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`, POSIX checkout paths for the systemd unit) and run on Linux (0.9.25, 2026-11-08: **9145 pass / 29 skip**, plus one failure a proxy set in the host's environment caused).
+are host-gated (0600 file modes, symlinks, `ps`, tmux, a real `sh`, POSIX checkout paths for the systemd unit) and run on Linux (0.9.27, 2026-11-12: **9704 pass / 0 fail**).
 
 Unit tests are **safe to run while a live relay is running**: they use in-memory SQLite,
 temp directories, and injected `spawnImpl`/`execImpl` fakes — nothing binds a port, spawns

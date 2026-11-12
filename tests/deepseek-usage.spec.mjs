@@ -122,7 +122,7 @@ async function restoreHeightCaps(page, locator, viewport) {
 async function openApp(page, relay) {
   await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
   await page.waitForLoadState("networkidle");
-  await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+  await expect.poll(() => page.evaluate(async () => (await fetch("/api/status", { headers: { "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" } })).status), { timeout: 30_000 }).toBe(200);
 }
 
 // A relay with a fake DeepSeek holding a CNY balance, and a conversation

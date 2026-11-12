@@ -9,6 +9,7 @@ import { createRemoteRelayRepository } from '../repositories/remote-relay-reposi
 import { createConversationGroupRepository } from '../repositories/conversation-group-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
 import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound.mjs';
+import { asAgent, asOwner } from '../services/relay-principal-test-harness.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { registerConversationGroupRoutes } from './conversation-group-routes.mjs';
 
@@ -167,7 +168,11 @@ function setup(overrides = {}) {
     };
     const req = { body, headers, query, params, socket: {} };
     // The in-process loopback (an agent of this relay) marks its requests.
-    if (loopback) markRemoteRelayLoopbackRequest(req);
+    // Who `auth` would have said is calling: this relay's own relay_tool (the
+    // loopback) carries the calling agent's token, everyone else here the
+    // owner token (another relay too, until peer keys).
+    if (loopback) asAgent(markRemoteRelayLoopbackRequest(req), body?.origin?.conversationId || 'loopback-caller');
+    else asOwner(req);
     await handler(req, res);
     return captured;
   };
@@ -201,7 +206,7 @@ function setup(overrides = {}) {
       json(payload) { captured.body = payload; return res; },
     };
     const req = { body: {}, headers, query: {}, params: {}, socket: {} };
-    if (loopback) markRemoteRelayLoopbackRequest(req);
+    if (loopback) asAgent(markRemoteRelayLoopbackRequest(req), 'loopback-caller');
     let index = 0;
     const next = async () => {
       const handler = handlers[index];

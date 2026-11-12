@@ -187,9 +187,13 @@ for (const profile of [
     async function expectEmptyState(page, variant) {
       await expect(emptyState(page)).toHaveAttribute("data-variant", variant);
       await expect(emptyState(page)).toBeVisible();
-      const box = await emptyState(page).boundingBox();
+      // The screen may be drawn again (same content) between the two reads:
+      // a box from a node on its way out is null, so read until there is one.
       const viewport = page.viewportSize();
-      expect(box.x + box.width).toBeLessThanOrEqual(viewport.width + 1);
+      await expect.poll(async () => {
+        const box = await emptyState(page).boundingBox();
+        return box ? box.x + box.width <= viewport.width + 1 : null;
+      }, { message: "the empty screen fits the viewport" }).toBe(true);
     }
 
     async function openNewChat(page) {

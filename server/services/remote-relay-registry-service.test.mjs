@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { createRemoteRelayRegistry } from './remote-relay-registry-service.mjs';
-import { RemoteRelayError } from './remote-relay-client.mjs';
+import { REMOTE_RELAY_NO_CREDENTIAL_TOKEN, createRemoteRelayRegistry } from './remote-relay-registry-service.mjs';
+import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
+import { createOwnerSecretStore } from './owner-secret-store.mjs';
 import { applySchema } from '../db-schema.mjs';
 import { createRemoteRelayRepository } from '../repositories/remote-relay-repository.mjs';
 import {
@@ -72,7 +77,6 @@ function setup({ settings = {}, answers = {}, repository = null, selfName = 'win
     writeSetting: store.writeSetting,
     client,
     repository,
-    getOwnToken: () => OWN_TOKEN,
     getSelfName: () => selfName,
     hostname: 'devbox',
     platform: 'win32',
@@ -120,7 +124,8 @@ test('selfIdentity reports the injected platform and version, the protocol and t
     version: '0.9.4',
     platform: 'win32',
     publicUrl: 'https://relay-a.example.test',
-    remoteRelays: { protocol: 1, inbound: true, imageInputs: true },
+    remoteRelays: { protocol: 2, inbound: true, imageInputs: true, peerKeys: true, inboundKeys: true },
+    capabilities: { answerLink: true },
   });
 });
 
@@ -227,7 +232,7 @@ test('update validates permission, URL and token changes', () => {
   assert.equal(registry.get(entry.id).token, CUSTOM_TOKEN);
 
   const own = registry.update(entry.id, { tokenMode: 'own' });
-  assert.equal(own.relay.tokenMode, 'own');
+  assert.equal(own.relay.tokenMode, 'none', 'own (this relay\'s token) is never sent any more: none');
   assert.equal(registry.get(entry.id).token, undefined, 'switching to own drops the stored token');
 
   const quiet = events.length;
@@ -304,7 +309,7 @@ test('upsertFromPairing never rewrites a known entry\'s address or token', () =>
 
   const own = registry.add({ name: 'win-test', url: 'https://relay-a.example.test' });
   registry.upsertFromPairing({ relayId: 'relay-a-0001', name: 'win-test', url: 'https://relay-a.example.test', token: otherToken });
-  assert.equal(registry.get(own.id).tokenMode, 'own', 'an entry on our own token stays on it');
+  assert.equal(registry.get(own.id).tokenMode, 'none', 'an entry with no token stays without one');
   assert.equal(registry.get(own.id).token, undefined);
 });
 
@@ -342,6 +347,18 @@ test('check records identity; a rename keeps the id and the unlocks', async () =
   await registry.check(entry.id);
   assert.equal(events.length, quiet, 'an unchanged remote emits nothing (lastSeenAt aside)');
   assert.equal(await registry.check('missing'), null);
+});
+
+test('check keeps whether the relay\'s page answers `?answer=` (answerLink), and drops it after a downgrade', async () => {
+  const answers = { 'https://relay-b.example.test': identity({ answerLink: true }) };
+  const { registry } = setup({ answers });
+  const entry = registry.add({ name: 'linux-test', url: 'https://relay-b.example.test', token: CUSTOM_TOKEN });
+  assert.equal(entry.answerLink, undefined);
+  assert.equal((await registry.check(entry.id)).answerLink, true);
+  assert.equal(registry.listPublic()[0].answerLink, true);
+  answers['https://relay-b.example.test'] = identity({ answerLink: false });
+  assert.equal((await registry.check(entry.id)).answerLink, undefined);
+  assert.equal(registry.listPublic()[0].answerLink, undefined);
 });
 
 test('check maps failures to a status and keeps the entry', async () => {
@@ -519,4 +536,194 @@ test('a stored wait outside the range reads as the nearest bound, a broken one a
   assert.equal(on('true'), true);
   assert.equal(on('false'), false);
   assert.equal(on('"maybe"'), false, 'anything but a clear yes is off');
+});
+
+test('moving the owner token out of the config: every `own` entry keeps that token as its own, once', () => {
+  // `own` entries come from before this version only.
+  const legacy = [{ id: 'rr_legacy-own', url: 'https://relay-b.example.test', name: 'linux-test', tokenMode: 'own' }];
+  const { registry, events } = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.relays]: JSON.stringify(legacy) } });
+  const own = registry.get('rr_legacy-own');
+  const custom = registry.add({ url: 'https://relay-c.example.test', name: 'mac-test', token: CUSTOM_TOKEN });
+  const tokenless = registry.add({ url: 'https://relay-d.example.test', name: 'lan-test' });
+  assert.equal(registry.get(own.id).tokenMode, 'own');
+  assert.equal(registry.get(tokenless.id).tokenMode, 'none', 'a new entry without a token is none, never own');
+  const before = events.length;
+  assert.equal(registry.convertOwnEntries(OWN_TOKEN), 1);
+  assert.deepEqual({ mode: registry.get(own.id).tokenMode, token: registry.get(own.id).token }, { mode: 'custom', token: OWN_TOKEN });
+  assert.equal(registry.get(custom.id).token, CUSTOM_TOKEN, 'an entry with its own token is left alone');
+  assert.deepEqual({ mode: registry.get(tokenless.id).tokenMode, token: registry.get(tokenless.id).token }, { mode: 'none', token: undefined }, 'a tokenless entry never gets the owner token');
+  assert.ok(events.length > before, 'the change is announced');
+  assert.equal(JSON.stringify(registry.listPublic()).includes(OWN_TOKEN), false, 'never in a payload');
+  assert.equal(registry.convertOwnEntries(OWN_TOKEN), 0, 'nothing left to convert');
+  assert.equal(registry.convertOwnEntries(''), 0);
+});
+
+test('the migration boot never gives the owner token to a keyed, one-way, inbound-only or introduced entry', () => {
+  const PEER_KEY = `oarp1_${'k'.repeat(43)}`;
+  // A `peer` entry whose key was lost reads as none, never as own.
+  const stored = [{ id: 'rr_lost-key', url: 'https://relay-e.example.test', name: 'lost-key-test', relayId: 'relay-e-0005', tokenMode: 'peer' }];
+  const { registry } = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.relays]: JSON.stringify(stored) } });
+  const oneWay = registry.add({ url: 'https://relay-b.example.test', name: 'linux-test', relayId: 'relay-b-0002', tokenMode: 'peer', peerToken: PEER_KEY, peerTokenSeq: 1, peerInboundOnly: true });
+  const { entry: holder } = registry.upsertInboundHolder({ relayId: 'relay-c-0003', name: 'mac-test', protocol: 2 });
+  const introduced = registry.upsertFromPairing({ relayId: 'relay-d-0004', name: 'lan-test', url: 'https://relay-d.example.test', protocol: 2 });
+  const adopted = registry.upsertInboundHolder({ relayId: 'relay-f-0006', name: 'adopted-test' }).entry;
+  registry.adoptInboundHolder(adopted.id, { url: 'https://relay-f.example.test', tokenMode: 'none', addedBy: 'user' });
+  assert.deepEqual(
+    [oneWay.id, holder.id, introduced.id, adopted.id, 'rr_lost-key'].map((id) => registry.get(id).tokenMode),
+    ['peer', 'none', 'none', 'none', 'none'],
+  );
+  assert.equal(registry.convertOwnEntries(OWN_TOKEN), 0);
+  for (const entry of registry.listAll()) {
+    assert.notEqual(entry.token, OWN_TOKEN, entry.name);
+    assert.notEqual(createRemoteRelayClient({ fetchImpl: async () => { throw new Error('no network'); } }).tokenFor(entry), OWN_TOKEN, entry.name);
+  }
+  assert.ok(registry.get(oneWay.id).peerToken === PEER_KEY, 'the one-way key is kept');
+});
+
+// ─── FIXTURE: OAR 0.9.26's token selection, copied from release commit 86a3db6e ───
+// server/services/remote-relay-registry-service.mjs (readList + normalizeEntry,
+// reduced to the fields that pick the token) and remote-relay-client.mjs
+// (tokenFor). Kept as it shipped; do not "fix" it: it is what a relay
+// downgraded to 0.9.26 runs over the entries this version stored.
+function v0926NormalizeEntry(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const toText = (value) => (typeof value === 'string' ? value.trim() : '');
+  const id = toText(raw.id);
+  const url = toText(raw.url).replace(/\/+$/, '');
+  if (!id || !url) return null;
+  const token = toText(raw.token);
+  const tokenMode = raw.tokenMode === 'custom' && token ? 'custom' : 'own';
+  return { id, url, tokenMode, ...(tokenMode === 'custom' ? { token } : {}) };
+}
+function v0926TokenFor(relay, getOwnToken) {
+  const toText = (value) => (typeof value === 'string' ? value.trim() : '');
+  return relay?.tokenMode === 'custom'
+    ? toText(relay?.token)
+    : toText(getOwnToken?.());
+}
+// ─── end of fixture ───
+
+test('downgrade: OAR 0.9.26 reading what this version stored never picks its owner token for a keyed, one-way, tokenless or inbound-only entry', () => {
+  const PEER_KEY = `oarp1_${'k'.repeat(43)}`;
+  const { registry, store } = setup();
+  const keyed = registry.add({ url: 'https://relay-b.example.test', name: 'linux-test', relayId: 'relay-b-0002', tokenMode: 'custom', token: CUSTOM_TOKEN, protocol: 2 });
+  // The key worked: the token held for it is dropped (noteHeldKeyWorked).
+  registry.patchPeerFields(keyed.id, { tokenMode: 'peer', token: undefined, peerToken: PEER_KEY, peerTokenSeq: 1 });
+  const oneWay = registry.add({ url: 'https://relay-c.example.test', name: 'mac-test', relayId: 'relay-c-0003', tokenMode: 'peer', peerToken: PEER_KEY, peerTokenSeq: 1, peerInboundOnly: true });
+  const introduced = registry.upsertFromPairing({ relayId: 'relay-d-0004', name: 'lan-test', url: 'https://relay-d.example.test', protocol: 2 });
+  const { entry: holder } = registry.upsertInboundHolder({ relayId: 'relay-e-0005', name: 'inbound-test', protocol: 2 });
+  const older = registry.add({ url: 'https://relay-f.example.test', name: 'old-test', relayId: 'relay-f-0006', tokenMode: 'custom', token: CUSTOM_TOKEN });
+  assert.deepEqual(
+    [keyed.id, oneWay.id, introduced.id, holder.id, older.id].map((id) => registry.get(id).tokenMode),
+    ['peer', 'peer', 'none', 'none', 'custom'],
+  );
+
+  const stored = JSON.parse(store.values.get(REMOTE_RELAY_SETTING_KEYS.relays));
+  const picked = stored.map(v0926NormalizeEntry).filter(Boolean).map((entry) => [entry.id, v0926TokenFor(entry, () => OWN_TOKEN)]);
+  assert.equal(picked.some(([, token]) => token === OWN_TOKEN), false, 'never the owner token');
+  assert.equal(new Set(picked.map(([id]) => id)).has(holder.id), false, 'an inbound-only entry (no address) is dropped by 0.9.26');
+  assert.deepEqual(Object.fromEntries(picked), {
+    [keyed.id]: REMOTE_RELAY_NO_CREDENTIAL_TOKEN,
+    [oneWay.id]: REMOTE_RELAY_NO_CREDENTIAL_TOKEN,
+    [introduced.id]: REMOTE_RELAY_NO_CREDENTIAL_TOKEN,
+    [older.id]: CUSTOM_TOKEN,
+  });
+
+  // This version reads the placeholder back as no credential: modes and keys
+  // survive a restart, and the placeholder is never sent or shown.
+  const reread = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.relays]: store.values.get(REMOTE_RELAY_SETTING_KEYS.relays) } }).registry;
+  assert.deepEqual(
+    [keyed.id, oneWay.id, introduced.id, holder.id, older.id].map((id) => reread.get(id).tokenMode),
+    ['peer', 'peer', 'none', 'none', 'custom'],
+  );
+  const client = createRemoteRelayClient({ fetchImpl: async () => { throw new Error('no network'); } });
+  for (const entry of reread.listAll()) {
+    assert.notEqual(entry.token, REMOTE_RELAY_NO_CREDENTIAL_TOKEN, entry.name);
+    assert.notEqual(client.tokenFor(entry), REMOTE_RELAY_NO_CREDENTIAL_TOKEN, entry.name);
+  }
+  assert.equal(client.tokenFor(reread.get(keyed.id)), PEER_KEY);
+  assert.equal(client.tokenFor(reread.get(introduced.id)), '');
+  assert.equal(JSON.stringify(reread.listPublic()).includes(REMOTE_RELAY_NO_CREDENTIAL_TOKEN), false);
+
+  // An entry 0.9.26 wrote back (its own fields only: no `credential`, no key)
+  // reads as no credential, never as own.
+  const rewritten = stored.map(v0926NormalizeEntry).filter(Boolean);
+  const after = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.relays]: JSON.stringify(rewritten) } }).registry;
+  assert.deepEqual(after.listAll().map((entry) => [entry.id, entry.tokenMode]).sort(), [
+    [keyed.id, 'none'], [oneWay.id, 'none'], [introduced.id, 'none'], [older.id, 'custom'],
+  ].sort());
+});
+
+test('an inbound-only entry: no address, never called, listed apart; it becomes a normal entry in place, and a listed relay gets none', async () => {
+  const { registry, client, events } = setup();
+  const { entry: holder, created } = registry.upsertInboundHolder({ relayId: 'relay-c-0003', name: 'mac-test', protocol: 2, version: '0.9.27' });
+  assert.equal(created, true);
+  assert.deepEqual([holder.inboundOnly, holder.url, holder.tokenMode, holder.name], [true, '', 'none', 'mac-test']);
+  assert.equal(events.at(-1).event, REMOTE_RELAY_SOCKET_EVENT);
+  assert.deepEqual(events.at(-1).payload.inbound.map((item) => item.id), [holder.id]);
+  assert.deepEqual(events.at(-1).payload.relays, []);
+  // Not among the relays this relay calls, resolves or probes.
+  assert.deepEqual(registry.list(), []);
+  assert.deepEqual(registry.listPublic(), []);
+  assert.deepEqual(registry.listAll().map((entry) => entry.id), [holder.id]);
+  assert.equal(registry.resolve('mac-test').error, 'unknown');
+  assert.equal(await registry.checkAll(), false);
+  await registry.check(holder.id);
+  assert.deepEqual(client.probes, []);
+  const [row] = registry.listInboundPublic();
+  assert.deepEqual([row.inboundOnly, row.host, row.httpWarning], [true, '', null]);
+  // Nothing to edit; the owner token never becomes its token.
+  assert.equal(registry.update(holder.id, { permission: 'read' }).status, 409);
+  assert.equal(registry.convertOwnEntries(OWN_TOKEN), 0);
+  assert.equal(registry.get(holder.id).token, undefined);
+  // Asked again: the same entry, refreshed.
+  const again = registry.upsertInboundHolder({ relayId: 'relay-c-0003', name: 'mac-test-2' });
+  assert.deepEqual([again.created, again.entry.id, again.entry.name], [false, holder.id, 'mac-test-2']);
+  // A relay listed both ways gets no inbound-only entry.
+  const listed = registry.add({ url: 'https://relay-b.example.test', name: 'linux-test', relayId: 'relay-b-0002', token: CUSTOM_TOKEN });
+  assert.throws(() => registry.upsertInboundHolder({ relayId: 'relay-b-0002' }), (error) => error.status === 409);
+  assert.equal(registry.listAll().length, 2);
+  // Its introduction (pairing back) makes the same entry a normal one,
+  // unconfirmed until probed, with its keys and epoch moved on.
+  registry.patchPeerFields(holder.id, { peerKeys: [{ hash: 'a'.repeat(64), seq: 1, issuedAt: '2026-09-20T10:00:00.000Z', confirmedAt: '2026-09-20T10:00:01.000Z' }], everKeyed: true, keyRelayId: 'relay-c-0003' });
+  const adopted = registry.upsertFromPairing({ relayId: 'relay-c-0003', name: 'mac-test', url: 'https://relay-c.example.test', protocol: 2 });
+  assert.equal(adopted.id, holder.id);
+  assert.deepEqual([adopted.inboundOnly, adopted.url, adopted.addedBy, adopted.unconfirmed, adopted.peerKeys.length, adopted.epoch, adopted.everKeyed], [undefined, 'https://relay-c.example.test', 'pairing', true, 0, 1, false]);
+  assert.deepEqual(registry.list().map((entry) => entry.id).sort(), [listed.id, holder.id].sort());
+  assert.deepEqual(registry.listInboundPublic(), []);
+  // A stored inbound-only entry without a relay id is dropped on read.
+  const broken = setup({ settings: { [REMOTE_RELAY_SETTING_KEYS.relays]: JSON.stringify([{ id: 'rr_x', inboundOnly: true, name: 'no-id' }]) } });
+  assert.deepEqual(broken.registry.listAll(), []);
+});
+
+test('a boot that did not move the token out of the config converts nothing and sends nothing to a tokenless relay', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-registry-convert-'));
+  const quiet = { log() {}, warn() {} };
+  try {
+    const configPath = path.join(dir, 'config.json');
+    const dataDir = path.join(dir, 'data');
+    const first = crypto.randomUUID();
+    fs.writeFileSync(configPath, JSON.stringify({ authToken: first }));
+    createOwnerSecretStore({ dataDir, logger: quiet }).bootstrap({ config: { authToken: first }, configPath });
+
+    // Later boots that know a plain token: one put back into the config, and
+    // a --token on the command line.
+    const reappeared = crypto.randomUUID();
+    const handEdit = createOwnerSecretStore({ dataDir, logger: quiet });
+    assert.equal(handEdit.bootstrap({ config: { authToken: reappeared }, configPath }).change, 'config-reappeared');
+    const argv = createOwnerSecretStore({ dataDir, logger: quiet });
+    argv.bootstrap({ config: {}, configPath, argvToken: crypto.randomUUID() });
+
+    for (const store of [handEdit, argv]) {
+      const { registry } = setup();
+      const tokenless = registry.add({ url: 'https://relay-b.example.test', name: 'linux-test' });
+      assert.equal(store.migratedOwnerToken(), '', 'only the migration boot hands the token to the pairing conversion');
+      assert.equal(registry.convertOwnEntries(store.migratedOwnerToken()), 0);
+      const stored = registry.get(tokenless.id);
+      assert.deepEqual({ mode: stored.tokenMode, token: stored.token }, { mode: 'none', token: undefined });
+      assert.equal(createRemoteRelayClient({ fetchImpl: async () => { throw new Error('no network'); } }).tokenFor(stored), '', 'nothing is sent');
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

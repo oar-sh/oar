@@ -41,6 +41,22 @@ test('the recycle compares with the relay build id and asks the registry, the qu
   assert.match(runtimeSource, /const recycleWorkerReplacement = createRuntimeWorkerReplacement\('WORKER RECYCLE'\);/);
 });
 
+test('a recycle stuck for stuckAfter tries leaves a note in the chat, as the billing swap does', () => {
+  const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
+  assert.match(service, /onStuck: \(stuck\) => noteWorkerRecycleStuck\(stuck\),/);
+  const note = sliceBetween('function noteWorkerRecycleStuck(stuck = {}) {', '\n}\n');
+  assert.match(note, /if \(stuck\.archived\) return;/);
+  assert.match(note, /const conversationId = workerSessionConversationId\(stuck\.sdkSessionId\);/);
+  assert.match(note, /const text = workerRecycleStuckNoteText\(stuck\);/);
+  assert.match(note, /stmts\.insertMsg\.run\(messageId, conversationId, 'assistant', text,/);
+  assert.match(note, /stmts\.setMessageKind\?\.run\?\.\('worker-recycle-stuck', messageId\);/);
+  assert.match(note, /io\.emit\('assistant_message', \{/);
+  assert.match(note, /kind: 'worker-recycle-stuck'/);
+  const conversation = sliceBetween('function workerSessionConversationId(sid) {', '\n}\n');
+  assert.match(conversation, /stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)/);
+  assert.match(conversation, /stmts\.getConvBySdkSessionId\?\.get\?\.\(sid\)\?\.id/);
+});
+
 test('a session is archived for the recycle only when no conversation in use stands behind it', () => {
   const body = sliceBetween('function isWorkerSessionArchived(sid) {', '\n}\n');
   assert.match(body, /stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)/);
@@ -158,4 +174,23 @@ test('a worker hello registers the process with its kind and build id, then runs
 test('the recycle\'s quiet window reads the session\'s last delivery or turn end from the queue', () => {
   const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
   assert.match(service, /quietSince: \(sid\) => \{\n    const at = Date\.parse\(stmts\.getOwnerLastActivityAt\?\.get\?\.\(sid\)\?\.last_activity_at \|\| ''\);\n    return Number\.isFinite\(at\) \? at : null;\n  \},/);
+});
+
+test('a launch reuses a listed worker only by its identity: the listed process can have ended and its pid gone to another', () => {
+  const spawn = sliceBetween('async function spawnSessionWorkerCli(', '\n}\n');
+  assert.match(spawn, /findProcessForSessionAsync\(normalizedTargetSessionId, \{ fresh: true \}\)/);
+  // On Windows the fresh row is the identity; elsewhere the reader is asked.
+  assert.match(spawn, /const liveIdentity = liveWorker\?\.processId\n      \? await identityOfListedWorker\(liveWorker, \{ platform: process\.platform, identityOf: readWorkerProcessIdentity \}\)\n      : null;/);
+  assert.match(spawn, /if \(liveWorker\?\.processId && mayReuseSessionWorkerRow\(\{\n      row: liveWorker,\n      current: liveIdentity,\n      sdkSessionId: normalizedTargetSessionId,/);
+  assert.doesNotMatch(spawn, /liveWorker\?\.processId && isProcessAlive\(/, 'liveness alone never decides');
+  // The launcher's own reuse check reads with the same reader.
+  assert.match(spawn, /readProcessIdentity: readWorkerProcessIdentity,/);
+});
+
+test('the recycle and the stop read what the process at a pid is, from one reader over the inspector\'s list', () => {
+  assert.match(runtimeSource, /const readWorkerProcessIdentity = createProcessIdentityReader\(\{\n  platform: process\.platform,\n  readProcessSnapshot: \(options\) => sessionWorkerProcessInspector\.readProcessSnapshot\(options\),\n\}\);/);
+  const replacement = sliceBetween('function createRuntimeWorkerReplacement(tag) {', '\n}\n');
+  assert.match(replacement, /readProcessIdentity: readWorkerProcessIdentity,/);
+  const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
+  assert.match(service, /readProcessIdentity: \(pid\) => readWorkerProcessIdentity\(pid, \{ fresh: true \}\),/);
 });

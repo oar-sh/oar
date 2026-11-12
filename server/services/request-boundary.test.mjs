@@ -6,6 +6,7 @@ import express from 'express';
 import {
   createLocalRequestCheck,
   expressRequestView,
+  isCliOverLoopback,
   isLoopbackAddress,
   isSameOriginRequest,
   requestHostOf,
@@ -147,4 +148,30 @@ test('a socket.io server gated with isSameOriginRequest refuses a foreign origin
     io.close();
     await new Promise((resolve) => server.close(() => resolve()));
   }
+});
+
+test('isCliOverLoopback: the cli agent token, truly local, with no proxy header at all', () => {
+  const cli = { kind: 'agent', agentKind: 'c', via: 'bearer' };
+  assert.equal(isCliOverLoopback(cli, req()), true);
+  assert.equal(isCliOverLoopback(cli, req({ peer: '::1' })), true);
+  // Not the cli kind: a session's token, the person, a paired relay, none.
+  for (const principal of [
+    { kind: 'agent', agentKind: 's', conversationId: 'conv-a' },
+    { kind: 'owner' },
+    { kind: 'browser', sessionId: 'bs_a' },
+    { kind: 'peer' },
+    null,
+  ]) {
+    assert.equal(isCliOverLoopback(principal, req()), false, JSON.stringify(principal));
+  }
+  // Another machine, an edge marker, any forwarding header (X-Forwarded-Proto included).
+  assert.equal(isCliOverLoopback(cli, req({ peer: '192.168.7.31' })), false);
+  assert.equal(isCliOverLoopback(cli, req({ headers: { 'cf-ray': '8a1b2c3d4e5f6789-AMS' } })), false);
+  for (const name of ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded-proto']) {
+    assert.equal(isCliOverLoopback(cli, req({ headers: { [name]: 'x' } })), false, name);
+  }
+  // The relay's own check (configured marker headers) is used when given.
+  const check = createLocalRequestCheck({ markerHeaders: ['x-edge-hop'] });
+  assert.equal(isCliOverLoopback(cli, req({ headers: { 'x-edge-hop': '1' } }), { isTrulyLocal: check.isTrulyLocal }), false);
+  assert.equal(isCliOverLoopback(cli, req(), { isTrulyLocal: () => { throw new Error('boom'); } }), false, 'a check that throws is not local');
 });

@@ -22,7 +22,8 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *   answered in place; the session is not blocked.
  * - On a phone the Inbox is one column with full-width buttons.
  * - An ask about a session on B, from A's agent: listed in A's Inbox under B,
- *   answered there through the pairing; B's session and A's asker are told.
+ *   read-only with "Open there" (B's person answers it on B); B's session and
+ *   A's asker are told.
  * - An approval card on B: A's Inbox row says what it is about,
  *   "Open there" only; A's badge follows within its ~20 s watch of B, not
  *   the Inbox's minute; with push on A only, A pushes it once (web-push
@@ -107,6 +108,9 @@ test.describe.serial("the Inbox", () => {
       const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
       return Boolean(top && (top === node || node.contains(top)));
     });
+    // The start screen lies over everything until it has faded out: judged
+    // under it, the drawer would be toggled shut.
+    await expect(page.locator("#startup-loading")).toHaveCount(0);
     if (!(await reachable())) await page.locator("#sidebar-toggle").click();
     await expect.poll(reachable).toBe(true);
     await button.click();
@@ -128,8 +132,12 @@ test.describe.serial("the Inbox", () => {
     expect((await apiA("/api/settings/pwa-app-name", { method: "POST", body: { appName: "win-test" } })).status).toBe(200);
     expect((await apiB("/api/settings/pwa-app-name", { method: "POST", body: { appName: "linux-test" } })).status).toBe(200);
     expect((await apiA("/api/settings/agent-sessions", { method: "POST", body: { enabled: true } })).status).toBe(200);
-    const added = await apiA("/api/remote-relays", { method: "POST", body: { url: relayB.baseUrl, token: relayB.token, pairBack: false } });
+    // Paired both ways with keys: asks and Inbox reads between the two are
+    // the relays' own, verified (origin binding).
+    expect((await apiA("/api/settings/remote-relays", { method: "POST", body: { publicUrl: relayA.baseUrl } })).status).toBe(200);
+    const added = await apiA("/api/remote-relays", { method: "POST", body: { url: relayB.baseUrl, token: relayB.token } });
     expect(added.payload?.ok, JSON.stringify(added.payload)).toBe(true);
+    expect(added.payload?.pairedBack, JSON.stringify(added.payload)).toBe(true);
     // On A: a lead (its first message names linux-test, which unlocks it there),
     // a worker, and a session whose turn waits on a card.
     sessions.lead = (await conversation(apiA, `cache lead ${suffix}: plan the work with linux-test`)).conversationId;
@@ -325,7 +333,7 @@ test.describe.serial("the Inbox", () => {
     await expect(item.locator(".inbox-item-outcome")).toHaveText("Answered: No");
   });
 
-  test("an ask about a session on a paired relay: listed under it, answered through the pairing, both sides told", async ({ page }) => {
+  test("an ask about a session on a paired relay: listed under it, answered there (popup buttons, \"Open there\"), both sides told", async ({ page }) => {
     const asked = await toolA(sessions.lead, "ask", { relay: "linux-test", session: sessions.far, question: "Run the migration tonight?", options: ["Tonight", "Tomorrow"] });
     expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
     const id = asked.payload.question_id;
@@ -340,16 +348,38 @@ test.describe.serial("the Inbox", () => {
     const item = there.locator(`.inbox-item[data-item-id="${id}"]`);
     await expect(item).toBeVisible();
     await expect(item.locator(".inbox-item-relay")).toHaveText("linux-test");
-    await expect(item.locator(".inbox-open-there")).toHaveAttribute("href", `${relayB.baseUrl}/?conv=${sessions.far}`);
-    await item.locator('.inbox-choice[data-choice="Tomorrow"]').click();
-    await expect(item.locator(".inbox-item-outcome")).toHaveText("Answered: Tomorrow (from win-test)");
+    await expect(item.locator(".inbox-item-question")).toHaveText("Run the migration tonight?");
+    // A paired relay's ask is answered there, by its person. B's page takes
+    // ?answer= (capabilities.answerLink, stored when A added B): one button
+    // per option opens B's page in a popup with it preselected; nothing is
+    // answered from here.
+    const choices = item.locator("button[data-inbox-action]");
+    await expect(choices).toHaveText(["Tonight", "Tomorrow"]);
+    for (const choice of await choices.all()) {
+      await expect(choice).toHaveAttribute("data-inbox-action", "answer-there");
+      await expect(choice).toHaveClass(/inbox-answer-there-choice/);
+    }
+    await expect(item.locator(".inbox-answer-there-hint")).toHaveText("answers on linux-test");
+    await expect(item.locator(".inbox-answer-text")).toHaveCount(0);
+    const open = item.locator(".inbox-open-there-button");
+    await expect(open).toHaveText("Open there");
+    await expect(open).toHaveAttribute("href", `${relayB.baseUrl}/?conv=${sessions.far}`);
+    await expect(open).toHaveAttribute("target", "_blank");
+
+    // Answered on B by its person; A's Inbox follows.
+    const answered = await apiB(`/api/relay-question/${encodeURIComponent(id)}/answer`, { method: "POST", body: { choice: "Tomorrow", answer: "" } });
+    expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
+    await page.evaluate(() => window.toggleInboxView()).catch(() => {});
+    await openInbox(page);
+    await expect(item.locator(".inbox-item-outcome")).toHaveText(/^Answered: Tomorrow/, { timeout: 20_000 });
+    await expect(item.locator(".inbox-open-there-button")).toHaveCount(0);
 
     const after = await apiB(`/api/relay-question/${encodeURIComponent(id)}`);
     expect(after.payload.question.status).toBe("answered");
-    await expectEvent(apiB, sessions.far, /"Run the migration tonight\?" → the user answered "Tomorrow" \(via relay "win-test"\)/);
+    await expectEvent(apiB, sessions.far, /"Run the migration tonight\?" → the user answered "Tomorrow"/);
     // A's lead learns it through the link (a fetch every few seconds).
-    await expectEvent(apiA, sessions.lead, /linux-test · session .*question_answered \(question_id ask_[0-9a-f]+\) "Run the migration tonight\?" → the user answered "Tomorrow" \(via relay "win-test"\)/);
-    // B's agent cannot answer it, nor can A's with answer_question.
+    await expectEvent(apiA, sessions.lead, /linux-test · session .*question_answered \(question_id ask_[0-9a-f]+\) "Run the migration tonight\?" → the user answered "Tomorrow"/);
+    // No agent answers it: not A's with answer_question.
     const byTool = await toolA(sessions.lead, "answer_question", { relay: "linux-test", question_id: id, choices: ["Tonight"] });
     expect(byTool.status).toBe(403);
   });
@@ -439,7 +469,7 @@ test.describe.serial("the Inbox", () => {
     }
   }
 
-  test("an approval card on B: A's row says what it is about, Open there only; the badge follows without the minute's poll", async ({ page }) => {
+  test("an approval card on B: A's row says what it is about, one Answer there and Open there; the badge follows without the minute's poll", async ({ page }) => {
     await openApp(page, DESKTOP);
     const count = page.locator("#inbox-count");
     const countNow = async () => Number((await count.textContent()) || 0) || 0;
@@ -458,7 +488,14 @@ test.describe.serial("the Inbox", () => {
     await expect(item.locator(".inbox-item-kind")).toHaveText("New session · the session waits");
     await expect(item.locator(".inbox-item-summary")).toHaveText(/^linux-test · New session requested by '.+': Docs pass$/);
     await expect(item.locator(".inbox-open-there-button")).toHaveAttribute("href", `${relayB.baseUrl}/?conv=${card.conversationId}`);
-    await expect(item.locator("button")).toHaveCount(0);
+    // B's page takes ?answer= (capabilities.answerLink): the approval gets one
+    // "Answer there" (the choice is made on B, never here), not its choices.
+    const answerThere = item.locator("button");
+    await expect(answerThere).toHaveCount(1);
+    await expect(answerThere).toHaveText("Answer there");
+    await expect(answerThere).toHaveClass(/inbox-answer-there-choice/);
+    await expect(answerThere).toHaveAttribute("aria-label", "Answer on linux-test, in a new window");
+    await expect(item.locator(".inbox-answer-there-hint")).toHaveText("answers on linux-test");
     await expect(page.locator(".inbox-view")).not.toContainText("Draft the release notes");
 
     await denyOnB(card);

@@ -17,6 +17,9 @@ Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, co
 
 const { mountMediaGallery } = await import('./media-gallery-ui.js');
 
+// The address the relay hands out: the route with the item's tag (a made-up one here).
+const mediaUrl = (id) => `/api/media/${id}/content?t=${`tag${id}`.padEnd(22, 'x')}`;
+
 const item = (id, extra = {}) => ({
   id,
   conversationId: 'c1',
@@ -30,7 +33,7 @@ const item = (id, extra = {}) => ({
   alt: `picture ${id}`,
   timestamp: '2026-10-15T10:00:00.000Z',
   occurrences: 1,
-  contentUrl: `/api/media/${id}/content`,
+  contentUrl: mediaUrl(id),
   remoteUrl: null,
   path: `/srv/demo/p${id}.png`,
   archived: false,
@@ -79,7 +82,7 @@ test('the Media tab is a grid under month headers; tiles are lazy pictures or vi
   const img = tiles[0].querySelector('img');
   assert.equal(img.getAttribute('loading'), 'lazy');
   assert.equal(img.getAttribute('decoding'), 'async');
-  assert.equal(img.getAttribute('src'), '/api/media/1/content');
+  assert.equal(img.getAttribute('src'), mediaUrl(1));
   assert.equal(tiles[0].querySelector('.media-tile-badge').textContent, '👤');
   assert.equal(tiles[1].querySelector('video').getAttribute('preload'), 'metadata');
   assert.ok(tiles[1].querySelector('.media-tile-play'));
@@ -171,7 +174,7 @@ test('a tap opens the viewer over the gallery; Open in session leaves through th
   await settle();
   assert.equal(opened.length, 1);
   const { viewerItem, viewerGallery } = opened[0];
-  assert.equal(viewerItem.href, '/api/media/2/content');
+  assert.equal(viewerItem.href, mediaUrl(2));
   assert.equal(viewerGallery.index, 1);
   assert.equal(viewerGallery.hasMore, true);
   const actions = viewerGallery.describe(viewerItem).actions;
@@ -211,7 +214,7 @@ test('a video tile gets its address only when it comes into view', async () => {
     assert.equal(video.getAttribute('src'), null, 'nothing is fetched before it is in view');
     const videoObserver = observed.find((observer) => observer.targets.includes(video));
     videoObserver.callback([{ isIntersecting: true, target: video }]);
-    assert.equal(video.getAttribute('src'), '/api/media/1/content#t=0.1');
+    assert.equal(video.getAttribute('src'), `${mediaUrl(1)}#t=0.1`, 'the tag stays; the fragment comes after it');
     gallery.destroy();
     assert.deepEqual(videoObserver.targets, [], 'destroy lets go of the tiles');
   } finally {
@@ -273,14 +276,14 @@ test('after a reconnect the failed tiles in view load again, four at a time, onc
     imgs[0].dispatchEvent(new window.Event('load'));
     imgs[1].dispatchEvent(new window.Event('error'));
     assert.equal(retried(), 6, 'the next ones start as others settle');
-    assert.equal(imgs[6].getAttribute('src'), '/api/media/7/content', 'a tile out of view is left for later');
+    assert.equal(imgs[6].getAttribute('src'), mediaUrl(7), 'a tile out of view is left for later');
     assert.ok(imgs[1].closest('.media-tile').classList.contains('media-tile-failed'), 'failed again: it waits');
     assert.ok(!imgs[0].closest('.media-tile').classList.contains('media-tile-failed'));
     for (const img of imgs.slice(2, 6)) img.dispatchEvent(new window.Event('load'));
-    assert.equal(imgs[6].getAttribute('src'), '/api/media/7/content', 'all settled: the tile out of view was never asked for');
+    assert.equal(imgs[6].getAttribute('src'), mediaUrl(7), 'all settled: the tile out of view was never asked for');
     // The next reconnect tries what is still failed and in view, with a new number.
     window.dispatchEvent(new window.CustomEvent('oar:relay-connected'));
-    assert.equal(imgs[1].getAttribute('src'), '/api/media/2/content?retry=2');
+    assert.equal(imgs[1].getAttribute('src'), `${mediaUrl(2)}&retry=2`, 'a retry keeps the tag');
     imgs[1].dispatchEvent(new window.Event('load'));
     // Failed again before the gallery goes: a reconnect after destroy leaves it alone.
     imgs[2].dispatchEvent(new window.Event('error'));

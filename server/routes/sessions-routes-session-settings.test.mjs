@@ -12,6 +12,7 @@ import { createRemoteRelayRepository } from '../repositories/remote-relay-reposi
 import { createConversationGroupRepository } from '../repositories/conversation-group-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
 import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound.mjs';
+import { CLI_AGENT_PRINCIPAL, agentPrincipal, asAgent, asOwner, peerPrincipal, withPrincipal } from '../services/relay-principal-test-harness.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { registerConversationGroupRoutes } from './conversation-group-routes.mjs';
 
@@ -42,6 +43,8 @@ const PAIRED_ORIGIN = {
   hops: 1,
 };
 const agentHeaders = { 'x-oar-remote-origin': 'relay-id-win', 'x-oar-remote-hops': '1' };
+// The paired relay as this relay lists it; its requests come with its own key.
+const WIN = { id: 'r-win', relayId: 'relay-id-win', name: 'win-test', url: 'https://relay-a.example.test', epoch: 0 };
 const loopbackHeaders = { 'x-oar-remote-origin': 'self', 'x-oar-remote-hops': '0' };
 
 let tempRoot = '';
@@ -74,7 +77,7 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
   const conversationGroups = createConversationGroupRepository(db);
   const remoteRelayInbound = {
     repository,
-    listRelays: () => [],
+    listRelays: () => [WIN],
     selfNames: () => ['linux-test'],
     inboundEnabled: () => true,
     recordUnlock: () => false,
@@ -193,7 +196,7 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
   registerSessionsRoutes(app, deps);
   registerConversationGroupRoutes(app, deps);
 
-  const call = async (key, { body = {}, headers = {}, params = {}, query = {}, loopback = false } = {}) => {
+  const call = async (key, { body = {}, headers = {}, params = {}, query = {}, loopback = false, principal = undefined } = {}) => {
     const handler = app.routes.get(key);
     assert.ok(handler, `${key} should be registered`);
     const captured = { status: 200, body: null };
@@ -204,12 +207,17 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
       json(payload) { captured.body = payload; return res; },
     };
     const req = { body, headers, query, params, socket: {} };
-    if (loopback) markRemoteRelayLoopbackRequest(req);
+    // Who `auth` would have said is calling: this relay's own relay_tool (the
+    // loopback) carries the calling agent's token, everyone else here the
+    // owner token (another relay too, until peer keys).
+    if (principal) withPrincipal(req, principal);
+    else if (loopback) asAgent(markRemoteRelayLoopbackRequest(req), body?.origin?.conversationId || 'loopback-caller');
+    else asOwner(req);
     await handler(req, res);
     return captured;
   };
-  const bootstrap = async (body = {}, headers = {}, loopback = false) => {
-    const created = await call('POST /api/conversation/bootstrap', { body: { title: 'Sample chat', relayMode: 'agent', ...body }, headers, loopback });
+  const bootstrap = async (body = {}, headers = {}, loopback = false, principal = undefined) => {
+    const created = await call('POST /api/conversation/bootstrap', { body: { title: 'Sample chat', relayMode: 'agent', ...body }, headers, loopback, principal });
     assert.equal(created.status, 200, JSON.stringify(created.body));
     return created.body.conversationId;
   };
@@ -235,7 +243,13 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
     headers: loopbackHeaders,
     loopback: true,
   });
-  const asPairedAgent = (id, body, { origin = null } = {}) => call(ROUTE, { params: { id }, body: { ...body, ...(origin ? { origin } : {}) }, headers: agentHeaders });
+  // `ownerToken`: an older relay calling on the owner token (unverified).
+  const asPairedAgent = (id, body, { origin = null, ownerToken = false } = {}) => call(ROUTE, {
+    params: { id },
+    body: { ...body, ...(origin ? { origin } : {}) },
+    headers: agentHeaders,
+    ...(ownerToken ? {} : { principal: peerPrincipal(WIN) }),
+  });
   const events = (name) => emitted.filter(([event]) => event === name).map(([, payload]) => payload);
   const row = (id) => db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
   return { db, stmts, conversationGroups, emitted, events, calls, call, bootstrap, owned, agentMade, asLocalAgent, asPairedAgent, row, creatorOf };
@@ -349,7 +363,14 @@ test('a session the owner started: a paired agent needs owner_approved, a dry ru
   assert.notEqual(fx.row(lead).preferred_model, 'claude-opus-5');
   const local = await fx.asLocalAgent(lead, { settings: { model: 'claude-opus-5' } });
   assert.equal(local.status, 403, 'this relay\'s own agents too');
-  const allowed = await fx.asPairedAgent(lead, { settings: { model: 'claude-opus-5' }, owner_approved: true });
+  // A paired relay signed in with its key: `owner_approved` is ignored
+  // (origin binding §6.4); a session it did not start stays the owner's.
+  const keyed = await fx.asPairedAgent(lead, { settings: { model: 'claude-opus-5' }, owner_approved: true });
+  assert.equal(keyed.status, 403);
+  assert.equal(keyed.body.code, 'REMOTE_RELAY_PERMISSION');
+  // An older relay on the owner token states it, as before keys: the owner
+  // token is the owner's.
+  const allowed = await fx.asPairedAgent(lead, { settings: { model: 'claude-opus-5' }, owner_approved: true }, { ownerToken: true });
   assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
   assert.equal(fx.row(lead).preferred_model, 'claude-opus-5');
   // The owner needs nobody's leave.
@@ -385,17 +406,35 @@ test('free only for the conversation that started the session; a sibling, the cr
   // A paired relay's agent: free on a session it started (same relay, same
   // conversation), not on one another of its conversations started, nor on
   // one this relay's agent started.
-  const remoteMade = await fx.bootstrap({ title: 'From afar', origin: PAIRED_ORIGIN }, agentHeaders);
+  const remoteMade = await fx.bootstrap({ title: 'From afar', origin: PAIRED_ORIGIN }, agentHeaders, false, peerPrincipal(WIN));
   assert.equal((await fx.asPairedAgent(remoteMade, { settings: { effort: 'low' } }, { origin: PAIRED_ORIGIN })).status, 200);
   const otherConversation = await fx.asPairedAgent(remoteMade, { settings: { effort: 'high' } }, { origin: { ...PAIRED_ORIGIN, conversationId: 'conv-other-on-that-relay' } });
   assert.equal(otherConversation.status, 403);
-  const otherRelay = await fx.asPairedAgent(remoteMade, { settings: { effort: 'high' } }, { origin: { ...PAIRED_ORIGIN, relayId: 'relay-id-elsewhere' } });
-  assert.equal(otherRelay.status, 403);
+  // The same relay on the owner token (unverified): no match with its key's session.
+  const onToken = await fx.asPairedAgent(remoteMade, { settings: { effort: 'high' } }, { origin: PAIRED_ORIGIN, ownerToken: true });
+  assert.equal(onToken.status, 403);
   const onLocal = await fx.asPairedAgent(child, { settings: { effort: 'high' } }, { origin: { ...PAIRED_ORIGIN, conversationId: lead } });
   assert.equal(onLocal.status, 403, 'a paired agent naming a local conversation is no local creator');
+  // A peer key's `owner_approved` is ignored, on a session it did not start.
+  const approvedClaim = await fx.asPairedAgent(child, { settings: { effort: 'high' }, owner_approved: true }, { origin: PAIRED_ORIGIN });
+  assert.equal(approvedClaim.status, 403);
+  assert.equal(approvedClaim.body.code, 'REMOTE_RELAY_PERMISSION');
+  // A session started on the owner token (an unverified creator) is nobody's.
+  const claimedMade = await fx.bootstrap({ title: 'Claimed', origin: PAIRED_ORIGIN }, agentHeaders);
+  assert.equal(JSON.parse(fx.db.prepare('SELECT origin_json FROM conversations WHERE id = ?').get(claimedMade).origin_json).verified, false);
+  assert.equal((await fx.asPairedAgent(claimedMade, { settings: { effort: 'low' } }, { origin: PAIRED_ORIGIN })).status, 403);
 });
 
-test('group: by id, by name (case-insensitive), a new name makes a group, none and null take it out', async () => {
+test('a paired relay\'s key never moves a session to another folder', async () => {
+  const fx = setup();
+  const remoteMade = await fx.bootstrap({ title: 'From afar', origin: PAIRED_ORIGIN }, agentHeaders, false, peerPrincipal(WIN));
+  const moved = await fx.asPairedAgent(remoteMade, { settings: { cwd: FOLDER_B } }, { origin: PAIRED_ORIGIN });
+  assert.equal(moved.status, 403, JSON.stringify(moved.body));
+  assert.equal(moved.body.code, 'REMOTE_RELAY_PERMISSION');
+  assert.match(moved.body.error, /cannot change a session's folder/);
+});
+
+test('group: by id, by name (case-insensitive), none and null take it out; a new name is the person\'s', async () => {
   const fx = setup();
   const { child } = await fx.agentMade();
   const other = await fx.owned();
@@ -416,22 +455,33 @@ test('group: by id, by name (case-insensitive), a new name makes a group, none a
   assert.equal(byName.body.settings.group.id, groupId);
   assert.equal((await fx.asLocalAgent(child, { settings: { group: 'Docs batch' } })).body.changed.length, 0);
 
-  const made = await fx.asLocalAgent(child, { settings: { group: '  Release   prep ' } });
+  // An agent makes no group (agent auth §0.2): refused, nothing changed.
+  const groupsBefore = fx.conversationGroups.listGroups().length;
+  const refused = await fx.asLocalAgent(child, { settings: { group: '  Release   prep ', effort: 'low' } });
+  assert.equal(refused.status, 403, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.match(refused.body.error, /^Only the person makes session groups: there is no group "Release {3}prep" here \(groups: Docs batch/);
+  assert.ok(refused.body.groups.some((group) => group.id === groupId), 'the groups there are listed');
+  assert.equal(fx.conversationGroups.listGroups().length, groupsBefore);
+  assert.notEqual(fx.row(child).preferred_reasoning_effort, 'low', 'nothing else is written either');
+  // The dry run says the same.
+  assert.equal((await fx.asLocalAgent(child, { settings: { group: 'Release prep' }, dry_run: true })).status, 403);
+  // The person may: a new name makes the group.
+  const made = await fx.call(ROUTE, { params: { id: child }, body: { settings: { group: '  Release   prep ' } } });
   assert.equal(made.status, 200, JSON.stringify(made.body));
   assert.equal(made.body.groupCreated.name, 'Release prep');
   assert.equal(made.body.settings.group.id, made.body.groupCreated.id);
-  assert.equal(fx.conversationGroups.getGroup(made.body.groupCreated.id).name, 'Release prep');
 
   const none = await fx.asLocalAgent(child, { settings: { group: 'none' } });
   assert.equal(none.body.settings.group, null);
-  // The group it made is gone with its only member.
-  assert.equal(fx.conversationGroups.getGroup(made.body.groupCreated.id), null);
+  // The person's group stays, empty, when an agent takes its last member out.
+  assert.equal(fx.conversationGroups.getGroup(made.body.groupCreated.id).name, 'Release prep');
 });
 
-test('a group update_session made is one create_session can name, by name or id, and the list shows it', async () => {
+test('a group the settings route made is one create_session can name; an unknown one starts the session in no group', async () => {
   const fx = setup();
   const { lead, child } = await fx.agentMade();
-  const made = await fx.asLocalAgent(child, { settings: { group: 'Release prep' } });
+  const made = await fx.call(ROUTE, { params: { id: child }, body: { settings: { group: 'Release prep' } } });
   const groupId = made.body.groupCreated.id;
   // Both resolve against the same list with the same rule.
   const byName = await fx.call('POST /api/conversation/bootstrap', {
@@ -442,12 +492,21 @@ test('a group update_session made is one create_session can name, by name or id,
   const list = await fx.call('GET /api/conversations', { query: {} });
   const rows = list.body.conversations.filter((entry) => entry.groupId === groupId).map((entry) => entry.id).sort();
   assert.deepEqual(rows, [child, byName.body.conversationId].sort());
-  // create_session still takes an existing group only.
+  // An unknown group: an agent makes none, so the session starts in no
+  // group (not even its creator's), and the answer says so.
+  const groupsBefore = fx.conversationGroups.listGroups().length;
   const unknown = await fx.call('POST /api/conversation/bootstrap', {
     body: { title: 'Elsewhere', relayMode: 'agent', origin: LOCAL_ORIGIN(lead), group: 'Not there' }, headers: loopbackHeaders, loopback: true,
   });
-  assert.equal(unknown.status, 400);
-  assert.equal(unknown.body.code, 'SESSION_GROUP_NOT_FOUND');
+  assert.equal(unknown.status, 200, JSON.stringify(unknown.body));
+  assert.equal(unknown.body.group, null);
+  assert.match(unknown.body.groupNote, /No session group "Not there" here, and only the person makes groups/);
+  assert.equal(fx.row(unknown.body.conversationId).group_id, null);
+  assert.equal(fx.conversationGroups.listGroups().length, groupsBefore, 'no group made');
+  // The person's own bootstrap naming an unknown group is refused as before.
+  const person = await fx.call('POST /api/conversation/bootstrap', { body: { title: 'Mine', relayMode: 'agent', group: 'Not there' } });
+  assert.equal(person.status, 400);
+  assert.equal(person.body.code, 'SESSION_GROUP_NOT_FOUND');
 });
 
 test('group: an unknown id and an ambiguous name are refused with the groups listed, nothing changed', async () => {
@@ -466,7 +525,7 @@ test('group: an unknown id and an ambiguous name are refused with the groups lis
   assert.equal(ambiguous.status, 400);
   assert.equal(ambiguous.body.code, 'SESSION_GROUP_AMBIGUOUS');
   assert.equal(ambiguous.body.groups.length, 2);
-  const long = await fx.asLocalAgent(child, { settings: { group: 'x'.repeat(61) } });
+  const long = await fx.call(ROUTE, { params: { id: child }, body: { settings: { group: 'x'.repeat(61) } } });
   assert.equal(long.status, 400);
   assert.match(long.body.error, /at most 60 characters/);
 });
@@ -556,19 +615,16 @@ test('moving the last member of an owner\'s group into another group or a new on
   assert.equal((await fx.asLocalAgent(child, { settings: { group: target } })).status, 200);
   assert.ok(fx.conversationGroups.getGroup(owner), 'kept after a join elsewhere');
   await fx.asLocalAgent(child, { settings: { group: owner } });
-  const made = await fx.asLocalAgent(child, { settings: { group: 'Fresh batch' } });
-  assert.equal(made.status, 200);
-  assert.ok(fx.conversationGroups.getGroup(owner), 'kept after a move into a new group');
-  assert.equal(fx.conversationGroups.getGroup(made.body.groupCreated.id).agentMade, true);
+  assert.equal((await fx.asLocalAgent(child, { settings: { group: 'none' } })).status, 200);
+  assert.ok(fx.conversationGroups.getGroup(owner), 'kept after a move out');
 });
 
-test('a group the agent path made goes once its last member leaves; the owner\'s own moves still remove an empty group', async () => {
+test('the agent path makes no group; the owner\'s own moves still remove an empty group', async () => {
   const fx = setup();
   const { child } = await fx.agentMade();
   const made = await fx.asLocalAgent(child, { settings: { group: 'Agent batch' } });
-  const madeId = made.body.groupCreated.id;
-  await fx.asLocalAgent(child, { settings: { group: null } });
-  assert.equal(fx.conversationGroups.getGroup(madeId), null);
+  assert.equal(made.status, 403);
+  assert.equal(fx.conversationGroups.listGroups().some((group) => group.name === 'Agent batch'), false);
   // By hand, as before: the owner's own move out deletes the empty group.
   const hand = (await fx.call('POST /api/conversation-groups', { body: { name: 'Hand batch', conversationIds: [child] } })).body.group.id;
   await fx.call('DELETE /api/conversation/:id/group', { params: { id: child } });
@@ -580,9 +636,10 @@ test('two calls that make the same group name side by side end in one group', as
   const { lead, child } = await fx.agentMade();
   const second = await fx.bootstrap({ title: 'Second', origin: LOCAL_ORIGIN(lead) }, loopbackHeaders, true);
   // A folder change makes each call wait once, so the two interleave.
+  // The person's calls (only the person makes groups).
   const [a, b] = await Promise.all([
-    fx.asLocalAgent(child, { settings: { group: 'Shared batch', cwd: FOLDER_A } }),
-    fx.asLocalAgent(second, { settings: { group: 'Shared batch', cwd: FOLDER_B } }),
+    fx.call(ROUTE, { params: { id: child }, body: { settings: { group: 'Shared batch', cwd: FOLDER_A } } }),
+    fx.call(ROUTE, { params: { id: second }, body: { settings: { group: 'Shared batch', cwd: FOLDER_B } } }),
   ]);
   assert.equal(a.status, 200, JSON.stringify(a.body));
   assert.equal(b.status, 200, JSON.stringify(b.body));
@@ -707,7 +764,8 @@ test('a group name that became ambiguous before the write is refused, not create
     fx.conversationGroups.createGroup({ name: 'Twin batch', conversationIds: [a] });
     fx.conversationGroups.createGroup({ name: 'twin batch', conversationIds: [b] });
   };
-  const result = await fx.asLocalAgent(child, { settings: { cwd: FOLDER_A, group: 'Twin batch' } });
+  // The person's call (only the person makes groups).
+  const result = await fx.call(ROUTE, { params: { id: child }, body: { settings: { cwd: FOLDER_A, group: 'Twin batch' } } });
   assert.equal(result.status, 400, JSON.stringify(result.body));
   assert.equal(result.body.code, 'SESSION_GROUP_AMBIGUOUS');
   assert.equal(result.body.groups.length, 2);
@@ -856,4 +914,86 @@ test('planOnly:false counts only with a new mode: alone or with plan it is passe
   fx.db.prepare(`UPDATE conversations SET plan_only = NULL WHERE id = ?`).run(child);
   const free = await fx.asLocalAgent(child, { settings: { planOnly: false, title: 'Free' } });
   assert.equal(free.body.notes, undefined);
+});
+// ─── Agent tokens (agent auth §2.2, §10 test 9) ──────────────────────────────
+
+test('an agent token\'s owner_approved is ignored: only the relay_tool loopback (after the owner\'s Allow) states it', async () => {
+  const fx = setup();
+  const lead = await fx.owned();
+  // A script holding a session's agent token, without the remote header.
+  const script = { principal: agentPrincipal('conv-script') };
+  const refused = await fx.call(ROUTE, { params: { id: lead }, body: { settings: { model: 'claude-opus-5' }, owner_approved: true }, ...script });
+  assert.equal(refused.status, 403, JSON.stringify(refused.body));
+  assert.equal(refused.body.code, 'REMOTE_RELAY_PERMISSION');
+  assert.equal(refused.body.approvalNeeded, true);
+  assert.notEqual(fx.row(lead).preferred_model, 'claude-opus-5');
+  // A mode change is held as for a remote caller.
+  const dry = await fx.call(ROUTE, { params: { id: lead }, body: { settings: { mode: 'autopilot' }, dry_run: true }, ...script });
+  assert.equal(dry.body.approvalNeeded, true);
+  // This relay's own relay_tool, which asked the owner first, may state it.
+  const local = await fx.asLocalAgent(lead, { settings: { model: 'claude-opus-5' }, owner_approved: true });
+  assert.equal(local.status, 200, JSON.stringify(local.body));
+  assert.equal(fx.row(lead).preferred_model, 'claude-opus-5');
+});
+
+test('an agent token cannot grant mayCreateSessions or set plan-only through the preferences route', async () => {
+  const fx = setup();
+  const lead = await fx.owned();
+  const script = { principal: agentPrincipal('conv-script') };
+  const grant = await fx.call('PATCH /api/conversation/:id/preferences', { params: { id: lead }, body: { mayCreateSessions: true }, ...script });
+  assert.equal(grant.status, 403);
+  const planOnly = await fx.call('PATCH /api/conversation/:id/preferences', { params: { id: lead }, body: { planOnly: true }, ...script });
+  assert.equal(planOnly.status, 403);
+});
+
+// ─── An agent token's claimed origin, and session starts past relay_tool ─────
+
+test('an agent token\'s X-OAR-Remote-Origin and body origin are ignored: it cannot pose as a session\'s creator', async () => {
+  const fx = setup();
+  const { lead, child } = await fx.agentMade();
+  // A worker of another conversation names the creator, the loopback way.
+  const forgedLocal = await fx.call(ROUTE, {
+    params: { id: child },
+    body: { settings: { effort: 'low' }, origin: LOCAL_ORIGIN(lead) },
+    headers: loopbackHeaders,
+    principal: agentPrincipal('conv-elsewhere'),
+  });
+  assert.equal(forgedLocal.status, 403, JSON.stringify(forgedLocal.body));
+  assert.equal(forgedLocal.body.code, 'REMOTE_RELAY_PERMISSION');
+  assert.equal(forgedLocal.body.startedByCaller, false);
+  assert.equal(forgedLocal.body.approvalNeeded, true);
+
+  // Or a paired relay's agent that started a session here.
+  const remoteMade = await fx.bootstrap({ title: 'From afar', origin: PAIRED_ORIGIN }, agentHeaders);
+  const forgedPaired = await fx.call(ROUTE, {
+    params: { id: remoteMade },
+    body: { settings: { effort: 'low' }, origin: PAIRED_ORIGIN },
+    headers: agentHeaders,
+    principal: agentPrincipal('conv-elsewhere'),
+  });
+  assert.equal(forgedPaired.status, 403);
+  assert.equal(forgedPaired.body.startedByCaller, false);
+  assert.notEqual(fx.row(remoteMade).preferred_reasoning_effort, 'low');
+});
+
+test('an agent token starts no session past relay_tool: bootstrap refuses it, the loopback is let through', async () => {
+  const fx = setup();
+  const lead = await fx.owned();
+  const count = () => fx.db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n;
+  const before = count();
+  for (const principal of [agentPrincipal(lead), CLI_AGENT_PRINCIPAL]) {
+    const refused = await fx.call('POST /api/conversation/bootstrap', {
+      body: { title: 'Side job', relayMode: 'agent', origin: LOCAL_ORIGIN(lead) },
+      headers: loopbackHeaders,
+      principal,
+    });
+    assert.equal(refused.status, 403, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, 'AUTH_RELAY_TOOL_REQUIRED');
+    assert.match(refused.body.error, /relay_tool create_session/);
+  }
+  assert.equal(count(), before, 'nothing was created');
+  // relay_tool's own request (the loopback, after the dispatcher's rules).
+  const child = await fx.bootstrap({ title: 'Side job', origin: LOCAL_ORIGIN(lead) }, loopbackHeaders, true);
+  assert.ok(child);
+  assert.equal(fx.creatorOf(child), lead);
 });

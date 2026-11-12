@@ -45,29 +45,29 @@ flowchart LR
 <table>
 <tr>
 <td width="42%" rowspan="4" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-mobile.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.26" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-mobile.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/cfmail-mobile.png?v=0.9.27" alt="OAR on a phone: a finished agent turn in a conversation, with the composer below"></picture></a>
 <br><sub>On a phone: the same conversations, installable as an app.</sub>
 </td>
 <td width="58%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-agents.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.26" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-agents.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/cfmail-agents.png?v=0.9.27" alt="Background subagents running in parallel in the task panel, each with live token counts, elapsed time, and its own Stop button"></picture></a>
 <br><sub>Agents working in parallel, each with live token counts and its own Stop.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-question.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.26" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-question.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/cfmail-question.png?v=0.9.27" alt="A question card in the middle of a turn: the agent offers several choices and a free-text reply"></picture></a>
 <br><sub>When the agent needs a decision, it asks, and waits for your answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pingcf-thoughts.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.26" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></picture></a>
+<a href="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pingcf-thoughts.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/pingcf-thoughts.png?v=0.9.27" alt="An expanded Thoughts block showing the agent's reasoning above its reply"></picture></a>
 <br><sub>Read the reasoning, not just the answer.</sub>
 </td>
 </tr>
 <tr>
 <td valign="top">
-<a href="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-watching.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.26" alt="A session watching two other sessions: a finished reply arrives as a compact relay-event row, the watching 2 sessions list is open with Unsubscribe, and a request to also watch a session on a paired relay waits on an Allow / Deny card"></picture></a>
+<a href="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-watching.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/pagewright-watching.png?v=0.9.27" alt="A session watching two other sessions: a finished reply arrives as a compact relay-event row, the watching 2 sessions list is open with Unsubscribe, and a request to also watch a session on a paired relay waits on an Allow / Deny card"></picture></a>
 <br><sub>Agents that watch agents: woken by events, approving nothing.</sub>
 </td>
 </tr>
@@ -80,8 +80,8 @@ flowchart LR
 
 ## Install
 
-1. **Install.** Run `curl -fsSL oar.sh/install | sh` (macOS, Linux) or `irm oar.sh/install.ps1 | iex` (Windows PowerShell). On macOS and Linux the installer says what it is about to do and asks once, then installs OAR into your home directory, writes a config with a fresh access token, starts the relay, and prints its address with a QR code. On Windows, run `oar start` afterwards.
-2. **Open the address** it printed; `oar url` prints it again. On the relay's own machine that is `http://localhost:3333/`. For your phone, switch on LAN access with `oar setup --lan`, or use a [tunnel](#remote-access).
+1. **Install.** Run `curl -fsSL oar.sh/install | sh` (macOS, Linux) or `irm oar.sh/install.ps1 | iex` (Windows PowerShell). On macOS and Linux the installer says what it is about to do and asks once, then installs OAR into your home directory, writes a config, makes a relay token (shown once, with a sign-in link: keep it in your password manager), starts the relay, and prints its address with a QR code. On Windows, run `oar start` afterwards.
+2. **Open the address** it printed; `oar url` prints it again. On the relay's own machine that is `http://localhost:3333/`. For your phone, switch on LAN access with `oar setup --lan`, or use a [tunnel](#remote-access); then sign the phone in with **⚙️ Settings → Security → Sign in another device**, or `oar url --sign-in` on the relay host, a link and QR code that work once.
 3. **Turn on an agent** under **⚙️ Settings → Providers**, then start a conversation with **+ New Chat**.
 
 You need Node.js 22.13 or newer (the macOS and Linux installer brings its own when yours is missing or older) and an account with the agent you want to use; see [Prerequisites](docs/install.md#prerequisites). There are also installs [with npm](docs/install.md#npm) and [from a git checkout](docs/install.md#from-a-git-checkout).
@@ -118,11 +118,11 @@ API keys are entered in **⚙️ Settings** and stay on the relay host. The Clau
 <table>
 <tr>
 <td width="62%" valign="top">
-<a href="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-steering.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.26" alt="A running Claude turn with a message steered into it mid-turn, the reply streaming with its tool calls, and the Steer button in the composer"></picture></a>
+<a href="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/cfmail-steering.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/cfmail-steering.png?v=0.9.27" alt="A running Claude turn with a message steered into it mid-turn, the reply streaming with its tool calls, and the Steer button in the composer"></picture></a>
 <br><sub>Send a message while the agent works, and it steers the running turn.</sub>
 </td>
 <td width="38%" valign="top">
-<a href="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/usage-copilot-compact.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.26" alt="The GitHub Copilot card in Check Usage: premium requests and plan quota with reset dates, and the cost of the last turn"></picture></a>
+<a href="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/usage-copilot-compact.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/usage-copilot-compact.png?v=0.9.27" alt="The GitHub Copilot card in Check Usage: premium requests and plan quota with reset dates, and the cost of the last turn"></picture></a>
 <br><sub>What each plan has left, in one place.</sub>
 </td>
 </tr>
@@ -191,13 +191,14 @@ flowchart LR
 
 You stay in charge: per paired relay you decide whether agents may only read, also prompt, or do everything, and in the `ask` and `plan` modes every write asks you first. A subscription only notifies; it approves nothing.
 
-<p><a href="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.26"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-cross-relay.light.png?v=0.9.26"><img src="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.26" alt="A session watching two sessions on a paired relay: a reply arrives as a relay-event row, and after a short outage the events the other relay kept arrive as one replayed row" width="720"></picture></a></p>
+<p><a href="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.27"><picture><source media="(prefers-color-scheme: light)" srcset="https://oar.sh/assets/shots/pagewright-cross-relay.light.png?v=0.9.27"><img src="https://oar.sh/assets/shots/pagewright-cross-relay.png?v=0.9.27" alt="A session watching two sessions on a paired relay: a reply arrives as a relay-event row, and after a short outage the events the other relay kept arrive as one replayed row" width="720"></picture></a></p>
 
 How pairing, permissions and limits work is in [Agents working together](docs/agents-together.md).
 
 ## Security notes
 
-- **The access token is the key to everything.** Whoever holds it, or a URL carrying `?token=`, can have your agents run commands on the host. Treat it like a password; `oar setup --new-token` replaces it and signs every device out.
+- **The relay token is the key to everything.** Whoever holds it, or a URL carrying `?token=`, can have your agents run commands on the host. Keep it in your password manager: the relay stores only its hash and shows a new one once. `oar setup --new-token` replaces it. Agents get tokens of their own (`OAR_AGENT_TOKEN`) that cannot answer your question cards, change settings or pairings; browsers hold a session of their own with a proof key, and paired relays sign in with keys of their own (see [Security notes](docs/security.md)).
+- **Sensitive files ask you.** A Claude session's edit to a file such as `.bashrc` or one under `.git/` waits for your **Allow once** on a Safety check card, in every mode.
 - **OAR adds reach, not a sandbox.** Agents act with the permissions of the user the relay runs as.
 - **Local by default.** The relay answers only on its own machine until you change that. Beyond your network, use one of the [tunnels](#remote-access).
 - **Public links are public.** Anyone with a shared-conversation or preview link can open it without signing in.

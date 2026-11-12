@@ -10,6 +10,7 @@ import {
   escHtml,
   repoBrowserState,
   getSessionWorkerState,
+  sessionWorkerStates,
   resolveConversationUiState,
   setCurrentConv,
   showTransientRelayNotice,
@@ -38,7 +39,7 @@ import {
   setConversationGroupFoldChoices,
 } from './store.js';
 import { archiveConfirmationFor } from './archive-confirm.mjs';
-import { arrangeConversationList, conversationGroupPosition } from './conversation-group-order.mjs';
+import { arrangeConversationList, conversationGroupPosition, parseConversationTimeMs } from './conversation-group-order.mjs';
 import { describeDragItems, dropAnnouncement, groupMoveStep } from './conversation-group-drag.mjs';
 import { bindConversationListDrag } from './conversation-list-drag.mjs';
 import { applyFetchedTurnStateToConversation } from './conversation-turn-state.mjs';
@@ -132,7 +133,7 @@ import {
   conversationProviderIndicatorLabel,
 } from './conversation-provider-indicator.mjs';
 import { leaveStatusView } from './status-view.mjs';
-import { leaveInboxView } from './inbox-ui.js';
+import { getInboxWaitingConversationIds, leaveInboxView } from './inbox-ui.js';
 import { leaveMediaView } from './media-view.js';
 import {
   CLAUDE_CLOUD_PROVIDER,
@@ -167,6 +168,18 @@ import {
   filterConversations,
   drainRemainingPages,
   describeFilterMatchCount,
+  ACTIVE_FILTER_LABEL,
+  estimateRelayNowMs,
+  noteActivityFirstSeen,
+  noteMissingChase,
+  isConversationActive,
+  nextActiveWindowEdgeMs,
+  activeFilterNeedsMorePages,
+  readActiveFilterSetting,
+  writeActiveFilterSetting,
+  describeActiveFilterTitle,
+  activeFilterBadgeText,
+  describeActiveMatchCount,
 } from './conversation-list-filter.mjs';
 
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
@@ -196,6 +209,22 @@ const convListTransientOpenGroups = new Set();
 let conversationListFilterText = '';
 let conversationFilterDrainActive = false;
 let conversationFilterGeneration = 0;
+// The 🔥 toggle (active sessions only), kept per browser. One timer waits for
+// the next row to age out of the window; `activeFilterDrainKey` is what the
+// last page drain for it was started on (initConversationFilter, below).
+let conversationListActiveOnly = readActiveFilterSetting();
+let activeFilterEdgeTimer = null;
+let activeFilterEdgeAt = 0;
+let activeFilterDrainKey = '';
+// The chase for active sessions no loaded page holds (noteMissingChase), and
+// the ids it gave up on: not chased again until 🔥 is switched on anew.
+let activeFilterChase = null;
+const activeFilterAbandonedIds = new Set();
+// Rows passing 🔥 (and the title filter), as last painted: the count, the status.
+let lastFilteredRowCount = 0;
+// Until the first page of the list has arrived, 🔥 says it is loading rather
+// than "Nothing active right now".
+let conversationListFirstPageLoaded = false;
 let openConversationVersion = 0;
 let newConversationInFlight = false;
 
@@ -297,6 +326,9 @@ function scheduleConversationListBoundaryCheck() {
   conversationListBoundaryCheckFrame = requestAnimationFrame(() => {
     conversationListBoundaryCheckFrame = 0;
     if (Date.now() < conversationListAutoLoadBlockedUntil) return;
+    // Under 🔥 a short list must not pull page after page: its own drain
+    // loads what the active sessions need (conversationListNeedsDrain).
+    if (isActiveFilterApplied()) return;
     void conversationListLoader.handleBoundaryDistance(getConversationListBoundaryDistance());
   });
 }
@@ -414,6 +446,7 @@ export async function refreshConversations(options = {}) {
   // names the ones still kept.
   forgetKeptEmptyConversationGroups();
   mergeConversationGroups(r.groups);
+  conversationListFirstPageLoaded = true;
   applyConversationPage(r.conversations || []);
   conversationRowsFetchedSinceRefresh = Array.isArray(r.conversations) ? r.conversations.length : 0;
   // A group no loaded row belongs to any more (dissolved, or its rows left)
@@ -427,8 +460,11 @@ export async function refreshConversations(options = {}) {
   if (!currentConvId) renderNoConversationState();
   updateCompactButton();
   // A reset bumps the loader version, which aborts any in-flight filter drain;
-  // restart it so an active filter keeps covering the unloaded pages.
-  if (normalizeConversationFilter(conversationListFilterText)) {
+  // restart it so an active filter keeps covering the unloaded pages. The
+  // cursor is back on page one: the 🔥 chase counts its pages afresh (the ids
+  // it gave up on stay given up).
+  activeFilterChase = null;
+  if (conversationListNeedsDrain()) {
     void drainConversationListForFilter();
   }
 }
@@ -655,32 +691,62 @@ function paintConvList() {
   };
   const foldChoices = readConversationGroupFoldChoices({ archived: conversationListArchivedView });
   const groupDescriptions = new Map();
+  const groupNameMatchesText = (info) => conversationMatchesFilter({ title: info?.displayName || info?.name }, activeFilter);
+  // 🔥: a row shows when it is active and (with a title filter as well) its
+  // title or its group's name matches; under a group only the active rows
+  // show, the head as context.
+  const activeOnly = isActiveFilterApplied();
+  const now = Date.now();
+  const inboxWaiting = activeOnly ? getInboxWaitingConversationIds() : null;
+  // A relay time ahead of this clock counts from when it was first seen.
+  if (activeOnly) for (const row of inView) noteActivityFirstSeen(row, now);
+  const isActive = (row) => {
+    const view = viewOf(row);
+    return isConversationActive(row, {
+      working: conversationWorksForActiveFilter(row, view),
+      waiting: view.pendingCount > 0 || inboxWaiting.has(String(row?.id || '')),
+      now,
+    });
+  };
+  const textMatches = (row) => !activeFilter
+    || conversationMatchesFilter(row, activeFilter)
+    || (!!row?.groupId && groupNameMatchesText(conversationGroups[row.groupId]));
+  const anyFilter = !!activeFilter || activeOnly;
+  const rowMatches = activeOnly
+    ? (row) => textMatches(row) && isActive(row)
+    : (activeFilter ? (row) => conversationMatchesFilter(row, activeFilter) : null);
   // Groups order with the same rules the list route pages by; a group is
   // folded once nothing in it runs or waits, unless the user chose otherwise.
   // A folded group still shows the open conversation under its head.
   const items = arrangeConversationList(inView, conversationGroups, {
-    matches: activeFilter ? (row) => conversationMatchesFilter(row, activeFilter) : null,
-    groupNameMatches: activeFilter ? (info) => conversationMatchesFilter({ title: info?.displayName || info?.name }, activeFilter) : null,
+    matches: rowMatches,
+    groupNameMatches: activeFilter && !activeOnly ? groupNameMatchesText : null,
+    membersMustMatch: activeOnly,
     // An owner's group an agent emptied shows in the live list, empty.
     emptyGroups: !conversationListArchivedView,
     keepVisibleId: currentConvId || null,
     isOpen: (groupId, group) => {
       const described = describeGroupForHead(group, viewOf);
       // Open whatever the choice: the fold button then says so and does nothing.
-      described.forcedOpen = !!activeFilter;
+      described.forcedOpen = anyFilter;
       groupDescriptions.set(groupId, described);
       if (convListTransientOpenGroups.has(groupId)) return true;
       return resolveGroupFold({
         choice: foldChoices[groupId] || null,
         active: groupIsActive(described.summary),
-        filterActive: !!activeFilter,
+        filterActive: anyFilter,
       });
     },
   });
+  // Counted only for 🔥: the title filter alone shows no count.
+  lastFilteredRowCount = activeOnly ? inView.filter(rowMatches).length : 0;
+  syncActiveFilterButton(lastFilteredRowCount);
+  scheduleActiveFilterEdge(activeOnly ? nextActiveWindowEdgeMs(inView, { now }) : 0);
+  if (activeOnly) queueMicrotask(maybeDrainForActiveFilter);
   lastConvListDragItems = describeDragItems(items);
-  syncConversationGroupsFoldAllButton(items, !!activeFilter);
+  syncConversationGroupsFoldAllButton(items, anyFilter);
   const footerHtml = (() => {
-    if (activeFilter) {
+    if (anyFilter) {
       // While a filter is active the drain loads older pages by itself; a
       // "scroll for more" hint would point at a gesture that does nothing, and
       // "Searching…" must only show while something is actually loading.
@@ -697,6 +763,20 @@ function paintConvList() {
     return '';
   })();
   if (items.length === 0) {
+    if (activeOnly && !conversationListFirstPageLoaded) {
+      // The list has not arrived yet: no "Nothing active" before it has.
+      list.innerHTML = '<div class="conv-active-empty conv-active-loading">Loading conversations…</div>';
+      lastConvListHtml = '';
+      return;
+    }
+    if (activeOnly) {
+      // 🔥 on and nothing passes: say so, with the way back to the whole list.
+      const emptyText = activeFilter ? 'No active sessions match your filter' : 'Nothing active right now';
+      list.innerHTML = `<div class="conv-active-empty"><div>${emptyText}</div><button type="button" class="conv-active-empty-off" data-active-filter-off="1">Show all sessions</button></div>${footerHtml}`;
+      lastConvListHtml = '';
+      scheduleConversationListBoundaryCheck();
+      return;
+    }
     const emptyText = activeFilter && inView.length > 0
       ? 'No conversations match your filter'
       : (conversationListArchivedView ? 'No archived conversations' : 'No conversations yet');
@@ -720,7 +800,7 @@ function paintConvList() {
     return `<span class="conv-group-summary conv-group-summary-${described.summary.strongest}" title="${escHtml(title)}"${waitingId ? ` data-open-waiting="${escHtml(waitingId)}" role="button" tabindex="0" onclick="event.stopPropagation();openConversation('${escHtml(waitingId)}',{fromList:true})"` : ''}>${escHtml(text)}</span>`;
   };
   const foldButtonHtml = (item) => {
-    const forced = (groupDescriptions.get(item.group.id) || {}).forcedOpen === true || item.group.contextOnly === true || !!activeFilter;
+    const forced = (groupDescriptions.get(item.group.id) || {}).forcedOpen === true || item.group.contextOnly === true || anyFilter;
     const label = forced
       ? 'Open while the filter is on'
       : (item.group.open ? 'Fold group' : 'Unfold group');
@@ -2805,14 +2885,194 @@ export function initConversationListLazyLoading() {
   el.dataset.lazyLoadBound = '1';
   el.addEventListener('scroll', () => {
     conversationListAutoLoadBlockedUntil = 0;
+    if (isActiveFilterApplied()) return;
     void conversationListLoader.handleBoundaryDistance(getConversationListBoundaryDistance());
   }, { passive: true });
   scheduleConversationListBoundaryCheck();
 }
 
+// ── 🔥 Active only ──
+// The toggle left of the title filter. A row shows while it works (the same
+// verdict as its colour and spinner, plus a queued turn), was active in the
+// last ACTIVE_WINDOW_MS, or a card waits in it for the person (the "N open"
+// questions and Safety checks this page holds, and the Inbox's list, which
+// adds plan cards and relay asks). Not applied in the Archived view.
+
+function isActiveFilterApplied() {
+  return conversationListActiveOnly && !conversationListArchivedView;
+}
+
+export function isConversationListActiveOnly() {
+  return conversationListActiveOnly;
+}
+
+/** Condition 1: the row's working state, or a turn the relay holds queued for it. */
+function conversationWorksForActiveFilter(conversation, view) {
+  return view?.working === true
+    || conversation?.activeTurn === true
+    || String(conversation?.sessionState || '').trim() === 'running_turn';
+}
+
+/**
+ * Sessions known to be active that no loaded page holds yet: a waiting card's
+ * conversation, a worker processing a session no loaded row is bound to.
+ * Recent rows need no such list: the pages come newest first.
+ */
+function activeFilterMissingIds() {
+  const missing = new Set();
+  // A loaded record counts whatever its view: an archived conversation the
+  // Archived view brought in is not missing from the live list.
+  const loaded = (id) => Object.hasOwn(conversations, id);
+  const consider = (id) => {
+    if (!loaded(id) && !activeFilterAbandonedIds.has(id)) missing.add(id);
+  };
+  for (const id of Object.keys(getPendingQuestionCountsByConversation())) consider(id);
+  for (const id of getInboxWaitingConversationIds()) consider(id);
+  // A new conversation's worker goes by the conversation's id until its SDK
+  // session is bound, so both name a loaded row.
+  const boundSessions = new Set();
+  for (const conversation of Object.values(conversations)) {
+    const sdkSessionId = String(conversation?.sdkSessionId || '').trim();
+    if (sdkSessionId) boundSessions.add(sdkSessionId);
+    const id = String(conversation?.id || '').trim();
+    if (id) boundSessions.add(id);
+  }
+  for (const [sdkSessionId, state] of sessionWorkerStates) {
+    if (String(state?.status || '').trim().toLowerCase() === 'processing' && !boundSessions.has(sdkSessionId)) {
+      consider(`session:${sdkSessionId}`);
+    }
+  }
+  return missing;
+}
+
+function conversationListCursorKey() {
+  try {
+    return JSON.stringify(conversationListLoader.getState().nextCursor ?? null);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The active sessions still chased on unloaded pages. Each page loaded in
+ * which none of them turned up counts; after ACTIVE_FILTER_MAX_STALE_PAGES
+ * such pages they are given up (a card in an archived conversation, a
+ * worker of a session the list never holds), so the drain cannot page
+ * through the whole history for an id that is never there.
+ */
+function activeFilterChasedMissingIds() {
+  const missing = activeFilterMissingIds();
+  const chase = noteMissingChase(activeFilterChase, { cursorKey: conversationListCursorKey(), missingCount: missing.size });
+  if (chase.exhausted) {
+    for (const id of missing) activeFilterAbandonedIds.add(id);
+    activeFilterChase = null;
+    return new Set();
+  }
+  activeFilterChase = chase;
+  return missing;
+}
+
+/** Whether a page drain is due: always under a title filter, under 🔥 only until it is complete. */
+function conversationListNeedsDrain() {
+  if (normalizeConversationFilter(conversationListFilterText)) return true;
+  if (!isActiveFilterApplied()) return false;
+  const state = conversationListLoader.getState();
+  if (!state.hasMore) return false;
+  return activeFilterNeedsMorePages({
+    hasMore: state.hasMore,
+    cursorTimeMs: parseConversationTimeMs(state.nextCursor?.beforeUpdatedAt),
+    missingCount: activeFilterChasedMissingIds().size,
+    // The cursor is a relay time: measured on the relay's clock.
+    now: estimateRelayNowMs(Object.values(conversations)),
+  });
+}
+
+/**
+ * After a paint under 🔥: start a drain when the list is not complete for it,
+ * once per state of what is missing (a drain that gave up is not restarted
+ * on every render, only when the cursor or the missing set changes).
+ */
+function maybeDrainForActiveFilter() {
+  if (!isActiveFilterApplied() || conversationFilterDrainActive) return;
+  if (!conversationListNeedsDrain()) return;
+  const key = `${conversationListCursorKey()}#${[...activeFilterMissingIds()].sort().join('|')}`;
+  if (key === activeFilterDrainKey) return;
+  activeFilterDrainKey = key;
+  void drainConversationListForFilter();
+}
+
+// setTimeout's longest delay; a longer one fires at once.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** One timer, for the moment the next row leaves the window (0: none). */
+function scheduleActiveFilterEdge(edgeMs) {
+  const at = Number(edgeMs) || 0;
+  if (at === activeFilterEdgeAt) return;
+  if (activeFilterEdgeTimer) clearTimeout(activeFilterEdgeTimer);
+  activeFilterEdgeTimer = null;
+  activeFilterEdgeAt = at;
+  if (!at) return;
+  // A little past the edge, so the row is out of the window when it repaints.
+  const delay = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, at - Date.now()) + 25);
+  activeFilterEdgeTimer = setTimeout(() => {
+    activeFilterEdgeTimer = null;
+    activeFilterEdgeAt = 0;
+    renderConvList();
+  }, delay);
+  activeFilterEdgeTimer?.unref?.();
+}
+
+function syncActiveFilterButton(count) {
+  const button = document.getElementById('conv-active-toggle');
+  if (!button) return;
+  const archivedView = conversationListArchivedView;
+  const on = conversationListActiveOnly && !archivedView;
+  const pressed = conversationListActiveOnly ? 'true' : 'false';
+  if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
+  if (button.disabled !== archivedView) button.disabled = archivedView;
+  if (button.getAttribute('aria-label') !== ACTIVE_FILTER_LABEL) button.setAttribute('aria-label', ACTIVE_FILTER_LABEL);
+  const title = archivedView ? 'The 🔥 filter applies to the live list, not the Archived view' : describeActiveFilterTitle(on, count);
+  if (button.title !== title) button.title = title;
+  const badge = button.querySelector('.conv-active-count');
+  if (badge) {
+    // No count before the list has arrived.
+    const text = conversationListFirstPageLoaded ? activeFilterBadgeText(on, count) : '';
+    if (badge.textContent !== text) badge.textContent = text;
+    badge.hidden = !text;
+  }
+}
+
+/** Turns 🔥 on or off, remembered in this browser. */
+export function setConversationListActiveOnly(on) {
+  const next = on === true;
+  if (next === conversationListActiveOnly) return;
+  conversationListActiveOnly = next;
+  writeActiveFilterSetting(next);
+  // A running title-filter drain restarts under the new filters.
+  conversationFilterGeneration += 1;
+  activeFilterDrainKey = '';
+  // Switched on anew: what an earlier chase gave up on is looked for again.
+  activeFilterChase = null;
+  activeFilterAbandonedIds.clear();
+  const list = getConversationListElement();
+  if (list) list.scrollTop = 0;
+  // The paint starts what 🔥 needs: the drain for unloaded pages (in a
+  // microtask), the timer. The status speaks after that microtask, so it
+  // says "searching" while the drain runs rather than a partial count; the
+  // drain's end announces the result.
+  renderConvList();
+  queueMicrotask(() => announceConversationFilterResults());
+}
+
+export function toggleConversationListActiveOnly() {
+  setConversationListActiveOnly(!conversationListActiveOnly);
+}
+
 // A title filter has to search conversations that only exist on unloaded pages,
 // so an active filter drains the remaining pages in the background. Each page
-// re-renders via applyPage, so matches appear as they load.
+// re-renders via applyPage, so matches appear as they load. Under 🔥 alone the
+// drain stops as soon as the pages hold every active session (see
+// conversationListNeedsDrain).
 // A filter change aborts the running drain and starts a fresh one, so the new
 // filter gets a full retry budget.
 async function drainConversationListForFilter() {
@@ -2823,13 +3083,12 @@ async function drainConversationListForFilter() {
   try {
     await drainRemainingPages(
       conversationListLoader,
-      () => generation === conversationFilterGeneration
-        && !!normalizeConversationFilter(conversationListFilterText),
+      () => generation === conversationFilterGeneration && conversationListNeedsDrain(),
     );
   } finally {
     conversationFilterDrainActive = false;
-    const filterActive = !!normalizeConversationFilter(conversationListFilterText);
-    if (filterActive && generation !== conversationFilterGeneration) {
+    const filterActive = !!normalizeConversationFilter(conversationListFilterText) || isActiveFilterApplied();
+    if (generation !== conversationFilterGeneration && conversationListNeedsDrain()) {
       void drainConversationListForFilter();
     } else {
       // The "Searching older conversations…" footer keys off the drain flag.
@@ -2848,7 +3107,20 @@ function announceConversationFilterResults() {
   if (!status) return;
   const activeFilter = normalizeConversationFilter(conversationListFilterText);
   let text = '';
-  if (activeFilter) {
+  if (isActiveFilterApplied()) {
+    // The rows the last paint let through, both filters applied.
+    const count = lastFilteredRowCount;
+    if (conversationFilterDrainActive) {
+      text = count
+        ? `${describeActiveMatchCount(count)} so far, searching older conversations`
+        : 'No active sessions yet, searching older conversations';
+    } else if (conversationListNeedsDrain()) {
+      // The drain gave up with pages left, so the search is not complete.
+      text = describeActiveMatchCount(count, { loadedOnly: true });
+    } else {
+      text = describeActiveMatchCount(count);
+    }
+  } else if (activeFilter) {
     const count = filterConversations(Object.values(conversations), activeFilter).length;
     if (!conversationListLoader.getState().hasMore) {
       text = describeFilterMatchCount(count);
@@ -2908,6 +3180,18 @@ export function initConversationFilter() {
     input.focus();
   });
   syncClearButton();
+  // 🔥: a native button (Enter and Space work), and the empty state's way out.
+  const activeToggle = document.getElementById('conv-active-toggle');
+  activeToggle?.addEventListener('click', () => toggleConversationListActiveOnly());
+  getConversationListElement()?.addEventListener('click', (event) => {
+    const off = event.target instanceof Element ? event.target.closest('[data-active-filter-off]') : null;
+    if (!off) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setConversationListActiveOnly(false);
+    activeToggle?.focus();
+  });
+  syncActiveFilterButton(lastFilteredRowCount);
 }
 
 // ── Archive, and the row's context menu ──
@@ -3446,9 +3730,9 @@ function bindConversationContextMenu(list) {
   if (!list || list.dataset.contextMenuBound === '1') return;
   list.dataset.contextMenuBound = '1';
   // Rows move only where their place means something: not in the Archived
-  // view and not under a title filter (the menu entries still work there).
+  // view and not under a title or 🔥 filter (the menu entries still work there).
   const drag = bindConversationListDrag(list, {
-    isEnabled: () => !IS_SHARED_VIEW && !conversationListArchivedView && !normalizeConversationFilter(conversationListFilterText),
+    isEnabled: () => !IS_SHARED_VIEW && !conversationListArchivedView && !normalizeConversationFilter(conversationListFilterText) && !isActiveFilterApplied(),
     describeItems: () => lastConvListDragItems,
     onHold: (held) => holdConvListRender(held),
     rerender: () => paintConvList(),

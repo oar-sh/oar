@@ -111,40 +111,63 @@ async function updateOutboxEntry(db, key, value) {
 // A 4xx (other than timeout/rate-limit) means the server made a decision about
 // this exact request — including 409 DUPLICATE_MESSAGE_ID for a send that
 // actually landed on a previous ambiguous attempt — so the entry is finished.
-function isFinalResponse(response) {
+// Refusals about this browser's sign-in, not about the request (a 401, a
+// 403 AUTH_SESSION_PROOF or AUTH_COOKIE_UPGRADE): the send stays queued for
+// after the sign-in. sw.js keeps the same rule.
+const KEEP_403_CODES = new Set(['AUTH_SESSION_PROOF', 'AUTH_COOKIE_UPGRADE']);
+
+async function isSignInRefusal(response) {
+  if (response.status === 401) return true;
+  if (response.status !== 403) return false;
+  try {
+    return KEEP_403_CODES.has(String((await response.clone().json())?.code || ''));
+  } catch {
+    return false;
+  }
+}
+
+export async function isFinalResponse(response) {
   if (!response) return false;
   if (response.ok) return true;
-  return response.status >= 400 && response.status < 500
-    && response.status !== 408 && response.status !== 429;
+  if (!(response.status >= 400 && response.status < 500)) return false;
+  if (response.status === 408 || response.status === 429) return false;
+  return !(await isSignInRefusal(response));
 }
 
 /**
  * Page-side replay for browsers without Background Sync. Replays in insertion
  * order; stops at the first retryable failure so ordering is preserved.
  */
+// Bumped by clearOutbox: a page replay under way stops.
+let outboxGeneration = 0;
+
 export async function replayOutboxFromPage() {
   if (!('indexedDB' in window)) return { replayed: 0 };
+  const generation = outboxGeneration;
   let db = null;
   let replayed = 0;
   try {
     db = await openOutboxDb();
     const entries = await readOutboxEntries(db);
     for (const { key, value } of entries) {
+      if (generation !== outboxGeneration) break;
       if (isStaleDraftFlushEntry(value)) {
         await deleteOutboxEntry(db, key);
         continue;
       }
       let response = null;
       try {
-        response = await fetch(`${BASE}${value.path}`, {
+        const target = `${BASE}${value.path}`;
+        response = await fetch(target, {
           method: value.method || 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          headers: { 'Content-Type': 'application/json', ...authHeaders(target) },
           body: value.body,
         });
       } catch {
         response = null;
       }
-      if (isFinalResponse(response)) {
+      if (generation !== outboxGeneration) break;
+      if (await isFinalResponse(response)) {
         await deleteOutboxEntry(db, key);
         replayed += 1;
         continue;
@@ -161,6 +184,42 @@ export async function replayOutboxFromPage() {
     try { db?.close(); } catch {}
   }
   return { replayed };
+}
+
+// What the page tells its service worker to empty the outbox with (sw.js
+// listens for the same type).
+export const OUTBOX_CLEAR_MESSAGE = 'oar-clear-outbox';
+
+/**
+ * This browser signed itself out on purpose ("Sign out this browser"): what
+ * it queued while signed in is not sent by whoever signs in next. Empties
+ * the outbox here and tells the service worker, which empties it too and
+ * stops a replay it is in. A refused send (401, 403 AUTH_SESSION_PROOF)
+ * keeps its entries for after the sign-in, up to MAX_REPLAY_ATTEMPTS.
+ * True when the page's store was emptied.
+ */
+export async function clearOutbox() {
+  outboxGeneration += 1;
+  let cleared = false;
+  if (typeof indexedDB !== 'undefined' && indexedDB) {
+    let db = null;
+    try {
+      db = await openOutboxDb();
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).clear();
+      cleared = await new Promise((resolve) => {
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+        tx.onabort = () => resolve(false);
+      });
+    } catch {
+      cleared = false;
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  }
+  try { globalThis.navigator?.serviceWorker?.controller?.postMessage({ type: OUTBOX_CLEAR_MESSAGE }); } catch {}
+  return cleared;
 }
 
 let fallbackReplayBound = false;

@@ -778,6 +778,10 @@ test('launchSessionCli reuses a live existing process before launching', async (
         return { processId: process.pid, commandLine: 'gh copilot -- --session-id abc-123' };
       },
     },
+    readProcessIdentity: async (pid, options) => {
+      assert.deepEqual(options, { fresh: true });
+      return { pid, startTime: '987654', commandLine: 'gh copilot -- --session-id abc-123' };
+    },
     execFileSyncImpl() {
       throw new Error('tmux should not be checked when live process is reused');
     },
@@ -789,6 +793,44 @@ test('launchSessionCli reuses a live existing process before launching', async (
   assert.equal(launched.reused, true);
   assert.equal(launched.pid, process.pid);
   assert.equal(launched.launchMode, 'existing');
+});
+
+test('launchSessionCli reuses a listed process only by its identity, never by its pid alone', async () => {
+  // The row names pid `process.pid` (alive: this test); what runs there now
+  // decides.
+  const launchWith = async ({ platform = 'linux', row = { processId: process.pid, commandLine: 'node claude-session-worker.mjs --session-id abc-123' }, current }) => {
+    const spawned = [];
+    let launched = null;
+    try {
+      launched = await launchSessionCli({
+        targetSessionId: 'abc-123',
+        cwd: '/repo',
+        platform,
+        env: { COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: '' },
+        prepareOarMcpConfigImpl: fakeMcpConfig(POSIX_MCP_CONFIG),
+        processInspector: { findProcessForSessionAsync: async () => row },
+        readProcessIdentity: async () => (typeof current === 'function' ? current() : current),
+        execFileSyncImpl() { throw new Error('no tmux here'); },
+        spawnImpl() { spawned.push('spawn'); throw new Error('spawned'); },
+      });
+    } catch (error) {
+      if (!/spawned|tmux/.test(error.message)) throw error;
+    }
+    return { reused: launched?.reused === true, spawned: spawned.length > 0 || !launched };
+  };
+  const ours = (extra = {}) => ({ pid: process.pid, startTime: '987654', commandLine: 'node claude-session-worker.mjs --session-id abc-123', ...extra });
+  assert.equal((await launchWith({ current: ours() })).reused, true, 'the session\'s by its command line');
+  assert.equal((await launchWith({ current: ours({ commandLine: 'sshd: dev@pts/0' }) })).reused, false, 'the pid went to another program');
+  assert.equal((await launchWith({ current: null })).reused, false, 'no process has the pid');
+  assert.equal((await launchWith({ current: () => { throw new Error('unreadable'); } })).reused, true, 'nothing readable: a running process is reused, never doubled');
+  // Windows: the fresh row is the identity (its createdAt and command line),
+  // so no second read of the process list judges it.
+  const winRow = { processId: process.pid, commandLine: 'node claude-session-worker.mjs --session-id abc-123', createdAt: 1762941600000 };
+  let reads = 0;
+  const counted = () => { reads += 1; return null; };
+  assert.equal((await launchWith({ platform: 'win32', row: winRow, current: counted })).reused, true);
+  assert.equal((await launchWith({ platform: 'win32', row: { ...winRow, commandLine: 'node claude-session-worker.mjs --session-id other-9' }, current: counted })).reused, false, 'a row of another session');
+  assert.equal(reads, 0, 'no identity read on Windows');
 });
 
 test('launchSessionCli bypasses process reuse when disabled', async () => {
@@ -1233,7 +1275,7 @@ test('an unreadable process list does not stop a windows launch', async () => {
   assert.match(reported[0], /^windows-process-snapshot-unreadable: /);
 });
 
-test('the launcher prefers the asynchronous finder and asks the pid poll for a fresh list', async () => {
+test('the launcher prefers the asynchronous finder and asks the reuse check and the pid poll for a fresh list', async () => {
   const lookups = [];
   let polls = 0;
   const launched = await launchSessionCli({
@@ -1251,7 +1293,8 @@ test('the launcher prefers the asynchronous finder and asks the pid poll for a f
     processInspector: {
       async findProcessForSessionAsync(target, options) {
         lookups.push({ target, options });
-        if (!options?.fresh) return null;
+        // The reuse check finds nothing; the polls find the new process.
+        if (lookups.length === 1) return null;
         polls += 1;
         return polls >= 2 ? { processId: process.pid, commandLine: 'node claude-session-worker.mjs --session-id abc-123' } : null;
       },
@@ -1262,6 +1305,6 @@ test('the launcher prefers the asynchronous finder and asks the pid poll for a f
   });
   assert.equal(launched.pid, process.pid);
   assert.equal(launched.launchMode, 'console');
-  assert.deepEqual(lookups.map((entry) => entry.options), [{ fresh: false }, { fresh: true }, { fresh: true }]);
+  assert.deepEqual(lookups.map((entry) => entry.options), [{ fresh: true }, { fresh: true }, { fresh: true }]);
   assert.ok(lookups.every((entry) => entry.target === 'abc-123'));
 });

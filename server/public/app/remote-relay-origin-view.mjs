@@ -103,14 +103,21 @@ export function normalizeRemoteOrigin(raw) {
   const relayId = oneLine(raw.relayId);
   if (!relayName && !relayId) return null;
   const relayUrl = oneLine(raw.relayUrl);
+  // Origin binding: only an origin the relay verified (the paired relay
+  // signed in with its own key) names its relay for sure; anything else is
+  // a claim: tagged "claimed", and its address is never a link.
+  const verified = raw.verified === true;
   return {
     relayName: relayName || relayId,
-    relayUrl: /^https?:\/\//i.test(relayUrl) ? relayUrl : '',
+    relayUrl: verified && /^https?:\/\//i.test(relayUrl) ? relayUrl : '',
     conversationId: oneLine(raw.conversationId),
     conversationTitle: oneLine(raw.conversationTitle),
     model: oneLine(raw.model),
+    verified,
   };
 }
+
+export const CLAIMED_ORIGIN_TOOLTIP = 'Claimed, not verified: the sending relay did not sign in with a key of its own (an older OAR, or no confirmed key yet). The prompt opens nothing here. Re-pair in Settings → Relays to fix it.';
 
 export function remoteOriginBadgeText(origin, options = {}) {
   const local = localAgentOriginModel(origin, options);
@@ -153,6 +160,9 @@ export function renderRemoteOriginBadgeHtml(origin, { linkable = true, conversat
   const label = escapeHtml(remoteOriginBadgeText(normalized));
   const href = linkable ? remoteOriginLink(normalized) : '';
   const name = escapeHtml(normalized.relayName);
+  if (!normalized.verified) {
+    return `<div class="msg-origin"><span class="msg-origin-badge msg-origin-claimed" title="${escapeHtml(CLAIMED_ORIGIN_TOOLTIP)}">${label} <span class="msg-origin-claimed-tag">claimed</span></span></div>`;
+  }
   if (href) {
     return `<div class="msg-origin"><a class="msg-origin-badge" href="${escapeHtml(href)}" target="_blank" rel="noopener" title="Sent by an agent on relay ${name}. Opens its session there.">${label}</a></div>`;
   }
@@ -185,7 +195,9 @@ export function conversationOriginInfo(conversation, { conversations = null, lin
   if (!normalized) return null;
   return {
     kind: 'remote',
-    label: `Started by an agent on relay “${normalized.relayName}”`,
+    label: normalized.verified
+      ? `Started by an agent on relay “${normalized.relayName}”`
+      : `Started by an agent claiming to be relay “${normalized.relayName}” (unverified)`,
     href: linkable !== false ? remoteOriginLink(normalized) : '',
   };
 }

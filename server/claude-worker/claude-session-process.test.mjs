@@ -5136,6 +5136,117 @@ test('a person-only safety ask between turns gets its card on a fresh continuati
   await settled(runner);
 });
 
+test('a sensitive-file edit ask between turns gets its card on a fresh continuation turn', async () => {
+  const calls = [];
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/continuation-turn') return { messageId: 'cont-1' };
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      return { question: { id: 'rq-1', status: 'answered', answer: 'Allow once' } };
+    }
+    return { ok: true };
+  };
+  let capturedCanUseTool = null;
+  const turn = scriptedTurn();
+  const runner = createClaudeSessionRunner({
+    api,
+    sdkSessionId: 'conv-1',
+    cwd: osModule.tmpdir(),
+    relocateTranscriptImpl: noopRelocate,
+    startClaudeSessionImpl: (params) => {
+      capturedCanUseTool = params.canUseTool;
+      return turn;
+    },
+    continuationRetryDelayMs: 10,
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'agent', description: 'background agent' }]));
+  turn.emit(resultMessage('spawned', 'native-1'));
+  assert.equal(await first, true);
+
+  const input = { file_path: '/srv/sample-app/work/.bashrc', content: 'alias ll="ls -l"' };
+  const decision = await capturedCanUseTool('Write', input, {
+    blockedPath: '/srv/sample-app/work/.bashrc',
+    decisionReason: 'Claude requested permissions to edit /srv/sample-app/work/.bashrc which is a sensitive file.',
+    decisionReasonType: 'safetyCheck',
+    toolUseID: 'toolu_sample_1',
+  });
+  assert.deepEqual(decision, { behavior: 'allow', updatedInput: input });
+  const continuationPost = calls.find((call) => call.routePath === '/api/continuation-turn');
+  assert.ok(continuationPost, 'a continuation turn is registered before the card');
+  const questionPost = calls.find((call) => call.routePath === '/api/relay-question');
+  assert.equal(questionPost.body.queueId, 'cont-1', 'the card must ride the registered continuation turn');
+  assert.equal(questionPost.body.context.source, 'ClaudeSafetyCheck');
+  assert.equal(questionPost.body.context.kind, 'sensitive-file');
+  assert.deepEqual(questionPost.body.choices, ['Allow once', 'Deny']);
+
+  turn.emit(resultMessage('removed', 'native-1'));
+  await waitFor(
+    () => calls.find((call) => call.routePath === '/api/response' && call.body.messageId === 'cont-1'),
+    { label: 'continuation response' },
+  );
+  turn.endInput();
+  await settled(runner);
+});
+
+// Plan §10 C 28: the sensitive-file card shows in every relay mode, plan
+// included; no mode auto-allows it.
+for (const relayMode of ['plan', 'ask', 'agent', 'autopilot']) {
+  test(`a sensitive-file safety check in ${relayMode} mode gets the person-only Safety check card`, async () => {
+    const stub = makeApiStub({
+      routeResponses: {
+        '/api/relay-question': { question: { id: 'rq-1' } },
+        '/api/relay-question/rq-1': { question: { id: 'rq-1', status: 'answered', answer: 'Allow once' } },
+      },
+    });
+    let captured = null;
+    const turn = scriptedTurn();
+    const runner = makeRunner({
+      stub,
+      startImpl: (params) => {
+        captured = params;
+        return turn;
+      },
+      askUserBridgeOptions: { questionPollMs: 10 },
+    });
+    const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode } });
+    turn.emit(initMessage('native-1'));
+    await waitFor(() => captured?.canUseTool, { label: 'canUseTool wired' });
+    assert.equal(captured.relayMode, relayMode);
+
+    const input = { file_path: '/srv/sample-app/work/.bashrc', content: 'alias ll="ls -l"' };
+    const decision = await captured.canUseTool('Write', input, {
+      suggestions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }],
+      blockedPath: '/srv/sample-app/work/.bashrc',
+      decisionReason: 'Claude requested permissions to edit /srv/sample-app/work/.bashrc which is a sensitive file.',
+      decisionReasonType: 'safetyCheck',
+      toolUseID: 'toolu_sample_1',
+      signal: new AbortController().signal,
+    });
+    assert.deepEqual(decision, { behavior: 'allow', updatedInput: input });
+    const questionPost = stub.calls.find((call) => call.routePath === '/api/relay-question');
+    assert.ok(questionPost, 'the card is posted');
+    assert.equal(questionPost.body.context.source, 'ClaudeSafetyCheck');
+    assert.equal(questionPost.body.context.kind, 'sensitive-file');
+    assert.equal(questionPost.body.context.personOnly, true);
+    assert.equal(questionPost.body.context.header, 'Safety check');
+    assert.equal(questionPost.body.context.relayMode, relayMode);
+    assert.equal(questionPost.body.mode, relayMode);
+    assert.deepEqual(questionPost.body.choices, ['Allow once', 'Deny']);
+    assert.equal(questionPost.body.allowFreeform, false);
+    assert.match(questionPost.body.prompt, /File: \/srv\/sample-app\/work\/\.bashrc\n\nChange, 1 line:\n│ alias ll="ls -l"/);
+
+    turn.emit(resultMessage('done', 'native-1'));
+    await pending;
+    turn.endInput();
+    await settled(runner);
+  });
+}
+
 test('a session-scoped refusal fallback is recorded truthfully and the pinned model is repinned next turn', async () => {
   // Live incident (conv 3366b9d3): a security-audit session pinned to
   // claude-fable-5[1m] tripped Fable's safeguards; the CLI switched the whole

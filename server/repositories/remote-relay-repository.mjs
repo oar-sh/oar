@@ -18,10 +18,12 @@ import { REMOTE_RELAY_LOCAL_ID, normalizeRemoteRelayOrigin } from '../../shared/
 // Allow to change sessions a conversation did not start (update_session) is an unlock
 // under `<relay id>:session-settings`, like the watch approvals.
 
+// Stored origins were written by this relay: their `verified`, `entryId`
+// and `epoch` (origin binding) are kept on the way back.
 function parseOrigin(json) {
   if (!json) return null;
   try {
-    return normalizeRemoteRelayOrigin(JSON.parse(json));
+    return normalizeRemoteRelayOrigin(JSON.parse(json), { trusted: true });
   } catch {
     return null;
   }
@@ -133,14 +135,14 @@ export function createRemoteRelayRepository(db) {
       return deleteUnlocksForConversation.run(String(conversationId || '')).changes;
     },
     setMessageOrigin(messageId, origin) {
-      const normalized = normalizeRemoteRelayOrigin(origin);
+      const normalized = normalizeRemoteRelayOrigin(origin, { trusted: true });
       return setMessageOrigin.run(normalized ? JSON.stringify(normalized) : null, String(messageId || '')).changes > 0;
     },
     getMessageOrigin(messageId) {
       return parseOrigin(getMessageOrigin.get(String(messageId || ''))?.origin_json);
     },
     setConversationOrigin(conversationId, origin) {
-      const normalized = normalizeRemoteRelayOrigin(origin);
+      const normalized = normalizeRemoteRelayOrigin(origin, { trusted: true });
       return setConversationOrigin.run(normalized ? JSON.stringify(normalized) : null, String(conversationId || '')).changes > 0;
     },
     getConversationOrigin(conversationId) {
@@ -151,13 +153,26 @@ export function createRemoteRelayRepository(db) {
      * origin, not the local registry id) write to the conversation: by
      * starting it, or with a prompt in it?
      */
-    hasContactFrom(conversationId, remoteInstanceId) {
+    hasContactFrom(conversationId, remoteInstanceId, { weighted = null } = {}) {
       const conversation = String(conversationId || '').trim();
       const instance = String(remoteInstanceId || '').trim();
       if (!conversation || !instance) return false;
-      if (parseOrigin(getConversationOrigin.get(conversation)?.origin_json)?.relayId === instance) return true;
+      // Origin binding: only origins that carry weight for that relay count
+      // (`weighted(origin)`); a claim opens nothing.
+      const counts = (origin) => !!origin && origin.relayId === instance && (typeof weighted !== 'function' || weighted(origin));
+      if (counts(parseOrigin(getConversationOrigin.get(conversation)?.origin_json))) return true;
       return listUserMessageOrigins.all(conversation)
-        .some((row) => parseOrigin(row.origin_json)?.relayId === instance);
+        .some((row) => counts(parseOrigin(row.origin_json)));
+    },
+    /** Legacy origin rows (from before origin binding): `{ messages, conversations }`. */
+    countLegacyOrigins() {
+      try {
+        const messages = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE origin_json IS NOT NULL AND origin_json NOT LIKE '%"verified":%' AND origin_json NOT LIKE '%"local":true%'`).get()?.n || 0;
+        const conversations = db.prepare(`SELECT COUNT(*) AS n FROM conversations WHERE origin_json IS NOT NULL AND origin_json NOT LIKE '%"verified":%' AND origin_json NOT LIKE '%"local":true%'`).get()?.n || 0;
+        return { messages: Number(messages) || 0, conversations: Number(conversations) || 0 };
+      } catch {
+        return { messages: 0, conversations: 0 };
+      }
     },
     /** The id of the latest message the user wrote themselves, or null. */
     latestHumanMessageId(conversationId) {

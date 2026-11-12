@@ -241,22 +241,59 @@ test('a registry pid whose process is gone counts as stopped: nothing to stop, n
   }
 });
 
-test('a registry pid that is alive is still stopped when the list does not show it', async () => {
+// Windows hands a pid out again within seconds: the registry's pid that is
+// not in the session's tree is stopped only while it is still the worker.
+function windowsUnlistedWorker({ snapshot, workerIdentity = null, readProcessIdentityImpl = undefined }) {
   const stopCalls = [];
+  const snapshotReads = [];
   const alive = new Set([4242]);
-  const result = await stopSessionWorkerProcesses({
-    sdkSessionId: SID,
-    worker: { pid: 4242 },
-    platform: 'win32',
-    processInspector: {
-      findWindowsProcessTreeForSessionAsync: async () => [{ processId: 81 }],
-      stopWindowsPidsAsync: async (pids) => { stopCalls.push([...pids]); for (const pid of pids) alive.delete(pid); },
-    },
-    isPidAliveImpl: (pid) => alive.has(pid),
-    ...fakeClock(),
-  });
+  return {
+    stopCalls,
+    snapshotReads,
+    run: () => stopSessionWorkerProcesses({
+      sdkSessionId: SID,
+      worker: { pid: 4242 },
+      workerIdentity,
+      platform: 'win32',
+      processInspector: {
+        findWindowsProcessTreeForSessionAsync: async () => [{ processId: 81 }],
+        ...(snapshot ? { readProcessSnapshot: async (options) => { snapshotReads.push(options); return snapshot; } } : {}),
+        stopWindowsPidsAsync: async (pids) => { stopCalls.push([...pids]); for (const pid of pids) alive.delete(pid); },
+      },
+      ...(readProcessIdentityImpl ? { readProcessIdentityImpl } : {}),
+      isPidAliveImpl: (pid) => alive.has(pid),
+      ...fakeClock(),
+    }),
+  };
+}
+
+const WORKER_ROW = { processId: 4242, parentProcessId: 1, name: 'node.exe', commandLine: `node claude-session-worker.mjs --session-id ${SID}`, createdAt: 1762941600000 };
+
+test('win32: a registry pid the tree does not show is stopped when it is still the session\'s worker', async () => {
+  const app = windowsUnlistedWorker({ snapshot: [WORKER_ROW], workerIdentity: { pid: 4242, startTime: '1762941600000' } });
+  const result = await app.run();
   assert.equal(result.ok, true);
-  assert.deepEqual(stopCalls, [[81, 4242]]);
+  assert.deepEqual(app.stopCalls, [[81, 4242]]);
+  // The list the tree came from, not a read of its own.
+  assert.deepEqual(app.snapshotReads, [{ fresh: false }]);
+});
+
+test('win32: a registry pid that is not verified as the worker is never killed', async () => {
+  const cases = {
+    'another process got the pid': { snapshot: [{ ...WORKER_ROW, name: 'svchost.exe', commandLine: 'C:\\Windows\\system32\\svchost.exe -k netsvcs' }] },
+    'another session\'s worker': { snapshot: [{ ...WORKER_ROW, commandLine: 'node claude-session-worker.mjs --session-id sess-2' }] },
+    'another start time than before the stop': { snapshot: [WORKER_ROW], workerIdentity: { pid: 4242, startTime: '1762941500000' } },
+    'not on the list at all': { snapshot: [] },
+    'no list to read': { snapshot: null },
+    'a reader that throws': { snapshot: [WORKER_ROW], readProcessIdentityImpl: async () => { throw new Error('unreadable'); } },
+  };
+  for (const [name, options] of Object.entries(cases)) {
+    const app = windowsUnlistedWorker(options);
+    const result = await app.run();
+    assert.equal(result.ok, true, name);
+    assert.deepEqual(app.stopCalls, [[81]], name);
+    assert.deepEqual(result.pids, [81], name);
+  }
 });
 
 // The process list holds every process with its command line, so a live

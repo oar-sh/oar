@@ -91,10 +91,14 @@ test.describe("fullscreen file viewer", () => {
     const card = page.locator("#file-preview-body .file-preview-card");
     await expect(card.locator("[data-viewer-open-tab]")).toHaveText("Open in new tab");
     await expect(card.locator("a[download]")).toHaveAttribute("href", /[?&]v=/);
+    // Both carry the file's capability (`k`): the browser loads them without the session's key.
+    await expect(card.locator("a[download]")).toHaveAttribute("href", /[?&]k=fc1\./);
+    await expect(card.locator("[data-viewer-open-tab]")).toHaveAttribute("data-viewer-open-tab", /[?&]k=fc1\./);
     await expect(page.locator("#file-preview-mode-raw")).toBeHidden();
 
     await open(page, "song.mp3");
     await expect(page.locator("#file-preview-body")).toHaveClass(/audio-preview-mode/);
+    await expect(page.locator("#file-preview-body audio")).toHaveAttribute("src", /[?&]k=fc1\./);
     await expect(modal(page)).toHaveClass(/media-mode/);
 
     // An SVG is a picture here, not plain text: the browser must decode it.

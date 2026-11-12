@@ -46,6 +46,7 @@ import { migrateRelayAsksQueueId } from './migrations/0037-relay-asks-queue-id.m
 import { migrateTurnSeq } from './migrations/0038-turn-seq.mjs';
 import { migrateMediaIndex } from './migrations/0039-media-index.mjs';
 import { migrateImageSessionDefaults } from './migrations/0040-image-session-defaults.mjs';
+import { migrateBrowserSessions } from './migrations/0041-browser-sessions.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1113,6 +1114,15 @@ try {
   migrateImageSessionDefaults(db);
 } catch (error) {
   console.warn(`[image-sessions] migration 0040 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Browser sessions (the cookie holds a session secret, the table its hash).
+// Without the table the relay still takes Bearer sign-ins but cannot keep a
+// browser signed in, so a failure is logged and retried next boot.
+try {
+  migrateBrowserSessions(db);
+} catch (error) {
+  console.warn(`[auth] migration 0041 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

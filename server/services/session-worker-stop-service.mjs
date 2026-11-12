@@ -10,6 +10,8 @@
 // Never throws: the caller decides what a timeout means.
 // ---------------------------------------------------------------------------
 
+import { createProcessIdentityReader, judgeSessionWorkerProcess } from './session-worker-process-service.mjs';
+
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 3_000;
 const DEFAULT_ESCALATION_TIMEOUT_MS = 2_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
@@ -26,24 +28,41 @@ function toPidList(rows, extraPid) {
 // registry's pid counts only while that process is alive: a worker that is
 // gone is stopped already (on Windows its stop call alone could fail).
 //
-// On POSIX the list is every process with its command line, so a live worker
-// of the session is on it as long as its argv carries the session id within
-// ps's width (procps-ng cuts `args` at 128 KiB even with -ww), and the
-// registry's pid counts only when it is: a pid that is alive but not listed
-// is no worker of this session. It is
-// the old worker's pid handed to another process (another user's, which no
-// signal reaches, or one of the relay user's own, which the stop would
-// kill), or the worker ended and its parent has not reaped it yet (a zombie
-// answers signal 0 and has no command line left).
-async function enumeratePids({ sdkSessionId, worker, processInspector, platform, isPidAliveImpl }) {
+// On Windows the registry's pid that is alive but not in the session's tree
+// is stopped only when what runs under it is still the session's worker: its
+// command line names the session, and its start time is the one the caller
+// read before the stop (`workerIdentity`), when it has one. Windows hands a
+// pid out again within seconds; an unverified pid is never killed.
+//
+// On POSIX the list is every process with its command line, and the
+// registry's pid is signalled only when the list shows it as the session's.
+// A pid that is alive but not listed is never signalled here, since it is
+// usually no worker of this session: the old worker's pid handed to another
+// process (another user's, which no signal reaches, or one of the relay
+// user's own, which the stop would kill), or a worker that ended and whose
+// parent has not reaped it yet (a zombie answers signal 0 and has no command
+// line left). It can also be the session's worker under a command line the
+// list does not take for a worker's, or cut past the session id (procps-ng
+// cuts `args` at 128 KiB even with -ww). The stop does not tell these apart;
+// the worker replacement (worker-replacement.mjs) does, by the process's
+// start time and command line, and counts only the last as a failed stop.
+async function enumeratePids({ sdkSessionId, worker, processInspector, platform, isPidAliveImpl, readIdentity, workerIdentity }) {
   const rows = platform === 'win32'
     ? await processInspector?.findWindowsProcessTreeForSessionAsync?.(sdkSessionId, { fresh: true })
     : await processInspector?.findProcessesForSessionAsync?.(sdkSessionId, { fresh: true });
   const listed = toPidList(rows || []);
   const workerPid = Number(worker?.pid);
-  const workerAlive = Number.isInteger(workerPid) && workerPid > 0
-    && (listed.includes(workerPid) || (platform === 'win32' && isPidAliveImpl(workerPid)));
-  return workerAlive ? toPidList(rows || [], workerPid) : listed;
+  if (!Number.isInteger(workerPid) || workerPid <= 0 || listed.includes(workerPid)) return listed;
+  if (platform !== 'win32' || !isPidAliveImpl(workerPid)) return listed;
+  let current;
+  try {
+    // The list the tree came from, a moment old at most.
+    current = await readIdentity(workerPid);
+  } catch {
+    current = { pid: workerPid, startTime: null, commandLine: null };
+  }
+  const verdict = judgeSessionWorkerProcess(current, { sdkSessionId, before: workerIdentity });
+  return verdict === 'ours' ? toPidList(rows || [], workerPid) : listed;
 }
 
 async function stopWindowsPids(processInspector, pids) {
@@ -75,6 +94,11 @@ export async function stopSessionWorkerProcesses({
   platform = process.platform,
   killImpl = (pid, signal) => process.kill(pid, signal),
   isPidAliveImpl = isProcessAlive,
+  // (pid) → { pid, startTime, commandLine } | null; by default from the
+  // inspector's process list (session-worker-process-service.mjs).
+  readProcessIdentityImpl = null,
+  // The worker's identity as the caller read it before the stop, or null.
+  workerIdentity = null,
   killTmuxSessionImpl = null,
   sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   nowMs = Date.now,
@@ -97,9 +121,19 @@ export async function stopSessionWorkerProcesses({
 
   if (!sid) return done({ ok: false, error: 'Missing session id' });
 
+  const readIdentity = typeof readProcessIdentityImpl === 'function'
+    ? readProcessIdentityImpl
+    : createProcessIdentityReader({
+      platform,
+      readProcessSnapshot: typeof processInspector?.readProcessSnapshot === 'function'
+        ? (options) => processInspector.readProcessSnapshot(options)
+        : null,
+    });
+  const enumerate = () => enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl, readIdentity, workerIdentity });
+
   let pids;
   try {
-    pids = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
+    pids = await enumerate();
   } catch (error) {
     // Nothing is stopped blind: the known pid alone would leave the tree
     // running, and the caller would relaunch next to it.
@@ -132,7 +166,7 @@ export async function stopSessionWorkerProcesses({
   const stillListed = async (list) => {
     if (platform === 'win32' || !list.length) return list;
     try {
-      const fresh = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
+      const fresh = await enumerate();
       return list.filter((pid) => fresh.includes(pid) && isPidAliveImpl(pid));
     } catch {
       return list;
@@ -171,7 +205,7 @@ export async function stopSessionWorkerProcesses({
   try {
     if (platform === 'win32') {
       // Re-enumerate: children spawned after the first snapshot are invisible to it.
-      const rediscovered = await enumeratePids({ sdkSessionId: sid, worker, processInspector, platform, isPidAliveImpl });
+      const rediscovered = await enumerate();
       escalationTargets = [...new Set([...remainingPids, ...rediscovered.filter((pid) => isPidAliveImpl(pid))])];
       await stopWindowsPids(processInspector, escalationTargets);
     } else {

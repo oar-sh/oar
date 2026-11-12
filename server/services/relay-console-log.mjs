@@ -15,6 +15,8 @@ import fs from 'fs';
 import path from 'path';
 import { format } from 'util';
 
+import { RELAY_CREDENTIAL_PATTERN } from '../../shared/relay-credentials.mjs';
+
 export const RELAY_CONSOLE_LOG_FILE = 'relay-console.log';
 export const RELAY_CONSOLE_LOG_DISABLE_ENV = 'OAR_NO_CONSOLE_LOG';
 
@@ -24,6 +26,12 @@ const LEVELS = Object.freeze(['log', 'info', 'warn', 'error', 'debug']);
 const ANSI_STYLE_PATTERN = /\u001b\[[0-9;]*m/g;
 // A token in a URL, whatever its value: the page is opened with `?token=`.
 const TOKEN_PARAM_PATTERN = /([?&]token=)[^&\s"'<>]+/gi;
+// A file capability (`fc1.<session>.<expiry>.<mac>`, file-capability.mjs),
+// in a URL as `k=` or anywhere else, and a media tag (`t=` of a media
+// address, media-tag.mjs): what opens a file with a browser's cookie.
+const FILE_CAPABILITY_PATTERN = /\bfc1(?:\.|%2E)[A-Za-z0-9_-]+(?:\.|%2E)[0-9a-z]+(?:\.|%2E)[A-Za-z0-9_-]+/gi;
+const CAPABILITY_PARAM_PATTERN = /([?&]k=)[^&\s"'<>#]+/g;
+const MEDIA_TAG_PATTERN = /(\/api\/media\/\d+\/content\?(?:[^\s"'<>#]*&)?t=)[^&\s"'<>#]+/g;
 const SECRET_MIN_LENGTH = 6;
 
 function escapeRegExp(value) {
@@ -124,7 +132,10 @@ export function installRelayConsoleLog({
   }
 
   function scrub(text) {
-    const out = String(text).replace(ANSI_STYLE_PATTERN, '').replace(TOKEN_PARAM_PATTERN, '$1[token]');
+    // Any prefixed relay credential (owner token, session, sign-in code,
+    // agent token, peer key) goes by its shape; older values by name.
+    const out = String(text).replace(ANSI_STYLE_PATTERN, '').replace(TOKEN_PARAM_PATTERN, '$1[token]').replace(RELAY_CREDENTIAL_PATTERN, '[token]')
+      .replace(FILE_CAPABILITY_PATTERN, '[capability]').replace(CAPABILITY_PARAM_PATTERN, '$1[capability]').replace(MEDIA_TAG_PATTERN, '$1[tag]');
     const secrets = currentSecretPattern();
     return secrets ? out.replace(secrets, '[token]') : out;
   }

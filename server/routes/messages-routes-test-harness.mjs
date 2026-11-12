@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 
 import { registerMessagesRoutes } from './messages-routes.mjs';
+import { withPrincipal } from '../services/relay-principal-test-harness.mjs';
 
 // Baseline deps: enough for registerMessagesRoutes to register every route
 // without touching a real server. Registration eagerly prepares statements for
@@ -77,11 +78,13 @@ export function makeRes() {
 }
 
 // Dispatches into a captured handler and returns { status, body }.
-export async function invokeRoute(routes, method, routePath, { body = {}, headers = {}, query = {}, params = {}, socket = {} } = {}) {
+// `principal`: who `auth` would have said is calling (relay-principal.mjs);
+// the owner unless a test names another (an agent) or null (untagged).
+export async function invokeRoute(routes, method, routePath, { body = {}, headers = {}, query = {}, params = {}, socket = {}, principal } = {}) {
   const handler = routes.get(`${String(method).toUpperCase()} ${routePath}`);
   assert.ok(handler, `${routePath} should be registered`);
   const { res, captured } = makeRes();
-  await handler({ body, headers, query, params, socket }, res);
+  await handler(withPrincipal({ body, headers, query, params, socket }, principal), res);
   return captured;
 }
 

@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 import { fileVersionToken, serveFileWithRangeSupport, withFileVersion } from '../services/file-serving.mjs';
+import { FILE_CAPABILITY_REQUEST_KEY, withFileCapability } from '../services/file-capability.mjs';
 import { registerMediaRoutes } from './media-routes.mjs';
 import { validateEntryName } from '../services/explorer-entry-name.mjs';
 import { countEntries, createDirectory, removeEntry, renameEntry } from '../services/explorer-mutations.mjs';
@@ -64,7 +65,7 @@ import {
   resolveProviderModelSelection,
   unknownProviderModelText,
 } from '../services/provider-model-selection.mjs';
-import { stripRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
+import { stripAllRemotePromptHeaders, stripRemotePromptHeader, withRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import {
   OPENAI_IMAGE_LIMITS,
   OPENAI_IMAGE_MIME_BY_FORMAT,
@@ -118,7 +119,7 @@ import { isRelayAutomatedMessageKind } from '../../shared/relay-events.mjs';
 import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay-shutdown-gate.mjs';
 import { createStaleAttemptLogLimiter } from '../services/stale-attempt-log-limiter.mjs';
 import { createSubagentTimelinePublisher } from '../services/subagent-viewer-rooms.mjs';
-import { createLocalRequestCheck } from '../services/request-boundary.mjs';
+import { createLocalRequestCheck, isCliOverLoopback } from '../services/request-boundary.mjs';
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
 import {
   DEEPSEEK_REASONING_EFFORTS,
@@ -135,12 +136,16 @@ import { createClaudeApiStopNoteLedger } from '../services/plan-usage-claude-api
 import { normalizeClaudeApiUsageReport } from '../services/claude-api-usage-service.mjs';
 import { planBoundaryHoldSql } from '../repositories/message-repository.mjs';
 import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
+import { notPerson, principalLabel, principalOf } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES, AUTH_FILE_CAPABILITY_MESSAGE, AUTH_RELAY_TOOL_REQUIRED_MESSAGE, FILE_PROTECTED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 import {
   admitRemoteRelayRequest,
+  isDirectAgentRequest,
   readRemoteRelayRequest,
   findMentionedRemoteRelays,
   findOriginRemoteRelay,
   formatRemoteRelayOriginHint,
+  remoteOriginAnswerFields,
   formatRemoteRelayMentionHint,
   recordRemoteRelayUnlocks,
   withRemoteRelayMentionHint,
@@ -2367,6 +2372,9 @@ export function registerMessagesRoutes(app, deps) {
     pushDispatchService,
     runtimeState,
     config,
+    // `(conversationId) => token`: an agent token for one conversation, for
+    // the relay's own call back into /api/response (an image operation).
+    mintAgentToken = () => '',
     uuidv4,
     ts,
     MAX_UPLOAD_BYTES,
@@ -2376,6 +2384,20 @@ export function registerMessagesRoutes(app, deps) {
     // What a send's `imagePaths` never reads, beside the upload dirs: the
     // relay's data dir (`dirs`), its database and config files (`files`).
     imageInputDenyPaths = { dirs: [], files: [] },
+    // File capabilities (`k`, services/file-capability.mjs): `{ mint, verify }`.
+    fileCapabilities = null,
+    // `(rawPath, rootPath) => absolute path | null`: the path GET /api/files/*
+    // is asked for, normalized as a string (no link resolved, nothing read);
+    // what a file capability is checked against.
+    resolveWorkspaceFileTargetPath = () => null,
+    // The platform the file-by-path and explorer-change routes serve paths of.
+    filePlatform = process.platform,
+    // Media tags (`t`, services/media-tag.mjs): what opens GET /api/media/:id/content.
+    mediaTags = undefined,
+    // `{ isProtected, touchesProtected }` (services/relay-protected-files.mjs):
+    // the relay's secrets, database and config, never served, changed,
+    // moved or deleted (nor a folder holding them).
+    protectedRelayFiles = null,
     MAX_REPO_TREE_NODES,
     MAX_REQUEUE_RETRIES,
     MAX_IMAGE_DATA_URL_LENGTH,
@@ -3906,7 +3928,7 @@ export function registerMessagesRoutes(app, deps) {
   // for are listed as `unstoppable`. The owner's action only: a paired
   // relay's agent is refused.
   app.post('/api/conversation-groups/:id/stop', auth, (req, res) => {
-    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+    if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) {
       return res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.' });
     }
     const groupId = String(req.params.id || '').trim();
@@ -4439,6 +4461,8 @@ export function registerMessagesRoutes(app, deps) {
     db,
     uploadPathForSha,
     fetchBrowsableDrives,
+    isProtectedFile: isProtectedRelayFile,
+    ...(mediaTags ? { mediaTags } : {}),
     resolveGeneratedImagePath: ({ sessionId, relativePath }) => resolveGeneratedImageReadPath({
       resolveSessionStateRoot,
       sessionId,
@@ -4446,11 +4470,131 @@ export function registerMessagesRoutes(app, deps) {
     }),
   });
 
+  function isProtectedRelayFile(filePath) {
+    try { return protectedRelayFiles?.isProtected?.(filePath) === true; } catch { return true; }
+  }
+
+  function refuseFileCapability(res) {
+    res.status(403).json({ error: AUTH_FILE_CAPABILITY_MESSAGE, code: AUTH_ERROR_CODES.fileCapability });
+    return true;
+  }
+
+  /**
+   * First thing a file route does for a request `auth` let in on a file
+   * capability: its MAC against the path the request asks for, absolute and
+   * normalized as a string (`targetOf()`, which reads nothing from the disk;
+   * '' for a path the route would refuse). A wrong one gets 403
+   * AUTH_FILE_CAPABILITY whatever the path (missing, a link, the relay's
+   * own files): no link is resolved, no file looked at and no drive listed
+   * before it. A right one is marked on the request for that path, which
+   * file-serving.mjs checks again. True when refused; false without a
+   * capability (the request carries the proof key or a Bearer).
+   */
+  function fileCapabilityRefused(req, res, targetOf) {
+    const capability = req?.[FILE_CAPABILITY_REQUEST_KEY];
+    if (!capability) return false;
+    let target = '';
+    try { target = String((typeof targetOf === 'function' ? targetOf() : targetOf) || ''); } catch { target = ''; }
+    let checked = null;
+    try { checked = target ? fileCapabilities?.verify?.(capability.k, { filePath: target, sessionIds: capability.sessionIds }) : null; } catch { checked = null; }
+    if (!checked?.ok) return refuseFileCapability(res);
+    capability.verified = true;
+    capability.verifiedPath = target;
+    return false;
+  }
+
+  /**
+   * Before a file route reads `filePath`, after its path checks: 403 for the
+   * relay's own secrets, database and config, whoever asks; the check
+   * resolves links, so the file a verified capability's path really is gets
+   * looked at too. A request on a capability must be about the path it was
+   * verified for. True when refused.
+   */
+  function fileAccessRefused(req, res, filePath) {
+    const capability = req?.[FILE_CAPABILITY_REQUEST_KEY];
+    if (capability && (capability.verified !== true || capability.verifiedPath !== filePath)) return refuseFileCapability(res);
+    if (isProtectedRelayFile(filePath)) {
+      res.status(403).json({ error: FILE_PROTECTED_MESSAGE, code: AUTH_ERROR_CODES.protectedFile });
+      return true;
+    }
+    return false;
+  }
+
+  // The absolute path GET /api/drives/file or /api/files/* resolves for a
+  // relative address of either (with or without the relay's base path), as
+  // the routes themselves resolve it; '' for anything else.
+  function fileRoutePathOf(rawUrl) {
+    const text = String(rawUrl || '').trim();
+    if (!text.startsWith('/') || text.startsWith('//') || text.length > 4096) return '';
+    let parsed = null;
+    try { parsed = new URL(text, 'http://relay.invalid'); } catch { return ''; }
+    const base = String(remotePath || '').replace(/\/+$/, '');
+    let appPath = parsed.pathname;
+    if (base && (appPath === base || appPath.startsWith(`${base}/`))) appPath = appPath.slice(base.length);
+    if (appPath === '/api/drives/file') {
+      return driveFileTargetPath(String(parsed.searchParams.get('path') || '').trim());
+    }
+    if (appPath.startsWith('/api/files/')) {
+      let requestedPath = '';
+      try {
+        requestedPath = appPath.slice('/api/files/'.length).split('/').map((segment) => decodeURIComponent(segment)).join('/').trim();
+      } catch {
+        return '';
+      }
+      const query = Object.fromEntries(parsed.searchParams.entries());
+      const rootOverride = resolveScopedWorkspaceRootPath({ query, headers: {} });
+      // Only for a path the route would serve (a link out of the workspace
+      // is not one); signed as the string the route checks it against.
+      if (!resolveWorkspaceFilePath(requestedPath, rootOverride)) return '';
+      return resolveWorkspaceFileTargetPath(requestedPath, rootOverride) || '';
+    }
+    return '';
+  }
+
+  // The absolute path GET /api/drives/file is asked for, normalized as a
+  // string; '' for one it refuses on its face.
+  function driveFileTargetPath(requestedPath) {
+    return (filePlatform === 'win32' ? normalizeDriveAbsolutePath(requestedPath) : normalizeLinuxAbsolutePath(requestedPath)) || '';
+  }
+
+  // File capabilities for the page's native loads (an <img>, a <video>, a
+  // download, a PDF in a new tab): `{ urls: [...] }`, relative addresses of
+  // GET /api/drives/file or /api/files/*, gives back `{ urls, expiresAt }`,
+  // each address with its `k` (null for one that names no file the routes
+  // would serve). Only a browser session gets capabilities; the owner token
+  // gets the addresses back as they are (its Bearer reads them).
+  const FILE_CAPABILITY_MAX_URLS = 200;
+  app.post('/api/files/capability', auth, (req, res) => {
+    const urls = Array.isArray(req.body?.urls) ? req.body.urls : null;
+    if (!urls || urls.length > FILE_CAPABILITY_MAX_URLS || urls.some((url) => typeof url !== 'string')) {
+      return res.status(400).json({ error: `urls: a list of at most ${FILE_CAPABILITY_MAX_URLS} addresses` });
+    }
+    const principal = principalOf(req);
+    res.setHeader('Cache-Control', 'no-store');
+    if (principal?.kind !== 'browser') {
+      return res.json({ urls: urls.map((url) => (fileRoutePathOf(url) ? url : null)), expiresAt: null });
+    }
+    let expiresAtMs = null;
+    const signed = urls.map((url) => {
+      const filePath = fileRoutePathOf(url);
+      if (!filePath || isProtectedRelayFile(filePath)) return null;
+      const made = fileCapabilities?.mint?.({ sessionId: principal.sessionId, filePath });
+      if (!made?.k) return null;
+      expiresAtMs = expiresAtMs === null ? made.expiresAtMs : Math.min(expiresAtMs, made.expiresAtMs);
+      return withFileCapability(url, made.k);
+    });
+    return res.json({ urls: signed, expiresAt: expiresAtMs === null ? null : new Date(expiresAtMs).toISOString() });
+  });
+
   app.get('/api/files/{*splat}', auth, (req, res) => {
     const requestedPath = splatPath(req).trim();
     const rootOverride = resolveScopedWorkspaceRootPath(req);
+    // A capability first, then the path checks (a link out of the
+    // workspace): no 400-or-403 difference for a wrong `k`.
+    if (fileCapabilityRefused(req, res, () => resolveWorkspaceFileTargetPath(requestedPath, rootOverride))) return;
     const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath) return res.status(400).json({ error: 'Invalid file path' });
+    if (fileAccessRefused(req, res, filePath)) return;
 
     let meta = null;
     try {
@@ -4474,6 +4618,7 @@ export function registerMessagesRoutes(app, deps) {
     const rootOverride = resolveScopedWorkspaceRootPath(req);
     const filePath = resolveWorkspaceFilePath(requestedPath, rootOverride);
     if (!filePath || !normalizedPath) return res.status(400).json({ error: 'Invalid file path' });
+    if (fileAccessRefused(req, res, filePath)) return;
 
     // The preview carries the version the download link is built from, so
     // it reads the file's metadata fresh, not from the short-lived cache.
@@ -4891,7 +5036,7 @@ export function registerMessagesRoutes(app, deps) {
   // path form for the answer. Answers the request itself on a bad path.
   function withDriveMutationTarget(req, res, rawPath, { allowRoot = false } = {}, next) {
     const requestedPath = String(rawPath || '').trim();
-    if (process.platform !== 'win32') {
+    if (filePlatform !== 'win32') {
       const absolutePath = normalizeLinuxAbsolutePath(requestedPath);
       if (!absolutePath) return res.status(400).json({ error: 'Invalid Linux path' });
       if (absolutePath === '/' && !allowRoot) return res.status(400).json({ error: 'The root folder cannot be changed' });
@@ -4921,8 +5066,24 @@ export function registerMessagesRoutes(app, deps) {
     return check.name;
   }
 
+  // The relay's own secrets, database and config, and any folder holding
+  // them, are never created, renamed, moved or deleted here, whoever asks.
+  function mutationRefused(res, ...targets) {
+    const refused = targets.some((target) => {
+      try { return protectedRelayFiles?.touchesProtected?.(target) === true; } catch { return true; }
+    });
+    if (refused) res.status(403).json({ error: FILE_PROTECTED_MESSAGE, code: AUTH_ERROR_CODES.protectedFile });
+    return refused;
+  }
+
   function sendMutationResult(res, result, extra = {}) {
-    if (!result?.ok) return res.status(Number(result?.statusCode) || 500).json({ error: result?.error || 'Request failed' });
+    if (!result?.ok) {
+      const status = Number(result?.statusCode) || 500;
+      // An unexpected failure is logged with its message (the protected files
+      // were refused before any change was tried, so it names none of them).
+      if (status >= 500) console.warn(`[explorer] ${res.req?.path || 'change'} failed (${status}): ${result?.error || 'no message'}`);
+      return res.status(status).json({ error: result?.error || 'Request failed' });
+    }
     res.setHeader('Cache-Control', 'no-store');
     return res.json({ ok: true, ...extra });
   }
@@ -4934,6 +5095,7 @@ export function registerMessagesRoutes(app, deps) {
     if (String(req.body?.path || '').trim() && !parentRelative) return res.status(400).json({ error: 'Invalid path' });
     const target = resolveWorkspaceMutationTarget(req, res, parentRelative ? `${workspaceWebPath(parentRelative)}/${name}` : name);
     if (!target) return;
+    if (mutationRefused(res, target.absolutePath)) return;
     return sendMutationResult(res, createDirectory(target.absolutePath), { path: workspaceWebPath(target.relative) });
   });
 
@@ -4948,12 +5110,14 @@ export function registerMessagesRoutes(app, deps) {
     // leave the workspace or land on the root.
     const destination = resolveWorkspaceMutationTarget(req, res, destinationWeb);
     if (!destination) return;
+    if (mutationRefused(res, source.absolutePath, destination.absolutePath)) return;
     return sendMutationResult(res, renameEntry(source.absolutePath, newName), { path: workspaceWebPath(destination.relative) });
   });
 
   app.post('/api/repo/delete', auth, (req, res) => {
     const target = resolveWorkspaceMutationTarget(req, res, req.body?.path);
     if (!target) return;
+    if (mutationRefused(res, target.absolutePath)) return;
     if (req.body?.dryRun === true) {
       const counted = countEntries(target.absolutePath);
       return sendMutationResult(res, counted, counted.ok ? { kind: counted.kind, files: counted.files, dirs: counted.dirs, capped: counted.capped } : {});
@@ -4966,6 +5130,7 @@ export function registerMessagesRoutes(app, deps) {
     if (!name) return;
     withDriveMutationTarget(req, res, req.body?.path, { allowRoot: true }, (parentAbsolute, webPathOf) => {
       const targetAbsolute = path.join(parentAbsolute, name);
+      if (mutationRefused(res, targetAbsolute)) return;
       return sendMutationResult(res, createDirectory(targetAbsolute), { path: webPathOf(targetAbsolute) });
     });
   });
@@ -4974,6 +5139,7 @@ export function registerMessagesRoutes(app, deps) {
     const newName = validatedName(res, req.body?.newName);
     if (!newName) return;
     withDriveMutationTarget(req, res, req.body?.path, {}, (sourceAbsolute, webPathOf) => {
+      if (mutationRefused(res, sourceAbsolute, path.join(path.dirname(sourceAbsolute), newName))) return;
       const result = renameEntry(sourceAbsolute, newName);
       return sendMutationResult(res, result, result.ok ? { path: webPathOf(result.path) } : {});
     });
@@ -4981,6 +5147,7 @@ export function registerMessagesRoutes(app, deps) {
 
   app.post('/api/drives/delete', auth, (req, res) => {
     withDriveMutationTarget(req, res, req.body?.path, {}, (targetAbsolute) => {
+      if (mutationRefused(res, targetAbsolute)) return;
       if (req.body?.dryRun === true) {
         const counted = countEntries(targetAbsolute);
         return sendMutationResult(res, counted, counted.ok ? { kind: counted.kind, files: counted.files, dirs: counted.dirs, capped: counted.capped } : {});
@@ -4991,10 +5158,13 @@ export function registerMessagesRoutes(app, deps) {
 
   app.get('/api/drives/file', auth, (req, res) => {
     const requestedPath = String(req.query.path || '').trim();
+    // A capability first: before the path checks, the disk and the drive list.
+    if (fileCapabilityRefused(req, res, () => driveFileTargetPath(requestedPath))) return;
 
-    if (process.platform !== 'win32') {
+    if (filePlatform !== 'win32') {
       const filePath = normalizeLinuxAbsolutePath(requestedPath);
       if (!filePath) return res.status(400).json({ error: 'Invalid Linux file path' });
+      if (fileAccessRefused(req, res, filePath)) return;
 
       let meta = null;
       try {
@@ -5020,6 +5190,7 @@ export function registerMessagesRoutes(app, deps) {
       if (!filePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
         return res.status(400).json({ error: 'Invalid drive file path' });
       }
+      if (fileAccessRefused(req, res, filePath)) return;
 
       let meta = null;
       try {
@@ -5044,6 +5215,7 @@ export function registerMessagesRoutes(app, deps) {
     if (process.platform !== 'win32') {
       const filePath = normalizeLinuxAbsolutePath(requestedPath);
       if (!filePath) return res.status(400).json({ error: 'Invalid Linux file path' });
+      if (fileAccessRefused(req, res, filePath)) return;
 
       // Fresh metadata: the download link's version comes from this answer.
       workspaceFileMetaCache.delete(filePath);
@@ -5120,6 +5292,7 @@ export function registerMessagesRoutes(app, deps) {
       if (!filePath || !rootAbsolute || !allowedRoots.has(rootAbsolute)) {
         return res.status(400).json({ error: 'Invalid drive file path' });
       }
+      if (fileAccessRefused(req, res, filePath)) return;
 
       // Fresh metadata: the download link's version comes from this answer.
       workspaceFileMetaCache.delete(filePath);
@@ -5247,7 +5420,7 @@ export function registerMessagesRoutes(app, deps) {
       messageId: clientMessageId,
       clientId,
       conversationId,
-      text,
+      text: rawText,
       newConversation,
       model,
       reasoningEffort,
@@ -5267,6 +5440,16 @@ export function registerMessagesRoutes(app, deps) {
     // unlocks relays or touches the composer draft and preferences.
     const remoteRequest = admitRemoteRelayRequest(req, res, remoteRelayInbound);
     if (!remoteRequest) return;
+    // Another relay's prompt: every header line it sent goes, and this relay
+    // writes its own from the stored origin (the registry's name when the
+    // relay signed in with its key, the claimed one marked "(unverified)").
+    const text = remoteRequest.remote && !remoteRequest.local && remoteRequest.origin && typeof rawText === 'string'
+      ? withRemotePromptHeader(stripAllRemotePromptHeaders(rawText).trim(), remoteRequest.origin)
+      : rawText;
+    // Not the person (an agent token, or another relay's agent): its send
+    // never unlocks relays, touches the composer draft or the saved model,
+    // and is held to plan-only (agent auth §2.2).
+    const byAgent = notPerson(req, remoteRequest);
     const sessionId = clientId || ensureSessionId(req, res);
     const requesterIdentity = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
@@ -5286,7 +5469,7 @@ export function registerMessagesRoutes(app, deps) {
     // Plan-only: an agent's send that names another mode is refused
     // and nothing is queued (nor a billing switched). Without a mode it runs
     // in the session's own. The owner's own sends are not limited.
-    if (remoteRequest.remote && readPlanOnly(existingConversation) && planOnlyRefusesMode(relayMode || mode)) {
+    if (byAgent && readPlanOnly(existingConversation) && planOnlyRefusesMode(relayMode || mode)) {
       return res.status(409).json({ ...PLAN_ONLY_REFUSAL, conversationId });
     }
     const trimmedText = stripRelayPromptContext(text, requestedRelayMode || relayMode || mode);
@@ -5343,6 +5526,11 @@ export function registerMessagesRoutes(app, deps) {
 
     if (!trimmedText && attachments.length === 0) return res.status(400).json({ error: 'Empty message' });
     const shouldCreateConversation = !!newConversation || !conversationId;
+    // A new session by an agent token's own request: through relay_tool
+    // only, where the dispatcher's rules apply (as on the bootstrap route).
+    if (shouldCreateConversation && isDirectAgentRequest(req)) {
+      return res.status(403).json({ ok: false, code: AUTH_ERROR_CODES.relayToolRequired, error: AUTH_RELAY_TOOL_REQUIRED_MESSAGE });
+    }
     const existingRuntimeSession = shouldCreateConversation
       ? null
       : (stmts.getRuntimeSessionByConversation.get(conversationId) || null);
@@ -5420,7 +5608,7 @@ export function registerMessagesRoutes(app, deps) {
     // A send that switches to the key was refused by the switch's own check;
     // one that names the key for a chat already on it (a switch that changes
     // nothing) is refused here like any other.
-    if (remoteRequest.remote && (!billingSwitch || billingSwitch.to === 'claude-api') && runtimeProviderType === 'claude-api') {
+    if (byAgent && (!billingSwitch || billingSwitch.to === 'claude-api') && runtimeProviderType === 'claude-api') {
       let cap = null;
       try { cap = getClaudeApiCapState() || null; } catch { cap = { reached: true }; }
       if (cap?.reached === true) {
@@ -6346,7 +6534,7 @@ export function registerMessagesRoutes(app, deps) {
     // a prompt from a relay's agent opens that one relay and no other. The hint
     // rides in the queued prompt only, so the stored message and the user's
     // bubble stay exactly what was typed.
-    const mentionedRemoteRelays = remoteRequest.remote
+    const mentionedRemoteRelays = byAgent
       ? []
       : findMentionedRemoteRelays(remoteRelayInbound, trimmedText);
     // A prompt from another relay's agent opens that relay for this
@@ -6357,7 +6545,7 @@ export function registerMessagesRoutes(app, deps) {
     const queueText = withRemoteRelayMentionHint(promptText, remoteRelayHint);
     // A Resend never came from the composer, and neither did another relay's
     // agent: whatever the user is typing there stays their draft.
-    const keepsComposerDraft = !!resendOriginId || remoteRequest.remote;
+    const keepsComposerDraft = !!resendOriginId || byAgent;
 
     const requestedModelOrigin = deriveModelOrigin(requestedModelVariantId || requestedModel);
     let conversationPreferences;
@@ -6474,7 +6662,7 @@ export function registerMessagesRoutes(app, deps) {
         conversationPreferences = persistConversationModelPreference(
           convId, requestedRelayMode, requestedModel, requestedReasoningEffort, now,
         );
-      } else if (remoteRequest.remote || (!explicitModelGiven && !(explicitEffortGiven && savedModel))) {
+      } else if (byAgent || (!explicitModelGiven && !(explicitEffortGiven && savedModel))) {
         conversationPreferences = readConversationModelPreference(convId, requestedRelayMode);
       } else {
         conversationPreferences = persistConversationModelPreference(
@@ -6663,6 +6851,7 @@ export function registerMessagesRoutes(app, deps) {
     }
     res.json({
       ok: true,
+      ...remoteOriginAnswerFields(remoteRequest),
       messageId: msgId,
       conversationId: convId,
       runtimeSessionId: runtimeSession?.id || null,
@@ -8169,6 +8358,36 @@ export function registerMessagesRoutes(app, deps) {
     // The banner's "Restart now" names the queued request it saw (see
     // services/relay-restart-queue.mjs); a stale one is refused.
     const expectRequestedAt = String(req.body?.expectRequestedAt || '').trim().slice(0, 40) || null;
+    // An agent may queue a restart, nothing else (agent auth §0.3): it waits
+    // for idle as always. A restart now, a plain shutdown, anything that
+    // would cut running turns, is the person's. One exception: the `oar`
+    // CLI's own token (the cli kind), straight over loopback, may stop the
+    // relay and restart it now (`oar stop`, `stop --now`, `restart --now`,
+    // `oar uninstall`). That is no boundary: a process of the same user can
+    // end the relay anyway; the CLI asks before it does (docs/security.md).
+    //
+    // "Over loopback" means really local: any forwarding header
+    // (X-Forwarded-For, Forwarded, X-Real-IP, X-Forwarded-Proto) means a proxy
+    // in front, which connects from 127.0.0.1 for every public request too.
+    const principal = principalOf(req);
+    const cutsOff = !restart || immediate || !!expectRequestedAt;
+    const cliToken = principal?.kind === 'agent' && principal.agentKind === 'c';
+    const cliOverLoopback = isCliOverLoopback(principal, req, { isTrulyLocal: isTrulyLocalRequest });
+    if (cliOverLoopback && cutsOff) {
+      const action = restart ? 'restart-now' : (immediate ? 'stop-now' : 'stop');
+      console.log(`[auth] cli stop/restart-now: ${reason} (${action})`);
+    } else if (notPerson(req)) {
+      if (cutsOff) {
+        return res.status(403).json({
+          error: cliToken
+            ? 'The oar command may stop the relay or restart it now only straight over loopback, with no proxy in between. From here, queued restart only: POST /api/relay/shutdown with { "restart": true, "reason": "..." }.'
+            : 'An agent token gets the queued restart only: POST /api/relay/shutdown with { "restart": true, "reason": "..." }. Restarting now or shutting down is the user\'s, in the relay UI.',
+          code: AUTH_ERROR_CODES.personRequired,
+        });
+      }
+      const caller = principal?.conversationId ? String(principal.conversationId) : principalLabel(principal);
+      console.log(`[auth] agent restart queued by ${caller}: ${reason}`);
+    }
     const result = requestRelayShutdown({ reason, requestedBy, restart, immediate, expectRequestedAt });
     return res.json({ ok: true, ...result });
   });
@@ -8720,8 +8939,10 @@ export function registerMessagesRoutes(app, deps) {
     }
 
     const now = new Date().toISOString();
+    // The relay calls itself as that conversation's agent: an agent token
+    // minted for it, never the owner token.
     const selfHeaders = {
-      Authorization: `Bearer ${config.authToken}`,
+      Authorization: `Bearer ${mintAgentToken(operation.conversation_id)}`,
       'Content-Type': 'application/json',
     };
     const selfBaseUrl = `http://127.0.0.1:${config.port}`;

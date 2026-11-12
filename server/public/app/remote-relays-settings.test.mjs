@@ -115,7 +115,8 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
   const rowMatch = /^\/api\/remote-relays\/([^/]+)(\/check)?$/.exec(url.pathname);
   if (rowMatch) {
     const id = decodeURIComponent(rowMatch[1]);
-    const relay = listPayload.relays.find((entry) => entry.id === id);
+    const relay = listPayload.relays.find((entry) => entry.id === id)
+      || (listPayload.inbound || []).find((entry) => entry.id === id);
     if (!relay) return reply(404, { ok: false, error: 'Unknown remote relay' });
     if (rowMatch[2] && method === 'POST') {
       const checked = { ...relay, lastStatus: 'online', lastError: null, lastSeenAt: new Date().toISOString() };
@@ -128,7 +129,7 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
       return reply(200, { ok: true, relay: patched });
     }
     if (method === 'DELETE') {
-      listPayload = { ...listPayload, relays: listPayload.relays.filter((entry) => entry.id !== id) };
+      listPayload = { ...listPayload, relays: listPayload.relays.filter((entry) => entry.id !== id), inbound: (listPayload.inbound || []).filter((entry) => entry.id !== id) };
       return reply(200, { ok: true });
     }
   }
@@ -410,6 +411,49 @@ test('Remove asks first and only deletes when confirmed', async () => {
   assert.ok(row('rr-2'));
 });
 
+test('an inbound-only relay gets its own row: what it is, and Remove that revokes its key', async () => {
+  await freshSection();
+  const at = Date.now();
+  const holder = {
+    id: 'rr-9',
+    relayId: 'relay-d',
+    name: 'report-box',
+    url: '',
+    host: '',
+    inboundOnly: true,
+    version: '0.9.27',
+    addedAt: new Date(at - 10 * MINUTE).toISOString(),
+    protocol: 2,
+    tokenMode: 'own',
+    refusedClaims: 0,
+    peerKey: { status: 'active', lastUsedAt: new Date(at - 2 * MINUTE).toISOString(), inboundOnly: true },
+  };
+  listPayload = { relays: [LINUX], inbound: [holder], self: SELF };
+  store.setRemoteRelaysSnapshot(listPayload);
+  assert.deepEqual(rows().map((node) => node.dataset.relayId), ['rr-1', 'rr-9']);
+  const inboundRow = row('rr-9');
+  assert.equal(inboundRow.dataset.inboundOnly, 'true');
+  assert.equal(inboundRow.querySelector('.remote-relay-name').textContent, 'report-box');
+  assert.equal(inboundRow.querySelector('.remote-relay-key-tag').textContent, 'Inbound only');
+  assert.match(inboundRow.querySelector('.remote-relay-peer-key').textContent, /report-box added this relay one way and signs in here with a key this relay gave it \(its key was last used 2 min ago\); its prompts arrive verified\. This relay never calls it: it has no address here\. Remove revokes its key at once\.$/);
+  // Nothing to check, re-pair, open or set: Remove only.
+  assert.deepEqual([...inboundRow.querySelectorAll('button, a, select')].map((node) => node.className), ['preview-close remote-relay-remove']);
+  // Not offered to @mention.
+  assert.deepEqual(store.getRemoteRelays().map((relay) => relay.id), ['rr-1']);
+  assert.deepEqual(store.getInboundOnlyRelays().map((relay) => relay.id), ['rr-9']);
+  confirmAnswer = true;
+  inboundRow.querySelector('.remote-relay-remove').click();
+  await settle();
+  assert.match(confirmPrompts.at(-1), /^Remove report-box\? Its key is revoked at once: report-box can no longer call this relay\./);
+  assert.ok(requests.some((entry) => entry.method === 'DELETE' && entry.path === '/api/remote-relays/rr-9'));
+  assert.equal(row('rr-9'), undefined);
+  assert.equal(el('remote-relays-empty').hidden, true);
+  // Only an inbound-only relay: the list is not "empty".
+  store.setRemoteRelaysSnapshot({ relays: [], inbound: [holder], self: SELF });
+  assert.equal(el('remote-relays-empty').hidden, true);
+  assert.equal(settings.describeInboundOnlyRelay({ ...holder, peerKey: { status: 'waiting' } }).text.includes('its key was not used yet'), true);
+});
+
 test('a remote_relays_updated snapshot repaints the list live', async () => {
   await freshSection();
   store.setRemoteRelaysSnapshot({ relays: [LINUX, WIN, { ...LINUX, id: 'rr-3', name: 'report-box', host: 'relay-d.example.test', url: 'https://relay-d.example.test' }] });
@@ -576,6 +620,20 @@ test('describeAddRemoteRelayResult covers every outcome', () => {
   assert.equal(describe({ ok: false, code: 'SELF' }).state, 'self');
   assert.equal(describe({ ok: false, code: 'NETWORK', error: 'Failed to fetch' }).text, 'Failed to fetch');
   assert.equal(describe({ ok: true, updated: true, relay: { name: 'x' } }, { pairBack: false }).text, 'Updated x.');
+  // One way on purpose: an inbound-only key, and no token kept.
+  const inboundOnly = describe({ ok: true, relay: { name: 'linux-test' }, pairedBack: false, oneWay: 'inbound-only', keys: { ours: { ok: false, inboundOnly: true }, theirs: { ok: true, inboundOnly: true } } }, { pairBack: false });
+  assert.deepEqual([inboundOnly.state, inboundOnly.added], ['added', true]);
+  assert.equal(inboundOnly.text, 'Added linux-test one way. linux-test gave this relay a key of its own and lists it as inbound only: this relay\'s prompts arrive there verified, linux-test never calls this relay, and its token was not kept. To make the pairing two-way, add it again with "Also add this relay there".');
+  // One way with an OAR older than 0.9.27: the token stays, said so.
+  const older = describe({ ok: true, relay: { name: 'linux-test' }, pairedBack: false, oneWay: 'older' }, { pairBack: false });
+  assert.equal(older.state, 'added');
+  assert.match(older.text, /^Added linux-test one way\. It runs an OAR older than 0\.9\.27, which gives no keys: this relay keeps linux-test's token \(which opens everything there\) and its prompts arrive there as claimed\./);
+  // A protocol-2 relay without inbound-only keys: no key either way.
+  const oneWay = describe({ ok: true, relay: { name: 'linux-test' }, pairedBack: false, keys: { ours: { ok: false }, theirs: { ok: false, unlisted: true } } }, { pairBack: false });
+  assert.equal(oneWay.state, 'added');
+  assert.equal(oneWay.added, true);
+  assert.match(oneWay.text, /^Added linux-test one way\. Its OAR gives no inbound-only keys \(older than 0\.9\.27\) and it does not list this relay, so neither relay gets a key: this relay keeps linux-test's token \(which opens everything there\)/);
+  assert.match(oneWay.text, /Re-pair on its row \(or Add again with "Also add this relay there"\) switches both to keys\.$/);
 });
 
 test('browserSelfUrl offers the page address only when another relay could use it', () => {
@@ -595,4 +653,101 @@ test('formatRelativeTime', () => {
   assert.equal(settings.formatRelativeTime(ago(5 * MINUTE), now), '5 min ago');
   assert.equal(settings.formatRelativeTime(ago(3 * 60 * MINUTE), now), '3 h ago');
   assert.equal(settings.formatRelativeTime(ago(2 * 24 * 60 * MINUTE), now), '2 d ago');
+});
+
+test('the peer-key line: keyed, legacy token, old version; refused claims; what Re-pair says', () => {
+  const at = Date.parse('2026-11-11T12:00:00.000Z');
+  const keyed = settings.describeRelayPeerKey({ ...LINUX, protocol: 2, peerKey: { status: 'active', lastUsedAt: new Date(at - 5 * MINUTE).toISOString(), theirKey: true } }, at);
+  assert.deepEqual([keyed.state, keyed.label], ['keyed', 'Keyed']);
+  assert.match(keyed.text, /signs in here with its own key, last used 5 min ago; this relay holds its key\./);
+  const legacy = settings.describeRelayPeerKey({ ...LINUX, protocol: 2, tokenMode: 'custom', peerKey: { status: 'waiting', theirKey: false } }, at);
+  assert.deepEqual([legacy.state, legacy.label], ['legacy', 'Legacy token']);
+  assert.match(legacy.text, /arrive as claimed \(unverified\)\. Re-pair/);
+  const older = settings.describeRelayPeerKey({ ...LINUX, protocol: 1, peerKey: { status: 'older' } }, at);
+  assert.deepEqual([older.state, older.label], ['older', 'Old version']);
+  assert.match(older.text, /Update it to 0\.9\.27 or later, then Re-pair/);
+  assert.equal(settings.describeRelayPeerKey({ ...LINUX, protocol: 2, peerKey: { status: 'held' } }).state, 'held');
+  assert.equal(settings.describeRelayPeerKey({ ...LINUX, protocol: 2, peerKey: { status: 'revoked' } }).state, 'revoked');
+  // Refused there for want of a key it takes: re-add it from its link,
+  // whatever this relay's side of the row says.
+  for (const [theirKeyState, why] of [
+    ['required', /takes calls from this relay only with the key it gave it/],
+    ['gone', /no longer lists this relay, so it refuses/],
+    ['revoked', /refuses the key it gave this relay \(revoked there, or it no longer lists this relay\)/],
+  ]) {
+    const relink = settings.describeRelayPeerKey({ ...LINUX, protocol: 2, peerKey: { status: 'active', theirKey: false, theirKeyState } }, at);
+    assert.deepEqual([relink.state, relink.label], ['relink', 'Re-add from link'], theirKeyState);
+    assert.match(relink.text, why);
+    assert.match(relink.text, /Re-add this relay from its link: Add a relay, paste .*'s pairing link \(the entry is updated in place\)\.$/);
+  }
+  assert.equal(settings.describeRelayPeerKey({ ...LINUX, protocol: 2, peerKey: { status: 'held', theirKeyState: 'required' } }).state, 'held', 'a held identity comes first');
+  // Added one way with an inbound-only key: verified, no token; only the
+  // pairing link with "Also add this relay there" makes it two-way.
+  const inboundOnly = settings.describeRelayPeerKey({ ...LINUX, protocol: 2, tokenMode: 'peer', peerKey: { status: 'waiting', theirKey: true, listedInboundOnly: true, leastPrivilege: true } }, at);
+  assert.deepEqual([inboundOnly.state, inboundOnly.label], ['one-way', 'One way']);
+  assert.equal(inboundOnly.text, 'linux-test lists this relay as inbound only. This relay signs in there with a key linux-test gave it, so its prompts arrive there verified, and it holds no token of linux-test\'s; linux-test never calls this relay. To make the pairing two-way, add linux-test again from its pairing link with "Also add this relay there" on (Re-pair opens that).');
+  // Its key revoked there (Remove): re-add from the link.
+  assert.equal(settings.describeRelayPeerKey({ ...LINUX, protocol: 2, tokenMode: 'peer', peerKey: { status: 'waiting', theirKey: false, theirKeyState: 'revoked', listedInboundOnly: true } }, at).state, 'relink');
+  // Added one way to an older OAR: not a fault, and not "Re-add from link"
+  // (that would not make the other relay list this one); Re-pair does.
+  const oneWay = settings.describeRelayPeerKey({ ...LINUX, protocol: 2, tokenMode: 'custom', peerKey: { status: 'waiting', theirKey: false, theirKeyState: 'unlisted' } }, at);
+  assert.deepEqual([oneWay.state, oneWay.label], ['one-way', 'One way']);
+  assert.match(oneWay.text, /^Added one way to an OAR older than 0\.9\.27: linux-test does not list this relay, so it gives it no key\./);
+  assert.match(oneWay.text, /Re-pair adds this relay there and switches both to keys\.$/);
+  assert.doesNotMatch(oneWay.text, /Re-add/);
+  assert.equal(settings.refusedClaimsText({ refusedClaims: 0 }), '');
+  assert.equal(settings.refusedClaimsText({ refusedClaims: 1 }), '1 refused claim since start');
+  assert.equal(settings.refusedClaimsText({ refusedClaims: 3 }), '3 refused claims since start');
+  assert.equal(settings.describeRepairResult({ ok: true, keys: { ours: { ok: true }, theirs: { ok: true } } }, LINUX).text, 'Re-paired with linux-test: keys both ways.');
+  assert.equal(
+    settings.describeRepairResult({ ok: true, pairedBack: false, pairBackError: 'This relay\'s public URL is not set, so the other relay cannot reach it', keys: { ours: { ok: false }, theirs: { ok: false, unlisted: true } } }, LINUX).text,
+    'Could not add this relay to linux-test: This relay\'s public URL is not set, so the other relay cannot reach it. It stays one way until then.',
+  );
+  const needsLink = settings.describeRepairResult({ ok: false, needsLink: true, error: 'linux-test runs an older OAR.' }, LINUX);
+  assert.equal(needsLink.openLink, true);
+});
+
+// ─── This browser on the paired relays (agent auth §13.2, 1b/1c) ────────────
+
+test('"This browser on your paired relays": Sign in there and Turn on push there per relay, new windows without an opener', async () => {
+  await freshSection();
+  const section = el('remote-relays-browser-section');
+  assert.equal(section.hidden, false);
+  assert.equal(el('remote-relays-browser-title').textContent, 'This browser on your paired relays');
+  assert.match(section.textContent, /Each relay keeps its own sign-in; this page cannot see it\./);
+  const entries = [...el('remote-relays-browser-list').querySelectorAll('.remote-relays-browser-row')];
+  assert.deepEqual(entries.map((node) => node.dataset.relayId), ['rr-1', 'rr-2']);
+  const signIn = entries[0].querySelector('.remote-relays-browser-signin');
+  const push = entries[0].querySelector('.remote-relays-browser-push');
+  assert.equal(signIn.textContent, 'Sign in there');
+  assert.equal(signIn.getAttribute('href'), 'https://relay-b.example.test/');
+  assert.equal(push.textContent, 'Turn on push there');
+  assert.equal(push.getAttribute('href'), 'https://relay-b.example.test/?settings=notifications');
+  for (const link of [signIn, push]) {
+    assert.equal(link.target, '_blank');
+    assert.equal(link.rel, 'noopener noreferrer');
+  }
+  // Neither shares this page's host (localhost) on another port.
+  assert.equal(section.querySelectorAll('.remote-relays-browser-warning').length, 0);
+});
+
+test('a relay on this page\'s host but another port is warned about; a bad address or an inbound-only relay gets no row', () => {
+  const rows = settings.browserChecklistRows([
+    { id: 'a', name: 'same-host', url: 'http://localhost:3352' },
+    { id: 'b', name: 'same-port', url: 'http://localhost:3351' },
+    { id: 'c', name: 'odd', url: 'javascript:alert(1)' },
+    { id: 'd', name: 'tunnel', url: 'https://relay-c.example.test' },
+    { id: 'e', name: 'inbound only', url: 'https://relay-e.example.test', inboundOnly: true },
+    { id: 'f', name: 'no address', url: null, inboundOnly: true },
+  ], 'http://localhost:3351/?conv=c-1');
+  assert.deepEqual(rows.map((entry) => [entry.id, entry.sameHost]), [['a', true], ['b', false], ['d', false]]);
+  assert.equal(rows[0].push, 'http://localhost:3352/?settings=notifications');
+  assert.match(settings.SAME_HOST_WARNING, /sign each other out/);
+});
+
+test('?settings=relays&add-relay=1 brings the Add a relay form up, empty', () => {
+  el('remote-relays-add-url-input').value = '';
+  assert.equal(settings.revealAddRemoteRelayForm(), true);
+  assert.equal(document.activeElement, el('remote-relays-add-url-input'));
+  assert.equal(el('remote-relays-add-url-input').value, '');
 });

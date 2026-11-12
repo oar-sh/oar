@@ -4,6 +4,7 @@ import http from 'http';
 
 import { parsePreviewPath, previewLogId } from './preview-registry-service.mjs';
 import { serveStaticPreview } from './preview-static-handler.mjs';
+import { isRelayCredential } from '../../shared/relay-credentials.mjs';
 
 // The preview listener. A bare http.Server on its own loopback port whose
 // handler has exactly two outcomes: proxy to a registered upstream, or an error
@@ -72,6 +73,8 @@ export function sanitizeRequestHeaders(headers = {}, {
   forwardedFor = '',
   cookieNames = RELAY_COOKIE_NAMES,
   bearerTokens = [],
+  // `(value) => boolean`: a Bearer value that is a relay credential.
+  isRelayBearerToken = isRelayCredential,
 } = {}) {
   const out = {};
   for (const [rawName, value] of Object.entries(headers)) {
@@ -87,7 +90,7 @@ export function sanitizeRequestHeaders(headers = {}, {
       // Only the relay's own bearer token is withheld; an app's Basic/Bearer
       // auth is legitimate traffic and must pass through.
       const presented = String(value || '').replace(/^Bearer\s+/i, '').trim();
-      if (presented && bearerTokens.some((token) => token && token === presented)) continue;
+      if (presented && (bearerTokens.some((token) => token && token === presented) || isRelayBearerToken(presented))) continue;
       out.authorization = value;
       continue;
     }
@@ -249,6 +252,7 @@ export function createPreviewProxyServer({
   logger = console,
   httpImpl = http,
   relayBearerTokens = [],
+  isRelayBearerToken = isRelayCredential,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
 } = {}) {
   const agent = new httpImpl.Agent({ keepAlive: true, maxSockets: 64 });
@@ -338,6 +342,7 @@ export function createPreviewProxyServer({
       forwardedProto: String(req.headers['x-forwarded-proto'] || 'https'),
       forwardedFor: clientIp(req),
       bearerTokens: relayBearerTokens,
+      isRelayBearerToken,
     });
 
     // A request without a body can be sent a second time.
@@ -454,6 +459,7 @@ export function createPreviewProxyServer({
       forwardedProto: String(req.headers['x-forwarded-proto'] || 'https'),
       forwardedFor: clientIp(req),
       bearerTokens: relayBearerTokens,
+      isRelayBearerToken,
     });
     // The upgrade handshake needs exactly the hop-by-hop headers the proxy
     // strips everywhere else, so they are restored for this one request.

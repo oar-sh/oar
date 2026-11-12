@@ -2,6 +2,10 @@
 
 Reaching the relay from your phone or another network, through a managed tunnel. This is the detail behind the [README](../README.md#remote-access); the most complete guide is [Remote access on oar.sh](https://oar.sh/docs/remote-access/).
 
+Once your phone reaches the relay, sign it in without typing the relay token: **Settings → Security → Sign in another device** on a browser that is signed in makes a link that works once, for 10 minutes, and shows its QR code after a tap on **Show QR code** (see [the web UI](web-ui.md#security)). In a terminal on the relay host, `oar url --sign-in` prints such a link and QR code for the address a phone reaches.
+
+Two relays reached under the same host name with different ports (`host:3333`, `host:3334`) share one sign-in cookie in a browser and sign each other out; give each its own host name (a tunnel each, or `localhost` for one and `127.0.0.1` for the other).
+
 `localhostOnly` controls only the relay's own listener (`127.0.0.1` vs `0.0.0.0`). To reach the relay from outside your network, prefer one of the two managed tunnels below over opening a port. They are independent and can run at the same time.
 
 ## Optional remote internet access (SSH tunnel)
@@ -124,6 +128,22 @@ access-log address for everyone), new share links would start with `http://` and
 Restart the relay after editing the config. A proxy on the relay host itself needs neither
 `trustProxy` nor `localhostOnly`; `allowedOrigins` only if it rewrites `Host`. Under a URL
 subpath, set `remotePath` too (see the [configuration reference](configuration.md#configuration-reference-serverconfigjson)).
+
+## Pairing relays across a tunnel or proxy
+
+[Paired relays](agents-together.md#remote-relays) reach each other at the address each one has in
+**Settings → Relays → Public address**: set it to the tunnel's or the proxy's public URL on both
+relays before pairing. Pairing uses the other relay's token from its link once; from then on each
+relay signs in to the other with a key of its own (OAR 0.9.27 or later on both), which opens only
+the routes relays call each other on. A key is a bearer secret like the token, so the same rules
+apply: `https://` (plain `http://` only on loopback and private ranges), no redirects followed. A
+key is only ever sent to the address the receiving relay has stored for that relay, and checked
+back there; when a relay's address changes (a new tunnel name, a moved proxy), or another relay
+answers at it, the keys this relay gave it are revoked, nothing this relay holds for it (the key
+it gave this relay, or a token) is sent anywhere, and no new key is issued until you confirm the new address in Settings → Relays,
+then **Re-pair**.
+Replacing a relay's token does not break a keyed pairing; a relay that still calls with the token
+(an older OAR) needs the new pairing link.
 
 ## Session-worker path guard
 

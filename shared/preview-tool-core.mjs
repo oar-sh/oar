@@ -209,7 +209,7 @@ export function renderPreviewInstructionBlock({ publicBaseUrl = '', conversation
 
 ${PREVIEW_TOOL_DESCRIPTION}
 
-There is no \`${PREVIEW_TOOL_NAME}\` tool on this provider — use the authenticated localhost API (same auth as /api/relay/shutdown):
+There is no \`${PREVIEW_TOOL_NAME}\` tool on this provider — use the authenticated localhost API (\`Authorization: Bearer $OAR_AGENT_TOKEN\`, as for /api/relay/shutdown):
 
 - Publish a running dev server: \`POST /api/previews\` with \`{ "conversationId": "${conv}", "port": 5173, "label": "web app" }\` → \`{ "url": "${base}/test_<token>/", "basePath": "/test_<token>/" }\`. Register FIRST, then start the server under the returned basePath.
 - Publish files without a server: \`POST /api/previews\` with \`{ "conversationId": "${conv}", "dir": "./dist", "label": "built site" }\` — the relay serves the directory itself. \`dir\` must live inside the conversation's workspace root.

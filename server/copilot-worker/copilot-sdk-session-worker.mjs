@@ -14,7 +14,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import {
-  loadTokenFromConfig,
+  loadAgentToken,
   resolveRelayServerUrl,
 } from '../../shared/worker-runtime/config-loader.mjs';
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
@@ -64,7 +64,8 @@ async function main() {
   // duplicated to save a 1 KB read at process start. Not worth it; the
   // extension helper stays the single source of the relay URL.
   const serverUrl = resolveRelayServerUrl({ configPath });
-  const token = loadTokenFromConfig(configPath);
+  // This session's agent token (OAR_AGENT_TOKEN), bound to its conversation.
+  const token = loadAgentToken({ env: process.env, configPath, conversationId: sdkSessionId });
   const cwd = String(process.env.COPILOT_WORKSPACE_ROOT || '').trim() || process.cwd();
   const defaultModel = String(process.env.COPILOT_RELAY_MODEL || '').trim();
 

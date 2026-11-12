@@ -1,14 +1,15 @@
 // The agent SDKs (and koffi on Windows) are installed on demand from the pins
-// folders in server/agent-sdks/: an exact package.json and the lockfile `npm
-// ci` installs from. A git checkout runs the same versions from its own
-// node_modules, so the root package names every pin at the same version.
+// folders in server/agent-sdks/: an exact manifest (pin.json, package.json
+// once installed) and the lockfile `npm ci` installs from (pin-lock.json). A
+// git checkout runs the same versions from its own node_modules, so the root
+// package names every pin at the same version.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { listPinsFolders, lockProblems } from '../scripts/agent-sdk-lock.mjs';
+import { PIN_LOCK, PIN_MANIFEST, listPinsFolders, lockProblems } from '../scripts/agent-sdk-lock.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pinsDir = path.join(repoRoot, 'server', 'agent-sdks');
@@ -21,25 +22,32 @@ const ENTRIES = { claude: ['entry.mjs'], cursor: ['entry.mjs', 'entry-sqlite.mjs
 const MAIN = { claude: '@anthropic-ai/claude-agent-sdk', cursor: '@cursor/sdk', koffi: 'koffi' };
 
 test('the pins folders are claude, cursor and koffi, each with its entries', () => {
+  assert.equal(PIN_MANIFEST, 'pin.json');
+  assert.equal(PIN_LOCK, 'pin-lock.json');
   assert.deepEqual(listPinsFolders(pinsDir), Object.keys(ENTRIES).sort());
   for (const [id, entries] of Object.entries(ENTRIES)) {
-    for (const file of ['package.json', 'package-lock.json', ...entries]) {
+    for (const file of [PIN_MANIFEST, PIN_LOCK, ...entries]) {
       assert.ok(fs.existsSync(path.join(pinsDir, id, file)), `server/agent-sdks/${id}/${file} is missing`);
+    }
+    // A package.json here would read as a package of OAR's to a dependency
+    // scanner, which then lists the SDKs as OAR's dependencies.
+    for (const file of ['package.json', 'package-lock.json']) {
+      assert.ok(!fs.existsSync(path.join(pinsDir, id, file)), `server/agent-sdks/${id}/${file} must be named ${file === 'package.json' ? PIN_MANIFEST : PIN_LOCK}`);
     }
   }
 });
 
 test('every pin is an exact version, and its lockfile may ship', () => {
   for (const id of listPinsFolders(pinsDir)) {
-    const pkg = readJson(path.join(pinsDir, id, 'package.json'));
-    assert.equal(pkg.private, true, `${id}: package.json is private`);
+    const pkg = readJson(path.join(pinsDir, id, PIN_MANIFEST));
+    assert.equal(pkg.private, true, `${id}: ${PIN_MANIFEST} is private`);
     for (const field of ['devDependencies', 'optionalDependencies', 'peerDependencies', 'scripts']) {
-      assert.equal(pkg[field], undefined, `${id}: package.json has no ${field}`);
+      assert.equal(pkg[field], undefined, `${id}: ${PIN_MANIFEST} has no ${field}`);
     }
     for (const [name, spec] of Object.entries(pkg.dependencies || {})) {
       assert.match(spec, EXACT_VERSION, `${id}: ${name} is "${spec}", not an exact version`);
     }
-    const lock = readJson(path.join(pinsDir, id, 'package-lock.json'));
+    const lock = readJson(path.join(pinsDir, id, PIN_LOCK));
     assert.deepEqual(lockProblems(id, pkg, lock), [], `${id}: run node scripts/agent-sdk-lock.mjs ${id} on Linux`);
   }
 });
@@ -48,7 +56,7 @@ test('the root package holds every pin as a devDependency at the same version, f
   const root = readJson(path.join(repoRoot, 'package.json'));
   const rootLock = readJson(path.join(repoRoot, 'package-lock.json'));
   for (const id of listPinsFolders(pinsDir)) {
-    const pkg = readJson(path.join(pinsDir, id, 'package.json'));
+    const pkg = readJson(path.join(pinsDir, id, PIN_MANIFEST));
     assert.ok(pkg.dependencies[MAIN[id]], `${id}: the pins folder pins ${MAIN[id]}`);
     for (const [name, version] of Object.entries(pkg.dependencies)) {
       // An install gets them on demand; a shipped dependency would bring them back.

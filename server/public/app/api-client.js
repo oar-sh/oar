@@ -1,5 +1,7 @@
-import { BASE, TOKEN, CLIENT_ID, IS_SHARE_PREVIEW, SHARE_PREVIEW_CONVERSATION_ID, SHARED_CONVERSATION_TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
+import { BASE, TOKEN, CLIENT_ID, DEVICE_ID, IS_SHARE_PREVIEW, SHARE_PREVIEW_CONVERSATION_ID, SHARED_CONVERSATION_TOKEN, authHeaders, updateWorkspaceRootHints, applyContextUsageBar, readContextUsageRatio, currentConvId, conversations, setCliOnline, setCloudflaredTunnelState, setActiveRuntimeSessionCount, setRuntimeSessionBindingCount, setContextIndicatorMode, setServerPlatform, setUpdateState } from './store.js';
 import { liveActivityCap } from './live-activity-cap.mjs';
+import { clearSessionProof, getSessionProof, hasPageOrigin, isSameOriginUrl, sessionProofHeaders, storeSessionProof, syncSessionProof } from './session-proof.mjs';
+import { resetFileCapabilities } from './file-capability.mjs';
 import { OPENAI_IMAGE_PRESETS_PATH, OPENAI_IMAGE_SETTINGS_FIELDS, OPENAI_IMAGE_USAGE_PATH } from './openai-image-spend.mjs';
 
 // fetch() has no default timeout. Without one, a request issued while the app is
@@ -47,22 +49,147 @@ export function areNetworkRequestsEnabled() {
   return networkRequestsEnabled;
 }
 
+// A 401 on a regular call means this browser's session no longer counts
+// (signed out from another browser, expired, or the relay token it signed
+// in with was replaced): the app opens its sign-in gate instead of failing
+// silently. bootstrap.js registers the handler.
+let signedOutHandler = null;
+
+export function onSignedOut(handler) {
+  signedOutHandler = typeof handler === 'function' ? handler : null;
+}
+
+// Signed out, or signed in as another session: the file capabilities (`k`)
+// made for the session before go (file-capability.mjs); one still on its
+// way is not used.
+function forgetSessionCapabilities() {
+  try { resetFileCapabilities(); } catch {}
+}
+
+function noteSignedOut(url) {
+  forgetSessionCapabilities();
+  try { signedOutHandler?.(url); } catch {}
+}
+
+const SESSION_PROOF_CODE = 'AUTH_SESSION_PROOF';
+// A browser from before sessions (the relay token in its cookie): not signed
+// out; the page trades the cookie for a session and tries again.
+const COOKIE_UPGRADE_CODE = 'AUTH_COOKIE_UPGRADE';
+// That trade answered for another tab a moment ago: its key arrives here.
+const UPGRADE_PENDING_CODE = 'AUTH_UPGRADE_PENDING';
+const UPGRADE_WAIT_POLL_MS = 100;
+
+/**
+ * A refusal that means this browser is not signed in here: 401, or 403
+ * AUTH_SESSION_PROOF (the cookie came without its session key, or with a
+ * key that is not its own). The answer is read from a clone, so the caller
+ * can still read it.
+ */
+async function isSignedOutResponse(response) {
+  if (!response) return false;
+  if (response.status === 401) return true;
+  if (response.status !== 403) return false;
+  try {
+    const body = await (typeof response.clone === 'function' ? response.clone() : response).json();
+    return body?.code === SESSION_PROOF_CODE;
+  } catch {
+    return false;
+  }
+}
+
+async function isOldCookieResponse(response) {
+  if (response?.status !== 403) return false;
+  try {
+    const body = await (typeof response.clone === 'function' ? response.clone() : response).json();
+    return body?.code === COOKIE_UPGRADE_CODE;
+  } catch {
+    return false;
+  }
+}
+
+function isSignedOutResult(result) {
+  return result?.status === 401 || (result?.status === 403 && result?.payload?.code === SESSION_PROOF_CODE);
+}
+
+async function noteAuthRefusal(response, url, sentProof) {
+  if (!(await isSignedOutResponse(response))) return;
+  // The key this request carried no longer counts; one another tab has
+  // stored since then stays.
+  if (sentProof && getSessionProof() === sentProof) void clearSessionProof();
+  noteSignedOut(url);
+}
+
+/**
+ * This browser signed itself out (Settings → Security), or a refusal says
+ * it is signed out: the sign-in gate opens with `message` instead of
+ * waiting for the next call's 401. With `sentProof` (the key a refused
+ * request carried), the stored key goes only when it is still that one: a
+ * key another tab has stored since then stays.
+ */
+export function reportSignedOut(message = '', options = {}) {
+  const refused = options && Object.prototype.hasOwnProperty.call(options, 'sentProof');
+  const sentProof = refused ? String(options.sentProof || '') : '';
+  // Signed out on purpose: the session's key goes with it.
+  if (!refused) void clearSessionProof();
+  else if (sentProof && getSessionProof() === sentProof) void clearSessionProof();
+  forgetSessionCapabilities();
+  try { signedOutHandler?.(null, { message: String(message || '') }); } catch {}
+}
+
+// `//host`, `/\host` (a browser reads `\` as `/`): another origin.
+function leavesOrigin(path) {
+  return /^[/\\]{2}/.test(path);
+}
+
+/**
+ * `${BASE}${url}` for a path of this relay, or '' for anything that would
+ * leave this origin: `//host/…` (protocol-relative), `/\host`, a tab or a
+ * line break the URL parser drops, an absolute URL, or no path at all.
+ * apiFetch and apiFetchOrThrow send nothing then. In a page the resolved
+ * address must be of the page's own origin as well.
+ */
+export function relayRequestUrl(url) {
+  const path = typeof url === 'string' ? url : '';
+  if (!path.startsWith('/') || /[\t\n\r]/.test(path) || leavesOrigin(path)) return '';
+  const target = `${BASE}${path}`;
+  if (leavesOrigin(target)) return '';
+  if (hasPageOrigin() && !isSameOriginUrl(target)) return '';
+  return target;
+}
+
+function refuseForeignUrl(url) {
+  console.error('API request refused: not an address of this relay', String(url ?? '').slice(0, 80));
+}
+
 export async function apiFetch(url, { onErrorResponse, ...opts } = {}) {
   // A keepalive request is a page's last word; it goes out even when the
   // page's regular network work is already suspended.
   if (!networkRequestsEnabled && !opts.keepalive) return null;
+  const target = relayRequestUrl(url);
+  if (!target) {
+    refuseForeignUrl(url);
+    return null;
+  }
   try {
-    const response = await fetch(`${BASE}${url}`, {
+    const send = () => fetch(target, {
       signal: requestTimeoutSignal(),
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(target),
         ...(opts.headers || {}),
       },
       ...opts,
     });
+    let sentProof = getSessionProof();
+    let response = await send();
+    // A browser from before sessions: trade its cookie, then once more.
+    if (await isOldCookieResponse(response) && await recoverFromOldCookie(sentProof, url)) {
+      sentProof = getSessionProof();
+      response = await send();
+    }
     if (!response.ok) {
       console.error('API error', response.status, url);
+      await noteAuthRefusal(response, url, sentProof);
       // A caller that shows why a request failed reads the answer here; the
       // result is still null.
       if (typeof onErrorResponse === 'function') await onErrorResponse(response);
@@ -96,17 +223,29 @@ export function readableServerError(value) {
  */
 export async function apiFetchOrThrow(url, opts = {}) {
   if (!networkRequestsEnabled && !opts.keepalive) return null;
+  const target = relayRequestUrl(url);
+  if (!target) {
+    refuseForeignUrl(url);
+    throw Object.assign(new Error('That address is not this relay\'s.'), { status: 0 });
+  }
   let response;
+  let sentProof = getSessionProof();
+  const send = () => fetch(target, {
+    signal: requestTimeoutSignal(),
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(target),
+      ...(opts.headers || {}),
+    },
+    ...opts,
+  });
   try {
-    response = await fetch(`${BASE}${url}`, {
-      signal: requestTimeoutSignal(),
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders(),
-        ...(opts.headers || {}),
-      },
-      ...opts,
-    });
+    response = await send();
+    // A browser from before sessions: trade its cookie, then once more.
+    if (await isOldCookieResponse(response) && await recoverFromOldCookie(sentProof, url)) {
+      sentProof = getSessionProof();
+      response = await send();
+    }
   } catch (error) {
     noteFetchFailure(url, error);
     const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
@@ -118,6 +257,7 @@ export async function apiFetchOrThrow(url, opts = {}) {
   noteFetchSuccess();
   if (!response.ok) {
     console.error('API error', response.status, url);
+    await noteAuthRefusal(response, url, sentProof);
     let serverText = '';
     try {
       const body = await response.json();
@@ -128,47 +268,185 @@ export async function apiFetchOrThrow(url, opts = {}) {
   return response.json();
 }
 
-export async function verifyExistingSession(tokenCandidate = '') {
-  if (!networkRequestsEnabled) {
-    return {
-      ok: false,
-      status: 0,
-      payload: null,
-      error: 'Network requests are paused',
-    };
-  }
-  try {
-    const requestStatus = async (headers = null) => {
-      const response = await fetch(`${BASE}/api/status`, {
-        signal: requestTimeoutSignal(),
-        ...(headers ? { headers } : {}),
-      });
-      const payload = await response.json().catch(() => null);
-      if (response.ok && payload) {
-        updateWorkspaceRootHints(payload);
-        setContextIndicatorMode(payload?.contextIndicatorMode);
-        setCliOnline(!!payload?.cliOnline);
-        setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
-        setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
-        setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
-        if (payload?.platform) setServerPlatform(payload.platform);
-        setUpdateState(payload?.update || null);
-      }
-      if (response.ok) noteFetchSuccess();
-      return {
-        ok: response.ok,
-        status: response.status,
-        payload,
-        error: response.ok ? null : (payload?.error || 'Unauthorized'),
-      };
-    };
+function pausedResult() {
+  return {
+    ok: false,
+    status: 0,
+    payload: null,
+    error: 'Network requests are paused',
+  };
+}
 
-    const cookieResult = await requestStatus();
-    if (cookieResult.ok) return cookieResult;
+function networkErrorResult(error) {
+  return {
+    ok: false,
+    status: 0,
+    payload: null,
+    error: error?.message || 'Network error',
+  };
+}
+
+// GET /api/status on this browser's cookie and its session key; a good
+// answer fills the status the app starts from.
+async function requestStatus() {
+  const target = `${BASE}/api/status`;
+  const response = await fetch(target, {
+    signal: requestTimeoutSignal(),
+    credentials: 'same-origin',
+    headers: sessionProofHeaders(target, BASE),
+  });
+  const payload = await response.json().catch(() => null);
+  if (response.ok && payload) {
+    updateWorkspaceRootHints(payload);
+    setContextIndicatorMode(payload?.contextIndicatorMode);
+    setCliOnline(!!payload?.cliOnline);
+    setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
+    setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
+    setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
+    if (payload?.platform) setServerPlatform(payload.platform);
+    setUpdateState(payload?.update || null);
+  }
+  if (response.ok) noteFetchSuccess();
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
+    error: response.ok ? null : (payload?.error || 'Unauthorized'),
+  };
+}
+
+/**
+ * The sign-in exchange (POST /api/auth/session): the relay token, or a
+ * sign-in code from a `?signin=` link, for a browser session in the HttpOnly
+ * cookie. The answer carries the session's proof key once, which is kept
+ * for this origin (session-proof.mjs); the token itself is kept nowhere.
+ * Without a credential it renews this browser's session (with its key), or
+ * turns an old browser's token cookie into a session.
+ */
+export async function exchangeSignIn(credential) {
+  const value = String(credential || '').trim();
+  const response = await fetch(`${BASE}/api/auth/session`, {
+    method: 'POST',
+    signal: requestTimeoutSignal(),
+    credentials: 'same-origin',
+    headers: {
+      'Content-Type': 'application/json',
+      ...sessionProofHeaders(`${BASE}/api/auth/session`, BASE),
+      ...(value ? { Authorization: `Bearer ${value}` } : {}),
+    },
+    body: JSON.stringify({ deviceId: DEVICE_ID }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (response.ok) {
+    noteFetchSuccess();
+    if (payload?.proof) {
+      const before = getSessionProof();
+      // Stored at once (the IndexedDB copy follows): a request from here on
+      // carries the new key, so only capabilities from before it are dropped.
+      const stored = storeSessionProof(payload.proof);
+      if (getSessionProof() !== before) forgetSessionCapabilities();
+      await stored;
+    }
+  }
+  const { proof: _proof, ...visible } = payload && typeof payload === 'object' ? payload : {};
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload: payload && typeof payload === 'object' ? visible : payload,
+    error: response.ok ? null : (payload?.error || 'Unauthorized'),
+  };
+}
+
+// One sign-in at a time per origin: tabs opening together after an update
+// must not each trade the old cookie, or one tab's cookie could end up next
+// to another tab's key. (The relay holds to one session per old cookie as
+// well: a second trade within moments gets 409 AUTH_UPGRADE_PENDING.)
+async function withSignInLock(work) {
+  const locks = globalThis.navigator?.locks;
+  if (typeof locks?.request === 'function') return locks.request('oar-sign-in', work);
+  return work();
+}
+
+/** Waits up to `ms` for a key another tab stores; true when one came. */
+async function waitForSessionProof(ms) {
+  const until = Date.now() + Math.max(0, ms);
+  while (!getSessionProof()) {
+    if (Date.now() >= until) return false;
+    await new Promise((resolve) => setTimeout(resolve, UPGRADE_WAIT_POLL_MS));
+  }
+  return true;
+}
+
+/**
+ * A browser from before sessions trades the relay token in its cookie for a
+ * session and its key, once per origin (the lock; a tab that waited finds
+ * the key). A 409 AUTH_UPGRADE_PENDING: another tab's trade answered a
+ * moment ago; its key arrives in this origin's storage, or, when it does
+ * not (an answer that never arrived), the trade runs again.
+ */
+export async function tradeOldCookie() {
+  return withSignInLock(async () => {
+    if (getSessionProof()) return { ok: true, status: 200, payload: null, error: null };
+    let traded = await exchangeSignIn('');
+    if (traded.status === 409 && traded.payload?.code === UPGRADE_PENDING_CODE) {
+      const waitMs = (Number(traded.payload?.retryAfterSeconds) || 10) * 1000;
+      if (await waitForSessionProof(waitMs)) return { ok: true, status: 200, payload: null, error: null };
+      traded = await exchangeSignIn('');
+    }
+    return traded;
+  });
+}
+
+/**
+ * An API call answered 403 AUTH_COOKIE_UPGRADE: the cookie is the old one,
+ * so a key this page sent belongs to no session of this cookie. Trades the
+ * cookie; true when the call can go again. A trade the relay refuses as
+ * signed out opens the sign-in gate.
+ */
+async function recoverFromOldCookie(sentProof, url) {
+  if (sentProof && getSessionProof() === sentProof) await clearSessionProof();
+  let traded;
+  try {
+    traded = await tradeOldCookie();
+  } catch {
+    return false;
+  }
+  if (traded?.ok) return true;
+  if (isSignedOutResult(traded)) noteSignedOut(url);
+  return false;
+}
+
+/**
+ * The browser's own session at start. With a key: the status on the cookie
+ * and the key. Without one: signed out, except a browser from before
+ * sessions, whose cookie the sign-in route trades once for a session and a
+ * key. A link credential (`?token=`, `?signin=`) is exchanged when there is
+ * no working session.
+ */
+export async function verifyExistingSession(tokenCandidate = '') {
+  if (!networkRequestsEnabled) return pausedResult();
+  try {
+    await syncSessionProof();
     const normalizedToken = String(tokenCandidate || '').trim();
-    if (!normalizedToken) return cookieResult;
-    if (cookieResult.status !== 401) return cookieResult;
-    const tokenResult = await requestStatus({ Authorization: `Bearer ${normalizedToken}` });
+    if (getSessionProof()) {
+      const cookieResult = await requestStatus();
+      if (cookieResult.ok) return cookieResult;
+      // The cookie is still the old one (a key left from elsewhere): trade it.
+      if (!normalizedToken && cookieResult.status === 403 && cookieResult.payload?.code === COOKIE_UPGRADE_CODE) {
+        await clearSessionProof();
+        const upgrade = await tradeOldCookie();
+        if (!upgrade.ok) return upgrade;
+        return await requestStatus();
+      }
+      if (!normalizedToken || !isSignedOutResult(cookieResult)) return cookieResult;
+    } else if (!normalizedToken) {
+      const upgrade = await tradeOldCookie();
+      if (!upgrade.ok) return upgrade;
+      return await requestStatus();
+    }
+    const signIn = await exchangeSignIn(normalizedToken);
+    if (!signIn.ok) return signIn;
+    const tokenResult = await requestStatus();
     if (tokenResult?.ok) {
       return {
         ...tokenResult,
@@ -178,55 +456,34 @@ export async function verifyExistingSession(tokenCandidate = '') {
     return tokenResult;
   } catch (error) {
     noteFetchFailure('/api/status', error);
-    return {
-      ok: false,
-      status: 0,
-      payload: null,
-      error: error?.message || 'Network error',
-    };
+    return networkErrorResult(error);
   }
 }
 
-export async function verifyToken(token) {
-  if (!networkRequestsEnabled) {
-    return {
-      ok: false,
-      status: 0,
-      payload: null,
-      error: 'Network requests are paused',
-    };
-  }
+/**
+ * Once after start: the session learns this browser's device id when it
+ * has none (an old browser's upgrade), so signing it out later also stops
+ * its notifications. A renewal: no new key.
+ */
+export async function announceDeviceId() {
+  if (!networkRequestsEnabled || !getSessionProof()) return false;
   try {
-    const response = await fetch(`${BASE}/api/status`, {
-      signal: requestTimeoutSignal(),
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const payload = await response.json().catch(() => null);
-    if (response.ok && payload) {
-      updateWorkspaceRootHints(payload);
-      setContextIndicatorMode(payload?.contextIndicatorMode);
-      setCliOnline(!!payload?.cliOnline);
-      setCloudflaredTunnelState(payload?.cloudflaredTunnel || null);
-      setActiveRuntimeSessionCount(payload?.activeRuntimeSessionCount);
-      setRuntimeSessionBindingCount(payload?.runtimeSessionBindingCount);
-      if (payload?.platform) setServerPlatform(payload.platform);
-      setUpdateState(payload?.update || null);
-    }
-    if (response.ok) noteFetchSuccess();
-    return {
-      ok: response.ok,
-      status: response.status,
-      payload,
-      error: response.ok ? null : (payload?.error || 'Unauthorized'),
-    };
+    return (await exchangeSignIn('')).ok === true;
+  } catch {
+    return false;
+  }
+}
+
+
+export async function verifyToken(token) {
+  if (!networkRequestsEnabled) return pausedResult();
+  try {
+    const signIn = await exchangeSignIn(token);
+    if (!signIn.ok) return signIn;
+    return await requestStatus();
   } catch (error) {
-    noteFetchFailure('/api/status', error);
-    return {
-      ok: false,
-      status: 0,
-      payload: null,
-      error: error?.message || 'Network error',
-    };
+    noteFetchFailure('/api/auth/session', error);
+    return networkErrorResult(error);
   }
 }
 
@@ -298,7 +555,7 @@ async function settingsRequest(path, body = null, fallbackError = 'Request faile
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${path}`),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
@@ -469,7 +726,7 @@ async function quietGet(path) {
   try {
     const response = await fetch(`${BASE}${path}`, {
       signal: requestTimeoutSignal(),
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(`${BASE}${path}`) },
     });
     if (!response.ok) return null;
     noteFetchSuccess();
@@ -570,7 +827,7 @@ async function imagePresetsRequest(method, path, body = null) {
     response = await fetch(`${BASE}${path}`, {
       signal: requestTimeoutSignal(),
       method,
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(`${BASE}${path}`) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
   } catch (error) {
@@ -816,7 +1073,7 @@ async function remoteRelayRequest(path, { method = 'GET', body = undefined, time
       method,
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${path}`),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -872,6 +1129,27 @@ export async function removeRemoteRelay(id) {
 
 export async function checkRemoteRelay(id) {
   return remoteRelayRequest(remoteRelayPath(id, '/check'), { method: 'POST', body: {}, timeoutMs: LONG_REQUEST_TIMEOUT_MS });
+}
+
+/** One-click Re-pair: keys both ways, or `needsLink` / `needsConfirm`. */
+export async function repairRemoteRelay(id, { confirmIdentity = false } = {}) {
+  return remoteRelayRequest(remoteRelayPath(id, '/repair'), { method: 'POST', body: confirmIdentity ? { confirmIdentity: true } : {}, timeoutMs: LONG_REQUEST_TIMEOUT_MS });
+}
+
+export async function renewRemoteRelayKey(id) {
+  return remoteRelayRequest(remoteRelayPath(id, '/renew-key'), { method: 'POST', body: {}, timeoutMs: LONG_REQUEST_TIMEOUT_MS });
+}
+
+export async function revokeRemoteRelayKey(id) {
+  return remoteRelayRequest(remoteRelayPath(id, '/revoke-key'), { method: 'POST', body: {} });
+}
+
+export async function confirmRemoteRelayIdentity(id) {
+  return remoteRelayRequest(remoteRelayPath(id, '/confirm-identity'), { method: 'POST', body: {} });
+}
+
+export async function dismissRemoteRelayRefusalNotice(id) {
+  return remoteRelayRequest(remoteRelayPath(id, '/refusal-notice/dismiss'), { method: 'POST', body: {} });
 }
 
 /** `{ publicUrl, inboundEnabled }` for this relay. */
@@ -1182,7 +1460,7 @@ async function conversationActionRequest(url) {
     const response = await fetch(`${BASE}${url}`, {
       signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(`${BASE}${url}`) },
       body: '{}',
     });
     const payload = await response.json().catch(() => null);
@@ -1203,7 +1481,7 @@ async function groupRequest(url, method, body = null) {
     const response = await fetch(`${BASE}${url}`, {
       signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
       method,
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(`${BASE}${url}`) },
       body: body === null ? undefined : JSON.stringify(body),
     });
     const payload = await response.json().catch(() => null);
@@ -1263,7 +1541,7 @@ export async function deleteConversation(id) {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${url}`),
       },
     });
     const payload = await response.json().catch(() => null);
@@ -1286,7 +1564,7 @@ async function shareVisibilityRequest(url, method, body = null) {
       method,
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${url}`),
       },
       body: body === null ? undefined : JSON.stringify(body),
     });
@@ -1335,7 +1613,7 @@ export async function updateMessagePin(conversationId, messageId, pinned) {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${url}`),
       },
       body: JSON.stringify({ pinned: pinned === true }),
     });
@@ -1474,9 +1752,9 @@ function sharedReaderEndpoint(shareToken, suffix = '') {
   return token ? `${BASE}/api/shared/${encodeURIComponent(token)}${suffix}` : '';
 }
 
-function sharedReaderHeaders() {
+function sharedReaderHeaders(url) {
   return IS_SHARE_PREVIEW
-    ? { 'Content-Type': 'application/json', ...authHeaders() }
+    ? { 'Content-Type': 'application/json', ...authHeaders(url) }
     : { 'Content-Type': 'application/json' };
 }
 
@@ -1500,9 +1778,10 @@ export async function loadSharedConversation(shareToken, options = {}) {
   if (options.open === true) params.set('open', '1');
   const query = params.toString();
   try {
-    const response = await fetch(`${endpoint}${query ? `?${query}` : ''}`, {
+    const target = `${endpoint}${query ? `?${query}` : ''}`;
+    const response = await fetch(target, {
       signal: requestTimeoutSignal(),
-      headers: sharedReaderHeaders(),
+      headers: sharedReaderHeaders(target),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -1532,9 +1811,10 @@ export async function loadSharedSubagentRecord(runId, { after = 0, limit = 500 }
   const endpoint = id ? sharedReaderEndpoint(SHARED_CONVERSATION_TOKEN, `/subagent/${encodeURIComponent(id)}`) : '';
   if (!endpoint) return null;
   try {
-    const response = await fetch(`${endpoint}?after=${Number(after) || 0}&limit=${Number(limit) || 500}`, {
+    const target = `${endpoint}?after=${Number(after) || 0}&limit=${Number(limit) || 500}`;
+    const response = await fetch(target, {
       signal: requestTimeoutSignal(),
-      headers: sharedReaderHeaders(),
+      headers: sharedReaderHeaders(target),
     });
     if (!response.ok) return null;
     return await response.json().catch(() => null);
@@ -1585,7 +1865,7 @@ export async function updateConversationDraft(id, draft = {}) {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}/api/conversation/${convId}/draft`),
       },
       body: JSON.stringify(draft || {}),
     });
@@ -1759,7 +2039,7 @@ export async function bootstrapConversationSession(body = {}) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...authHeaders(),
+      ...authHeaders(`${BASE}/api/conversation/bootstrap`),
     },
     body: JSON.stringify(body || {}),
   });
@@ -1835,7 +2115,7 @@ export async function answerRelayQuestionStructured(questionId, structuredAnswer
     const response = await fetch(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`, {
       signal: requestTimeoutSignal(),
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(`${BASE}/api/relay-question/${encodeURIComponent(id)}/answer`) },
       body: JSON.stringify({ structuredAnswer, sdk_session_id: sessionId || undefined }),
     });
     const data = await response.json().catch(() => null);
@@ -1876,7 +2156,7 @@ export async function uploadAttachment(item) {
     signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
     headers: {
-      ...authHeaders(),
+      ...authHeaders(`${BASE}/api/upload`),
       'X-File-Name': encodeURIComponent(String(item.name || item.file.name || 'upload')),
       'X-File-Type': String(item.type || item.file.type || 'application/octet-stream'),
     },
@@ -1901,7 +2181,7 @@ export async function apiMutate(url, body = {}) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders(`${BASE}${url}`),
       },
       body: JSON.stringify(body),
     });
@@ -2011,10 +2291,11 @@ export async function requestGitPull(conversationId = null) {
   const convId = String(conversationId || '').trim();
   if (convId) params.set('conversationId', convId);
   const suffix = params.toString();
-  const response = await fetch(`${BASE}/api/git/pull${suffix ? `?${suffix}` : ''}`, {
+  const target = `${BASE}/api/git/pull${suffix ? `?${suffix}` : ''}`;
+  const response = await fetch(target, {
     signal: requestTimeoutSignal(LONG_REQUEST_TIMEOUT_MS),
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(target) },
   }).catch(() => null);
   if (!response) return { ok: false, error: 'Network error' };
   const payload = await response.json().catch(() => null);

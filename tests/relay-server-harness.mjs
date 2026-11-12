@@ -22,10 +22,65 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { redactSecretsInText } from "../server/services/worker-secret-redaction.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const repoRoot = path.resolve(__dirname, "..");
 export const serverScript = path.join(repoRoot, "server", "server.js");
+
+// A relay's output as it may be printed or attached to a report: the token it
+// was started with, session keys and sign-in codes (`oarc1_…`, like every
+// `oar?1_` credential), file capabilities (`fc1.…`), Bearer values and token
+// query parameters are replaced.
+const RELAY_LOG_PATTERNS = [
+  /\boar[a-z]\d?_[A-Za-z0-9_-]{8,}/g,
+  /\bfc1\.[A-Za-z0-9_.-]+/g,
+  /(\bBearer\s+)[^\s"',;]+/gi,
+  /([?&](?:token|signin|k)=)[^\s&"'#]+/gi,
+];
+
+export function redactRelayLog(text, secrets = []) {
+  let out = redactSecretsInText(String(text || ""), secrets.filter(Boolean).map(String));
+  for (const pattern of RELAY_LOG_PATTERNS) {
+    out = out.replace(pattern, (match, prefix) => (typeof prefix === "string" ? `${prefix}[redacted]` : "[redacted]"));
+  }
+  return out;
+}
+
+/**
+ * Redacts a stream line by line: a chunk's partial last line is held until
+ * its newline comes (or `end()`), so a secret split across two chunks is
+ * never written unredacted. `write` gets redacted text only.
+ */
+export function createRedactingLineWriter(write, secrets = []) {
+  let pending = "";
+  return {
+    push(text) {
+      pending += String(text ?? "");
+      const cut = pending.lastIndexOf("\n");
+      if (cut < 0) return;
+      const lines = pending.slice(0, cut + 1);
+      pending = pending.slice(cut + 1);
+      write(redactRelayLog(lines, secrets));
+    },
+    end() {
+      if (!pending) return;
+      const rest = pending;
+      pending = "";
+      write(redactRelayLog(rest, secrets));
+    },
+  };
+}
+
+// The last `bytes` of a stream's output, from a line start: a cut through a
+// line could leave a secret's tail that no pattern knows.
+function tailFromLineStart(text, bytes) {
+  if (text.length <= bytes) return text;
+  const tail = text.slice(-bytes);
+  const newline = tail.indexOf("\n");
+  return newline >= 0 ? tail.slice(newline + 1) : "";
+}
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -191,6 +246,9 @@ export function removeStateRoot(stateRoot) {
 /**
  * The server environment. `overrides` is applied last so a spec-owned server can
  * deliberately relax one pin (routing, the SDK path) without copying the block.
+ * `baseEnv` is what the pins go over: the host's environment for e2e, an
+ * environment built from nothing for a scratch relay
+ * (tests/helpers/scratch-relay-env.mjs).
  */
 export function buildRelayServerEnv({
   stateRoot,
@@ -205,6 +263,7 @@ export function buildRelayServerEnv({
   grokLoginDeniedFile,
   allowCli = false,
   overrides = {},
+  baseEnv = process.env,
 } = {}) {
   const fixtures = path.join(repoRoot, "server", "services", "fixtures");
   // host-platform: each stub is one Node script behind two launchers, and only
@@ -217,7 +276,7 @@ export function buildRelayServerEnv({
   const disableCliSpawn = allowCli ? "" : "1";
 
   return {
-    ...process.env,
+    ...baseEnv,
     COPILOT_WORKSPACE_ROOT: repoRoot,
     // The package root, which a relay exports to its sessions: inherited, the
     // test server would report that install's version and commit and start
@@ -375,6 +434,16 @@ export async function startRelayServer({
   // How long a start may take: longer for a relay that backs its database
   // up or compares two database files first (fsyncs on a loaded disk).
   readyTimeoutMs = 30_000,
+  // A relay given its token on the command line recommends a new one: the
+  // banner "Your relay token was readable by agents…" sits in the page's
+  // flow above the transcript. It is dismissed once the relay is ready, so
+  // the specs see the page they were written against; `true` keeps it.
+  keepSecurityNotices = false,
+  // How much of the relay's stdout and stderr is kept in memory (each).
+  logTailBytes = 10_000,
+  // A file the relay's output is appended to as it comes, redacted
+  // (redactRelayLog): what a failed spec's report shows (relay-log-reporter.mjs).
+  logFile = "",
 } = {}) {
   const resolvedPort = port || await reserveFreePort();
   const baseUrl = `http://127.0.0.1:${resolvedPort}`;
@@ -407,14 +476,28 @@ export async function startRelayServer({
     },
   );
 
+  const tailBytes = Math.max(1_000, Number(logTailBytes) || 10_000);
+  const writeLog = (text) => {
+    if (!logFile || !text) return;
+    try { fs.appendFileSync(logFile, text); } catch {}
+  };
+  // One writer per stream, so a held partial line is never joined with the
+  // other stream's output.
+  const stdoutLog = createRedactingLineWriter(writeLog, [token]);
+  const stderrLog = createRedactingLineWriter(writeLog, [token]);
   proc.stdout?.on("data", (chunk) => {
-    stdout += String(chunk || "");
-    if (stdout.length > 10_000) stdout = stdout.slice(-10_000);
+    const text = String(chunk || "");
+    stdout = tailFromLineStart(stdout + text, tailBytes);
+    stdoutLog.push(text);
   });
+  proc.stdout?.on("end", () => stdoutLog.end());
   proc.stderr?.on("data", (chunk) => {
-    stderr += String(chunk || "");
-    if (stderr.length > 10_000) stderr = stderr.slice(-10_000);
+    const text = String(chunk || "");
+    stderr = tailFromLineStart(stderr + text, tailBytes);
+    stderrLog.push(text);
   });
+  proc.stderr?.on("end", () => stderrLog.end());
+  proc.on("close", () => { stdoutLog.end(); stderrLog.end(); });
 
   const handle = {
     proc,
@@ -424,6 +507,11 @@ export async function startRelayServer({
     ...paths,
     get stdout() { return stdout; },
     get stderr() { return stderr; },
+    // The kept output, redacted, for printing.
+    relayLog: () => [
+      stdout ? `--- relay stdout ---\n${redactRelayLog(stdout, [token])}` : "",
+      stderr ? `--- relay stderr ---\n${redactRelayLog(stderr, [token])}` : "",
+    ].filter(Boolean).join("\n"),
     cleanupStateRoot: () => removeStateRoot(paths.stateRoot),
     // The process only: the state root stays for a restart (`state`).
     kill: () => stopProcess(proc),
@@ -441,11 +529,30 @@ export async function startRelayServer({
     removeStateRoot(paths.stateRoot);
     const suffix = [
       "[relay-server-harness] Server startup failed.",
-      stdout ? `--- server stdout ---\n${stdout}` : "",
-      stderr ? `--- server stderr ---\n${stderr}` : "",
+      stdout ? `--- server stdout ---\n${redactRelayLog(stdout, [token])}` : "",
+      stderr ? `--- server stderr ---\n${redactRelayLog(stderr, [token])}` : "",
     ].filter(Boolean).join("\n");
     throw new Error(`${error?.message || String(error)}\n${suffix}`);
   }
 
+  if (!keepSecurityNotices) await dismissUpgradeNotice(baseUrl, token);
+
   return handle;
+}
+
+// The notices a harness relay raises: the token came from the command line
+// (rotate-after-upgrade, and argv-token for the --token itself).
+async function dismissUpgradeNotice(baseUrl, token) {
+  for (const id of ["rotate-after-upgrade", "argv-token"]) {
+    try {
+      const response = await fetch(`${baseUrl}/api/auth/notices/${id}/dismiss`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: "{}",
+      });
+      if (!response.ok) console.warn(`[relay-server-harness] Dismissing the security notice ${id}: HTTP ${response.status}`);
+    } catch (error) {
+      console.warn(`[relay-server-harness] Dismissing the security notice ${id}: ${error?.message || error}`);
+    }
+  }
 }

@@ -81,6 +81,20 @@ async function openRepoBrowserFromComposer(page) {
   await page.click("#repo-browser-fab");
 }
 
+// A workspace file link's address as the page has it: its path, whether it
+// carries a file capability (`k`, file-capability.mjs) and what other query
+// parameters it has. The `k` value itself is never read out.
+function fileLinkOf(link) {
+  return link.evaluate((node) => {
+    const url = new URL(node.getAttribute("href") || "", window.location.href);
+    return {
+      path: url.pathname,
+      signed: !!url.searchParams.get("k"),
+      params: [...url.searchParams.keys()].filter((name) => name !== "k"),
+    };
+  });
+}
+
 async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30, ownerSessionId = "") {
   // When session-worker routing is enabled the queue row is born owned and the
   // anonymous legacy-relay poll never sees it; claiming it as its owner (the
@@ -820,18 +834,20 @@ test("linkifies workspace file mentions in assistant messages and question cards
     }, conversationId);
 
     const assistantReadmeLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "README.md" }).first();
+    // A link opens in a new tab, without the session's proof key: the page
+    // gives it a file capability (`k`) for its one file, and nothing else.
     await expect(assistantReadmeLink).toBeVisible();
-    await expect(assistantReadmeLink).toHaveAttribute("href", /\/api\/files\/README\.md$/);
+    await expect.poll(() => fileLinkOf(assistantReadmeLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/README\.md$/), signed: true, params: [] });
     await expect(assistantReadmeLink).toHaveAttribute("target", "_blank");
 
     const assistantWindowsPathLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "relay.mjs" }).first();
     await expect(assistantWindowsPathLink).toBeVisible();
-    await expect(assistantWindowsPathLink).toHaveAttribute("href", /\/api\/files\/server\/relay\.mjs$/);
-    await expect(assistantWindowsPathLink).not.toHaveAttribute("href", /\/api\/files\/git\/copilot\/server\/relay\.mjs$/);
+    await expect.poll(() => fileLinkOf(assistantWindowsPathLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/server\/relay\.mjs$/), signed: true, params: [] });
+    expect((await fileLinkOf(assistantWindowsPathLink)).path).not.toMatch(/\/api\/files\/git\/copilot\/server\/relay\.mjs$/);
 
     const questionReadmeLink = page.locator(".relay-question-body a", { hasText: "README.md" }).first();
     await expect(questionReadmeLink).toBeVisible();
-    await expect(questionReadmeLink).toHaveAttribute("href", /\/api\/files\/README\.md$/);
+    await expect.poll(() => fileLinkOf(questionReadmeLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/README\.md$/), signed: true, params: [] });
   } finally {
     if (messageId && conversationId) {
       await request.post("/api/response", {

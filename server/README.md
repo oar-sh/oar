@@ -1957,11 +1957,24 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/api/auth/session` | The sign-in exchange. `Authorization: Bearer <relay token \| oarc1_ sign-in code>`, body `{ deviceId, label? }` → `{ session: { id, label } }` and the session cookie (`no-store`). A browser that has a session renews it (`renewed: true`). Wrong values count toward the sign-in lockout; an agent token is `403 AUTH_PERSON_REQUIRED` |
+| DELETE | `/api/auth/session` | Sign out this browser → `{ ok, id }`; the cookie is cleared |
+| GET | `/api/auth/sessions` | The signed-in browsers → `{ sessions: [{ id, label, userAgent, deviceId, authMethod, createdAt, lastSeenAt, lastIp, expiresAt, absoluteExpiresAt, current }], currentId }` |
+| PATCH | `/api/auth/sessions/:id` | Rename one: `{ label }` → `{ session }` |
+| DELETE | `/api/auth/sessions/:id` | Sign one out → `{ ok, id, current, effects: { sockets, pushDevices } }`: its live connections close, and its device's push subscriptions go unless another session of that device is still signed in |
+| DELETE | `/api/auth/sessions` | Sign out all other browsers (the current one stays) → `{ ok, revoked, kept, effects }` |
+| POST | `/api/auth/signin-codes` | A single-use sign-in link for one more device → `{ code, link, expiresAt }` (10 minutes, `no-store`) |
+| GET | `/api/auth/owner-token` | `{ ownerToken: { set, hashed, persisted, createdAt, rotatedAt, legacyPlaintext }, pairedRelays }`, never the token |
+| POST | `/api/auth/owner-token/rotate` | A new relay token → `{ token, pairingLink, affectedRelays: [{ id, name, url }], rotatedAt }`, shown once (`no-store`). The old token fails at once; browser sessions, agent tokens and session workers keep working |
+| GET | `/api/auth/notices` | Security notices for the banner → `{ notices: [{ id: 'rotate-after-upgrade' \| 'changed-outside', message, action: 'rotate', reason?, at? }] }` |
+| POST | `/api/auth/notices/:id/dismiss` | Dismiss one, for the relay (not per browser) → `{ ok, notices }` |
+| POST | `/api/auth/notices/dismiss-signins` | `{ ids: ['signin-…'] }`: dismiss these new sign-in notices for this browser session only ("Got it") → `{ ok, dismissed, notices, signins, recommendations }`; `400` without a browser session |
 | POST | `/api/message` | Send a message from the browser. A Claude chat's send that names the other billing is `409 CLAUDE_BILLING_SWITCH_REQUIRED`, one whose `billing` is stale `409 CLAUDE_BILLING_CHANGED` (kept in the draft); see [Billing switch](#billing-switch) |
 | POST | `/api/upload` | Upload binary file content (deduped by SHA-256) |
 | GET | `/api/upload/:sha256/content` | Stream stored upload content by hash |
 | PATCH | `/api/conversation/:id/draft` | Save composer draft text and optional `draftAttachments` |
-| GET | `/api/files/*` | Stream a workspace file by repo-relative path (token required) |
+| GET | `/api/files/*` | Stream a workspace file by repo-relative path (a token, the browser session's proof key, or a file capability `k`; never the relay's secrets, database or config) |
+| POST | `/api/files/capability` | File capabilities for the page's native loads: `{ urls }` (addresses of `/api/drives/file` or `/api/files/*`) → `{ urls, expiresAt }`, each with its `k` (bound to the browser session and the file, ≤ 10 minutes). Browser sessions with their proof key; the relay token gets the addresses back as they are; agents and paired relays are refused |
 | GET | `/api/files-preview/*` | Return structured preview JSON for markdown/code/text/image/video files |
 | GET | `/api/repo/tree` | Return repository root + first-level entries for lazy workspace browsing |
 | GET | `/api/repo/list` | Lazy-load workspace directory entries (`path`, `includeHidden`, `includeHeavy`) |
@@ -1974,7 +1987,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/drives/mkdir` | As `/api/repo/mkdir` for an absolute path (also the explorer's Session root), checked like `/api/drives/list`: `{ path, name }`. Missing parents are created with the folder |
 | POST | `/api/drives/rename` | As `/api/repo/rename` for an absolute path: `{ path, newName }`. `/` and drive roots are refused |
 | POST | `/api/drives/delete` | As `/api/repo/delete` for an absolute path: `{ path, dryRun? }`. `/` and drive roots are refused |
-| GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform |
+| GET | `/api/drives/file` | Stream a file by path — Windows drive path or Linux absolute path depending on server platform (credentials as for `/api/files/*`) |
 | GET | `/api/drives/files-preview` | Return structured preview JSON for a file — Windows drive path or Linux absolute path depending on server platform |
 | GET | `/api/git/status` | Git status for the conversation's workspace root (`branch`, `upstream`, `ahead`, `behind`, `files[]` incl. untracked); a non-repo root returns `isRepo: false` rather than an error |
 | GET | `/api/git/diff` | Full-context unified diff for one changed file (`path`, optional `untracked=1`); the client renders both "changes only" and "full file" views from this single patch |
@@ -2061,13 +2074,21 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/openai/images/generate` | Generate images for an OpenAI Image conversation |
 | POST | `/api/image-operations/:operationId/execute` | Execute a queued image generation/edit operation |
 | GET | `/api/generated-image/:conversationId/:messageId/:imageId/content` | Stream a generated image blob |
-| GET | `/api/relay/identity` | This relay's identity for paired relays: `relayId`, `name` (the PWA app name, else the hostname), `version`, `platform`, `publicUrl`, `remoteRelays.{protocol, inbound}` |
-| GET | `/api/remote-relays` | Paired remote relays with their status (`relays[]`, never a token) plus `self` |
+| GET | `/api/relay/identity` | This relay's identity for paired relays: `relayId`, `name` (the PWA app name, else the hostname), `version`, `platform`, `publicUrl`, `remoteRelays.{protocol, inbound, imageInputs, peerKeys}` (protocol 2: paired relays sign in with keys of their own) |
+| GET | `/api/remote-relays` | Paired remote relays with their status (`relays[]`, never a token or key) plus `self`. Each entry carries `peerKey` (`status`: active, waiting, older, held, revoked; `lastUsedAt`, `theirKey`, `leastPrivilege`, `hold`, `unconfirmed`), `peerKeyConfirmed` and `refusedClaims` (since start) |
 | POST | `/api/remote-relays` | Pair a relay from a pasted web address (`url`, optional `token`, `pairBack`, `selfUrl`); `{ needsToken: true }` when neither token works |
 | PATCH | `/api/remote-relays/:id` | Change a paired relay's `permission` (`read` / `prompt` / `full`), URL or token |
 | DELETE | `/api/remote-relays/:id` | Remove a paired relay here (the other side keeps its entry) |
 | POST | `/api/remote-relays/:id/check` | Probe a paired relay now |
-| POST | `/api/remote-relays/pair` | (Relay to relay) Another relay introduces itself after the user paired it there |
+| POST | `/api/remote-relays/pair` | (Relay to relay, on this relay's token: owner only) Another relay introduces itself after the user paired it there. Never rewrites a listed entry's relay id or protocol; an address listed under another relay id is refused (409); a new entry stays unconfirmed until its address proves to be that relay |
+| POST | `/api/remote-relays/:id/repair` | Re-pair: probe the stored address with what this relay holds for it, pair back without rewriting the entry, keys both ways. `{ needsLink: true }` (paste the pairing link) for a relay below protocol 2 or one that refuses the stored credential; `{ needsConfirm: true }` when another identity answers there (`{ confirmIdentity: true }` confirms) |
+| POST | `/api/remote-relays/:id/renew-key` | Send that relay a new key now |
+| POST | `/api/remote-relays/:id/revoke-key` | Void its keys (and the weight of its earlier prompts); none is issued until Renew or Re-pair |
+| POST | `/api/remote-relays/:id/confirm-identity` | The owner confirms a held change of a keyed relay's address or relay id |
+| POST | `/api/remote-relays/:id/refusal-notice/dismiss` | Dismiss that relay's Inbox notice of a refused claim |
+| POST | `/api/remote-relays/peer-key` | (Relay to relay) A paired relay delivers a key it made for this relay `{ issuer, seq, key, proof? }`; kept only after the check at that relay's stored address agrees (a rotation needs a proof under the current key, a lower `seq` is a no-op) |
+| GET | `/api/remote-relays/peer-key/check` | (Relay to relay, with the key just delivered) `{ issuer, holder, seq }` of that key |
+| POST | `/api/remote-relays/peer-key/request` | (Relay to relay: its key, one retired less than 7 days ago, or this relay's token with `{ relayId }`) A new key, delivered to that relay's stored address, never in the answer; once a minute per relay. On this relay's token, `relink: true` (that relay added this one again from its pairing link) renews a key revoked here, like Renew key, without the minute; an issuance already on its way is the one it waits for |
 | GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `relay_tool` when `count` is above zero or `localEnabled` is `true` |
 | POST | `/api/remote-relays/tool` | (Worker) One `relay_tool` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
 | GET | `/api/relay-events/subscriptions` | Every active [relay event subscription](#relay-event-subscriptions) (`{ available, subscriptions }`); refused to other relays' agents |
@@ -2259,7 +2280,7 @@ follow-up, or a second time in the same runtime. The browser renders it as a com
 
 ### Workspace file bridge
 
-- Use `/api/files/<repo-relative-path>` to open workspace files in a new tab. The browser sends the auth cookie automatically.
+- Use `/api/files/<repo-relative-path>` to open workspace files in a new tab. The page adds the file capability (`k`) the cookie needs there; the cookie alone gets 403.
 - Use `/api/files-preview/<repo-relative-path>` for structured preview JSON (`kind`, `language`, `content`, `truncated`, `size`).
 - Use `/api/repo/tree?includeHidden=0&includeHeavy=0` to load workspace root and first-level entries.
 - Use `/api/repo/list?path=<repo-relative-dir>&includeHidden=0|1&includeHeavy=0|1` for lazy-loaded workspace directory browsing.
@@ -2474,7 +2495,6 @@ service).
 
 ```json
 {
-  "authToken": "<your-token>",
   "port": 3333,
   "localhostOnly": true,
   "processingTimeoutMs": 600000,
@@ -2506,7 +2526,7 @@ service).
 
 | Key | Default | Description |
 |---|---|---|
-| `authToken` | generated if empty | Token for all API / UI access. Empty or missing: a random token on every start, printed to the log and not saved (`--token <value>` sets one for the run) |
+| `authToken` | — | Gone: the relay keeps the SHA-256 of its token in `<dataDir>/relay-secrets.json` (services/owner-secret-store.mjs). One found here at a start is moved there. `--token <value>` still sets one for the run, with a warning. Agents call with `OAR_AGENT_TOKEN` (shared/relay-credentials.mjs, shared/relay-route-policy.mjs) |
 | `port` | `3333` | HTTP/WebSocket listen port (`--port <n>` for the run) |
 | `localhostOnly` | `true` | Bind only to loopback (`127.0.0.1`) and block LAN/WAN access |
 | `host` | `127.0.0.1` | Read by the workers only: the address they connect to the relay on (`0.0.0.0`, `::` and `localhost` mean `127.0.0.1`) |
@@ -2726,7 +2746,10 @@ and on `messages`:
   [Conversation sharing](#conversation-sharing-and-per-message-visibility))
 
 `0005-remote-relays.mjs` adds `origin_json` to `messages` and `conversations` (provenance of
-prompts and sessions another relay's agent created) and the table
+prompts and sessions another relay's agent created; since peer keys it carries `verified`, and for
+a relay that signed in with its key the registry `entryId` and key `epoch`: only such an origin,
+or this relay's own agent's `local: true`, carries weight, while `verified: false` and rows from
+before 0.9.27 open nothing; no migration, it is a JSON field) and the table
 `conversation_remote_relay_unlocks` (the remote relays the user mentioned per conversation).
 Agent sessions reuse both without a migration of their own: a conversation an agent of this relay
 created stores an origin with `local: true` that names the conversation it was created from, and

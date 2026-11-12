@@ -179,9 +179,15 @@ test("a running compaction is one line that turns into the final one; the window
     await clickHeaderAction(page, "context");
     await expect(slider).toBeVisible();
     await slider.fill("4");
-    // The request leaves while the page unloads, where the page-level route
-    // above no longer sees it: let it reach the relay and read what it stored.
-    await page.unroute(`**/api/conversation/${conversationId}/preferences`);
+    // The draft is taken (label and notes follow it) before the page goes.
+    await expect(page.locator("#ctx-autocompact-value")).toHaveText("300k");
+    // The request leaves while the page unloads, where the page-level routes
+    // no longer see it: none is left in its way (an intercepted request of a
+    // page that is gone can be lost on the way), so it reaches the relay. The
+    // browser may still drop it with the page; the page also keeps the save,
+    // and the reloaded page sends it while the relay still holds the old
+    // value. Either way, what the relay stored is read.
+    await page.unrouteAll({ behavior: "wait" });
     await page.reload();
     await expect.poll(async () => {
       const stored = await request.get(`/api/context/${conversationId}`, { headers });

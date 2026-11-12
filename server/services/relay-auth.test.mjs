@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
+import Database from 'better-sqlite3';
 
+import { createBrowserSessionService } from './browser-session-service.mjs';
+import { migrateBrowserSessions } from '../migrations/0041-browser-sessions.mjs';
 import {
   AUTH_FAILURE_LIMIT,
   createAuthFailureLockout,
@@ -11,6 +14,9 @@ import {
 import { createLocalRequestCheck } from './request-boundary.mjs';
 import { registerMessagesRoutes } from '../routes/messages-routes.mjs';
 import { makeRouteDeps } from '../routes/messages-routes-test-harness.mjs';
+
+// Yes/no on values that hold a credential: a failure never prints it.
+const matchSecret = (value, pattern, message) => assert.ok(pattern.test(String(value)), message || `expected ${pattern}`);
 
 const TOKEN = '6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f';
 const COOKIE = 'copilot_auth';
@@ -44,9 +50,12 @@ async function startApp({ clock = null, routes = null } = {}) {
   app.set('trust proxy', 'loopback');
   app.use(express.json());
   const lockout = createAuthFailureLockout(clock ? { nowMs: () => clock.now } : {});
+  const db = new Database(':memory:');
+  migrateBrowserSessions(db);
   const relayAuth = createRelayAuth({
     app,
     getAuthToken: () => TOKEN,
+    browserSessions: createBrowserSessionService({ db, logger: { log() {}, warn() {} } }),
     cookieName: COOKIE,
     parseCookies,
     appendSetCookie,
@@ -54,6 +63,7 @@ async function startApp({ clock = null, routes = null } = {}) {
     lockout,
     logger: { warn() {} },
   });
+  app.post('/api/auth/session', relayAuth.signIn);
   app.get('/api/status', relayAuth.auth, (_req, res) => res.json({ ok: true }));
   app.get('/api/files/{*splat}', relayAuth.auth, (_req, res) => res.type('text').send('file'));
   if (routes) routes(app, relayAuth);
@@ -77,14 +87,25 @@ test('tokensMatch: exact match only, empty never matches', () => {
   assert.equal(tokensMatch(`${TOKEN}x`, TOKEN), false);
 });
 
-test('Bearer and cookie sign in; a ?token= on an API or file URL does not', async () => {
+test('Bearer signs in; the sign-in exchange gives a session cookie that signs in; a ?token= on an API or file URL does not', async () => {
   const relay = await startApp();
   try {
     const bearer = await relay.call('/api/status', { headers: { Authorization: `Bearer ${TOKEN}` } });
     assert.equal(bearer.status, 200);
-    assert.match(String(bearer.headers.get('set-cookie')), /copilot_auth=.*HttpOnly/);
-    const cookie = await relay.call('/api/status', { headers: { Cookie: `${COOKIE}=${TOKEN}` } });
+    assert.equal(bearer.headers.get('set-cookie'), null, 'a script\'s Bearer call leaves no cookie');
+    const signIn = await relay.call('/api/auth/session', { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}` }, body: { deviceId: 'd' } });
+    assert.equal(signIn.status, 200);
+    const setCookie = String(signIn.headers.get('set-cookie'));
+    matchSecret(setCookie, /^copilot_auth=oars1_[^;]+; .*HttpOnly/);
+    const { proof } = await signIn.json();
+    const cookie = await relay.call('/api/status', { headers: { Cookie: setCookie.split(';')[0], 'X-OAR-Session-Proof': proof } });
     assert.equal(cookie.status, 200);
+    // The cookie alone opens neither the API nor a file by path (that takes
+    // the key or a file capability, file-capability-routes.test.mjs).
+    const cookieOnly = await relay.call('/api/status', { headers: { Cookie: setCookie.split(';')[0] } });
+    assert.equal(cookieOnly.status, 403);
+    assert.equal((await relay.call('/api/files/notes.md', { headers: { Cookie: setCookie.split(';')[0] } })).status, 403);
+    assert.equal((await relay.call('/api/files/notes.md', { headers: { Cookie: setCookie.split(';')[0], 'X-OAR-Session-Proof': proof } })).status, 200);
     const query = await relay.call(`/api/status?token=${TOKEN}`);
     assert.equal(query.status, 401);
     const file = await relay.call(`/api/files/notes.md?token=${TOKEN}`, { headers: tunnel('203.0.113.9') });
@@ -176,12 +197,13 @@ function runSocketMiddleware(relayAuth, socket) {
   return outcome;
 }
 
-test('socket handshake: auth.token or cookie, never query.token; wrong tokens count toward the lockout', async () => {
+test('socket handshake: auth.token or the cookie with its key, never query.token; wrong tokens count toward the lockout', async () => {
   const relay = await startApp();
   try {
     const { relayAuth } = relay;
     assert.equal(runSocketMiddleware(relayAuth, fakeSocket({ auth: { token: TOKEN } })), 'ok');
-    assert.equal(runSocketMiddleware(relayAuth, fakeSocket({ headers: { cookie: `${COOKIE}=${TOKEN}` } })), 'ok');
+    // An old owner-token cookie has no session key: its page trades it first.
+    assert.equal(runSocketMiddleware(relayAuth, fakeSocket({ headers: { cookie: `${COOKIE}=${TOKEN}` } })).data?.code, 'AUTH_COOKIE_UPGRADE');
     assert.equal(runSocketMiddleware(relayAuth, fakeSocket({ query: { token: TOKEN } })).message, 'Unauthorized');
 
     for (let index = 0; index < AUTH_FAILURE_LIMIT; index += 1) {

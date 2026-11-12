@@ -17,6 +17,7 @@ import {
   packageDatabaseEvidence,
 } from './earlier-database-service.mjs';
 import { useScratchProcessEnv } from './scratch-env-test-harness.mjs';
+import { hashOwnerToken } from '../../shared/relay-credentials.mjs';
 // Home and state folders of this process point into a scratch folder.
 useScratchProcessEnv();
 
@@ -589,6 +590,26 @@ test('a relay on another state root leaves the package\'s database alone, unless
     const tokenHash = crypto.createHash('sha256').update('own-token').digest('hex');
     fs.writeFileSync(path.join(install.earlierDir, 'relay-server.lock'), JSON.stringify({ pid: 1, tokenHash }));
     assert.equal(adopt(install, { ...isolated, authToken: 'own-token' }).status, 'adopted');
+  } finally {
+    install.cleanup();
+  }
+});
+
+test('a pre-upgrade lock is the relay\'s own by the owner token hash the secrets file keeps', () => {
+  const install = createInstall();
+  try {
+    writeDatabase(install.earlierDb, { marker: 'real-user-data', at: '2026-10-20T09:00:00.000Z' });
+    const isolatedRoot = path.join(install.root, 'isolated');
+    const isolated = {
+      dataDir: path.join(isolatedRoot, 'data'),
+      uploadDir: path.join(isolatedRoot, 'data', 'uploads'),
+      env: { ...install.env, OAR_STATE_ROOT: isolatedRoot, COPILOT_WEB_RELAY_DATA_DIR: path.join(isolatedRoot, 'data') },
+    };
+    // The lock an older build wrote: the hash of the plain token it held.
+    const legacyHash = crypto.createHash('sha256').update('own-token').digest('hex');
+    fs.writeFileSync(path.join(install.earlierDir, 'relay-server.lock'), JSON.stringify({ pid: 1, tokenHash: legacyHash }));
+    assert.equal(adopt(install, { ...isolated, ownerTokenHash: hashOwnerToken('wrong-token') }).status, 'no-earlier-database');
+    assert.equal(adopt(install, { ...isolated, ownerTokenHash: hashOwnerToken('own-token') }).status, 'adopted');
   } finally {
     install.cleanup();
   }

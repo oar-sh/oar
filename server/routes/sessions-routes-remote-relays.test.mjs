@@ -30,7 +30,8 @@ const ORIGIN = {
   model: 'claude-sonnet-5',
   hops: 1,
 };
-const STORED_ORIGIN = { kind: 'agent', ...ORIGIN };
+// On the owner token (no paired relay's key here) a claim is stored unverified.
+const STORED_ORIGIN = { kind: 'agent', ...ORIGIN, verified: false };
 const agentHeaders = { 'x-oar-remote-origin': ORIGIN.relayId, 'x-oar-remote-hops': '1' };
 
 function createMockApp() {
@@ -187,7 +188,8 @@ test('a conversation another relay\'s agent bootstraps keeps its origin and expo
   const byId = new Map(single.body.messages.map((message) => [message.id, message]));
   const userMessage = byId.get('msg-user-1');
   const assistantMessage = byId.get('msg-assistant-1');
-  assert.deepEqual(userMessage.origin, STORED_ORIGIN);
+  // A row written before origin binding (no `verified`): read as it is, unverified.
+  assert.deepEqual(userMessage.origin, { kind: 'agent', ...ORIGIN });
   // The header stays in the text: the browser hides it when origin is set.
   assert.equal(userMessage.text, header);
   assert.equal('origin' in assistantMessage, false);

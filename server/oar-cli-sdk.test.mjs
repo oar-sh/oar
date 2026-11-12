@@ -124,6 +124,31 @@ test('oar sdk install runs the store, streams npm\'s output and exits by the out
   assert.deepEqual(refused.calls.at(-1), ['dispose']);
 });
 
+test('oar sdk install --reinstall that fails says so, names the folder that stays and exits 1', async () => {
+  const kept = '/tmp/sdks/claude/0.3.1-0123abcd';
+  const failing = fakeStore({
+    install: (id, push) => { push('npm error code E407\n'); return { ok: true, status: { state: 'installing' } }; },
+    // The store hands its waiters the failure; the old folder still checks out.
+    ensure: () => ({ state: 'error', label: 'Claude Agent SDK', error: 'npm error code E407', dir: kept }),
+  });
+  const store = failing.factory;
+  const { out, options } = cliOptions({ argv: ['install', 'claude', '--reinstall'], createAgentSdkStore: (opts) => ({ ...store(opts), readyDir: () => kept }) });
+  assert.deepEqual(await runSdk(options), { code: 1, reason: 'sdk-install-failed' });
+  assert.equal(out.logs.length, 0, 'no "ready" line');
+  assert.equal(out.errors.at(-1), `[oar] Claude Agent SDK: the reinstall failed: npm error code E407. The installed folder ${kept} stays in use.`);
+  assert.equal(failing.calls[1][2], true, '--reinstall forces');
+  assert.deepEqual(failing.calls.at(-1), ['dispose']);
+
+  // Without --reinstall there is no old folder to name.
+  const plain = fakeStore({
+    install: () => ({ ok: true, status: { state: 'installing' } }),
+    ensure: () => ({ state: 'error', label: 'Claude Agent SDK', error: 'npm error code E407' }),
+  });
+  const first = cliOptions({ argv: ['install', 'claude'], createAgentSdkStore: (opts) => ({ ...plain.factory(opts), readyDir: () => null }) });
+  assert.equal((await runSdk(first.options)).code, 1);
+  assert.equal(first.out.errors.at(-1), '[oar] Claude Agent SDK: npm error code E407');
+});
+
 test('oar sdk alone prints the block and installs nothing', async () => {
   const { out, options } = cliOptions({ argv: [], createAgentSdkStore: () => assert.fail('no store for a status') });
   assert.deepEqual(await runSdk(options), { code: 0, reason: 'sdk-status' });

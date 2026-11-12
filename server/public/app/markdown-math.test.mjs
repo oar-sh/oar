@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Marked } from 'marked';
 
 import {
+  MATH_ENVIRONMENTS,
   MATH_MESSAGE_MAX_CHARS,
   mathAppliesTo,
   mathPlaceholderHtml,
@@ -106,6 +107,22 @@ const PROSE = [
   // No guessing from bare brackets.
   'Ein Draht mit (0{,}23,\\Omega) bei (20^\\circ\\text{C}).',
   'It maps by\n\n[\n\\frac1z=\\frac{x-iy}{x^2+y^2}\n]\n\nand so on.',
+  // A bare environment inside a sentence, in code, of another kind, not closed, or closed wrongly.
+  'See \\begin{align} inside a sentence \\end{align} here.',
+  'Text first \\begin{pmatrix} a & b \\end{pmatrix}',
+  'Run `\\begin{align} x \\end{align}` as code.',
+  '```latex\n\\begin{align}\nx &= 1\n\\end{align}\n```',
+  'Text\n\n    \\begin{align}\n    x\n    \\end{align}\n',
+  '\\begin{document}\ntext\n\\end{document}',
+  '\\begin{itemize}\n\\item a\n\\end{itemize}',
+  '\\begin{multline}\na \\\\\nb\n\\end{multline}',
+  '\\begin{tabular}{cc}\na & b\n\\end{tabular}',
+  '\\begin{align*}\nf(x) &= (x+1)^2 - 1 \\\\\n&= x^2 + 2x',
+  '\\begin{align}\nx &= 1\n\nLater text that ends with \\end{align}',
+  '\\begin{align}\nx\n```\ncode \\end{align}\n```',
+  '\\begin{align}\nx\n\\end{align} and more on the line',
+  '\\begin{align}\nx\n\\end{align*}',
+  '\\\\begin{align}\nx\n\\end{align}',
 ];
 
 test('prose holds no formula', () => {
@@ -115,6 +132,9 @@ test('prose holds no formula', () => {
 });
 
 // ─── Formulas are found ───────────────────────────────────────────────
+
+// The bare environment a model wrote at the start of a line, without `$$`.
+const BARE_ALIGN = '\\begin{align*}\nf(x) &= (x+1)^2 - 1 \\\\\n&= x^2 + 2x \\\\\n&= x(x+2)\n\\end{align*}';
 
 const MATHS = [
   ['Energy is $E=mc^2$ here.', ['E=mc^2']],
@@ -162,6 +182,23 @@ const MATHS = [
   ['Text\n~~~ math\nx^2\n~~~\nmore', ['x^2']],
   ['Water: $\\ce{2H2 + O2 -> 2H2O}$', ['\\ce{2H2 + O2 -> 2H2O}']],
   ['$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$', ['\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}']],
+  ['$$\n\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}\n$$', ['\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}']],
+  // Bare environments at the start of a line, their source untouched.
+  [BARE_ALIGN, [BARE_ALIGN]],
+  [`The expansion:\n${BARE_ALIGN}\nSo it factors.`, [BARE_ALIGN]],
+  [`Before.\n\n${BARE_ALIGN}\n\nAfter.`, [BARE_ALIGN]],
+  ['\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}', ['\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}']],
+  ['  \\begin{cases}\n  x & x > 0 \\\\\n  0 & \\text{else}\n  \\end{cases}', ['\\begin{cases}\n  x & x > 0 \\\\\n  0 & \\text{else}\n  \\end{cases}']],
+  ['\\begin{equation}\nE = mc^2\n\\end{equation}.\nNext.', ['\\begin{equation}\nE = mc^2\n\\end{equation}']],
+  ['\\begin{array}{c}\n\\begin{array}{c} x \\end{array} \\\\\ny\n\\end{array}', ['\\begin{array}{c}\n\\begin{array}{c} x \\end{array} \\\\\ny\n\\end{array}']],
+  ['\\begin{gather}\n\\begin{cases} a \\\\ b \\end{cases}\n\\end{gather}', ['\\begin{gather}\n\\begin{cases} a \\\\ b \\end{cases}\n\\end{gather}']],
+  ['\\begin{CD}\nA @>>> B\n\\end{CD}', ['\\begin{CD}\nA @>>> B\n\\end{CD}']],
+  ['- item\n\n  \\begin{align}\n  x\n  \\end{align}', ['\\begin{align}\nx\n\\end{align}']],
+  // An opener without its end is text; the closed environment behind it is found.
+  ['\\begin{align}\n\\begin{align}\nx\n\\end{align}', ['\\begin{align}\nx\n\\end{align}']],
+  ['> \\begin{align}\n> x\n> \\end{align}', ['\\begin{align}\nx\n\\end{align}']],
+  ['\\begin{align}\nx\n\\end{align}\n\\begin{align}\ny\n\\end{align}', ['\\begin{align}\nx\n\\end{align}', '\\begin{align}\ny\n\\end{align}']],
+  ['Costs $5 and\n\\begin{align}\nx\n\\end{align}', ['\\begin{align}\nx\n\\end{align}']],
 ];
 
 test('formulas are found between their delimiters, with their TeX untouched', () => {
@@ -309,6 +346,34 @@ test('a display block takes its closing line with it, punctuation included', () 
   assert.equal(matchMathBlock('text $$\nx\n$$'), null);
 });
 
+test('a bare environment is a display block up to its matching end, the source as written', () => {
+  assert.deepEqual(
+    matchMathBlock(`${BARE_ALIGN}\nnext`),
+    { raw: `${BARE_ALIGN}\n`, source: BARE_ALIGN, tex: BARE_ALIGN, display: true, trail: '' },
+  );
+  assert.deepEqual(
+    matchMathBlock('  \\begin{equation}\n  x\n  \\end{equation}.  \nnext'),
+    { raw: '  \\begin{equation}\n  x\n  \\end{equation}.  \n', source: '\\begin{equation}\n  x\n  \\end{equation}', tex: '\\begin{equation}\n  x\n  \\end{equation}', display: true, trail: '.' },
+  );
+  assert.equal(matchMathBlock('\\begin{pmatrix} a \\\\ b \\end{pmatrix}')?.tex, '\\begin{pmatrix} a \\\\ b \\end{pmatrix}');
+  assert.equal(matchMathBlock('\\begin{array}{c}\n\\begin{array}{c} x \\end{array}\n\\end{array}')?.tex, '\\begin{array}{c}\n\\begin{array}{c} x \\end{array}\n\\end{array}', 'nesting is counted');
+  assert.equal(matchMathBlock('\\begin{align}\n\\begin{align}\nx\n\\end{align}'), null, 'one end for two begins');
+  assert.equal(matchMathBlock('\\begin{align}\nx\n\\end{align*}'), null, 'the end names another environment');
+  assert.equal(matchMathBlock('\\begin{align}\nx\n\\end{align} more'), null, 'the end does not end its line');
+  assert.equal(matchMathBlock('\\begin{align}\nx\n\n\\end{align}'), null, 'a blank line');
+  assert.equal(matchMathBlock('\\begin{align}\nx\n```\n\\end{align}'), null, 'a code fence');
+  assert.equal(matchMathBlock('    \\begin{align}\nx\n\\end{align}'), null, 'four blanks are a code block');
+  assert.equal(matchMathBlock('\\begin{itemize}\n\\item x\n\\end{itemize}'), null, 'not an environment KaTeX sets');
+  assert.equal(matchMathBlock('\\begin{align}\nx &= 1 \\\\'), null, 'not closed yet');
+  assert.equal(matchMathBlock(`\\begin{align}\n${'x + \\\\\n'.repeat(2100)}\\end{align}`), null, 'over the size limit');
+  // Inside a paragraph it is read by the inline rule, where it starts its line only.
+  assert.equal(inline('\\begin{align}\nx\n\\end{align}', '\n')?.tex, '\\begin{align}\nx\n\\end{align}');
+  assert.equal(inline('\\begin{align}\nx\n\\end{align}', ' ', { atLineStart: false }), null);
+  for (const environment of MATH_ENVIRONMENTS) {
+    assert.equal(matchMathBlock(`\\begin{${environment}}\nx\n\\end{${environment}}`)?.tex, `\\begin{${environment}}\nx\n\\end{${environment}}`, environment);
+  }
+});
+
 test('a fenced math block is a display once it is closed', () => {
   assert.deepEqual(
     matchMathBlock('```math\na\n\nb\n```\nnext'),
@@ -348,7 +413,7 @@ test('maths applies to a message with a delimiter that is not over the size cap'
   assert.equal(mathAppliesTo('Plain prose with (some_id_1) and a path C:\\Users\\dev\\x.'), false);
   assert.equal(mathAppliesTo(''), false);
   assert.equal(mathAppliesTo(null), false);
-  for (const source of ['costs $5', 'a \\(x\\)', 'a \\[ x \\]', '```math\nx\n```', '~~~ math\nx\n~~~']) {
+  for (const source of ['costs $5', 'a \\(x\\)', 'a \\[ x \\]', '```math\nx\n```', '~~~ math\nx\n~~~', '\\begin{align}\nx\n\\end{align}']) {
     assert.equal(mathAppliesTo(source), true, source);
   }
   assert.equal(mathAppliesTo(`$x$ ${'a'.repeat(MATH_MESSAGE_MAX_CHARS - 4)}`), true);
@@ -389,6 +454,8 @@ test('no shape of 100,000 characters takes the rules long', () => {
     ['unclosed display openers, one per line', '$$ x\n'],
     ['bare display openers, one per line', '$$\n'],
     ['unclosed bracket openers, one per line', '\\[ x\n'],
+    ['unclosed environment openers, one per line', '\\begin{align}\nx\n'],
+    ['environments opened and closed on their lines', '\\begin{align}\nx\n\\end{align}\n'],
     ['displays between text lines, no blank line', 'text\n$$\nx^2\n$$\n'],
     ['real formulas', 'Let $x_i^2$ and \\(\\frac{a}{b}\\) be.\n\n'],
     // One delimiter switches the rules on; the rest of the paragraph holds none.

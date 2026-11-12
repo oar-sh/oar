@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // Writes the lockfile of each pins folder in server/agent-sdks/ (the agent
-// SDKs, and koffi, that the relay installs on demand with `npm ci`).
+// SDKs, and koffi, that the relay installs on demand with `npm ci`). A folder
+// ships its manifest as pin.json and the lockfile as pin-lock.json, never as
+// package.json (a dependency scanner would list the SDKs as OAR's own); the
+// store and this script hand them to npm under the npm names.
 //
 //   node scripts/agent-sdk-lock.mjs            every folder
 //   node scripts/agent-sdk-lock.mjs claude     one folder
@@ -14,6 +17,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { AGENT_SDK_PIN_FILES } from '../server/services/agent-sdk-paths.mjs';
+
+export const PIN_MANIFEST = AGENT_SDK_PIN_FILES['package.json'];
+export const PIN_LOCK = AGENT_SDK_PIN_FILES['package-lock.json'];
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const AGENT_SDK_PINS_DIR = path.join(repoRoot, 'server', 'agent-sdks');
@@ -36,18 +44,18 @@ function packageName(key) {
 
 /**
  * What is wrong with a pins folder's lockfile, as readable lines (none: it
- * may ship). `id` is the folder name, `pkg` its package.json.
+ * may ship). `id` is the folder name, `pkg` its manifest (pin.json).
  */
 export function lockProblems(id, pkg, lock) {
   const problems = [];
   const packages = lock?.packages || {};
   const root = packages[''] || {};
-  if (lock?.name !== pkg?.name || root.name !== pkg?.name) problems.push(`the lock names ${lock?.name}, package.json ${pkg?.name}`);
+  if (lock?.name !== pkg?.name || root.name !== pkg?.name) problems.push(`the lock names ${lock?.name}, ${PIN_MANIFEST} ${pkg?.name}`);
   const wanted = pkg?.dependencies || {};
-  if (JSON.stringify(root.dependencies || {}) !== JSON.stringify(wanted)) problems.push('the lock root lists other dependencies than package.json');
+  if (JSON.stringify(root.dependencies || {}) !== JSON.stringify(wanted)) problems.push(`the lock root lists other dependencies than ${PIN_MANIFEST}`);
   for (const [name, version] of Object.entries(wanted)) {
     const installed = packages[`node_modules/${name}`]?.version;
-    if (installed !== version) problems.push(`${name}: the lock holds ${installed}, package.json pins ${version}`);
+    if (installed !== version) problems.push(`${name}: the lock holds ${installed}, ${PIN_MANIFEST} pins ${version}`);
   }
   const withScripts = [];
   for (const [key, entry] of Object.entries(packages)) {
@@ -73,7 +81,7 @@ export function lockProblems(id, pkg, lock) {
 
 export function listPinsFolders(dir = AGENT_SDK_PINS_DIR) {
   return fs.readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(dir, entry.name, 'package.json')))
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(dir, entry.name, PIN_MANIFEST)))
     .map((entry) => entry.name)
     .sort();
 }
@@ -85,10 +93,11 @@ function npmCommand() {
 
 function generate(id) {
   const folder = path.join(AGENT_SDK_PINS_DIR, id);
-  const pkg = JSON.parse(fs.readFileSync(path.join(folder, 'package.json'), 'utf8'));
+  const pkg = JSON.parse(fs.readFileSync(path.join(folder, PIN_MANIFEST), 'utf8'));
   const work = fs.mkdtempSync(path.join(os.tmpdir(), `oar-sdk-lock-${id}-`));
   try {
-    fs.copyFileSync(path.join(folder, 'package.json'), path.join(work, 'package.json'));
+    // npm reads and writes the npm names; the pins folder keeps its own.
+    fs.copyFileSync(path.join(folder, PIN_MANIFEST), path.join(work, 'package.json'));
     const result = spawnSync(npmCommand(), [
       'install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund', '--lockfile-version=3',
     ], { cwd: work, stdio: 'inherit', env: { ...process.env, PATH: `${path.dirname(process.execPath)}:${process.env.PATH || ''}` } });
@@ -96,8 +105,8 @@ function generate(id) {
     const text = fs.readFileSync(path.join(work, 'package-lock.json'), 'utf8');
     const problems = lockProblems(id, pkg, JSON.parse(text));
     if (problems.length) throw new Error(`${id}: ${problems.join('; ')}`);
-    fs.writeFileSync(path.join(folder, 'package-lock.json'), text.endsWith('\n') ? text : `${text}\n`);
-    console.log(`${id}: package-lock.json written`);
+    fs.writeFileSync(path.join(folder, PIN_LOCK), text.endsWith('\n') ? text : `${text}\n`);
+    console.log(`${id}: ${PIN_LOCK} written`);
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }

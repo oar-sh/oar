@@ -19,6 +19,7 @@ import {
   renderSummaryModalContent,
   setSummaryModalLoading,
 } from './store.js';
+import { isOwnImageUrl, sessionProofHeaders } from './session-proof.mjs';
 import { openAnnotateEditor } from './annotate-editor.js';
 import {
   uploadAttachment,
@@ -68,6 +69,7 @@ import {
   eventClosest,
 } from './router.js';
 import { buildDownloadLink } from './file-version.mjs';
+import { fileSrcAttribute, signFileUrls, withCachedFileCapability } from './file-capability.mjs';
 import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
 import { openExternalNavigation } from './external-link-policy.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
@@ -245,7 +247,7 @@ export function renderAttachmentMarkup(attachments, { messageId = '' } = {}) {
         return `
           <div class="msg-attachment msg-attachment-${mediaKind}" data-media-name="${name}" data-media-url="${escHtml(rawUrl)}" data-media-type="${escHtml(att?.type || 'image/jpeg')}">
             ${isImage
-              ? `<img src="${escHtml(rawUrl)}" alt="${name}" loading="eager" decoding="async">`
+              ? `<img ${fileSrcAttribute(rawUrl)} alt="${name}" loading="eager" decoding="async">`
               : `<div class="msg-attachment-video-chip">${chip}</div>`}
             <div class="msg-attachment-meta"><a href="#" data-media-open>${name}</a> · ${type}${sizeText} · <a href="#" data-media-open>open</a>${continuityActions}</div>
           </div>`;
@@ -475,9 +477,13 @@ function isAnnotatableImageType(type) {
 }
 
 async function fetchImageBlob(url) {
-  // Upload/generated-image content URLs are cookie-authenticated (the same way
-  // the <img> tags load them), so a plain same-origin fetch works.
-  const response = await fetch(url, { credentials: 'same-origin' });
+  // Only a picture of this origin (or an inline one): a picture from another
+  // address is never fetched by the page (its 🖍️ is hidden). Upload and
+  // generated-image content URLs open on the cookie alone (the way the <img>
+  // tags load them); the session's key goes along to this relay's /api only
+  // (sessionProofHeaders checks the address).
+  if (!isOwnImageUrl(url)) throw new Error('Only pictures from this relay can be marked up');
+  const response = await fetch(url, { credentials: 'same-origin', headers: sessionProofHeaders(url, BASE) });
   if (!response.ok) throw new Error('Could not load the image');
   return response.blob();
 }
@@ -520,8 +526,11 @@ export function openAnnotateEditorForPending(idx) {
 export function filePreviewSupportsAnnotation() {
   if (IS_SHARED_VIEW) return false;
   const payload = filePreviewState?.payload;
+  // A picture from another address (an agent's server on another port of
+  // this host, say) gets no 🖍️: the editor would have to fetch it.
   return payload?.kind === 'image'
     && !!String(payload.rawUrl || '')
+    && isOwnImageUrl(String(payload.rawUrl || ''))
     && isAnnotatableImageType(payload.contentType);
 }
 
@@ -1290,7 +1299,9 @@ export function renderFilePreview() {
   const bodyEl = document.getElementById('file-preview-body');
   const rawLink = document.getElementById('file-preview-open-raw');
   const payload = filePreviewState.payload;
-  const rawHref = previewRawHref(filePreviewState.source, filePreviewState.path, payload);
+  // A file by path carries its file capability (`k`) when one is cached;
+  // else its media waits in data-oar-file-src for one (file-capability.mjs).
+  const rawHref = withCachedFileCapability(previewRawHref(filePreviewState.source, filePreviewState.path, payload));
   const fallbackName = String(filePreviewState.path || '').split('/').filter(Boolean).pop() || 'download';
   const plainName = String(payload?.name || fallbackName);
   // An upload is addressed by its content and never changes; a file on disk
@@ -1377,7 +1388,7 @@ export function renderFilePreview() {
           icon: '🎵',
           name: plainName,
           meta: cardMeta,
-          actions: audioHref ? `<audio class="file-preview-audio" controls preload="metadata" src="${escHtml(audioHref)}"></audio>` : '<span class="file-preview-note">Audio preview unavailable.</span>',
+          actions: audioHref ? `<audio class="file-preview-audio" controls preload="metadata" ${fileSrcAttribute(audioHref)}></audio>` : '<span class="file-preview-note">Audio preview unavailable.</span>',
         })}
       </div>`;
     bodyEl.classList.add('audio-preview-mode');
@@ -1400,7 +1411,7 @@ export function renderFilePreview() {
       ? String(payload.rawUrl || '')
       : String(rawHref || payload.rawUrl || '');
     if (imageHref) {
-      bodyEl.innerHTML = `<div class="file-preview-image"><img loading="lazy" src="${escHtml(imageHref)}" alt="${escHtml(payload.name || filePreviewState.path || 'image')}"></div>`;
+      bodyEl.innerHTML = `<div class="file-preview-image"><img loading="lazy" ${fileSrcAttribute(imageHref)} alt="${escHtml(payload.name || filePreviewState.path || 'image')}"></div>`;
       bodyEl.classList.add('image-zoom-mode');
       setupImageZoom(bodyEl.querySelector('.file-preview-image'));
     } else {
@@ -1418,7 +1429,7 @@ export function renderFilePreview() {
     if (videoHref) {
       bodyEl.innerHTML = `
         <div class="file-preview-video-shell" data-start-seconds="${escHtml(String(startSeconds))}" data-preload="${escHtml(preload)}">
-          <video class="file-preview-video" controls playsinline preload="${escHtml(preload)}" src="${escHtml(videoHref)}"></video>
+          <video class="file-preview-video" controls playsinline preload="${escHtml(preload)}" ${fileSrcAttribute(videoHref)}></video>
         </div>`;
       bodyEl.classList.add('video-preview-mode');
       const shell = bodyEl.querySelector('.file-preview-video-shell');
@@ -1512,7 +1523,11 @@ async function openFilePreviewFromSource(source, normalized, options, fetchPaylo
 
   // A step through the gallery takes the neighbour fetched ahead of time.
   const cached = options?.viaGallery ? galleryPayloadCache.get(galleryCacheKey(source, normalized)) : null;
+  // The file's capability (`k`) is asked for alongside, so its media and
+  // links are drawn with it.
+  const capability = signFileUrls([previewRawHref(source, normalized, null)]).catch(() => null);
   const payload = await (cached || fetchPayload());
+  await capability;
   if (seq !== filePreviewLoadSeq) return false;
   if (!payload || payload.error) {
     filePreviewState.loading = false;
@@ -1671,8 +1686,10 @@ function prefetchGalleryNeighbors() {
         return null;
       }
       if (payload.kind === 'image') {
-        const image = new Image();
-        image.src = previewRawHref(source, String(payload.path || normalized), payload);
+        void signFileUrls([previewRawHref(source, String(payload.path || normalized), payload)]).then(([href]) => {
+          const image = new Image();
+          image.src = href;
+        });
       }
       return payload;
     }).catch(() => {

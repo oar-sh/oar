@@ -133,10 +133,14 @@ test("both, copilot.db newer: exit 78 naming both files, the lock released, ever
 test("a copilot.db an earlier version's start alone wrote, beside a used oar.db: set aside, the relay runs on oar.db", async () => {
   // A real start on an empty folder, renamed to copilot.db: what 0.9.19 does
   // after a downgrade that skipped the rename back (the rows it writes are
-  // the same).
+  // the same). A start alone: dismissing the security notice (the harness
+  // does by default) is a person's action, a setting no start writes.
   const state = createStateRoot();
   roots.push(state.stateRoot);
-  const first = await startRelayServer({ token: randomUUID(), state, ...SLOW_START });
+  // One token for both starts: once relay-secrets.json exists, a --token
+  // that differs is ignored.
+  const token = randomUUID();
+  const first = await startRelayServer({ token, state, keepSecurityNotices: true, ...SLOW_START });
   await first.kill();
   // 0.9.19 writes no db_last_run (0.9.20's backup step does).
   const started = new Database(path.join(state.dataDir, "oar.db"));
@@ -147,7 +151,7 @@ test("a copilot.db an earlier version's start alone wrote, beside a used oar.db:
     if (fs.existsSync(from)) fs.renameSync(from, path.join(state.dataDir, `copilot.db${side}`));
   }
   writeDatabase(path.join(state.dataDir, "oar.db"), { marker: "used", at: "2026-10-01T09:00:00.000Z" });
-  const relay = await startRelayServer({ token: randomUUID(), state, ...SLOW_START });
+  const relay = await startRelayServer({ token, state, ...SLOW_START });
   try {
     const answer = await about(relay);
     expect(answer.relay.dbPath).toBe(path.join(state.dataDir, "oar.db"));

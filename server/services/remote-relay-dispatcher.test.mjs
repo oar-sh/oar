@@ -424,12 +424,17 @@ function createFakeRemote() {
       if (method === 'POST' && path === '/api/conversation/bootstrap') {
         const takesGroup = !!remote.groupList && !remote.bootstrapIgnoresGroup;
         let group = null;
+        let groupNote = '';
         if (takesGroup && body.group) {
           const groups = remote.groupsAtBootstrap || remote.groupList;
           const wanted = String(body.group).toLowerCase();
           group = groups.find((candidate) => candidate.id === body.group)
             || groups.find((candidate) => candidate.name.toLowerCase() === wanted);
-          if (!group) {
+          // This version: an agent's unknown group starts the session in no
+          // group, said in groupNote. An earlier one refused it.
+          if (!group && !remote.bootstrapRefusesUnknownGroup) {
+            groupNote = `No session group "${body.group}" here, and only the person makes groups: the session was started in no group.`;
+          } else if (!group) {
             const error = `No session group "${body.group}" here. No conversation was created.`;
             throw remoteError(`${CODES.httpPrefix}400`, `Relay "${relay.name}" answered HTTP 400: ${error}`, 400, {
               ok: false,
@@ -466,7 +471,8 @@ function createFakeRemote() {
           ...(takesGroup ? {
             group: group
               ? { id: group.id, name: group.name, role: 'member' }
-              : (body.origin?.local === true ? remote.creatorGroup : null),
+              : (body.origin?.local === true && !groupNote ? remote.creatorGroup : null),
+            ...(groupNote ? { groupNote } : {}),
           } : {}),
         };
       }
@@ -571,8 +577,11 @@ function createFakeRemote() {
 function setup({
   relays = [LINUX, SPARE],
   unlocked = ['rr_linux', 'rr_spare'],
-  // Relays (by instance id) whose agents wrote to conversation c-1.
+  // Relays (by instance id) whose agents wrote to conversation c-1, signed
+  // in with their own key (verified origins).
   contacts = [],
+  // Relays (by instance id) that wrote there on a token only (unverified).
+  unverifiedContacts = [],
   // `{ latest }`: the id of the user's latest own message in c-1.
   humans = { latest: null },
   caller = {},
@@ -594,7 +603,15 @@ function setup({
   const approvedLocal = new Set(localApproved);
   const repository = {
     hasUnlock: (conversationId, relayId) => unlocks.has(`${conversationId}:${relayId}`),
-    hasContactFrom: (conversationId, instanceId) => conversationId === 'c-1' && contacts.includes(instanceId),
+    hasContactFrom: (conversationId, instanceId, { weighted = null } = {}) => {
+      if (conversationId !== 'c-1') return false;
+      const entry = relays.find((relay) => relay.relayId === instanceId);
+      const origins = [
+        ...(contacts.includes(instanceId) ? [{ relayId: instanceId, verified: true, entryId: entry?.id || '', epoch: 0 }] : []),
+        ...(unverifiedContacts.includes(instanceId) ? [{ relayId: instanceId, verified: false }] : []),
+      ];
+      return origins.some((origin) => typeof weighted !== 'function' || weighted(origin));
+    },
     latestHumanMessageId: () => humans.latest,
     // The local target's storage, read off the fake of this relay's own API.
     getConversationOrigin: (conversationId) => local.conversations.get(conversationId)?.origin || null,
@@ -634,6 +651,14 @@ function setup({
       processingRowId: 'q-1',
       userMessageId: 'q-1',
       hops: 0,
+      // The turn's prompts: a paired relay's verified (its key), this
+      // relay's own agent's local, any other id an unverified claim.
+      origins: (Array.isArray(caller.originRelayIds) ? caller.originRelayIds : []).map((id) => {
+        const entry = relays.find((relay) => relay.relayId === id);
+        if (entry && !(caller.unverifiedOrigins || []).includes(id)) return { relayId: id, verified: true, entryId: entry.id, epoch: 0 };
+        if (id === 'relay-self-id') return { relayId: id, local: true };
+        return { relayId: id, verified: false };
+      }),
       ...caller,
     })),
     requestApproval: requestApproval || (async (request) => {
@@ -819,6 +844,46 @@ test('the relay a prompt came from is open without a mention and may always be a
   assert.equal(other.body.code, CODES.locked);
 });
 
+test('origin binding: a claimed (unverified) origin opens nothing, waives no hop limit and gets no creator send-back', async () => {
+  // The relay wrote here on a token only: its claim opens nothing.
+  const locked = setup({ unlocked: [], unverifiedContacts: [LINUX.relayId] });
+  withSession(locked.remote);
+  const refused = await locked.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(refused.body.code, CODES.locked);
+  // Unlocked by a mention, the turn acting on an unverified prompt claiming
+  // that relay: `answering` does not hold, the hop limit applies.
+  const answering = setup({
+    unlocked: [],
+    contacts: [LINUX.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 1, originRelayIds: [LINUX.relayId], unverifiedOrigins: [LINUX.relayId] },
+  });
+  withSession(answering.remote);
+  const noAnswer = await answering.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(noAnswer.body.code, CODES.hopLimit);
+  // A session whose stored creator is a claim: no send-back past the limit.
+  const creator = setup({
+    relays: [LINUX, { ...SPARE, permission: 'full', lastStatus: 'online' }],
+    unlocked: [],
+    contacts: [LINUX.relayId],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 1, originRelayIds: ['relay-self-id'] },
+  });
+  creator.local.addConversation({ id: 'c-1', title: 'claimed creator', origin: { kind: 'agent', relayId: LINUX.relayId, conversationId: 'conv-1', verified: false } });
+  withSession(creator.remote);
+  const noSendBack = await creator.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(noSendBack.body.code, CODES.hopLimit);
+  // The same creator verified at an older key epoch (revoked, re-keyed): none either.
+  const stale = setup({
+    relays: [{ ...LINUX, epoch: 2 }, SPARE],
+    unlocked: [],
+    contacts: [],
+    caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 1, originRelayIds: ['relay-self-id'] },
+  });
+  stale.local.addConversation({ id: 'c-1', title: 'old epoch', origin: { kind: 'agent', relayId: LINUX.relayId, conversationId: 'conv-1', verified: true, entryId: LINUX.id, epoch: 1 } });
+  withSession(stale.remote);
+  const lockedStale = await stale.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT, wait_seconds: 0 });
+  assert.equal(lockedStale.body.code, CODES.locked);
+});
+
 test('the hop limit stops a prompt on its way to a third relay, and reading is never limited', async () => {
   // linux-test wrote to this conversation earlier, so it is open; the turn
   // acts on a prompt from spare-test that crossed two relays.
@@ -863,7 +928,7 @@ test('a session an agent created may always send to the session that created it,
       contacts: [LINUX.relayId, SPARE.relayId],
       caller: { hops: REMOTE_RELAY_LIMITS.hopLimit + 1, originRelayIds },
     });
-    fixture.local.addConversation({ id: 'c-1', title: 'reporting session', origin: { kind: 'agent', relayId: LINUX.relayId, relayName: 'linux-test', conversationId: 'conv-1', hops: REMOTE_RELAY_LIMITS.hopLimit } });
+    fixture.local.addConversation({ id: 'c-1', title: 'reporting session', origin: { kind: 'agent', relayId: LINUX.relayId, relayName: 'linux-test', conversationId: 'conv-1', hops: REMOTE_RELAY_LIMITS.hopLimit, verified: true, entryId: LINUX.id, epoch: 0 } });
     withSession(fixture.remote);
     fixture.remote.addConversation({ id: 'conv-other', title: 'another session there' });
     return fixture;
@@ -2608,8 +2673,8 @@ test('the remote\'s own approval cards are never offered to the agent or answere
 
   const answered = await run('answer_question', { relay: 'linux-test', question_id: 'question-approval', choices: ['Allow'] });
   assert.equal(answered.status, 403);
-  assert.equal(answered.body.code, CODES.forbidden);
-  assert.match(answered.body.error, /only its user can answer it/);
+  assert.equal(answered.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.match(answered.body.error, /Only the person can answer questions; ask them in the relay UI/);
   assert.equal(remote.callsTo('POST', '/api/relay-question/question-approval/answer').length, 0);
   assert.equal(remote.questions.get('question-approval').status, 'pending');
 
@@ -2650,7 +2715,9 @@ test('read_session reports a running turn as a progress snapshot', async () => {
 
 // ─── answer_question, stop, archive ──────────────────────────────────────────
 
-test('answer_question passes the question\'s sdk_session_id and the card\'s answer format', async () => {
+// No agent answers any question card (agent auth §0.1): answer_question is
+// refused before anything is read or sent, on a paired relay and on this one.
+test('answer_question is refused for every card with AUTH_PERSON_REQUIRED, and nothing is read or sent', async () => {
   const { run, remote } = setup();
   remote.addQuestion({
     id: 'question-3',
@@ -2660,58 +2727,18 @@ test('answer_question passes the question\'s sdk_session_id and the card\'s answ
     context: { multiSelect: true },
     messageId: 'm-turn',
   });
-  const result = await run('answer_question', { relay: 'linux-test', question_id: 'question-3', choices: ['unit', 'E2E'], answer: 'skip flaky ones' });
-  assert.equal(result.status, 200);
-  assert.equal(result.body.status, 'answered');
-  assert.equal(result.body.session, 'conv-9');
-  assert.equal(result.body.message_id, 'm-turn');
-  const post = remote.callsTo('POST', '/api/relay-question/question-3/answer')[0].body;
-  assert.deepEqual(post, { answer: 'Unit, E2E, skip flaky ones', sdk_session_id: 'sdk-remote-1' });
-  assert.equal(remote.questions.get('question-3').status, 'answered');
-
-  const again = await run('answer_question', { relay: 'linux-test', question_id: 'question-3', answer: 'x' });
-  assert.equal(again.status, 409);
-  assert.match(again.body.error, /already answered/);
-
-  const missing = await run('answer_question', { relay: 'linux-test', question_id: 'question-404', answer: 'x' });
-  assert.equal(missing.status, 404);
-  assert.equal(missing.body.code, CODES.notFound);
-});
-
-test('answer_question validates options and multi-field questions before sending', async () => {
-  const { run, remote } = setup();
-  remote.addQuestion({ id: 'question-4', conversationId: 'conv-9', prompt: 'Pick one', choices: ['Light', 'Dark'], allowFreeform: false, sdkSessionId: null });
-  const wrong = await run('answer_question', { relay: 'linux-test', question_id: 'question-4', choices: ['Sepia'] });
-  assert.equal(wrong.status, 400);
-  assert.equal(wrong.body.code, CODES.invalidInput);
-  assert.match(wrong.body.error, /Options: Light, Dark/);
-  const right = await run('answer_question', { relay: 'linux-test', question_id: 'question-4', choices: ['dark'] });
-  assert.equal(right.status, 200);
-  assert.deepEqual(remote.callsTo('POST', '/api/relay-question/question-4/answer')[0].body, { answer: 'Dark' });
-  // A card without typed text takes none from an agent either (the remote's
-  // answer route would refuse it); an option typed as the answer is an option.
-  remote.addQuestion({ id: 'question-6', conversationId: 'conv-9', prompt: 'Pick one', choices: ['Light', 'Dark'], allowFreeform: false, sdkSessionId: null });
-  const typed = await run('answer_question', { relay: 'linux-test', question_id: 'question-6', answer: 'whichever is darker' });
-  assert.equal(typed.status, 400);
-  assert.equal(typed.body.code, CODES.invalidInput);
-  assert.match(typed.body.error, /takes only its options \(Light, Dark\)/);
-  assert.equal(remote.callsTo('POST', '/api/relay-question/question-6/answer').length, 0);
-  const typedOption = await run('answer_question', { relay: 'linux-test', question_id: 'question-6', answer: ' light ' });
-  assert.equal(typedOption.status, 200);
-  assert.deepEqual(remote.callsTo('POST', '/api/relay-question/question-6/answer')[0].body, { answer: 'Light' });
-
-  remote.addQuestion({
-    id: 'question-5',
-    conversationId: 'conv-9',
-    prompt: 'Details',
-    requestSchema: { type: 'object', properties: { name: { type: 'string' }, count: { type: 'integer' } } },
-  });
-  const flat = await run('answer_question', { relay: 'linux-test', question_id: 'question-5', answer: 'report builder' });
-  assert.equal(flat.status, 400);
-  assert.match(flat.body.error, /several fields \(name, count\)/);
-  const structured = await run('answer_question', { relay: 'linux-test', question_id: 'question-5', answer: '{"name":"report builder","count":2}' });
-  assert.equal(structured.status, 200);
-  assert.deepEqual(remote.callsTo('POST', '/api/relay-question/question-5/answer')[0].body.structuredAnswer, { name: 'report builder', count: 2 });
+  const callsBefore = remote.calls.length;
+  for (const args of [
+    { relay: 'linux-test', question_id: 'question-3', choices: ['unit', 'E2E'], answer: 'skip flaky ones' },
+    { relay: 'linux-test', question_id: 'question-404', answer: 'x' },
+  ]) {
+    const result = await run('answer_question', args);
+    assert.equal(result.status, 403, JSON.stringify(args));
+    assert.equal(result.body.code, 'AUTH_PERSON_REQUIRED');
+    assert.match(result.body.error, /^Only the person can answer questions; ask them in the relay UI\./);
+  }
+  assert.equal(remote.calls.length, callsBefore, 'no call reached the relay');
+  assert.equal(remote.questions.get('question-3').status, 'pending');
 });
 
 test('stop and archive call the remote routes and report what happened', async () => {
@@ -2745,6 +2772,32 @@ test('remote failures map to the contract codes and statuses', async () => {
   unauthorized.remote.fail('GET', '/api/status', remoteError(CODES.unauthorized, 'Relay "linux-test" rejected the token (401)', 401));
   const rejected = await unauthorized.run('relay_info', { relay: 'linux-test' });
   assert.deepEqual([rejected.status, rejected.body.code], [502, CODES.unauthorized]);
+  assert.match(rejected.body.error, /Ask the person to re-add relay "linux-test" from its link \(Settings → Relays → Add a relay, paste its pairing link; the entry is updated in place\)\.$/);
+
+  // Refused for want of a key: the other relay's words are from its side,
+  // so the agent gets this side's, with what fixes it.
+  const keyless = setup();
+  withSession(keyless.remote);
+  keyless.remote.fail('POST', '/api/message', remoteError(CODES.peerKeyRequired, 'Relay "linux-test" refused: Refused: relay "x" signs in here with a key of its own', 403, {
+    error: 'Refused: relay "x" signs in here with a key of its own, and this request claimed to be it without that key.',
+    code: CODES.peerKeyRequired,
+  }));
+  const needsKey = await keyless.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT });
+  assert.deepEqual([needsKey.status, needsKey.body.code, needsKey.body.relay], [403, CODES.peerKeyRequired, 'linux-test']);
+  assert.match(needsKey.body.error, /^Relay "linux-test" refused this call: it takes calls from this relay only with the key it gave this relay/);
+  assert.match(needsKey.body.error, /Ask the person to re-add relay "linux-test" from its link/);
+  assert.equal(needsKey.body.error.includes('signs in here'), false);
+
+  // Added one way (that relay lists no entry for this one): said as such,
+  // with Re-pair, not "re-add from its link", which would not change it.
+  const oneWay = setup({ relays: [{ ...LINUX, peerTokenState: 'unlisted' }, SPARE] });
+  withSession(oneWay.remote);
+  oneWay.remote.fail('POST', '/api/message', remoteError(CODES.peerKeyRequired, 'Relay "linux-test" refused: needs a key', 403, { error: 'needs a key', code: CODES.peerKeyRequired }));
+  const unlisted = await oneWay.run('send', { relay: 'linux-test', session: 'conv-1', text: PROMPT });
+  assert.deepEqual([unlisted.status, unlisted.body.code, unlisted.body.oneWay], [403, CODES.peerKeyRequired, true]);
+  assert.match(unlisted.body.error, /^Relay "linux-test" refused this call: this relay was added there one way \(it does not list this relay\)/);
+  assert.match(unlisted.body.error, /ask them to use Re-pair on relay "linux-test" in Settings → Relays: it adds this relay there/);
+  assert.equal(/re-add/i.test(unlisted.body.error), false);
 
   const closed = setup();
   withSession(closed.remote);
@@ -2788,9 +2841,9 @@ test('through the real outbound client: query, path encoding, hop header and a 4
     }
     return json(404, { error: 'Conversation not found' });
   };
-  const client = createRemoteRelayClient({ fetchImpl, getOwnRelayId: () => 'relay-self-id', getOwnToken: () => token });
+  const client = createRemoteRelayClient({ fetchImpl, getOwnRelayId: () => 'relay-self-id' });
   const dispatcher = createRemoteRelayDispatcher({
-    registry: createRegistry([LINUX]),
+    registry: createRegistry([{ ...LINUX, tokenMode: 'custom', token }]),
     client,
     repository: { hasUnlock: () => true },
     getCallerContext: async () => ({ hops: 1, mode: 'agent' }),
@@ -3194,19 +3247,18 @@ test('an agent cannot send to, stop, archive or wait on the conversation it runs
   assert.equal((await run('read_session', { relay: 'this', session: 'c-1' })).status, 200);
 });
 
-test('an agent cannot answer a question of its own conversation; another session\'s it can', async () => {
+test('an agent answers no question on this relay: neither its own conversation\'s nor another session\'s', async () => {
   const { run, local } = setupLocal();
   local.addConversation({ id: 'c-1', title: 'report builder' });
   local.addConversation({ id: 'conv-2', title: 'sidebar polish' });
   local.addQuestion({ id: 'q-own', conversationId: 'c-1', prompt: 'Which colour?', choices: ['Teal', 'Amber'] });
   local.addQuestion({ id: 'q-other', conversationId: 'conv-2', prompt: 'Which colour?', choices: ['Teal', 'Amber'] });
-  const own = await run('answer_question', { relay: 'this', question_id: 'q-own', choices: ['Teal'] });
-  assert.equal(own.status, 400);
-  assert.equal(own.body.code, CODES.ownSession);
-  assert.equal(local.questions.get('q-own').status, 'pending');
-  const other = await run('answer_question', { relay: 'this', question_id: 'q-other', choices: ['Teal'] });
-  assert.equal(other.status, 200, JSON.stringify(other.body));
-  assert.equal(local.questions.get('q-other').answer, 'Teal');
+  for (const id of ['q-own', 'q-other']) {
+    const refused = await run('answer_question', { relay: 'this', question_id: id, choices: ['Teal'] });
+    assert.equal(refused.status, 403, id);
+    assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
+    assert.equal(local.questions.get(id).status, 'pending');
+  }
 });
 
 test('the same session id on a paired relay is another conversation: no own-session refusal there', async () => {
@@ -4060,32 +4112,40 @@ test('create_session with group resolves it before the approval card, and the ca
   assert.ok(lookup >= 0 && lookup < remote.calls.findIndex((entry) => entry.path === '/api/conversation/bootstrap'));
 });
 
-test('create_session with an unknown group is refused before anything is created, listing the groups', async () => {
+test('create_session with an unknown group starts the session in no group, with a warning (agents make no groups)', async () => {
   const { run, remote, approvals } = setup({ caller: { mode: 'ask' } });
   remote.groupList = [DOCS_GROUP, QA_GROUP];
   const result = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Release', wait_seconds: 0 });
-  assert.equal(result.status, 400);
-  assert.equal(result.body.code, CODES.unknownGroup);
-  assert.equal(result.body.error,
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.group, null);
+  assert.equal(result.body.groupWarning,
+    'The session was created in no group: relay "linux-test" has no session group "Release", and only the owner makes groups. Tell the user; name an existing group next time (relay_info lists them).');
+  assert.equal(remote.conversations.size, 1);
+  assert.equal(remote.groupList.length, 2, 'no group was made');
+  assert.equal(approvals[0].group, undefined, 'the card names no group it will not use');
+
+  // A relay of an earlier version refuses it, nothing created.
+  const older = setup();
+  older.remote.groupList = [DOCS_GROUP, QA_GROUP];
+  older.remote.bootstrapRefusesUnknownGroup = true;
+  const refused = await older.run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Release', wait_seconds: 0 });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, CODES.unknownGroup);
+  assert.equal(refused.body.error,
     `Relay "linux-test" has no session group "Release". Groups there: Docs batch (${DOCS_GROUP.id}), QA (${QA_GROUP.id}). No session was created.`);
-  assert.deepEqual(result.body.groups, [{ id: DOCS_GROUP.id, name: 'Docs batch' }, { id: QA_GROUP.id, name: 'QA' }]);
-  assert.match(result.body.note, /create_session takes an existing group only; update_session can put the session into a new group/);
-  assert.equal(result.body.relay, 'linux-test');
-  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0, 'nothing is created');
-  assert.equal(approvals.length, 0, 'the user is not asked about a call that cannot run');
+  assert.match(refused.body.note, /Agents name existing groups only; making, renaming and dissolving groups is the owner's\./);
+  assert.equal(older.remote.conversations.size, 0);
 });
 
-test('create_session on a relay without any group says only the owner creates them', async () => {
+test('create_session on a relay without any group starts the session in no group', async () => {
   const { run, remote } = setup();
   // A relay that lists groups, and has none.
   remote.groupList = [];
   const result = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Release', wait_seconds: 0 });
-  assert.equal(result.status, 400);
-  assert.equal(result.body.code, CODES.unknownGroup);
-  assert.equal(result.body.error, 'Relay "linux-test" has no session groups. No session was created.');
-  assert.deepEqual(result.body.groups, []);
-  assert.match(result.body.note, /update_session can put the session into a new group of that name afterwards/);
-  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.group, null);
+  assert.match(result.body.groupWarning, /has no session group "Release", and only the owner makes groups/);
+  assert.deepEqual(remote.groupList, []);
 });
 
 test('create_session with an ambiguous group name is refused, asking for the id', async () => {
@@ -4128,10 +4188,12 @@ test('create_session with group on the local target wins over the creator\'s gro
   // The once-per-conversation card names it too.
   assert.equal(approvals[0].localSessions, true);
   assert.deepEqual(approvals[0].group, { id: DOCS_GROUP.id, name: 'Docs batch' });
-  // An unknown group here is refused the same way, before the cap or a card.
-  const refused = await run('create_session', { relay: 'this', text: PROMPT, group: 'Nope', wait_seconds: 0 });
-  assert.equal(refused.body.code, CODES.unknownGroup);
-  assert.match(refused.body.error, /^This relay has no session group "Nope"\. Groups there: Docs batch/);
+  // An unknown group here: the session starts in no group (not the
+  // creator's either), with the warning.
+  const unknown = await run('create_session', { relay: 'this', text: PROMPT, group: 'Nope', wait_seconds: 0 });
+  assert.equal(unknown.status, 200, JSON.stringify(unknown.body));
+  assert.equal(unknown.body.group, null);
+  assert.match(unknown.body.groupWarning, /^The session was created in no group: this relay has no session group "Nope"/);
 });
 
 test('create_session without group on the local target returns the creator\'s group', async () => {
@@ -4199,6 +4261,8 @@ test('create_session whose target ignored group returns groupWarning, not a plai
 test('a bootstrap refusal for a vanished group maps to REMOTE_RELAY_UNKNOWN_GROUP with the groups', async () => {
   const { run, remote } = setup();
   remote.groupList = [DOCS_GROUP, QA_GROUP];
+  // A target of an earlier version: it refuses a group it does not have.
+  remote.bootstrapRefusesUnknownGroup = true;
   // Dissolved by the owner between the lookup and the create.
   remote.groupsAtBootstrap = [QA_GROUP];
   const result = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Docs batch', wait_seconds: 0 });
@@ -4252,17 +4316,17 @@ test('dispatch adds ignored to the answer of other actions', async () => {
   assert.equal('ignored' in (await run('read_session', { relay: 'linux-test', session: 'conv-1' })).body, false);
 });
 
-test('a refusal names at most 20 groups and says how many more there are, from the lookup and from the bootstrap', async () => {
+test('an ambiguous name is refused at the lookup; a target\'s refusal names at most 20 groups and how many more', async () => {
   const many = Array.from({ length: 23 }, (_, index) => ({ id: `grp_many${String(index).padStart(16, '0')}`, name: `Batch ${index}`, memberCount: 1 }));
   const { run, remote } = setup();
-  remote.groupList = many;
-  const looked = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Release', wait_seconds: 0 });
+  // An ambiguous name is refused at the lookup, its matches capped.
+  remote.groupList = [...many, ...many.map((group) => ({ ...group, id: `${group.id}b`, name: group.name.replace('Batch', 'batch') }))];
+  const looked = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Batch 1', wait_seconds: 0 });
   assert.equal(looked.body.code, CODES.unknownGroup);
-  assert.match(looked.body.error, /Batch 19 \(grp_many0000000000000019\) and 3 more\. No session was created\.$/);
-  assert.equal(looked.body.groups.length, 20);
-  assert.equal(looked.body.groupsTotal, 23);
+  assert.match(looked.body.error, /^"Batch 1" names several session groups/);
 
-  // The target's own refusal comes capped, with its count.
+  // The target's own refusal (an earlier version) comes capped, with its count.
+  remote.bootstrapRefusesUnknownGroup = true;
   remote.groupList = [DOCS_GROUP];
   remote.groupsAtBootstrap = many;
   const refused = await run('create_session', { relay: 'linux-test', text: PROMPT, group: 'Docs batch', wait_seconds: 0 });
@@ -4863,8 +4927,8 @@ test('a Safety check card is never offered to an agent or answered by one, on a 
   assert.deepEqual(read.body.pendingQuestions.map((question) => question.id), ['question-2']);
   const answered = await run('answer_question', { relay: 'linux-test', question_id: 'question-safety', choices: ['Allow once'] });
   assert.equal(answered.status, 403);
-  assert.equal(answered.body.code, CODES.forbidden);
-  assert.match(answered.body.error, /this card is the user's to answer/);
+  assert.equal(answered.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.match(answered.body.error, /Only the person can answer questions/);
   assert.equal(remote.callsTo('POST', '/api/relay-question/question-safety/answer').length, 0);
   assert.equal(remote.questions.get('question-safety').status, 'pending');
 
@@ -4874,7 +4938,7 @@ test('a Safety check card is never offered to an agent or answered by one, on a 
   here.local.addQuestion(safetyCard('conv-2'));
   const local = await here.run('answer_question', { relay: 'this', question_id: 'question-safety', choices: ['Allow once'] });
   assert.equal(local.status, 403);
-  assert.match(local.body.error, /this card is the user's to answer/);
+  assert.match(local.body.error, /Only the person can answer questions/);
   assert.equal(here.local.questions.get('question-safety').status, 'pending');
 });
 
@@ -5373,4 +5437,15 @@ test('usage of a target without the image spend route has no entry; a failed rea
   const failed = await run('usage', { relay: 'spare-test' });
   assert.equal(Object.prototype.hasOwnProperty.call(failed.body, 'openaiImages'), false);
   assert.match(failed.body.note, /The OpenAI image spend was not available there\./);
+});
+
+test('answer_question in ask mode shows the user no approval card: it is refused first', async () => {
+  const { run, local, approvals } = setupLocal({ caller: { mode: 'ask' } });
+  local.addConversation({ id: 'conv-2', title: 'sidebar polish' });
+  local.addQuestion({ id: 'q-other', conversationId: 'conv-2', prompt: 'Which colour?', choices: ['Teal', 'Amber'] });
+  const refused = await run('answer_question', { relay: 'this', question_id: 'q-other', choices: ['Teal'] });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.equal(approvals.length, 0);
+  assert.equal(local.questions.get('q-other').status, 'pending');
 });

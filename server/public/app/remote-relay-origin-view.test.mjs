@@ -27,6 +27,8 @@ const ORIGIN = {
   provider: 'claude',
   model: 'claude-sonnet-5',
   hops: 1,
+  // What the relay stores when the paired relay signed in with its own key.
+  verified: true,
 };
 
 function parse(html) {
@@ -50,11 +52,24 @@ test('missing parts are left out', () => {
   assert.equal(remoteOriginBadgeText({ relayName: 'linux-test', model: 'gpt-5.6-luna' }), '↗ from linux-test · gpt-5.6-luna');
   assert.equal(remoteOriginBadgeText({ relayId: 'relay-b', conversationTitle: 'sidebar polish' }), '↗ from relay-b · “sidebar polish”');
   // No relay URL: a plain badge, no link.
-  const body = parse(renderRemoteOriginBadgeHtml({ relayName: 'linux-test' }));
+  const body = parse(renderRemoteOriginBadgeHtml({ relayName: 'linux-test', verified: true }));
   assert.equal(body.querySelector('a'), null);
   assert.equal(body.querySelector('span.msg-origin-badge').textContent, '↗ from linux-test');
   // A relay URL without a conversation opens the relay itself.
-  assert.equal(remoteOriginLink({ relayName: 'x', relayUrl: 'https://relay-b.example.test/' }), 'https://relay-b.example.test/');
+  assert.equal(remoteOriginLink({ relayName: 'x', relayUrl: 'https://relay-b.example.test/', verified: true }), 'https://relay-b.example.test/');
+});
+
+test('an unverified origin is tagged "claimed" and its address is never a link', () => {
+  for (const origin of [{ ...ORIGIN, verified: false }, { ...ORIGIN, verified: undefined }]) {
+    const body = parse(renderRemoteOriginBadgeHtml(origin));
+    assert.equal(body.querySelector('a'), null);
+    const badge = body.querySelector('.msg-origin-badge.msg-origin-claimed');
+    assert.ok(badge);
+    assert.equal(badge.querySelector('.msg-origin-claimed-tag').textContent, 'claimed');
+    assert.match(badge.getAttribute('title'), /Claimed, not verified/);
+    assert.equal(remoteOriginLink(origin), '');
+  }
+  assert.equal(conversationOriginInfo({ id: 'c1', origin: { ...ORIGIN, verified: false } }).label, 'Started by an agent claiming to be relay “win-test” (unverified)');
 });
 
 test('no badge without an origin that names a relay', () => {
@@ -84,7 +99,7 @@ test('only http(s) relay URLs become links, and every field renders inertly', ()
   assert.equal(body.querySelector('b'), null);
   assert.match(body.textContent, /<img src=x onerror=alert\(1\)>/);
 
-  const quoted = parse(renderRemoteOriginBadgeHtml({ relayName: 'a', relayUrl: 'https://relay-b.example.test', conversationId: '" onclick="x' }));
+  const quoted = parse(renderRemoteOriginBadgeHtml({ relayName: 'a', relayUrl: 'https://relay-b.example.test', conversationId: '" onclick="x', verified: true }));
   const link = quoted.querySelector('a');
   assert.equal(link.getAttribute('onclick'), null);
   assert.equal(link.getAttribute('href'), 'https://relay-b.example.test/?conv=%22%20onclick%3D%22x');

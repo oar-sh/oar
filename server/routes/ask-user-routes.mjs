@@ -3,7 +3,9 @@
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { REMOTE_RELAY_ERROR_CODES, isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
-import { isPersonOnlyQuestion, isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { isPersonOnlyCard, isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { agentConversationOf, isAgent, isPerson, notPerson } from '../services/relay-principal.mjs';
+import { AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 import { askForPairedRelay, sendRelayAskError } from './relay-ask-routes.mjs';
 import { closedQuestionAnswer, questionAcceptsFreeText } from '../../shared/question-answer-rule.mjs';
 import {
@@ -57,20 +59,12 @@ function isRemoteRelayApprovalRow(row) {
 }
 
 /**
- * A stored question row that is a Claude session's Safety check card: an
- * ask Claude Code marks as person-only. Only the user answers it, never an
- * agent of this relay (the loopback client counts as remote) or another.
+ * A card no agent may list, answer or dismiss (shared/relay-asks.mjs
+ * isPersonOnlyCard): a relay's approval of its own agent's call, a Safety
+ * check, a Claude Cloud permission, any card marked person-only.
  */
-function isPersonOnlyRow(row) {
-  const envelope = parseRowJson(row?.request);
-  return envelope ? isPersonOnlyQuestion(envelope.context) : false;
-}
-
-const PERSON_ONLY_ANSWER_REFUSAL = 'This card is the user\'s to answer: Claude Code marks the call as person-only, so no agent may answer it.';
-
-/** A card no agent may list or answer. */
 function isUserOnlyRow(row) {
-  return isRemoteRelayApprovalRow(row) || isPersonOnlyRow(row);
+  return isRemoteRelayApprovalRow(row) || isPersonOnlyCard(row);
 }
 
 /**
@@ -164,6 +158,9 @@ export function registerAskUserRoutes(app, deps) {
     // Questions that don't block (relay-ask-service.mjs): their ids answer
     // here like a card's. Absent in older wiring (no asks).
     relayAskService = null,
+    // One conversation whichever id names it (the agent token's subject is a
+    // conversation id, a card may name the SDK session's).
+    sameConversation = (left, right) => !!left && left === right,
   } = deps;
 
   const continuationRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true;
@@ -180,11 +177,27 @@ export function registerAskUserRoutes(app, deps) {
     return readRemoteRelayRequest(req, remoteRelayInbound || {}).remote;
   }
 
+  // Not the person: an agent token, or another relay's request (which until
+  // peer keys still comes with the owner token). Replaces the remote flag
+  // as the person gate (agent auth §2.3).
+  function notOwner(req) {
+    return notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound || {}));
+  }
+
+  // No agent and no other relay answers or dismisses any card (agent auth
+  // §0.1): only the person, in this relay's UI.
+  function refuseNonPersonAnswer(req, res, reason) {
+    if (!notOwner(req)) return false;
+    console.warn(`[${ts()}] QUESTION  reject id=${String(req.params.id || '').slice(0, 12)} reason=${reason}`);
+    res.status(403).json({ error: AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, code: AUTH_ERROR_CODES.personRequired });
+    return true;
+  }
+
   app.get('/api/relay-questions', auth, (req, res) => {
     const conversationId = req.query.conversationId ? String(req.query.conversationId) : null;
     const status = String(req.query.status || 'pending').trim() || 'pending';
     let rows = stmts.listQuestions.all(status, conversationId, conversationId);
-    if (fromRemoteRelay(req)) rows = rows.filter((row) => !isUserOnlyRow(row));
+    if (notOwner(req)) rows = rows.filter((row) => !isUserOnlyRow(row));
     const questions = rows.map(formatQuestionRow).map((question) => ({ ...question, kind: relayQuestionKind(question) }));
     // Questions that don't block, on request (read_session's pendingQuestions):
     // the cards' own readers take only what a turn waits on.
@@ -206,7 +219,7 @@ export function registerAskUserRoutes(app, deps) {
       return res.json({ question: fromRemoteRelay(req) ? askForPairedRelay(ask) : ask });
     }
     const row = stmts.getQuestion.get(req.params.id);
-    if (!row || (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req))) {
+    if (!row || (isRemoteRelayApprovalRow(row) && notOwner(req))) {
       return res.status(404).json({ error: 'Not found' });
     }
     const question = formatQuestionRow(row);
@@ -219,7 +232,7 @@ export function registerAskUserRoutes(app, deps) {
    * (relay-ask-routes.mjs). Never from an agent, this relay's or another's.
    */
   function refuseAgentOnAsk(req, res) {
-    if (!fromRemoteRelay(req)) return false;
+    if (!notOwner(req)) return false;
     console.warn(`[${ts()}] QUESTION  reject id=${String(req.params.id || '').slice(0, 12)} reason=ask-from-agent`);
     res.status(403).json({
       error: 'This question was asked with ask: only the user answers it, in the Inbox or the session.',
@@ -245,6 +258,7 @@ export function registerAskUserRoutes(app, deps) {
 
   // POST /api/relay-question/:id/dismiss — an ask closed without an answer.
   app.post('/api/relay-question/:id/dismiss', auth, (req, res) => {
+    if (refuseNonPersonAnswer(req, res, 'dismiss-from-agent')) return;
     if (!isRelayAskId(req.params.id)) return res.status(400).json({ error: 'Only a question asked with ask can be dismissed; a card waits for its answer.' });
     answerAsk(req, res, true);
   });
@@ -349,6 +363,7 @@ export function registerAskUserRoutes(app, deps) {
   });
 
   app.post('/api/relay-question/:id/answer', auth, (req, res) => {
+    if (refuseNonPersonAnswer(req, res, 'answer-from-agent')) return;
     if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     if (isRelayAskId(req.params.id)) return answerAsk(req, res, false);
     const id = String(req.params.id || '').trim();
@@ -359,15 +374,11 @@ export function registerAskUserRoutes(app, deps) {
 
     const row = stmts.getQuestion.get(id);
     if (!row) return res.status(404).json({ error: 'Not found' });
-    // Allow / Deny on this relay's own call to another relay is its user's
-    // decision; the relay that call went to must never make it.
-    if (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req)) {
-      console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=remote-relay-approval-from-remote`);
-      return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
-    }
-    if (isPersonOnlyRow(row) && fromRemoteRelay(req)) {
+    // Belt and braces: a person-only card (approval, Safety check, cloud
+    // permission) is the person's even if the gate above ever changes.
+    if (isUserOnlyRow(row) && notOwner(req)) {
       console.warn(`[${ts()}] QUESTION  reject id=${id.slice(0, 8)} reason=person-only-from-agent`);
-      return res.status(403).json({ error: PERSON_ONLY_ANSWER_REFUSAL, code: REMOTE_RELAY_ERROR_CODES.forbidden });
+      return res.status(403).json({ error: AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, code: AUTH_ERROR_CODES.personRequired });
     }
     if (row.status !== 'pending') return res.status(409).json({ error: `Question already ${row.status}` });
 
@@ -441,11 +452,21 @@ export function registerAskUserRoutes(app, deps) {
   app.post('/api/relay-question/:id/timeout', auth, (req, res) => {
     const row = stmts.getQuestion.get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Not found' });
-    if (isRemoteRelayApprovalRow(row) && fromRemoteRelay(req)) {
-      return res.status(403).json({ error: 'Only this relay\'s user can answer a remote relay approval' });
+    // A timeout denies. Workers report their deadline here with their agent
+    // token: an agent may time out its own conversation's cards only. The
+    // person may time out any; another relay never a person-only one.
+    const remote = fromRemoteRelay(req);
+    const ownAgentCard = isAgent(req) && !remote
+      && sameConversation(String(row.conversation_id || ''), agentConversationOf(req));
+    if (!isPerson(req) && !ownAgentCard) {
+      console.warn(`[${ts()}] QUESTION  reject id=${String(row.id).slice(0, 8)} reason=timeout-not-own-conversation`);
+      return res.status(403).json({
+        error: 'An agent may time out only its own conversation\'s cards.',
+        code: AUTH_ERROR_CODES.personRequired,
+      });
     }
-    if (isPersonOnlyRow(row) && fromRemoteRelay(req)) {
-      return res.status(403).json({ error: PERSON_ONLY_ANSWER_REFUSAL, code: REMOTE_RELAY_ERROR_CODES.forbidden });
+    if (isUserOnlyRow(row) && remote && !ownAgentCard) {
+      return res.status(403).json({ error: AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, code: AUTH_ERROR_CODES.personRequired });
     }
     if (row.status !== 'pending') return res.json({ ok: true, question: formatQuestionRow(row) });
 

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createRemoteRelayPairing } from './remote-relay-pairing.mjs';
 import { createRemoteRelayRegistry } from './remote-relay-registry-service.mjs';
 import { RemoteRelayError } from './remote-relay-client.mjs';
+import { signInLink } from '../routes/auth-routes.mjs';
 import { REMOTE_RELAY_ERROR_CODES, REMOTE_RELAY_SETTING_KEYS } from '../../shared/remote-relay-contract.mjs';
 
 const OWN_TOKEN = 'o'.repeat(36);
@@ -36,7 +37,8 @@ function createFakeClient({ probeAnswers = {}, requestAnswer = { ok: true, relay
     requests,
     probeAnswers,
     setRequestAnswer(value) { requestAnswer = value; },
-    tokenFor: (relay) => (relay?.tokenMode === 'custom' ? relay.token : OWN_TOKEN),
+    // As the real client: the stored token, never this relay's own.
+    tokenFor: (relay) => (relay?.tokenMode === 'custom' ? relay.token : ''),
     async probe(url, token, options) {
       probes.push({ url, token, options });
       const answer = probeAnswers[url];
@@ -72,7 +74,7 @@ function setup({ settings = {}, probeAnswers, requestAnswer } = {}) {
     logger: { warn() {} },
     randomUUID: () => `uuid-${++ids}`,
   });
-  const pairing = createRemoteRelayPairing({ registry, client, getOwnToken: () => OWN_TOKEN });
+  const pairing = createRemoteRelayPairing({ registry, client });
   return { pairing, registry, client, values, events };
 }
 
@@ -100,22 +102,30 @@ test('a pasted web-client link is normalised and its ?token= becomes the candida
   assert.equal(JSON.stringify(result).includes(LINK_TOKEN), false);
 });
 
-test('token order: explicit field, then the link token, then our own token', async () => {
+test('a new entry keeps whether the relay\'s page answers ?answer= from the probe the add made', async () => {
+  const yes = setup({ probeAnswers: { 'https://relay-b.example.test': identity({ answerLink: true }) } });
+  assert.equal((await yes.pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN, pairBack: false })).relay.answerLink, true);
+  assert.equal(yes.registry.listPublic()[0].answerLink, true);
+  const no = setup({ probeAnswers: { 'https://relay-b.example.test': identity() } });
+  assert.equal((await no.pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN, pairBack: false })).relay.answerLink, undefined);
+});
+
+test('token order: explicit field, then the link token; this relay\'s own token is never tried', async () => {
   const probeAnswers = { 'https://relay-b.example.test': identity() };
   const explicit = setup({ probeAnswers });
   await explicit.pairing.addFromLink({ url: `https://relay-b.example.test/?token=${LINK_TOKEN}`, token: OTHER_TOKEN, pairBack: false });
   assert.equal(explicit.client.probes[0].token, OTHER_TOKEN);
   assert.equal(explicit.registry.list()[0].token, OTHER_TOKEN);
 
-  const own = setup({ probeAnswers });
-  const result = await own.pairing.addFromLink({ url: 'https://relay-b.example.test', pairBack: false });
-  assert.equal(own.client.probes[0].token, OWN_TOKEN);
-  assert.equal(result.relay.tokenMode, 'own', 'our own token working there means own mode');
-  assert.equal(own.registry.list()[0].token, undefined, 'and nothing is stored');
+  const none = setup({ probeAnswers });
+  await none.pairing.addFromLink({ url: 'https://relay-b.example.test', pairBack: false });
+  assert.equal(none.client.probes[0].token, '', 'no token given: the probe carries none (a relay that wants one asks)');
 
-  const sameAsOwn = setup({ probeAnswers });
-  await sameAsOwn.pairing.addFromLink({ url: 'https://relay-b.example.test', token: OWN_TOKEN, pairBack: false });
-  assert.equal(sameAsOwn.registry.list()[0].tokenMode, 'own');
+  // A token typed in is stored as that relay's own, whatever its value.
+  const typed = setup({ probeAnswers });
+  await typed.pairing.addFromLink({ url: 'https://relay-b.example.test', token: OWN_TOKEN, pairBack: false });
+  assert.equal(typed.registry.list()[0].tokenMode, 'custom');
+  assert.equal(typed.registry.list()[0].token, OWN_TOKEN);
 });
 
 test('an invalid or plain-http public address is refused before any probe', async () => {
@@ -160,6 +170,25 @@ test('adding this relay itself is refused', async () => {
   assert.equal(registry.list().length, 0);
 });
 
+test("this relay's own address is refused before any probe: its public URL, or the page's origin", async () => {
+  const unauthorized = new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, 'HTTP 401');
+  // Without its own token the probe of itself would only ask for a token.
+  const { pairing, registry, client } = setup({
+    settings: withPublicUrl,
+    probeAnswers: { 'https://relay-a.example.test': unauthorized, 'http://127.0.0.1:3333': unauthorized, 'http://127.0.0.1:4444': unauthorized },
+  });
+  const byPublicUrl = await pairing.addFromLink({ url: 'https://relay-a.example.test/' });
+  assert.equal(byPublicUrl.code, 'SELF');
+  assert.equal(byPublicUrl.status, 400);
+  const byPage = await pairing.addFromLink({ url: 'http://127.0.0.1:3333/?token=x' }, { requestOrigin: 'http://127.0.0.1:3333' });
+  assert.equal(byPage.code, 'SELF');
+  assert.equal(client.probes.length, 0, 'nothing was probed');
+  // Another port of the same host is another relay: it asks for its token.
+  const other = await pairing.addFromLink({ url: 'http://127.0.0.1:4444' }, { requestOrigin: 'http://127.0.0.1:3333' });
+  assert.equal(other.needsToken, true);
+  assert.equal(registry.list().length, 0);
+});
+
 test('the same relay under a second URL updates the entry instead of duplicating it', async () => {
   const { pairing, registry } = setup({
     probeAnswers: {
@@ -169,15 +198,31 @@ test('the same relay under a second URL updates the entry instead of duplicating
   });
   const first = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN, pairBack: false });
   registry.update(first.relay.id, { permission: 'read' });
-  const second = await pairing.addFromLink({ url: 'https://relay-b2.example.test', pairBack: false });
+  const second = await pairing.addFromLink({ url: 'https://relay-b2.example.test', token: LINK_TOKEN, pairBack: false });
   assert.equal(second.ok, true);
   assert.equal(second.updated, true);
   assert.equal(second.relay.id, first.relay.id);
   assert.equal(second.relay.url, 'https://relay-b2.example.test');
   assert.equal(second.relay.name, 'linux-renamed');
   assert.equal(second.relay.permission, 'read', 'the chosen permission survives');
-  assert.equal(second.relay.tokenMode, 'own', 'the token that just worked is the one kept');
+  assert.equal(second.relay.tokenMode, 'custom', 'the token that just worked is the one kept');
+  assert.equal(registry.list()[0].token, LINK_TOKEN);
   assert.equal(registry.list().length, 1);
+});
+
+test('re-pair after the other relay replaced its token: its new pairing link updates the entry in place (same id)', async () => {
+  const { pairing, registry } = setup({ probeAnswers: { 'https://relay-b.example.test/oar': identity() } });
+  const first = await pairing.addFromLink({ url: 'https://relay-b.example.test/oar', token: OTHER_TOKEN, pairBack: false });
+  registry.update(first.relay.id, { permission: 'read' });
+  // The rotate answer's pairing link (routes/auth-routes.mjs signInLink).
+  const pairingLink = signInLink('https://relay-b.example.test/oar/', 'token', LINK_TOKEN);
+  const repaired = await pairing.addFromLink({ url: pairingLink, pairBack: false });
+  assert.equal(repaired.ok, true);
+  assert.equal(repaired.updated, true);
+  assert.equal(repaired.relay.id, first.relay.id, 'the same entry');
+  assert.equal(repaired.relay.permission, 'read');
+  assert.equal(registry.list().length, 1);
+  assert.ok(registry.list()[0].token === LINK_TOKEN, 'the new token replaced the old one');
 });
 
 test('an older relay (protocol 0) is deduplicated by URL and never paired back', async () => {
@@ -193,9 +238,18 @@ test('an older relay (protocol 0) is deduplicated by URL and never paired back',
   assert.equal(client.requests.length, 0);
 });
 
-test('pair-back introduces this relay without a token when ours worked there', async () => {
-  const { pairing, client } = setup({ settings: withPublicUrl, probeAnswers: { 'https://relay-b.example.test': identity() } });
-  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test' });
+test('a protocol-1 relay is not paired back: it could call back only with this relay\'s token, which is not handed out', async () => {
+  const { pairing, client } = setup({ settings: withPublicUrl, probeAnswers: { 'https://relay-b.example.test': identity({ protocol: 1 }) } });
+  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN });
+  assert.equal(result.ok, true);
+  assert.equal(result.pairedBack, false);
+  assert.match(result.pairBackError, /add this relay there by hand with its token/);
+  assert.equal(client.requests.length, 0);
+});
+
+test('pair-back to a relay that can call back on its own credential introduces this relay without any token', async () => {
+  const { pairing, client } = setup({ settings: withPublicUrl, probeAnswers: { 'https://relay-b.example.test': identity({ protocol: 2 }) } });
+  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN });
   assert.equal(result.pairedBack, true);
   assert.equal(result.pairBackError, undefined);
   assert.equal(client.requests.length, 1);
@@ -203,23 +257,14 @@ test('pair-back introduces this relay without a token when ours worked there', a
   assert.equal(call.method, 'POST');
   assert.equal(call.path, '/api/remote-relays/pair');
   assert.equal(call.relay.url, 'https://relay-b.example.test');
-  assert.equal(call.token, OWN_TOKEN, 'the call itself uses the token that worked');
+  assert.equal(call.token, OTHER_TOKEN, 'the remote is called with its own token');
   assert.deepEqual(call.options.body, {
     relayId: OWN_ID,
     name: 'win-test',
     url: 'https://relay-a.example.test',
-    protocol: 1,
+    protocol: 2,
   });
-});
-
-test('pair-back sends our token only when the remote needed a different one', async () => {
-  const { pairing, client } = setup({ settings: withPublicUrl, probeAnswers: { 'https://relay-b.example.test': identity() } });
-  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN });
-  assert.equal(result.pairedBack, true);
-  const [call] = client.requests;
-  assert.equal(call.token, OTHER_TOKEN, 'the remote is called with its own token');
-  assert.equal(call.options.body.token, OWN_TOKEN, 'and told which token reaches us');
-  assert.equal(JSON.stringify(result).includes(OWN_TOKEN), false);
+  assert.equal('token' in call.options.body, false, 'this relay\'s token never travels');
   assert.equal(JSON.stringify(result).includes(OTHER_TOKEN), false);
 });
 
@@ -241,10 +286,10 @@ test('pair-back is skipped without a public URL or when not requested', async ()
 test('a failed pair-back is reported and the entry stays', async () => {
   const { pairing, registry } = setup({
     settings: withPublicUrl,
-    probeAnswers: { 'https://relay-b.example.test': identity() },
+    probeAnswers: { 'https://relay-b.example.test': identity({ protocol: 2 }) },
     requestAnswer: new RemoteRelayError('REMOTE_RELAY_HTTP_500', 'Relay "linux-test" answered HTTP 500: boom', { status: 500 }),
   });
-  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test' });
+  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN });
   assert.equal(result.ok, true);
   assert.equal(result.pairedBack, false);
   assert.match(result.pairBackError, /HTTP 500/);
@@ -252,9 +297,9 @@ test('a failed pair-back is reported and the entry stays', async () => {
 });
 
 test('selfUrl becomes the public URL once, when it passes the policy, and enables pair-back', async () => {
-  const probeAnswers = { 'https://relay-b.example.test': identity(), 'https://relay-c.example.test': identity({ relayId: 'relay-c-0003', name: 'mac-test' }) };
+  const probeAnswers = { 'https://relay-b.example.test': identity({ protocol: 2 }), 'https://relay-c.example.test': identity({ relayId: 'relay-c-0003', name: 'mac-test', protocol: 2 }) };
   const { pairing, registry, client } = setup({ probeAnswers });
-  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', selfUrl: 'https://relay-a.example.test/oar/?token=zzz' });
+  const result = await pairing.addFromLink({ url: 'https://relay-b.example.test', token: OTHER_TOKEN, selfUrl: 'https://relay-a.example.test/oar/?token=zzz' });
   assert.equal(registry.getSelfSettings().publicUrl, 'https://relay-a.example.test/oar');
   assert.equal(result.pairedBack, true);
   assert.equal(client.requests[0].options.body.url, 'https://relay-a.example.test/oar');
@@ -314,12 +359,12 @@ test('acceptPairing stores the token for that remote only and never echoes it', 
   assert.equal(registry.list()[0].token, OTHER_TOKEN);
 });
 
-test('acceptPairing of a new relay without a token uses this relay\'s own token for it', async () => {
+test('acceptPairing of a new relay without a token stores it with no token (never this relay\'s own)', async () => {
   const { pairing, registry } = setup({ probeAnswers: { 'https://relay-b.example.test': identity() } });
   const result = await pairing.acceptPairing({ relayId: 'relay-b-0002', name: 'linux-test', url: 'https://relay-b.example.test', protocol: 1 });
   assert.equal(result.ok, true);
   const [entry] = registry.list();
-  assert.equal(entry.tokenMode, 'own');
+  assert.equal(entry.tokenMode, 'none');
   assert.equal(entry.token, undefined);
   assert.equal(entry.protocol, 1);
 });

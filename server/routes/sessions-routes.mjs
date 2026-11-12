@@ -80,7 +80,9 @@ import { createShareAccessLog, readShareRequestViewer } from '../services/share-
 import { GROUP_NAME_MAX, resolveGroupDisplayName } from '../repositories/conversation-group-repository.mjs';
 import { conversationGroupPosition, conversationGroupRole, groupActivityTimes, pageConversationRows } from '../public/app/conversation-group-order.mjs';
 import { detailsVersion, parseHeldDetailsParam, thoughtFingerprint } from '../public/app/held-details.mjs';
-import { admitRemoteRelayRequest, publicRemoteRelayOrigin, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
+import { admitRemoteRelayRequest, isDirectAgentRequest, isRemoteRelayLoopbackRequest, originCarriesWeight, publicRemoteRelayOrigin, readRemoteRelayRequest, remoteOriginAnswerFields } from '../services/remote-relay-inbound.mjs';
+import { isPerson, notPerson, principalOf } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES, AUTH_RELAY_TOOL_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 import {
   RELAUNCH_COALESCE_WINDOW_MS,
   buildRelaunchRequestKey,
@@ -5407,7 +5409,7 @@ export function registerSessionsRoutes(app, deps) {
     // "Agents in this conversation may start sessions" is the owner's alone:
     // an agent (of this relay or a paired one) could grant it to itself.
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'mayCreateSessions')) {
-      if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+      if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) {
         return res.status(403).json({ error: 'Whether agents in a conversation may start sessions is the owner\'s setting alone.' });
       }
       if (typeof req.body.mayCreateSessions !== 'boolean') {
@@ -5420,7 +5422,7 @@ export function registerSessionsRoutes(app, deps) {
     // Plan-only: the owner's toggle here. Agents set and clear it through
     // update_session only (its dry run and Allow card), never through this
     // route, and they cannot change a plan-only session's mode here either.
-    const remoteRequest = readRemoteRelayRequest(req, remoteRelayInbound).remote;
+    const remoteRequest = notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound));
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'planOnly')) {
       if (remoteRequest) {
         return res.status(403).json({ error: 'Agents set plan-only through relay_tool update_session, not through this route.' });
@@ -5516,8 +5518,21 @@ export function registerSessionsRoutes(app, deps) {
     const callerConversation = String(caller.conversationId || '').trim();
     if (!callerConversation || String(createdBy.conversationId || '').trim() !== callerConversation) return false;
     if (remoteRequest.local === true) return createdBy.local === true && caller.local === true;
-    const relayId = String(createdBy.relayId || '').trim();
-    return createdBy.local !== true && !!relayId && relayId === String(caller.relayId || '').trim();
+    // Origin binding: a paired relay's request (its key) matches a session
+    // only that same registry entry started, verified, at its current epoch.
+    if (createdBy.local === true || caller.verified !== true || createdBy.verified !== true) return false;
+    if (String(createdBy.entryId || '') !== String(caller.entryId || '')) return false;
+    return originCarriesWeight(createdBy, (id) => {
+      try {
+        // An inbound-only entry (a relay that added this one one way) is no
+        // listed relay, and its key opens what any paired relay's does.
+        if (typeof remoteRelayInbound?.getRelay === 'function') return remoteRelayInbound.getRelay(id);
+        const listed = remoteRelayInbound?.listRelays?.() || [];
+        return listed.find((entry) => String(entry?.id || '') === String(id)) || null;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /** Why a session cannot move to another folder now ('' when it can). */
@@ -5648,6 +5663,14 @@ export function registerSessionsRoutes(app, deps) {
           // An id that is not there names no group to make.
           const refusal = bootstrapGroupRefusal(found, wanted.group, groups);
           return fail(400, refusal.error.replace('No conversation was created.', 'Nothing was changed.'), { code: refusal.code, groups: refusal.groups, ...(refusal.groupsTotal ? { groupsTotal: refusal.groupsTotal } : {}) });
+        } else if (remote) {
+          // Making a group is the person's (agent auth §0.2): an agent moves
+          // a session into an existing group or out of one.
+          const asked = String(wanted.group).replace(/["\r\n]+/g, ' ').slice(0, 80);
+          return fail(403, `Only the person makes session groups: there is no group "${asked}" here${groups.length ? ` (groups: ${formatSessionGroupList(groups)})` : ''}. Name an existing group (relay_info lists them), or ask the user to make it. Nothing was changed.`, {
+            code: AUTH_ERROR_CODES.personRequired,
+            groups: groups.slice(0, REMOTE_RELAY_GROUP_LIMITS.refusalMax).map((group) => ({ id: group.id, name: group.name })),
+          });
         } else if (wanted.group.replace(/\s+/g, ' ').length > GROUP_NAME_MAX) {
           return fail(400, `A group name has at most ${GROUP_NAME_MAX} characters. Nothing was changed.`, { code: SESSION_SETTINGS_INVALID });
         } else {
@@ -5804,7 +5827,11 @@ export function registerSessionsRoutes(app, deps) {
     }
     const conversationId = String(conversation.id);
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const planned = planSessionSettings(conversation, body.settings, { remote: remoteRequest.remote === true });
+    // Not the person (an agent token, or another relay's agent): mode and
+    // plan-only changes are held, and another's session needs the owner's
+    // Allow (agent auth §2.2).
+    const byAgent = notPerson(req, remoteRequest);
+    const planned = planSessionSettings(conversation, body.settings, { remote: byAgent });
     if (!planned.ok) return res.status(planned.status).json(planned.body);
     const { plan } = planned;
     const createdBy = parseRemoteRelayOriginJson(conversation.origin_json);
@@ -5812,7 +5839,7 @@ export function registerSessionsRoutes(app, deps) {
     // An agent changes freely only a session its own conversation started;
     // any other (the owner's, another agent's, its own creator's) needs the
     // owner's Allow, which the calling relay asks for and states.
-    const approvalNeeded = remoteRequest.remote === true && !byCaller;
+    const approvalNeeded = byAgent && !byCaller;
     const facts = { session: conversationId, provider: plan.provider, ownerStarted: !createdBy, startedByCaller: byCaller, approvalNeeded };
     if (body.dry_run === true) {
       return res.json({
@@ -5825,8 +5852,24 @@ export function registerSessionsRoutes(app, deps) {
         ...(plan.notes.length ? { notes: plan.notes } : {}),
       });
     }
-    // This relay's own rule, whatever the calling relay checked.
-    if (approvalNeeded && body.owner_approved !== true) {
+    // This relay's own rule, whatever the calling relay checked. An agent
+    // token's `owner_approved` is ignored: only this relay's own relay_tool
+    // (the loopback, after the owner's Allow card) and, until peer keys,
+    // another relay calling with the owner token may state it.
+    // A paired relay's key is never the person, so its `owner_approved` is
+    // ignored too (origin binding §6.4).
+    const ownerApproved = body.owner_approved === true
+      && (isRemoteRelayLoopbackRequest(req) || (isPerson(req) && remoteRequest.remote === true));
+    // A paired relay's key never moves a session to another folder here.
+    if (plan.cwd && principalOf(req)?.kind === 'peer') {
+      return res.status(403).json({
+        ok: false,
+        code: REMOTE_RELAY_ERROR_CODES.permission,
+        ...facts,
+        error: 'A paired relay cannot change a session\'s folder on this relay. Nothing was changed.',
+      });
+    }
+    if (approvalNeeded && !ownerApproved) {
       return res.status(403).json({
         ok: false,
         code: REMOTE_RELAY_ERROR_CODES.permission,
@@ -5880,7 +5923,7 @@ export function registerSessionsRoutes(app, deps) {
     // Groups through the agent path: an owner's group the session leaves is
     // never removed (it stays, empty if it was the last member); a group an
     // agent made goes once empty.
-    const groupOptions = { keepOwnerGroups: remoteRequest.remote === true };
+    const groupOptions = { keepOwnerGroups: byAgent };
     let groupCreated = null;
     let groupPlan = plan.group;
     if (groupPlan?.action === 'create') {
@@ -5914,7 +5957,7 @@ export function registerSessionsRoutes(app, deps) {
       }
     } else if (groupPlan?.action === 'create') {
       const previousGroupId = conversationGroups.groupOfConversation(conversationId)?.id || null;
-      const group = conversationGroups.createGroup({ name: groupPlan.name, conversationIds: [conversationId], agentMade: remoteRequest.remote === true, ...groupOptions });
+      const group = conversationGroups.createGroup({ name: groupPlan.name, conversationIds: [conversationId], agentMade: byAgent, ...groupOptions });
       groupCreated = group ? { id: group.id, name: group.name } : null;
       if (group) emitGroupChanged(group.id, [conversationId]);
       if (previousGroupId) emitGroupChanged(previousGroupId, [conversationId]);
@@ -6655,7 +6698,7 @@ export function registerSessionsRoutes(app, deps) {
   // or background work is skipped and named in the answer, so the owner can
   // stop it ("Stop all running") and archive again.
   app.post('/api/conversation-groups/:id/archive', auth, async (req, res) => {
-    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+    if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) {
       return res.status(403).json({ error: 'Session groups are managed by this relay\'s owner only.' });
     }
     const groupId = String(req.params.id || '').trim();
@@ -6716,6 +6759,12 @@ export function registerSessionsRoutes(app, deps) {
   });
 
   app.post('/api/conversation/bootstrap', auth, async (req, res) => {
+    // An agent of this relay starts sessions through relay_tool only: the
+    // dispatcher's rules (may this session start sessions, the cap, the
+    // owner's Allow) run there, and its loopback request is let through.
+    if (isDirectAgentRequest(req)) {
+      return res.status(403).json({ ok: false, code: AUTH_ERROR_CODES.relayToolRequired, error: AUTH_RELAY_TOOL_REQUIRED_MESSAGE });
+    }
     // Another relay's agent starting a session: refused while the inbound
     // switch is off, otherwise the conversation keeps its provenance.
     const remoteRequest = admitRemoteRelayRequest(req, res, remoteRelayInbound);
@@ -7096,15 +7145,18 @@ export function registerSessionsRoutes(app, deps) {
     }
 
     // The session group an agent's create_session names (an id or an exact
-    // name): resolved before anything is written, so an unknown one creates
-    // nothing. It wins over the creator's group. Only the row created here is
-    // ever placed; the group routes stay the owner's.
+    // name): resolved before anything is written. It wins over the creator's
+    // group. Only the row created here is ever placed; the group routes stay
+    // the owner's. A name that is not a group here: an agent makes no group
+    // (agent auth §0.2), so its session starts in no group and the answer
+    // says so; the person's request is refused, nothing created.
     const rawGroup = req.body?.group;
     if (rawGroup !== undefined && rawGroup !== null && typeof rawGroup !== 'string') {
       return res.status(400).json({ ok: false, code: 'SESSION_GROUP_INVALID', error: 'group must be text: a group id or name' });
     }
     const requestedGroup = String(rawGroup || '').trim();
     let bootstrapGroupId = '';
+    let bootstrapGroupNote = '';
     if (requestedGroup) {
       if (!conversationGroups?.enabled) {
         return res.status(503).json({
@@ -7115,8 +7167,14 @@ export function registerSessionsRoutes(app, deps) {
       }
       const groups = listGroupsForAgents();
       const found = resolveSessionGroupReference(groups, requestedGroup);
-      if (found.status !== 'found') return res.status(400).json(bootstrapGroupRefusal(found, requestedGroup, groups));
-      bootstrapGroupId = found.group.id;
+      if (found.status === 'found') {
+        bootstrapGroupId = found.group.id;
+      } else if (found.status === 'unknown' && notPerson(req, remoteRequest)) {
+        const asked = requestedGroup.replace(/["\r\n]+/g, ' ').slice(0, 80);
+        bootstrapGroupNote = `No session group "${asked}" here, and only the person makes groups: the session was started in no group.`;
+      } else {
+        return res.status(400).json(bootstrapGroupRefusal(found, requestedGroup, groups));
+      }
     }
 
     // Optional launch CWD from the New Chat modal. Validated before insertConv
@@ -7304,7 +7362,7 @@ export function registerSessionsRoutes(app, deps) {
           if (!placed?.ok) throw Object.assign(new Error('session group gone'), { bootstrapGroupGone: true });
           attachedGroupId = bootstrapGroupId;
           attachedGroupIds = [conversationId];
-        } else if (remoteRequest.origin?.local === true && remoteRequest.origin.conversationId) {
+        } else if (!bootstrapGroupNote && remoteRequest.origin?.local === true && remoteRequest.origin.conversationId) {
           // A session an agent of this relay created joins its creator's group
           // (or starts one with the creator as head). A creator on a paired
           // relay has no local flag and groups nothing.
@@ -7442,6 +7500,7 @@ export function registerSessionsRoutes(app, deps) {
         : null;
       return res.json({
         ok: true,
+        ...remoteOriginAnswerFields(remoteRequest),
         conversationId,
         conversation,
         origin: parseRemoteRelayOriginJson(conversation?.origin_json),
@@ -7451,6 +7510,7 @@ export function registerSessionsRoutes(app, deps) {
         // Always present (null outside a group): a caller that asked for a
         // group tells this relay from one that predates it by the key.
         group: conversationGroupField(conversationId),
+        ...(bootstrapGroupNote ? { groupNote: bootstrapGroupNote } : {}),
         runtimeSessionId: runtimeSession?.id || null,
         ownerSessionId,
         worker: ownerWorker,
@@ -7695,7 +7755,7 @@ export function registerSessionsRoutes(app, deps) {
     // this relay or a paired one could lift the cap on itself. Nothing of the
     // request is applied then.
     const imageSpend = parseOpenAIImageSpendSettingsRequest(req.body);
-    if (imageSpend.present && readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+    if (imageSpend.present && notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) {
       return res.status(403).json({ error: 'The OpenAI image cap and "Allow for today" are this relay\'s owner\'s settings alone.' });
     }
     if (!imageSpend.ok) return res.status(400).json({ error: imageSpend.error });
@@ -7805,7 +7865,7 @@ export function registerSessionsRoutes(app, deps) {
   const readOwnOpenAIImagePresets = () => parseOwnOpenAIImagePresets(readJsonAppSetting(OPENAI_IMAGE_PRESETS_SETTING_KEY) ?? []);
   const openAIImagePresetsPayload = (own = readOwnOpenAIImagePresets()) => ({ presets: listOpenAIImagePresets(own) });
   const changeOwnOpenAIImagePresets = (req, res, change) => {
-    if (readRemoteRelayRequest(req, remoteRelayInbound).remote) {
+    if (notPerson(req, readRemoteRelayRequest(req, remoteRelayInbound))) {
       return res.status(403).json({ error: 'Image presets are changed by this relay\'s owner only.' });
     }
     if (typeof stmts?.upsertAppSetting?.run !== 'function') {

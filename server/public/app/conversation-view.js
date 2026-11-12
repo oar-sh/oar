@@ -3931,7 +3931,7 @@ function handleChatMediaClick(event) {
     const img = event.target.closest?.('.msg-bubble img');
     if (!img || img.closest('.msg-attachment')) return;
     if (IS_SHARED_VIEW) return; // the file routes are cookie-authed; shared viewers would only see a failed load
-    if (!String(img.getAttribute('src') || '').trim()) return;
+    if (!String(img.getAttribute('src') || img.getAttribute('data-oar-file-src') || '').trim()) return;
     node = img;
   }
   event.preventDefault();

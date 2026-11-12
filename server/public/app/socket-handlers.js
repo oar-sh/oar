@@ -34,7 +34,8 @@ import {
   showTransientRelayNotice,
 } from './store.js';
 import { newModelsToastFor } from './model-refresh-ui.mjs';
-import { scheduleContextUsageRefresh } from './api-client.js';
+import { reportSignedOut, scheduleContextUsageRefresh, tradeOldCookie } from './api-client.js';
+import { getSessionProof } from './session-proof.mjs';
 import { capFinishedActivityEntries, capLiveActivityEntries, normalizeTurnSeq } from './activity-replay-state.mjs';
 import { liveActivityCap } from './live-activity-cap.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
@@ -59,6 +60,7 @@ import { setPreviews } from './preview-cards.mjs';
 import { applyShareSettings, hasActiveShare, refreshShares } from './share-state.js';
 import { handleShareOpened, handleViewerIpsForgotten } from './shared-conversations-settings.js';
 import { setRemoteRelaysSnapshot } from './remote-relays-store.mjs';
+import { noteNewSignIn, SIGNIN_NOTICE_SOCKET_EVENT } from './security-settings.js';
 import { REMOTE_RELAY_SOCKET_EVENT } from './remote-relay-shared.mjs';
 import { AGENT_SESSIONS_SOCKET_EVENT } from './agent-sessions-settings.mjs';
 import { applyAgentSessionsSettingsState, refreshAgentSessionsSection } from './agent-sessions-settings-ui.js';
@@ -149,6 +151,11 @@ let socket = null;
 let socketActivityEnabled = true;
 let livenessProbeInFlight = false;
 let lastSocketErrorSignature = '';
+// One trade of an old cookie per connection attempt that needed it (a
+// handshake refused again after the trade does not trade forever).
+let oldCookieTradeTried = false;
+// The key the latest handshake carried ('' for none).
+let handshakeProof = '';
 let lastSocketErrorAt = 0;
 
 /** @type {SocketHandlerDeps | null} */
@@ -330,7 +337,13 @@ export async function connectSocket(overrideDeps) {
 
   socket = io({
     path: `${BASE}/socket.io/`,
-    auth: TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID },
+    // Read at every (re)connect: the session cookie goes with its key, the
+    // one the latest sign-in of this origin stored.
+    auth: (deliver) => {
+      const proof = getSessionProof();
+      handshakeProof = TOKEN ? '' : proof;
+      deliver(TOKEN ? { token: TOKEN, clientId: CLIENT_ID } : { clientId: CLIENT_ID, ...(proof ? { proof } : {}) });
+    },
     autoConnect: false,
     reconnection: true,
     reconnectionDelay: 1000,
@@ -364,6 +377,7 @@ export async function connectSocket(overrideDeps) {
   }
 
   socket.on('connect', () => {
+    oldCookieTradeTried = false;
     lastSocketErrorSignature = '';
     lastSocketErrorAt = 0;
     console.log('Socket connected');
@@ -403,6 +417,27 @@ export async function connectSocket(overrideDeps) {
   });
   socket.on('connect_error', (e) => {
     setRelayOnline(false);
+    // The cookie without its session key: this browser is not signed in
+    // here. Unless another tab stored a new key since the handshake: then
+    // the socket tries again with that one, and the new key stays.
+    if (e?.data?.code === 'AUTH_SESSION_PROOF') {
+      const sentProof = handshakeProof;
+      const storedProof = getSessionProof();
+      if (storedProof && storedProof !== sentProof) {
+        socket.connect();
+      } else {
+        try { socket.io.reconnection(false); } catch {}
+        reportSignedOut('', { sentProof });
+      }
+    }
+    // A browser from before sessions: not signed out; the cookie is traded
+    // for a session and its key, then the socket connects again.
+    if (e?.data?.code === 'AUTH_COOKIE_UPGRADE' && !oldCookieTradeTried) {
+      oldCookieTradeTried = true;
+      void tradeOldCookie().then((traded) => {
+        if (traded?.ok) socket.connect();
+      }).catch(() => {});
+    }
     const message = String(e?.message || 'unknown').trim() || 'unknown';
     const signature = `socket-error:${message}`;
     const now = Date.now();
@@ -415,6 +450,9 @@ export async function connectSocket(overrideDeps) {
   socket.on('disconnect', () => {
     setRelayOnline(false);
   });
+  // A browser signed in just now (agent auth §13.2, 2d): a row in the
+  // notices banner, sent to every page but the new browser's own.
+  socket.on(SIGNIN_NOTICE_SOCKET_EVENT, (payload) => { noteNewSignIn(payload); });
   socket.on('cli_status', ({ online }) => {
     setCliOnline(online);
     renderConvList();
@@ -852,6 +890,9 @@ export async function connectSocket(overrideDeps) {
     if (subagentRunId) {
       upsertSubagentRun({ subagentRunId: String(subagentRunId).trim(), messageId, conversationId });
     }
+    // Streaming is activity (the 🔥 filter's window); no repaint for it here,
+    // the row works while it streams.
+    if (conversationId && conversations[conversationId]) conversations[conversationId].localActivityAt = Date.now();
     if (conversationId !== currentConvId) return;
     const autoScroll = followsTranscriptEnd();
     const accepted = applyRelayStreamEvent({
@@ -1019,6 +1060,9 @@ export async function connectSocket(overrideDeps) {
       // The row's turn fields follow the event, open or not: the title colour, a
       // group head's pill and its fold read them between list fetches.
       applyTurnStatusToConversation(conversation, normalizedStatus);
+      // A turn starting, queueing or ending is activity: the sidebar's 🔥
+      // filter keeps the row for a while after (conversation-list-filter.mjs).
+      conversation.localActivityAt = Date.now();
       if (normalizedStatus === 'processing') {
         conversation.localTurnStatus = 'processing';
         conversation.localTurnStatusUpdatedAt = Date.now();

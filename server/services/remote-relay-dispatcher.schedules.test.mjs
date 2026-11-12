@@ -12,6 +12,7 @@ import { REMOTE_RELAY_LIMITS } from '../../shared/remote-relay-contract.mjs';
 import { createRemoteRelayRepository } from '../repositories/remote-relay-repository.mjs';
 import { createRemoteRelayCallerContext, formatRemoteRelayApprovalPrompt } from './remote-relay-caller-context.mjs';
 import { createRemoteRelayDispatcher } from './remote-relay-dispatcher.mjs';
+import { originCarriesWeight } from './remote-relay-inbound.mjs';
 import { createRelayScheduleService } from './relay-schedule-service.mjs';
 
 // relay_tool schedule / list_schedules / unschedule through the dispatcher,
@@ -324,6 +325,49 @@ test('a schedule set by a turn acting on a hop-2 prompt passes the hops on: the 
     assert.equal(refused.status, 403, `${conversationId}: ${JSON.stringify(refused.body)}`);
     assert.equal(refused.body.code, CODES.hopLimit);
   }
+});
+
+test('origin binding: a firing carries the stored origin; its weight follows verified, entryId and epoch', async () => {
+  const { run, db, service } = setup({ realCaller: true });
+  const repository = createRemoteRelayRepository(db);
+  const at = new Date(Date.now() - 30_000).toISOString();
+  // The coordinator acts on a prompt that came with PROMPTER's key (verified,
+  // bound to its entry at epoch 3); the worker on a claimed (unverified) one.
+  const prompts = [
+    [CALLER, 'm-verified', { kind: 'agent', relayId: PROMPTER.relayId, relayName: PROMPTER.name, conversationId: 'conv-remote', hops: 1, verified: true, entryId: PROMPTER.id, epoch: 3 }],
+    [WORKER, 'm-claimed', { kind: 'agent', relayId: PROMPTER.relayId, relayName: 'claimed name', conversationId: 'conv-remote', hops: 1, verified: false }],
+  ];
+  for (const [conversationId, id, origin] of prompts) {
+    db.prepare(`INSERT INTO messages (id, conversation_id, role, text, timestamp, origin_json) VALUES (?, ?, 'user', 'go on', ?, ?)`)
+      .run(id, conversationId, at, JSON.stringify(origin));
+    db.prepare(`INSERT INTO queue (id, conversation_id, text, status, timestamp, processing_at) VALUES (?, ?, 'go on', 'processing', ?, ?)`).run(id, conversationId, at, at);
+  }
+  const verified = await run('schedule', { text: 'Carry on.', every_minutes: 5 });
+  const claimed = await run('schedule', { text: 'Carry on too.', every_minutes: 5 }, WORKER);
+  assert.equal(verified.status, 200, JSON.stringify(verified.body));
+  assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
+  db.prepare(`UPDATE queue SET status = 'done' WHERE id IN ('m-verified', 'm-claimed')`).run();
+  assert.equal(fireNow(db, service, verified.body.schedule_id).fired, true);
+  assert.equal(fireNow(db, service, claimed.body.schedule_id).fired, true);
+
+  const fired = repository.getMessageOrigin(scheduledMessages(db, CALLER)[0].id);
+  assert.equal(fired.verified, true, 'the binding is kept, not stripped like a claim');
+  assert.equal(fired.entryId, PROMPTER.id);
+  assert.equal(fired.epoch, 3);
+  assert.equal(fired.relayId, PROMPTER.relayId);
+  const entries = new Map([[PROMPTER.id, { ...PROMPTER, epoch: 3 }]]);
+  const lookup = (id) => entries.get(id) || null;
+  assert.equal(originCarriesWeight(fired, lookup), true, 'live entry, same epoch: weight');
+  entries.set(PROMPTER.id, { ...PROMPTER, epoch: 4 });
+  assert.equal(originCarriesWeight(fired, lookup), false, 'its key revoked since (a new epoch): none');
+  entries.delete(PROMPTER.id);
+  assert.equal(originCarriesWeight(fired, lookup), false, 'the entry removed: none');
+
+  const firedClaim = repository.getMessageOrigin(scheduledMessages(db, WORKER)[0].id);
+  assert.equal(firedClaim.verified, false, 'a claim stays a claim');
+  assert.equal(firedClaim.entryId, undefined);
+  entries.set(PROMPTER.id, { ...PROMPTER, epoch: 0 });
+  assert.equal(originCarriesWeight(firedClaim, lookup), false);
 });
 
 test('a schedule set on the user\'s own words carries no provenance', async () => {

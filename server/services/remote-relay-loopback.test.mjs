@@ -10,7 +10,7 @@ import { createRemoteRelayLoopbackClient } from './remote-relay-loopback.mjs';
 // The loopback hands requests to an Express app in-process: no port is bound
 // and no connection is opened anywhere in this file.
 
-const OWN_TOKEN = 't'.repeat(36);
+const CALLER_TOKEN = 't'.repeat(36);
 const SELF = Object.freeze({ id: 'self', name: 'win-test', local: true });
 
 /** An app shaped like the relay's: JSON body parser, bearer auth, JSON routes. */
@@ -19,7 +19,7 @@ function createApp({ inboundEnabled = true } = {}) {
   const seen = [];
   const inbound = { inboundEnabled: () => inboundEnabled };
   app.use(express.json({ limit: '1mb' }));
-  const auth = (req, res, next) => (req.headers.authorization === `Bearer ${OWN_TOKEN}`
+  const auth = (req, res, next) => (req.headers.authorization === `Bearer ${CALLER_TOKEN}`
     ? next()
     : res.status(401).json({ error: 'Unauthorized' }));
   app.get('/api/conversation/:id', auth, (req, res) => {
@@ -46,7 +46,7 @@ function createClient(app, options = {}) {
   return createRemoteRelayLoopbackClient({
     handle: app,
     getOwnRelayId: () => 'relay-self-id',
-    getOwnToken: () => OWN_TOKEN,
+    getCallerToken: () => CALLER_TOKEN,
     ...options,
   });
 }
@@ -70,7 +70,7 @@ test('a request reaches the app\'s own route with the bearer token and the agent
   assert.equal(answer.id, 'conv 1');
   assert.equal(answer.limit, '5');
   assert.deepEqual(seen[0].query, { limit: '5' }, 'empty query values are left out');
-  assert.equal(seen[0].headers.authorization, `Bearer ${OWN_TOKEN}`);
+  assert.equal(seen[0].headers.authorization, `Bearer ${CALLER_TOKEN}`);
   assert.equal(seen[0].headers['x-oar-remote-origin'], 'relay-self-id');
   assert.equal(seen[0].headers['x-oar-remote-hops'], '0');
   // The routes treat it as an agent's request, and as this relay's own.
@@ -117,12 +117,27 @@ test('a refusal comes back as the error a paired relay\'s refusal would be', asy
 
 test('a wrong or missing token is refused before or by the app\'s auth', async () => {
   const { app } = createApp();
-  const wrong = await rejected(createClient(app, { getOwnToken: () => 'another-token' }).request(SELF, 'GET', '/api/conversation/c-1'));
+  const wrong = await rejected(createClient(app, { getCallerToken: () => 'another-token' }).request(SELF, 'GET', '/api/conversation/c-1'));
   assert.equal(wrong.code, CODES.unauthorized);
   assert.equal(wrong.status, 401);
-  const none = await rejected(createClient(app, { getOwnToken: () => '' }).request(SELF, 'GET', '/api/conversation/c-1'));
+  const none = await rejected(createClient(app, { getCallerToken: () => '' }).request(SELF, 'GET', '/api/conversation/c-1'));
   assert.equal(none.code, CODES.unauthorized);
-  assert.match(none.message, /no token configured/);
+  assert.match(none.message, /no agent token for the calling session/);
+});
+
+test('the request carries the calling agent\'s own token, asked with the caller the dispatcher names', async () => {
+  const { app, seen } = createApp();
+  const callers = [];
+  const client = createClient(app, {
+    getCallerToken: (caller) => {
+      callers.push(caller);
+      return CALLER_TOKEN;
+    },
+  });
+  const caller = { principal: { kind: 'agent', agentKind: 's', conversationId: 'conv-lead' }, conversationId: 'conv-lead' };
+  await client.request(SELF, 'GET', '/api/conversation/c-1', { caller });
+  assert.deepEqual(callers, [caller]);
+  assert.equal(seen[0].headers.authorization, `Bearer ${CALLER_TOKEN}`);
 });
 
 test('an empty answer is null; one that is not JSON, or too large, is refused', async () => {
@@ -171,7 +186,7 @@ test('a path that is not one of the app\'s is refused, and a missing handler is 
     const error = await rejected(client.request(SELF, 'GET', path));
     assert.equal(error.code, CODES.invalidInput, path);
   }
-  const none = await rejected(createRemoteRelayLoopbackClient({ getOwnToken: () => OWN_TOKEN }).request(SELF, 'GET', '/api/conversation/c-1'));
+  const none = await rejected(createRemoteRelayLoopbackClient({ getCallerToken: () => CALLER_TOKEN }).request(SELF, 'GET', '/api/conversation/c-1'));
   assert.equal(none.code, CODES.unsupported);
 });
 

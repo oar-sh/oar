@@ -16,6 +16,7 @@ import {
   normalizeRemoteRelayPermission,
 } from '../../shared/remote-relay-contract.mjs';
 import { remoteRelayAliases } from '../../shared/remote-relay-mentions.mjs';
+import { normalizePeerKeyFields } from './remote-relay-peer-keys.mjs';
 
 // The list of OTHER OAR relays this relay is paired with, and this relay's own
 // identity towards them (plan §4, §5.1, §5.2). Everything lives in
@@ -31,10 +32,22 @@ import { remoteRelayAliases } from '../../shared/remote-relay-mentions.mjs';
 //
 // Tokens never leave through listPublic(), the socket event or any route; only
 // the outbound client reads them (list()/get()/resolve() are server-internal).
+// The same holds for peer keys (remote-relay-peer-keys.mjs): the key a paired
+// relay gave this one (`peerToken`) and the hashes of the keys this relay gave
+// it (`peerKeys`) stay in the stored entry.
 //
 // A health loop re-reads every remote's identity once a minute, so status,
 // version and renames propagate. Unlocks are keyed by the entry `id`, which
 // never changes, so a renamed remote keeps them.
+//
+// Inbound-only entries (`inboundOnly: true`): a relay that added this one one
+// way holds a key this relay minted for it (POST …/peer-key/inbound). Such an
+// entry has no address: this relay never calls it (no health probe, no key
+// delivery, no agent target, no mention), so list(), resolve() and
+// listPublic() leave it out; get() and listAll() see it (the key index, the
+// refusal notices, Remove). listInboundPublic() is its row in Settings →
+// Relays. When this relay adds that relay too, the entry becomes a normal
+// one in place (adoptInboundHolder).
 
 export const REMOTE_RELAY_STATUSES = Object.freeze(['unknown', 'online', 'offline', 'unauthorized', 'error']);
 
@@ -78,14 +91,65 @@ function describeFailure(error) {
   return predicate.replace(/^is\s+/, '').replace(/^\S/, (first) => first.toUpperCase());
 }
 
+// How an entry calls its relay:
+//   custom  with the token stored for it;
+//   peer    with the key that relay gave this one (the token held for it
+//           was dropped once the key worked, or none was ever stored: one
+//           way with an inbound-only key); without a key it reads as none;
+//   none    with no token (a pairing that gave us none, an inbound-only
+//           entry, which is never called);
+//   own     from before the owner token moved out of the config: "this
+//           relay's own token". Never made any more; the boot that moves the
+//           token out (bootChange 'migrated') turns these into `custom`.
+// The relay's own owner token is never sent: own and none send nothing.
+export const REMOTE_RELAY_TOKEN_MODES = Object.freeze(['custom', 'peer', 'none', 'own']);
+
+// What an older OAR (0.9.26 and before) makes of a stored entry: anything
+// but "custom with a token" reads as `own`, and `own` sends that relay's
+// owner token on every call and every health probe. So an entry that sends
+// no owner token (`peer`, `none`) is stored as `custom` with this fixed,
+// non-secret placeholder in `token` and its real mode in `credential`. An
+// older OAR sends the placeholder (the other relay answers 401) and never
+// its owner token; this version reads the placeholder as no credential.
+export const REMOTE_RELAY_NO_CREDENTIAL_TOKEN = 'oar-no-credential';
+
+/** The entry as written to app_settings (see REMOTE_RELAY_NO_CREDENTIAL_TOKEN). */
+export function toStoredRemoteRelayEntry(entry) {
+  if (!entry || (entry.tokenMode !== 'peer' && entry.tokenMode !== 'none')) return entry;
+  const { token: _token, ...rest } = entry;
+  return { ...rest, tokenMode: 'custom', token: REMOTE_RELAY_NO_CREDENTIAL_TOKEN, credential: entry.tokenMode };
+}
+
+/** A stored entry's real mode and token, the placeholder read as no credential. */
+function readStoredCredential(raw) {
+  const token = toText(raw.token);
+  if (raw.tokenMode === 'custom' && token === REMOTE_RELAY_NO_CREDENTIAL_TOKEN) {
+    return { mode: raw.credential === 'peer' ? 'peer' : 'none', token: '' };
+  }
+  return { mode: raw.tokenMode, token };
+}
+
+function storedTokenMode(mode, token) {
+  if (mode === 'custom') return token ? 'custom' : 'none';
+  if (mode === 'none' || mode === 'peer') return 'none';
+  return 'own';
+}
+
 /** A stored entry, defensively normalised (the setting may have been hand-edited). */
 function normalizeEntry(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const id = toText(raw.id);
-  const url = toText(raw.url).replace(/\/+$/, '');
-  if (!id || !url) return null;
-  const token = toText(raw.token);
-  const tokenMode = raw.tokenMode === 'custom' && token ? 'custom' : 'own';
+  const inboundOnly = raw.inboundOnly === true;
+  // An inbound-only entry has no address (this relay never calls it) and is
+  // known by its relay id alone.
+  const url = inboundOnly ? '' : toText(raw.url).replace(/\/+$/, '');
+  if (!id || (!url && !inboundOnly) || (inboundOnly && !toText(raw.relayId))) return null;
+  const { mode, token } = readStoredCredential(raw);
+  const peer = normalizePeerKeyFields(raw);
+  // `peer`: the owner token held for that relay was dropped once its key
+  // worked; without a key the entry reads as `none` (no credential).
+  let tokenMode = storedTokenMode(mode, token);
+  if (mode === 'peer' && peer.peerToken) tokenMode = 'peer';
   const protocol = Number(raw.protocol);
   return {
     id,
@@ -103,16 +167,25 @@ function normalizeEntry(raw) {
     lastStatus: REMOTE_RELAY_STATUSES.includes(raw.lastStatus) ? raw.lastStatus : 'unknown',
     lastError: capOrNull(raw.lastError, LAST_ERROR_MAX),
     protocol: Number.isInteger(protocol) && protocol >= 0 ? protocol : 0,
+    // Its page answers a question from `?answer=` (capabilities.answerLink).
+    ...(raw.answerLink === true ? { answerLink: true } : {}),
+    ...peer,
+    ...(inboundOnly ? { inboundOnly: true, tokenMode: 'none' } : {}),
   };
 }
 
-/** The shape any API or socket payload may carry: no token, plus display helpers. */
-function toPublic(entry) {
+// Kept out of every public view: credentials and the keys' hashes.
+const PRIVATE_FIELDS = ['token', 'peerToken', 'peerTokenSeq', 'peerKeys', 'peerKeySeq', 'keyRelayId', 'keyUrl'];
+
+/** The shape any API or socket payload may carry: no token or key, plus display helpers. */
+function toPublic(entry, extra = null) {
   if (!entry) return null;
-  const { token: _token, ...rest } = entry;
-  const policy = checkRemoteRelayUrlPolicy(entry.url);
+  const rest = { ...entry };
+  for (const field of PRIVATE_FIELDS) delete rest[field];
+  const policy = entry.inboundOnly ? { ok: true } : checkRemoteRelayUrlPolicy(entry.url);
   return {
     ...rest,
+    ...(typeof extra === 'function' ? extra(entry) : {}),
     host: hostOf(entry.url),
     httpWarning: policy.ok ? policy.warning || null : policy.error,
   };
@@ -134,8 +207,8 @@ export function createRemoteRelayRegistry({
   writeSetting,
   client,
   repository = null,
-  // getOwnToken is accepted for symmetry with the client; the client owns
-  // token selection (tokenFor), so the registry never reads a token itself.
+  // The client owns token selection (tokenFor), so the registry never reads
+  // a token itself. An `own` entry (none of its own) sends none.
   getSelfName = () => '',
   hostname = '',
   platform = '',
@@ -154,6 +227,21 @@ export function createRemoteRelayRegistry({
   let cachedInstanceId = '';
   let healthTimer = null;
   let sweeping = null;
+  // The peer-key service (set once both exist): its index follows every
+  // write, and it adds the key state to the public view.
+  let peerKeys = null;
+
+  function publicExtra(entry) {
+    try {
+      return peerKeys?.publicFields?.(entry) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function publicOf(entry) {
+    return toPublic(entry, publicExtra);
+  }
 
   function nowIso() {
     return now().toISOString();
@@ -174,22 +262,59 @@ export function createRemoteRelayRegistry({
     writeSetting(key, JSON.stringify(value));
   }
 
+  // Tokens from a pairing link, held in memory only while an add waits for
+  // the key of that relay (holdToken): the entry reads as `custom` with the
+  // token and is stored as `none`, so the token is never written to the
+  // database once the key works. It goes when the entry's mode or token
+  // changes (the key worked: `peer`), or is written once the add ends
+  // without a working key (releaseHeldToken). A restart in between forgets
+  // it: the entry reads as `none`, and adding it again fixes that.
+  const heldTokens = new Map();
+
   function readList() {
     const stored = readJsonSetting(REMOTE_RELAY_SETTING_KEYS.relays);
     if (!Array.isArray(stored)) return [];
     const seen = new Set();
     const entries = [];
     for (const raw of stored) {
-      const entry = normalizeEntry(raw);
+      let entry = normalizeEntry(raw);
       if (!entry || seen.has(entry.id)) continue;
+      const held = heldTokens.get(entry.id);
+      if (held && entry.tokenMode === 'none' && !entry.inboundOnly) entry = { ...entry, tokenMode: 'custom', token: held };
       seen.add(entry.id);
       entries.push(entry);
     }
     return entries;
   }
 
+  /** What is written for an entry: a token held in memory is left out. */
+  function withoutHeldToken(entry) {
+    const held = heldTokens.get(entry.id);
+    if (held === undefined) return entry;
+    if (entry.tokenMode === 'custom' && entry.token === held) {
+      const { token: _token, ...rest } = entry;
+      return { ...rest, tokenMode: 'none' };
+    }
+    heldTokens.delete(entry.id);
+    return entry;
+  }
+
   function writeList(entries) {
-    writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.relays, entries);
+    const ids = new Set(entries.map((entry) => entry.id));
+    for (const id of [...heldTokens.keys()]) if (!ids.has(id)) heldTokens.delete(id);
+    writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.relays, entries.map(withoutHeldToken).map(toStoredRemoteRelayEntry));
+    try {
+      peerKeys?.rebuildIndex?.(entries);
+    } catch (error) {
+      logger?.warn?.(`[remote-relays] the key index could not be rebuilt: ${error?.message || error}`);
+    }
+  }
+
+  function setPeerKeys(service) {
+    peerKeys = service || null;
+    try {
+      peerKeys?.rebuildIndex?.(readList());
+    } catch {}
   }
 
   // ─── This relay ────────────────────────────────────────────────────────────
@@ -228,7 +353,13 @@ export function createRemoteRelayRegistry({
       publicUrl: settings.publicUrl || null,
       // imageInputs: send and create_session may carry images and image
       // options here; an older relay would drop them and run the turn without.
-      remoteRelays: { protocol: REMOTE_RELAY_PROTOCOL, inbound: settings.inboundEnabled, imageInputs: true },
+      // peerKeys: this relay issues and takes paired relays' own keys.
+      // inboundKeys: a relay that adds this one one way gets a key of its
+      // own here (POST …/peer-key/inbound), so it keeps no token of this one.
+      remoteRelays: { protocol: REMOTE_RELAY_PROTOCOL, inbound: settings.inboundEnabled, imageInputs: true, peerKeys: true, inboundKeys: true },
+      // answerLink: this relay's page takes `?answer=<id>&option=<n>` (a
+      // paired relay's Inbox opens it in a popup; the person confirms here).
+      capabilities: { answerLink: true },
     };
   }
 
@@ -240,7 +371,7 @@ export function createRemoteRelayRegistry({
 
   function emitChange() {
     try {
-      emit(REMOTE_RELAY_SOCKET_EVENT, { relays: listPublic(), self: selfPayload() });
+      emit(REMOTE_RELAY_SOCKET_EVENT, { relays: listPublic(), inbound: listInboundPublic(), self: selfPayload() });
     } catch (error) {
       logger?.warn?.(`[remote-relays] update event failed: ${error?.message || error}`);
     }
@@ -320,12 +451,23 @@ export function createRemoteRelayRegistry({
 
   // ─── Remote relays ─────────────────────────────────────────────────────────
 
+  /** The relays this relay calls (inbound-only entries left out). */
   function list() {
+    return readList().filter((entry) => !entry.inboundOnly);
+  }
+
+  /** Every entry, inbound-only ones included (the key index, notices, Remove). */
+  function listAll() {
     return readList();
   }
 
   function listPublic() {
-    return readList().map(toPublic);
+    return list().map(publicOf);
+  }
+
+  /** The inbound-only entries' rows: no address, no token, no key. */
+  function listInboundPublic() {
+    return readList().filter((entry) => entry.inboundOnly).map(publicOf);
   }
 
   function get(id) {
@@ -340,7 +482,7 @@ export function createRemoteRelayRegistry({
    * a chat mention, an agent naming a relay may use a loopback or IP host too.
    */
   function resolve(nameOrAlias) {
-    const entries = readList();
+    const entries = list();
     let query = toText(nameOrAlias).replace(/^@/, '').toLowerCase();
     if (/^[a-z][a-z0-9+.-]*:\/\//.test(query)) query = hostOf(query);
     const matches = query
@@ -361,20 +503,28 @@ export function createRemoteRelayRegistry({
       throw error;
     }
     const token = toText(input.token);
-    const tokenMode = token && (input.tokenMode === 'custom' || input.tokenMode === undefined) ? 'custom' : 'own';
+    let tokenMode = token && (input.tokenMode === 'custom' || input.tokenMode === undefined) ? 'custom' : 'none';
+    // Added one way with an inbound-only key: the key that relay gave this
+    // one is the only credential stored, never the token from the link.
+    const peerFields = input.tokenMode === 'peer' && toText(input.peerToken)
+      ? { peerToken: input.peerToken, peerTokenSeq: input.peerTokenSeq, peerInboundOnly: input.peerInboundOnly === true }
+      : null;
+    if (peerFields) tokenMode = 'peer';
     const entry = normalizeEntry({
       relayId: input.relayId,
       name: input.name,
       version: input.version,
       platform: input.platform,
       protocol: input.protocol,
+      answerLink: input.answerLink === true,
       lastSeenAt: input.lastSeenAt,
       lastStatus: input.lastStatus,
       lastError: input.lastError,
       id: `rr_${randomUUID()}`,
       url,
       tokenMode,
-      token,
+      ...(tokenMode === 'custom' ? { token } : {}),
+      ...(peerFields || {}),
       permission: input.permission,
       addedBy: input.addedBy,
       addedAt: nowIso(),
@@ -396,17 +546,61 @@ export function createRemoteRelayRegistry({
     if (index === -1) return null;
     const before = entries[index];
     const merged = { ...before, ...fields };
-    if (Object.prototype.hasOwnProperty.call(fields, 'token') && fields.token === undefined) delete merged.token;
+    for (const key of ['token', 'peerToken']) {
+      if (Object.prototype.hasOwnProperty.call(fields, key) && fields[key] === undefined) delete merged[key];
+    }
     const after = normalizeEntry(merged);
     entries[index] = after;
     writeList(entries);
     return { before, after };
   }
 
+  /**
+   * The peer-key service's writes: `fields`, or `(entry) => fields | null`
+   * (null: nothing to write). `quiet` skips the socket event (the index is
+   * rebuilt either way). Returns the stored entry, or null.
+   */
+  function patchPeerFields(id, fieldsOrFn, { quiet = false } = {}) {
+    const current = get(id);
+    if (!current) return null;
+    const fields = typeof fieldsOrFn === 'function' ? fieldsOrFn(current) : fieldsOrFn;
+    if (!fields || typeof fields !== 'object') return current;
+    const result = patchStored(current.id, fields);
+    if (!result) return null;
+    if (!quiet && fingerprint(result.before) !== fingerprint(result.after)) emitChange();
+    return result.after;
+  }
+
+  /**
+   * Pairing: entry `id` (stored without a token) calls its relay with
+   * `token`, held in memory only (see heldTokens).
+   */
+  function holdToken(id, token) {
+    const entry = get(id);
+    const value = toText(token);
+    if (!entry || !value || entry.inboundOnly || entry.tokenMode !== 'none') return false;
+    heldTokens.set(entry.id, value);
+    return true;
+  }
+
+  /** The add ended: a token still held (no working key) is written now. */
+  function releaseHeldToken(id) {
+    const held = heldTokens.get(toText(id));
+    if (held === undefined) return false;
+    heldTokens.delete(toText(id));
+    const entry = get(id);
+    if (!entry || entry.tokenMode !== 'none') return false;
+    patchStored(entry.id, { tokenMode: 'custom', token: held });
+    return true;
+  }
+
   /** User edits: `{ permission, url, token, tokenMode }` (PATCH /api/remote-relays/:id). */
   function update(id, patch = {}) {
     const current = get(id);
     if (!current) return invalid('Unknown remote relay', 404);
+    if (current.inboundOnly) {
+      return invalid(`"${current.name}" calls this relay only (inbound only): it has no address or token here to change. Remove it to revoke its key.`, 409);
+    }
     const input = patch && typeof patch === 'object' ? patch : {};
     const fields = {};
 
@@ -425,15 +619,20 @@ export function createRemoteRelayRegistry({
         fields.url = link.baseUrl;
         fields.lastStatus = 'unknown';
         fields.lastError = null;
+        // A keyed entry's address is pinned: re-pointing it revokes its keys
+        // and holds issuance until the owner confirms (origin binding §4.3).
+        Object.assign(fields, peerKeys?.pinnedChangeFields?.(current, { url: link.baseUrl }) || {});
       }
     }
 
-    if (input.tokenMode !== undefined && !['own', 'custom'].includes(input.tokenMode)) {
-      return invalid('tokenMode must be own or custom');
+    if (input.tokenMode !== undefined && !['own', 'custom', 'none'].includes(input.tokenMode)) {
+      return invalid('tokenMode must be custom or none');
     }
     if (input.token !== undefined || input.tokenMode !== undefined) {
       const token = input.token !== undefined ? toText(input.token) : toText(current.token);
-      const tokenMode = input.tokenMode !== undefined ? input.tokenMode : (token ? 'custom' : 'own');
+      // `own` (this relay's token) is never sent any more: it means none.
+      const requested = input.tokenMode === 'own' ? 'none' : input.tokenMode;
+      const tokenMode = requested !== undefined ? requested : (token ? 'custom' : 'none');
       if (tokenMode === 'custom' && !token) return invalid('A custom token cannot be empty');
       const nextToken = tokenMode === 'custom' ? token : undefined;
       if (tokenMode !== current.tokenMode || nextToken !== current.token) {
@@ -447,7 +646,7 @@ export function createRemoteRelayRegistry({
     const result = Object.keys(fields).length ? patchStored(current.id, fields) : { before: current, after: current };
     if (!result) return invalid('Unknown remote relay', 404);
     if (fingerprint(result.before) !== fingerprint(result.after)) emitChange();
-    return { ok: true, relay: toPublic(result.after) };
+    return { ok: true, relay: publicOf(result.after) };
   }
 
   /** Local only: the other side keeps its own entry for this relay. */
@@ -489,14 +688,41 @@ export function createRemoteRelayRegistry({
     const entries = readList();
     const id = toText(relayId);
     const baseUrl = toText(url).replace(/\/+$/, '');
-    const existing = (id && entries.find((entry) => entry.relayId === id)) || findByUrl(entries, baseUrl);
+    const byId = id ? entries.find((entry) => entry.relayId === id) : null;
+    const byUrl = findByUrl(entries, baseUrl);
+    // A relay id is unique: an introduction naming a listed relay's id at
+    // another address, or a listed address under another id, changes no
+    // entry (origin binding §4.3: pairing never rewrites an entry).
+    if (byUrl && id && byUrl.relayId && byUrl.relayId !== id) {
+      const error = new Error('That address belongs to another paired relay here; remove that entry first if it was replaced');
+      error.status = 409;
+      throw error;
+    }
+    const existing = byId || byUrl;
     const secret = toText(token);
     const selfDescription = {
       ...(toText(name) ? { name } : {}),
       ...(toText(offeredVersion) ? { version: offeredVersion } : {}),
       ...(toText(offeredPlatform) ? { platform: offeredPlatform } : {}),
-      ...(Number.isInteger(protocol) && protocol >= 0 ? { protocol } : {}),
     };
+    // That relay held an inbound-only key here and now asks to be listed
+    // both ways: the same entry becomes a normal one, unconfirmed like any
+    // new entry from an introduction until its address proves to be it.
+    if (existing?.inboundOnly) {
+      if (!baseUrl) {
+        const error = new Error('An introduction needs the relay\'s address');
+        error.status = 400;
+        throw error;
+      }
+      return adoptInboundHolder(existing.id, {
+        url: baseUrl,
+        ...(secret ? { tokenMode: 'custom', token: secret } : { tokenMode: 'none' }),
+        ...selfDescription,
+        ...(Number.isInteger(protocol) && protocol >= 0 ? { protocol } : {}),
+        addedBy: 'pairing',
+        unconfirmed: true,
+      });
+    }
     if (existing) {
       const offeredOtherUrl = !!baseUrl && baseUrl.toLowerCase() !== existing.url.toLowerCase();
       const offeredOtherToken = secret
@@ -512,19 +738,100 @@ export function createRemoteRelayRegistry({
           logger?.warn?.(`[remote-relays] pairing from "${label}" offered a different ${changes}; change it in Settings → Relays if that is right`);
         } catch {}
       }
-      const result = patchStored(existing.id, { relayId: id || existing.relayId, ...selfDescription });
+      // The relay id and protocol stay as stored (the probe updates the
+      // protocol; a keyed entry's id is pinned). An entry from before ids
+      // were known takes the id once.
+      const result = patchStored(existing.id, { ...(existing.relayId ? {} : { relayId: id }), ...selfDescription });
       if (result && fingerprint(result.before) !== fingerprint(result.after)) emitChange();
       return result?.after || existing;
     }
-    const tokenFields = secret ? { tokenMode: 'custom', token: secret } : { tokenMode: 'own' };
-    return add({
+    const tokenFields = secret ? { tokenMode: 'custom', token: secret } : { tokenMode: 'none' };
+    // A new entry from an introduction is unconfirmed (no key, no weight)
+    // until its address proves to be that relay (a probe or a key check).
+    const entry = add({
       ...selfDescription,
+      ...(Number.isInteger(protocol) && protocol >= 0 ? { protocol } : {}),
       relayId: id,
       name: toText(name) || hostOf(baseUrl),
       url: baseUrl,
       ...tokenFields,
       addedBy: 'pairing',
     });
+    return patchPeerFields(entry.id, { unconfirmed: true }) || entry;
+  }
+
+  /**
+   * A relay that added this one one way asks for a key (POST
+   * …/peer-key/inbound): its inbound-only entry, made or refreshed. Throws
+   * 409 when that relay is listed here already as a normal entry (its key
+   * comes the usual way). `{ entry, created }`.
+   */
+  function upsertInboundHolder({ relayId, name, version: offeredVersion, platform: offeredPlatform, protocol } = {}) {
+    const id = toText(relayId).slice(0, 100);
+    if (!id) {
+      const error = new Error('relayId is required');
+      error.status = 400;
+      throw error;
+    }
+    const entries = readList();
+    const existing = entries.find((entry) => entry.relayId === id) || null;
+    if (existing && !existing.inboundOnly) {
+      const error = new Error('This relay lists that relay already, both ways: its key comes the usual way');
+      error.status = 409;
+      throw error;
+    }
+    const described = {
+      ...(toText(name) ? { name: toText(name).slice(0, 60) } : {}),
+      ...(toText(offeredVersion) ? { version: offeredVersion } : {}),
+      ...(toText(offeredPlatform) ? { platform: offeredPlatform } : {}),
+      ...(Number.isInteger(protocol) && protocol >= 0 ? { protocol } : {}),
+    };
+    if (existing) {
+      const result = patchStored(existing.id, described);
+      if (result && fingerprint(result.before) !== fingerprint(result.after)) emitChange();
+      return { entry: result?.after || existing, created: false };
+    }
+    const entry = normalizeEntry({
+      ...described,
+      id: `rr_${randomUUID()}`,
+      relayId: id,
+      inboundOnly: true,
+      tokenMode: 'none',
+      addedBy: 'pairing',
+      addedAt: nowIso(),
+    });
+    writeList([...entries, entry]);
+    emitChange();
+    return { entry, created: true };
+  }
+
+  /**
+   * An inbound-only entry becomes a normal one (this relay adds that relay,
+   * or it introduces itself to be listed both ways): same id, no duplicate
+   * row. The key it held is revoked and its epoch bumped: an inbound-only
+   * key's holder was never checked at an address, so it does not carry over
+   * to the relay found there; keys both ways follow the usual way.
+   */
+  function adoptInboundHolder(id, fields = {}) {
+    const current = get(id);
+    if (!current?.inboundOnly) return current;
+    const result = patchStored(current.id, {
+      ...fields,
+      inboundOnly: false,
+      peerKeys: [],
+      epoch: (Number(current.epoch) || 0) + 1,
+      everKeyed: false,
+      keyRelayId: null,
+      keyUrl: null,
+      lastStatus: 'unknown',
+      lastError: null,
+    });
+    if (!result) return null;
+    try {
+      logger?.log?.(`[remote-relays] "${current.name}" held an inbound-only key here and is now listed both ways; that key was revoked and keys follow both ways.`);
+    } catch {}
+    emitChange();
+    return result.after;
   }
 
   /** Stores what a successful probe said. Returns `{ changed, relay }` (full entry). */
@@ -535,11 +842,22 @@ export function createRemoteRelayRegistry({
       fields = { lastStatus: 'error', lastError: 'This address points at this relay itself' };
     } else {
       fields = { lastStatus: 'online', lastSeenAt: nowIso(), lastError: null };
-      if (identity?.relayId) fields.relayId = identity.relayId;
+      const current = get(id);
+      let review = { fields: {} };
+      try {
+        review = peerKeys?.reviewIdentity?.(current, identity) || review;
+      } catch {}
+      // A keyed entry's relay id is pinned: another id at its address is held
+      // for the owner, not adopted. Another entry's id is never taken either.
+      const takenByOther = identity?.relayId && readList().some((entry) => entry.id !== id && entry.relayId === identity.relayId);
+      if (identity?.relayId && !review.keepRelayId && !takenByOther) fields.relayId = identity.relayId;
+      if (current?.unconfirmed && identity?.relayId && current.relayId && identity.relayId === current.relayId) fields.unconfirmed = false;
       if (toText(identity?.name)) fields.name = identity.name;
       if (identity?.version) fields.version = identity.version;
       if (identity?.platform) fields.platform = identity.platform;
       if (Number.isInteger(identity?.protocol)) fields.protocol = identity.protocol;
+      if (typeof identity?.answerLink === 'boolean') fields.answerLink = identity.answerLink;
+      Object.assign(fields, review.fields || {});
     }
     const result = patchStored(id, fields);
     if (!result) return { changed: false, relay: null };
@@ -567,25 +885,33 @@ export function createRemoteRelayRegistry({
   async function checkEntry(id, { timeoutMs, emitOnChange = true } = {}) {
     const entry = get(id);
     if (!entry) return { changed: false, relay: null };
+    // Inbound only: no address, never called.
+    if (entry.inboundOnly) return { changed: false, relay: entry };
+    let outcome;
     try {
-      const identity = await client.probe(entry.url, client.tokenFor(entry), { timeoutMs });
-      return applyIdentity(entry.id, identity, { emitOnChange });
+      const identity = await client.probe(entry.url, client.tokenFor(entry), { timeoutMs, relay: entry });
+      outcome = applyIdentity(entry.id, identity, { emitOnChange });
     } catch (error) {
-      return applyFailure(entry.id, error, { emitOnChange });
+      outcome = applyFailure(entry.id, error, { emitOnChange });
     }
+    // Keys follow within one health interval: issue, rotate or ask.
+    try {
+      peerKeys?.afterProbe?.(entry.id);
+    } catch {}
+    return outcome;
   }
 
   /** Probes one remote now; the public entry, or null for an unknown id. */
   async function check(id, { timeoutMs } = {}) {
     const { relay } = await checkEntry(toText(id), { timeoutMs });
-    return toPublic(relay);
+    return publicOf(relay);
   }
 
   /** One pass over every remote; a single event when anything changed. */
   function checkAll() {
     if (sweeping) return sweeping;
     sweeping = (async () => {
-      const ids = readList().map((entry) => entry.id);
+      const ids = list().map((entry) => entry.id);
       if (ids.length === 0) return false;
       const results = await Promise.all(ids.map((id) => checkEntry(id, {
         timeoutMs: HEALTH_CHECK_TIMEOUT_MS,
@@ -620,6 +946,28 @@ export function createRemoteRelayRegistry({
     return client.tokenFor(relay);
   }
 
+  /**
+   * The owner token moved out of the config (owner-secret-store.mjs): every
+   * entry that called a paired relay with "this relay's own token" (`own`)
+   * gets that token stored as its own (`custom`), the one time the plain
+   * value is known, so the pairing never needs it again. Returns how many.
+   */
+  function convertOwnEntries(ownToken) {
+    const token = toText(ownToken);
+    if (!token) return 0;
+    const entries = readList();
+    let converted = 0;
+    const next = entries.map((entry) => {
+      if (entry.tokenMode !== 'own' || entry.inboundOnly) return entry;
+      converted += 1;
+      return normalizeEntry({ ...entry, tokenMode: 'custom', token });
+    });
+    if (!converted) return 0;
+    writeList(next);
+    emitChange();
+    return converted;
+  }
+
   return {
     instanceId,
     selfName,
@@ -633,19 +981,29 @@ export function createRemoteRelayRegistry({
     getAgentSessionsSettings,
     setAgentSessionsSettings,
     list,
+    listAll,
     listPublic,
+    listInboundPublic,
     get,
     resolve,
     add,
     update,
     remove,
     upsertFromPairing,
+    upsertInboundHolder,
+    adoptInboundHolder,
     recordIdentity,
+    patchPeerFields,
+    holdToken,
+    releaseHeldToken,
+    setPeerKeys,
+    publicOf,
     check,
     checkAll,
     startHealthLoop,
     stopHealthLoop,
     tokenFor,
+    convertOwnEntries,
     get healthLoopRunning() { return Boolean(healthTimer); },
   };
 }

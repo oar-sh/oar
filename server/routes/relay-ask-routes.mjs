@@ -35,13 +35,23 @@
 // Every text of an ask or card is an agent's: it goes out as data, and the
 // browser shows it as plain text.
 
-import { REMOTE_INBOX_CLAIMS, REMOTE_INBOX_NOTICES, REMOTE_RELAY_ERROR_CODES } from '../../shared/remote-relay-contract.mjs';
+import { REMOTE_INBOX_CLAIMS, REMOTE_INBOX_NOTICES, REMOTE_RELAY_ERROR_CODES, remoteRelayOneWayAdvice, remoteRelayReAddAdvice } from '../../shared/remote-relay-contract.mjs';
 import { RELAY_ASK_LIMITS, relayQuestionKind } from '../../shared/relay-asks.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
 import { findOriginRemoteRelay, admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { RelayAskError } from '../services/relay-ask-service.mjs';
 import { cleanSubscriberRelayId } from '../services/relay-event-service.mjs';
 import { RELAY_ASK_REMOTE_PATHS, isMissingRelayAskRoute } from '../services/relay-ask-link-service.mjs';
+import { notPerson } from '../services/relay-principal.mjs';
+import { AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
+
+// Whether a paired relay's questions can be answered over the pairing (this
+// relay's Inbox answering there, a paired relay answering here). Off: a
+// question is answered on the relay that holds it, by its person, and the
+// Inbox shows a paired relay's questions to open there (agent auth, pending
+// owner decision; the recommended option).
+export const PAIRED_ASKS_ANSWER_OVER_PAIRING = false;
+export const PAIRED_ASK_ANSWER_THERE_CODE = 'ANSWER_ON_THAT_RELAY';
 
 const RELAY_ASK_ERROR_STATUS = Object.freeze({
   invalid: [400, REMOTE_RELAY_ERROR_CODES.invalidInput],
@@ -205,6 +215,9 @@ export function registerRelayAskRoutes(app, deps) {
     // push-dispatch-service.mjs questionNotice: whether this relay's own push
     // of a card reached a device.
     questionNotice = null,
+    // Origin binding: `() => items`, this relay's own notices of refused
+    // claims (one per paired relay); never shown to a paired relay.
+    relayNotices = null,
     now = () => Date.now(),
   } = deps;
 
@@ -250,11 +263,22 @@ export function registerRelayAskRoutes(app, deps) {
     return false;
   }
 
-  /** This relay's user only: another relay's agent, and this relay's own, are refused. */
+  /** This relay's user only: an agent token, and another relay's request, are refused. */
   function refuseRemote(req, res) {
     const request = readRemoteRelayRequest(req, remoteRelayInbound || {});
-    if (!request.remote) return false;
+    if (!notPerson(req, request)) return false;
     res.status(403).json({ error: 'The Inbox is this relay\'s user\'s; agents use the relay_tool.', code: REMOTE_RELAY_ERROR_CODES.forbidden });
+    return true;
+  }
+
+  // An ask of this relay is answered by this relay's person, here; another
+  // relay never answers or dismisses it (agent auth §2.2).
+  function refusePairedAnswer(res) {
+    if (PAIRED_ASKS_ANSWER_OVER_PAIRING) return false;
+    res.status(403).json({
+      error: 'Questions of this relay are answered on this relay, by its user; open it there.',
+      code: AUTH_ERROR_CODES.peerScope,
+    });
     return true;
   }
 
@@ -270,6 +294,17 @@ export function registerRelayAskRoutes(app, deps) {
       res.status(403).json({
         error: 'Only another relay calls these routes; this relay\'s own agents use the relay_tool and its user the Inbox.',
         code: REMOTE_RELAY_ERROR_CODES.forbidden,
+      });
+      return null;
+    }
+    // Asks, their status and withdrawal, and push claims belong to the relay
+    // that signed in with its key; a claim on another credential is refused
+    // with the reason (origin binding §6.3).
+    if (request.origin?.verified !== true) {
+      res.status(403).json({
+        error: request.unverifiedNotice || 'This route needs a paired relay signed in with its own key.',
+        code: REMOTE_RELAY_ERROR_CODES.peerKeyRequired,
+        originVerified: false,
       });
       return null;
     }
@@ -338,18 +373,37 @@ export function registerRelayAskRoutes(app, deps) {
   });
 
   async function remoteInbox(relay) {
-    const entry = { id: relay.id, name: toText(relay.name) || relay.id, url: toText(relay.url) || null };
+    // answerLink: its page takes `?answer=` (the Inbox's popup buttons).
+    const entry = { id: relay.id, name: toText(relay.name) || relay.id, url: toText(relay.url) || null, answerLink: relay.answerLink === true };
     if (UNREACHABLE_STATES.has(toText(relay.lastStatus).toLowerCase())) {
       return { ...entry, reachable: false, error: toText(relay.lastError) || toText(relay.lastStatus), items: [] };
+    }
+    // Added one way: that relay lists no entry for this one, and shows its
+    // Inbox only to a relay signed in with a key it gave. Not a fault, so
+    // no call and no "not reachable": a note says how to get it.
+    if (relay.peerTokenState === 'unlisted') {
+      return {
+        ...entry,
+        reachable: true,
+        oneWay: true,
+        note: `Added one way: ${entry.name} shows its Inbox only to a relay it lists. To see it here, ${remoteRelayOneWayAdvice(entry.name)}.`,
+        items: [],
+      };
     }
     try {
       const response = await remoteRelayClient.request(relay, 'GET', RELAY_ASK_REMOTE_PATHS.inbox, { timeoutMs: INBOX_REMOTE_TIMEOUT_MS });
       const items = (Array.isArray(response?.items) ? response.items : []).slice(0, RELAY_ASK_LIMITS.listMax);
       return { ...entry, reachable: true, items };
     } catch (error) {
+      // A relay that takes Inbox reads from a relay signed in with its own
+      // key only (origin binding), and holds none from this one yet.
+      const keyRequired = toText(error?.code) === REMOTE_RELAY_ERROR_CODES.peerKeyRequired
+        || toText(error?.remoteBody?.code) === REMOTE_RELAY_ERROR_CODES.peerKeyRequired;
       const text = isMissingRelayAskRoute(error)
         ? 'runs an OAR version without the Inbox'
-        : toText(error?.message || error).slice(0, 200);
+        : (keyRequired
+          ? `it shows its Inbox only to a relay that signs in with the key it gave it, and this relay holds none it takes: ${remoteRelayReAddAdvice(entry.name)}.`
+          : toText(error?.message || error).slice(0, 200));
       return { ...entry, reachable: false, error: text, items: [] };
     }
   }
@@ -359,6 +413,11 @@ export function registerRelayAskRoutes(app, deps) {
   app.get('/api/inbox', auth, async (req, res) => {
     if (refuseRemote(req, res)) return;
     const own = localInboxItems();
+    // This relay's own notices (a paired relay's refused claim): here only.
+    try {
+      const notices = typeof relayNotices === 'function' ? relayNotices() : [];
+      if (Array.isArray(notices)) own.push(...notices);
+    } catch {}
     const selfName = toText(remoteRelayRegistry?.selfName?.()) || 'this relay';
     let paired = [];
     try {
@@ -366,7 +425,12 @@ export function registerRelayAskRoutes(app, deps) {
     } catch {}
     const remote = await Promise.all(paired.map(remoteInbox));
     const relays = [{ id: 'self', name: selfName, self: true, reachable: true, items: own }, ...remote];
-    res.json({ relays, pending: relays.reduce((sum, relay) => sum + pendingOf(relay.items), 0) });
+    res.json({
+      relays,
+      pending: relays.reduce((sum, relay) => sum + pendingOf(relay.items), 0),
+      // Off: a paired relay's asks show read-only here, with "Open there".
+      pairedAnswers: PAIRED_ASKS_ANSWER_OVER_PAIRING,
+    });
   });
 
   function pairedRelayOf(relayId) {
@@ -381,6 +445,15 @@ export function registerRelayAskRoutes(app, deps) {
     if (refuseRemote(req, res)) return;
     const relay = pairedRelayOf(req.params.relayId);
     if (!relay || !remoteRelayClient) return res.status(404).json({ error: 'No paired relay with that id.', code: REMOTE_RELAY_ERROR_CODES.unknown });
+    // A paired relay's questions are answered there, by its person: the
+    // pairing no longer carries answers (see PAIRED_ASKS_ANSWER_OVER_PAIRING).
+    if (!PAIRED_ASKS_ANSWER_OVER_PAIRING) {
+      return res.status(409).json({
+        error: `Answer this question on relay "${toText(relay.name) || relay.id}" itself: a paired relay's questions are answered there.`,
+        code: PAIRED_ASK_ANSWER_THERE_CODE,
+        openUrl: toText(relay.url) || null,
+      });
+    }
     const body = asObject(req.body);
     try {
       const response = await remoteRelayClient.request(relay, 'POST', RELAY_ASK_REMOTE_PATHS[action], {
@@ -453,6 +526,7 @@ export function registerRelayAskRoutes(app, deps) {
   // /dismiss — `{ id }`: an ask of this relay, answered from a paired
   // relay's Inbox. Only asks: an id of any other card is not found here.
   app.post('/api/relay-asks/remote/answer', auth, (req, res) => {
+    if (refusePairedAnswer(res)) return;
     const body = asObject(req.body);
     const caller = admitPairedRelay(req, res, body.via);
     if (!caller || !available(res)) return;
@@ -464,6 +538,7 @@ export function registerRelayAskRoutes(app, deps) {
   });
 
   app.post('/api/relay-asks/remote/dismiss', auth, (req, res) => {
+    if (refusePairedAnswer(res)) return;
     const body = asObject(req.body);
     const caller = admitPairedRelay(req, res, body.via);
     if (!caller || !available(res)) return;

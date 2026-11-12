@@ -107,7 +107,11 @@ import {
   relayEventQuietWindowEnd,
   relayEventTypesTake,
 } from '../../shared/relay-events.mjs';
-import { REMOTE_RELAY_APPROVAL_SOURCE, isPersonOnlyQuestion } from '../../shared/relay-asks.mjs';
+import {
+  REMOTE_RELAY_APPROVAL_SOURCE,
+  SENSITIVE_FILE_QUESTION_KIND,
+  isPersonOnlyQuestion,
+} from '../../shared/relay-asks.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
 export const RELAY_EVENT_SELF_RELAY_ID = 'self';
@@ -2300,6 +2304,21 @@ export function createRelayEventService({
     afterStateChange(conversationId);
   }
 
+  // A Safety check card's text names what waits for the person: a command,
+  // or a sensitive file's new text (an .npmrc token line, say). Watchers and
+  // paired relays get only the card's fixed lead line, plus its `File:` line
+  // for a sensitive-file edit.
+  function personOnlyEventPrompt(prompt, context) {
+    const paragraphs = String(prompt || '').split('\n\n');
+    const lines = [paragraphs[0]];
+    if (toText(context?.kind) === SENSITIVE_FILE_QUESTION_KIND) {
+      // The lead, then an optional Reason: line, then File: (one escaped line).
+      const file = paragraphs.slice(1, 3).find((paragraph) => /^File: [^\n]*$/.test(paragraph));
+      if (file) lines.push(file);
+    }
+    return lines.join('\n\n');
+  }
+
   /** A question card was put on a session's turn (formatted question row). */
   function noteQuestion(question) {
     if (!available || !question) return;
@@ -2312,13 +2331,15 @@ export function createRelayEventService({
     const context = question.context && typeof question.context === 'object'
       ? question.context
       : (parseJson(question.request, {})?.context || {});
+    const personOnly = isPersonOnlyQuestion(context);
+    const prompt = String(question.prompt || question.question || '');
     record('question_asked', conversationId, {
-      prompt: String(question.prompt || question.question || '').slice(0, 2000),
+      prompt: (personOnly ? personOnlyEventPrompt(prompt, context) : prompt).slice(0, 2000),
       options,
       questionId: toText(question.id),
       ...(toText(context?.source) === REMOTE_RELAY_APPROVAL_SOURCE ? { approvalCard: true } : {}),
       // A Claude session's Safety check: the user's to answer.
-      ...(isPersonOnlyQuestion(context) ? { personOnly: true } : {}),
+      ...(personOnly ? { personOnly: true } : {}),
       // A question that does not block (relay_tool ask).
       ...(toText(question.kind) === 'ask' ? { kind: 'ask' } : {}),
     });

@@ -72,16 +72,17 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+// The pins as the package ships them: pin.json and pin-lock.json.
 function writePins(pinsDir) {
   for (const [id, fixture] of Object.entries(PIN_FIXTURES)) {
     const folder = path.join(pinsDir, id);
-    writeJson(path.join(folder, 'package.json'), { name: `fixture-${id}`, version: '0.0.0', private: true, dependencies: fixture.dependencies });
+    writeJson(path.join(folder, 'pin.json'), { name: `fixture-${id}`, version: '0.0.0', private: true, dependencies: fixture.dependencies });
     const packages = { '': { name: `fixture-${id}`, version: '0.0.0', dependencies: fixture.dependencies } };
     for (const [name, version] of Object.entries(fixture.dependencies)) packages[`node_modules/${name}`] = { version };
     for (const [name, constraints] of Object.entries(fixture.platformPackages)) {
       packages[`node_modules/${name}`] = { version: '1.0.0', optional: true, ...constraints };
     }
-    writeJson(path.join(folder, 'package-lock.json'), { name: `fixture-${id}`, lockfileVersion: 3, requires: true, packages });
+    writeJson(path.join(folder, 'pin-lock.json'), { name: `fixture-${id}`, lockfileVersion: 3, requires: true, packages });
     for (const [name, text] of Object.entries(fixture.entries)) fs.writeFileSync(path.join(folder, name), text);
   }
 }
@@ -343,12 +344,15 @@ test('install: npm ci into a partial folder, marker last, renamed into place, le
   assert.equal(started.reused, false);
   assert.equal(started.status.state, 'installing');
   assert.equal(started.status.active, true);
-  // npm runs at once, in a partial folder beside the final one, with the pins.
+  // npm runs at once, in a partial folder beside the final one, with the pins
+  // under the npm names (shipped as pin.json and pin-lock.json).
   assert.equal(h.npm.calls.length, 1);
   const call = h.npm.calls[0];
   assert.equal(path.dirname(call.options.cwd), h.sdkDir('cursor'));
   assert.match(path.basename(call.options.cwd), new RegExp(`^${pin.dirName.replace(/[.+]/g, '\\$&')}\\.partial-[0-9a-f]+$`));
-  assert.ok(fs.existsSync(path.join(call.options.cwd, 'package-lock.json')));
+  assert.deepEqual(fs.readFileSync(path.join(call.options.cwd, 'package.json')), fs.readFileSync(path.join(h.pinsDir, 'cursor', 'pin.json')));
+  assert.deepEqual(fs.readFileSync(path.join(call.options.cwd, 'package-lock.json')), fs.readFileSync(path.join(h.pinsDir, 'cursor', 'pin-lock.json')));
+  assert.ok(!fs.existsSync(path.join(call.options.cwd, 'pin.json')) && !fs.existsSync(path.join(call.options.cwd, 'pin-lock.json')));
   assert.ok(fs.existsSync(path.join(call.options.cwd, 'entry-sqlite.mjs')));
   assert.ok(fs.existsSync(path.join(h.sdkDir('cursor'), '.store.lock')), 'the lock is held while npm runs');
   assert.equal(call.command, '/opt/node/bin/npm');
@@ -981,6 +985,81 @@ test('force reinstall replaces a ready folder', async (t) => {
   assert.equal(fs.existsSync(path.join(dir, 'stray.txt')), false, 'a fresh copy');
 });
 
+test('a failed force reinstall: its waiters learn the failure, the old folder stays ready', async (t) => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  const store = h.createStore();
+  // A listener asks for the status on every change, as the relay's does.
+  const seen = [];
+  const broadcasts = [];
+  store.subscribe((snapshot) => {
+    seen.push(snapshot.sdks.claude.state);
+    broadcasts.push(snapshot.sdks.claude);
+  });
+  await store.ensure('claude');
+  const dir = store.readyDir('claude');
+  const firstAt = readAgentSdkMarker(dir).installedAt;
+  assert.equal(store.status('claude').reinstallFailure, null);
+
+  h.npm.next({ fail: 'npm error code E407\nnpm error 407 Proxy Authentication Required\n' });
+  assert.equal(store.install('claude', { force: true }).reused, false);
+  const outcome = await store.ensure('claude', { retryFailed: true });
+  assert.equal(outcome.state, 'error');
+  assert.match(outcome.error, /407/);
+  assert.equal(outcome.dir, dir, 'the folder it was to replace');
+  assert.equal(outcome.active, false);
+  // The old folder checks out still: it is what the relay keeps using.
+  assert.equal(store.status('claude').state, 'ready');
+  assert.equal(store.readyDir('claude'), dir);
+  assert.equal(readAgentSdkMarker(dir).installedAt, firstAt);
+  assert.ok(seen.includes('installing'));
+  // What Settings gets (the broadcast and GET /api/agent-sdks/status): a
+  // ready row that still says the reinstall failed, and why.
+  const last = broadcasts.at(-1);
+  assert.equal(last.state, 'ready');
+  assert.equal(last.dir, dir);
+  assert.match(last.reinstallFailure?.error || '', /407/);
+  assert.equal(store.snapshot().sdks.claude.reinstallFailure.error, last.reinstallFailure.error);
+  // The next install, and its success, clear it.
+  assert.equal(store.install('claude', { force: true }).reused, false);
+  assert.equal(store.status('claude').reinstallFailure, null);
+  assert.equal((await store.ensure('claude')).state, 'ready');
+  assert.equal(store.status('claude').reinstallFailure, null);
+});
+
+test('a failed force reinstall is told until the relay restarts: the next store shows the row ready, with no failure', async (t) => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  const store = h.createStore();
+  await store.ensure('claude');
+  const dir = store.readyDir('claude');
+  h.npm.next({ fail: 'npm error code E407\nnpm error 407 Proxy Authentication Required\n' });
+  store.install('claude', { force: true });
+  await store.ensure('claude', { retryFailed: true });
+  assert.match(store.status('claude').reinstallFailure?.error || '', /407/);
+  // The failure lives in memory only (CHANGELOG): a restarted relay's store
+  // finds the folder that still checks out, and nothing of the failure.
+  const restarted = h.createStore();
+  assert.equal(restarted.status('claude').state, 'ready');
+  assert.equal(restarted.readyDir('claude'), dir);
+  assert.equal(restarted.status('claude').reinstallFailure, null);
+});
+
+test('a cancelled force reinstall is no reinstall failure', async (t) => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  const store = h.createStore();
+  await store.ensure('claude');
+  h.npm.next('hang');
+  assert.equal(store.install('claude', { force: true }).reused, false);
+  const reinstalling = store.ensure('claude', { retryFailed: true });
+  await flush();
+  store.cancel('claude');
+  assert.equal((await reinstalling).kind, 'cancelled');
+  assert.equal(store.status('claude').state, 'ready');
+  assert.equal(store.status('claude').reinstallFailure, null);
+});
+
 test('a ready folder that stops checking out turns missing', async (t) => {
   const h = createHarness();
   t.after(() => h.dispose());
@@ -1234,7 +1313,9 @@ test('dispose: stops a running install and resolves its waiters', async (t) => {
   assert.equal(status.active, false);
   assert.deepEqual(h.npm.kills[0], [-h.npm.calls[0].child.pid, 'SIGTERM']);
   await waitFor(() => !fs.existsSync(partial), 'partial removed');
-  assert.equal(h.locks.held.size, 0);
+  // The lock goes right after the folder (the store awaits the removal, then
+  // releases): the folder can be gone one tick before the release runs.
+  await waitFor(() => h.locks.held.size === 0, 'lock released');
 });
 
 test('a git checkout reports its SDKs ready from the devDependencies', (t) => {

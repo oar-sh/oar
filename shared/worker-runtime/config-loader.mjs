@@ -4,6 +4,15 @@ import { fileURLToPath } from "url";
 
 import { RESCUE_DIR_NAME } from "../../server/services/earlier-database-service.mjs";
 import { resolveRelayStateDirs, resolveStateLayout } from "../../server/services/oar-state-layout.mjs";
+import { resolveDataDir } from "../../server/services/data-dir-resolution.mjs";
+import {
+  AGENT_TOKEN_ENV,
+  AGENT_TOKEN_KINDS,
+  agentKeyBytes,
+  mintAgentTokenWithKey,
+} from "../relay-credentials.mjs";
+
+const SHARED_SERVER_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "server");
 
 function toAbsolutePath(value) {
   if (!value) return "";
@@ -93,10 +102,30 @@ export function carryOverPackageConfig({ serverDir, configPath, dataDir, fsImpl 
   }
 }
 
-export function loadTokenFromConfig(configPath) {
+/**
+ * The credential a worker, the MCP server, the Copilot extension or a tool
+ * started by hand calls the relay with: an agent token, never the owner
+ * token (which no file holds).
+ *
+ * `OAR_AGENT_TOKEN` first: the relay puts it in every session's environment,
+ * bound to that session's conversation. Without it (a CLI that does not pass
+ * its environment on to an MCP server, an extension started by hand) the
+ * token is derived from the relay's agent key in `<dataDir>/relay-secrets.json`:
+ * for `conversationId` when one is given (the MCP server's
+ * --conversation-id), else the `cli` token. '' when neither is there.
+ */
+export function loadAgentToken({ env = process.env, configPath = "", conversationId = "", serverDir = SHARED_SERVER_DIR, fsImpl = fs } = {}) {
+  const fromEnv = String(env?.[AGENT_TOKEN_ENV] || "").trim();
+  if (fromEnv) return fromEnv;
   try {
-    const cfg = loadRelayConfig(configPath);
-    return String(cfg.authToken || "").trim();
+    const dataDir = resolveDataDir({ env, configPath, serverDir });
+    const parsed = JSON.parse(fsImpl.readFileSync(path.join(dataDir, "relay-secrets.json"), "utf8"));
+    const key = agentKeyBytes(parsed?.agentKey);
+    if (!key) return "";
+    const subject = String(conversationId || "").trim();
+    return subject
+      ? mintAgentTokenWithKey(key, { kind: AGENT_TOKEN_KINDS.session, subject })
+      : mintAgentTokenWithKey(key, { kind: AGENT_TOKEN_KINDS.cli });
   } catch {
     return "";
   }

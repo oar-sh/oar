@@ -3,6 +3,546 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [0.9.27] — 2026-11-13
+
+Highlights: a new security model, in plain words. Agents no longer hold
+the relay token: the relay keeps only its hash, and every session gets an
+agent token of its own (`OAR_AGENT_TOKEN`) that opens what agents need and
+none of your routes. Only you answer question cards, Safety checks and
+plan cards, signed in to the relay they belong to. Browsers hold a session
+of their own instead of the token, with a proof key that a page on another
+port of the relay host never gets; **Settings → Security** lists them,
+signs in another device with a single-use link or QR code, and tells every
+browser when a new one signs in. Paired relays sign in with keys of their
+own, and a remote prompt's origin is the relay that signed in, never what
+the request claims. The relay token can be replaced from the web UI
+without signing anyone out. Claude sessions ask you before an edit to a
+sensitive file such as `.bashrc` or anything under `.git/`. **🔥** left of
+the sidebar's filter shows only the sessions that are active. And after an
+update, a session worker the relay could not stop is no longer taken for
+replaced: the stop is retried, and its chat says so after three tries.
+
+### Added
+
+- **🔥 Active sessions only.** A toggle left of the sidebar's filter shows
+  only the sessions working, active in the last 5 minutes, or with a card
+  waiting for you, with their count; it combines with the title filter,
+  follows along live and is remembered per browser.
+- **Agent tokens.** Every session's environment gets `OAR_AGENT_TOKEN`, a
+  token bound to that session's conversation. Workers, their CLIs and
+  tools, and OAR's MCP server call the relay with it. It opens the routes
+  agents need (reading, prompting, their own turns and cards, relay_tool,
+  files, git, their own conversation's previews, moving a session into an
+  existing group or out of one, a queued restart and its cancel) and none
+  of yours. `oar agent-token` prints one for scripts on the relay host; it
+  is never the relay token. Every API route says what an agent and a
+  paired relay may do, and a route it does not list is yours. `oar status`
+  and `oar doctor` say *owner token: set (hashed)*.
+- **Browser sessions.** Signing in gives the browser a session of its own:
+  the cookie holds a random `oars1_…` secret, the relay only its hash. A
+  session lasts 30 days from its last use and 400 days at most; at most 50
+  are kept. Sessions can be listed, renamed and signed out one by one, all
+  others at once, or this browser (`/api/auth/sessions`, `DELETE
+  /api/auth/session`). Signing one out closes its live connection and
+  stops its device's notifications. A browser whose session no longer
+  counts shows *This browser was signed out* on its sign-in page; a
+  notification answered after that says *Signed out, open OAR*. A sign-out
+  that reaches a page with Settings or a dialog open closes them, so the
+  sign-in box is never hidden behind them.
+- **Settings → Security.** A new Settings tab lists the browsers signed in
+  (this one tagged; created, last seen, last address and how each signed
+  in, *from the terminal (oar url --sign-in)* included) with Rename and
+  Sign out, and signs out all other browsers or this one. **Sign in
+  another device** makes a link `…/?signin=oarc1_…` that signs one more
+  browser in, once, within 10 minutes, without the token changing hands,
+  with a Copy button and a countdown. Its QR code shows after a tap on
+  **Show QR code** and hides again after a minute, when you leave the page
+  or Settings, when the link is used or expires, and on **Hide QR code**.
+  A new link revokes the previous one of the same browser (`POST
+  /api/auth/signin-codes`, which answers with the QR code as a module
+  matrix).
+- **Replace the relay token from the web UI.** **Generate new relay
+  token** (`POST /api/auth/owner-token/rotate`) asks first, then shows the
+  new token once, with Copy and Copy pairing link, and the paired relays
+  that still need it with how to re-pair them. The old token stops working
+  at once; signed-in browsers, agents and session workers carry on, and
+  the rotation is logged with the session that did it. The dialog is a
+  form your password manager can save from (**Save in password manager**,
+  the relay's name as the user name), with **Show**. It says when the old
+  token was last used by something other than a browser page, and from
+  which address (never the token; also `GET /api/auth/owner-token`), gives
+  each paired relay still on the old token **Open there** (its Settings →
+  Relays → Add a relay; you paste the pairing link, nothing is carried in
+  the address), and hints to clear the clipboard after pasting. Closing it
+  removes the token from the page. The sign-in box is a password-manager
+  form the same way.
+- **Security notices.** A banner under the header recommends a new relay
+  token once after this upgrade (dismissed once for the relay), says when
+  the token was changed outside OAR, and says when the relay was started
+  with its token on the command line (`GET /api/auth/notices`). While a
+  new token is recommended (the upgrade or the changed-outside banner was
+  dismissed and the token not replaced; `recommendations` in the same
+  answer), the Security tab carries a quiet dot and the token row a
+  *Recommended* tag, until the token is replaced.
+- **`oar url --sign-in`** prints a link and QR code that sign one browser
+  in, once, within 10 minutes, for the address a phone reaches. It works
+  in a terminal only (`--yes` does not stand in for one), not with
+  `OAR_AGENT_TOKEN` set, and the relay makes at most 3 such links in 10
+  minutes (`POST /api/auth/signin-codes/terminal`, for the `oar` command's
+  own token straight over loopback). A new link replaces the one before
+  it, and the command says so. Such a browser is listed "via the
+  terminal". Plain `oar url` prints no token.
+- **New sign-in notices.** A browser that signs in with the relay token, a
+  sign-in link or a terminal link is announced to every other browser
+  before the sign-in completes: live on their open pages, as a push
+  notification *New browser signed in* and in `GET /api/auth/notices`
+  (`signins`), kept 7 days. The push is on by default (a switch in
+  Settings → Notifications), comes also while a device is in use, goes to
+  every device with a session other than the new one, whatever device id
+  the new browser gives, and several within 5 minutes replace one another;
+  it has a **Sign it out** action, and its tap opens Settings → Security.
+  In the page the notices are one row of the banner, one line however many
+  there are (*New browser signed in: <name>, <address>, via …*, or *3 new
+  browsers signed in (latest: …)*): **Show all** opens the list over the
+  conversation, each with how and when it signed in and **Sign it out**,
+  and one **Got it** (`POST /api/auth/notices/dismiss-signins`) dismisses
+  them all. A sign-in from the relay host with forwarding headers shows
+  *this host*, with the forwarded address in brackets, in the notice and
+  in the list of signed-in browsers. Over 20 notices, one whose browser is
+  signed out or that a browser dismissed goes first; a terminal sign-in's
+  notice stays while that browser is signed in. Each browser dismisses a
+  notice for itself only, and a browser that signs in again sees the ones
+  it had dismissed again; signing browsers out takes back neither a notice
+  nor a push.
+- **Paired relays sign in with their own key** (remote-relay protocol 2).
+  Pairing uses the other relay's token from its link once: each relay
+  sends the other a key (`oarp1_…`, checked back at the stored address
+  before it is kept), and the token held for the other relay is dropped
+  once its key worked. Relays paired before switch to keys by themselves
+  within about a minute once both run this version. Keys renew every 30
+  days; **Renew key** and **Revoke key** per relay. A revoked key stays
+  void until you renew it or that relay is added again from its pairing
+  link, which gives it a working key again; only removing the relay and
+  replacing the relay token lock it out for good.
+- **A remote prompt's origin is the relay that signed in, never what the
+  request claims.** The session part is that relay's own statement. A key
+  claiming another relay is refused (403 `REMOTE_RELAY_ORIGIN_MISMATCH`),
+  and so is the relay token or a browser claiming a relay that has a key
+  (403 `REMOTE_RELAY_PEER_KEY_REQUIRED`; an agent token's claim is
+  ignored, not refused). Refusals are logged, counted per relay ("N
+  refused claims since start" in Settings → Relays) and the first one per
+  relay puts a notice in the Inbox. Contact unlocks, answering past the
+  hop limit, creator send-back, the settings creator match, push
+  suppression and push claims follow verified origins of a live entry at
+  its key epoch only, from the first start (no grace period). Claims from
+  older relays are shown as unverified: a "claimed" tag on the badge,
+  "(unverified)" in the header line the agent reads, and they open none of
+  these. The sender is told why and how to fix it (`originVerified: false`
+  and a notice). A keyed relay's address and relay id are pinned: a change
+  revokes its keys and holds new ones until you confirm it.
+- **Re-pair**, one click per relay in Settings → Relays: keys both ways
+  again; for an older relay, or one that no longer takes what this relay
+  holds, it opens Add a relay with the address filled in, and the pasted
+  pairing link updates the entry in place. Each row says Keyed, Legacy
+  token, Old version, One way, Inbound only or Re-add from link (the other
+  relay refuses this one for want of a key it takes: its key was revoked
+  there, it no longer lists this relay, or none is held); an agent refused
+  that way is told to ask for the same. A refused call says whether the
+  key or the token was rejected (*Rejected the key it gave this relay
+  (401)*).
+- **A one-way pairing keeps a key, never the token.** Added with "Also add
+  this relay there" off, the token from the other relay's link is used for
+  the add alone, in memory: that relay gives this one a key of its own
+  (the same scope as any paired relay's key) and lists it as **Inbound
+  only** (it never calls it; **Remove** there revokes the key at once).
+  This relay checks the key at that relay's address and stores only the
+  key, so its prompts arrive there verified, that relay's Inbox, asks and
+  watches work, and replacing that relay's token does not break it. If the
+  exchange fails halfway nothing is stored and the form says so. Adding
+  one way again replaces the key; adding the other way later turns the
+  inbound-only row into a normal one, keys both ways, no second row. The
+  row here says **One way**; Re-pair opens the pairing-link field (with
+  "Also add this relay there" it becomes two-way). Minting such a key is
+  yours: an agent token or a paired relay's key gets 403.
+- **One way with a relay older than 0.9.27** still works as before: no key
+  there, so this relay keeps its token and its prompts arrive as claimed.
+  The add says so, and the row says **Old version**.
+- **Answer a paired relay's question in a popup.** In the Inbox, a paired
+  relay's pending ask, plain question card or approval gets option buttons
+  (approvals: **Answer there**) when that relay is on this version
+  (`capabilities.answerLink` in `GET /api/relay/identity`). A button opens
+  that relay's page in a small window (`?answer=<id>&option=<n>`, no
+  opener, no referrer) with the full card, the option picked and
+  **Confirm**: the link answers nothing, Confirm opens only after the
+  window was on screen and focused for 800 ms and you moved the pointer or
+  pressed a key there, and it sends that relay's own option text. Signed
+  out there, the sign-in box comes first (*Sign in to <relay> to answer*).
+  The window closes itself, and the Inbox reloads when you are back. Plan
+  cards, cards with fields and multi-select cards keep **Open there**.
+- **Settings → Relays → This browser on your paired relays**: per paired
+  relay, **Sign in there** and **Turn on push there** (its Notifications
+  tab), in a new window; each relay keeps its own sign-in. A relay on this
+  page's host with another port is flagged: the two share one sign-in
+  cookie and sign each other out.
+- **`?settings=<tab>`** opens Settings at that tab once the app has
+  started (`&add-relay=1` with `relays`: the Add a relay form, empty).
+
+### Changed
+
+- **The relay token is stored as a hash.** `authToken` is gone from the
+  config: at its first start the relay moves it, with the same value, into
+  `relay-secrets.json` in its data folder as a SHA-256 hash, and out of
+  `relay-previous.json` too. New tokens look like `oaro1_…`; tokens of
+  earlier versions keep working. `oar copilot` no longer puts the token on
+  the relay's command line. A `--token` is read on the first start only,
+  when no token is stored yet; after that it is ignored with a warning,
+  never in force, and the relay's supervisor passes it to no restart. An
+  `authToken` put back into the config by hand becomes the relay token and
+  is logged as a token changed outside OAR. `oar setup --new-token`
+  records the new token's hash in the relay's database itself, so the next
+  start raises no alarm; a database restored from a backup older than such
+  a replacement shows the alarm once. A `relay-secrets.json` the relay
+  cannot read (permissions, a program holding it open) stops the start
+  with exit code 78 and a line naming the file; the relay never makes a
+  new token over it.
+- **Only you answer question cards.** No agent answers or dismisses any
+  card, an ordinary one of another conversation included, and no paired
+  relay either: 403 `AUTH_PERSON_REQUIRED`. relay_tool's `answer_question`
+  says *Only the person can answer questions; ask them in the relay UI*.
+  Plan cards and the Inbox are yours alone too. A paired relay's questions
+  are answered on that relay; the Inbox no longer answers them over the
+  pairing, and shows its asks read-only with **Open there**, which opens
+  that relay's web UI on the session.
+- **Claude sessions ask you before an edit to a sensitive file, instead of
+  allowing it.** An edit to a file Claude Code marks as sensitive
+  (`.bashrc` and other shell startup files, `.npmrc`, anything under
+  `.git/` or `.claude/`, …) now gets a **Safety check** card in every
+  mode, autopilot included, showing the file and the whole change, with
+  **Allow once** and **Deny**. Only you can answer it: an agent token gets
+  403 `AUTH_PERSON_REQUIRED`, a paired relay's key 403
+  `REMOTE_RELAY_PEER_SCOPE`. It never allows more than that one edit, a
+  card left unanswered denies the edit, and a change over 8000 characters
+  is refused without a card (see [Security notes](docs/security.md)).
+- **Agents may queue a restart, nothing more.** `POST /api/relay/shutdown`
+  with an agent token takes only `{ "restart": true, "reason": "…" }` and
+  is logged with the reason and the calling session; a restart now and a
+  plain shutdown are yours (403 `AUTH_PERSON_REQUIRED`).
+- **Agents are held as another relay's agent.** Their `owner_approved` is
+  ignored (this relay's own relay_tool still states it after your Allow
+  card), and their plan-only, mode and `mayCreateSessions` changes are
+  held as for another relay's agent. They name existing session groups
+  only: `update_session` with a new group name gets 403
+  `AUTH_PERSON_REQUIRED`, and `create_session` with a group that is not
+  there starts the session in no group, with a warning.
+- **`oar` runs on an agent token.** `oar status`, restarts and `oar
+  update` call the relay with the cli agent token. `oar url` prints the
+  address without a token link: the relay keeps only the hash. `oar setup`
+  shows a new token once, with its sign-in link and QR code. `oar setup
+  --new-token` needs a terminal and the typed word NEW; signed-in browsers
+  stay signed in, agents carry on. `oar stop`, `oar stop --now`, `oar
+  restart --now` and `oar uninstall` work on a running relay without the
+  systemd service: the relay takes a stop and a restart now from the `oar`
+  command's own agent token over loopback, and logs it. Loopback means
+  really local: with `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or
+  `X-Forwarded-Proto` the request is refused (403), as a same-host proxy
+  connects from 127.0.0.1 too. On a terminal, `stop --now`, `restart
+  --now` and `uninstall` ask y/N first; without one they need `--yes`.
+  None of this is a boundary (docs/security.md).
+- **No token printed without a terminal.** A relay's first start and `oar
+  setup` run without a terminal make a token and store only its hash;
+  nothing prints it, since that output lands in logs agents can read. `oar
+  setup --new-token` needs a terminal for both its input and its output,
+  never replaces the token without showing the new one, and works also
+  when no browser is signed in any more.
+- **Pairing never hands out this relay's token.** Pairing back carries no
+  token: for relays running this version pairing goes both ways again, the
+  keys are the way back, and an older relay is told to add this relay by
+  hand. A pairing that used "this relay's own token" keeps that token as
+  its own (only the start that moves the token out of the config gives
+  those older pairings that token), and a pairing that gave this relay no
+  token is stored as such and sends none.
+- **A paired relay's key opens only the routes relays call each other
+  on**; anything else answers 403 `REMOTE_RELAY_PEER_SCOPE` (which
+  replaces `AUTH_PEER_SCOPE`), among them switching a session's billing,
+  pairing, settings and answering any card or ask. A key's
+  `owner_approved` is ignored (it changes the settings only of sessions
+  that relay started here) and it never moves a session to another folder.
+  Asks, session watches and the Inbox read from a paired relay need its
+  key: a relay paired one way, or an older one, gets the reason instead.
+  Replacing the relay token leaves keyed paired relays working; the
+  rotation lists only the relays without a key.
+- **New answers.** 403 `AUTH_PERSON_REQUIRED` (an agent token on a route
+  that is yours), 403 `AUTH_CONVERSATION_MISMATCH` (a session's agent
+  token on relay_tool for another conversation), 403
+  `AUTH_RELAY_TOOL_REQUIRED` (an agent token starting a session past
+  relay_tool), 403 `AUTH_CROSS_SITE` (a write from another site), 401 with
+  the `OAR_AGENT_TOKEN` hint, 401 `AUTH_SIGNED_OUT` (a browser session
+  that no longer counts), 403 `AUTH_SESSION_PROOF` (the session cookie
+  without its proof key), 403 `AUTH_COOKIE_UPGRADE` (a cookie from before
+  sessions; the page trades it), 409 `AUTH_UPGRADE_PENDING` (that trade
+  again within 10 seconds), 403 `AUTH_FILE_CAPABILITY` (a wrong file
+  capability), and for paired relays 403 `REMOTE_RELAY_ORIGIN_MISMATCH`,
+  `REMOTE_RELAY_PEER_KEY_REQUIRED` and `REMOTE_RELAY_PEER_SCOPE`.
+
+### Fixed
+
+- **Dependency scanners list only OAR's own dependencies.** The agent SDK
+  pins ship as `server/agent-sdks/<sdk>/pin.json` and `pin-lock.json`
+  instead of `package.json` and `package-lock.json`, which scanners such
+  as Socket read as OAR's own and so listed the Claude and Cursor SDKs,
+  their peers and koffi as dependencies. The relay writes them as
+  `package.json` and `package-lock.json` for `npm ci` as before, and the
+  SDK folders keep their names: installed SDKs are not downloaded again.
+- **The Safety check card shows more hidden characters.** Soft hyphens,
+  the invisible operators (U+2060–U+2064), tag characters
+  (U+E0000–U+E007F), variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF),
+  the combining grapheme joiner, the Mongolian vowel separator, the Hangul
+  fillers and the blank braille pattern in a tool name, command or reason
+  now show as visible escapes, like bidi controls.
+- **Formulas in replies: bare environments, punctuation, macros.** A
+  `\begin{align*} … \end{align*}` (or any environment KaTeX sets as a
+  display: equation, align, gather, cases, the matrices, array, CD and
+  their variants) written at the start of a line without `$$` is now
+  rendered; before, Markdown showed it raw and ate its `\\`. The full stop
+  or comma straight behind an inline formula no longer wraps onto a line
+  of its own. Macros a reply defines with `\def`, `\gdef` or `\newcommand`
+  now hold for the later formulas of that reply, and never for another
+  one.
+
+- **A worker the relay could not stop no longer counts as replaced.** When
+  the process list did not show a session's worker that was still running,
+  the worker recycle after an update (and the Claude billing switch) took
+  the stop as done while the old worker went on taking the session's
+  messages; after an update that had removed its SDK, the next message
+  failed on it. The stop now counts as failed and is retried, as for a
+  worker that survives its stop. The relay tells a worker by its pid and
+  the time its process started, so a process that only got an old worker's
+  pid is neither blamed nor stopped as that worker. A new worker that got
+  the stopped one's pid counts as new when both start times can be read;
+  otherwise it is stopped again and relaunched, never doubled.
+- **A worker the relay cannot stop is shown in its chat.** When the
+  replacement of a session's worker after an update fails three times in a
+  row (an old worker that does not stop, a launch that fails), the chat gets
+  a note saying so, with the old worker's pid (when the relay could check
+  that the process still is that worker) and how to stop it by hand;
+  before, only the relay's log said it. The troubleshooting guide has the
+  way out under "A chat's old worker does not stop".
+- **A failed SDK reinstall says so, in the CLI and in Settings.** When npm
+  fails, `oar sdk install <sdk> --reinstall` now says the reinstall failed,
+  names the installed folder that stays in use and exits with 1; before, it
+  said the SDK was ready and exited with 0. The Reinstall button in Settings
+  now shows "Reinstall failed: <reason>. <folder> stays in use." under the
+  row, which stays Installed, and opens the install log; before, the row
+  went back to Installed with a "Finished" log and no word of the failure.
+  The note is kept in memory only: a relay restart clears it, and the row
+  shows Installed again.
+
+### Security
+
+- **The session cookie needs its proof key.** Cookies are not isolated by
+  port, so a dev server an agent runs on another port of the relay host
+  receives the session cookie whenever you open it, from a phone on your
+  LAN too, and could replay it. Signing in now also gives the page a proof
+  key (`oark1_…`), once, in the JSON answer; the relay keeps only its
+  hash. The page sends it as `X-OAR-Session-Proof` with every API request
+  and in the Socket.IO handshake; the cookie without it gets 403
+  `AUTH_SESSION_PROOF`, reads included. Only the content a browser loads
+  by itself (attachments, generated pictures, media) still opens on the
+  cookie alone; agent tokens read all of it anyway. A session without a
+  proof hash never opens anything, those included. A browser that lost its
+  key (site data cleared) is signed out and signs in again.
+- **The proof key goes to this relay's own API only.** The page sends
+  `X-OAR-Session-Proof` only to its own origin's `/api/` paths, the
+  service worker to its scope's `api/`; any other address (a picture an
+  agent put in a reply, on another port of the relay host) never gets it.
+  Such a picture has no 🖍️ in the viewer, and an API path that would leave
+  the origin (`//host/…`) is refused before it is sent.
+- **Browsers from before sessions** trade their old cookie for a session
+  and a key when the page starts, or when a call gets 403
+  `AUTH_COOKIE_UPGRADE`, without showing the sign-in page. The trade must
+  come from the relay's own page, its answer clears the old cookie and
+  sets the session's, and one old cookie makes one session per browser:
+  tabs take turns, and the relay answers a second trade within 10 seconds
+  with 409 `AUTH_UPGRADE_PENDING`.
+- **The browser cookie no longer holds the relay token.** A request with
+  the token as Bearer makes no session, so scripts and paired relays never
+  add browsers to the list; sessions are made at the sign-in route only.
+- **Files by path need the proof key or a file capability.** The session
+  cookie alone no longer reads `GET /api/drives/file` or `/api/files/…`.
+  The page loads pictures, videos, downloads and PDFs by path with a `k`
+  in the address: a capability it asks for with its proof key, bound to
+  its browser session and the one file, valid for at most 10 minutes and
+  renewed as needed. A wrong one gets the same 403 `AUTH_FILE_CAPABILITY`
+  whatever the path: the relay checks a `k` before it resolves a link,
+  looks at the disk or lists the drives (its form, expiry and session even
+  before the route runs), so a wrong one tells nothing about the files.
+- **Files no route serves.** Whatever the credential, the relay never
+  serves its secrets file, its database files or its config; this also
+  covers a backup being written (`*.db.partial`), the secrets file's
+  temporary copy during a write, and database files in the folders an
+  upgrade takes an earlier database from. A backup folder moved in the
+  settings counts at once, and a folder whose name starts with `..` is no
+  longer taken for one outside.
+- **Media addresses carry a tag.** `GET /api/media/:id/content` answers
+  404 to an id without its tag `t`, whoever asks, before it looks anything
+  up, so a replayed cookie cannot walk the ids. The gallery gets every
+  address with its tag; old addresses stop working when the agentKey
+  changes. The gallery serves a file a message names by its path only as a
+  picture or a video; other files by path (texts, PDFs) are no longer
+  listed under Files or served there, and open from the chat with a file
+  capability instead.
+- **Credentials are cut out of the log.** Every prefixed relay credential
+  (`oaro1_`, `oara1_`, `oars1_`, `oarc1_` and `oarp1_`), file capabilities
+  (`fc1.…`, the `k` of a file address) and media tags (the `t` of a media
+  address) are cut out of the relay's log, and the preview proxy never
+  forwards a prefixed credential.
+- **Writes from another site** with the browser cookie, a page on another
+  port of the relay host or a sibling host of the same domain included,
+  get 403 `AUTH_CROSS_SITE`. The cookie stays host-only (no `Domain`
+  attribute) and is `Secure` over HTTPS, a trusted TLS proxy included.
+- **An agent token acts for its own session.** relay_tool refuses a call
+  that names another conversation (403 `AUTH_CONVERSATION_MISMATCH`), an
+  agent token's `X-OAR-Remote-Origin` header and body `origin` are
+  ignored, and it starts sessions only through relay_tool
+  `create_session`, where may-start-sessions, the cap and your Allow apply
+  (403 `AUTH_RELAY_TOOL_REQUIRED` on the bootstrap and on a send that
+  opens a conversation).
+- **Agent tokens never open the Socket.IO channel.** The worker socket
+  takes an agent token only for its own session and only in the
+  `Authorization` header, never the browser cookie. A worker started
+  before the upgrade keeps working on the owner token in its URL
+  (`?token=`) until the relay recycles it or the token is replaced, which
+  closes its socket. That `?token=` is a transition and is removed in the
+  next version: it takes the owner token only, every use is logged as a
+  warning by the credential's shape (never its value), and the value is
+  cut out of the URL before anything logs it.
+- **Signing out ends what the browser had.** Signing in again over a
+  session, and a session that expires or is pushed out by the 50-browser
+  limit, sign the old one out like "Sign out": its live connection closes
+  and its device's push notifications stop; an upgraded browser's page
+  sends its device id once, so this works for it too. "Sign out this
+  browser" empties the outbox, in the page and in the service worker, and
+  stops a replay under way: sends queued while signed in are not sent
+  after the next sign-in. "Sign it out" on a new sign-in does the same
+  when that browser is this one; signing out another browser leaves this
+  one's outbox alone. A send refused for the sign-in (401, 403
+  `AUTH_SESSION_PROOF` or `AUTH_COOKIE_UPGRADE`) stays queued for after
+  it, at most 10 attempts, and a refused live connection no longer drops a
+  key another tab has just stored.
+- **Cookies and the lockout.** A cookie header with a malformed `%` no
+  longer fails the request with a 500, and of several `copilot_auth`
+  cookies (another relay on the same host) the first valid one counts; a
+  stale one never clears it. Only the first two are read, and each of
+  those that matches nothing counts toward the lockout, so many values in
+  one Cookie header are no way around it.
+- **Framing.** The app's page, a shared link's reader and "Preview as
+  shared" carry `Content-Security-Policy: frame-ancestors 'self'` besides
+  `X-Frame-Options: SAMEORIGIN`.
+- **What stays open.** [Security notes](docs/security.md) say what agent
+  tokens do not close. A stolen session (the cookie and the key of a
+  browser on the relay host) is a full person session. To recover:
+  generate a new relay token, sign in with it, then "Sign out all other
+  browsers".
+
+### Upgrade notes
+
+- **Database migration 0041** runs at the first start: it adds the browser
+  sessions table, with each session's proof-key hash in its `proof_hash`
+  column. As before, the relay first copies its database to the backups
+  folder. A database that already has the table without that column (a
+  pre-release build) gains the column and keeps its rows; those browsers
+  sign in again.
+- **The relay token is hashed.** At its first start the relay moves the
+  token from `config.json` (and `relay-previous.json`) into
+  `relay-secrets.json` in its data folder, as a SHA-256 hash, and takes
+  `authToken` out of the config. The same token keeps working; keep it in
+  your password manager, since no file holds it any more.
+- **Scripts: `OAR_AGENT_TOKEN`.** Scripts that read `authToken` from the
+  relay config must switch: use the `OAR_AGENT_TOKEN` environment variable
+  a session has (group moves and queued restarts keep working; routes that
+  are yours refuse it), and outside a session the token `oar agent-token`
+  prints. A script that sends no token gets 401 *The relay token is no
+  longer in the config; use OAR_AGENT_TOKEN*. Your own scripts that call
+  the API with a browser's cookie need its `X-OAR-Session-Proof` too;
+  better, give them `OAR_AGENT_TOKEN`.
+- **Browsers move to sessions once.** A browser signed in before this
+  version stays signed in: when the page starts, it trades the token in
+  its cookie for a session and its proof key. A tab left open from before
+  the update runs the old page and needs one reload.
+- **Paired relays: protocol 2.** Relays paired before switch to keys both
+  ways by themselves within about a minute once both run this version;
+  **Re-pair** does it at once. A paired relay older than 0.9.27 keeps
+  working on this relay's token, unverified: its prompts arrive "claimed",
+  and its asks and session watches are refused until it is updated and
+  re-paired. Stored prompts from before this version read as unverified. A
+  one-way pairing added from now on gets an inbound-only key from the
+  other relay instead of keeping its token. A relay that still calls with
+  this relay's token needs the new pairing link after a token change
+  (Settings → Relays → Add a relay updates the entry in place).
+- **Replace the token once.** The web UI recommends a new relay token once
+  after the upgrade, in a banner (dismissed once for the relay) and, once
+  that is dismissed, with the *Recommended* dot in Settings → Security
+  until the token is replaced: agents could read the old one, and earlier
+  copies may sit in shell history or backups. If agents ran on this relay
+  before, replace it (Settings → Security, or `oar setup --new-token`).
+- **Stop and start the relay once, by install type.** The restart after an
+  update replaces the relay's runtime, not the supervisor that watches it,
+  which keeps the version and the command line it was started with:
+  - Linux under the systemd user service (a git checkout or a global
+    install): nothing more; the restart after the update restarts the
+    whole service.
+  - A global npm install started with `oar start`: `oar stop && oar
+    start`, once.
+  - Windows, at sign-in or at boot (the scheduled task), with its
+    supervisor: stop the relay and start it once (`oar stop`, then `oar
+    start`, or sign out and in again for the sign-in entry).
+  - Termux: `oar stop && oar start`, once.
+
+  A relay that 0.9.26 or older started through `oar copilot`, or that was
+  started with a manual `--token`, must be stopped and started once before
+  you replace the token: its supervisor still holds the relay token on its
+  command line, which other processes can read, and a notice in the web UI
+  says so until then. The new supervisor passes no `--token` on, and once
+  `relay-secrets.json` exists a `--token` is ignored with a warning, so
+  that old token never comes back into force.
+- **Restart after the update.** A relay of 0.9.26 or older left running
+  after `npm i -g @oar-sh/oar` (for example when the native build failed,
+  so nothing restarted it) still reads the agent SDK pins lazily under
+  their old names; they now ship as `pin.json` and `pin-lock.json`, so that
+  relay gets ENOENT on an SDK install or update until it is restarted.
+  Restart the relay after updating.
+- **Workers on `?token=` for now.** A session worker started before the
+  update keeps working on the owner token in its socket's URL until the
+  relay replaces it on the new build (once its session is idle) or the
+  token is replaced. That `?token=` is transitional and is removed in the
+  next version.
+
+### Downgrade notes
+
+Going back to 0.9.26: `oar update --to 0.9.26` or `npm install -g
+@oar-sh/oar@0.9.26` (in a git checkout: `git checkout v0.9.26`, then a
+relay restart).
+
+- **Remove paired relays first.** In Settings → Relays, remove every
+  paired relay before you go back, and pair again afterwards. 0.9.26
+  cannot use keys, and it sends its own relay token to every paired relay
+  it reads as using that token, at every health check. This version stores
+  keyed and tokenless pairings with a fixed placeholder in their place, so
+  0.9.26 sends that placeholder and gets 401 (the row shows
+  *unauthorized*); an entry edited by hand would still get the token.
+- **The hashed token.** 0.9.26 reads its token from `config.json`, which
+  holds none any more, so it makes one up at each start and answers 401
+  until you run `oar setup --new-token` there. Coming back up after that:
+  the token it wrote into `config.json` becomes the relay token, the web
+  UI says *The relay token was changed outside OAR* (dismiss it if this
+  was you), and the token you had made in this version before going back
+  no longer works.
+- **Browser sessions.** 0.9.26 ignores the browser sessions table and
+  reads a browser's cookie as the token, so every browser signs in again
+  with the token (the one `oar setup --new-token` made there).
+- **The database** needs no step: 0.9.26 opens it as it is, and migration
+  0041's table stays in place, unused.
+
 ## [0.9.26] — 2026-11-11
 
 Highlights: formulas from their delimiters only, and Settings sorted by

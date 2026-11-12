@@ -9,6 +9,7 @@ import {
   REMOTE_RELAY_APPROVAL_SUMMARY_MAX,
   REMOTE_RELAY_APPROVAL_VARIANTS,
 } from '../../shared/remote-relay-contract.mjs';
+import { RELAY_QUESTION_CONTEXT_KINDS } from '../../shared/relay-asks.mjs';
 
 /**
  * @param {unknown} rawContext
@@ -53,5 +54,11 @@ export function sanitizeRelayQuestionContext(rawContext, {
   if (typeof rawContext.summary === 'string' && rawContext.summary.trim()) {
     context.summary = rawContext.summary.trim().replace(/\s+/g, ' ').slice(0, REMOTE_RELAY_APPROVAL_SUMMARY_MAX);
   }
+  // A card's variant within its source (a Safety check's `sensitive-file`):
+  // a listed kind only.
+  if (RELAY_QUESTION_CONTEXT_KINDS.includes(rawContext.kind)) context.kind = rawContext.kind;
+  // A card no agent may answer (the Safety check cards). Only an explicit
+  // `true` is kept; it can only make a card stricter.
+  if (rawContext.personOnly === true) context.personOnly = true;
   return Object.keys(context).length ? context : null;
 }

@@ -477,6 +477,9 @@ export function createRemoteRelayCallerContext({
       userMessageId: live?.id || null,
       hops,
       originRelayIds,
+      // The prompts' origins themselves: what may be answered is decided on
+      // their `verified`, `entryId` and `epoch` (origin binding).
+      origins,
       origin,
     };
   }

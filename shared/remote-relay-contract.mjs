@@ -58,7 +58,11 @@ export const REMOTE_RELAY_LEGACY_TOOL_NAME = 'remote_relay';
 
 // Bumped when a relay starts relying on a newer inbound behaviour of its peers.
 // 0 = a relay without this feature (reachable read/prompt only, no pairing).
-export const REMOTE_RELAY_PROTOCOL = 1;
+// 2 = paired relays sign in with a key of their own (peer keys, `oarp1_…`);
+// identity says `remoteRelays.peerKeys: true`.
+export const REMOTE_RELAY_PROTOCOL = 2;
+// The lowest protocol that takes and issues peer keys.
+export const REMOTE_RELAY_PEER_KEY_PROTOCOL = 2;
 
 // Every agent path converges on this one local endpoint; the relay does the
 // gating, approval, forwarding and waiting.
@@ -296,9 +300,122 @@ export const REMOTE_RELAY_ERROR_CODES = Object.freeze({
   // a conversation (or the session it asks for) already has the most pending asks.
   questionLimit: 'REMOTE_RELAY_QUESTION_LIMIT',
   internal: 'REMOTE_RELAY_INTERNAL',
+  // Peer keys (origin binding):
+  // a paired relay signed in with its key and claimed to be another relay (403),
+  originMismatch: 'REMOTE_RELAY_ORIGIN_MISMATCH',
+  // a request on another credential claimed a relay that signs in with a key
+  // of its own, or a route that needs a verified relay got none (403),
+  peerKeyRequired: 'REMOTE_RELAY_PEER_KEY_REQUIRED',
+  // a paired relay's key on a route outside REMOTE_RELAY_PEER_ROUTES (403).
+  peerScope: 'REMOTE_RELAY_PEER_SCOPE',
+  // an inbound-only key was asked for a relay that is listed here already,
+  // both ways: its key comes the usual way (409).
+  alreadyListed: 'REMOTE_RELAY_ALREADY_LISTED',
   // Prefix: the remote answered with this HTTP status, e.g. REMOTE_RELAY_HTTP_409.
   httpPrefix: 'REMOTE_RELAY_HTTP_',
 });
+
+// The routes a paired relay's key opens (least privilege): every call the
+// dispatcher, the ask, event and Inbox links and the health probe make, plus
+// the peer-key delivery, check and request. `METHOD pattern`, Express
+// patterns. Not here, on purpose: switching a session's billing, answering or
+// dismissing any card or ask (the person's), pairing (an owner act) and
+// everything else. shared/relay-route-policy.mjs's peer column follows this
+// list; tests hold the two together and check that every path the client
+// calls is in it.
+export const REMOTE_RELAY_PEER_ROUTES = Object.freeze([
+  'GET /api/relay/identity',
+  'GET /api/status',
+  'GET /api/models',
+  'GET /api/usage',
+  'GET /api/usage-limit',
+  'GET /api/image-usage',
+  'GET /api/openai-image-presets',
+  'GET /api/settings/openai',
+  'GET /api/settings/copilot',
+  'GET /api/settings/claude',
+  'GET /api/settings/grok',
+  'GET /api/settings/cursor',
+  'GET /api/settings/deepseek',
+  'GET /api/settings/claude-api',
+  'GET /api/settings/claude-cloud',
+  'GET /api/conversation-groups',
+  'GET /api/conversations',
+  'GET /api/conversation/:id',
+  'GET /api/conversation/:conversationId/background-task/:taskId/output',
+  'PATCH /api/conversation/:id/settings',
+  'POST /api/conversation/:conversationId/cancel-turn',
+  'POST /api/conversation/:id/archive',
+  'POST /api/message',
+  'POST /api/conversation/bootstrap',
+  'GET /api/relay-questions',
+  'GET /api/relay-question/:id',
+  'POST /api/relay-events/remote/subscribe',
+  'POST /api/relay-events/remote/pull',
+  'POST /api/relay-asks/remote/ask',
+  'POST /api/relay-asks/remote/status',
+  'POST /api/relay-asks/remote/withdraw',
+  'GET /api/relay-asks/remote/inbox',
+  'POST /api/remote-relays/peer-key',
+  'GET /api/remote-relays/peer-key/check',
+  'POST /api/remote-relays/peer-key/request',
+]);
+
+// The peer-key routes (remote-relay-peer-keys.mjs).
+export const REMOTE_RELAY_PEER_KEY_PATHS = Object.freeze({
+  deliver: '/api/remote-relays/peer-key',
+  check: '/api/remote-relays/peer-key/check',
+  request: '/api/remote-relays/peer-key/request',
+});
+
+// One-way pairing (inbound-only key): the relay being added mints a key for
+// the relay that adds it and hands it back in the answer. The person's call
+// (the owner token from the pairing link), never a paired relay's or an
+// agent's: shared/relay-route-policy.mjs lists it as person-only.
+export const REMOTE_RELAY_INBOUND_KEY_PATH = '/api/remote-relays/peer-key/inbound';
+
+/**
+ * What a prompt from a relay without a confirmed key is told (and what the
+ * receiver says in the hint, the badge and the Settings row): it arrives,
+ * stored as unverified, and opens nothing. `reason`: 'older' (an OAR below
+ * protocol 2), 'nokey' (new enough, no confirmed key yet) or 'unpaired'.
+ */
+export function remoteRelayUnverifiedNotice({ reason = 'nokey', relayName = '' } = {}) {
+  const name = toText(relayName).replace(/["\r\n]+/g, ' ').slice(0, 60);
+  const who = name ? `relay "${name}"` : 'the sending relay';
+  let why;
+  if (reason === 'older') why = `${who} runs an OAR older than 0.9.27 and signs in with this relay's token, not with a key of its own`;
+  else if (reason === 'unpaired') why = `${who} is not paired with this relay`;
+  else why = `${who} holds no confirmed key for this relay yet`;
+  return `Arrived unverified: ${why}, so its claim to be that relay could not be checked. `
+    + 'The prompt is stored and shown as "claimed", and it opens nothing here (no reply access, no hop allowance, no push suppression). '
+    + 'To fix it, run OAR 0.9.27 or later on both relays and use Re-pair in Settings → Relays.';
+}
+
+/**
+ * What fixes a paired relay that refuses this one for want of a key it takes
+ * (403 PEER_KEY_REQUIRED, or 401 on a key or a token it no longer knows):
+ * adding it again from its pairing link, which works whatever this relay
+ * still holds for it and updates the entry in place. Said to this relay's
+ * agents and in its log; Settings → Relays says the same on the relay's row.
+ */
+export function remoteRelayReAddAdvice(relayName = '') {
+  const name = toText(relayName).replace(/["\r\n]+/g, ' ').slice(0, 60);
+  const which = name ? `relay "${name}"` : 'that relay';
+  return `re-add ${which} from its link (Settings → Relays → Add a relay, paste its pairing link; the entry is updated in place)`;
+}
+
+/**
+ * What turns a one-way add into keys: the other relay lists no entry for
+ * this one (it was added there with "Also add this relay there" off), so it
+ * gives this relay no key and takes its calls on the token held for it as
+ * claimed. Re-pair adds this relay there; keys follow both ways.
+ */
+export function remoteRelayOneWayAdvice(relayName = '') {
+  const name = toText(relayName).replace(/["\r\n]+/g, ' ').slice(0, 60);
+  const which = name ? `relay "${name}"` : 'that relay';
+  return `use Re-pair on ${which} in Settings → Relays: it adds this relay there, and both relays then sign in to each other with keys`;
+}
 
 // app_settings keys (JSON values). `remote_relays` holds tokens for remotes
 // that use their own token: never return that value through an API.
@@ -355,8 +472,8 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'here are grouped under this session in the owner\'s sidebar; list_sessions and read_session '
   + 'show the group. Agents can name an existing group when they create a session (group: an id '
   + 'or name relay_info lists, on this relay or a paired one). update_session {session, ...} sets '
-  + 'another session\'s model, effort, mode, auto_compact_window, title, group (an id or name; a name '
-  + 'not there yet makes a new group; "none" takes the session out), thinking, cwd (its CLI restarts '
+  + 'another session\'s model, effort, mode, auto_compact_window, title, group (an existing group\'s id '
+  + 'or name; "none" takes the session out; only the owner makes groups), thinking, cwd (its CLI restarts '
   + 'there; not while it works) and planOnly for its next turns without prompting it, and answers the settings and '
   + 'what changed. A session this conversation started may be changed freely; any other (the owner\'s, '
   + 'another agent\'s, the one that started you) needs the owner\'s Allow once per conversation and relay; '
@@ -377,8 +494,8 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'waiting. An agent that answers but keeps working in the background also comes '
   + 'back as "running", with its latest reply so far; "done" means it has finished. '
   + 'If a result lists pendingQuestions, the other agent is waiting for an '
-  + 'answer: ask the user (unless they told you to decide yourself) and pass the answer '
-  + 'with answer_question. Write actions can first need the user\'s approval. Always '
+  + 'answer: tell the user, who answers it in the relay UI (only the person answers '
+  + 'questions; answer_question is refused). Write actions can first need the user\'s approval. Always '
   + 'tell the user which relay and session you worked on. '
   + 'Image sessions (provider "openai" with a gpt-image or dall-e model): send and create_session take images (absolute paths '
   + 'on the target relay to edit or work from) and image {size, quality, count, output_format, background, preset} for that turn '
@@ -463,7 +580,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
         + 'read_task_output: the end of a background shell task\'s output. send: prompt an '
         + 'existing session. create_session: start a new session with a first prompt. update_session: change '
         + 'another session\'s settings (model, effort, mode, auto-compact window, title, group, thinking, cwd, image defaults). wait: keep waiting for '
-        + 'a reply. answer_question: answer a question the remote agent asked. stop: stop the running turn. '
+        + 'a reply. answer_question: refused, only the person answers questions (in the relay UI). stop: stop the running turn. '
         + 'archive: archive a session. subscribe / unsubscribe / list_subscriptions / transfer_subscriptions: '
         + 'be woken by events of sessions on this relay or a paired one (relay may be left out: "this"). '
         + 'schedule / list_schedules / unschedule: a prompt this relay queues at a set time, once or repeated (relay may be left out). '
@@ -549,8 +666,8 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       type: 'string',
       description: 'create_session: an existing session group on the target relay to put the new session in: its id (grp_…) '
         + 'or its exact name, case-insensitive (relay_info lists them). Default: a session started on this relay joins '
-        + 'your own group, one on a paired relay none. An unknown group is refused with the groups there, nothing created. '
-        + `update_session: move the session into a group (id or name; a name the relay does not have yet makes a new group) or out of its group ("${REMOTE_RELAY_NO_GROUP}"). `
+        + 'your own group, one on a paired relay none. A group that is not there: the session starts in no group, with a warning. '
+        + `update_session: move the session into an existing group (id or name) or out of its group ("${REMOTE_RELAY_NO_GROUP}"). Only the owner makes groups. `
         + 'A group the owner made is never removed this way: it stays, empty if the session was its last member; one update_session made goes once empty. '
         + 'Renaming and dissolving groups is the owner\'s.',
     },
@@ -1472,7 +1589,7 @@ const ORIGIN_CAPS = {
  * loopback may claim it; the inbound side drops it from anything that came in
  * over HTTP (readRemoteRelayRequest).
  */
-export function normalizeRemoteRelayOrigin(raw) {
+export function normalizeRemoteRelayOrigin(raw, { trusted = false } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const origin = { kind: 'agent' };
   for (const [key, cap] of Object.entries(ORIGIN_CAPS)) {
@@ -1484,6 +1601,22 @@ export function normalizeRemoteRelayOrigin(raw) {
   const hops = Number(raw.hops);
   origin.hops = Number.isInteger(hops) && hops >= 0 ? Math.min(hops, 10) : 1;
   if (raw.local === true) origin.local = true;
+  // Origin binding: `verified`, `entryId` and `epoch` are set by this relay
+  // alone (a paired relay's key, readRemoteRelayRequest) and kept only for
+  // what it stored itself (`trusted`). Anything that came in is stripped.
+  if (trusted && raw.verified === true) {
+    const entryId = toText(raw.entryId).slice(0, 100);
+    const epoch = Number(raw.epoch);
+    if (entryId) {
+      origin.verified = true;
+      origin.entryId = entryId;
+      origin.epoch = Number.isInteger(epoch) && epoch >= 0 ? epoch : 0;
+      // A paired relay's origin is never this relay's own agent's.
+      delete origin.local;
+    }
+  } else if (trusted && raw.verified === false) {
+    origin.verified = false;
+  }
   return origin;
 }
 
@@ -1499,7 +1632,10 @@ function quoteForHeader(value) {
 export function formatRemotePromptHeader(origin) {
   // The same line for an agent of this relay (origin.local): REMOTE_PROMPT_HEADER_PATTERN
   // and every reader that strips it stay as they are.
-  const parts = [`[Remote prompt from an agent on relay "${quoteForHeader(origin?.relayName) || 'unknown'}"`];
+  // A receiver writes the line again from what it stored: the registry's
+  // name for a verified origin, the claimed one marked "(unverified)".
+  const unverified = origin?.verified === false ? ' (unverified)' : '';
+  const parts = [`[Remote prompt from an agent on relay "${quoteForHeader(origin?.relayName) || 'unknown'}"${unverified}`];
   const title = quoteForHeader(origin?.conversationTitle);
   if (title) parts.push(`session "${title}"`);
   const model = quoteForHeader(origin?.model);
@@ -1516,6 +1652,32 @@ export function withRemotePromptHeader(text, origin) {
 
 export function stripRemotePromptHeader(text) {
   return String(text ?? '').replace(REMOTE_PROMPT_HEADER_PATTERN, '');
+}
+
+// A header line that ends the text, with no line break after it.
+const REMOTE_PROMPT_HEADER_ONLY_PATTERN = /^\[Remote prompt from an agent on relay "[^"\r\n]*"[^\r\n]*\][ \t]*$/;
+
+/**
+ * Every leading remote-prompt header line, in a loop (a sender can forge
+ * several), the last one also when it ends the text with no line break. The
+ * receiver then writes its own line from the stored origin.
+ */
+export function stripAllRemotePromptHeaders(text) {
+  const original = String(text ?? '');
+  let current = original;
+  let stripped = false;
+  for (let guard = 0; guard < 64; guard += 1) {
+    const trimmed = current.replace(/^(?:[ \t]*\r?\n)+/, '');
+    const next = trimmed.replace(REMOTE_PROMPT_HEADER_PATTERN, '');
+    if (next !== trimmed) {
+      current = next;
+      stripped = true;
+      continue;
+    }
+    if (REMOTE_PROMPT_HEADER_ONLY_PATTERN.test(trimmed)) return '';
+    return stripped ? trimmed : original;
+  }
+  return current;
 }
 
 // ─── Remote addresses ────────────────────────────────────────────────────────

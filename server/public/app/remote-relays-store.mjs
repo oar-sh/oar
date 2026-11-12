@@ -16,7 +16,10 @@ export function remoteRelayStatus(relay) {
   return KNOWN_STATUSES.has(status) ? status : 'unknown';
 }
 
-let snapshot = null; // { relays: [], self: {} | null } once known
+// { relays: [], inbound: [], self: {} | null } once known. `inbound`: relays
+// that added this one one way and hold an inbound-only key (never called
+// from here, so never offered to @mention); Settings → Relays lists them.
+let snapshot = null;
 let loadPromise = null;
 let lastFailedLoadAt = 0;
 const listeners = new Set();
@@ -32,8 +35,11 @@ function normalizeSnapshot(payload) {
   const relays = Array.isArray(payload?.relays)
     ? payload.relays.map(normalizeRelay).filter(Boolean)
     : [];
+  const inbound = Array.isArray(payload?.inbound)
+    ? payload.inbound.map(normalizeRelay).filter(Boolean)
+    : [];
   const self = payload?.self && typeof payload.self === 'object' ? { ...payload.self } : null;
-  return { relays, self };
+  return { relays, inbound, self };
 }
 
 function notify() {
@@ -53,6 +59,11 @@ export function getRemoteRelaysSnapshot() {
 
 export function getRemoteRelays() {
   return snapshot?.relays || [];
+}
+
+/** The inbound-only entries (Settings → Relays only). */
+export function getInboundOnlyRelays() {
+  return snapshot?.inbound || [];
 }
 
 /**
@@ -86,7 +97,11 @@ export function upsertRemoteRelay(relay) {
 export function removeRemoteRelayFromSnapshot(id) {
   const key = String(id || '').trim();
   if (!snapshot || !key) return snapshot;
-  snapshot = { ...snapshot, relays: snapshot.relays.filter((entry) => entry.id !== key) };
+  snapshot = {
+    ...snapshot,
+    relays: snapshot.relays.filter((entry) => entry.id !== key),
+    inbound: (snapshot.inbound || []).filter((entry) => entry.id !== key),
+  };
   notify();
   return snapshot;
 }

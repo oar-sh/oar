@@ -7,7 +7,7 @@ const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 // General leads: `SETTINGS_TABS[0]` is the tab a first-time visitor lands on.
 // A remembered tab or a deep link to General still lands there after its
 // Appearance block got a tab of its own.
-const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'previews', 'shares', 'notifications', 'features'];
+export const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications', 'features'];
 // Copilot leads: it is the default provider, and `SETTINGS_PROVIDER_TABS[0]`
 // is also the sub-tab a first-time visitor lands on.
 const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'claude-api', 'claude-cloud', 'grok', 'cursor', 'deepseek'];
@@ -147,4 +147,28 @@ export function selectSettingsTab(tab, providerTab) {
 export function revealSettingsTabs() {
   const modal = document.getElementById('settings-modal');
   if (modal) revealSelectedTabs(modal);
+}
+
+/**
+ * A quiet dot on a top tab (agent auth §13.2, 3b: "Recommended" on Security
+ * while a new relay token is recommended), or none. No count, no motion.
+ */
+export function setSettingsTabDot(tab, on, label = 'Recommended') {
+  const name = normalizeTab(tab, SETTINGS_TABS);
+  const button = name ? document.querySelector(`#settings-modal [data-settings-tab="${name}"]`) : null;
+  if (!button) return false;
+  let dot = button.querySelector('.settings-tab-dot');
+  if (!on) {
+    dot?.remove();
+    return false;
+  }
+  if (!dot) {
+    dot = document.createElement('span');
+    dot.className = 'settings-tab-dot';
+    dot.setAttribute('role', 'img');
+    button.append(dot);
+  }
+  dot.setAttribute('aria-label', label);
+  dot.title = label;
+  return true;
 }

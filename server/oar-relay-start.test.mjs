@@ -11,6 +11,7 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 
 import { ensureRelayRunning, findFreePort, isPortFree, probeRelayPort } from '../bin/oar.js';
+import { cliAgentToken } from './services/oar-cli-helpers.mjs';
 
 function makeLayout(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-relay-start-'));
@@ -262,6 +263,21 @@ test('a progress file is a take-over only with its pid alive and the lock\'s', a
   assert.equal(spawnedMismatch.length, 1);
 });
 
+test('a relay that stopped on purpose (exit 78, e.g. an unreadable relay-secrets.json) is reported as that, not retried', async (t) => {
+  const layout = makeLayout(t);
+  const spawned = [];
+  const result = await ensureRelayRunning({
+    packageRoot: path.join(layout.root, 'pkg'), layout, configPath: path.join(layout.root, 'config.json'),
+    config: { port: 4026, authToken: 'tok' }, env: {},
+    ...silentRelay(spawned),
+    spawnImpl: (command, args) => { spawned.push(args); return { exitCode: 78, unref() {} }; },
+    logger: { log() {}, error() {} },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedOnPurpose, true);
+  assert.equal(spawned.length, 1, 'started once');
+});
+
 test('a relay that did not come up beside a live lock says how to clear it', async (t) => {
   const layout = makeLayout(t);
   const lockPath = heldLock(layout, 4646);
@@ -327,12 +343,19 @@ test('without a service the server is started detached on the config of the inst
     packageRoot,
     layout,
     configPath,
-    config: { port: 4012, authToken: 'tok' },
+    config: { port: 4012 },
     cwd: '/home/dev',
     env: { PATH: '/usr/bin' },
     nodeBin: '/opt/node/bin/node',
     spawnImpl: (command, args, options) => {
       spawned.push({ command, args, options });
+      // A first start makes the secrets file the CLI's token comes from.
+      fs.mkdirSync(layout.dataDir, { recursive: true });
+      fs.writeFileSync(path.join(layout.dataDir, 'relay-secrets.json'), JSON.stringify({
+        version: 1,
+        owner: { hash: 'a'.repeat(64), createdAt: '2026-01-01T00:00:00.000Z', rotatedAt: null, legacyPlaintext: false },
+        agentKey: Buffer.from('agent-key-material-for-this-test').toString('base64url'),
+      }));
       return { exitCode: null, unref() {} };
     },
     spawnSyncImpl: noSystemd,
@@ -355,7 +378,10 @@ test('without a service the server is started detached on the config of the inst
   assert.equal(options.env.COPILOT_WEB_RELAY_DATA_DIR, layout.dataDir);
   assert.equal(options.env.COPILOT_WEB_RELAY_LOG_DIR, path.join(layout.root, 'logs'));
   assert.equal(options.env.COPILOT_WORKSPACE_ROOT, '/home/dev');
-  assert.deepEqual(probes.at(-1), { url: 'http://localhost:4012/api/status', auth: 'Bearer tok' });
+  // The cli agent token, looked up again once the relay had made its key.
+  assert.equal(probes[0].auth, 'Bearer ');
+  assert.deepEqual(probes.at(-1), { url: 'http://localhost:4012/api/status', auth: `Bearer ${cliAgentToken({ dataDir: layout.dataDir })}` });
+  assert.match(probes.at(-1).auth, /^Bearer oara1_c\./);
 });
 
 test('a server that exits before it answers is reported as not started', async (t) => {

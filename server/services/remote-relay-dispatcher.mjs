@@ -1,5 +1,6 @@
 'use strict';
 
+import { originWeightedFor } from './remote-relay-inbound.mjs';
 import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
@@ -24,6 +25,8 @@ import {
   remoteConversationUrl,
   remoteRelayActionPermission,
   remoteRelayPermissionAllows,
+  remoteRelayOneWayAdvice,
+  remoteRelayReAddAdvice,
   resolveSessionGroupReference,
   stripRemotePromptHeader,
   summarizeRemoteRelayCall,
@@ -47,8 +50,9 @@ import {
   formatOpenAIImageUsd,
 } from '../../shared/openai-image-spend.mjs';
 import { schemaFields } from '../../shared/question-schema.mjs';
+import { principalOf } from './relay-principal.mjs';
+import { AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 import { PLAN_ONLY_ERROR_CODE, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
-import { matchQuestionChoice } from '../../shared/question-answer-rule.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES, RELAY_EVENT_RELAY_LEVEL_TYPES } from '../../shared/relay-events.mjs';
 import { checkRequestedProviderModel, isAutoModelId, providerModelLabel, unknownProviderModelText } from './provider-model-selection.mjs';
@@ -864,7 +868,11 @@ export function createRemoteRelayDispatcher({
   function relayAccess(conversationId, relay) {
     if (isUnlocked(conversationId, relay?.id)) return 'user';
     try {
-      if (toText(relay?.relayId) && repository?.hasContactFrom?.(conversationId, relay.relayId)) return 'contact';
+      // Origin binding: only a verified origin of this very entry, at its
+      // current key epoch, opens it; a claimed one opens nothing.
+      if (toText(relay?.relayId) && repository?.hasContactFrom?.(conversationId, relay.relayId, {
+        weighted: (origin) => originWeightedFor(origin, relay),
+      })) return 'contact';
     } catch {}
     return null;
   }
@@ -993,6 +1001,7 @@ export function createRemoteRelayDispatcher({
       ...(body !== undefined ? { body } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
       hops: ctx.hops,
+      ...(ctx.relay.local ? { caller: ctx.callerAuth || { conversationId: ctx.conversationId } } : {}),
     });
   }
 
@@ -1402,15 +1411,17 @@ export function createRemoteRelayDispatcher({
       groups: listed.slice(0, max).map((group) => ({ id: group.id, name: group.name })),
       ...(count > max ? { groupsTotal: count } : {}),
       note: groups.length
-        ? 'Pass one of these ids or names (relay_info lists them), or leave group out. create_session takes an existing group only; update_session can put the session into a new group of that name afterwards. Renaming groups is the owner\'s.'
-        : 'Leave group out; update_session can put the session into a new group of that name afterwards.',
+        ? 'Pass one of these ids or names (relay_info lists them), or leave group out. Agents name existing groups only; making, renaming and dissolving groups is the owner\'s.'
+        : 'Leave group out; only the owner makes session groups.',
     });
   }
 
   /**
    * The group a create_session names, looked up on the target before anyone
    * is asked: `{ id, name }`. Any failure to read the target's groups refuses
-   * the call (a DispatchFailure), as an unknown or ambiguous group does.
+   * the call (a DispatchFailure), as an ambiguous name does. A name that is
+   * not a group there is null: agents make no groups (only the owner does),
+   * so the session starts in no group and the answer warns.
    */
   async function settleRequestedGroup(ctx, requested) {
     let response;
@@ -1427,6 +1438,7 @@ export function createRemoteRelayDispatcher({
     const groups = mapGroupList(response);
     const found = resolveSessionGroupReference(groups, requested);
     if (found.status === 'found') return { id: found.group.id, name: found.group.name };
+    if (found.status === 'unknown') return null;
     throw unknownGroupFailure(ctx, requested, found, groups);
   }
 
@@ -2712,7 +2724,8 @@ export function createRemoteRelayDispatcher({
         // validates it and refuses with its own codes.
         ...(cloud ? { cloudSource: { repoUrl: args.repo, ...(args.branch ? { branch: args.branch } : {}) } } : {}),
         // The group the lookup found (its id), else the agent's words; the
-        // target resolves it again and refuses before creating anything.
+        // target resolves it again: an ambiguous one is refused before
+        // anything is created, an unknown one leaves the session in no group.
         ...(args.group ? { group: ctx.group?.id || args.group } : {}),
         origin,
       },
@@ -2745,7 +2758,9 @@ export function createRemoteRelayDispatcher({
     const groupReported = isPlainObject(bootstrap) && Object.prototype.hasOwnProperty.call(bootstrap, 'group');
     const group = groupReported ? bootstrapGroupField(bootstrap.group) : null;
     let groupWarning = null;
-    if (args.group && !groupReported) {
+    if (args.group && !ctx.group && groupReported && !group) {
+      groupWarning = `The session was created in no group: ${groupWhere(ctx)} has no session group "${clipLine(args.group, 80)}", and only the owner makes groups. Tell the user; name an existing group next time (relay_info lists them).`;
+    } else if (args.group && !groupReported) {
       groupWarning = `The session was created WITHOUT a group: ${groupWhere(ctx)} ignored group "${clipLine(args.group, 80)}" (its OAR is older and does not take group on create_session). Tell the user; the owner can move the session into the group by hand.`;
     } else if (args.group && (!group || (ctx.group?.id && group.id !== ctx.group.id))) {
       groupWarning = `The session was created, but not in group "${clipLine(args.group, 80)}": ${groupWhere(ctx)} put it ${group ? `in "${group.name || group.id}" (${group.id})` : 'in no group'}. Tell the user.`;
@@ -2888,96 +2903,12 @@ export function createRemoteRelayDispatcher({
     }
   }
 
-  /** The answer body the remote's answer route expects for this question. */
-  function buildAnswer(question, args) {
-    const fields = schemaFields(question.requestSchema);
-    if (fields.length > 1) {
-      let structured = null;
-      try {
-        structured = JSON.parse(toText(args.answer));
-      } catch {}
-      if (!isPlainObject(structured)) {
-        throw invalidInput(`This question has several fields (${fields.map((field) => field.name).join(', ')}); pass answer as a JSON object with those keys.`);
-      }
-      return { structuredAnswer: structured, text: JSON.stringify(structured) };
-    }
-    const options = Array.isArray(question.choices) ? question.choices.map(toText).filter(Boolean) : [];
-    const labels = [];
-    for (const choice of args.choices || []) {
-      const match = options.find((option) => option.toLowerCase() === choice.toLowerCase()) || '';
-      if (!match && question.allowFreeform === false) {
-        throw invalidInput(`"${clipLine(choice, 80)}" is not an option of this question. Options: ${options.join(', ')}.`);
-      }
-      const label = match || choice;
-      if (!labels.includes(label)) labels.push(label);
-    }
-    // The card's own format: the picked labels, then any typed text, ", "-joined.
-    // A card that takes no typed text gets an option or nothing.
-    let extra = toText(args.answer);
-    if (extra && question.allowFreeform === false) {
-      extra = matchQuestionChoice(extra, options);
-      if (!extra) {
-        throw invalidInput(`This question takes only its options (${options.join(', ')}), no typed answer; pass one of them in choices.`);
-      }
-    }
-    if (extra && !labels.includes(extra)) labels.push(extra);
-    const text = labels.join(', ');
-    return { answer: text, text };
-  }
-
-  async function answerQuestion(ctx, args) {
-    const fetched = await call(ctx, 'GET', `/api/relay-question/${encodeURIComponent(args.question_id)}`);
-    const question = isPlainObject(fetched?.question) ? fetched.question : null;
-    if (!question) {
-      throw new DispatchFailure(404, REMOTE_RELAY_ERROR_CODES.notFound,
-        `Question ${args.question_id} was not found on relay "${ctx.relay.name}".`);
-    }
-    const session = toText(question.conversationId) || null;
-    if (isPersonOnlyQuestion(question.context)) {
-      throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
-        `Question ${args.question_id} is a Safety check: Claude Code marks the call as person-only, so this card is the user's to answer, never an agent's. Leave it to the user.`,
-        { session });
-    }
-    if (ctx.relay.local && session && isOwnConversation(ctx, session)) {
-      throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.ownSession,
-        `Question ${args.question_id} belongs to this conversation itself; an agent cannot answer its own question. It is the user's to answer.`,
-        { session });
-    }
-    if (isRemoteRelayApprovalQuestion(question)) {
-      throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
-        `Question ${args.question_id} is relay "${ctx.relay.name}"'s approval of its own agent's call to another relay; only its user can answer it.`,
-        { session });
-    }
-    if (toText(question.kind) === RELAY_ASK_KIND) {
-      throw new DispatchFailure(403, REMOTE_RELAY_ERROR_CODES.forbidden,
-        `Question ${args.question_id} was asked with ask: it is the user's to answer, in the Inbox or that session, not an agent's. Leave it to the user.`,
-        { session });
-    }
-    if (toText(question.status) && toText(question.status) !== 'pending') {
-      throw new DispatchFailure(409, `${REMOTE_RELAY_ERROR_CODES.httpPrefix}409`,
-        `Question ${args.question_id} on relay "${ctx.relay.name}" is already ${toText(question.status).replace(/_/g, ' ')}.`,
-        { session });
-    }
-    const answer = buildAnswer(question, args);
-    // The answer route checks the session the question belongs to; the card
-    // sends the stored one back, and so do we.
-    const sdkSessionId = toText(question.sdkSessionId);
-    await call(ctx, 'POST', `/api/relay-question/${encodeURIComponent(args.question_id)}/answer`, {
-      body: {
-        ...(answer.structuredAnswer ? { structuredAnswer: answer.structuredAnswer } : { answer: answer.answer }),
-        ...(sdkSessionId ? { sdk_session_id: sdkSessionId } : {}),
-      },
-    });
-    const messageId = toText(question.messageId) || null;
-    return {
-      summary: `answer_question → ${ctx.relay.name} question ${shortId(args.question_id)}: answered`,
-      status: 'answered',
-      question_id: args.question_id,
-      session,
-      message_id: messageId,
-      answer: clipLine(answer.text, 500),
-      note: messageId ? 'Call wait with this session and message_id to follow the turn.' : null,
-    };
+  // No agent answers a question card, this relay's or another's (agent auth
+  // §0.1): runValidated refuses the action first; this stays the action's
+  // answer should anything reach it.
+  async function answerQuestion(_ctx, args) {
+    throw new DispatchFailure(403, AUTH_ERROR_CODES.personRequired,
+      `${AUTH_ANSWER_PERSON_REQUIRED_MESSAGE} (question ${toText(args?.question_id) || 'unknown'} was not answered)`);
   }
 
   async function stopTurn(ctx, args) {
@@ -3062,9 +2993,11 @@ export function createRemoteRelayDispatcher({
       return failed(400, C.unknownGroup, text, {
         groups: mapGroupList(body).slice(0, REMOTE_RELAY_GROUP_LIMITS.refusalMax).map((group) => ({ id: group.id, name: group.name })),
         ...(Number.isInteger(body.groupsTotal) ? { groupsTotal: body.groupsTotal } : {}),
-        note: 'Pass one of these ids, a name for a new group, or "none".',
+        note: 'Pass one of these ids or names, or "none". Only the owner makes new groups.',
       });
     }
+    // Refused for want of a key: mapRemoteError says what fixes it here.
+    if (remoteCode === C.peerKeyRequired) return null;
     if (status === 403 && remoteCode && remoteCode !== C.inboundDisabled) {
       return failed(403, remoteCode, text || `${sentence(where)} refused the change.`);
     }
@@ -3673,7 +3606,10 @@ export function createRemoteRelayDispatcher({
   async function scheduleOrigin(ctx, session) {
     if (session !== ctx.conversationId) return buildOrigin(ctx);
     if (!(ctx.hops > 0)) return null;
-    const acting = isPlainObject(ctx.caller?.origin) ? normalizeRemoteRelayOrigin({ ...ctx.caller.origin, hops: ctx.hops }) : null;
+    // The caller's origin was read from this relay's own store, so its
+    // binding (`verified`, `entryId`, `epoch`) is kept: a firing weighs what
+    // the prompt that set it weighed, and loses it with that entry's epoch.
+    const acting = isPlainObject(ctx.caller?.origin) ? normalizeRemoteRelayOrigin({ ...ctx.caller.origin, hops: ctx.hops }, { trusted: true }) : null;
     return acting || buildOrigin(ctx);
   }
 
@@ -3917,8 +3853,22 @@ export function createRemoteRelayDispatcher({
     const remoteBody = isPlainObject(error?.remoteBody) ? error.remoteBody : null;
     const extra = { relay: relay.name };
     if (code === C.offline) return failure(502, C.offline, message, extra);
+    // Refused for want of a key that relay takes: what it wrote is from its
+    // side ("this relay" is that one), so the agent gets this side's words.
+    if (code === C.peerKeyRequired || toText(remoteBody?.code) === C.peerKeyRequired) {
+      // Added one way: that relay lists no entry for this one, by the
+      // person's choice; re-adding from the link would not change that.
+      if (relay?.peerTokenState === 'unlisted') {
+        return failure(403, C.peerKeyRequired,
+          `Relay "${relay.name}" refused this call: this relay was added there one way (it does not list this relay), so it gives this relay no key, and this call needs one. Prompts and sessions there still work, as claimed. Nothing was done there. If the person wants this, ask them to ${remoteRelayOneWayAdvice(relay.name)}.`,
+          { ...extra, remoteCode: C.peerKeyRequired, oneWay: true });
+      }
+      return failure(403, C.peerKeyRequired,
+        `Relay "${relay.name}" refused this call: it takes calls from this relay only with the key it gave this relay, and this relay holds none that it takes. Nothing was done there. Ask the person to ${remoteRelayReAddAdvice(relay.name)}.`,
+        { ...extra, remoteCode: C.peerKeyRequired });
+    }
     if (code === C.unauthorized || status === 401) {
-      return failure(502, C.unauthorized, `${message}. Check this relay in Settings → Relays (token).`, extra);
+      return failure(502, C.unauthorized, `${message}. Ask the person to ${remoteRelayReAddAdvice(relay.name)}.`, extra);
     }
     if (code === C.inboundDisabled || toText(remoteBody?.code) === C.inboundDisabled) {
       return failure(403, C.inboundDisabled, message, extra);
@@ -4140,12 +4090,16 @@ export function createRemoteRelayDispatcher({
       return false;
     }
     return !!origin && origin.local !== true
+      && originWeightedFor(origin, relay)
       && toText(origin.relayId) === toText(relay.relayId)
       && !!toText(origin.conversationId)
       && toText(origin.conversationId) === toText(session);
   }
 
   async function runRelayAction({ conversationId, action, args, req, signal, waitNote }) {
+    // Who called, for this relay's own routes (the loopback): the calling
+    // agent's principal, so its in-process requests carry its token.
+    const callerAuth = { principal: principalOf(req), conversationId };
     const target = await resolveTarget(args.relay);
     if (!target.relay) return target.failure;
     const relay = target.relay;
@@ -4204,9 +4158,13 @@ export function createRemoteRelayDispatcher({
     // relay the user unlocked here stays in reach whatever prompts arrive,
     // the relay the prompts came from may always be answered, and reading
     // carries nothing on.
-    const origins = Array.isArray(caller.originRelayIds) ? caller.originRelayIds.map(toText) : [];
-    const answering = !!toText(relay.relayId) && origins.length > 0
-      && origins.every((id) => id === toText(relay.relayId));
+    // Answering: every prompt of the turn came from this very relay, verified
+    // (origin binding). An unverified prompt in the turn waives nothing.
+    const turnOrigins = Array.isArray(caller.origins) ? caller.origins.filter(isPlainObject) : [];
+    const answering = !!toText(relay.relayId) && turnOrigins.length > 0
+      && turnOrigins.every((origin) => (local
+        ? origin.local === true && toText(origin.relayId) === toText(relay.relayId)
+        : originWeightedFor(origin, relay)));
     // A session another relay's agent created may always send to the session
     // that created it, whatever else its turn acts on (a prompt of a session
     // on this relay, say): its reports go back the way its work came.
@@ -4238,7 +4196,7 @@ export function createRemoteRelayDispatcher({
     // itself always takes them.
     if (!local && IMAGE_INPUT_ACTIONS.has(action) && (args.images || args.image)) {
       try {
-        await refuseWithoutImageInputs({ relay, caller, hops, conversationId, signal }, action);
+        await refuseWithoutImageInputs({ relay, caller, hops, conversationId, signal, callerAuth }, action);
       } catch (error) {
         if (error instanceof DispatchFailure) {
           return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
@@ -4253,7 +4211,7 @@ export function createRemoteRelayDispatcher({
     let group = null;
     if (action === 'create_session' && args.group) {
       try {
-        group = await settleRequestedGroup({ relay, caller, hops, conversationId, signal }, args.group);
+        group = await settleRequestedGroup({ relay, caller, hops, conversationId, signal, callerAuth }, args.group);
       } catch (error) {
         if (error instanceof DispatchFailure) {
           return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
@@ -4262,7 +4220,7 @@ export function createRemoteRelayDispatcher({
       }
     }
     if ((action === 'create_session' || action === 'send') && args.model) {
-      const early = { relay, caller, hops, conversationId, signal };
+      const early = { relay, caller, hops, conversationId, signal, callerAuth };
       try {
         if (action === 'create_session') {
           catalog = await loadCatalog(early);
@@ -4292,7 +4250,7 @@ export function createRemoteRelayDispatcher({
     let cardArgs = args;
     if (action === 'send' && args.provider) {
       try {
-        const conversation = await call({ relay, caller, hops, conversationId, signal }, 'GET', sessionPath(args.session), { query: { limit: 1 } });
+        const conversation = await call({ relay, caller, hops, conversationId, signal, callerAuth }, 'GET', sessionPath(args.session), { query: { limit: 1 } });
         const runtime = isPlainObject(conversation?.runtimeSession) ? conversation.runtimeSession : {};
         if (toText(runtime.providerType).toLowerCase() === args.provider) cardArgs = { ...args, provider: undefined };
       } catch {}
@@ -4303,7 +4261,7 @@ export function createRemoteRelayDispatcher({
     let updatePlan = null;
     if (action === 'update_session') {
       try {
-        updatePlan = await planSessionUpdate({ relay, caller, hops, conversationId, signal }, args);
+        updatePlan = await planSessionUpdate({ relay, caller, hops, conversationId, signal, callerAuth }, args);
       } catch (error) {
         if (error instanceof DispatchFailure) {
           return finish(failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra }));
@@ -4399,7 +4357,7 @@ export function createRemoteRelayDispatcher({
         }
       }
 
-      const ctx = { relay, caller, hops, conversationId, signal, onPromptQueued: releaseLocalCreate, ...(catalog ? { catalog } : {}), ...(settledModel ? { settledModel } : {}), ...(group ? { group } : {}), ...(updatePlan ? { updatePlan } : {}) };
+      const ctx = { relay, caller, hops, conversationId, signal, callerAuth, onPromptQueued: releaseLocalCreate, ...(catalog ? { catalog } : {}), ...(settledModel ? { settledModel } : {}), ...(group ? { group } : {}), ...(updatePlan ? { updatePlan } : {}) };
       const body = await ACTIONS[action](ctx, args);
       if (prompting) agentPrompts(conversationId).count += 1;
       const { summary, ...rest } = body;
@@ -4499,6 +4457,12 @@ export function createRemoteRelayDispatcher({
     const waitNote = validation.waitLimitedFrom
       ? `wait_seconds ${validation.waitLimitedFrom} is more than this relay allows per call (${validation.args.wait_seconds}, set by its owner); it waited at most ${validation.args.wait_seconds} s.`
       : '';
+    // No agent answers a question card (agent auth §0.1): refused before any
+    // unlock, permission or approval step, so no card asks the user first.
+    if (validation.action === 'answer_question') {
+      return failure(403, AUTH_ERROR_CODES.personRequired,
+        `${AUTH_ANSWER_PERSON_REQUIRED_MESSAGE} (question ${toText(validation.args?.question_id) || 'unknown'} was not answered)`);
+    }
     try {
       if (validation.action === 'list_relays') return await listRelays(callerConversationId);
       if (await isOwnAskCall(callerConversationId, validation.action, validation.args)) {

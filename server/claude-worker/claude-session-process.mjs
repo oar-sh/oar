@@ -19,6 +19,7 @@ import {
   startClaudeSession,
   createCanUseTool,
   isPersonOnlyAsk,
+  isSensitiveFileAsk,
   readContextUsage,
   readPlanUsage,
   normalizeClaudeEffort,
@@ -3812,9 +3813,10 @@ export function createClaudeSessionRunner({
         // denied. Register a continuation turn first: it is born processing,
         // gives the card a real queue row, and the flow's eventual top-level
         // result (or stream end) closes it like any other continuation.
-        // A person-only safety ask is a question card too.
+        // A person-only safety ask and a sensitive-file edit ask are
+        // question cards too.
         if (
-          (toolName === 'AskUserQuestion' || isPersonOnlyAsk(options))
+          (toolName === 'AskUserQuestion' || isPersonOnlyAsk(options) || isSensitiveFileAsk(options))
           && proc === processRef
           && !processRef.activeCtx
           && !processRef.pendingDelivered.length

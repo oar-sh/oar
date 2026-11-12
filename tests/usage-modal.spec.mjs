@@ -251,7 +251,7 @@ test.describe("Claude API usage card", () => {
     // Opened from a chat on the key, Check Usage lands on the Claude API tab.
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
     await page.waitForLoadState("networkidle");
-    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status", { headers: { "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" } })).status), { timeout: 30_000 }).toBe(200);
     await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
     await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
     await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
@@ -308,7 +308,7 @@ test.describe("Claude API usage card", () => {
     // The page shows the reached cap.
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
     await page.waitForLoadState("networkidle");
-    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status", { headers: { "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" } })).status), { timeout: 30_000 }).toBe(200);
     await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
     await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
     await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
@@ -390,7 +390,7 @@ test.describe("Claude API usage card", () => {
 
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
     await page.waitForLoadState("networkidle");
-    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status", { headers: { "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" } })).status), { timeout: 30_000 }).toBe(200);
     await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
     await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
     await page.evaluate(async (id) => { await window.openConversation(id); }, keyChat);
@@ -432,7 +432,7 @@ test.describe("Claude API usage card", () => {
 
     await page.goto(`${relay.baseUrl}/?token=${encodeURIComponent(relay.token)}`);
     await page.waitForLoadState("networkidle");
-    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status")).status), { timeout: 30_000 }).toBe(200);
+    await expect.poll(() => page.evaluate(async () => (await fetch("/api/status", { headers: { "X-OAR-Session-Proof": localStorage.getItem("oar_session_proof") || "" } })).status), { timeout: 30_000 }).toBe(200);
     await page.waitForFunction(() => typeof window.openConversation === "function" && typeof window.showUsage === "function");
     await page.evaluate(() => sessionStorage.removeItem("oar.usage.lastReport.v1"));
     await page.evaluate(async (id) => { await window.openConversation(id); }, subscriptionChat);

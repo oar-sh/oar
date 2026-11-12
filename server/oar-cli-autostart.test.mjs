@@ -9,12 +9,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 
 import { UNINSTALL_HELPER_SOURCE, main, runAutostart, runSetup, runUninstall } from '../bin/oar.js';
 import { TAKEOVER_PROGRESS_FILE } from './services/earlier-database-service.mjs';
 import { scratchEnv } from './services/scratch-env-test-harness.mjs';
 
-const CONFIG = { authToken: 'old-token', port: 4100, localhostOnly: true };
+// A config of this version: no token in it (the relay keeps its hash).
+const CONFIG = { port: 4100, localhostOnly: true };
 const TASK = 'scheduled task \\oar-relay';
 
 function scripted(answers = []) {
@@ -27,18 +29,20 @@ function scripted(answers = []) {
   return { asked, line: async (question) => next(question), yesNo: async (question) => next(question) };
 }
 
-// A relay that answers on its port and stops when asked (or stays busy).
+// A relay that answers on its port. The `oar` CLI calls it with the cli
+// agent token, which may only queue a restart: a stop is refused (403).
 function fakeRelay({ busy = false } = {}) {
   const relay = { running: true, shutdowns: 0 };
   relay.fetch = async (url, options = {}) => {
     const { pathname } = new URL(String(url));
     if (!relay.running) throw new Error('connect ECONNREFUSED');
+    if (!String(options.headers?.Authorization || '').startsWith('Bearer oara1_c.')) return { ok: false, status: 401 };
     if (pathname === '/api/relay/shutdown') {
       relay.shutdowns += 1;
-      if (!busy) relay.running = false;
+      const body = JSON.parse(options.body || '{}');
+      if (!body.restart || body.immediate) return { ok: false, status: 403, json: async () => ({ code: 'AUTH_PERSON_REQUIRED' }) };
       return { ok: true, json: async () => ({ queue: { processingCount: busy ? 1 : 0 } }) };
     }
-    if (options.headers?.Authorization !== `Bearer ${CONFIG.authToken}`) return { ok: false, status: 401 };
     return { ok: true, json: async () => ({ cliOnline: false, localhostOnly: true, relayShutdown: { status: busy ? 'queued' : 'idle' } }) };
   };
   return relay;
@@ -55,7 +59,16 @@ function makeInstall(t, { config = CONFIG } = {}) {
   fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ version: '9.9.9' }));
   const stateRoot = env.OAR_STATE_ROOT;
   fs.mkdirSync(stateRoot, { recursive: true });
-  if (config) fs.writeFileSync(path.join(stateRoot, 'config.json'), JSON.stringify(config));
+  if (config) {
+    fs.writeFileSync(path.join(stateRoot, 'config.json'), JSON.stringify(config));
+    // The relay ran once: its token hash and agent key are in its data folder.
+    fs.mkdirSync(path.join(stateRoot, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(stateRoot, 'data', 'relay-secrets.json'), JSON.stringify({
+      version: 1,
+      owner: { hash: 'a'.repeat(64), createdAt: '2026-01-01T00:00:00.000Z', rotatedAt: null, legacyPlaintext: false },
+      agentKey: crypto.randomBytes(32).toString('base64url'),
+    }));
+  }
   const install = { root, env, packageRoot, stateRoot, lines: [], spawned: [], calls: [] };
   install.output = () => install.lines.join('\n');
   install.startup = path.join(env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
@@ -362,15 +375,15 @@ test('the command line takes autostart, uninstall and setup --autostart', async 
   const calls = [];
   const commands = Object.fromEntries(['autostart', 'uninstall', 'setup'].map((name) => [name, async ({ argv }) => { calls.push([name, argv]); return { code: 0 }; }]));
   const logger = { log() {}, error() {} };
-  for (const argv of [['autostart', 'boot'], ['autostart'], ['uninstall', '--purge'], ['setup', '--autostart', 'off'], ['--autostart', 'signin', 'setup']]) {
+  for (const argv of [['autostart', 'boot'], ['autostart'], ['uninstall', '--purge'], ['uninstall', '--yes'], ['setup', '--autostart', 'off'], ['--autostart', 'signin', 'setup']]) {
     assert.equal((await main({ argv, commands, logger })).code, 0);
   }
   assert.deepEqual(calls, [
-    ['autostart', ['boot']], ['autostart', []], ['uninstall', ['--purge']], ['setup', ['--autostart', 'off']], ['setup', ['--autostart', 'signin']],
+    ['autostart', ['boot']], ['autostart', []], ['uninstall', ['--purge']], ['uninstall', ['--yes']], ['setup', ['--autostart', 'off']], ['setup', ['--autostart', 'signin']],
   ]);
   assert.equal((await main({ argv: ['autostart', 'boot', '--replace'], commands, logger })).code, 0);
   assert.deepEqual(calls.at(-1), ['autostart', ['boot', '--replace']]);
-  for (const argv of [['autostart', 'reboot'], ['uninstall', '--yes'], ['setup', '--replace'], ['uninstall', '--replace']]) {
+  for (const argv of [['autostart', 'reboot'], ['uninstall', '--now'], ['setup', '--replace'], ['uninstall', '--replace']]) {
     assert.equal((await main({ argv, commands, logger })).code, 2);
   }
 });
@@ -417,16 +430,16 @@ test('setup asks nothing about autostart off Windows, without a terminal, or wit
 
 // ─── oar uninstall ───────────────────────────────────────────────────────────
 
-test('uninstall stops the relay, removes the generated entries, keeps hand-made ones and the data, and leaves npm to a helper', async (t) => {
+test('uninstall of a stopped relay removes the generated entries, keeps hand-made ones and the data, and leaves npm to a helper', async (t) => {
   const install = makeInstall(t);
   const handMade = { path: path.join(install.startup, 'copilot-remote-web-relay.cmd'), generated: false, otherInstall: null };
   windowsDoubles(install, { signin: [generatedSignin(install), handMade], boot: BOOT_READY(install) });
-  fs.mkdirSync(path.join(install.stateRoot, 'data'));
+  fs.mkdirSync(path.join(install.stateRoot, 'data'), { recursive: true });
   fs.writeFileSync(path.join(install.stateRoot, 'data', 'oar.db'), 'db');
   const relay = fakeRelay();
-  const result = await runUninstall(install.options({ argv: [], fetchImpl: relay.fetch }));
+  relay.running = false;
+  const result = await runUninstall(install.options({ argv: ['--yes'], fetchImpl: relay.fetch }));
   assert.deepEqual(result, { code: 0, reason: 'uninstalled' });
-  assert.equal(relay.running, false, 'the relay is stopped');
   assert.deepEqual(install.calls, ['elevate:disable', 'signin:false']);
   assert.deepEqual(install.signin.listEntries(), [handMade]);
   assert.match(install.output(), /Left as it is: .*copilot-remote-web-relay\.cmd \(hand-made\)/);
@@ -446,7 +459,7 @@ test('uninstall leaves a hand-made task and the launcher it runs; a launcher no 
   const install = makeInstall(t);
   windowsDoubles(install, { boot: { ...BOOT_READY(install), generated: false, handMade: [OWN_TASK] } });
   fs.writeFileSync(install.launcher, 'generated launcher');
-  assert.equal((await runUninstall(install.options({ argv: [] }))).code, 0);
+  assert.equal((await runUninstall(install.options({ argv: ['--yes'] }))).code, 0);
   assert.deepEqual(install.calls, ['signin:false'], 'no prompt, no delete');
   assert.ok(fs.existsSync(install.launcher));
   assert.match(install.output(), /Left as it is: scheduled task \\oar-relay \(hand-made\)/);
@@ -454,7 +467,7 @@ test('uninstall leaves a hand-made task and the launcher it runs; a launcher no 
   const stray = makeInstall(t);
   windowsDoubles(stray, { boot: { launcherPath: stray.launcher } });
   fs.writeFileSync(stray.launcher, 'generated launcher');
-  assert.equal((await runUninstall(stray.options({ argv: [] }))).code, 0);
+  assert.equal((await runUninstall(stray.options({ argv: ['--yes'] }))).code, 0);
   assert.equal(fs.existsSync(stray.launcher), false);
 });
 
@@ -478,7 +491,7 @@ test('uninstall removes the Copilot wrapper OAR wrote for this install, now or b
         .replace('Auto-generated by oar ', 'Auto-generated by copilot-remote ')
         .replace('`oar --install-extension`', '`copilot-remote --install-extension`'));
     }
-    assert.equal((await runUninstall(install.options({ argv: [] }))).code, 0);
+    assert.equal((await runUninstall(install.options({ argv: ['--yes'] }))).code, 0);
     assert.equal(fs.existsSync(wrapper), false);
     assert.match(install.output(), /Done: removed .*web-relay[\\/]extension\.mjs/);
   }
@@ -493,28 +506,29 @@ test('uninstall leaves a hand-edited wrapper, or one of another install, and nam
     windowsDoubles(install);
     const { wrapper, source } = await installWrapper(install);
     fs.writeFileSync(wrapper, edit(source));
-    assert.equal((await runUninstall(install.options({ argv: [] }))).code, 0);
+    assert.equal((await runUninstall(install.options({ argv: ['--yes'] }))).code, 0);
     assert.equal(fs.readFileSync(wrapper, 'utf8'), edit(source), 'byte-identical');
     assert.match(install.output(), wanted);
   }
 });
 
 test('uninstall stops at a failed step and says what is done and what is left', async (t) => {
-  // A declined prompt: the relay was stopped, nothing else changed.
+  // A declined prompt: nothing changed.
   const declined = makeInstall(t);
   windowsDoubles(declined, { signin: [generatedSignin(declined)], boot: BOOT_READY(declined) });
   declined.boot.answer = false;
   const relay = fakeRelay();
-  assert.deepEqual(await runUninstall(declined.options({ argv: [], fetchImpl: relay.fetch })), { code: 1, reason: 'autostart' });
+  relay.running = false;
+  assert.deepEqual(await runUninstall(declined.options({ argv: ['--yes'], fetchImpl: relay.fetch })), { code: 1, reason: 'autostart' });
   assert.deepEqual(declined.calls, ['elevate:disable']);
   assert.deepEqual(declined.spawned, [], 'the package stays');
-  assert.match(declined.output(), /Done: stopped the relay\./);
   assert.match(declined.output(), /Not done: the autostart entries; the package\. Run oar uninstall again/);
 
-  // A relay still busy: nothing removed at all.
+  // A running relay the CLI may not stop (its agent token only queues
+  // restarts): nothing removed at all.
   const busy = makeInstall(t);
   windowsDoubles(busy, { signin: [generatedSignin(busy)] });
-  assert.deepEqual(await runUninstall(busy.options({ argv: [], fetchImpl: fakeRelay({ busy: true }).fetch })), { code: 1, reason: 'relay-running' });
+  assert.deepEqual(await runUninstall(busy.options({ argv: ['--yes'], fetchImpl: fakeRelay({ busy: true }).fetch })), { code: 1, reason: 'relay-running' });
   assert.deepEqual(busy.calls, []);
   assert.deepEqual(busy.spawned, []);
   assert.match(busy.output(), /Not done: the autostart entries; the package\./);
@@ -533,13 +547,13 @@ test('uninstall --purge deletes the state root only after the typed word, and as
 
   // Anything but the word changes nothing, not even the relay or the entries.
   const refused = scripted(['yes']);
-  assert.deepEqual(await runUninstall(install.options({ argv: ['--purge'], prompter: refused })), { code: 1, reason: 'purge-not-confirmed' });
+  assert.deepEqual(await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter: refused })), { code: 1, reason: 'purge-not-confirmed' });
   assert.deepEqual(install.calls, []);
   assert.ok(fs.existsSync(path.join(dataDir, 'copilot.db')));
 
   // The word, then no for the rescued data and no for the folder outside.
   const prompter = scripted(['delete', false, false]);
-  assert.deepEqual(await runUninstall(install.options({ argv: ['--purge'], prompter })), { code: 0, reason: 'uninstalled' });
+  assert.deepEqual(await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter })), { code: 0, reason: 'uninstalled' });
   assert.match(prompter.asked[1], /rescued-package-data/);
   assert.match(prompter.asked[2], /my-data \(a data folder outside the state root\)/);
   assert.equal(fs.existsSync(path.join(dataDir, 'copilot.db')), false);
@@ -558,13 +572,13 @@ test('uninstall --purge with yes to each deletes those too, and refuses a state 
   fs.mkdirSync(elsewhere);
   fs.writeFileSync(path.join(elsewhere, 'copilot.db'), 'db');
   fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dataDir: elsewhere }));
-  await runUninstall(install.options({ argv: ['--purge'], prompter: scripted(['delete', true]) }));
+  await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter: scripted(['delete', true]) }));
   assert.equal(fs.existsSync(install.stateRoot), false);
   assert.equal(fs.existsSync(elsewhere), false);
 
   const home = makeInstall(t);
   windowsDoubles(home);
-  const options = home.options({ argv: ['--purge'] });
+  const options = home.options({ argv: ['--purge', '--yes'] });
   options.env = { ...options.env, OAR_STATE_ROOT: home.env.HOME };
   fs.mkdirSync(home.env.HOME, { recursive: true });
   assert.deepEqual(await runUninstall(options), { code: 1, reason: 'purge-unsafe' });
@@ -596,7 +610,7 @@ test('uninstall on Linux removes the unit oar service wrote (this version or 0.9
     fs.writeFileSync(unitPath, unit);
     const systemctl = [];
     const result = await runUninstall(install.options({
-      argv: [], platform: 'linux', spawnSyncImpl: (command, args) => { systemctl.push([command, ...args].join(' ')); return { status: 0 }; },
+      argv: ['--yes'], platform: 'linux', spawnSyncImpl: (command, args) => { systemctl.push([command, ...args].join(' ')); return { status: 0 }; },
     }));
     assert.equal(result.code, 0);
     assert.equal(fs.existsSync(unitPath), handMade);
@@ -624,7 +638,7 @@ test('uninstall in a checkout removes nothing', async (t) => {
   const install = makeInstall(t);
   windowsDoubles(install);
   fs.mkdirSync(path.join(install.packageRoot, '.git'));
-  assert.deepEqual(await runUninstall(install.options({ argv: [] })), { code: 1, reason: 'git-checkout' });
+  assert.deepEqual(await runUninstall(install.options({ argv: ['--yes'] })), { code: 1, reason: 'git-checkout' });
   assert.deepEqual(install.spawned, []);
 });
 
@@ -654,7 +668,9 @@ test('a boot task not read back after a confirmed prompt is no success, and noth
   const uninstall = makeInstall(t);
   windowsDoubles(uninstall, { signin: [generatedSignin(uninstall)], boot: BOOT_READY(uninstall) });
   uninstall.boot.answer = 'unverified';
-  assert.deepEqual(await runUninstall(uninstall.options({ argv: [], fetchImpl: fakeRelay().fetch })), { code: 1, reason: 'autostart' });
+  const stoppedRelay = fakeRelay();
+  stoppedRelay.running = false;
+  assert.deepEqual(await runUninstall(uninstall.options({ argv: ['--yes'], fetchImpl: stoppedRelay.fetch })), { code: 1, reason: 'autostart' });
   assert.match(uninstall.output(), /Uninstall stopped: The administrator prompt was confirmed and the boot task should be removed, but it could not be read back to check \(x\)\. Nothing was undone; the launcher stays\./);
   assert.doesNotMatch(uninstall.output(), /removed the scheduled task|not removed/);
   assert.deepEqual(uninstall.spawned, [], 'the package stays');
@@ -674,7 +690,7 @@ test('uninstall never goes on while a relay holds its lock: one bringing over it
     const install = makeInstall(t);
     windowsDoubles(install, { signin: [generatedSignin(install)] });
     holdLock(install, 4321, { takeover });
-    const result = await runUninstall(install.options({ argv: ['--purge'], prompter: scripted(['delete']), isProcessAliveImpl: (pid) => pid === 4321 }));
+    const result = await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter: scripted(['delete']), isProcessAliveImpl: (pid) => pid === 4321 }));
     assert.deepEqual(result, { code: 1, reason: 'relay-running' });
     assert.match(install.output(), takeover
       ? /The relay \(process 4321\) is bringing over its database and does not answer yet/
@@ -687,14 +703,17 @@ test('uninstall never goes on while a relay holds its lock: one bringing over it
   }
 });
 
-test('uninstall stops a running relay and waits until its lock is free', async (t) => {
+test('uninstall leaves a running relay it may not stop, and says how to stop it', async (t) => {
   const install = makeInstall(t);
   windowsDoubles(install);
   holdLock(install, 4321);
   const relay = fakeRelay();
-  const result = await runUninstall(install.options({ argv: [], fetchImpl: relay.fetch, isProcessAliveImpl: () => relay.running }));
-  assert.deepEqual(result, { code: 0, reason: 'uninstalled' });
-  assert.equal(install.spawned.length, 1);
+  const result = await runUninstall(install.options({ argv: ['--yes'], fetchImpl: relay.fetch, isProcessAliveImpl: () => relay.running }));
+  assert.deepEqual(result, { code: 1, reason: 'relay-running' });
+  assert.equal(relay.shutdowns, 1);
+  assert.match(install.output(), /The relay refused: stopping it is for you to do in the web UI/);
+  assert.equal(install.spawned.length, 0, 'the package stays');
+  assert.deepEqual(install.calls, [], 'no autostart entry removed');
 });
 
 test('--purge refuses a drive root, the home folder\'s parent, a system folder and a folder without OAR in it, whatever is typed', async (t) => {
@@ -710,7 +729,7 @@ test('--purge refuses a drive root, the home folder\'s parent, a system folder a
     [stranger, /no OAR config or database in it/],
   ]) {
     install.lines.length = 0;
-    const options = install.options({ argv: ['--purge'], prompter: scripted([]) });
+    const options = install.options({ argv: ['--purge', '--yes'], prompter: scripted([]) });
     options.env = { ...options.env, OAR_STATE_ROOT: root };
     assert.deepEqual(await runUninstall(options), { code: 1, reason: 'purge-unsafe' }, root);
     assert.match(install.output(), why);
@@ -724,7 +743,7 @@ test('--purge refuses a drive root, the home folder\'s parent, a system folder a
   fs.mkdirSync(install.env.HOME, { recursive: true });
   fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dataDir: install.env.HOME }));
   install.lines.length = 0;
-  assert.equal((await runUninstall(install.options({ argv: ['--purge'], prompter: scripted(['delete']) }))).code, 0);
+  assert.equal((await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter: scripted(['delete']) }))).code, 0);
   assert.match(install.output(), /Not deleted, and not offered: .*home \(the home folder or a folder above it\)/);
   assert.ok(fs.existsSync(install.env.HOME));
 });
@@ -745,11 +764,11 @@ test('uninstall names the programs that still run from the package and the folde
     { processId: 5151, commandLine: `"C:\\node\\node.exe" "${path.join(install.packageRoot, 'server', 'session-worker.mjs')}"` },
     { processId: 6262, commandLine: 'C:\\Windows\\explorer.exe' },
   ];
-  assert.equal((await runUninstall(install.options({ argv: [] }))).code, 0);
+  assert.equal((await runUninstall(install.options({ argv: ['--yes'] }))).code, 0);
   assert.match(install.output(), new RegExp(`A program still runs from the package \\(process 5151: a session worker, or a CLI it started\\)\\. npm cannot remove the files they hold and leaves them in a hidden \\.oar-\\* folder in ${install.root.replace(/[\\.]/g, '\\$&')}; delete it once they have ended, at the latest after a reboot\\.`));
   const quiet = makeInstall(t);
   windowsDoubles(quiet);
-  await runUninstall(quiet.options({ argv: [] }));
+  await runUninstall(quiet.options({ argv: ['--yes'] }));
   assert.doesNotMatch(quiet.output(), /still runs? from the package/);
 });
 
@@ -760,7 +779,7 @@ test('a declined prompt stops uninstall before anything else goes: the launcher 
   const { wrapper, source } = await installWrapper(install);
   install.boot.answer = false;
   install.lines.length = 0;
-  assert.deepEqual(await runUninstall(install.options({ argv: [] })), { code: 1, reason: 'autostart' });
+  assert.deepEqual(await runUninstall(install.options({ argv: ['--yes'] })), { code: 1, reason: 'autostart' });
   assert.match(install.output(), /Uninstall stopped: the boot task was not removed: the administrator prompt was declined\./);
   assert.doesNotMatch(install.output(), /removed the scheduled task/);
   assert.equal(fs.readFileSync(install.launcher, 'utf8'), 'generated launcher');
@@ -774,7 +793,7 @@ test('uninstall --purge knows an OAR folder by either database name, oar.db or c
   windowsDoubles(bare);
   fs.mkdirSync(path.join(bare.stateRoot, 'data'), { recursive: true });
   fs.writeFileSync(path.join(bare.stateRoot, 'data', 'oar.db'), 'db');
-  assert.deepEqual(await runUninstall(bare.options({ argv: ['--purge'], prompter: scripted(['delete']) })), { code: 0, reason: 'uninstalled' });
+  assert.deepEqual(await runUninstall(bare.options({ argv: ['--purge', '--yes'], prompter: scripted(['delete']) })), { code: 0, reason: 'uninstalled' });
   assert.equal(fs.existsSync(bare.stateRoot), false);
   assert.match(bare.output(), /the database with every conversation, its backups, the uploads and the logs/, 'the prompt names the backups');
 
@@ -786,7 +805,7 @@ test('uninstall --purge knows an OAR folder by either database name, oar.db or c
   fs.writeFileSync(path.join(elsewhere, 'oar.db'), 'db');
   fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dataDir: elsewhere }));
   const prompter = scripted(['delete', true]);
-  await runUninstall(install.options({ argv: ['--purge'], prompter }));
+  await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter }));
   assert.match(prompter.asked[1], /my-data \(a data folder outside the state root\)/);
   assert.equal(fs.existsSync(elsewhere), false);
 });
@@ -798,7 +817,7 @@ test('uninstall --purge names backups kept outside the state root as not deleted
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, 'oar-0.9.20-20261103-091500-manual.db'), 'kept');
   fs.writeFileSync(path.join(install.stateRoot, 'config.json'), JSON.stringify({ ...CONFIG, dbBackups: { dir: outside } }));
-  await runUninstall(install.options({ argv: ['--purge'], prompter: scripted(['delete']) }));
+  await runUninstall(install.options({ argv: ['--purge', '--yes'], prompter: scripted(['delete']) }));
   assert.match(install.output(), new RegExp(`Not deleted: the database backups in ${outside.replace(/[\\.]/g, '\\$&')} \\(dbBackups\\.dir in the config\\)`));
   assert.ok(fs.existsSync(path.join(outside, 'oar-0.9.20-20261103-091500-manual.db')));
 });

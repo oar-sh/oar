@@ -238,8 +238,10 @@ test.describe.serial("agent sessions on this relay", () => {
     // that raised it, through the very tool it is waiting in.
     expect((await api("/api/conversations")).payload.conversations).toHaveLength(1);
     const selfAnswer = await tool(orchestrator, "answer_question", { relay: "this", question_id: card.id, choices: ["Allow"] });
-    expect(selfAnswer.status).toBe(404);
-    expect(selfAnswer.payload.code).toBe("REMOTE_RELAY_NOT_FOUND");
+    // No agent answers any card (agent auth): refused as the person's.
+    expect(selfAnswer.status).toBe(403);
+    expect(selfAnswer.payload.code).toBe("AUTH_PERSON_REQUIRED");
+    expect(String(selfAnswer.payload.error || "")).toMatch(/Only the person can answer questions; ask them in the relay UI\./);
     expect((await pendingCards(api, orchestrator)).map((question) => question.id)).toEqual([card.id]);
 
     const answered = await answerCard(api, card, "Allow");

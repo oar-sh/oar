@@ -5,6 +5,7 @@ import { registerRemoteRelayRoutes } from './remote-relay-routes.mjs';
 import { createRemoteRelayRegistry } from '../services/remote-relay-registry-service.mjs';
 import { createRemoteRelayPairing } from '../services/remote-relay-pairing.mjs';
 import { RemoteRelayError } from '../services/remote-relay-client.mjs';
+import { tagPrincipal } from '../services/relay-principal.mjs';
 import { REMOTE_RELAY_ERROR_CODES, REMOTE_RELAY_SETTING_KEYS } from '../../shared/remote-relay-contract.mjs';
 
 const OWN_TOKEN = 'o'.repeat(36);
@@ -50,7 +51,9 @@ async function callRoute(handlers, req = {}, { onResponse = null } = {}) {
     },
   };
   onResponse?.(response);
-  const request = { body: {}, query: {}, params: {}, headers: {}, ...req };
+  // A tagged request (relay-principal.mjs) stays the prototype, so the
+  // principal is found the way an Object.create re-dispatch finds it.
+  const request = Object.assign(Object.create(req), { body: {}, query: {}, params: {}, headers: {}, ...req });
   for (const handler of handlers) {
     let nextCalled = false;
     await handler(request, response, () => {
@@ -102,7 +105,7 @@ function setup({ dispatcher = null, probeAnswers = {} } = {}) {
     logger: { warn() {} },
     randomUUID: () => `uuid-${++ids}`,
   });
-  const pairing = createRemoteRelayPairing({ registry, client, getOwnToken: () => OWN_TOKEN });
+  const pairing = createRemoteRelayPairing({ registry, client });
   const app = createMockApp();
   const auth = (_req, _res, next) => next();
   const remoteRelayInbound = { listRelays: () => [], inboundEnabled: () => true };
@@ -129,13 +132,22 @@ test('every route is behind auth and static paths come before /:id', () => {
     'GET /api/relay/identity',
     'GET /api/remote-relays',
     'GET /api/remote-relays/inflight',
+    'GET /api/remote-relays/peer-key/check',
     'GET /api/remote-relays/summary',
     'GET /api/settings/agent-sessions',
     'GET /api/settings/remote-relays',
     'PATCH /api/remote-relays/:id',
     'POST /api/remote-relays',
     'POST /api/remote-relays/:id/check',
+    'POST /api/remote-relays/:id/confirm-identity',
+    'POST /api/remote-relays/:id/refusal-notice/dismiss',
+    'POST /api/remote-relays/:id/renew-key',
+    'POST /api/remote-relays/:id/repair',
+    'POST /api/remote-relays/:id/revoke-key',
     'POST /api/remote-relays/pair',
+    'POST /api/remote-relays/peer-key',
+    'POST /api/remote-relays/peer-key/inbound',
+    'POST /api/remote-relays/peer-key/request',
     'POST /api/remote-relays/tool',
     'POST /api/settings/agent-sessions',
     'POST /api/settings/remote-relays',
@@ -143,7 +155,7 @@ test('every route is behind auth and static paths come before /:id', () => {
   for (const [key, handlers] of app.routes) assert.equal(handlers[0], auth, `${key} starts with auth`);
   const order = [...app.routes.keys()];
   const idRoute = order.indexOf('POST /api/remote-relays/:id/check');
-  for (const staticRoute of ['POST /api/remote-relays/pair', 'POST /api/remote-relays/tool']) {
+  for (const staticRoute of ['POST /api/remote-relays/pair', 'POST /api/remote-relays/tool', 'POST /api/remote-relays/peer-key', 'POST /api/remote-relays/peer-key/request', 'POST /api/remote-relays/peer-key/inbound']) {
     assert.ok(order.indexOf(staticRoute) < idRoute, `${staticRoute} is registered before the /:id route`);
   }
 });
@@ -158,7 +170,8 @@ test('GET /api/relay/identity describes this relay', async () => {
     version: '0.9.4',
     platform: 'win32',
     publicUrl: null,
-    remoteRelays: { protocol: 1, inbound: true, imageInputs: true },
+    remoteRelays: { protocol: 2, inbound: true, imageInputs: true, peerKeys: true, inboundKeys: true },
+    capabilities: { answerLink: true },
   });
 });
 
@@ -170,7 +183,7 @@ test('GET /api/remote-relays lists public entries and the self block, never a to
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.body.relays.map((relay) => [relay.name, relay.host, relay.tokenMode]), [
     ['linux-test', 'relay-b.example.test', 'custom'],
-    ['lan-test', '192.168.10.20', 'own'],
+    ['lan-test', '192.168.10.20', 'none'],
   ]);
   assert.match(response.body.relays[1].httpWarning, /Plain http/);
   assert.equal(response.body.self.relayId, OWN_ID);
@@ -383,6 +396,38 @@ test('the tool endpoint forwards to the dispatcher and relays its answer', async
   assert.deepEqual((await callRoute(route('GET /api/remote-relays/inflight'), { query: {} })).body, { inflight: 0 });
 });
 
+test('a session\'s agent token acts for its own conversation only', async () => {
+  const calls = [];
+  const dispatcher = { async dispatch(input) { calls.push(input); return { status: 200, body: { ok: true } }; }, inflight: () => 0 };
+  const { route } = setup({ dispatcher });
+  const agentReq = (body) => tagPrincipal({ body, headers: {} }, { kind: 'agent', agentKind: 's', conversationId: 'c-own' });
+
+  const other = await callRoute(route('POST /api/remote-relays/tool'), agentReq({ conversationId: 'c-other', action: 'list_sessions' }));
+  assert.equal(other.statusCode, 403);
+  assert.equal(other.body.code, 'AUTH_CONVERSATION_MISMATCH');
+  assert.equal(calls.length, 0, 'nothing reaches the dispatcher');
+
+  const own = await callRoute(route('POST /api/remote-relays/tool'), agentReq({ conversationId: 'c-own', action: 'list_sessions' }));
+  assert.equal(own.statusCode, 200);
+  const unnamed = await callRoute(route('POST /api/remote-relays/tool'), agentReq({ action: 'list_sessions' }));
+  assert.equal(unnamed.statusCode, 200);
+  assert.deepEqual(calls.map((call) => call.conversationId), ['c-own', 'c-own'], 'the token\'s conversation is the one used');
+  // The same for a call that goes on to a paired relay: its origin is built
+  // from the conversation the dispatcher gets.
+  const toPaired = (conversationId) => agentReq({ ...(conversationId ? { conversationId } : {}), action: 'send', args: { relay: 'linux-test', session: 'conv-there', text: 'hi' } });
+  assert.equal((await callRoute(route('POST /api/remote-relays/tool'), toPaired('c-other'))).body.code, 'AUTH_CONVERSATION_MISMATCH');
+  assert.equal((await callRoute(route('POST /api/remote-relays/tool'), toPaired(''))).statusCode, 200);
+  assert.deepEqual([calls.length, calls.at(-1).conversationId, calls.at(-1).args.relay], [3, 'c-own', 'linux-test']);
+  calls.splice(2);
+
+  // The cli token and the person name the conversation in the body.
+  const cli = tagPrincipal({ body: { conversationId: 'c-any', action: 'list_sessions' }, headers: {} }, { kind: 'agent', agentKind: 'c' });
+  assert.equal((await callRoute(route('POST /api/remote-relays/tool'), cli)).statusCode, 200);
+  const owner = tagPrincipal({ body: { conversationId: 'c-any', action: 'list_sessions' }, headers: {} }, { kind: 'owner' });
+  assert.equal((await callRoute(route('POST /api/remote-relays/tool'), owner)).statusCode, 200);
+  assert.deepEqual(calls.slice(2).map((call) => call.conversationId), ['c-any', 'c-any']);
+});
+
 test('another relay cannot call the tool: it would act for a conversation it does not host', async () => {
   const calls = [];
   const dispatcher = { async dispatch(input) { calls.push(input); return { status: 200, body: { ok: true } }; }, inflight: () => 0 };
@@ -429,4 +474,20 @@ test('a worker that hangs up aborts the dispatch, and nothing is written to the 
   answered.close();
   assert.equal(normalSignal.aborted, false);
   assert.deepEqual(answered.body, { ok: true });
+});
+
+test('an inbound-only entry shows apart in GET /api/remote-relays, counts as no remote, and DELETE removes it', async () => {
+  const { route, registry } = setup();
+  registry.add({ name: 'linux-test', url: 'https://relay-b.example.test', token: CUSTOM_TOKEN, lastStatus: 'online' });
+  const { entry: holder } = registry.upsertInboundHolder({ relayId: 'relay-c-0003', name: 'mac-test', protocol: 2 });
+  const listed = await callRoute(route('GET /api/remote-relays'));
+  assert.deepEqual(listed.body.relays.map((relay) => relay.name), ['linux-test']);
+  assert.deepEqual(listed.body.inbound.map((relay) => [relay.id, relay.name, relay.inboundOnly, relay.url]), [[holder.id, 'mac-test', true, '']]);
+  assertNoToken(listed);
+  assert.deepEqual((await callRoute(route('GET /api/remote-relays/summary'))).body, { count: 1, online: 1, localEnabled: false });
+  const patched = await callRoute(route('PATCH /api/remote-relays/:id'), { params: { id: holder.id }, body: { url: 'https://relay-c.example.test' } });
+  assert.equal(patched.statusCode, 409);
+  const removed = await callRoute(route('DELETE /api/remote-relays/:id'), { params: { id: holder.id } });
+  assert.equal(removed.statusCode, 200);
+  assert.deepEqual((await callRoute(route('GET /api/remote-relays'))).body.inbound, []);
 });

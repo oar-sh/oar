@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import {
-  loadTokenFromConfig,
+  loadAgentToken,
   resolveRelayServerUrl,
 } from '../../shared/worker-runtime/config-loader.mjs';
 import { createApiClient } from '../../shared/worker-runtime/api-client.mjs';
@@ -56,7 +56,8 @@ async function main() {
   // its own, and a tree that moves on under us must not change our answer.
   const buildId = resolveBuildId(path.resolve(__dirname, '..', '..')).id;
   const serverUrl = resolveRelayServerUrl({ configPath });
-  const token = loadTokenFromConfig(configPath);
+  // This session's agent token (OAR_AGENT_TOKEN), bound to its conversation.
+  const token = loadAgentToken({ env: process.env, configPath, conversationId: sdkSessionId });
   const cwd = String(process.env.COPILOT_WORKSPACE_ROOT || '').trim() || process.cwd();
   const defaultModel = String(process.env.CURSOR_RELAY_MODEL || '').trim();
   const apiKey = String(process.env.CURSOR_API_KEY || '').trim();

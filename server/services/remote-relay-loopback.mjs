@@ -20,10 +20,12 @@ import { markRemoteRelayLoopbackRequest } from './remote-relay-inbound.mjs';
 // provenance and their events, and there is no second implementation of what a
 // created session is or how reading, stopping and answering work.
 //
-// The request carries what the outbound client sends: the bearer token (the
+// The request carries what the outbound client sends: a bearer token (the
 // routes sit behind `auth`), Accept, and the two x-oar-remote-* headers, so the
 // routes treat it as an agent's request (approval cards stay hidden, nothing
-// unlocks, the composer draft is left alone). It is also marked as built here
+// unlocks, the composer draft is left alone). The token is the calling agent's
+// own (an agent token for its conversation, never the owner token), so `auth`
+// gives the request exactly that agent's rights. It is also marked as built here
 // (markRemoteRelayLoopbackRequest), which is what lets it past the inbound
 // switch and lets its origin say `local: true`; nothing sent over HTTP can
 // claim that.
@@ -81,7 +83,9 @@ export function createRemoteRelayLoopbackClient({
   // The relay's own request handler: `(req, res) => void` (the Express app).
   handle,
   getOwnRelayId = () => '',
-  getOwnToken = () => '',
+  // `(caller) => token`: the agent token of the calling agent. `caller` is
+  // `{ principal, conversationId }` as the relay_tool route saw it.
+  getCallerToken = () => '',
   timeoutMs: defaultTimeoutMs = REMOTE_RELAY_LIMITS.requestTimeoutMs,
   maxBytes = REMOTE_RELAY_LIMITS.responseMaxBytes,
   setTimeoutImpl = setTimeout,
@@ -179,13 +183,14 @@ export function createRemoteRelayLoopbackClient({
    * (null when empty); rejects with a RemoteRelayError, like the outbound
    * client's request.
    */
-  async function request(relay, method, path, { body, query, hops = 0, timeoutMs } = {}) {
+  async function request(relay, method, path, { body, query, hops = 0, timeoutMs, caller = null } = {}) {
     if (typeof handle !== 'function') {
       throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unsupported, 'This relay cannot call its own API', { detail: 'no handler' });
     }
-    const token = toText(getOwnToken?.());
+    let token = '';
+    try { token = toText(getCallerToken?.(caller || {})); } catch { token = ''; }
     if (!token) {
-      throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, 'This relay has no token configured');
+      throw new RemoteRelayError(REMOTE_RELAY_ERROR_CODES.unauthorized, 'This relay has no agent token for the calling session');
     }
     const hopCount = Number.isInteger(Number(hops)) && Number(hops) >= 0 ? Number(hops) : 0;
     const hasBody = body !== undefined;

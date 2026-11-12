@@ -213,7 +213,10 @@ function safeReadLock(lockPath) {
 export function createRelaySingletonGuard({
   lockPath,
   pid,
-  token,
+  // The owner token's SHA-256 hex (owner-secret-store), or the plain token
+  // (older callers and tests), hashed here the same way.
+  tokenHash = '',
+  token = '',
   now = () => new Date().toISOString(),
   isProcessAlive,
   // When a pid's process started, and when the machine booted (lockHolderMayRun).
@@ -235,7 +238,7 @@ export function createRelaySingletonGuard({
 }) {
   const lockFilePath = path.resolve(String(lockPath || ""));
   const currentPid = Number.parseInt(String(pid || process.pid), 10);
-  const currentTokenHash = hashToken(token);
+  const currentTokenHash = /^[0-9a-f]{64}$/.test(String(tokenHash || '')) ? String(tokenHash) : hashToken(token);
   const processAlive = typeof isProcessAlive === "function" ? isProcessAlive : defaultIsProcessAlive;
 
   // The whole lock goes into a file of its own, linked into place (fails

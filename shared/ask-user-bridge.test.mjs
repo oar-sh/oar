@@ -241,3 +241,20 @@ test('one ask may take no typed reply; every other ask still does', async () => 
   assert.equal(posts[0].body.allowFreeform, false);
   assert.equal(posts[1].body.allowFreeform, true);
 });
+
+test('one ask may carry a card kind and the person-only flag; every other ask carries neither', async () => {
+  const stub = makeApiStub({ answers: ['A', 'A'] });
+  const bridge = createAskUserBridge({
+    api: stub.api,
+    getActiveMessage: () => activeMessage,
+    sleep: async () => {},
+  });
+  const question = { questions: [{ question: 'Go ahead?', options: [{ label: 'A' }, { label: 'B' }] }] };
+  await bridge.handleAskUserQuestion(question, { source: 'SampleCheck', kind: 'sensitive-file', personOnly: true });
+  await bridge.handleAskUserQuestion(question, { personOnly: 'yes' });
+  const posts = stub.calls.filter((call) => call.routePath === '/api/relay-question');
+  assert.equal(posts[0].body.context.kind, 'sensitive-file');
+  assert.equal(posts[0].body.context.personOnly, true);
+  assert.equal('kind' in posts[1].body.context, false);
+  assert.equal('personOnly' in posts[1].body.context, false, 'only a real boolean true');
+});

@@ -6,6 +6,7 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { registerSessionsRoutes, withoutCopilotImageModels } from './sessions-routes.mjs';
+import { asOwner } from '../services/relay-principal-test-harness.mjs';
 
 // Copilot lists image ids (gpt-image-*, dall-e-*) its runtime cannot serve:
 // they are not offered for Copilot, and a Copilot chat on one is refused at
@@ -106,7 +107,7 @@ function setup({ modelState = COPILOT_CATALOG, openAISettings = OPENAI_ON } = {}
       status(code) { captured.status = code; return res; },
       json(payload) { captured.body = payload; return res; },
     };
-    await handler({ body, headers: {}, query, params, socket: {} }, res);
+    await handler(asOwner({ body, headers: {}, query, params, socket: {} }), res);
     return captured;
   };
   const bootstrap = (body) => call('POST /api/conversation/bootstrap', { body: { title: 'Poster draft', relayMode: 'agent', ...body } });

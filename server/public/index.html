@@ -147,14 +147,26 @@
       return;
     }
     // Fallback for cases where the app module failed to initialize on mobile:
-    // validate token directly so auth is still possible.
+    // exchange the token for a browser session directly so auth is still
+    // possible. The session lives in the HttpOnly cookie; its proof key goes
+    // where app/session-proof.mjs keeps it (the app copies it for the
+    // service worker when it starts). The token is stored nowhere.
     try {
       __clearLegacyClientAuthCookie();
-      const response = await fetch(`${__APP_BASE}/api/status`, {
+      let deviceId = '';
+      try { deviceId = String(localStorage.getItem('copilot_device_id') || ''); } catch {}
+      const response = await fetch(`${__APP_BASE}/api/auth/session`, {
+        method: 'POST',
         signal: AbortSignal.timeout?.(15000),
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ deviceId }),
       });
       if (response.ok) {
+        const answer = await response.json().catch(() => null);
+        if (answer?.proof) {
+          try { localStorage.setItem('oar_session_proof', String(answer.proof)); } catch {}
+        }
         if (input) input.value = '';
         try {
           await window.__loadCopilotApp({ recover: true });
@@ -521,6 +533,8 @@
     font-size: var(--fs-core-subtitle);
     line-height: 1.4;
   }
+  .auth-box p.auth-context { color: var(--text); font-weight: 600; margin-top: calc(-12px * var(--ui-scale)); margin-bottom: calc(16px * var(--ui-scale)); }
+  .auth-box p.auth-context[hidden] { display: none; }
   .auth-box input {
     width: 100%; padding: calc(12px * var(--ui-scale)) calc(16px * var(--ui-scale)); font-size: var(--fs-core-control);
     background: var(--bg3); border: 1px solid var(--border); border-radius: calc(8px * var(--ui-scale));
@@ -530,6 +544,13 @@
   .auth-box button {
     width: 100%; padding: calc(12px * var(--ui-scale)); font-size: var(--fs-core-control); font-weight: 600;
     background: var(--accent); color: var(--on-accent); border: none; border-radius: calc(8px * var(--ui-scale)); cursor: pointer;
+  }
+  /* The sign-in forms' username for password managers: in the layout tree
+     (a manager skips type=hidden and display:none), never seen. */
+  .credential-username {
+    position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important;
+    margin: -1px !important; overflow: hidden !important; clip: rect(0 0 0 0) !important; clip-path: inset(50%) !important;
+    border: 0 !important; white-space: nowrap !important;
   }
   .auth-error { color: var(--danger); font-size: var(--fs-meta-md); margin-top: calc(8px * var(--ui-scale)); }
 
@@ -703,9 +724,68 @@
 
   #conv-filter-row {
     position: relative;
+    display: flex;
+    align-items: center;
+    gap: calc(4px * var(--ui-scale));
     padding: calc(5px * var(--ui-scale)) calc(10px * var(--ui-scale));
   }
+  /* 🔥 Active only: left of the field, so the buttons inside the field keep
+     their slots from the right; the field takes what is left. */
+  #conv-active-toggle {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: calc(2px * var(--ui-scale));
+    height: calc(28px * var(--ui-scale));
+    min-width: calc(28px * var(--ui-scale));
+    padding: 0 calc(4px * var(--ui-scale));
+    border: 1px solid var(--border);
+    border-radius: calc(8px * var(--ui-scale));
+    background: var(--bg2);
+    color: var(--muted);
+    cursor: pointer;
+    font-size: var(--fs-meta-md);
+    line-height: 1;
+  }
+  #conv-active-toggle .conv-active-glyph { filter: grayscale(1); opacity: 0.7; }
+  #conv-active-toggle:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  #conv-active-toggle:hover:not(:disabled) .conv-active-glyph { opacity: 1; }
+  #conv-active-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #conv-active-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--accent); background: var(--bg3); }
+  #conv-active-toggle[aria-pressed="true"] .conv-active-glyph { filter: none; opacity: 1; }
+  #conv-active-toggle:disabled { opacity: 0.4; cursor: default; }
+  #conv-active-toggle .conv-active-count {
+    font-size: var(--fs-meta-xs);
+    font-variant-numeric: tabular-nums;
+    min-width: 1ch;
+  }
+  /* The display rule above outranks the UA [hidden] rule. */
+  #conv-active-toggle .conv-active-count[hidden] { display: none; }
+  .conv-active-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: calc(6px * var(--ui-scale));
+    padding: calc(10px * var(--ui-scale)) calc(7px * var(--ui-scale));
+    color: var(--muted);
+    font-size: 0.85rem;
+    text-align: center;
+  }
+  .conv-active-empty-off {
+    border: 1px solid var(--border);
+    border-radius: calc(6px * var(--ui-scale));
+    background: var(--bg3);
+    color: var(--text);
+    font-size: var(--fs-meta-sm);
+    padding: calc(4px * var(--ui-scale)) calc(8px * var(--ui-scale));
+    min-height: calc(28px * var(--ui-scale));
+    cursor: pointer;
+  }
+  .conv-active-empty-off:hover { border-color: var(--accent); }
   #conv-filter-input {
+    flex: 1 1 0;
+    min-width: 0;
     width: 100%;
     box-sizing: border-box;
     height: calc(28px * var(--ui-scale));
@@ -964,6 +1044,7 @@
   }
   .inbox-item-outcome { color: var(--success); font-size: var(--fs-meta-sm); overflow-wrap: anywhere; }
   .inbox-item-options, .inbox-item-actions { display: flex; flex-wrap: wrap; gap: calc(4px * var(--ui-scale)); }
+  .inbox-relay-notice { border-left: 3px solid #f85149; }
   .inbox-item-reply { display: grid; gap: calc(4px * var(--ui-scale)); }
   .inbox-answer-text {
     width: 100%;
@@ -2466,13 +2547,25 @@
   /* An inline formula breaks only between its terms: one long term is a box
      wider than the bubble and made the whole bubble scroll sideways. It
      scrolls inside itself instead. */
-  .msg-bubble :not(.katex-display) > .katex {
+  .msg-bubble :not(.katex-display) > .katex,
+  .math-tail > [data-math] > .katex {
     display: inline-block;
     max-width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
     vertical-align: bottom;
     -webkit-overflow-scrolling: touch;
+  }
+  /* An inline formula and the punctuation straight behind it ("$x^2$.")
+     stay on one line: the wrapper does not wrap, and a formula inside it
+     scrolls like one in a bubble (an element inside that may wrap would
+     open a break before the marks), leaving the marks their room at the
+     edge. */
+  .math-tail {
+    white-space: nowrap;
+  }
+  .math-tail > [data-math] > .katex {
+    max-width: calc(100% - 1.5em);
   }
   /* A formula KaTeX could not set is shown as its source, line breaks kept. */
   .math-source {
@@ -5064,6 +5157,147 @@
     font-size: var(--fs-meta-sm); color: var(--muted); background: var(--bg3); white-space: nowrap;
   }
   .remote-relay-error { color: #f85149; overflow-wrap: anywhere; }
+  /* A relay row has up to six actions: the text keeps a readable width and
+     the actions wrap below it on a narrow screen. */
+  .remote-relay-row { flex-wrap: wrap; }
+  .remote-relay-row .preview-main { flex: 1 1 16em; }
+  .remote-relay-row .preview-side { flex-shrink: 1; max-width: 100%; }
+  .remote-relay-row .preview-actions { flex-wrap: wrap; justify-content: flex-end; }
+  /* Peer keys: keyed, legacy token, old version; refused claims; Re-pair. */
+  .remote-relay-peer-key { overflow-wrap: anywhere; }
+  .remote-relay-key-tag {
+    border: 1px solid var(--border); border-radius: 999px; padding: 0 calc(5px * var(--ui-scale));
+    font-size: var(--fs-meta-sm); white-space: nowrap; background: var(--bg3); color: var(--muted);
+  }
+  .remote-relay-key-tag[data-state="keyed"] { color: var(--relay-tone-online); border-color: var(--relay-tone-online); }
+  .remote-relay-key-tag[data-state="legacy"],
+  .remote-relay-key-tag[data-state="older"],
+  .remote-relay-key-tag[data-state="waiting"] { color: #d29922; border-color: #d29922; }
+  .remote-relay-key-tag[data-state="held"],
+  .remote-relay-key-tag[data-state="relink"],
+  .remote-relay-key-tag[data-state="revoked"] { color: #f85149; border-color: #f85149; }
+  .remote-relay-refused { color: #f85149; }
+  .remote-relay-repair-status { overflow-wrap: anywhere; }
+  .remote-relay-repair-status[data-state="error"], .remote-relay-repair-status[data-state="needs-token"] { color: #d29922; }
+  /* Settings → Security (security-settings.js): rows like the push devices'
+     list, the sign-in link with its Copy button, the token's dialog. */
+  #security-session-list { width: 100%; }
+  .security-session-row { gap: calc(5px * var(--ui-scale)); align-items: flex-start; flex-wrap: wrap; }
+  .security-session-info { flex: 1 1 14em; min-width: 0; }
+  .security-session-name { overflow-wrap: anywhere; }
+  .security-session-meta { margin-top: calc(2px * var(--ui-scale)); overflow-wrap: anywhere; }
+  .security-session-row .summary-btn { flex: 0 0 auto; }
+  .security-actions { display: flex; flex-wrap: wrap; gap: calc(5px * var(--ui-scale)); }
+  .security-copy-row { display: flex; gap: calc(5px * var(--ui-scale)); align-items: center; width: 100%; }
+  .security-copy-row input {
+    flex: 1 1 auto; min-width: 0;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: calc(6px * var(--ui-scale)); padding: calc(3px * var(--ui-scale)) calc(7px * var(--ui-scale));
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: var(--fs-meta-md);
+    min-height: calc(28px * var(--ui-scale));
+  }
+  .security-copy-row .summary-btn { flex: 0 0 auto; }
+  /* Security's dialogs open over Settings: a darker backdrop, a narrower box
+     with a shadow, so they read as a dialog of their own instead of a part
+     of the Settings page behind them. */
+  #summary-modal[data-kind^="security-"] { background: rgba(0, 0, 0, 0.82); }
+  #summary-modal[data-kind^="security-"] .summary-dialog {
+    width: min(calc(620px * var(--ui-scale)), 100%);
+    height: auto;
+    border-color: var(--accent);
+    box-shadow: 0 calc(12px * var(--ui-scale)) calc(40px * var(--ui-scale)) rgba(0, 0, 0, 0.6);
+  }
+  .security-token-dialog p { margin: 0 0 calc(6px * var(--ui-scale)); }
+  .security-token-dialog .security-copy-row { margin-bottom: calc(6px * var(--ui-scale)); }
+  .security-token-once { font-weight: 600; color: var(--warn); }
+  .security-affected-relays { margin: 0 0 calc(6px * var(--ui-scale)); padding-left: calc(18px * var(--ui-scale)); }
+  .security-affected-relays li { margin-bottom: calc(3px * var(--ui-scale)); overflow-wrap: anywhere; }
+  .security-rename-field { width: 100%; }
+  .remote-relays-browser-row { display: flex; flex-wrap: wrap; align-items: center; gap: calc(4px * var(--ui-scale)) calc(10px * var(--ui-scale)); padding: calc(4px * var(--ui-scale)) 0; }
+  .remote-relays-browser-name { flex: 1 1 10em; min-width: 0; overflow-wrap: anywhere; }
+  .remote-relays-browser-row a { color: var(--accent); }
+  .remote-relays-browser-warning { flex: 1 1 100%; color: var(--warn); font-size: var(--fs-meta-sm); }
+  .security-signin-qr canvas {
+    display: block; width: min(calc(240px * var(--ui-scale)), 100%); height: auto; aspect-ratio: 1;
+    image-rendering: pixelated; background: #ffffff; border-radius: calc(4px * var(--ui-scale));
+  }
+  .security-token-last-use { color: var(--muted); }
+  /* The app's link colour (as on the Relays tab's checklist), not the
+     browser's dark blue, which is barely legible on the dark theme. */
+  .security-affected-open { margin-left: calc(6px * var(--ui-scale)); color: var(--accent); }
+  .security-affected-open:visited { color: var(--accent); }
+  .security-affected-hint { color: var(--muted); font-size: var(--fs-meta-sm); }
+  .security-recommended-tag { align-self: center; }
+  .security-recommended-tag[hidden] { display: none; }
+  /* ?answer=<id>&option=<n> (answer-there.js): one question over the app, in
+     the popup a paired relay's Inbox opened. Under dialogs and toasts. */
+  .answer-there-view {
+    position: fixed; inset: 0; z-index: 10950; overflow-y: auto; box-sizing: border-box;
+    display: flex; flex-direction: column; gap: calc(10px * var(--ui-scale));
+    padding: calc(16px * var(--ui-scale)); background: var(--bg); color: var(--text);
+  }
+  .answer-there-title { font-size: var(--fs-core-title); margin: 0; outline: none; }
+  .answer-there-content { display: flex; flex-direction: column; gap: calc(10px * var(--ui-scale)); }
+  .answer-there-detail { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
+  .answer-there-options {
+    display: grid; gap: calc(6px * var(--ui-scale)); margin: 0;
+    padding: calc(8px * var(--ui-scale)); border: 1px solid var(--border); border-radius: calc(10px * var(--ui-scale));
+  }
+  .answer-there-options legend { padding: 0 calc(4px * var(--ui-scale)); color: var(--muted); font-size: var(--fs-meta-sm); }
+  .answer-there-option { display: flex; align-items: center; gap: calc(6px * var(--ui-scale)); min-height: calc(32px * var(--ui-scale)); overflow-wrap: anywhere; }
+  .answer-there-actions { display: flex; flex-wrap: wrap; gap: calc(8px * var(--ui-scale)); margin-top: calc(8px * var(--ui-scale)); }
+  .answer-there-status:empty { display: none; }
+  /* 1a: "answers on <relay>" beside a paired relay's popup buttons. */
+  .inbox-answer-there { display: grid; gap: calc(4px * var(--ui-scale)); }
+  .inbox-answer-there > .inbox-item-actions { align-items: center; }
+  .inbox-answer-there-hint { color: var(--muted); font-size: var(--fs-meta-sm); line-height: 1.2; }
+  /* 3b: a quiet "Recommended" dot on the Security tab. */
+  .settings-tab-dot {
+    display: inline-block; width: calc(7px * var(--ui-scale)); height: calc(7px * var(--ui-scale));
+    margin-left: calc(5px * var(--ui-scale)); vertical-align: middle; border-radius: 50%; background: var(--warn);
+  }
+  /* The security notices: in the page's flow under the header, like the
+     composer's warning banners, so they never lie over a dialog. Positioned
+     (z-index under the mobile drawer's overlay) for the list of new
+     sign-ins, which lies over the transcript below it. */
+  #security-notice-banner {
+    display: none;
+    position: relative;
+    z-index: 9;
+    flex-direction: column;
+    gap: calc(4px * var(--ui-scale));
+    margin: calc(6px * var(--ui-scale)) calc(12px * var(--ui-scale)) 0;
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg2));
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: calc(8px * var(--ui-scale));
+    padding: calc(4px * var(--ui-scale)) calc(8px * var(--ui-scale));
+    font-size: var(--fs-meta-sm);
+  }
+  #security-notice-banner.visible { display: flex; }
+  :root[data-theme="light"] #security-notice-banner { color: #7d4e00; }
+  .security-notice-row { display: flex; align-items: center; flex-wrap: wrap; gap: calc(4px * var(--ui-scale)) calc(8px * var(--ui-scale)); }
+  .security-notice-text { flex: 1 1 16em; min-width: 0; overflow-wrap: anywhere; }
+  .security-notice-row .relay-toast-action { flex: 0 0 auto; margin-left: 0; }
+  /* New sign-ins: one row of one line whatever their number (the text
+     ellipsised, all of it in the tooltip), so a sign-in never pushes the
+     transcript or the composer once the row is there; "Show all" opens a
+     bounded, scrolling list over the transcript. */
+  .security-notice-row.security-signin-notice { flex-wrap: nowrap; }
+  .security-signin-notice > .security-notice-text { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .security-signin-list {
+    position: absolute; top: calc(100% + 4px * var(--ui-scale)); left: 0; right: 0;
+    max-height: min(40vh, 18em); overflow-y: auto; overscroll-behavior: contain;
+    margin: 0; padding: calc(6px * var(--ui-scale)) calc(8px * var(--ui-scale)); list-style: none;
+    display: flex; flex-direction: column; gap: calc(6px * var(--ui-scale));
+    background: var(--bg2); border: 1px solid var(--warn); border-radius: calc(8px * var(--ui-scale));
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  }
+  .security-signin-entry { display: flex; align-items: center; gap: calc(8px * var(--ui-scale)); }
+  .security-signin-entry .security-notice-text { flex: 1 1 auto; }
+  .security-signin-entry .relay-toast-action { flex: 0 0 auto; margin-left: 0; }
+
   .remote-relay-http-warning { color: var(--warn); opacity: 1; }
   label.remote-relay-permission { display: flex; align-items: center; gap: calc(3px * var(--ui-scale)); font-size: var(--fs-meta-sm); color: var(--muted); font-weight: normal; }
   .remote-relay-permission select {
@@ -5112,6 +5346,11 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .msg.user .msg-bubble a.msg-origin-badge { text-decoration: none; }
+  /* An origin the relay could not verify: "claimed", never a link. */
+  .msg-origin-claimed-tag {
+    border: 1px solid currentColor; border-radius: 999px; padding: 0 calc(4px * var(--ui-scale));
+    font-size: var(--fs-meta-sm); color: #d29922; margin-left: calc(2px * var(--ui-scale));
+  }
   .msg.user .msg-bubble a.msg-origin-badge:hover { text-decoration: underline; }
   /* "via agent · “title”" in the header: an agent on this relay started the
      conversation. A button while the conversation it runs in can be opened,
@@ -8432,11 +8671,33 @@
     <div class="brand-logo" aria-hidden="true"></div>
     <h1>OAR</h1>
     <p>Enter your access token to connect</p>
-    <input id="token-input" type="password" placeholder="Access token" autofocus onkeydown="if(event.key==='Enter')window.__copilotAuthConnect(event)">
-    <button onclick="window.__copilotAuthConnect(event)">Connect</button>
+    <!-- "Sign in to <relay> to answer" while ?answer= waits (bootstrap.js). -->
+    <p id="auth-context" class="auth-context" role="note" hidden></p>
+    <!-- A form so that password managers offer and keep the relay token
+         (agent auth §13.2, 2a). The username is the relay's name; the token
+         field has no name, so even a native submit would carry no token, and
+         the submit is always stopped (never a request, never the URL). -->
+    <form id="auth-form" method="post" action="#" autocomplete="on">
+      <input id="auth-username" class="credential-username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true">
+      <input id="token-input" type="password" autocomplete="current-password" placeholder="Access token" aria-label="Access token" autocapitalize="off" spellcheck="false" autofocus>
+      <button id="auth-connect-btn" type="submit">Connect</button>
+    </form>
     <div id="auth-error" class="auth-error"></div>
   </div>
 </div>
+<script>
+  // Bound before anything can fill the field: the form never submits itself.
+  (() => {
+    const form = document.getElementById('auth-form');
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void window.__copilotAuthConnect?.(event);
+    });
+    const username = document.getElementById('auth-username');
+    const name = String(window.__COPILOT_APP_CONFIG?.relayName || '').trim();
+    username.value = name || `OAR (${window.location.host})`;
+  })();
+</script>
 
 <div id="startup-loading" role="status" aria-live="polite"><div class="brand-logo" aria-hidden="true"></div><div class="startup-label">Connecting to OAR…</div></div>
 <script>
@@ -8540,6 +8801,7 @@
       </div>
     </div>
     <div id="conv-filter-row">
+      <button id="conv-active-toggle" type="button" title="Show active sessions only" aria-label="Show active sessions only" aria-pressed="false"><span class="conv-active-glyph" aria-hidden="true">🔥</span><span class="conv-active-count" aria-hidden="true" hidden></span></button>
       <input id="conv-filter-input" type="text" placeholder="Filter conversations…" autocomplete="off" spellcheck="false" aria-label="Filter conversations by title">
       <button id="conv-filter-clear" type="button" title="Clear filter" aria-label="Clear filter" hidden>×</button>
       <button id="conv-archived-toggle" type="button" title="Show archived conversations" aria-label="Show archived conversations" aria-pressed="false" onclick="toggleArchivedConversations()">🗄️</button>
@@ -8613,6 +8875,9 @@
         </div>
       </div>
     </div>
+    <!-- Security notices for the person (security-settings.js): a new relay
+         token recommended, or the token changed outside OAR. -->
+    <div id="security-notice-banner" role="status" aria-live="polite" hidden></div>
     <div id="messages">
       <!-- Replaced on start by conversation-view.js (no-conversation-state.mjs),
            which knows whether a provider is ready and whether chats exist. -->
@@ -8877,6 +9142,16 @@
         tabindex="-1"
         data-settings-tab="relays"
       >Relays</button>
+      <button
+        id="settings-tab-security"
+        class="settings-tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="settings-panel-security"
+        tabindex="-1"
+        data-settings-tab="security"
+      >Security</button>
       <button
         id="settings-tab-previews"
         class="settings-tab"
@@ -9986,7 +10261,7 @@
             checked
           >
         </div>
-        <div class="settings-help settings-gap-xs">When off, agents on paired relays can still list, read and wait on sessions here, but cannot send prompts, start sessions, answer questions, stop turns, cancel queued turns, archive or unarchive sessions, or watch sessions here for events. The relay token stays the real boundary: anyone holding it has full access.</div>
+        <div class="settings-help settings-gap-xs">When off, agents on paired relays can still list, read and wait on sessions here, but cannot send prompts, start sessions, answer questions, stop turns, cancel queued turns, archive or unarchive sessions, or watch sessions here for events. A paired relay's own key opens only the routes relays call each other on; the relay token itself still opens everything, so keep it to yourself.</div>
         <!-- Agent sessions (agent-sessions-settings-ui.js). Hidden until the relay
              answers with settings; a relay without the route never shows it. -->
         <div id="agent-sessions-section" hidden>
@@ -10029,6 +10304,15 @@
           <div id="remote-relays-empty" class="settings-help">Loading remote relays…</div>
           <div id="remote-relays-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
           <div class="settings-help">Agents in any session here can work on these relays once you mention one in the conversation (for example <code>@name</code>). "Agents may" limits what they can do there.</div>
+          <div class="settings-help">A paired relay's key opens only the routes relays call each other on. A relay without a confirmed key ("Legacy token", "Old version") still reaches its sessions here, but its prompts arrive as <em>claimed</em> and open nothing: Re-pair switches it to keys.</div>
+        </div>
+        <!-- 1b/1c (remote-relays-settings.js): sign in and push on each
+             paired relay, in that relay's own page; this page cannot tell
+             whether this browser is signed in there. -->
+        <div id="remote-relays-browser-section" class="settings-row settings-row-column settings-gap-lg" hidden>
+          <label id="remote-relays-browser-title">This browser on your paired relays</label>
+          <div id="remote-relays-browser-list" aria-labelledby="remote-relays-browser-title"></div>
+          <div class="settings-help">Each relay keeps its own sign-in; this page cannot see it.</div>
         </div>
         <div id="remote-relays-add-section" class="settings-row settings-row-column settings-gap-lg">
           <label for="remote-relays-add-url-input">Add a relay</label>
@@ -10062,13 +10346,71 @@
             Also add this relay there
           </label>
           <div id="remote-relays-pair-back-hint" class="settings-help">
-            The other relay gets this relay's public address and, if it uses a different token, this
-            relay's token too: its agents can then work here. Removing a relay here does not revoke
-            that; rotate this relay's token to lock it out.
+            The other relay gets this relay's public address. With OAR 0.9.27 or later on both, each
+            relay then signs in to the other with a key of its own and drops the token it held; an older
+            relay is told to add this one by hand. Off, the pairing is one way: the other relay gives this
+            one a key of its own and lists it as inbound only (it never calls this relay), its prompts
+            arrive there verified, and its token is used for the add alone, never kept. An OAR older than
+            0.9.27 gives no such key: then this relay keeps its token and its prompts arrive there as
+            claimed. Removing a relay here does not remove this relay there; revoke its key (or remove
+            it) to lock it out.
           </div>
           <button id="remote-relays-add-btn" class="chat-title-action-btn" type="button" onclick="addRemoteRelayFromForm()">Add</button>
           <div id="remote-relays-add-status" class="settings-help settings-provider-status" role="status" aria-live="polite" hidden></div>
         </div>
+      </div>
+      <!-- Settings → Security (security-settings.js): the browsers signed in,
+           a sign-in link for one more device, and the relay token. -->
+      <div
+        id="settings-panel-security"
+        class="settings-panel"
+        role="tabpanel"
+        tabindex="0"
+        aria-labelledby="settings-tab-security"
+        data-settings-panel="security"
+        hidden
+      >
+        <section class="settings-section" id="security-sessions-section" aria-labelledby="security-sessions-title">
+          <h3 class="settings-section-title" id="security-sessions-title">Browsers signed in</h3>
+          <div id="security-session-list"></div>
+          <div id="security-sessions-status" class="settings-help settings-provider-status" role="status" aria-live="polite">Loading the signed-in browsers…</div>
+          <div class="security-actions settings-gap">
+            <button id="security-signout-others-btn" class="summary-btn" type="button">Sign out all other browsers</button>
+            <button id="security-signout-self-btn" class="summary-btn" type="button">Sign out this browser</button>
+          </div>
+          <div class="settings-help settings-gap">A browser stays signed in for 30 days after it was last used, and 400 days at most. Signing one out ends its connection at once and stops its push notifications.</div>
+        </section>
+        <section class="settings-section" id="security-signin-section" aria-labelledby="security-signin-title">
+          <h3 class="settings-section-title" id="security-signin-title">Sign in another device</h3>
+          <div class="settings-help">A link that signs one more browser in without the relay token. It works once, for 10 minutes.</div>
+          <div class="security-actions settings-gap">
+            <button id="security-signin-code-btn" class="summary-btn" type="button">Make a sign-in link</button>
+          </div>
+          <div id="security-signin-code" class="security-signin-code settings-gap" hidden>
+            <div class="security-copy-row">
+              <input id="security-signin-link" type="text" readonly autocomplete="off" spellcheck="false" aria-label="Sign-in link">
+              <button id="security-signin-copy-btn" class="summary-btn" type="button">Copy</button>
+            </div>
+            <div id="security-signin-expiry" class="settings-help" role="status" aria-live="polite"></div>
+            <div class="security-actions settings-gap-xs">
+              <button id="security-signin-qr-btn" class="summary-btn" type="button" aria-expanded="false" aria-controls="security-signin-qr">Show QR code</button>
+            </div>
+            <div id="security-signin-qr" class="security-signin-qr settings-gap-xs" hidden>
+              <canvas id="security-signin-qr-canvas" width="0" height="0" role="img" aria-label="QR code of the sign-in link"></canvas>
+              <div class="settings-help">Scan it with the other device's camera. It hides after a minute, when you leave this page, and once the link is used.</div>
+            </div>
+            <div class="settings-help">Open the link on the other device, or scan the QR code. Whoever opens it first is signed in, so show or send it only where you alone can see it.</div>
+          </div>
+        </section>
+        <section class="settings-section" id="security-token-section" aria-labelledby="security-token-title">
+          <h3 class="settings-section-title" id="security-token-title">Relay token</h3>
+          <div id="security-token-status" class="settings-help settings-provider-status" role="status" aria-live="polite">Loading…</div>
+          <div class="security-actions settings-gap">
+            <button id="security-rotate-btn" class="summary-btn" type="button">Generate new relay token</button>
+            <span id="security-token-recommended" class="remote-relay-tag security-recommended-tag" title="A new relay token is recommended" hidden>Recommended</span>
+          </div>
+          <div class="settings-help settings-gap">The relay token signs a browser in and pairs other relays. A new one is shown once, and the current one stops working at once. Signed-in browsers stay signed in and agents keep working; paired relays need the new one.</div>
+        </section>
       </div>
       <div
         id="settings-panel-previews"
@@ -10192,9 +10534,13 @@
             <label for="push-event-relay-restart-toggle">Queued relay restart waited its maximum time</label>
             <input id="push-event-relay-restart-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
           </div>
+          <div class="settings-row settings-row-full settings-gap-xs">
+            <label for="push-event-new-signin-toggle">A new browser signed in (sent even while the app is open)</label>
+            <input id="push-event-new-signin-toggle" type="checkbox" onchange="updatePushPreferencesFromControls()" checked disabled>
+          </div>
           <label class="settings-gap-md">Devices</label>
           <div id="push-device-list" style="width: 100%;"></div>
-          <div class="settings-help">Notifications are only sent while no device has the app in the foreground. Content defaults to generic text; message previews are opt-in per device.</div>
+          <div class="settings-help">Notifications are only sent while no device has the app in the foreground; a new sign-in is sent at once, to every device but the new one. Content defaults to generic text; message previews are opt-in per device.</div>
         </div>
       </div>
       <div
