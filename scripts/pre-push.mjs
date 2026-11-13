@@ -20,7 +20,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { buildIdentityHeaderPatterns, buildPrivateNamePatterns, buildPublishPatterns } from './hygiene-patterns.mjs';
+import {
+  AUTHORS_FILE,
+  authorsSectionLines,
+  buildIdentityHeaderPatterns,
+  buildPrivateNamePatterns,
+  buildPublishPatterns,
+  matchesLeak,
+} from './hygiene-patterns.mjs';
 
 const ZERO_SHA_RE = /^0+$/;
 const DEFAULT_PUBLIC_REMOTE_RE = /github\.com[:/]+oar-sh\/oar(?:\.git)?\/?$/i;
@@ -80,29 +87,50 @@ export function evaluatePublicRefs(refs, { env = process.env, isAncestor = () =>
 /**
  * Scan `git log -p` output: commit messages and added lines. Returns
  * `{ commit, file, line, label }` records; `file` is null for a message line.
+ * `authorsSectionAt(sha)` returns the line numbers of the README's Authors
+ * section at that commit (see matchesLeak); without it there is no exception.
  */
-export function scanLogOutput(text, patterns, { privateNamePatterns = patterns } = {}) {
+export function scanLogOutput(text, patterns, { privateNamePatterns = patterns, authorsSectionAt = () => null } = {}) {
   const findings = [];
   let commit = '';
+  let sha = '';
   let file = null;
   let inMessage = false;
+  let newLine = 0;
+  let authors = null;
   for (const raw of String(text || '').split(/\r?\n/)) {
     const commitMatch = raw.match(/^commit ([0-9a-f]{7,40})\b/);
-    if (commitMatch) { commit = commitMatch[1].slice(0, 7); file = null; inMessage = true; continue; }
+    if (commitMatch) { sha = commitMatch[1]; commit = sha.slice(0, 7); file = null; inMessage = true; continue; }
     const fileMatch = raw.match(/^diff --git a\/(.+?) b\/(.+)$/);
-    if (fileMatch) { file = fileMatch[2]; inMessage = false; continue; }
+    if (fileMatch) {
+      file = fileMatch[2];
+      inMessage = false;
+      newLine = 0;
+      authors = file === AUTHORS_FILE ? authorsSectionAt(sha) : null;
+      continue;
+    }
+    const hunkMatch = !inMessage && raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) { newLine = Number(hunkMatch[1]); continue; }
     let candidate = null;
     let active = patterns;
+    let lineNo = 0;
     if (inMessage) {
       candidate = raw;
     } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
+      lineNo = newLine;
+      newLine += 1;
       if (file && SCAN_SKIP_FILES.has(file)) continue;
       if (file && HYGIENE_FILES.has(file)) active = privateNamePatterns;
       candidate = raw.slice(1);
+    } else if (raw.startsWith(' ')) {
+      newLine += 1;
     }
     if (candidate === null) continue;
-    for (const { label, re } of active) {
-      if (re.test(candidate)) findings.push({ commit, file: inMessage ? null : file, line: candidate.trim().slice(0, 120), label });
+    const where = inMessage ? {} : { file, inAuthorsSection: Boolean(authors?.has(lineNo)) };
+    for (const pattern of active) {
+      if (matchesLeak(pattern, candidate, where)) {
+        findings.push({ commit, file: inMessage ? null : file, line: candidate.trim().slice(0, 120), label: pattern.label });
+      }
     }
   }
   return findings;
@@ -150,7 +178,12 @@ export function scanPushedCommits(refs, {
       findings.push({ commit: '', file: null, line: String(error?.message || error).split('\n')[0], label: 'could not read the commits being pushed' });
       continue;
     }
-    for (const finding of scanLogOutput(log, patterns, { privateNamePatterns })) findings.push({ ...finding, ref: ref.remoteRef });
+    const authorsSectionAt = (sha) => {
+      try { return authorsSectionLines(git(['show', `${sha}:${AUTHORS_FILE}`], { cwd })); } catch { return null; }
+    };
+    for (const finding of scanLogOutput(log, patterns, { privateNamePatterns, authorsSectionAt })) {
+      findings.push({ ...finding, ref: ref.remoteRef });
+    }
     if (identityPatterns.length) {
       let headers = '';
       try { headers = git(['log', '--format=%H%x09%an <%ae>%x09%cn <%ce>', ...range], { cwd }); } catch { headers = ''; }

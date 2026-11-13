@@ -8,6 +8,9 @@ import {
   buildDenylistPatterns,
   buildFingerprintPatterns,
   buildPrivateNamePatterns,
+  authorsSectionLines,
+  AUTHORS_FILE,
+  matchesLeak,
   SECRET_PATTERNS,
 } from '../scripts/hygiene-patterns.mjs';
 
@@ -289,12 +292,14 @@ test('tracked files contain no machine fingerprints or secrets', (t) => {
   const violations = [];
 
   for (const file of files) {
-    const relPath = path.relative(repoRoot, file);
-    let lines = [];
-    try { lines = fs.readFileSync(file, 'utf8').split(/\r?\n/); } catch { continue; }
-    lines.forEach((line, idx) => {
-      for (const { label, re } of [...fingerprintPatterns, ...SECRET_PATTERNS]) {
-        if (re.test(line)) violations.push(`${relPath}:${idx + 1} — ${label}`);
+    const relPath = path.relative(repoRoot, file).split(path.sep).join('/');
+    let text = '';
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    const authors = relPath === AUTHORS_FILE ? authorsSectionLines(text) : new Set();
+    text.split(/\r?\n/).forEach((line, idx) => {
+      const where = { file: relPath, inAuthorsSection: authors.has(idx + 1) };
+      for (const pattern of [...fingerprintPatterns, ...SECRET_PATTERNS]) {
+        if (matchesLeak(pattern, line, where)) violations.push(`${relPath}:${idx + 1} — ${pattern.label}`);
       }
     });
   }
@@ -443,4 +448,37 @@ test('account and denylist patterns behave the same on any machine', () => {
   assert.equal(flags(deny, 'https://relay.corp.example9/api'), true, 'a private domain under a subdomain');
   assert.equal(flags(deny, "{ title: 'Tree View 7' }"), true, 'multi-word entries, any case');
   assert.equal(flags(deny, 'acme-internals and the corp.example90'), false, 'longer words are other words');
+});
+
+// The one exception to the account pattern: profile links in the README's
+// Authors section (matchesLeak in scripts/hygiene-patterns.mjs). Pinned with a
+// synthetic login so it reads the same on every machine.
+test('the gh account is allowed only as a profile link in the README Authors section', () => {
+  const patterns = buildFingerprintPatterns({ username: '', homedir: '', hostname: '', githubLogins: ['octo-jane'] });
+  const flagged = (file, text) => {
+    const authors = file === AUTHORS_FILE ? authorsSectionLines(text) : new Set();
+    const hits = [];
+    text.split('\n').forEach((line, idx) => {
+      const where = { file, inAuthorsSection: authors.has(idx + 1) };
+      if (patterns.some((pattern) => matchesLeak(pattern, line, where))) hits.push(idx + 1);
+    });
+    return hits;
+  };
+  const link = '[octo-jane](https://github.com/octo-jane) · [other-dev](https://github.com/other-dev)';
+  const readme = (authorsBody, rest = '') => `# Project\n\n${rest}\n## Documentation\n\nGuides.\n\n## Authors\n\n${authorsBody}\n`;
+
+  assert.deepEqual(flagged('README.md', readme(link)), [], 'the Authors link passes');
+  assert.deepEqual(flagged('docs/install.md', `## Authors\n\n${link}\n`), [3], 'the same link in another file fails');
+  assert.deepEqual(flagged('README.md', readme(link, `${link}\n`)), [3], 'the link outside the Authors section fails');
+  assert.deepEqual(flagged('README.md', readme(link, 'Maintained by octo-jane.\n')), [3], 'the bare login elsewhere in README fails');
+  assert.deepEqual(flagged('README.md', readme('octo-jane')), [10], 'the bare login inside Authors fails');
+  assert.deepEqual(flagged('README.md', readme('[Jane](https://github.com/octo-jane)')), [10], 'a link whose text is not the login fails');
+  assert.deepEqual(flagged('README.md', readme(`${link} · see octo-jane/private-repo`)), [10], 'anything beyond the link still flags');
+  assert.deepEqual(flagged('README.md', readme(link).replace('## Authors', '## Authors and octo-jane')), [8, 10], 'a renamed heading is no Authors section');
+  assert.deepEqual(flagged('README.md', `${readme(link)}\n## Later\n\n${link}\n`), [14], 'a later section is outside Authors');
+
+  // Only the account pattern looks past the link: a denylist name in the same
+  // spot is still a leak.
+  const deny = buildDenylistPatterns(['octo-jane']);
+  assert.equal(deny.some((pattern) => matchesLeak(pattern, link, { file: 'README.md', inAuthorsSection: true })), true);
 });

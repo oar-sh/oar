@@ -170,9 +170,40 @@ export function buildAccountPatterns(identity = readHostIdentity()) {
   for (const login of identity.githubLogins || []) {
     const name = String(login || '').trim();
     if (name.length < 3 || isGenericIdentity(name)) continue;
-    patterns.push({ label: `GitHub account of this host's gh login (${name})`, re: wholeWordPattern(name) });
+    patterns.push({ label: `GitHub account of this host's gh login (${name})`, re: wholeWordPattern(name), account: true });
   }
   return patterns;
+}
+
+// The one place a gh account may be named: a profile link
+// `[login](https://github.com/login)` inside the `## Authors` section of the
+// top-level README. Only the account patterns look past it; the denylist, the
+// fingerprints and the secrets still see the whole line. Commit messages get no
+// exception (they carry no file).
+export const AUTHORS_FILE = 'README.md';
+const AUTHORS_HEADING_RE = /^##\s+Authors\s*$/;
+const AUTHOR_LINK_RE = /\[([A-Za-z0-9-]+)\]\(https:\/\/github\.com\/\1\)/g;
+
+/** 1-based line numbers of the README's `## Authors` section (heading excluded). */
+export function authorsSectionLines(text) {
+  const lines = new Set();
+  let inside = false;
+  String(text || '').split(/\r?\n/).forEach((line, idx) => {
+    if (/^#{1,2}\s/.test(line)) inside = AUTHORS_HEADING_RE.test(line);
+    else if (inside) lines.add(idx + 1);
+  });
+  return lines;
+}
+
+/**
+ * Whether `line` (from `file`, repository-relative with forward slashes) is a
+ * leak under `pattern`. `inAuthorsSection` says whether the line sits in the
+ * README's Authors section; only then, and only for an account pattern, are
+ * the profile links taken out before matching.
+ */
+export function matchesLeak(pattern, line, { file = '', inAuthorsSection = false } = {}) {
+  const exempt = pattern.account && inAuthorsSection && file === AUTHORS_FILE;
+  return pattern.re.test(exempt ? String(line).replace(AUTHOR_LINK_RE, '') : line);
 }
 
 export const SECRET_PATTERNS = [

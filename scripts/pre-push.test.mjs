@@ -10,7 +10,7 @@ import {
   scanLogOutput,
   scanPushedCommits,
 } from './pre-push.mjs';
-import { buildDenylistPatterns, SECRET_PATTERNS } from './hygiene-patterns.mjs';
+import { buildAccountPatterns, buildDenylistPatterns, SECRET_PATTERNS } from './hygiene-patterns.mjs';
 import { createSandbox, hasGit } from './git-test-helpers.mjs';
 
 const ZERO = '0'.repeat(40);
@@ -237,6 +237,39 @@ test('a push to the public remote is refused when a commit header carries a priv
     assert.match(lines.join('\n'), /\(author header\)/);
     assert.match(lines.join('\n'), /setup-git\.mjs --email/);
     assert.equal(run(buildDenylistPatterns(['acme-internal'])), 0, 'an unrelated denylist lets it through');
+  } finally {
+    box.cleanup();
+  }
+});
+
+// The README Authors exception (matchesLeak in hygiene-patterns.mjs), read from
+// the pushed commits themselves: the section is located in the README as of
+// each commit, so an added line only passes when it lands inside Authors.
+test('the gh account passes only as a profile link in the README Authors section', { skip: !hasGit() }, () => {
+  const box = createSandbox();
+  try {
+    const patterns = [...buildAccountPatterns({ githubLogins: ['octo-jane'] }), ...PATTERNS];
+    const link = '[octo-jane](https://github.com/octo-jane) · [other-dev](https://github.com/other-dev)';
+    const scan = (from) => scanPushedCommits(
+      [{ localRef: 'refs/heads/main', localSha: box.git('rev-parse', 'HEAD'), remoteRef: 'refs/heads/main', remoteSha: from }],
+      { remoteName: 'origin', cwd: box.repo, patterns },
+    ).map((f) => f.file || '(message)');
+
+    let base = box.git('rev-parse', 'HEAD');
+    box.commit('README.md', `demo\n\n## Documentation\n\nGuides.\n\n## Authors\n\n${link}\n`, 'README: Authors section');
+    assert.deepEqual(scan(base), [], 'the Authors link passes');
+
+    base = box.git('rev-parse', 'HEAD');
+    box.commit('README.md', `demo\n\nMaintained by octo-jane.\n\n## Documentation\n\nGuides.\n\n## Authors\n\n${link}\n`, 'Credit the maintainer');
+    assert.deepEqual(scan(base), ['README.md'], 'the bare login outside Authors fails');
+
+    base = box.git('rev-parse', 'HEAD');
+    box.commit('docs/team.md', `## Authors\n\n${link}\n`, 'Add a team page');
+    assert.deepEqual(scan(base), ['docs/team.md'], 'the same link in another file fails');
+
+    base = box.git('rev-parse', 'HEAD');
+    box.commit('notes.md', 'plain\n', `Thanks ${link}`);
+    assert.deepEqual(scan(base), ['(message)'], 'a commit message gets no exception');
   } finally {
     box.cleanup();
   }

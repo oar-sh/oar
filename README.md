@@ -236,3 +236,7 @@ How keys, cookies, served files, paired relays and Claude Cloud's use of the Cla
 | [DEVELOPING.md](DEVELOPING.md) · [server/README.md](server/README.md#api-reference) · [CHANGELOG.md](CHANGELOG.md) | Development, tests, relay internals and the repository layout; the HTTP API; release notes |
 
 The most complete guide, in six languages, is [oar.sh/docs](https://oar.sh/docs/).
+
+## Authors
+
+[materia79](https://github.com/materia79) · [d2x](https://github.com/d2x)
