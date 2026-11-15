@@ -484,9 +484,9 @@ export function createCopilotEventNormalizer({
   // In autopilot agent mode the model can finish with BOTH durable
   // assistant.messages empty — the whole answer lives in the task summary
   // (live burn-in, 2026-08-31: "echo CWD" produced 145 output tokens and an
-  // empty reply). The extension already treats task_complete({ summary }) as
-  // "the agent's explicit closing message — highest priority"
-  // (runtime/session-io.mjs); the same precedence applies here.
+  // empty reply). The removed Copilot CLI extension treated task_complete({ summary })
+  // as "the agent's explicit closing message — highest priority"; the same
+  // precedence applies here.
   let taskCompleteSummary = '';
 
   /** What the user should read: the task summary outranks composed text. */

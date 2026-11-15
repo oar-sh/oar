@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { buildModelCatalogWithClaudeApiProvider, registerSessionsRoutes } from './sessions-routes.mjs';
 import { createClaudeApiSettingsService } from '../services/claude-api-settings-service.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 // Invented placeholders, short enough not to look like real keys.
 const TEST_KEY = 'sk-ant-api03-test-3333';
@@ -67,7 +68,7 @@ function createHarness({
   claudeSettings = CLAUDE_SETTINGS,
   runtimeRows = [],
   sessionWorkerRegistry = null,
-  sessionWorkerSupervisor = { getWorkerState: () => null },
+  sessionWorkerSupervisor = fakeSessionWorkerSupervisor(),
   modelState = {
     models: ['auto', 'gpt-5.4-mini', 'claude-sonnet-5'],
     currentModel: 'gpt-5.4-mini',
@@ -136,13 +137,11 @@ function createHarness({
     resolveConversationWorkspaceState: () => ({}),
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => true,
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: (_cb) => {},
     ensureRuntimeSessionBinding: (conversationId, model, now, sdkSessionId, options) => {
@@ -157,10 +156,6 @@ function createHarness({
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
     resolveSessionStateRoot: () => null,

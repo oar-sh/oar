@@ -77,7 +77,7 @@ test('routeAnswer persists structured_answer when provided', () => {
       required: ['meaning', 'format'],
     };
     insertQuestion(db, 'qid-multi', schema);
-    const service = createAskUserRoutingService(db, {});
+    const service = createAskUserRoutingService(db);
     const structured = JSON.stringify({ meaning: 'agent', format: 'json' });
     const result = service.routeAnswer({ question_id: 'qid-multi', answer: 'meaning: agent · format: json', structured_answer: structured });
     assert.equal(result.ok, true);
@@ -95,7 +95,7 @@ test('routeAnswer remains backward compatible for flat answers', () => {
   try {
     migrate(dbPath);
     insertQuestion(db, 'qid-flat', null);
-    const service = createAskUserRoutingService(db, {});
+    const service = createAskUserRoutingService(db);
     const result = service.routeAnswer({ question_id: 'qid-flat', answer: 'Mars' });
     assert.equal(result.ok, true);
     const row = db.prepare(`SELECT status, answer, structured_answer FROM relay_questions WHERE id = ?`).get('qid-flat');

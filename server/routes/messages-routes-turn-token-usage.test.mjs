@@ -33,7 +33,6 @@ function setup({ conversations = {}, workers = {} } = {}) {
       getConv: { get: (id) => (chats[id] && !deleted.has(id) ? { id, status: 'active' } : null) },
       getRuntimeSessionByConversation: { get: (id) => (chats[id] && !unbound.has(id) ? { id: `rs-${id}`, provider_type: chats[id] } : null) },
     },
-    relayBridgeOwnerService: { normalizeIdentity: ({ sessionId }) => (sessionId ? { sessionId } : null) },
     sessionWorkerRegistry: { getWorker: (sid) => (workers[sid] ? { kind: workers[sid] } : null) },
   });
   const routes = captureRoutes(deps);

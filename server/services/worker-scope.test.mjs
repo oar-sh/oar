@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { launchSessionCli } from './session-worker-launch-service.mjs';
 import { createWorkerScope, WORKER_SCOPE_PREFIX } from './worker-scope.mjs';
@@ -107,6 +110,26 @@ function fakeTmux() {
   return { calls, execFileSyncImpl };
 }
 
+// A log dir that cannot be created on any platform: its parent is a file. A
+// rooted path such as /relay/logs would resolve to the current drive on
+// Windows, where it can be created.
+const SCRATCH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-worker-scope-'));
+test.after(() => fs.rmSync(SCRATCH_DIR, { recursive: true, force: true }));
+fs.writeFileSync(path.join(SCRATCH_DIR, 'a-file'), '');
+const UNWRITABLE_LOG_DIR = path.join(SCRATCH_DIR, 'a-file', 'logs');
+
+// The worker these launches start. Its log dir cannot be created, so none is written.
+const WORKER_ENV = Object.freeze({
+  COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdk',
+  COPILOT_WEB_RELAY_ROOT: '/srv/oar',
+  COPILOT_WEB_RELAY_LOG_DIR: UNWRITABLE_LOG_DIR,
+});
+const WORKER_ARGS = Object.freeze([
+  path.join('/srv/oar', 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs'),
+  '--session-id',
+  'abc-123',
+]);
+
 const LAUNCH = {
   targetSessionId: 'abc-123',
   processCwd: '/relay',
@@ -114,9 +137,8 @@ const LAUNCH = {
   platform: 'linux',
   tmuxPollAttempts: 1,
   tmuxPollDelayMs: 1,
-  prepareOarMcpConfigImpl: () => null,
   allowProcessReuse: false,
-  processInspector: { findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'copilot --session-id abc-123' }) },
+  processInspector: { findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'node copilot-sdk-session-worker.mjs --session-id abc-123' }) },
 };
 
 test('a tmux worker starts its tmux through systemd-run; only new-session is wrapped, and no secret reaches its env', async () => {
@@ -124,7 +146,7 @@ test('a tmux worker starts its tmux through systemd-run; only new-session is wra
   const { workerScope } = scope();
   const launched = await launchSessionCli({
     ...LAUNCH,
-    env: { PATH: '/usr/bin', COPILOT_PROVIDER_API_KEY: 'sk-secret-value', XDG_RUNTIME_DIR: '/run/user/1000' },
+    env: { ...WORKER_ENV, PATH: '/usr/bin', COPILOT_PROVIDER_API_KEY: 'sk-secret-value', XDG_RUNTIME_DIR: '/run/user/1000' },
     execFileSyncImpl: tmux.execFileSyncImpl,
     createSecretEnvFileImpl: () => ({ filePath: '/tmp/oar-test/provider.env', cleanup() {} }),
     workerScope,
@@ -141,7 +163,7 @@ test('a tmux worker starts its tmux through systemd-run; only new-session is wra
 
 test('without a worker scope the tmux call is as before', async () => {
   const tmux = fakeTmux();
-  await launchSessionCli({ ...LAUNCH, env: { PATH: '/usr/bin' }, execFileSyncImpl: tmux.execFileSyncImpl });
+  await launchSessionCli({ ...LAUNCH, env: { ...WORKER_ENV, PATH: '/usr/bin' }, execFileSyncImpl: tmux.execFileSyncImpl });
   assert.equal(tmux.calls.find((call) => call.args[0] === 'new-session')?.command, 'tmux');
   assert.ok(!tmux.calls.some((call) => call.command === 'systemd-run'));
 });
@@ -154,7 +176,7 @@ test('a detached worker is spawned through systemd-run, its pid the worker\'s; a
     const spawned = [];
     const launched = await launchSessionCli({
       ...LAUNCH,
-      env: { PATH: process.env.PATH || '' },
+      env: { ...WORKER_ENV, PATH: process.env.PATH || '' },
       execFileSyncImpl: (command) => { throw new Error(`no ${command}`); },
       processInspector: { findProcessForSessionAsync: () => null },
       spawnImpl: (command, args, options) => { spawned.push({ command, args, options }); return { pid: 4242, unref() {} }; },
@@ -162,7 +184,7 @@ test('a detached worker is spawned through systemd-run, its pid the worker\'s; a
     });
     assert.equal(launched.launchMode, 'detached');
     assert.equal(launched.pid, 4242);
-    assert.deepEqual({ command: spawned[0].command, args: spawned[0].args }, expected('copilot', ['--allow-all', '--session-id', 'abc-123']));
+    assert.deepEqual({ command: spawned[0].command, args: spawned[0].args }, expected(process.execPath, [...WORKER_ARGS]));
     assert.equal(spawned[0].options.detached, true);
   }
 });
@@ -173,9 +195,9 @@ test('on win32 a worker scope is never used', async () => {
   await launchSessionCli({
     ...LAUNCH,
     platform: 'win32',
-    env: { SystemRoot: 'C:\\Windows', PATH: 'C:\\Windows' },
+    env: { ...WORKER_ENV, SystemRoot: 'C:\\Windows', PATH: 'C:\\Windows' },
     execFileSyncImpl: (command) => { throw new Error(`no ${command}`); },
-    processInspector: { findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'copilot --session-id abc-123' }) },
+    processInspector: { findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'node copilot-sdk-session-worker.mjs --session-id abc-123' }) },
     spawnImpl: (command, args, options) => { spawned.push({ command, args, options }); return { pid: 1, unref() {}, once() {}, on() {} }; },
     detachedPollAttempts: 1,
     detachedPollDelayMs: 1,

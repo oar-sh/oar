@@ -1,9 +1,10 @@
 // Settings → Relays → Agent sessions: the switch that lets agents start and use
-// sessions on this relay through the relay_tool, and the slider for the
-// longest wait of one tool call. The decisions live in
+// sessions on this relay through the relay_tool, the slider for the
+// longest wait of one tool call, and the loop guard (its limit, and the
+// sessions it is off for, each with Revoke). The decisions live in
 // agent-sessions-settings.mjs; this file only moves them into the markup in
-// index.html. The static controls use inline handlers that bootstrap.js
-// exposes on window.
+// index.html. The switch and the slider use inline handlers that bootstrap.js
+// exposes on window; the loop guard's controls are bound here.
 //
 // The section ships hidden. It shows once the relay answered with settings and
 // stays hidden on a relay that does not know the route (404).
@@ -12,6 +13,7 @@ import { loadAgentSessionsSettings, updateAgentSessionsSettings } from './api-cl
 import {
   agentSessionsSavedText,
   agentSessionsViewModel,
+  clampAgentPrompts,
   clampWaitSeconds,
   classifyAgentSessionsLoad,
   formatWaitMinutesLabel,
@@ -29,6 +31,7 @@ let pendingChange = null;
 // A value from elsewhere arrived while the slider had focus; drawn on blur.
 let sliderRenderDeferred = false;
 let sliderBlurBound = false;
+let loopGuardBound = false;
 
 function el(id) {
   return document.getElementById(id);
@@ -59,6 +62,20 @@ function bindSliderBlur(slider) {
   sliderBlurBound = true;
   slider.addEventListener('blur', () => {
     if (sliderRenderDeferred) renderAgentSessionsSection({ forceSlider: true });
+  });
+}
+
+// The loop guard's number saves on change; Revoke is one delegated click.
+function bindLoopGuard() {
+  if (loopGuardBound) return;
+  const input = el('agent-sessions-loop-guard-input');
+  const list = el('agent-sessions-loop-guard-off');
+  if (!input || !list) return;
+  loopGuardBound = true;
+  input.addEventListener('change', () => { void saveAgentSessionsAgentPrompts(input.value); });
+  list.addEventListener('click', (event) => {
+    const button = event.target?.closest?.('[data-loop-guard-revoke]');
+    if (button) void revokeLoopGuardOff(button.dataset.loopGuardRevoke);
   });
 }
 
@@ -104,6 +121,24 @@ export function renderAgentSessionsSection({ forceSlider = false } = {}) {
   if (cap) {
     cap.textContent = view.capText;
     cap.hidden = !view.capText;
+  }
+
+  bindLoopGuard();
+  const prompts = el('agent-sessions-loop-guard-input');
+  if (prompts) {
+    prompts.disabled = view.agentPrompts.disabled;
+    prompts.min = String(view.agentPrompts.min);
+    prompts.max = String(view.agentPrompts.max);
+    prompts.step = String(view.agentPrompts.step);
+    // Not under the user's typing.
+    if (forceSlider || document.activeElement !== prompts) prompts.value = String(view.agentPrompts.value);
+  }
+  const promptsLabel = el('agent-sessions-loop-guard-value');
+  if (promptsLabel) promptsLabel.textContent = view.agentPrompts.label;
+  const offList = el('agent-sessions-loop-guard-off');
+  if (offList) {
+    offList.innerHTML = view.loopGuardOff.html;
+    offList.hidden = view.loopGuardOff.hidden;
   }
 }
 
@@ -184,6 +219,27 @@ export async function saveAgentSessionsMaxWait(value) {
     return;
   }
   await saveAgentSessionsChange('maxWaitSeconds', { maxWaitSeconds: seconds }, 'Failed to save the longest wait.');
+}
+
+/** The loop guard's limit: 0 (never ask), or 10–500 in steps of 10. */
+export async function saveAgentSessionsAgentPrompts(value) {
+  if (saveInFlight || !settingsState) {
+    renderAgentSessionsSection({ forceSlider: true });
+    return;
+  }
+  const prompts = clampAgentPrompts(value, settingsState.limits, settingsState.agentPromptsBeforeAsking);
+  if (prompts === settingsState.agentPromptsBeforeAsking) {
+    renderAgentSessionsSection({ forceSlider: true });
+    return;
+  }
+  await saveAgentSessionsChange('agentPromptsBeforeAsking', { agentPromptsBeforeAsking: prompts }, 'Failed to save the loop guard limit.');
+}
+
+/** Revoke an "Allow for this session": the loop guard asks in it again. */
+export async function revokeLoopGuardOff(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (saveInFlight || !settingsState || !id) return;
+  await saveAgentSessionsChange('loopGuardOff', { loopGuardOff: { revoke: [id] } }, 'Failed to revoke it.');
 }
 
 /** Test hook. */

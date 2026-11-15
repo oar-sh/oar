@@ -33,13 +33,13 @@ test('the Claude API settings service is built on the settings table over the Cl
 test('a Claude API conversation launches the Claude API worker with the saved key, never Claude or Copilot', () => {
   const launchSource = sliceBetween(
     'function buildSessionWorkerLaunchEnvForSession(',
-    '\nconst relayCliLauncherService = ',
+    '\nfunction buildSessionWorkerLaunchEnvWithAgentToken(',
   );
   // Every launch clears the Claude API variables first, so no other kind
   // inherits the key.
   assert.match(launchSource, /const cleared = applyClaudeApiProviderEnvironment\(/);
   const branch = launchSource.indexOf("if (providerType === 'claude-api') {");
-  const copilotFallThrough = launchSource.indexOf("const copilotSdkEngine = getCopilotEngine() === 'sdk';");
+  const copilotFallThrough = launchSource.indexOf('const sdkPath = resolveCopilotSdkLaunchPath({ config, env: sessionWorkerLaunchEnv });');
   assert.notEqual(branch, -1);
   assert.ok(branch < copilotFallThrough, 'the claude-api branch must come before the Copilot fall-through');
   const branchSource = launchSource.slice(branch, launchSource.indexOf('\n  }\n', branch));

@@ -1,19 +1,18 @@
 # Copilot SDK worker (`server/copilot-worker/`)
 
-Updated: 2026-09-25 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
+Updated: 2026-11-14 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
 provider-agnostic relay rows live there. Design and phase history: [`docs/plans/copilot-sdk-worker.md`](../plans/copilot-sdk-worker.md).
 
-A second engine for Copilot conversations: instead of the `copilot` TUI under a `script`-PTY with
-`.github/extensions/web-relay/extension.mjs` injected, one plain Node process per conversation
-drives the CLI's **bundled SDK** (`COPILOT_SDK_PATH`) as a headless JSON-RPC runtime — the same
-shape as the Claude, Cursor and Grok workers. The extension engine ([copilot-sdk.md](copilot-sdk.md))
-is the fallback (and a setting) and is untouched; this file tracks the SDK engine only.
+The engine of every Copilot, OpenAI (BYOK) and OpenAI Image conversation: one plain Node process
+per conversation drives the CLI's **bundled SDK** (`COPILOT_SDK_PATH`) as a headless JSON-RPC
+runtime — the same shape as the Claude, Cursor and Grok workers. It started as a second engine
+beside the Copilot CLI extension (the `copilot` TUI under a `script`-PTY with
+`.github/extensions/web-relay/extension.mjs` injected); that engine, its setting and its fallback
+were removed on 2026-11-14. The SDK's other uses are in [copilot-sdk.md](copilot-sdk.md).
 
-**Status:** implemented (phases 0–4), **burn-in in progress**. **Default engine is SDK** as of
-2026-09-07 (hardening Phase 6): an unset `copilot_engine` reads as `sdk` when the relay can run
-it, falling back to `extension` when no Copilot CLI resolves or session-worker routing is off —
-the same guard the save path enforces. Both maintainer relays run `sdk` by explicit setting.
-Burn-in finding #2 (self-initiated turns were dropped; a live session on 2026-08-31) is fixed
+**Status:** implemented (phases 0–4); the only Copilot engine since 2026-11-14 (the
+[deprecation gate](#burn-in-checklist-deprecation-gate) is closed). It was the default from
+2026-09-07 (hardening Phase 6). Burn-in finding #2 (self-initiated turns were dropped; a live session on 2026-08-31) is fixed
 worker-side, and `/api/continuation-turn` accepts `github`/`openai` alongside `claude`
 (`CONTINUATION_PROVIDER_TYPES`, `server/routes/messages-routes.mjs`), so self-initiated turns are
 live-testable. See [Self-initiated turns](#self-initiated-continuation-turns).
@@ -33,17 +32,16 @@ effort is applied and model switches are **observed** (`copilot-model-switch.mjs
 structured elicitation is bridged; the worker publishes model-catalog snapshots; and the transport
 quartet moved to `shared/worker-runtime/` ahead of extension deletion.
 
-## Engine selection
+## Launch
 
 | Question | Answer / evidence |
 | -------- | ----------------- |
-| Where is it chosen? | Settings → Providers → Copilot → *Copilot engine* (`#copilot-engine-select`), `GET`/`POST /api/settings/copilot` (`server/routes/sessions-routes.mjs` → `buildCopilotSettingsPayload`, `parseCopilotSettingsUpdateRequest`), broadcast as `copilot_settings_updated`. |
-| Where is it stored? | App setting `copilot_engine` (`COPILOT_ENGINE_SETTING_KEY`), values `COPILOT_ENGINES = ['extension','sdk']`, `DEFAULT_COPILOT_ENGINE = 'sdk'` with `FALLBACK_COPILOT_ENGINE = 'extension'` when `copilotSdkEngineUnavailableReason()` fires; read by `getCopilotEngine()` / `getCopilotProviderSettings()` (`server/server-runtime.mjs`). |
-| When does it take effect? | Per spawn: `buildSessionWorkerLaunchEnvForSession()` reads `getCopilotEngine()` each time a worker launches, so running sessions keep their engine until their worker restarts. Applies to `provider_type` `github` **and** `openai` (BYOK rides the same worker). |
-| Why can a save be refused? | `setCopilotProviderSettings()` answers **409** with `copilotSdkEngineUnavailableReason({ env, routingEnabled })` (`server/services/session-worker-launch-service.mjs`) rather than persisting a setting that cannot take effect: (a) `COPILOT_SDK_PATH` never resolved at boot — the launch env is snapshotted once in `buildSessionWorkerLaunchEnv()`, so a CLI installed since startup needs a relay restart; (b) `SESSION_WORKER_ROUTING_ENABLED` is off, so no node worker is ever spawned. |
-| How is the worker launched? | Worker kind `copilot-sdk` (`COPILOT_WEB_RELAY_WORKER_KIND`) in the launch service's node-worker descriptors (`windowsTitle: 'Copilot SDK Worker'`), env applied by `applyCopilotSdkProviderEnvironment()` (throws `copilot-sdk-path-not-resolved` when the path is empty), script from `resolveCopilotSdkWorkerScriptPath()`. Plain `node <script> --session-id <id>` — no `script` PTY, no extension bootstrap; under tmux it runs in the session's tmux session like the other Node workers, with its output in the worker log. |
-| What does routing see? | Nothing new: `shared/provider-routing.mjs` is deliberately untouched. The engine changes the worker *kind*, not the provider type — conversations stay bound to `github`/`openai`, so model catalogs, usage cards and queue SQL are unaffected. |
-| Process inspection | `looksLikeCopilotWorkerProcess` (`server/services/session-worker-process-service.mjs`) matches the `<kind>-session-worker` naming convention rather than per-worker literals — which also made `grok-session-worker` visible to the kill route. |
+| Is there a choice? | No, since 2026-11-14. `GET /api/settings/copilot` stays for paired relays on older versions and answers the constant `{ engine: 'sdk', engines: ['sdk'] }` from `getCopilotProviderSettings()` (`server/server-runtime.mjs`, `server/routes/sessions-routes.mjs`); there is no `POST`. A stored `copilot_engine=extension` is ignored and named once at start (`retiredCopilotEngineLine`, `server/services/retired-copilot-extension.mjs`); the row stays, so a downgrade finds it. |
+| Which conversations? | `provider_type` `github` **and** `openai` (BYOK and OpenAI Image ride the same worker). |
+| Where does the SDK come from? | Asked on every launch: `resolveCopilotSdkLaunchPath()` (`server/copilot-sdk-runtime.mjs`) — a `COPILOT_SDK_PATH` in the environment as given, else `resolveInstalledCopilotPaths()` over `config.sdkPath` or the Copilot CLI's package folders (`getCopilotBaseDirs`). A CLI installed or updated since the relay started is found without a restart; a version folder that is gone is not used. Nothing found: the launch fails with `COPILOT_SDK_NOT_FOUND`, a message that names the folders searched and asks to install the Copilot CLI and run it once. |
+| How is the worker launched? | Worker kind `copilot-sdk` (`COPILOT_WEB_RELAY_WORKER_KIND`) in the launch service's node-worker descriptors (`windowsTitle: 'Copilot SDK Worker'`), env applied by `applyCopilotSdkProviderEnvironment()` (throws `copilot-sdk-path-not-resolved` when the path is empty), script from `resolveCopilotSdkWorkerScriptPath()`. Plain `node <script> --session-id <id>` — no `script` PTY; under tmux it runs in the session's tmux session like the other Node workers, with its output in the worker log. |
+| What does routing see? | Nothing new: `shared/provider-routing.mjs` is deliberately untouched. Conversations stay bound to `github`/`openai`, so model catalogs, usage cards and queue SQL are unaffected. |
+| Process inspection | `looksLikeCopilotWorkerProcess` (`server/services/session-worker-process-service.mjs`) matches the `<kind>-session-worker` naming convention rather than per-worker literals — which also made `grok-session-worker` visible to the kill route. A process of the conversation that is not its expected worker (a Copilot CLI of the removed engine still running after an upgrade) is stopped before the next launch and logged as `stopped pid=…, a process of this session that is no copilot-sdk-session-worker.mjs (left by an earlier version or another provider)`. |
 
 ## Module map
 
@@ -68,8 +66,8 @@ Shared modules it reuses rather than reimplements: `shared/worker-bootstrap.mjs`
 `shared/stream-emit-gating.mjs`, `shared/thought-cap.mjs`, `shared/subagent-run-id.mjs`,
 `shared/context-window-fallbacks.mjs`, plus the relay transport quartet in
 `shared/worker-runtime/` (`config-loader.mjs`, `api-client.mjs`, `worker-websocket-link.mjs`,
-`heartbeat.mjs` — relocated 2026-09-06 from `.github/extensions/web-relay/`, where one-line
-re-export shims remain for the extension until its deletion).
+`heartbeat.mjs` — relocated 2026-09-06 from `.github/extensions/web-relay/`; the one-line
+re-export shims left there went with the extension on 2026-11-14).
 
 ## Relay contract
 
@@ -179,7 +177,7 @@ The route is stricter than its siblings on purpose: `github` is the *default* pr
 the whole relay reads. It requires the runtime session to exist (404) and to be Copilot-bound (409),
 normalizes with `normalizeCopilotWorkerUsage` (clamping every count non-negative; 400 when nothing is
 usable), and stores under provider key **`copilot-sdk`** — deliberately not `github`, so the Copilot
-card's account-level meters stay unified across both engines and this is strictly additive.
+card's account-level meters stay as they are and this is strictly additive.
 
 It carries the two things no relay-side source can see: `totalNanoAiu` (real spend — the event's
 `cost` is the premium multiplier, not money, and there is no `premiumRequests` field) and
@@ -188,11 +186,11 @@ It carries the two things no relay-side source can see: `totalNanoAiu` (real spe
 Rendered as the Copilot card's **Last SDK worker turn** section (`buildCopilotWorkerUsageSection`,
 section id `copilot-sdk-last-turn`) with a `Model … · as of …` note, and withheld once the payload's
 `capturedAt` is more than `COPILOT_WORKER_USAGE_MAX_AGE_MS` (7 days) old — the snapshot never expires
-on its own, and after a switch back to the extension engine nothing would ever replace it.
+on its own, and a relay whose Copilot conversations stop running would otherwise show it forever.
 
-## Known differences from the extension engine
+## Known differences from the removed extension engine
 
-- **No tmux TUI inspector** for SDK sessions — a headless runtime has no TUI to attach to.
+- **No TUI** — a headless runtime has none, and the relay's tmux inspector went on 2026-11-14.
   `tmux attach` shows the worker's own log lines (as for Claude/Cursor/Grok).
 - **No thinking stream** for hosted models (encrypted reasoning; see the event table).
 - **Built-in slash commands**: feasible but deferred. SDK 1.0.13 exposes an `@experimental`
@@ -237,17 +235,23 @@ JSON-RPC protocol exists, and none is planned — see [the plan's §4c](../plans
 | `server/copilot-worker/copilot-plan-board.test.mjs` | 8 | board payload, fallback gating |
 | `server/copilot-worker/copilot-prompt-context.test.mjs` | 9 | prompt prefix composition, commit-after-send |
 | `server/services/session-worker-launch-service.copilot-sdk.test.mjs` | 12 | launch env, refusal reasons |
-| `server/routes/sessions-routes-copilot-settings.test.mjs` | 10 | engine GET/POST, 400 vs 409, broadcast suppression on refusal |
-| `server/public/app/copilot-engine-ui.test.mjs` | 6 | panel state machine (JSDOM over the real `index.html`) |
+| `server/routes/sessions-routes-copilot-get.test.mjs` | 3 | the constant GET, auth, no save route |
 | `server/routes/messages-routes-plan-usage.test.mjs` | 6 of 20 | ingest route binding checks and clamping |
 | `server/services/plan-usage.test.mjs` | 4 of 47 | last-turn section, 7-day cutoff |
 | `server/services/session-worker-process-service.test.mjs` | 1 of 14 | `<kind>-session-worker` inspector match |
-| `tests/copilot-engine.spec.mjs` (e2e) | 10 | panel render, both 409 refusals end-to-end, accept + persistence on a routing-enabled relay, ingest 404/409/200, usage-card section + cutoff |
+| `tests/copilot-engine.spec.mjs` (e2e) | 5 | panel without an engine choice + the constant GET, the GET's relay token, ingest 404/409/200, usage-card section + cutoff |
 
 ## Burn-in checklist (deprecation gate)
 
-From the plan's §5. The SDK engine became the default in 0.9.2 with these still open; they remain
-the gate for removing the extension engine, which is a separate future decision.
+From the plan's §5. The SDK engine became the default in 0.9.2 with these still open; they were
+the gate for removing the extension engine.
+
+**Closed 2026-11-14:** the extension engine is removed. Before that the cases it was the fallback
+for were checked live on the SDK worker (Windows spawn, resume across a worker restart without
+replayed output, a turn across a relay restart, OpenAI BYOK and image sessions without a Copilot
+login, the inspector pane of a node worker), and the rest of what went with the extension (no TUI,
+no built-in slash commands) was accepted. The boxes below were never ticked one by one; they
+stay as the list of what the worker covers.
 
 - [ ] Turn delivery + completion/failure records
 - [ ] Steering mid-turn

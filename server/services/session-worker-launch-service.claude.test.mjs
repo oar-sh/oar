@@ -62,18 +62,6 @@ test('tmux shell command for claude workers runs node without the script PTY wra
   assert.match(command, /export CLAUDE_RELAY_MODEL='claude-sonnet-5';/);
 });
 
-test('tmux shell command for copilot workers is unchanged (script PTY wrapper)', () => {
-  const env = {
-    COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
-    COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
-  };
-  const command = buildTmuxWorkerShellCommand('session-2', env);
-  assert.match(command, /exec script -q -c /);
-  assert.match(command, /\/usr\/bin\/copilot/);
-  assert.match(command, /--allow-all --session-id/);
-  assert.doesNotMatch(command, /claude-session-worker/);
-});
-
 test('launchSessionCli spawns node for claude workers when tmux is unavailable', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
@@ -102,29 +90,3 @@ test('launchSessionCli spawns node for claude workers when tmux is unavailable',
   ]);
 });
 
-test('launchSessionCli still spawns the copilot CLI for non-claude workers without tmux', async () => {
-  const spawnCalls = [];
-  await launchSessionCli({
-    targetSessionId: 'session-4',
-    cwd: '/workspace',
-    env: { COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot' },
-    platform: 'linux',
-    spawnImpl: (command, args) => {
-      spawnCalls.push({ command, args });
-      return { pid: 999, unref: () => {} };
-    },
-    execFileSyncImpl: () => { throw new Error('tmux missing'); },
-    processInspector: { findProcessForSessionAsync: () => null },
-    allowProcessReuse: false,
-    // The extension engine's OAR MCP config file; faked so nothing is written.
-    prepareOarMcpConfigImpl: () => '/workspace/logs/worker-session-4.mcp.json',
-  });
-  assert.equal(spawnCalls[0].command, '/usr/bin/copilot');
-  assert.deepEqual(spawnCalls[0].args, [
-    '--allow-all',
-    '--session-id',
-    'session-4',
-    '--additional-mcp-config',
-    '@/workspace/logs/worker-session-4.mcp.json',
-  ]);
-});

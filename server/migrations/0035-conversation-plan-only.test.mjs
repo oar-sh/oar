@@ -69,7 +69,7 @@ test('the claim\'s plan-boundary hold reads the queue through that index', () =>
   const db = new Database(':memory:');
   applySchema(db);
   const repository = createMessageRepository(db);
-  for (const name of ['findPending', 'findPendingForLegacyRelay', 'findPendingForSessionAffinity', 'findPendingForWorker']) {
+  for (const name of ['findPendingForWorker']) {
     const source = repository[name].source;
     const params = (source.match(/\?/g) || []).map(() => 'x');
     const plan = db.prepare(`EXPLAIN QUERY PLAN ${source}`).all(...params).map((row) => row.detail);

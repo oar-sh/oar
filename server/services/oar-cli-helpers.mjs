@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   AGENT_SDK_IDS,
   agentSdkSupport,
@@ -17,8 +18,10 @@ import {
   readAgentSdkPin,
   resolveAgentSdkRoot,
 } from './agent-sdk-paths.mjs';
+import { CLI_LONG_PROBE_TIMEOUT_MS } from './cli-process-runner.mjs';
 import { formatMegabytes } from './db-backup-service.mjs';
 import { readRelaySecretsFile, relaySecretsPath } from './owner-secret-store.mjs';
+import { launcherScriptsMatch } from './windows-autostart-service.mjs';
 import { AGENT_TOKEN_KINDS, agentKeyBytes, mintAgentTokenWithKey, mintOwnerToken } from '../../shared/relay-credentials.mjs';
 
 /** A new owner token (`oaro1_…`); only its hash is ever stored. */
@@ -107,7 +110,9 @@ export function describeRelayAddress({ config, lanAddress = null, wslNat = false
 }
 
 const VALUE_OPTIONS = ['--port', '--migrate-from', '--to', '--autostart', '--reason'];
-const LAUNCHER_FLAGS = ['--install-extension', '--no-install-extension', '--migrate-from'];
+// The flags of the removed `oar copilot`, which also named it without a command.
+const COPILOT_FLAGS = ['--install-extension', '--no-install-extension'];
+const COPILOT_REMOVED = 'oar copilot was removed: Copilot runs in the relay\'s web page. Start the relay with: oar start';
 const COMMAND_OPTIONS = { '--setup': 'setup', '--start': 'start', '--stop': 'stop', '--status': 'status' };
 const CLI_COMMANDS = {
   menu: {},
@@ -128,7 +133,6 @@ const CLI_COMMANDS = {
   update: { flags: ['--beta'], values: ['--to'] },
   'build-native': { flags: ['--force'] },
   sdk: { words: ['install', 'status'], words2: [...AGENT_SDK_IDS], flags: ['--reinstall'] },
-  copilot: { flags: ['--install-extension', '--no-install-extension'], values: ['--port', '--migrate-from'], forwards: true },
 };
 
 export function usageText() {
@@ -158,8 +162,6 @@ export function usageText() {
     '  oar uninstall [--purge] [--yes]',
     '                         Remove autostart and the package; the data stays (--purge deletes it)',
     '                         --yes: no question (needed without a terminal, for --now too)',
-    '  oar copilot [--port <port>] [--install-extension] [--no-install-extension] [-- gh copilot args...]',
-    '                         Relay plus a Copilot terminal session',
     '  oar doctor             Check the install and the provider CLIs',
     '  oar backup [--reason <text>]',
     '                         A copy of the database into the backup folder (safe while the relay runs)',
@@ -179,8 +181,9 @@ export function usageText() {
  * Reads the command line into `{ command, args }`, or `{ error }` for anything
  * `oar` does not know, so nothing starts by accident. The command may follow
  * options (`oar --port 3339 setup`), and `--setup`, `--start`, `--stop` and
- * `--status` name it too. Without a command the launcher's own flags (or a
- * `--` part) mean the Copilot session, and nothing at all means the menu.
+ * `--status` name it too. Nothing at all means the menu. The removed `oar
+ * copilot`, its flags and a `--` part (which named it without a command) get
+ * an error that says so.
  */
 export function parseCliArgs(argv = []) {
   const all = (Array.isArray(argv) ? argv : []).map((arg) => String(arg));
@@ -208,8 +211,8 @@ export function parseCliArgs(argv = []) {
     if (named) {
       command = COMMAND_OPTIONS[named];
       args.splice(args.indexOf(named), 1);
-    } else if (forwarded.length || args.some((arg) => LAUNCHER_FLAGS.includes(arg))) {
-      command = 'copilot';
+    } else if (forwarded.length || args.some((arg) => COPILOT_FLAGS.includes(arg))) {
+      return { error: COPILOT_REMOVED };
     } else if (!args.length) {
       command = 'menu';
     } else {
@@ -219,9 +222,10 @@ export function parseCliArgs(argv = []) {
     }
   }
 
+  if (command === 'copilot') return { error: COPILOT_REMOVED };
   const spec = Object.hasOwn(CLI_COMMANDS, command) ? CLI_COMMANDS[command] : null;
   if (!spec) return { error: `Unknown command: ${command}` };
-  if (forwarded.length && !spec.forwards) return { error: `oar ${command} takes no "--" part.` };
+  if (forwarded.length) return { error: `oar ${command} takes no "--" part.` };
   let words = 0;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -236,7 +240,7 @@ export function parseCliArgs(argv = []) {
       return { error: arg.startsWith('-') ? `Unknown option for oar ${command}: ${arg}` : `Unexpected argument: ${arg}` };
     }
   }
-  return { command, args: [...args, ...forwarded] };
+  return { command, args };
 }
 
 // The first systemd version with RestartSteps= and RestartMaxDelaySec=.
@@ -250,13 +254,12 @@ export function parseSystemdVersion(text) {
 }
 
 /**
- * A systemd *user* unit for the relay server. The launcher is not used here —
- * the service runs server.js directly, so a `gh copilot` session is not tied
- * to the unit's lifetime. A global install pins its state paths; a git
- * checkout (`checkout`) runs in the checkout and finds its config, data and
- * logs as `npm start` does. Crashes are restarted with a backoff that never
- * gives up; a systemd older than 254 (or one whose version is unknown) has no
- * backoff, and gets a longer fixed delay instead.
+ * A systemd *user* unit for the relay server: it runs server.js directly. A
+ * global install pins its state paths; a git checkout (`checkout`) runs in
+ * the checkout and finds its config, data and logs as `npm start` does.
+ * Crashes are restarted with a backoff that never gives up; a systemd older
+ * than 254 (or one whose version is unknown) has no backoff, and gets a
+ * longer fixed delay instead.
  */
 export function buildSystemdUnit({
   nodeBin, packageRoot, configPath, dataDir, logDir, pathEnv = '', checkout = false, systemdVersion = null,
@@ -492,14 +495,18 @@ export function resolveNpmInvocation({
   return { command, prefixArgs, env: { ...env, PATH: childPath } };
 }
 
+/** How long `oar doctor` gives a provider CLI's `--version`. */
+export const DOCTOR_PROBE_TIMEOUT_MS = 5_000;
+
 /**
  * Provider CLIs `oar doctor` probes, with the args that answer fast. Cursor is
  * deliberately absent: the relay drives it through the Cursor SDK it installs
  * on demand (the agent SDK block of the report) and never invokes a
- * cursor-agent binary.
+ * cursor-agent binary. Copilot gets longer, as in the relay's CLI status: its
+ * first run after an install or an update unpacks its package first.
  */
 export const DOCTOR_PROBES = Object.freeze([
-  { id: 'gh (Copilot)', binary: 'gh', args: ['--version'] },
+  { id: 'copilot', binary: 'copilot', args: ['--version'], timeoutMs: CLI_LONG_PROBE_TIMEOUT_MS },
   { id: 'claude', binary: 'claude', args: ['--version'] },
   { id: 'grok', binary: 'grok', args: ['--version'] },
 ]);
@@ -630,4 +637,101 @@ export function renderDoctorReport({
   lines.push(...renderAgentSdkLines(agentSdks));
   for (const warning of warnings) lines.push(`  warning       : ${warning}`);
   return lines.join('\n');
+}
+
+// ─── The Copilot CLI wrapper of earlier versions ─────────────────────────────
+
+/**
+ * Where `oar copilot` of earlier versions wrote a user-global Copilot CLI
+ * extension that loads the relay's extension: under COPILOT_CONFIG_HOME, else
+ * `.copilot` in the home folder (on Windows USERPROFILE's).
+ */
+export function copilotWrapperPath({ env = process.env, platform = process.platform, homeDir = os.homedir() } = {}) {
+  const pathImpl = platform === 'win32' ? path.win32 : path.posix;
+  const override = String(env.COPILOT_CONFIG_HOME || '').trim();
+  const profile = platform === 'win32' ? String(env.USERPROFILE || '').trim() : '';
+  const copilotHome = override || pathImpl.join(profile || homeDir, '.copilot');
+  return pathImpl.join(copilotHome, 'extensions', 'web-relay', 'extension.mjs');
+}
+
+/**
+ * The wrapper as earlier versions generated it for the install at
+ * `packageRoot`, and as it read before the rename (copilot-remote). A frozen
+ * copy: nothing writes it any more; it only tells a generated wrapper from a
+ * file a person wrote.
+ */
+export function generatedCopilotWrapperSources(packageRoot, { platform = process.platform } = {}) {
+  const windows = platform === 'win32';
+  const pathImpl = windows ? path.win32 : path.posix;
+  const root = pathImpl.resolve(String(packageRoot || ''));
+  const entryUrl = pathToFileURL(pathImpl.join(root, '.github', 'extensions', 'web-relay', 'extension.mjs'), { windows }).href;
+  const current = [
+    '// Auto-generated by oar to provide a stable user-global extension entrypoint.',
+    '// Do not edit manually; regenerate via `oar --install-extension`.',
+    '',
+    'import path from "path";',
+    '',
+    `const PACKAGE_ROOT = ${JSON.stringify(root)};`,
+    'const cwd = path.resolve(process.cwd());',
+    'const normalizedPackageRoot = path.resolve(PACKAGE_ROOT);',
+    'const runningInsidePackage = cwd === normalizedPackageRoot || cwd.startsWith(`${normalizedPackageRoot}${path.sep}`);',
+    'const forceGlobalExtension = process.env.COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION === "true";',
+    '',
+    '// Avoid double-loading when the project-local extension is already discoverable from the repo itself.',
+    'if (!runningInsidePackage || forceGlobalExtension) {',
+    `  await import(${JSON.stringify(entryUrl)});`,
+    '}',
+    '',
+  ].join('\n');
+  const earlier = current
+    .replace('Auto-generated by oar ', 'Auto-generated by copilot-remote ')
+    .replace('`oar --install-extension`', '`copilot-remote --install-extension`');
+  return [current, earlier];
+}
+
+/** Whether `source` is the wrapper earlier versions generated for the install at `packageRoot`. */
+export function copilotWrapperIsGenerated(source, packageRoot, { platform = process.platform } = {}) {
+  return generatedCopilotWrapperSources(packageRoot, { platform }).some((generated) => launcherScriptsMatch(source, generated));
+}
+
+/** The install a wrapper names in its PACKAGE_ROOT line, or ''. */
+function copilotWrapperPackageRoot(source) {
+  const quoted = String(source || '').match(/^const PACKAGE_ROOT = (".*");\r?$/m)?.[1];
+  try { return quoted ? String(JSON.parse(quoted)) : ''; } catch { return ''; }
+}
+
+/**
+ * Removes the wrapper earlier versions generated once the extension it loads
+ * is gone: from then on it fails on every start of the Copilot CLI. A file
+ * that is not one of the generated forms (one a person wrote or edited) stays,
+ * and so does a wrapper whose extension is still there (an install of an
+ * earlier version). Returns `{ status, path }`: status 'absent' (no wrapper),
+ * 'removed', 'foreign' (not generated), 'in-use' (its extension is there) or
+ * 'failed' (with `error`).
+ */
+export function removeGeneratedCopilotWrapper({
+  env = process.env, platform = process.platform, homeDir = os.homedir(), fsImpl = fs,
+} = {}) {
+  const pathImpl = platform === 'win32' ? path.win32 : path.posix;
+  const wrapper = copilotWrapperPath({ env, platform, homeDir });
+  let source;
+  try {
+    source = fsImpl.readFileSync(wrapper, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { status: 'absent', path: wrapper };
+    return { status: 'failed', path: wrapper, error };
+  }
+  const root = copilotWrapperPackageRoot(source);
+  if (!root || !copilotWrapperIsGenerated(source, root, { platform })) return { status: 'foreign', path: wrapper };
+  if (fsImpl.existsSync(pathImpl.join(root, '.github', 'extensions', 'web-relay', 'extension.mjs'))) {
+    return { status: 'in-use', path: wrapper };
+  }
+  try {
+    fsImpl.rmSync(wrapper, { force: true });
+  } catch (error) {
+    return { status: 'failed', path: wrapper, error };
+  }
+  // The folder too, when nothing else is in it.
+  try { fsImpl.rmdirSync(pathImpl.dirname(wrapper)); } catch {}
+  return { status: 'removed', path: wrapper };
 }

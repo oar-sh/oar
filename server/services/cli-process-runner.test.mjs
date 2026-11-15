@@ -130,7 +130,9 @@ test('runToCompletion resolves with the exit code, the captured output and a clo
   child.emitStdout('hello ');
   child.emitStderr('world\n');
   child.exit(0);
-  assert.deepEqual(await pending, { ok: true, code: 0, output: 'hello world\n', error: null });
+  // `stdout` is the standard output alone: an answer a caller parses is
+  // never mixed with a warning on stderr.
+  assert.deepEqual(await pending, { ok: true, code: 0, output: 'hello world\n', stdout: 'hello ', error: null });
 
   const failing = createFakeChild(5002);
   const failed = runToCompletion(() => failing, { timeoutMs: 1000 });
@@ -144,7 +146,7 @@ test('runToCompletion resolves with the exit code, the captured output and a clo
 
 test('runToCompletion reports a refused spawn as a result instead of throwing', async () => {
   const result = await runToCompletion(() => { throw new Error(CLI_SPAWN_DISABLED_ERROR); }, { timeoutMs: 1000 });
-  assert.deepEqual(result, { ok: false, code: null, output: '', error: CLI_SPAWN_DISABLED_ERROR });
+  assert.deepEqual(result, { ok: false, code: null, output: '', stdout: '', error: CLI_SPAWN_DISABLED_ERROR });
 });
 
 test('runToCompletion reports an error event on the child', async () => {

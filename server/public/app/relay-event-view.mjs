@@ -29,6 +29,8 @@ const EVENT_TYPES = new Set([
   'link_lost',
   'link_restored',
   'relay_restarted',
+  'late_reply',
+  'reply_undelivered',
 ]);
 const URGENT_TYPES = new Set(['question_asked', 'error']);
 const DIGEST_PATTERN = /^Digest of \d+ events?/;
@@ -52,7 +54,11 @@ const TYPE_LABELS = Object.freeze({
   link_lost: 'link lost',
   link_restored: 'link back',
   relay_restarted: 'relay restarted',
+  late_reply: 'late reply',
+  reply_undelivered: 'reply undelivered',
 });
+// A late reply's head line (not an ack's): the session it came from.
+const LATE_REPLY_FROM_PATTERN = /^\[relay event\] late_reply: late reply from session "([^"]*)"/;
 
 function defaultEscape(value) {
   return String(value ?? '')
@@ -96,8 +102,16 @@ export function parseRelayEventMessageText(text) {
   return { lines, types, count: count || lines.length, digest, quiet, replayed };
 }
 
-/** The collapsed row's one line: "3 events · question, reply". */
+/**
+ * The collapsed row's one line: "3 events · question, reply". A row of late
+ * replies only says whose: "late reply from Orbit camera".
+ */
 export function relayEventSummaryText(parsed) {
+  const from = [...new Set((parsed?.lines || []).map((line) => LATE_REPLY_FROM_PATTERN.exec(line)?.[1]).filter((title) => title !== undefined))];
+  if (from.length && (parsed?.types || []).every((type) => type === 'late_reply')) {
+    const replies = (parsed.lines || []).filter((line) => LATE_REPLY_FROM_PATTERN.test(line)).length;
+    return `${replies === 1 ? 'late reply' : `${replies} late replies`} from ${from.map((title) => title || 'untitled').join(', ')}`;
+  }
   const count = Number(parsed?.count) || 0;
   const labels = (parsed?.types || []).map((type) => TYPE_LABELS[type] || type);
   const events = `${count} event${count === 1 ? '' : 's'}`;

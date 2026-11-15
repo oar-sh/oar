@@ -664,7 +664,8 @@ test('buildReport gives the DeepSeek card its balance bar, the daily and shares 
   // CLI's running totals: 2M on the 7th, 3M on the 8th (1M more that day).
   service.recordDeepSeekUsageReport(dsReport('native-1', [flash(0, 2_000_000, 0)], { at: '2026-08-07T12:00:00.000Z' }));
   service.recordDeepSeekUsageReport(dsReport('native-1', [flash(0, 3_000_000, 0)], { at: '2026-08-08T12:00:00.000Z' }));
-  // Last month: in the totals, not in this month's budget, and off the 30-day chart.
+  // Last month: in the totals, not in this month's budget, off the 30-day
+  // chart and on the 90-day one (the days are read from 89 days back).
   service.recordDeepSeekUsageReport(dsReport('native-2', [flash(0, 1_000_000, 0)], { at: '2026-07-01T12:00:00.000Z' }));
   const balance = (total) => ({ ok: true, isAvailable: true, balances: [{ currency: 'CNY', total, granted: 0, toppedUp: total }], fetchedAt: '2026-08-08T11:59:00.000Z' });
   const first = service.buildReport({ copilotSummary, deepseekConfigured: true, deepseekBalance: balance(50), deepseekMonthlyBudget: 4 }).providers.at(-1);
@@ -676,10 +677,14 @@ test('buildReport gives the DeepSeek card its balance bar, the daily and shares 
   assert.equal(first.meters[1].resetAt, '2026-09-01T00:00:00.000Z');
   assert.equal(first.meters[1].estimated, true);
   assert.deepEqual(first.charts.map((chart) => [chart.id, chart.kind, chart.unit, chart.items.length]), [
-    ['deepseek-daily-spend', 'columns', 'cny', 30],
+    ['deepseek-daily-spend-7d', 'columns', 'cny', 7],
+    ['deepseek-daily-spend-30d', 'columns', 'cny', 30],
+    ['deepseek-daily-spend-90d', 'columns', 'cny', 90],
     ['deepseek-spend-shares', 'bars', 'cny', 1],
   ]);
-  const daily = first.charts[0];
+  const daily = first.charts[1];
+  const quarter = first.charts[2];
+  assert.deepEqual([quarter.items[0].key, quarter.items.filter((item) => item.values['deepseek-flash'] > 0).map((item) => item.key)], ['2026-05-11', ['2026-07-01', '2026-08-07', '2026-08-08']]);
   assert.deepEqual([daily.items[0].key, daily.items.at(-1).key], ['2026-07-10', '2026-08-08']);
   assert.deepEqual(daily.items.filter((item) => item.values['deepseek-flash'] > 0).map((item) => [item.key, item.label, item.values]), [
     ['2026-08-07', 'Aug 7', { 'deepseek-flash': 2 }],
@@ -689,8 +694,8 @@ test('buildReport gives the DeepSeek card its balance bar, the daily and shares 
   // The daily table reaches back to July 1 here, so the 30 days are complete.
   assert.equal(daily.note, 'Estimated, by UTC day, from the turns of this relay.');
   // Misses only (4M over both sessions): the whole cost is cache misses, so the cache saved nothing.
-  assert.deepEqual(first.charts[1].items, [{ key: 'deepseek-flash', label: 'DeepSeek Flash', values: { hit: 0, miss: 4, output: 0 } }]);
-  assert.equal(first.charts[1].summary, null);
+  assert.deepEqual(first.charts[3].items, [{ key: 'deepseek-flash', label: 'DeepSeek Flash', values: { hit: 0, miss: 4, output: 0 } }]);
+  assert.equal(first.charts[3].summary, null);
 
   // The balance read again, lower: spent against the reference.
   const second = service.buildReport({ copilotSummary, deepseekConfigured: true, deepseekBalance: balance(47.5), deepseekMonthlyBudget: 4 }).providers.at(-1);
@@ -699,7 +704,7 @@ test('buildReport gives the DeepSeek card its balance bar, the daily and shares 
   // Without a budget there is no budget bar; without a balance read there is no balance bar.
   const bare = service.buildReport({ copilotSummary, deepseekConfigured: true, deepseekBalance: null }).providers.at(-1);
   assert.deepEqual(bare.meters, []);
-  assert.equal(bare.charts.length, 2);
+  assert.deepEqual(bare.charts.map((chart) => chart.id), ['deepseek-daily-spend-7d', 'deepseek-daily-spend-30d', 'deepseek-daily-spend-90d', 'deepseek-spend-shares']);
   // The budget's stored currency reaches the card: a dollar budget on a CNY account is measured in dollars.
   const dollars = service.buildReport({ copilotSummary, deepseekConfigured: true, deepseekBalance: balance(47.5), deepseekMonthlyBudget: 4, deepseekMonthlyBudgetCurrency: 'USD' }).providers.at(-1);
   assert.deepEqual([dollars.meters[1].label, dollars.meters[1].unit, dollars.meters[1].allowance], ['Monthly budget (USD)', 'usd', 4]);

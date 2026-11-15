@@ -1436,9 +1436,9 @@ export function createCopilotSdkSessionRunner({
   }
 
   /**
-   * Publish the session's model catalog to `/api/models/snapshot` (Phase 5A:
-   * with the extension retired, worker snapshots and the server-side discovery
-   * service are what keep the relay's catalog populated).
+   * Publish the session's model catalog to `/api/models/snapshot` (worker
+   * snapshots and the server-side discovery service are what keep the relay's
+   * catalog populated).
    *
    * Fire-and-forget on a chain, exactly like `postTurnUsage`: a catalog is
    * never worth a millisecond of a turn, and the failure mode is "the relay
@@ -1468,7 +1468,7 @@ export function createCopilotSdkSessionRunner({
         const { models, contextLimitsByModel, modelMetadataByModel } = buildModelSnapshotFields(descriptors);
         const currentModel = appliedModel() || defaultModel || null;
         const payload = {
-          // Same field set the extension and the standalone relay publish;
+          // Same field set the server-side discovery feeds the catalog;
           // the route reads exactly these seven keys and nothing else.
           source: `copilot-sdk-worker:${reason}`,
           models,
@@ -4735,8 +4735,8 @@ export function createCopilotSdkSessionRunner({
    * Composer-facing steering snapshot, published on the heartbeat: whether a
    * turn is live, whether a message typed now would steer into it, and — when
    * it would not — why. `supported` is how the client learns this Copilot
-   * conversation steers at all (its provider type alone cannot tell an SDK
-   * worker from the extension engine); `cancellableIds` are the pushed rows
+   * conversation steers at all (the provider type is not consulted);
+   * `cancellableIds` are the pushed rows
    * that may still be pulled back out of the runtime (decision 8).
    */
   function steeringState() {

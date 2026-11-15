@@ -1,16 +1,15 @@
-// Server-side Copilot model discovery (Phase 5A of the extension-retirement
-// track).
+// Server-side Copilot model discovery.
 //
-// Today the model catalog is only ever POPULATED by a running engine — the
-// extension and the standalone relay POST `/api/models/snapshot` when their
-// session comes up. Once the extension retires, a relay restart leaves the
+// Otherwise the model catalog is only ever POPULATED by a running engine — the
+// SDK workers POST `/api/models/snapshot` when their session comes up — so a
+// relay restart leaves the
 // catalog empty until the first SDK worker happens to spawn, and the composer's
 // model picker with it. This service closes that gap from the server side: a
 // short-lived `CopilotClient` (the same installed-CLI runtime the session
 // import service boots) answers `listModels()`, and the result feeds the SAME
 // in-process catalog the snapshot route feeds — no HTTP self-call, and the
-// entries are tagged `server-discovery:<reason>` alongside the existing
-// `web-relay-extension:<reason>` / `standalone-relay:<reason>` sources.
+// entries are tagged `server-discovery:<reason>` alongside the workers'
+// `copilot-sdk-worker:<reason>` source.
 //
 // Failure policy is log-and-skip throughout: the catalog keeps its previous
 // contents (persisted model-variant rows survive restarts), so a missing CLI,

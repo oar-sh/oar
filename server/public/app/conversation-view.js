@@ -575,7 +575,7 @@ function workerSteeringForConversation(conversationId) {
 // Claude and Copilot SDK workers both do). One rule for every provider; the
 // provider name is not consulted (the name-based Claude rule was retired
 // 2026-09-26 once every live Claude worker advertised the flag). Workers that
-// do not advertise (the extension path, Cursor, Grok) stay strictly serial,
+// do not advertise (Cursor, Grok) stay strictly serial,
 // so their composer keeps saying "Queue".
 function conversationSupportsSteering(conversationId) {
   const conversationKey = String(conversationId || '').trim();
@@ -5111,8 +5111,7 @@ export async function sendMessage() {
         // The session the relay routed this first message to: the id its
         // worker is launched, registered and heartbeats under, so the
         // composer reads that worker's steering snapshot before the list
-        // catches up. A binding that names another id (the placeholder
-        // rekey) replaces it via conversation_session_bound.
+        // catches up.
         sdkSessionId: r.ownerSessionId || null,
         runtimeSessionId: r.runtimeSessionId || null,
         runtimeProviderType: r.runtimeProviderType || 'github',

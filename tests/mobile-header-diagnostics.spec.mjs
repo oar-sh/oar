@@ -1,5 +1,9 @@
 import { devices, expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 test.use({ ...devices["iPhone 12"], browserName: "chromium" });
 
@@ -62,38 +66,31 @@ test.describe.serial("mobile header diagnostics", () => {
       let messageId = "";
 
     try {
-      const created = await request.post("/api/message", {
-        headers,
-          data: {
-            text: seed,
-            relayMode: "autopilot",
-            model: "gpt-5.4-mini",
-            attachments: [
-              {
-                name: "menu-overlap.svg",
-                type: "image/svg+xml",
-                dataUrl: imageDataUrl,
-              },
-            ],
-          },
-        });
-      expect(created.ok()).toBeTruthy();
-      const createdBody = await created.json();
+      // Made as the web client makes a chat: bound to its session from the start.
+      const createdBody = await startConversation({
+        text: seed,
+        relayMode: "autopilot",
+        model: "gpt-5.4-mini",
+        message: {
+          attachments: [
+            {
+              name: "menu-overlap.svg",
+              type: "image/svg+xml",
+              dataUrl: imageDataUrl,
+            },
+          ],
+        },
+      });
       conversationId = String(createdBody?.conversationId || "").trim();
       messageId = String(createdBody?.messageId || "").trim();
 
       if (conversationId && messageId) {
-        const response = await request.post("/api/response", {
-          headers,
-          data: {
-            messageId,
-            conversationId,
-            text: "playwright setup",
-            model: "gpt-5.4-mini",
-            mode: "autopilot",
-          },
+        const response = await completeTurn(createdBody, {
+          text: "playwright setup",
+          model: "gpt-5.4-mini",
+          mode: "autopilot",
         });
-        expect(response.ok()).toBeTruthy();
+        expect(response.ok).toBeTruthy();
       }
 
       await page.goto(`/?token=${encodeURIComponent(token)}`);

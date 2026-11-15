@@ -1,6 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test, devices } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
+import { createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A turn paused at the Claude usage limit, through the relay's own routes and
 // its own queue: what the worker posts when the CLI refuses a turn, a message
@@ -44,52 +48,39 @@ function usageLimitRefusal(messageId, resetsAt) {
   };
 }
 
-async function seedClaudeConversation(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const sessionId = `pw-sid-limit-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
-  const synced = await request.post("/api/session-sync", {
-    headers,
-    data: { sdk_session_id: sessionId, conversation_id: conversationId },
-  });
-  expect(synced.ok()).toBeTruthy();
+// Made as the web client makes a chat (bound to its session from the start),
+// then rebound to Claude in the relay's database; its worker is a Claude
+// worker (a Claude chat's turn goes only to a worker of its kind).
+async function seedClaudeConversation(text) {
+  const started = await startConversation({ text }, { workerKind: "claude" });
+  const conversationId = String(started.conversationId || "");
   withDb((db) => db.prepare(`UPDATE runtime_sessions SET provider_type = 'claude' WHERE conversation_id = ?`).run(conversationId));
-  return { conversationId, messageId: String(body?.messageId || ""), sessionId, ownerSessionId: String(body?.ownerSessionId || "") };
+  return { conversationId, messageId: String(started.messageId || ""), sessionId: started.worker.sessionId };
 }
 
 /** Dequeue as the conversation's worker; returns the id handed out, or "". */
-async function dequeueNext(request, headers, sessionIds) {
-  for (const sessionId of sessionIds.filter(Boolean)) {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      const dequeued = await request.get("/api/pending", { headers: { ...headers, "x-relay-session-id": sessionId } });
-      expect(dequeued.ok()).toBeTruthy();
-      const message = (await dequeued.json())?.message || null;
-      if (message) return String(message.id);
-      await sleep(150);
-    }
+async function dequeueNext(seed) {
+  const worker = createFakeWorker({ sessionId: seed.sessionId, conversationId: seed.conversationId });
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const answer = await worker.poll();
+    expect(answer.ok).toBeTruthy();
+    const message = answer.payload?.message || null;
+    if (message) return String(message.id);
+    await sleep(150);
   }
   return "";
 }
 
 async function refuse(request, headers, { conversationId, messageId, resetsAt }) {
-  const answered = await request.post("/api/response", {
-    headers,
-    data: {
-      messageId,
-      conversationId,
-      text: "You've hit your session limit",
-      model: "gpt-5.4-mini",
-      mode: "agent",
-      terminalError: usageLimitRefusal(messageId, resetsAt),
-    },
+  const answered = await respondAsWorker(messageId, {
+    conversationId,
+    text: "You've hit your session limit",
+    model: "gpt-5.4-mini",
+    mode: "agent",
+    terminalError: usageLimitRefusal(messageId, resetsAt),
   });
-  expect(answered.ok()).toBeTruthy();
-  return answered.json();
+  expect(answered.ok).toBeTruthy();
+  return answered.payload;
 }
 
 test("a paused turn holds one follow-up through a message sent meanwhile, and Resume now sends it", async ({ page, request }) => {
@@ -97,12 +88,11 @@ test("a paused turn holds one follow-up through a message sent meanwhile, and Re
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const resetsAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
-  const seed = await seedClaudeConversation(request, headers, `Pause seed ${stamp}`);
+  const seed = await seedClaudeConversation(`Pause seed ${stamp}`);
   const { conversationId } = seed;
-  const workers = [seed.ownerSessionId, seed.sessionId];
 
   try {
-    expect(await dequeueNext(request, headers, workers)).toBe(seed.messageId);
+    expect(await dequeueNext(seed)).toBe(seed.messageId);
     // Other specs leave queued messages on this relay: the count is compared
     // with what it was, not with zero.
     const queuedBefore = Number((await (await request.get("/api/status", { headers })).json()).pendingCount || 0);
@@ -117,7 +107,7 @@ test("a paused turn holds one follow-up through a message sent meanwhile, and Re
     expect(listed.pauses.map((pause) => pause.conversationId)).toContain(conversationId);
     const status = await (await request.get("/api/status", { headers })).json();
     expect(Number(status.pendingCount || 0)).toBe(queuedBefore);
-    expect(await dequeueNext(request, headers, workers)).toBe("");
+    expect(await dequeueNext(seed)).toBe("");
 
     // The page shows the pause and when the turn carries on.
     await page.addInitScript((id) => { localStorage.setItem("copilot_last_conv", id); }, conversationId);
@@ -136,7 +126,7 @@ test("a paused turn holds one follow-up through a message sent meanwhile, and Re
     });
     expect(sent.ok()).toBeTruthy();
     const sentId = String((await sent.json())?.messageId || "");
-    expect(await dequeueNext(request, headers, workers)).toBe(sentId);
+    expect(await dequeueNext(seed)).toBe(sentId);
 
     // The CLI refuses it as well: still one follow-up, still held.
     await refuse(request, headers, { conversationId, messageId: sentId, resetsAt });
@@ -148,15 +138,12 @@ test("a paused turn holds one follow-up through a message sent meanwhile, and Re
     // Resume now: the banner goes and the follow-up is what the worker gets.
     await banner.getByRole("button", { name: /resume now/i }).click();
     await expect(banner).toBeHidden();
-    expect(await dequeueNext(request, headers, workers)).toBe(held[0].id);
+    expect(await dequeueNext(seed)).toBe(held[0].id);
     const after = await (await request.get("/api/usage-limit", { headers })).json();
     expect(after.pauses.map((pause) => pause.conversationId)).not.toContain(conversationId);
 
-    const answered = await request.post("/api/response", {
-      headers,
-      data: { messageId: held[0].id, conversationId, text: "carried on", model: "gpt-5.4-mini", mode: "agent" },
-    });
-    expect(answered.ok()).toBeTruthy();
+    const answered = await respondAsWorker(held[0].id, { conversationId, text: "carried on", model: "gpt-5.4-mini", mode: "agent" });
+    expect(answered.ok).toBeTruthy();
     // The answer is where the user looks for it: below what was written
     // during the pause, not above it at the time of the first refusal. On
     // the open page first, then after a reload.
@@ -189,12 +176,11 @@ test("Cancel drops the held follow-up and nothing is sent at the reset", async (
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const resetsAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
-  const seed = await seedClaudeConversation(request, headers, `Cancel seed ${stamp}`);
+  const seed = await seedClaudeConversation(`Cancel seed ${stamp}`);
   const { conversationId } = seed;
-  const workers = [seed.ownerSessionId, seed.sessionId];
 
   try {
-    expect(await dequeueNext(request, headers, workers)).toBe(seed.messageId);
+    expect(await dequeueNext(seed)).toBe(seed.messageId);
     await refuse(request, headers, { conversationId, messageId: seed.messageId, resetsAt });
     expect(heldRows(conversationId).length).toBe(1);
 
@@ -208,7 +194,7 @@ test("Cancel drops the held follow-up and nothing is sent at the reset", async (
     await banner.getByRole("button", { name: /cancel/i }).click();
     await expect(banner).toBeHidden();
     expect(heldRows(conversationId).length).toBe(0);
-    expect(await dequeueNext(request, headers, workers)).toBe("");
+    expect(await dequeueNext(seed)).toBe("");
     // The relay's own message goes with it, on the open page and for good:
     // it was never sent.
     await expect(page.locator(".msg", { hasText: "Automatic message from OAR" })).toHaveCount(0);
@@ -221,11 +207,8 @@ test("Cancel drops the held follow-up and nothing is sent at the reset", async (
     });
     expect(sent.ok()).toBeTruthy();
     const sentId = String((await sent.json())?.messageId || "");
-    expect(await dequeueNext(request, headers, workers)).toBe(sentId);
-    await request.post("/api/response", {
-      headers,
-      data: { messageId: sentId, conversationId, text: "answered", model: "gpt-5.4-mini", mode: "agent" },
-    });
+    expect(await dequeueNext(seed)).toBe(sentId);
+    await respondAsWorker(sentId, { conversationId, text: "answered", model: "gpt-5.4-mini", mode: "agent" });
   } finally {
     await request.post("/api/usage-limit/cancel", { headers, data: { conversationId } }).catch(() => {});
     await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});

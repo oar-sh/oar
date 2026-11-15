@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 function createMockApp() {
   const routes = new Map();
@@ -67,8 +68,7 @@ function createBootstrapHarness({
   claudeSettings = { configured: false, enabled: false, model: 'claude-sonnet-5', models: [] },
   cursorSettings = { configured: false, enabled: false, model: 'composer-2.5', models: [] },
   grokSettings = { configured: false, enabled: false, model: 'grok-4.5', models: [] },
-  sessionWorkerSupervisor = null,
-  featureFlags = {},
+  sessionWorkerSupervisor = fakeSessionWorkerSupervisor(),
   supportedRelayModes = ['agent'],
 } = {}) {
   const app = createMockApp();
@@ -126,13 +126,11 @@ function createBootstrapHarness({
     resolveConversationWorkspaceState: () => ({}),
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => true,
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: (_cb) => {},
     ensureRuntimeSessionBinding: (conversationId, model, now, sdkSessionId, options) => {
@@ -147,10 +145,6 @@ function createBootstrapHarness({
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags,
     sessionWorkerSupervisor,
     sessionWorkerRegistry: null,
     resolveSessionStateRoot: () => null,
@@ -408,7 +402,6 @@ test('a failed worker prestart still reports the committed conversation', async 
       models: ['composer-2.5', 'grok-4.5'],
       effortsByModel: { 'grok-4.5': ['none', 'high'] },
     },
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
     sessionWorkerSupervisor: {
       clearRestartSchedule() {},
       async ensureWorker() {

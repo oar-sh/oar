@@ -61,7 +61,7 @@ test('the clear chain takes every DeepSeek variable out, in any order, and leave
   const cleared = applyDeepSeekProviderEnvironment(applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(
     applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(stale))))),
   ));
-  assert.equal(resolveWorkerKind(cleared), 'copilot');
+  assert.equal(resolveWorkerKind(cleared), '');
   for (const key of ['DEEPSEEK_API_KEY', 'DEEPSEEK_RELAY_MODEL', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_CLAUDE_CONFIG_DIR']) {
     assert.equal(key in cleared, false, key);
   }
@@ -87,9 +87,9 @@ test('the DeepSeek key is a secret of the DeepSeek worker and of no other', () =
   assert.equal(workerSecretEnvVarsFor({ COPILOT_WEB_RELAY_WORKER_KIND: 'deepseek' }).includes('CLAUDE_CODE_OAUTH_TOKEN'), false);
   for (const kind of ['', 'claude', 'claude-cloud', 'cursor', 'grok', 'copilot-sdk']) {
     const env = { COPILOT_WEB_RELAY_WORKER_KIND: kind, DEEPSEEK_API_KEY: TEST_KEY };
-    assert.equal(workerSecretEnvVarsFor(env).includes('DEEPSEEK_API_KEY'), false, kind || 'copilot');
+    assert.equal(workerSecretEnvVarsFor(env).includes('DEEPSEEK_API_KEY'), false, kind || '(no kind)');
     // A key exported in the relay's own environment does not travel either.
-    assert.equal('DEEPSEEK_API_KEY' in withoutForeignWorkerSecrets(env), false, kind || 'copilot');
+    assert.equal('DEEPSEEK_API_KEY' in withoutForeignWorkerSecrets(env), false, kind || '(no kind)');
   }
   const scrubbed = withoutForeignWorkerSecrets(deepseekEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value' }));
   assert.equal(scrubbed.DEEPSEEK_API_KEY, TEST_KEY);

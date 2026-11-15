@@ -1,6 +1,10 @@
 import http from "node:http";
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The session's proof key goes to this relay's own /api and nowhere else.
 // An agent can put any picture address in a reply; a server on another port
@@ -52,19 +56,6 @@ async function startForeignServer(relayOrigin, hostname) {
   };
 }
 
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
 test("a picture from another port of the relay host never gets the session's proof key, the 🖍️ path included", async ({ page, request, baseURL }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
@@ -73,20 +64,13 @@ test("a picture from another port of the relay host never gets the session's pro
   const pictureUrl = `${foreign.origin}/x.png`;
   let conversationId = "";
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Show me the chart ${Date.now()}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const body = await queued.json();
-    conversationId = String(body?.conversationId || "");
-    const messageId = String(body?.messageId || "");
-    await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
-    const answered = await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, model: "gpt-5.4-mini", mode: "agent", text: `Here it is:\n\n![](${pictureUrl})` },
-    });
-    expect(answered.ok()).toBeTruthy();
+    // Made as the web client makes a chat: bound from the start.
+    const started = await startConversation({ text: `Show me the chart ${Date.now()}` });
+    conversationId = started.conversationId;
+    const messageId = started.messageId;
+    await started.worker.take(messageId);
+    const answered = await respondAsWorker(messageId, { conversationId, model: "gpt-5.4-mini", mode: "agent", text: `Here it is:\n\n![](${pictureUrl})` });
+    expect(answered.ok).toBeTruthy();
 
     // Signed in in the browser: the cookie and the key.
     await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, conversationId);

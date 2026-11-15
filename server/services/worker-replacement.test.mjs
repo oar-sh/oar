@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createWorkerReplacement, createWorkerReplacementFence, workerReleaseHold } from './worker-replacement.mjs';
 import { createSessionWorkerRegistry } from './session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './session-worker-supervisor-service.mjs';
+import { createProcessIdentityReader } from './session-worker-process-service.mjs';
 
 function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { ok: true }, alive = () => false, identity = async () => null } = {}) {
   const calls = [];
@@ -169,6 +170,18 @@ test('a live pid that is not the session\'s worker any more is not blamed: the w
     assert.equal(app.calls.some(([call]) => call === 'removeWorker'), true, name);
     assert.deepEqual(app.warnings, [], name);
   }
+});
+
+test('on Windows, a live worker the relay may not read is no stop: no second worker starts beside it', async () => {
+  // Win32_Process lists it with a null CommandLine (an elevated relay
+  // started it); the real reader over that row, as the runtime wires it.
+  const reader = createProcessIdentityReader({
+    platform: 'win32',
+    readProcessSnapshot: async () => [{ processId: 4242, parentProcessId: 4100, name: 'node.exe', commandLine: null, createdAt: 1_763_100_000_000 }],
+  });
+  const app = setup({ stopResult: { ok: true, pids: [] }, alive: () => true, identity: (pid, options) => reader(pid, options) });
+  assert.deepEqual(await app.replacement.stopWorker('sid-1-abcdef'), { ok: false, error: 'worker-not-in-process-list', remainingPids: [] });
+  assert.equal(app.calls.some(([call]) => call === 'removeWorker'), false);
 });
 
 test('a live pid nothing could be read about is no stop, and is not named', async () => {

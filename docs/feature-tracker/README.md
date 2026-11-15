@@ -1,16 +1,16 @@
 # SDK Feature Tracker
 
-Updated: 2026-10-25
-Scope: `server/` + `server/claude-worker/` + `server/claude-cloud-worker/` + `shared/claude-cloud/` + `.github/extensions/web-relay/`
+Updated: 2026-11-14
+Scope: `server/` + `server/claude-worker/` + `server/claude-cloud-worker/` + `shared/claude-cloud/` + `server/copilot-worker/`
 
 The relay is multi-provider. Each provider's SDK surface is tracked in its own file; capabilities
 that live in the relay itself (and apply to every provider) are tracked here.
 
 | Provider | Runtime | Tracker |
 | -------- | ------- | ------- |
-| **Copilot** | `@github/copilot-sdk`, driven by the CLI extension (foreground) or the standalone relay client | [copilot-sdk.md](copilot-sdk.md) |
-| **Copilot (SDK engine)** | The same SDK driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *the default engine since 0.9.2 on a relay that can run it (`getCopilotEngine()`), else the extension; burn-in checklist still open* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
-| **OpenAI (BYOK)** | Rides the Copilot worker of the selected engine via `COPILOT_PROVIDER_*` env vars (base URL from the OpenAI settings); image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md), [copilot-sdk-worker.md](copilot-sdk-worker.md#byok-openai-compatible) + the core rows below |
+| **Copilot** | `@github/copilot-sdk` (the SDK that comes with the Copilot CLI), driven headlessly by a per-conversation Node worker in `server/copilot-worker/` — *the only Copilot engine since 2026-11-14* | [copilot-sdk-worker.md](copilot-sdk-worker.md) |
+| **Copilot (relay side)** | The same SDK in the relay itself (history import, session delete, model discovery) | [copilot-sdk.md](copilot-sdk.md) |
+| **OpenAI (BYOK)** | Rides the Copilot worker via `COPILOT_PROVIDER_*` env vars (base URL from the OpenAI settings); image conversations call the OpenAI Images API directly from the relay, outside the SDK turn path | covered by [copilot-sdk.md](copilot-sdk.md), [copilot-sdk-worker.md](copilot-sdk-worker.md#byok-openai-compatible) + the core rows below |
 | **Claude** | `@anthropic-ai/claude-agent-sdk` in `server/claude-worker/` | [claude-sdk.md](claude-sdk.md) |
 | **Claude Cloud** | Claude Code cloud sessions (a sandbox at Anthropic on a clone of a GitHub repository), driven over the session API the Claude CLI itself uses by `server/claude-cloud-worker/` + `shared/claude-cloud/` — no SDK, no local agent; *not a documented public API, off by default* | [claude-cloud.md](claude-cloud.md) |
 | **Cursor** | `@cursor/sdk` in `server/cursor-worker/` — *implemented, pending live validation* | [cursor-sdk.md](cursor-sdk.md) |
@@ -75,6 +75,9 @@ but are not Copilot SDK surface.
 
 ## Changelog
 
+- 2026-11-14: Removed the hand-started standalone relay client (`server/relay.mjs`), the HTTP polling path it and the extension used (`GET /api/pending` now serves only a named session's worker), session sync, the restart orchestrator and the bridge owner. [copilot-sdk.md](copilot-sdk.md) drops the rows only `server/relay.mjs` made true.
+- 2026-11-14: Removed the Copilot CLI extension (`.github/extensions/web-relay/`) and with it the Extension engine, the engine choice, the fallback when the SDK is not found, `oar copilot` and the tmux inspector. Copilot, OpenAI (BYOK) and OpenAI Image conversations run on the SDK worker only, which looks the SDK up on every launch; the deprecation gate in [copilot-sdk-worker.md](copilot-sdk-worker.md#burn-in-checklist-deprecation-gate) is closed, and [copilot-sdk.md](copilot-sdk.md) keeps only the rows still true.
+- 2026-11-14: Removed the session worker routing, continuation answer routing and generated-image continuity feature flags, and the reserved worker fallback restart flag; all three features are now always-on, and the Settings → Features tab is gone.
 - 2026-10-25: **Claude API.** A provider of its own on the Claude worker's runner, with Claude Code on an
   API key from the Claude Console ([claude-api.md](claude-api.md)). It has the Claude column's capabilities and
   models. A Claude chat can switch between the subscription and the key. Spend is estimated on a Check Usage

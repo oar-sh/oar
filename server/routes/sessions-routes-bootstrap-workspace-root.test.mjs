@@ -5,6 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
+import { createSessionWorkerSupervisor } from '../services/session-worker-supervisor-service.mjs';
+import { createCliSpawnDisabledDeferral } from '../services/session-worker-launch-service.mjs';
 
 function createMockApp() {
   const routes = new Map();
@@ -48,7 +51,7 @@ function createMockDb() {
   };
 }
 
-function createBootstrapHarness({ workspaceRootAllowList = [], workspaceRootUpdateResult = null } = {}) {
+function createBootstrapHarness({ workspaceRootAllowList = [], workspaceRootUpdateResult = null, sessionWorkerSupervisor = null, sessionWorkerRegistry = null } = {}) {
   const app = createMockApp();
   const db = createMockDb();
   const modelState = {
@@ -132,14 +135,12 @@ function createBootstrapHarness({ workspaceRootAllowList = [], workspaceRootUpda
       };
     },
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     workspaceRootAllowList,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'browser-session-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: (_cb) => {},
     ensureRuntimeSessionBinding: () => ({ id: 'runtime-session-1' }),
@@ -151,11 +152,7 @@ function createBootstrapHarness({ workspaceRootAllowList = [], workspaceRootUpda
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
-    sessionWorkerSupervisor: {
+    sessionWorkerSupervisor: sessionWorkerSupervisor || {
       clearRestartSchedule: () => {},
       ensureWorker: async (sessionId) => {
         calls.push('ensure-worker');
@@ -166,7 +163,7 @@ function createBootstrapHarness({ workspaceRootAllowList = [], workspaceRootUpda
       getLifecycleState: () => null,
       snapshot: () => null,
     },
-    sessionWorkerRegistry: {
+    sessionWorkerRegistry: sessionWorkerRegistry || {
       upsertWorker: () => null,
       getWorker: () => null,
     },
@@ -293,4 +290,42 @@ test('bootstrap still creates the chat when the root update loses a race', async
   assert.match(response.body.workspaceRootWarning, /Directory not found: gone/);
   assert.equal(response.body.configuredWorkspaceRootPath, null);
   assert.deepEqual(calls, ['update-workspace-root', 'ensure-worker']);
+});
+
+// The real supervisor around a launch: the deferral a test relay's runtime
+// returns under COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN, or a launch that fails.
+function realSupervisor(spawnWorker) {
+  const registry = createSessionWorkerRegistry();
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    spawnWorker,
+    setTimeoutImpl: () => ({ unref() {} }),
+    clearTimeoutImpl: () => {},
+  });
+  return { sessionWorkerSupervisor: supervisor, sessionWorkerRegistry: registry };
+}
+
+test('on a relay that launches no worker, bootstrap answers 200 and the session waits for its worker', async () => {
+  const deferLaunch = createCliSpawnDisabledDeferral();
+  const workers = realSupervisor(async (sid) => deferLaunch(sid));
+  const { app, insertedConversations } = createBootstrapHarness(workers);
+  const response = await callBootstrap(app, { model: 'gpt-5.4-mini' });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(response.body.ok, true);
+  assert.equal(insertedConversations.length, 1);
+  const { conversationId } = response.body;
+  assert.equal(workers.sessionWorkerRegistry.getWorker(conversationId)?.status, 'new', 'no worker yet');
+  const lifecycle = workers.sessionWorkerSupervisor.getLifecycleState(conversationId);
+  assert.equal(lifecycle.retryCount, 0);
+  assert.equal(lifecycle.nextRestartAt, null);
+});
+
+test('a launch that fails still answers bootstrap with 409 spawn-failed', async () => {
+  const workers = realSupervisor(async () => { throw new Error('spawn ENOENT'); });
+  const { app, insertedConversations } = createBootstrapHarness(workers);
+  const response = await callBootstrap(app, { model: 'gpt-5.4-mini' });
+  assert.equal(response.statusCode, 409, JSON.stringify(response.body));
+  assert.equal(response.body.error, 'spawn-failed');
+  assert.equal(response.body.conversationCreated, true);
+  assert.equal(insertedConversations.length, 1);
 });

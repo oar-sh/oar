@@ -23,6 +23,27 @@ test('the allowlist is the Settings tabs', async () => {
   assert.deepEqual([...SETTINGS_DEEP_LINK_TABS], SETTINGS_TABS);
 });
 
+test('a link to the retired Features tab opens General', () => {
+  assert.deepEqual(readSettingsDeepLink('https://b.example.test/?settings=features'), { tab: 'general', addRelay: false, cleanedPath: '/' });
+  assert.deepEqual(readSettingsDeepLink('https://b.example.test/?settings=Features&add-relay=1'), { tab: 'general', addRelay: false, cleanedPath: '/' });
+  const opened = [];
+  const calls = [];
+  const options = {
+    open: (tab) => opened.push(tab),
+    location: { href: 'https://b.example.test/' },
+    history: { state: null, replaceState: (...args) => calls.push(args) },
+    title: 'OAR',
+  };
+  assert.equal(requestSettingsTab('features', options), 'opened');
+  assert.deepEqual(opened, ['general']);
+  // Behind the sign-in box the link waits in the address as General.
+  assert.equal(requestSettingsTab('features', { ...options, isAuthGateVisible: () => true }), 'deferred');
+  assert.deepEqual(calls, [[null, 'OAR', '/?settings=general']]);
+  assert.equal(SETTINGS_DEEP_LINK_TABS.includes('features'), false);
+  // Only own entries of the map count.
+  assert.equal(readSettingsDeepLink('https://b.example.test/?settings=constructor').tab, '');
+});
+
 test('consume replaces the entry once and keeps its state', () => {
   const calls = [];
   const history = { state: { mark: 1 }, replaceState: (...args) => calls.push(args) };

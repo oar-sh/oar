@@ -368,7 +368,6 @@ function retryExternalLinkOpen() {
   if (!pendingExternalLinkUrl) return;
   openExternalNavigation(pendingExternalLinkUrl, showExternalLinkFallback);
 }
-import { initTmuxInspectorView, closeTmuxInspectorView } from './tmux-inspector-view.js';
 import {
   initTheme,
   updateTheme,
@@ -388,8 +387,6 @@ import {
   toggleClaudeProvider,
   applyClaudeSettingsState,
   refreshClaudeSettingsState,
-  saveCopilotSettings,
-  applyCopilotSettingsState,
   saveGrokSettings,
   toggleGrokProvider,
   applyGrokSettingsState,
@@ -5612,7 +5609,6 @@ initSocketHandlers({
   applyConversationPreferencesForConversation,
   applyOpenAISettingsState,
   applyClaudeSettingsState,
-  applyCopilotSettingsState,
   applyGrokSettingsState,
   applyCursorSettingsState,
   applyDeepSeekSettingsState,
@@ -5631,12 +5627,6 @@ initActionConfirmations({
   refreshSessionWorkerStatus,
   exposeOnWindow: false,
 });
-initTmuxInspectorView({
-  bindMenuAction,
-  lockChatActionsMenuShield,
-  closeChatActionsMenu,
-});
-
 // The composer's model list of a cloud conversation comes from the Claude
 // Cloud settings, which load (and change) independently of the catalog.
 function refreshClaudeCloudComposerModels() {
@@ -5750,7 +5740,6 @@ async function initApp() {
       });
     }
     void flushConversationDraft(currentConvId);
-    closeTmuxInspectorView();
   });
   // The start screen lies over the app and leaves once its animation is done.
   void window.__startupSplash?.finish?.();
@@ -6225,7 +6214,6 @@ async function bootstrap() {
     closeChangeCwdMenu: () => closeChangeCwdMenu({ focusTrigger: true }),
     closeGitChangesModal,
     closeGitDiffViewer,
-    closeTmuxInspector: closeTmuxInspectorView,
     closeAnnotateEditor,
     closeRelayWatchPanel,
     closeQuestionsPanel,
@@ -6276,7 +6264,6 @@ window.saveOpenAISettings = saveOpenAISettings;
 window.removeOpenAISettings = removeOpenAISettings;
 window.toggleOpenAIProvider = toggleOpenAIProvider;
 window.saveClaudeSettings = saveClaudeSettings;
-window.saveCopilotSettings = saveCopilotSettings;
 window.toggleClaudeProvider = toggleClaudeProvider;
 window.startClaudeRelogin = startClaudeRelogin;
 window.submitClaudeLoginCodeFromInput = submitClaudeLoginCodeFromInput;

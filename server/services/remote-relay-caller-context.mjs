@@ -9,7 +9,7 @@ import {
   REMOTE_RELAY_PROVIDERS,
 } from '../../shared/remote-relay-contract.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../../shared/question-timeout.mjs';
-import { readApprovalAnswer } from '../../shared/question-answer-rule.mjs';
+import { matchQuestionChoice, readApprovalAnswer } from '../../shared/question-answer-rule.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
 import { pickLiveTurnRowId } from './live-turn-picker.mjs';
 import { sanitizeRelayQuestionContext } from './relay-question-context.mjs';
@@ -39,6 +39,8 @@ const APPROVAL_HEADER = 'Remote relay';
 const LOCAL_SESSIONS_HEADER = 'Agent sessions';
 const WATCH_HEADER = 'Relay events';
 const APPROVAL_ALLOW = 'Allow';
+// The loop guard's card only: Allow, and switch the guard off for the conversation.
+const APPROVAL_ALLOW_SESSION = 'Allow for this session';
 const APPROVAL_DENY = 'Deny';
 const EXCERPT_MAX = 200;
 
@@ -371,6 +373,7 @@ export function createRemoteRelayCallerContext({
     ORDER BY COALESCE(processing_at, timestamp) ASC
   `);
   const getQueueRow = db.prepare(`SELECT * FROM queue WHERE id = ?`);
+  const getMessageKind = db.prepare(`SELECT kind FROM messages WHERE id = ?`);
   const getLatestUserMessage = db.prepare(`
     SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY timestamp DESC LIMIT 1
   `);
@@ -428,6 +431,16 @@ export function createRemoteRelayCallerContext({
   }
 
   /**
+   * What a processing row is: '' for a message someone wrote (the user, or
+   * an agent with its origin), else its kind (a continuation, a relay event,
+   * a scheduled prompt, another relay note).
+   */
+  function rowKind(row) {
+    if (toText(row.kind)) return toText(row.kind).toLowerCase();
+    return toText(getMessageKind.get(row.id)?.kind).toLowerCase();
+  }
+
+  /**
    * `{ conversationId, title, provider, model, effort, mode, planOnly,
    * processingRowId, attemptId, userMessageId, hops, originRelayIds }` for the
    * conversation making the call. A plan-only conversation's `mode` is its
@@ -443,6 +456,8 @@ export function createRemoteRelayCallerContext({
    * `originRelayIds` are the relays (their instance ids) those prompts came
    * from: empty when the agent acts on the user's words alone. `origin` is
    * the one among them with the most hops (null for the user's words).
+   * `turnRows` are the processing rows themselves, `[{ kind, origin }]`: who
+   * the loop guard lets report to the session that started this one.
    */
   function getCallerContext(conversationId) {
     const id = toText(conversationId);
@@ -450,8 +465,9 @@ export function createRemoteRelayCallerContext({
     const runtime = getRuntimeSession.get(id) || null;
     const rows = listProcessingRows.all(id);
     const live = liveTurnRow(id, rows);
+    const turnRows = rows.map((row) => ({ kind: rowKind(row), origin: rowOrigin(id, row) }));
     const origins = (rows.length
-      ? rows.map((row) => rowOrigin(id, row))
+      ? turnRows.map((row) => row.origin)
       : [messageOrigin(getLatestUserMessage.get(id)?.id)]).filter(Boolean);
     const hops = Math.max(0, ...origins.map(originHops));
     const originRelayIds = [...new Set(origins.map((origin) => toText(origin.relayId)))];
@@ -481,6 +497,7 @@ export function createRemoteRelayCallerContext({
       // their `verified`, `entryId` and `epoch` (origin binding).
       origins,
       origin,
+      turnRows,
     };
   }
 
@@ -502,8 +519,10 @@ export function createRemoteRelayCallerContext({
    * closed with REMOTE_RELAY_NO_ACTIVE_TURN). Waits as long as the question
    * lives (8 h by default); `signal` withdraws the card early.
    * `agentPrompts` (the loop guard) is how many prompts the agent has sent to
-   * other relays' agents since the user last wrote; the card then asks for
-   * that, in any relay mode.
+   * other agents since the user last wrote; the card then asks for that, in
+   * any relay mode, with a third choice: "Allow for this session" resolves
+   * `{ approved:true, scope:'session' }` (the dispatcher switches the guard
+   * off for the conversation), Allow `scope:'once'`.
    * `localSessions` makes it the card for starting sessions on this relay
    * itself, asked once per conversation (the dispatcher remembers the Allow).
    * `group` (`{ id, name }`) is the session group a create_session names, as
@@ -526,13 +545,14 @@ export function createRemoteRelayCallerContext({
     const createdAt = now().toISOString();
     const questionId = String(uuid());
     const relayMode = normalizeMode(row.relay_mode);
+    const loopGuard = agentPrompts > 0;
     const prompt = formatRemoteRelayApprovalPrompt({ relay, action, args, caller: callerContext, agentPrompts, localSessions, watch, group, sessionSettings });
     const local = relay?.local === true;
     let rationale = `Write actions on ${local ? 'other sessions of this relay' : 'other relays'} need approval in ${relayMode} mode.`;
-    if (agentPrompts > 0) {
-      rationale = local
+    if (loopGuard) {
+      rationale = `${local
         ? 'Agents that keep prompting each other need your go from time to time.'
-        : 'Agents on different relays that keep prompting each other need your go from time to time.';
+        : 'Agents on different relays that keep prompting each other need your go from time to time.'} Allow for this session stops asking in this conversation until you revoke it in Settings → Relays → Agent sessions.`;
     } else if (localSessions) {
       rationale = 'Allow covers every session this conversation\'s agent starts on this relay; Deny refuses this one.';
     } else if (sessionSettings) {
@@ -564,7 +584,7 @@ export function createRemoteRelayCallerContext({
       row.id,
       relayMode,
       prompt,
-      JSON.stringify([APPROVAL_ALLOW, APPROVAL_DENY]),
+      JSON.stringify(loopGuard ? [APPROVAL_ALLOW, APPROVAL_ALLOW_SESSION, APPROVAL_DENY] : [APPROVAL_ALLOW, APPROVAL_DENY]),
       JSON.stringify({ request: null, context, allowFreeform: false }),
       null,
       toText(row.owner_sdk_session_id) || null,
@@ -586,9 +606,16 @@ export function createRemoteRelayCallerContext({
       const current = questionStatements.getQuestion.get(questionId);
       if (!current) return { approved: false, error: 'The approval question was removed.' };
       if (current.status === 'answered') {
-        const decision = readApprovalAnswer(current.answer, { approve: APPROVAL_ALLOW, deny: APPROVAL_DENY });
-        if (decision === 'approve') return { approved: true };
-        if (decision === 'deny') return { approved: false };
+        if (loopGuard) {
+          const choice = matchQuestionChoice(current.answer, [APPROVAL_ALLOW, APPROVAL_ALLOW_SESSION, APPROVAL_DENY]);
+          if (choice === APPROVAL_ALLOW) return { approved: true, scope: 'once' };
+          if (choice === APPROVAL_ALLOW_SESSION) return { approved: true, scope: 'session' };
+          if (choice === APPROVAL_DENY) return { approved: false };
+        } else {
+          const decision = readApprovalAnswer(current.answer, { approve: APPROVAL_ALLOW, deny: APPROVAL_DENY });
+          if (decision === 'approve') return { approved: true };
+          if (decision === 'deny') return { approved: false };
+        }
         // The answer route takes only the choices; anything else in the row
         // is no decision of the user's, so it is not passed off as their Deny.
         return { approved: false, error: 'The approval question was answered with neither Allow nor Deny. Go on without it, or ask the user first.' };

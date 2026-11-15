@@ -281,22 +281,33 @@ export function buildDetailSection({ id, label, rows = [], note = null, open = f
   return { id: sectionId, label: sectionLabel, rows: normalizedRows, note: toTrimmedString(note), ...(open === true ? { open: true } : {}) };
 }
 
-export const CHART_KINDS = Object.freeze(['columns', 'bars']);
+// columns: stacked per item (a day); bars: one row per item with its parts;
+// share: one item (a window) split into its series, drawn as one line.
+export const CHART_KINDS = Object.freeze(['columns', 'bars', 'share']);
+/** The windows a card's charts come in; the browser's picker offers these. */
+export const CHART_WINDOW_DAYS = Object.freeze([7, 30, 90]);
 
 /**
  * A small chart drawn by the browser from data, never from markup: stacked
- * `columns` (one per item, e.g. days) or horizontal stacked `bars` (one per
- * item, e.g. models). Every item holds one value per series, in `unit`
+ * `columns` (one per item, e.g. days), horizontal stacked `bars` (one per
+ * item, e.g. models), or a `share` (one item, e.g. a window, drawn as one
+ * line cut into its series). Every item holds one value per series, in `unit`
  * (`buildMeter`'s units); the renderer draws the shares and writes the text
  * equivalents, so the card payload carries numbers only.
  *
- * `series`: `[{ key, label }]` in the order the colours are assigned, which
- * never changes between reads. `items`: `[{ key, label, values: { <series
+ * `series`: `[{ key, label }]` in the order the colours are assigned. Within
+ * one read, the charts of a card that belong together (a daily chart and its
+ * split, in every window) share one series array, so a series has one colour
+ * there; between reads the order can change (the token charts sort models by
+ * their 90-day total), and so can a model's colour. `items`: `[{ key, label, values: { <series
  * key>: number } }]`; a value that is missing or not a number counts as 0.
  * `note`: one sentence under the chart. `summary`: a figure the chart adds
  * up to, shown with it (e.g. "Cache saved about ¥1.20").
+ * `windowDays`: the days the chart covers when it is one of a card's 7, 30
+ * and 90 days charts (the browser shows the window picked); anything else is
+ * dropped, and a chart without it is always shown.
  */
-export function buildChart({ id, label, kind = 'columns', unit = 'credits', series = [], items = [], note = null, summary = null } = {}) {
+export function buildChart({ id, label, kind = 'columns', unit = 'credits', series = [], items = [], note = null, summary = null, windowDays = null } = {}) {
   const chartId = toTrimmedString(id);
   const chartLabel = toTrimmedString(label);
   if (!chartId || !chartLabel || !CHART_KINDS.includes(kind)) return null;
@@ -328,6 +339,7 @@ export function buildChart({ id, label, kind = 'columns', unit = 'credits', seri
     items: normalizedItems,
     note: toTrimmedString(note),
     summary: toTrimmedString(summary),
+    ...(CHART_WINDOW_DAYS.includes(windowDays) ? { windowDays } : {}),
   };
 }
 

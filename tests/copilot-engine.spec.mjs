@@ -4,27 +4,15 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 
 import { relayBaseUrl, relayDbPath, relayToken } from "./e2e-env.mjs";
-import { startRelayServer } from "./relay-server-harness.mjs";
 import { buildCopilotPlanCard } from "../server/services/plan-usage-copilot.mjs";
 
 /**
- * The Copilot engine toggle (Settings → Providers → Copilot) and the SDK
- * worker's usage snapshot.
+ * What is left of the Copilot settings, and the SDK worker's usage snapshot.
  *
- * Three things are pinned here, each against the relay that can actually
- * express it:
- *
- *  1. The panel itself, and the *refusal* path, on the shared e2e relay. That
- *     relay pins session-worker routing off (see relay-server-harness.mjs), so
- *     an SDK save there can only ever be refused — which is worth asserting
- *     precisely, because the reason string is the entire UX of the refusal.
- *  2. The *accept* path, on a throwaway relay this spec boots with routing on
- *     and a stub COPILOT_SDK_PATH. Stubbing the response in the browser would
- *     only prove the client renders what it is handed; booting a second relay
- *     proves the relay's own precondition check, the persistence and the
- *     reload. Nothing is ever spawned on it — no conversation is created there
- *     — so routing-on is inert beyond the setting it unlocks.
- *  3. The usage snapshot, end to end: the worker's POST → the relay's
+ *  1. Settings → Providers → Copilot has no engine choice: the SDK worker is
+ *     the only engine. GET /api/settings/copilot stays for paired relays on an
+ *     older version, and it needs the relay token.
+ *  2. The usage snapshot, end to end: the worker's POST → the relay's
  *     normalise/store → the card builder → the rendered detail section. The one
  *     seam is /api/usage itself: the Copilot card needs a GitHub quota snapshot
  *     the isolated relay has no token to fetch, so the card is built in-process
@@ -36,233 +24,32 @@ import { buildCopilotPlanCard } from "../server/services/plan-usage-copilot.mjs"
  * (server/copilot-worker/*.test.mjs). See docs/plans/copilot-sdk-worker.md §4c.
  */
 
-const EXTENSION_STATUS = "New Copilot conversations run on the Copilot CLI with the web-relay extension.";
-const SDK_STATUS = "New Copilot conversations run on the headless SDK worker. No tmux inspector for these sessions.";
-
 function authHeaders(token = relayToken()) {
   return { Authorization: `Bearer ${token}` };
 }
 
-async function loadApp(page, { baseUrl = "", token = relayToken() } = {}) {
-  await page.goto(`${baseUrl}/?token=${encodeURIComponent(token)}`);
-  await page.waitForLoadState("networkidle");
-  // networkidle can fire before the app modules finish binding their globals.
-  await page.waitForFunction(() => typeof window.openSettingsModal === "function");
-}
-
-async function openCopilotSettings(page) {
-  await page.evaluate(() => window.openSettingsModal("providers", "copilot"));
-  await expect(page.locator("#settings-modal")).toHaveClass(/visible/);
-  await expect(page.locator("#settings-provider-panel-copilot")).toBeVisible();
-}
-
-const engineSelect = (page) => page.locator("#copilot-engine-select");
-const engineStatus = (page) => page.locator("#copilot-settings-status");
-
-async function readEngine(request, { baseUrl = "", token = relayToken() } = {}) {
-  const response = await request.get(`${baseUrl}/api/settings/copilot`, { headers: authHeaders(token) });
-  expect(response.status()).toBe(200);
-  return response.json();
-}
-
-/** Saves through the panel exactly as a user would, alert and all. */
-async function saveEngineFromPanel(page, engine) {
-  await engineSelect(page).selectOption(engine);
-  await page.click("#copilot-save-btn");
-  // The save re-enables its controls in a `finally`, so this settles for both
-  // the accepted and the refused path.
-  await expect(page.locator("#copilot-save-btn")).toBeEnabled();
-}
-
-test.describe.serial("Copilot engine panel on a relay without session-worker routing", () => {
-  test.beforeEach(async ({ page }) => {
-    // A refused save raises a native alert; an unhandled dialog would hang the
-    // click that opened it.
-    page.on("dialog", (dialog) => { dialog.accept().catch(() => {}); });
-  });
-
-  // Plain fetch, not the `request` fixture: only worker-scoped fixtures are
-  // available in afterAll.
-  test.afterAll(async () => {
-    await fetch(`${relayBaseUrl()}/api/settings/copilot`, {
-      method: "POST",
-      headers: { ...authHeaders(), "content-type": "application/json" },
-      body: JSON.stringify({ engine: "extension" }),
-    }).catch(() => {});
-  });
-
-  test("renders the engine choice with Extension active and describes both engines", async ({ page }) => {
-    await loadApp(page);
-    await openCopilotSettings(page);
-
-    await expect(engineSelect(page)).toHaveValue("extension");
-    await expect(engineSelect(page).locator("option")).toHaveText([
-      "Extension",
-      "SDK — default",
-    ]);
-    expect(await engineSelect(page).locator("option").evaluateAll(
-      (options) => options.map((option) => option.value),
-    )).toEqual(["extension", "sdk"]);
-
-    // The default engine is not an error state and not a configured-extra one.
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "unconfigured");
-    await expect(engineStatus(page)).toHaveText(EXTENSION_STATUS);
-
-    // The two losses a user must know about before switching, and the fact that
-    // switching does not disturb a running session.
+test.describe("Copilot settings", () => {
+  test("the Copilot panel offers no engine choice, and the GET answers the SDK engine", async ({ page, request }) => {
+    await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
+    await page.waitForLoadState("networkidle");
+    // networkidle can fire before the app modules finish binding their globals.
+    await page.waitForFunction(() => typeof window.openSettingsModal === "function");
+    await page.evaluate(() => window.openSettingsModal("providers", "copilot"));
+    await expect(page.locator("#settings-modal")).toHaveClass(/visible/);
     const panel = page.locator("#settings-provider-panel-copilot");
-    await expect(panel).toContainText("no tmux inspector for those sessions");
-    await expect(panel).toContainText("Applies whenever a conversation's worker starts");
+    await expect(panel).toBeVisible();
+    await expect(panel.locator("#cli-copilot-section")).toBeVisible();
+    await expect(panel.locator("select")).toHaveCount(0);
+    await expect(page.locator("#copilot-engine-select, #copilot-save-btn, #copilot-settings-status")).toHaveCount(0);
+
+    const response = await request.get("/api/settings/copilot", { headers: authHeaders() });
+    expect(response.status()).toBe(200);
+    expect((await response.json()).engine).toBe("sdk");
   });
 
-  test("refuses the SDK engine in place, with the relay's reason", async ({ page, request }) => {
-    await loadApp(page);
-    await openCopilotSettings(page);
-    await saveEngineFromPanel(page, "sdk");
-
-    // The reason replaces the engine description rather than only flashing in
-    // the alert, which is gone as soon as it is dismissed.
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "error");
-    await expect(engineStatus(page)).toContainText("SESSION_WORKER_ROUTING_ENABLED");
-    // The select snaps back to what the relay actually runs — leaving "SDK"
-    // selected would read as though the switch had happened.
-    await expect(engineSelect(page)).toHaveValue("extension");
-
-    expect((await readEngine(request)).engine).toBe("extension");
-  });
-
-  test("answers the refused save with 409 and leaves the stored engine alone", async ({ request }) => {
-    const refused = await request.post("/api/settings/copilot", {
-      headers: authHeaders(),
-      data: { engine: "sdk" },
-    });
-    // 409, not 400: the request is well formed, the relay is not in a state to
-    // honour it.
-    expect(refused.status()).toBe(409);
-    const body = await refused.json();
-    expect(body.error).toMatch(/SESSION_WORKER_ROUTING_ENABLED/);
-    expect(body.error).toMatch(/no SDK worker is ever spawned/);
-    expect((await readEngine(request)).engine).toBe("extension");
-  });
-
-  test("accepts the Extension engine and reflects it on the GET", async ({ request }) => {
-    const saved = await request.post("/api/settings/copilot", {
-      headers: authHeaders(),
-      data: { engine: "extension" },
-    });
-    expect(saved.status()).toBe(200);
-    expect(await saved.json()).toEqual({
-      ok: true,
-      engine: "extension",
-      engines: ["extension", "sdk"],
-    });
-    expect(await readEngine(request)).toEqual({ engine: "extension", engines: ["extension", "sdk"] });
-  });
-
-  test("requires the relay token", async ({ request }) => {
-    const anonymous = await request.post(`${relayBaseUrl()}/api/settings/copilot`, {
-      data: { engine: "sdk" },
-    });
+  test("the GET requires the relay token", async ({ request }) => {
+    const anonymous = await request.get("/api/settings/copilot");
     expect(anonymous.status()).toBe(401);
-  });
-});
-
-test.describe.serial("Copilot engine panel on an SDK-capable relay", () => {
-  // Booting a relay costs a few seconds on top of the page work.
-  test.describe.configure({ timeout: 120_000 });
-
-  let relay = null;
-
-  test.beforeAll(async () => {
-    relay = await startRelayServer({
-      token: randomUUID(),
-      // The only difference from the shared harness server. COPILOT_SDK_PATH is
-      // already pinned to a stub directory for every e2e relay, so this is the
-      // one remaining precondition the engine setting checks.
-      overrides: { COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1" },
-    });
-  });
-
-  test.afterAll(async () => {
-    if (relay) await relay.stop();
-    relay = null;
-  });
-
-  test("saves the SDK engine from the panel and keeps it across a reload", async ({ page, request }) => {
-    page.on("dialog", (dialog) => { dialog.accept().catch(() => {}); });
-
-    // Since extension-retirement Phase 6 an SDK-capable relay defaults to the
-    // SDK engine, so the panel opens there.
-    await loadApp(page, { baseUrl: relay.baseUrl, token: relay.token });
-    await openCopilotSettings(page);
-    await expect(engineSelect(page)).toHaveValue("sdk");
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "active");
-    await expect(engineStatus(page)).toHaveText(SDK_STATUS);
-
-    // The panel is not a one-way door: extension stays selectable.
-    await saveEngineFromPanel(page, "extension");
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "unconfigured");
-    await expect(engineSelect(page)).toHaveValue("extension");
-
-    // Persistence is the point of the setting: a worker spawned after a relay
-    // restart has to pick the same engine.
-    expect(await readEngine(request, { baseUrl: relay.baseUrl, token: relay.token }))
-      .toEqual({ engine: "extension", engines: ["extension", "sdk"] });
-
-    await loadApp(page, { baseUrl: relay.baseUrl, token: relay.token });
-    await openCopilotSettings(page);
-    await expect(engineSelect(page)).toHaveValue("extension");
-
-    // And back to the SDK default.
-    await saveEngineFromPanel(page, "sdk");
-    await expect(engineStatus(page)).toHaveAttribute("data-state", "active");
-    await expect(engineStatus(page)).toHaveText(SDK_STATUS);
-    expect((await readEngine(request, { baseUrl: relay.baseUrl, token: relay.token })).engine)
-      .toBe("sdk");
-  });
-
-  test("names the missing SDK path, distinctly from the routing refusal", async ({ request }) => {
-    const routingRefusal = await request.post("/api/settings/copilot", {
-      headers: authHeaders(),
-      data: { engine: "sdk" },
-    });
-    expect(routingRefusal.status()).toBe(409);
-    const routingReason = (await routingRefusal.json()).error;
-
-    // Routing on, SDK path deliberately unresolvable: blanking the derivation
-    // inputs matters because the relay otherwise falls back to whatever Copilot
-    // CLI the host has installed. HOME already points at the temp state root,
-    // so the CLI-cache scan finds nothing.
-    const bare = await startRelayServer({
-      token: randomUUID(),
-      overrides: {
-        COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
-        COPILOT_SDK_PATH: "",
-        COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH: "",
-        COPILOT_EXTENSION_BOOTSTRAP_PATH: "",
-        COPILOT_CLI_DIST_DIR: "",
-      },
-    });
-    try {
-      const refused = await request.post(`${bare.baseUrl}/api/settings/copilot`, {
-        headers: authHeaders(bare.token),
-        data: { engine: "sdk" },
-      });
-      expect(refused.status()).toBe(409);
-      const sdkReason = (await refused.json()).error;
-      expect(sdkReason).toMatch(/COPILOT_SDK_PATH did not resolve/);
-      // The env is snapshotted at boot, so "install the CLI" alone is not
-      // actionable advice — the restart is the part users miss.
-      expect(sdkReason).toMatch(/restart the relay/);
-
-      // Two causes, two answers: a single generic "SDK unavailable" would send
-      // the user looking in the wrong place.
-      expect(sdkReason).not.toBe(routingReason);
-      expect((await readEngine(request, { baseUrl: bare.baseUrl, token: bare.token })).engine)
-        .toBe("extension");
-    } finally {
-      await bare.stop();
-    }
   });
 });
 
@@ -418,8 +205,7 @@ test.describe.serial("Copilot SDK worker usage snapshot", () => {
     await renderUsageModal(page, payload);
 
     // The card still renders — only the aged section is withheld, because after
-    // a week (or a switch back to the extension engine) nothing will ever
-    // replace those numbers.
+    // a week nothing will ever replace those numbers.
     await expect(page.locator('#summary-modal-body [data-provider="github"]')).toBeVisible();
     await expect(page.locator('#summary-modal-body [data-section-id="copilot-sdk-last-turn"]')).toHaveCount(0);
   });

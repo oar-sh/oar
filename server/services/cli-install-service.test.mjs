@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { CLI_SPAWN_DISABLED_ERROR } from './cli-process-runner.mjs';
+import { COPILOT_SDK_NOT_FOUND, resolveCopilotSdkLaunchPath } from '../copilot-sdk-runtime.mjs';
+import { CLI_LONG_PROBE_TIMEOUT_MS, CLI_SPAWN_DISABLED_ERROR } from './cli-process-runner.mjs';
 import {
+  CLI_INSTALL_TIMEOUT_MS,
   CLI_PROVIDER_IDS,
   createCliInstallService,
   parseClaudeDoctor,
@@ -209,7 +212,7 @@ function createHarness({
 
 // ─── Descriptor table ────────────────────────────────────────────────────────
 
-test('the descriptor table holds exactly grok, claude and a detect-only copilot', () => {
+test('the descriptor table holds exactly grok, claude and copilot', () => {
   // Cursor is deliberately absent: the relay never invokes a Cursor binary.
   assert.deepEqual([...CLI_PROVIDER_IDS].sort(), ['claude', 'copilot', 'grok']);
 });
@@ -249,26 +252,661 @@ test('an unknown action is rejected, and a known provider is case-insensitive', 
   }
 });
 
-test('copilot is read-only: it reports a version but refuses to be installed', async () => {
+// ─── Copilot ─────────────────────────────────────────────────────────────────
+
+const COPILOT_SCRIPT_URL = 'https://raw.githubusercontent.com/github/copilot-cli/main/install.sh';
+const COPILOT_NPM_LOADER = '/usr/lib/node_modules/@github/copilot/npm-loader.js';
+
+/** The launch lookup's answer once a version folder with the SDK exists: its SDK folder. */
+function sdkFound(version = '1.0.112') {
+  return () => `${HOME}/.cache/copilot/pkg/linux-x64/${version}/copilot-sdk`;
+}
+
+/** The lookup's own refusal while no version folder has the SDK. */
+function sdkMissing() {
+  return () => {
+    const error = new Error(`Copilot SDK not found. Looked in: ${HOME}/.cache/copilot/pkg`);
+    error.code = COPILOT_SDK_NOT_FOUND;
+    throw error;
+  };
+}
+
+/** Lets an installer's close, the first run and the re-probe settle. */
+async function settle() {
+  for (let i = 0; i < 10; i += 1) await flush();
+}
+
+/**
+ * Starts a Copilot install whose installer leaves `copilot` in ~/.local/bin,
+ * and holds the first run (`copilot --version`) for the test to answer.
+ */
+async function installCopilotUpToFirstRun(harness, action = 'install') {
+  harness.fsImpl.addDir(`${HOME}/.local/bin`);
+  harness.control.reply = (call) => (call.args.join(' ') === '--version' ? null : defaultReply(call));
+  const installer = startInstall(harness, 'copilot', action);
+  if (action === 'install') harness.fsImpl.addFile(`${HOME}/.local/bin/copilot`);
+  installer.exit(0);
+  await settle();
+  const firstRun = harness.callsFor('--version')[0];
+  assert.ok(firstRun, 'the first run was started');
+  harness.control.reply = defaultReply;
+  return { installer, firstRun };
+}
+
+test('on Linux copilot installs with the vendor script from its raw URL, detached, with stdin closed', async () => {
   const harness = createHarness();
-  harness.fsImpl.addFile('/usr/bin/copilot', { realPath: '/usr/lib/node_modules/@github/copilot/npm-loader.js' });
   try {
     const status = await harness.service.probeCliStatus('copilot');
+    assert.equal(status.installed, false);
+    assert.equal(status.canInstall, true);
+    assert.equal(status.blockedReason, null);
+    assert.equal(status.commands.install.display, `curl -fsSL ${COPILOT_SCRIPT_URL} | bash`);
+    assert.equal(status.commands.install.targetDir, '~/.local/bin');
+    assert.match(status.commands.install.detail, /checksum/);
+    assert.match(status.hint, /run copilot once in a terminal .* log in/);
+
+    startInstall(harness, 'copilot');
+    const call = harness.calls.at(-1);
+    assert.equal(call.command, 'bash');
+    assert.equal(call.args[0], '-lc');
+    const script = call.args[1];
+    assert.ok(script.includes(`curl -fsSL ${COPILOT_SCRIPT_URL} -o "$stage/install.sh"`));
+    assert.ok(!script.includes('gh.io'), 'never the short link');
+    assert.ok(script.includes('bash "$stage/install.sh" </dev/null'), 'the script gets no stdin');
+    assert.ok(script.includes('mv -f "$stage/bin/copilot" "$HOME/.local/bin/copilot"'));
+    assert.ok(!/\.profile|\.bashrc/.test(script), 'no shell profile is edited');
+    // Detached: a session of its own, so no controlling terminal for the
+    // script's /dev/tty question.
+    assert.equal(call.options.detached, true);
+    assert.deepEqual(call.options.stdio, ['ignore', 'pipe', 'pipe']);
+    assert.equal(harness.service.getInstallState().command, `curl -fsSL ${COPILOT_SCRIPT_URL} | bash`);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('on macOS copilot installs with the same script, and its update names the macOS cache', async () => {
+  const harness = createHarness({ platform: 'darwin' });
+  try {
+    const before = await harness.service.probeCliStatus('copilot');
+    assert.equal(before.commands.install.display, `curl -fsSL ${COPILOT_SCRIPT_URL} | bash`);
+    harness.fsImpl.addFile(`${HOME}/.local/bin/copilot`);
+    const after = await harness.service.probeCliStatus('copilot', { force: true });
+    assert.equal(after.commands.update.display, 'copilot update');
+    assert.equal(after.commands.update.targetDir, '~/Library/Caches/copilot');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('on Windows copilot installs with npm through npm.cmd, never winget', async () => {
+  const harness = createHarness({
+    platform: 'win32',
+    pathImpl: path.win32,
+    env: { PATH: 'C:\\Windows', PATHEXT: '.COM;.EXE;.CMD' },
+  });
+  try {
+    const status = await harness.service.probeCliStatus('copilot');
+    assert.equal(status.commands.install.display, 'npm install -g @github/copilot');
+    assert.equal(status.commands.install.targetDir, '%APPDATA%\\npm');
+    assert.match(status.commands.install.detail, /integrity/);
+
+    startInstall(harness, 'copilot');
+    const call = harness.calls.at(-1);
+    assert.equal(call.command, 'powershell');
+    assert.deepEqual(call.args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-Command']);
+    const command = call.args[3];
+    // `exit $LASTEXITCODE` is 0 when npm.cmd does not exist, so a missing npm
+    // is caught first and named, with a failing exit code.
+    assert.ok(command.startsWith('if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) { '));
+    assert.match(command, /\[Console\]::Error\.WriteLine\('npm was not found on PATH\. [^']*'\); exit 1 \}; /);
+    assert.ok(command.endsWith("npm.cmd install -g '@github/copilot'; exit $LASTEXITCODE"));
+    assert.ok(command.indexOf('Get-Command npm.cmd') < command.indexOf('npm.cmd install'));
+    assert.ok(!call.args.join(' ').includes('winget'));
+    assert.deepEqual(call.options.stdio, ['ignore', 'pipe', 'pipe']);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('copilot update is offered for every install method; a copy the relay did not install only says so', async () => {
+  const npm = createHarness();
+  npm.fsImpl.addFile('/usr/bin/copilot', { realPath: COPILOT_NPM_LOADER });
+  try {
+    const status = await npm.service.probeCliStatus('copilot');
     assert.equal(status.installed, true);
     assert.equal(status.version, '1.0.82');
     assert.equal(status.installMethod, 'npm-global');
     assert.equal(status.canInstall, false);
-    assert.equal(status.canUpdate, false);
-    assert.match(status.blockedReason, /npm/i);
-    assert.deepEqual(status.commands, {});
+    assert.equal(status.commands.install, undefined, 'never an Install over a managed copy');
+    assert.equal(status.canUpdate, true, 'copilot update writes to the user cache, not to the npm prefix');
+    assert.equal(status.commands.update.display, 'copilot update');
+    assert.equal(status.commands.update.targetDir, '~/.cache/copilot');
+    assert.match(status.blockedReason, /npm, Homebrew or into a system folder/);
+    assert.match(status.blockedReason, /copilot update writes only to your user cache/);
+    assert.match(status.hint, /To log in, run copilot once in a terminal/);
 
-    const refused = harness.service.runInstall('copilot', { action: 'install' });
-    assert.equal(refused.ok, false);
-    assert.equal(refused.statusCode, 400);
-    assert.match(refused.error, /npm/i);
+    npm.control.reply = () => null;
+    startInstall(npm, 'copilot', 'update');
+    const call = npm.calls.at(-1);
+    assert.equal(call.command, '/usr/bin/copilot');
+    assert.deepEqual(call.args, ['update']);
+  } finally {
+    npm.cleanup();
+  }
+
+  const system = createHarness();
+  system.fsImpl.addFile('/usr/local/bin/copilot');
+  const native = createHarness();
+  native.fsImpl.addFile(`${HOME}/.local/bin/copilot`);
+  try {
+    assert.match((await system.service.probeCliStatus('copilot')).blockedReason, /system folder/);
+    const own = await native.service.probeCliStatus('copilot');
+    assert.equal(own.installMethod, 'native');
+    assert.equal(own.blockedReason, null);
+    assert.equal(own.canUpdate, true);
+  } finally {
+    system.cleanup();
+    native.cleanup();
+  }
+
+  // npm is the relay's own route on Windows, so it gets no note there.
+  const windows = createHarness({
+    platform: 'win32',
+    pathImpl: path.win32,
+    env: { PATH: 'C:\\Users\\dev\\AppData\\Roaming\\npm', PATHEXT: '.COM;.EXE;.CMD' },
+  });
+  windows.fsImpl.addFile('C:\\Users\\dev\\AppData\\Roaming\\npm\\copilot.cmd', {
+    realPath: 'C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\@github\\copilot\\npm-loader.js',
+  });
+  // The .cmd launcher's args reach cmd.exe quoted, so the default reply does
+  // not recognise them.
+  windows.control.reply = () => ({ out: 'GitHub Copilot CLI 1.0.112.\n', code: 0 });
+  try {
+    const status = await windows.service.probeCliStatus('copilot');
+    assert.equal(status.installMethod, 'npm-global');
+    assert.equal(status.blockedReason, null);
+    assert.equal(status.commands.update.targetDir, '%LOCALAPPDATA%\\copilot');
+  } finally {
+    windows.cleanup();
+  }
+});
+
+test('the copilot --version probe gets the long timeout; the other CLIs keep theirs', async () => {
+  const harness = createHarness();
+  harness.fsImpl.addFile(`${HOME}/.local/bin/copilot`);
+  harness.fsImpl.addFile(`${HOME}/.grok/bin/grok`);
+  harness.control.reply = () => null;
+  try {
+    const copilot = harness.service.probeCliStatus('copilot');
+    await flush();
+    assert.deepEqual(harness.timers.delays(), [CLI_LONG_PROBE_TIMEOUT_MS]);
+    assert.equal(harness.timers.fire(5_000), 0, 'a first run past 5 s is not cut off');
+    const versionRun = harness.callsFor('--version')[0];
+    versionRun.child.emitStdout('GitHub Copilot CLI 1.0.112.\n');
+    versionRun.child.exit(0);
+    const status = await copilot;
+    assert.equal(status.installed, true);
+    assert.equal(status.version, '1.0.112');
+
+    const grok = harness.service.probeCliStatus('grok');
+    await flush();
+    assert.deepEqual(harness.timers.delays(), [5_000]);
+    harness.callsFor('--version')[1].child.exit(0);
+    await flush();
+    harness.callsFor('update --check --json')[0].child.exit(0);
+    await grok;
   } finally {
     harness.cleanup();
   }
+});
+
+test('a copilot install is done after its first run, under the install timeout, once the SDK is found', async () => {
+  const harness = createHarness({ findCopilotSdk: sdkFound() });
+  const hookCalls = [];
+  try {
+    harness.service.onInstallSuccess((detail) => { hookCalls.push(`${detail.providerId} ${detail.action}`); });
+    const { firstRun } = await installCopilotUpToFirstRun(harness);
+    assert.equal(firstRun.command, `${HOME}/.local/bin/copilot`);
+    assert.equal(firstRun.options.detached, true);
+    assert.equal(firstRun.options.stdio[0], 'ignore');
+
+    // Still the install: Cancel reaches it and a second install is refused.
+    const running = harness.service.getInstallState();
+    assert.equal(running.state, 'running');
+    assert.equal(running.active, true);
+    assert.equal(harness.service.runInstall('grok').statusCode, 409);
+
+    // Under the install timeout: a first run slower than either probe budget
+    // (12 s were measured on one host) is not cut off.
+    assert.ok(harness.timers.delays().includes(CLI_INSTALL_TIMEOUT_MS));
+    assert.equal(harness.timers.fire(5_000), 0);
+    assert.equal(harness.timers.fire(CLI_LONG_PROBE_TIMEOUT_MS), 0);
+    assert.equal(harness.service.getInstallState().state, 'running');
+
+    firstRun.child.emitStdout('GitHub Copilot CLI 1.0.112.\n');
+    firstRun.child.exit(0);
+    await settle();
+
+    const done = harness.service.getInstallState();
+    assert.equal(done.state, 'success');
+    assert.equal(done.active, false);
+    assert.match(done.log, /\$ copilot --version\nGitHub Copilot CLI 1\.0\.112\./);
+    assert.match(done.log, /Copilot SDK found: \/home\/dev\/\.cache\/copilot\/pkg\/linux-x64\/1\.0\.112\/copilot-sdk\n/);
+    assert.deepEqual(harness.persisted.at(-1), { copilot: `${HOME}/.local/bin/copilot` });
+    assert.equal(harness.env.PATH.split(':')[0], `${HOME}/.local/bin`);
+    assert.deepEqual(hookCalls, ['copilot install']);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('a copilot update gets the same first run before it counts as done', async () => {
+  const harness = createHarness({ findCopilotSdk: sdkFound('1.0.113') });
+  harness.fsImpl.addFile('/usr/bin/copilot', { realPath: COPILOT_NPM_LOADER });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(harness, 'update');
+    assert.deepEqual(harness.calls[0].args, ['update']);
+    assert.equal(harness.service.getInstallState().state, 'running');
+    firstRun.child.exit(0);
+    await settle();
+    assert.equal(harness.service.getInstallState().state, 'success');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('a copilot install whose first run leaves no SDK folder fails with what the lookup saw', async () => {
+  const harness = createHarness({ findCopilotSdk: sdkMissing() });
+  const hookCalls = [];
+  try {
+    harness.service.onInstallSuccess(() => { hookCalls.push('hook'); });
+    const { firstRun } = await installCopilotUpToFirstRun(harness);
+    firstRun.child.exit(0);
+    await settle();
+
+    const state = harness.service.getInstallState();
+    assert.equal(state.state, 'error');
+    assert.equal(state.active, false);
+    assert.match(state.error, /copilot --version ran, but a Copilot launch would not find its SDK: Copilot SDK not found\. Looked in: /);
+    assert.deepEqual(harness.persisted, [], 'nothing is bound');
+    assert.deepEqual(hookCalls, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('a copilot install whose first run fails, or outlasts the install timeout, fails', async () => {
+  const failing = createHarness({ findCopilotSdk: sdkFound() });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(failing);
+    firstRun.child.emitStdout('Error: this build needs a newer glibc\n');
+    firstRun.child.exit(1);
+    await settle();
+    const state = failing.service.getInstallState();
+    assert.equal(state.state, 'error');
+    assert.match(state.error, /first run \(copilot --version\) failed: Error: this build needs a newer glibc/);
+    assert.deepEqual(failing.persisted, []);
+  } finally {
+    failing.cleanup();
+  }
+
+  const hanging = createHarness({ findCopilotSdk: sdkFound() });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(hanging);
+    assert.equal(hanging.timers.fire(CLI_INSTALL_TIMEOUT_MS), 1);
+    await settle();
+    const state = hanging.service.getInstallState();
+    assert.equal(state.state, 'error');
+    assert.match(state.error, /first run \(copilot --version\) failed: timed out after 600000ms/);
+    assert.ok(hanging.kills.some(([pid, signal]) => pid === -firstRun.child.pid && signal === 'SIGTERM'));
+  } finally {
+    hanging.cleanup();
+  }
+});
+
+test('cancel during the copilot first run stops it and binds nothing', async () => {
+  const harness = createHarness({ findCopilotSdk: sdkFound() });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(harness);
+    harness.service.cancel();
+    assert.deepEqual(harness.kills[0], [-firstRun.child.pid, 'SIGTERM']);
+    firstRun.child.exit(null);
+    await settle();
+    assert.equal(harness.service.getInstallState().state, 'cancelled');
+    assert.deepEqual(harness.persisted, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('a launch after a copilot install finds the SDK without a relay restart', async (t) => {
+  // The real lookup (no findCopilotSdk injected) over a cache folder of the
+  // test's own, and the one a worker launch calls, before and after.
+  const cacheHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-install-copilot-cache-'));
+  t.after(() => fs.rmSync(cacheHome, { recursive: true, force: true }));
+  const harness = createHarness({ env: { PATH: '/usr/bin', COPILOT_PKG_CACHE_HOME: cacheHome } });
+  const launchLookup = () => resolveCopilotSdkLaunchPath({ env: harness.env, platform: 'linux', homeDir: HOME });
+  const versionDir = path.join(cacheHome, 'pkg', `linux-${process.arch}`, '1.0.112');
+  try {
+    assert.throws(launchLookup, (error) => error.code === COPILOT_SDK_NOT_FOUND);
+
+    const { firstRun } = await installCopilotUpToFirstRun(harness);
+    // What the CLI's first run does: unpack its package into the cache.
+    fs.mkdirSync(path.join(versionDir, 'copilot-sdk'), { recursive: true });
+    fs.writeFileSync(path.join(versionDir, 'copilot-sdk', 'index.js'), '');
+    fs.writeFileSync(path.join(versionDir, 'app.js'), '');
+    firstRun.child.exit(0);
+    await settle();
+
+    assert.equal(harness.service.getInstallState().state, 'success');
+    assert.equal(launchLookup(), path.join(versionDir, 'copilot-sdk'));
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('with a pinned SDK version that is not in the cache, the done-check fails with the launch\'s own message', async (t) => {
+  // The runtime hands in the launch's lookup with its configuration; here
+  // the same function with a pinned sdkVersion. The first run unpacks
+  // another version, which the launch would refuse.
+  const cacheHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-install-copilot-pinned-'));
+  t.after(() => fs.rmSync(cacheHome, { recursive: true, force: true }));
+  const versionDir = path.join(cacheHome, 'pkg', `linux-${process.arch}`, '1.0.112');
+  fs.mkdirSync(path.join(versionDir, 'copilot-sdk'), { recursive: true });
+  fs.writeFileSync(path.join(versionDir, 'copilot-sdk', 'index.js'), '');
+  fs.writeFileSync(path.join(versionDir, 'app.js'), '');
+  const env = { PATH: '/usr/bin', COPILOT_PKG_CACHE_HOME: cacheHome };
+  const launchLookupWith = (config) => () => resolveCopilotSdkLaunchPath({ config, env, platform: 'linux', homeDir: HOME });
+
+  const pinned = createHarness({ env, findCopilotSdk: launchLookupWith({ sdkVersion: '1.0.200' }) });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(pinned);
+    firstRun.child.exit(0);
+    await settle();
+    const state = pinned.service.getInstallState();
+    assert.equal(state.state, 'error');
+    assert.match(state.error, /but a Copilot launch would not find its SDK: Copilot SDK version 1\.0\.200 not found\./);
+    assert.deepEqual(pinned.persisted, [], 'nothing is bound');
+  } finally {
+    pinned.cleanup();
+  }
+
+  const unpinned = createHarness({ env, findCopilotSdk: launchLookupWith({}) });
+  try {
+    const { firstRun } = await installCopilotUpToFirstRun(unpinned);
+    firstRun.child.exit(0);
+    await settle();
+    assert.equal(unpinned.service.getInstallState().state, 'success');
+    assert.ok(unpinned.service.getInstallState().log.includes(`Copilot SDK found: ${path.join(versionDir, 'copilot-sdk')}\n`));
+  } finally {
+    unpinned.cleanup();
+  }
+});
+
+/** A Windows host whose npm global folder is not the default one. */
+const NODE_DIR = 'C:\\Program Files\\nodejs';
+const NPM_CMD = 'C:\\Program Files\\nodejs\\npm.cmd';
+// How a .cmd launcher reaches cmd.exe: its absolute path, quoted.
+const NPM_CMD_QUOTED = '"C:\\Program Files\\nodejs\\npm.cmd"';
+
+function createCustomNpmPrefixHarness({ stdout = '', stderr = '' } = {}) {
+  const harness = createHarness({
+    platform: 'win32',
+    pathImpl: path.win32,
+    env: { PATH: `C:\\Windows;${NODE_DIR}`, PATHEXT: '.COM;.EXE;.CMD' },
+    findCopilotSdk: () => 'C:\\Users\\dev\\AppData\\Local\\copilot\\pkg\\win32-x64\\1.0.112\\copilot-sdk',
+  });
+  harness.fsImpl.addFile(NPM_CMD);
+  harness.fsImpl.addDir('D:\\tools\\npm-global');
+  // A .cmd launcher's args reach cmd.exe quoted.
+  harness.control.reply = (call) => {
+    if (call.command === NPM_CMD_QUOTED && call.args.join(' ') === '"prefix" "-g"') {
+      if (stderr) call.child.emitStderr(stderr);
+      return { out: stdout, code: 0 };
+    }
+    if (call.args.join(' ') === '"--version"') return { out: 'GitHub Copilot CLI 1.0.112.\r\n', code: 0 };
+    return null;
+  };
+  return harness;
+}
+
+test('after an npm install on Windows, copilot is looked for in npm\'s global folder, through npm.cmd\'s full path', async () => {
+  const harness = createCustomNpmPrefixHarness({ stdout: 'D:\\tools\\npm-global\r\n' });
+  try {
+    const installer = startInstall(harness, 'copilot');
+    // npm wrote its launcher into a prefix that is neither on PATH nor searched.
+    harness.fsImpl.addFile('D:\\tools\\npm-global\\copilot.cmd');
+    installer.exit(0);
+    await settle();
+
+    // Never the bare name: npm.cmd finds its JS through %~dp0, which is the
+    // working directory when cmd.exe starts it by name.
+    assert.ok(!harness.calls.some((call) => call.command === '"npm.cmd"'));
+    const prefixRun = harness.calls.find((call) => call.command === NPM_CMD_QUOTED);
+    assert.deepEqual(prefixRun.args, ['"prefix"', '"-g"'], 'npm prefix -g ran');
+    assert.equal(prefixRun.options.shell, true);
+    const state = harness.service.getInstallState();
+    assert.equal(state.state, 'success', state.error || '');
+    assert.equal(harness.env.PATH.split(';')[0], 'D:\\tools\\npm-global');
+    assert.deepEqual(harness.persisted.at(-1), { copilot: 'D:\\tools\\npm-global\\copilot.cmd' });
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('the npm prefix is the first stdout line that is a folder: a notice on stderr or stdout never is', async () => {
+  const harness = createCustomNpmPrefixHarness({
+    stderr: 'npm notice New major version of npm available! 11.19.1 -> 12.0.0\r\n',
+    stdout: 'npm warn config ignoring an unknown key\r\nD:\\tools\\npm-global\r\n',
+  });
+  try {
+    const installer = startInstall(harness, 'copilot');
+    harness.fsImpl.addFile('D:\\tools\\npm-global\\copilot.cmd');
+    installer.exit(0);
+    await settle();
+    assert.equal(harness.service.getInstallState().state, 'success', harness.service.getInstallState().error || '');
+    assert.equal(harness.env.PATH.split(';')[0], 'D:\\tools\\npm-global');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('the npm prefix lookup runs under the probe timeout, and a miss names the prefix', async () => {
+  const harness = createCustomNpmPrefixHarness();
+  const reply = harness.control.reply;
+  harness.control.reply = (call) => (call.command === NPM_CMD_QUOTED ? null : reply(call));
+  try {
+    const installer = startInstall(harness, 'copilot');
+    installer.exit(0);
+    await settle();
+    const prefixRun = harness.calls.find((call) => call.command === NPM_CMD_QUOTED);
+    assert.deepEqual(harness.timers.delays(), [5_000], 'the probe timeout, not the install timeout');
+    prefixRun.child.emitStdout('D:\\tools\\npm-global\r\n');
+    prefixRun.child.exit(0);
+    await settle();
+
+    const state = harness.service.getInstallState();
+    assert.equal(state.state, 'error');
+    assert.equal(state.error,
+      "GitHub Copilot CLI install finished but copilot was not found on PATH or in npm's global folder D:\\tools\\npm-global");
+    assert.deepEqual(harness.persisted, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('without npm.cmd on PATH there is no prefix lookup to run', async () => {
+  const harness = createCustomNpmPrefixHarness({ stdout: 'D:\\tools\\npm-global\r\n' });
+  harness.fsImpl.removeFile(NPM_CMD);
+  try {
+    const installer = startInstall(harness, 'copilot');
+    installer.exit(0);
+    await settle();
+    assert.ok(!harness.calls.some((call) => /npm\.cmd/.test(call.command)));
+    assert.equal(harness.service.getInstallState().error,
+      'GitHub Copilot CLI install finished but copilot was not found on PATH');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('on a real Windows host the prefix lookup runs an npm.cmd that finds its own JS through %~dp0', { skip: process.platform !== 'win32' }, async (t) => {
+  // A stand-in for the npm.cmd Node.js ships: it starts the JS next to it,
+  // found through %~dp0, which only works when cmd.exe gets its full path.
+  // The installer is the only fake; npm.cmd and copilot.cmd run for real.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-install-npm-prefix-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const nodeDir = path.join(root, 'nodejs');
+  const prefix = path.join(root, 'npm-global');
+  fs.mkdirSync(nodeDir);
+  fs.mkdirSync(prefix);
+  fs.writeFileSync(path.join(nodeDir, 'npm.cmd'), '@ECHO OFF\r\n"%NODE_EXE%" "%~dp0npm-prefix.js" %*\r\n');
+  fs.writeFileSync(path.join(nodeDir, 'npm-prefix.js'), [
+    "process.stderr.write('npm notice a newer npm is available\\n');",
+    `if (process.argv[2] === 'prefix' && process.argv[3] === '-g') process.stdout.write(${JSON.stringify(`${prefix}\r\n`)});`,
+    'else process.exit(1);',
+    '',
+  ].join('\n'));
+  // Neither the host's PATH nor its home: the resolve walk must not find a
+  // copilot the host already has. System32 stays, for cmd.exe (Node starts it from ComSpec).
+  const env = {
+    ...process.env,
+    PATH: `${nodeDir};${path.join(process.env.SystemRoot || 'C:\\Windows', 'System32')}`,
+    NODE_EXE: process.execPath,
+    COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN: '',
+    COPILOT_WEB_RELAY_CLI_BIN_DIR: '',
+  };
+  const realSpawn = (await import('node:child_process')).spawn;
+  const spawnImpl = (command, args, options) => {
+    if (command === 'powershell') {
+      // The npm install itself: it writes copilot.cmd into the custom prefix.
+      fs.writeFileSync(path.join(prefix, 'copilot.cmd'), '@ECHO GitHub Copilot CLI 1.0.112.\r\n');
+      const child = new EventEmitter();
+      child.pid = 0;
+      child.exitCode = null;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => true;
+      setImmediate(() => { child.exitCode = 0; child.emit('close', 0); });
+      return child;
+    }
+    return realSpawn(command, args, options);
+  };
+  const service = createCliInstallService({
+    env,
+    platform: 'win32',
+    homedirImpl: () => root,
+    spawnImpl,
+    logger: { log() {} },
+    findCopilotSdk: () => path.join(root, 'copilot-sdk'),
+    writeBoundBinaries: () => {},
+  });
+  t.after(() => service.dispose());
+  // Only an install with no copilot reachable yet means anything here.
+  if (service.resolveCliBinary('copilot')) {
+    t.skip('this host already has a copilot the resolve walk finds');
+    return;
+  }
+  const done = new Promise((resolve) => {
+    service.subscribe((snapshot) => {
+      if (['success', 'error', 'cancelled'].includes(snapshot.state)) resolve(snapshot);
+    });
+  });
+  assert.equal(service.runInstall('copilot').ok, true);
+  const finished = await done;
+  assert.equal(finished.state, 'success', finished.error || '');
+  assert.equal(service.getBoundBinaries().copilot.toLowerCase(), path.join(prefix, 'copilot.cmd').toLowerCase());
+});
+
+/**
+ * The POSIX install command itself, run by a real bash against stubs: a `curl`
+ * that serves a stand-in for the vendor script and logs what it was asked
+ * for, and a PATH holding only the tools the command uses. Nothing reaches
+ * the network and nothing is installed outside the test's own folder.
+ */
+function runCopilotInstallCommand(t, { validated = true, hashTool = true, existing = '' } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-install-copilot-script-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true });
+  fs.mkdirSync(bin);
+  const tools = ['bash', 'cat', 'chmod', 'find', 'grep', 'mkdir', 'mktemp', 'mv', 'rm', 'tee'];
+  if (hashTool) tools.push('sha256sum', 'shasum');
+  for (const tool of tools) {
+    const found = ['/usr/bin', '/bin', '/usr/local/bin']
+      .map((dir) => path.join(dir, tool))
+      .find((candidate) => fs.existsSync(candidate));
+    if (found) fs.symlinkSync(found, path.join(bin, tool));
+  }
+  const bash = fs.realpathSync(path.join(bin, 'bash'));
+  fs.writeFileSync(path.join(root, 'install.sh'), [
+    'echo "Installing GitHub Copilot CLI..."',
+    'if read -r line; then echo "read from stdin: $line"; fi',
+    'mkdir -p "$PREFIX/bin"',
+    'printf "#!/bin/sh\\necho new\\n" > "$PREFIX/bin/copilot"',
+    'chmod +x "$PREFIX/bin/copilot"',
+    ...(validated ? ['echo "✓ Checksum validated"'] : []),
+    'echo "✓ GitHub Copilot CLI installed to $PREFIX/bin/copilot"',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(bin, 'curl'), [
+    `#!${bash}`,
+    'echo "$*" >> "$STUB_ROOT/curl.log"',
+    'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+    'cat "$STUB_ROOT/install.sh" > "$out"',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  if (existing) fs.writeFileSync(path.join(home, '.local', 'bin', 'copilot'), existing, { mode: 0o755 });
+  // A staging folder a killed install left behind two hours ago.
+  const stale = path.join(home, '.local', '.copilot-install.OLD123');
+  fs.mkdirSync(stale);
+  const twoHoursAgo = new Date(Date.now() - 2 * 3600_000);
+  fs.utimesSync(stale, twoHoursAgo, twoHoursAgo);
+
+  const harness = createHarness();
+  const script = harness.service.getDescriptor('copilot').commands.install.posix.argv[2];
+  harness.cleanup();
+  const result = spawnSync(bash, ['-c', script], {
+    env: { PATH: bin, HOME: home, STUB_ROOT: root },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
+    timeout: 20_000,
+  });
+  const read = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
+  return {
+    result,
+    installed: read(path.join(home, '.local', 'bin', 'copilot')),
+    curlLog: read(path.join(root, 'curl.log')),
+    leftovers: fs.readdirSync(path.join(home, '.local')).filter((name) => name.startsWith('.copilot-install.')),
+  };
+}
+
+test('the copilot install command installs only what the vendor script checked against its checksum', { skip: process.platform === 'win32' }, (t) => {
+  const run = runCopilotInstallCommand(t, { existing: '#!/bin/sh\necho old\n' });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.equal(run.installed, '#!/bin/sh\necho new\n');
+  assert.match(run.curlLog, new RegExp(`^-fsSL ${COPILOT_SCRIPT_URL.replace(/\./g, '\\.')} -o `));
+  assert.ok(!run.result.stdout.includes('read from stdin'), 'the script read nothing');
+  assert.match(run.result.stdout, /Installed to .*\/\.local\/bin\/copilot/);
+  assert.deepEqual(run.leftovers, [], 'its own staging folder and the stale one are gone');
+});
+
+test('the copilot install command fails, and leaves the old binary, when the script skipped its checksum check', { skip: process.platform === 'win32' }, (t) => {
+  const run = runCopilotInstallCommand(t, { validated: false, existing: '#!/bin/sh\necho old\n' });
+  assert.equal(run.result.status, 1);
+  assert.match(run.result.stderr, /did not check the download against its checksum file.*Nothing was installed/);
+  assert.equal(run.installed, '#!/bin/sh\necho old\n');
+  assert.deepEqual(run.leftovers, []);
+});
+
+test('the copilot install command refuses to start without sha256sum or shasum', { skip: process.platform === 'win32' }, (t) => {
+  const run = runCopilotInstallCommand(t, { hashTool: false });
+  assert.equal(run.result.status, 1);
+  assert.match(run.result.stderr, /neither sha256sum nor shasum is installed/);
+  assert.equal(run.curlLog, null, 'nothing was downloaded');
+  assert.equal(run.installed, null);
 });
 
 // ─── resolveCliBinary ────────────────────────────────────────────────────────

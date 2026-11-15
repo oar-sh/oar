@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 import Database from "better-sqlite3";
 import { relayDbPath, relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The stream view, against the shared e2e relay. A turn is queued and taken
 // off the queue; its thoughts and tool lines are posted through the routes a
@@ -20,43 +24,13 @@ const PHONE = { width: 390, height: 844 };
 const DESKTOP = { width: 1280, height: 900 };
 const REPLY = "The cache evicts the oldest widget first; the tests cover it.";
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-async function startTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+// Made as the web client makes a chat: bound to its session from the start.
+async function startTurn(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
+  await started.worker.take(messageId);
   return { conversationId, messageId };
-}
-
-// The worker's heartbeat while the turn runs: without it the CLI reads as
-// offline after a while and the live bubble goes with it.
-function keepWorkerAlive(request, headers, messageId) {
-  const beat = () => request.post("/api/heartbeat", { headers, data: { activeQueueMessageId: messageId } }).catch(() => {});
-  void beat();
-  const timer = setInterval(beat, 2_000);
-  return () => clearInterval(timer);
 }
 
 async function openConversationPage(page, token, conversationId, { stream = true } = {}) {
@@ -109,9 +83,8 @@ test.describe("stream view", () => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const { conversationId, messageId } = await startTurn(request, headers, `Audit the widget cache ${stamp}`);
-    const post = (route, data) => request.post(route, { headers, data: { messageId, conversationId, mode: "agent", ...data } });
-    const stopBeating = keepWorkerAlive(request, headers, messageId);
+    const { conversationId, messageId } = await startTurn(`Audit the widget cache ${stamp}`);
+    const post = (route, data) => request.post(route, { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", ...data } });
     try {
       await openConversationPage(page, token, conversationId);
       for (const [kind, a, b] of FIXTURE.slice(0, 4)) {
@@ -137,7 +110,7 @@ test.describe("stream view", () => {
       await page.waitForResponse(isPoll);
       expect(await streamRows(liveRows)).toEqual(expectedRows(FIXTURE));
 
-      expect((await post("/api/response", { text: REPLY, model: "gpt-5.4-mini" })).ok()).toBeTruthy();
+      expect((await respondAsWorker(messageId, { conversationId, mode: "agent", text: REPLY, model: "gpt-5.4-mini" })).ok).toBeTruthy();
       const finished = page.locator(".msg.assistant .msg-turn-stream > *");
       await expect(finished).toHaveCount(7);
       const kinds = await streamRows(finished);
@@ -189,8 +162,7 @@ test.describe("stream view", () => {
       await expect(page.locator(".msg.assistant .msg-thoughts")).toHaveCount(1);
       await expect(page.locator(".msg.assistant .msg-turn-stream")).toHaveCount(0);
     } finally {
-      stopBeating();
-      await post("/api/response", { text: "cleanup", model: "gpt-5.4-mini" }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, mode: "agent", text: "cleanup", model: "gpt-5.4-mini" }).catch(() => {});
     }
   });
 
@@ -198,12 +170,12 @@ test.describe("stream view", () => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const { conversationId, messageId } = await startTurn(request, headers, `Count the widget files ${stamp}`);
-    const post = (route, data) => request.post(route, { headers, data: { messageId, conversationId, mode: "agent", ...data } });
+    const { conversationId, messageId } = await startTurn(`Count the widget files ${stamp}`);
+    const post = (route, data) => request.post(route, { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", ...data } });
     expect((await post("/api/activity", { text: "Tool (glob): src/**/widget*.js" })).ok()).toBeTruthy();
     expect((await post("/api/thought", { reasoningId: `copilot-thought-${stamp}`, text: "Twelve files match; check the tests too.", done: true })).ok()).toBeTruthy();
     expect((await post("/api/activity", { text: "Tool (glob): tests/**/widget*.test.js" })).ok()).toBeTruthy();
-    expect((await post("/api/response", { text: "There are twelve widget files and four tests.", model: "gpt-5.4-mini" })).ok()).toBeTruthy();
+    expect((await respondAsWorker(messageId, { conversationId, mode: "agent", text: "There are twelve widget files and four tests.", model: "gpt-5.4-mini" })).ok).toBeTruthy();
 
     await openConversationPage(page, token, conversationId);
     const finished = page.locator(".msg.assistant .msg-turn-stream > *");

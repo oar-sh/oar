@@ -368,7 +368,8 @@ test('a reply the watcher waited for itself is not delivered again as turn_end',
   service.noteTurnEnd({ conversationId: BUILDER, queueMessageId: 'msg-own-1', replyText: 'here is your answer' });
   clock.advance(MINUTE);
   assert.equal(eventMessages(db).length, 0, 'held while the watcher waits');
-  assert.equal(service.endOwnWait(wait, { received: true }), 1);
+  // The prompt was open when its turn ended: that turn_end was never recorded.
+  assert.equal(service.endOwnWait(wait, { received: true }).dropped, 0);
   clock.advance(5 * MINUTE);
   assert.equal(eventMessages(db).length, 0);
   // Recorded after the wait (a paired relay's fetch comes later): not recorded at all.
@@ -382,28 +383,28 @@ test('a reply the watcher waited for itself is not delivered again as turn_end',
   assert.match(eventMessages(db)[0].text, /"other work"/);
 });
 
-test('a prompt the watcher did not wait for gets its turn_end as today', () => {
+test('a prompt the watcher did not wait for brings no turn_end: it is owed a late reply', () => {
   const { db, service, clock } = setup();
   service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
   service.noteOwnPrompt({ watcherConversationId: WATCHER, sessionId: BUILDER, messageId: 'msg-own-2' });
   service.noteTurnEnd({ conversationId: BUILDER, queueMessageId: 'msg-own-2', replyText: 'nobody waited' });
   clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
-  assert.match(eventMessages(db)[0].text, /"nobody waited"/);
+  assert.equal(eventMessages(db).length, 0);
+  assert.equal(db.prepare(`SELECT late_state FROM relay_event_own_prompts WHERE message_id = 'msg-own-2'`).get().late_state, null, 'still open');
 });
 
-test('a wait that ends without the finished reply lets the held turn_end go', () => {
+test('a wait that ends without a final outcome leaves the prompt open: no turn_end, the late reply follows', () => {
   const { db, service, clock } = setup();
   service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
   service.noteOwnPrompt({ watcherConversationId: WATCHER, sessionId: BUILDER, messageId: 'msg-own-3' });
   const wait = service.beginOwnWait({ watcherConversationId: WATCHER, messageId: 'msg-own-3', waitMs: 30_000 });
   service.noteTurnEnd({ conversationId: BUILDER, queueMessageId: 'msg-own-3', replyText: 'answered, still working' });
   clock.advance(20_000);
-  assert.equal(eventMessages(db).length, 0);
   // The wait came back "running".
-  assert.equal(service.endOwnWait(wait, { received: false }), 0);
-  // The usual 30 s coalescing from the turn's end.
-  clock.advance(10_000);
-  assert.match(eventMessages(db)[0].text, /"answered, still working"/);
+  assert.equal(service.endOwnWait(wait, { received: false }).dropped, 0);
+  clock.advance(MINUTE);
+  assert.equal(eventMessages(db).length, 0);
+  assert.equal(db.prepare(`SELECT late_state FROM relay_event_own_prompts WHERE message_id = 'msg-own-3'`).get().late_state, null);
 });
 
 test('errors and questions of the watcher\'s own turn still go at once', () => {
@@ -421,7 +422,7 @@ test('errors and questions of the watcher\'s own turn still go at once', () => {
   service.endOwnWait(wait, { received: true });
 });
 
-test('only the watcher\'s own prompt is held: another watcher\'s wait changes nothing, a lost wait expires', () => {
+test('only the watcher\'s own prompt is held: another watcher\'s wait changes nothing, and its own owed prompt brings no turn_end', () => {
   const { db, service, clock } = setup();
   service.subscribe({ watcherConversationId: WATCHER, sessionIds: [BUILDER] });
   service.noteOwnPrompt({ watcherConversationId: DOCS, sessionId: BUILDER, messageId: 'msg-docs' });
@@ -431,14 +432,12 @@ test('only the watcher\'s own prompt is held: another watcher\'s wait changes no
   clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
   assert.match(eventMessages(db)[0].text, /"for the docs session"/);
   takeAll(db);
-  // A wait that never reports back holds no longer than it could have lasted.
+  // A wait that never reports back: the prompt stays open, its late reply brings the reply.
   service.noteOwnPrompt({ watcherConversationId: WATCHER, sessionId: BUILDER, messageId: 'msg-own-5' });
   service.beginOwnWait({ watcherConversationId: WATCHER, messageId: 'msg-own-5', waitMs: 60_000 });
   service.noteTurnEnd({ conversationId: BUILDER, queueMessageId: 'msg-own-5', replyText: 'nobody came back' });
-  clock.advance(MINUTE + 59_000);
+  clock.advance(3 * MINUTE);
   assert.equal(eventMessages(db).length, 1);
-  clock.advance(1_000);
-  assert.match(eventMessages(db)[1].text, /"nobody came back"/);
 });
 
 test('a one-shot turn_end of the watcher\'s own turn is still delivered: it ends the subscription', () => {
@@ -640,5 +639,5 @@ test('a steered prompt whose turn_end carries another message\'s id is not dedup
   service.noteTurnEnd({ conversationId: BUILDER, queueMessageId: 'msg-running-turn', replyText: 'answered both' });
   clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
   assert.match(eventMessages(db)[0].text, /"answered both"/, 'not held by the wait');
-  assert.equal(service.endOwnWait(wait, { received: true }), 0);
+  assert.equal(service.endOwnWait(wait, { received: true }).dropped, 0);
 });

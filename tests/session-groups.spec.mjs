@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, completeTurn, createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Session groups in the sidebar, on a desktop and on a phone viewport, each
@@ -23,8 +27,8 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *    working member to stop.
  *
  * No model runs. The spec plays the worker where one is needed: it takes a
- * message off the queue (GET /api/pending) and posts cards and replies as a
- * worker would. Titles are invented.
+ * message off the queue as the session's worker (helpers/fake-worker.mjs)
+ * and posts cards and replies as a worker would. Titles are invented.
  */
 
 const APPROVAL_TIMEOUT = 20_000;
@@ -54,13 +58,9 @@ async function waitForApprovalCard(api, conversationId) {
 }
 
 /** Takes a conversation's queued message as its worker would: the turn is then processing. */
-async function dequeueAsOwner(api, conversationId, messageId) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const dequeued = await api("/api/pending", { headers: { "x-relay-session-id": conversationId } });
-    if (String(dequeued.payload?.message?.id || "") === messageId) return;
-    await sleep(250);
-  }
-  throw new Error(`The message of ${conversationId.slice(0, 8)} was never handed out`);
+async function dequeueAsOwner(onRelay, conversationId, messageId) {
+  // The sessions here are bound from their creation.
+  await createFakeWorker({ ...onRelay, sessionId: conversationId, conversationId }).take(messageId);
 }
 
 for (const profile of [
@@ -72,6 +72,7 @@ for (const profile of [
     test.use(profile.use);
 
     let relay = null;
+    const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
     const api = createApi(() => relay);
     const tool = (conversationId, action, args = {}) => api("/api/remote-relays/tool", { method: "POST", body: { conversationId, action, args } });
     const seeded = { lead: "", leadMessage: "", docs: "", docsMessage: "", tests: "", testsMessage: "", solo: "" };
@@ -181,13 +182,10 @@ for (const profile of [
 
       // The session that creates the others, with its turn running (the
       // approval card needs a turn to sit on).
-      const queued = await api("/api/message", { method: "POST", body: { text: `Release lead ${Date.now()}`, relayMode: "agent", model: "gpt-5.4-mini" } });
-      expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-      seeded.lead = queued.payload.conversationId;
-      seeded.leadMessage = queued.payload.messageId;
-      const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: seeded.lead, conversation_id: seeded.lead } });
-      expect(synced.status).toBe(200);
-      await dequeueAsOwner(api, seeded.lead, seeded.leadMessage);
+      const lead = await startConversation({ text: `Release lead ${Date.now()}` }, onRelay);
+      seeded.lead = lead.conversationId;
+      seeded.leadMessage = lead.messageId;
+      await dequeueAsOwner(onRelay, seeded.lead, seeded.leadMessage);
 
       const first = tool(seeded.lead, "create_session", { relay: "this", text: "write the docs for the release", title: "Docs pass", wait_seconds: 0 });
       const card = await waitForApprovalCard(api, seeded.lead);
@@ -206,10 +204,9 @@ for (const profile of [
       seeded.testsMessage = tests.payload.message_id;
 
       // A lone chat, newer than everything in the group.
-      const solo = await api("/api/message", { method: "POST", body: { text: "Lone chat about the site", relayMode: "agent", model: "gpt-5.4-mini" } });
-      expect(solo.status).toBe(200);
-      seeded.solo = solo.payload.conversationId;
-      const replied = await api("/api/response", { method: "POST", body: { messageId: solo.payload.messageId, conversationId: seeded.solo, text: "reply", model: "gpt-5.4-mini", mode: "agent" } });
+      const solo = await startConversation({ text: "Lone chat about the site" }, onRelay);
+      seeded.solo = solo.conversationId;
+      const replied = await completeTurn(solo, { text: "reply", model: "gpt-5.4-mini", mode: "agent" }, onRelay);
       expect(replied.status).toBe(200);
     });
 
@@ -291,10 +288,11 @@ for (const profile of [
       await expect.poll(() => listedIds(page)).toEqual([seeded.solo, seeded.lead]);
 
       // The docs member's turn is taken by "its worker", which asks a question.
-      await dequeueAsOwner(api, seeded.docs, seeded.docsMessage);
+      await dequeueAsOwner(onRelay, seeded.docs, seeded.docsMessage);
       const asked = await api("/api/relay-question", {
         method: "POST",
         body: {
+          ...attemptOf(seeded.docsMessage),
           queueId: seeded.docsMessage,
           messageId: seeded.docsMessage,
           conversationId: seeded.docs,
@@ -324,7 +322,11 @@ for (const profile of [
       await expect.poll(() => listedIds(page)).toEqual([seeded.solo, seeded.lead, seeded.docs]);
 
       // The answer, so the card is gone for the next tests.
-      const answered = await api(`/api/relay-question/${encodeURIComponent(asked.payload.question.id)}/answer`, { method: "POST", body: { answer: "main" } });
+      // As the page answers it: with the session the card belongs to.
+      const answered = await api(`/api/relay-question/${encodeURIComponent(asked.payload.question.id)}/answer`, {
+        method: "POST",
+        body: { answer: "main", sdk_session_id: asked.payload.question.sdkSessionId },
+      });
       expect(answered.status).toBe(200);
     });
 
@@ -340,7 +342,7 @@ for (const profile of [
       // The tests member answers: its turn ends while the lone chat is open.
       // No list fetch follows; the pill, the working mark and the menu must follow
       // the live event alone.
-      const replied = await api("/api/response", { method: "POST", body: { messageId: seeded.testsMessage, conversationId: seeded.tests, text: "all green", model: "gpt-5.4-mini", mode: "agent" } });
+      const replied = await completeTurn({ conversationId: seeded.tests, messageId: seeded.testsMessage }, { text: "all green", model: "gpt-5.4-mini", mode: "agent" }, { ...onRelay, stay: true });
       expect(replied.status).toBe(200);
       await expect(pill).toHaveText("3 · 2 running", { timeout: 10_000 });
       await expect(row(page, seeded.tests)).not.toHaveClass(/conv-working/);
@@ -352,8 +354,7 @@ for (const profile of [
       // heartbeats under its session id, so the status poll lists it)
       // publishes a running task (background_only), then an empty set. Both
       // reach the row through the live event, with no list fetch.
-      const beat = await api("/api/heartbeat", { method: "POST", body: {}, headers: { "x-relay-session-id": seeded.tests } });
-      expect(beat.status).toBe(200);
+      expect(await createFakeWorker({ ...onRelay, sessionId: seeded.tests, conversationId: seeded.tests }).beat()).toBe(true);
       const published = await api("/api/background-tasks", { method: "POST", body: { conversationId: seeded.tests, tasks: [{ taskId: "task-build", taskType: "shell", description: "npm run build", startedAt: Date.now() }] } });
       expect(published.status).toBe(200);
       await expect(pill).toHaveText("3 · 3 running", { timeout: 10_000 });
@@ -437,8 +438,19 @@ for (const profile of [
 
     test("Archive group archives the idle members and names the one still working; Stop all asks it to stop", async ({ page }) => {
       // The head's own turn ends: only the docs member is still working.
-      const replied = await api("/api/response", { method: "POST", body: { messageId: seeded.leadMessage, conversationId: seeded.lead, text: "planned", model: "gpt-5.4-mini", mode: "agent" } });
+      const replied = await respondAsWorker(seeded.leadMessage, { conversationId: seeded.lead, text: "planned", model: "gpt-5.4-mini", mode: "agent" });
       expect(replied.status).toBe(200);
+      // The late reply from "Tests pass" (answered while the head's turn ran) starts a turn in the head: take and answer it.
+      const headWorker = createFakeWorker({ ...onRelay, sessionId: seeded.lead, conversationId: seeded.lead });
+      const lateReply = await headWorker.take("", { timeoutMs: 45_000 });
+      expect(String(lateReply?.text || "")).toContain("late_reply");
+      const consumed = await headWorker.respond(lateReply.id, { text: "noted", model: "gpt-5.4-mini", mode: "agent" });
+      expect(consumed.status).toBe(200);
+      await expect.poll(async () => {
+        const list = await api("/api/conversations");
+        const head = list.payload.conversations.find((entry) => entry.id === seeded.lead);
+        return head?.sessionState === "running_turn" || head?.activeTurn === true || head?.processing === true;
+      }, { timeout: 10_000 }).toBe(false);
       await openApp(page);
       const menu = await openRowMenu(page, row(page, seeded.lead));
       await expect(menu.locator('[data-menu-item="group-archive"]')).toHaveText("Archive group (3)");
@@ -477,9 +489,8 @@ for (const profile of [
     test("a group action on a row beyond the first page shows without a reload; a dissolved group leaves the picker", async ({ page }) => {
       // Enough newer chats that the lone chat sits on the second page.
       for (let index = 0; index < 42; index += 1) {
-        const queued = await api("/api/message", { method: "POST", body: { text: `Filler chat ${index}`, relayMode: "agent", model: "gpt-5.4-mini" } });
-        expect(queued.status).toBe(200);
-        const replied = await api("/api/response", { method: "POST", body: { messageId: queued.payload.messageId, conversationId: queued.payload.conversationId, text: "reply", model: "gpt-5.4-mini", mode: "agent" } });
+        const queued = await startConversation({ text: `Filler chat ${index}` }, onRelay);
+        const replied = await completeTurn(queued, { text: "reply", model: "gpt-5.4-mini", mode: "agent" }, onRelay);
         expect(replied.status).toBe(200);
       }
       await openApp(page);

@@ -7,6 +7,10 @@ import { createRequire } from "node:module";
 import { expect, test } from "@playwright/test";
 
 import { repoRoot, sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, relayPresence, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The media gallery beyond its first page, on a relay of its own seeded
@@ -21,7 +25,7 @@ import { repoRoot, sleep, startRelayServer } from "./relay-server-harness.mjs";
  *   deleted since is left out and counted.
  *
  * No worker runs: the question's turn is a message the spec took off the
- * queue (GET /api/pending), as in mobile-session-header.spec.mjs.
+ * queue as the session's worker, as in mobile-session-header.spec.mjs.
  */
 
 const DESKTOP = { width: 1280, height: 800 };
@@ -175,9 +179,11 @@ test("offline and back: the refresh after the reconnect leaves the Media view in
   await context.setOffline(true);
   await sleep(1500);
   await context.setOffline(false);
-  // The CLI comes online (a client polls for work): the page refreshes its view,
-  // as it does after every reconnect.
-  await api("/api/pending");
+  // The CLI comes online (the relay hears from a worker): the page refreshes
+  // its view, as it does after every reconnect.
+  const presence = relayPresence({ baseUrl: relay.baseUrl, token: relay.token });
+  await presence.beat();
+  presence.stop();
   await sleep(5000);
   await expect(page.locator("body")).toHaveClass(/media-view-active/);
   await expect(view.locator(".media-tile")).toHaveCount(tiles);
@@ -185,24 +191,23 @@ test("offline and back: the refresh after the reconnect leaves the Media view in
 
 test("a question waiting in another session does not pull the reader out of the Media view", async ({ page }) => {
   const view = await openMediaView(page);
-  const queued = await api("/api/message", { method: "POST", body: { text: "Which bed first?", relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const { conversationId, ownerSessionId, messageId } = queued.payload;
-  await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const dequeued = await api("/api/pending", { headers: ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {} });
-    if (String(dequeued.payload?.message?.conversationId || dequeued.payload?.message?.conversation_id || "") === conversationId) break;
-    await sleep(250);
-  }
+  // Made as the web client makes a chat: bound to its session from the start.
+  const { messageId, worker } = await startConversation({ text: "Which bed first?" }, { baseUrl: () => relay.baseUrl, token: () => relay.token });
+  await worker.take(messageId);
   const asked = await api("/api/relay-question", {
     method: "POST",
-    body: { queueId: messageId, prompt: "Which bed is planted first?", choices: ["North", "South"], timeout_ms: 600_000 },
+    body: { ...attemptOf(messageId), queueId: messageId, prompt: "Which bed is planted first?", choices: ["North", "South"], timeout_ms: 600_000 },
   });
   expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
   // The questions poll runs every 3 s; with nothing open it would open the asking session.
-  await sleep(7000);
-  await expect(page.locator("body")).toHaveClass(/media-view-active/);
-  await expect(view.locator(".media-tile").first()).toBeVisible();
+  try {
+    await sleep(7000);
+    await expect(page.locator("body")).toHaveClass(/media-view-active/);
+    await expect(view.locator(".media-tile").first()).toBeVisible();
+  } finally {
+    // The asking turn ends with the test.
+    await worker.respond(messageId, { text: "North first.", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
+  }
 });
 
 test("tiles that failed while the relay was away load after the reconnect", async ({ page }) => {

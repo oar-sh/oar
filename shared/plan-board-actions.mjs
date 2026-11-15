@@ -1,7 +1,6 @@
 /**
  * The buttons of a `plan_ready` card, one list for every provider: the Claude,
- * Copilot, Cursor and Grok workers post it, the CLI extension adds
- * "Approve plan" to the Copilot CLI's own list, and the relay's action route
+ * Copilot, Cursor and Grok workers post it, and the relay's action route
  * builds the follow-up message from the same table.
  *
  * - `approve_only` marks the plan approved. Its follow-up runs one turn in

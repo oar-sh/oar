@@ -14,6 +14,9 @@
  */
 export function createPendingWorkerPrimer({
   isEnabled = () => true,
+  // Fails the pending rows whose conversation is gone (they would wait for
+  // good); run first on every prime, also where no worker is launched.
+  failGoneRows = () => 0,
   listPendingOwnerSessionIds,
   isKillBlocked = () => false,
   // A session whose rows were failed instead of launched (a Claude API chat
@@ -26,6 +29,11 @@ export function createPendingWorkerPrimer({
   limit = 25,
 } = {}) {
   return async function prime(reason = 'pending-worker-prime') {
+    try {
+      failGoneRows();
+    } catch (error) {
+      warn(`QUEUE     gone-conversation sweep failed err=${error?.message || error}`);
+    }
     if (!isEnabled()) return 0;
     const rows = listPendingOwnerSessionIds(limit) || [];
     if (rows.length) onRowsWaiting();

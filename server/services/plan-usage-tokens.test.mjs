@@ -152,6 +152,38 @@ test('appendTokenSections adds the groups to their cards, the plan before the ow
   assert.deepEqual(kept[0].details, []);
 });
 
+test('appendTokenSections adds each group\'s charts after the card\'s own, the plan first; none to DeepSeek or without rows', () => {
+  const { service, book } = setup();
+  book('github', [{ model: 'gpt-5.5', inputTokens: 9, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0 }], { billing: 'byok-openai' });
+  book('github', [{ model: 'gpt-5.5', inputTokens: 4, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0 }]);
+  book('deepseek', [{ model: 'deepseek-flash', inputTokens: 4, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0 }]);
+  book('claude', [{ model: 'claude-opus-5-5', inputTokens: 4, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0, costUsd: 0.5 }]);
+  const own = { id: 'own-chart', label: 'Own', kind: 'columns', series: [], items: [] };
+  const cards = [
+    { provider: 'github', details: [], charts: [own] },
+    { provider: 'deepseek', details: [], charts: [own] },
+    { provider: 'cursor', details: [], charts: [] },
+    { provider: 'claude', details: [] },
+  ];
+  appendTokenSections(cards, (options) => service.readPeriods(options));
+  assert.deepEqual(cards[0].charts.map((chart) => chart.id), [
+    'own-chart',
+    'github-daily-tokens-7d', 'github-token-shares-7d', 'github-daily-tokens-30d', 'github-token-shares-30d', 'github-daily-tokens-90d', 'github-token-shares-90d',
+    'github-daily-tokens-byok-openai-7d', 'github-token-shares-byok-openai-7d', 'github-daily-tokens-byok-openai-30d', 'github-token-shares-byok-openai-30d', 'github-daily-tokens-byok-openai-90d', 'github-token-shares-byok-openai-90d',
+  ]);
+  // DeepSeek draws its own charts; it still gets its Tokens sections.
+  assert.deepEqual(cards[1].charts, [own]);
+  assert.ok(cards[1].details.some((section) => section.id === 'deepseek-token-usage'));
+  assert.deepEqual(cards[2].charts, []);
+  // Booked today: "Nov 2" is the last column, at Claude Code's figure.
+  const claude = cards[3].charts.find((chart) => chart.id === 'claude-daily-spend-30d');
+  assert.deepEqual([claude.unit, claude.items.at(-1).label, claude.items.at(-1).values], ['usd', 'Nov 2', { 'model:claude-opus-5-5': 0.5 }]);
+  // A failing read changes nothing.
+  const kept = [{ provider: 'grok', details: [], charts: [own] }];
+  appendTokenSections(kept, () => { throw new Error('locked'); });
+  assert.deepEqual(kept[0], { provider: 'grok', details: [], charts: [own] });
+});
+
 test('a tab may name its models: the label where it has one, the raw id where it has none', () => {
   const { service, book } = setup();
   book('claude-api', [

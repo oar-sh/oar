@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Archiving conversations from the sidebar, the Archived view, and the row
@@ -13,21 +17,13 @@ import { relayToken } from "./e2e-env.mjs";
  * long-press gesture). Unarchive brings a chat back to the live list.
  */
 
-async function seed(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const messageId = String(body?.messageId || "").trim();
+// Made as the web client makes a chat: bound to its session from the start.
+async function seed(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "").trim();
   expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   return conversationId;
 }
 
@@ -49,8 +45,8 @@ for (const profile of [
       const token = relayToken();
       const headers = { Authorization: `Bearer ${token}` };
       const stamp = Date.now();
-      const first = await seed(request, headers, `archive-row-${profile.name}-${stamp}`);
-      const second = await seed(request, headers, `archive-menu-${profile.name}-${stamp}`);
+      const first = await seed(`archive-row-${profile.name}-${stamp}`);
+      const second = await seed(`archive-menu-${profile.name}-${stamp}`);
       page.on("dialog", (dialog) => { dialog.accept().catch(() => {}); });
 
       try {

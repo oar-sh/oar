@@ -4,7 +4,7 @@ function sleepDefault(ms) {
 
 /**
  * Poll the relay's control API while a turn is in flight, mirroring the
- * Copilot extension's `checkActiveAbortControl` semantics:
+ * removed Copilot CLI extension's `checkActiveAbortControl` semantics:
  * - `abort_turn`   → invoke `onAbortTurn()` and acknowledge the control.
  * - `abort_subagent` → try `onAbortSubagent(subagentRunId)` when the worker
  *   provides one (the Claude worker can stop a BACKGROUNDED subagent via

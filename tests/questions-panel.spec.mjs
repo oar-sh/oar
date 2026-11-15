@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import { expect, test } from "@playwright/test";
 
-import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { startRelayServer } from "./relay-server-harness.mjs";
+import { respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * 📓 Questions on a relay of its own: the header icon with its count (the
@@ -263,6 +267,7 @@ test.describe.serial("📓 stubs", () => {
   test.describe.configure({ timeout: 180_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const suffix = Date.now();
   const turn = {};
   const ids = {};
@@ -276,24 +281,19 @@ test.describe.serial("📓 stubs", () => {
     return { status: response.status, payload: await response.json().catch(() => null) };
   }
 
+  // A session no turn runs in, made by a bare first message.
   async function conversation(text) {
     const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
     expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
     return queued.payload;
   }
 
-  // A turn a worker took: its queue row is the live one while it runs.
+  // A turn a worker took: its queue row is the live one while it runs. Made
+  // as the web client makes a chat: bound to its session from the start.
   async function runningTurn(text) {
-    const { conversationId, messageId, ownerSessionId } = await conversation(text);
-    const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-    expect(synced.status).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-      await sleep(250);
-    }
-    throw new Error("The message was never handed out");
+    const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+    await worker.take(messageId);
+    return { conversationId, messageId };
   }
 
   async function ask(conversationId, args) {
@@ -346,7 +346,7 @@ test.describe.serial("📓 stubs", () => {
         await expect(live).toHaveText("📓 Question for you · urgent");
         await expect(live.locator(".msg-ask-stub-urgent")).toHaveText("urgent");
         await shoot(page, `stub-live-${layout}`);
-        const answered = await api("/api/response", { method: "POST", body: { messageId: turn.messageId, conversationId: turn.conversationId, text: "The transect plan is ready; one question is in 📓.", model: "gpt-5.4-mini" } });
+        const answered = await respondAsWorker(turn.messageId, { conversationId: turn.conversationId, text: "The transect plan is ready; one question is in 📓.", model: "gpt-5.4-mini" });
         expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
       }
       const inReply = page.locator(`.msg.assistant[data-source-message-id="${turn.messageId}"] .msg-ask-stub[data-ask-id="${ids.live}"]`);

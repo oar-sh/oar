@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { createApiClient } from "../shared/worker-runtime/api-client.mjs";
-import { createHeartbeatController } from "../shared/worker-runtime/heartbeat.mjs";
-import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { startRelayServer } from "./relay-server-harness.mjs";
+import { createFakeWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A relay restart must not forget the running background tasks of the
 // workers that outlive it. The relay holds the task sets in memory, so its
@@ -11,8 +13,9 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 // again. Until the workers had time to report, a suspend is held back.
 //
 // This spec boots its OWN relay and restarts it on the same state. The
-// "worker" is this process: the real heartbeat controller and API client of
-// the session workers, around one running shell that never ends.
+// "worker" is this process (helpers/fake-worker.mjs: the real heartbeat
+// controller of the session workers), around one running shell that never
+// ends.
 
 // Long enough to be seen right after a restart on a slow machine, short
 // enough to wait out. Production: 45 s.
@@ -20,6 +23,8 @@ const BOOT_WINDOW_MS = 15_000;
 const PLACEHOLDER_ID = "unreported-background-work";
 
 let relay = null;
+// The relay restarts on the same port; the worker follows whichever runs.
+const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
 
 function api(route, { method = "GET", body, headers = {} } = {}) {
   return fetch(`${relay.baseUrl}${route}`, {
@@ -43,67 +48,43 @@ async function restartRelay() {
 }
 
 // A conversation whose only turn is answered: nothing runs in it but what the
-// worker reports. Only its message is ever pending when this runs.
+// worker reports. Made as the web client makes a chat: bound to its session
+// (its own id) from the start.
 async function idleConversation(text) {
-  const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const { conversationId, messageId, ownerSessionId } = queued.payload;
-  const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-  const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-  let handed = false;
-  for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-    handed = String((await api("/api/pending", { headers })).payload?.message?.id || "") === messageId;
-    if (!handed) await sleep(250);
-  }
-  expect(handed, "the message was handed out").toBe(true);
-  const answered = await api("/api/response", { method: "POST", body: { messageId, conversationId, text: "started it in the background", model: "gpt-5.4-mini" } });
+  const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+  await worker.take(messageId);
+  const answered = await worker.respond(messageId, { text: "started it in the background", model: "gpt-5.4-mini" });
   expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
   return conversationId;
 }
 
 /**
- * A session worker as the relay sees one: its identity headers on every
- * request, a task set it owns, the real heartbeat. `digest: false` is a
- * worker on older code, which sends no digest and cannot be asked.
+ * A session worker as the relay sees one (helpers/fake-worker.mjs), with a
+ * task set it owns. `digest: false` is a worker on older code, which sends
+ * no digest and cannot be asked.
  */
 function fakeWorker(conversationId, { digest = true } = {}) {
-  const posts = [];
   const tasks = [];
-  const client = createApiClient({
-    serverUrl: relay.baseUrl,
-    token: relay.token,
-    getHeaders: () => ({
-      "x-relay-session-id": conversationId,
-      "x-relay-conversation-id": conversationId,
-      "x-relay-process-pid": String(process.pid),
-    }),
-  });
-  const send = async (method, route, body) => {
-    posts.push({ route, body });
-    return client(method, route, body);
-  };
-  let timer = null;
+  const base = createFakeWorker({ ...onRelay, sessionId: conversationId, conversationId });
+  // What this worker sent from here on: its heartbeats and task posts.
+  const from = base.calls.length;
   const worker = {
-    posts,
+    get posts() { return base.calls.slice(from); },
     tasks,
     backgroundWork: false,
-    publish: (extra = {}) => send("POST", "/api/background-tasks", { conversationId, tasks, ...extra }),
+    publish: async (extra = {}) => {
+      const published = await base.post("/api/background-tasks", { conversationId, tasks, ...extra });
+      expect(published.status, JSON.stringify(published.payload)).toBe(200);
+    },
+    beat: async () => { expect(await base.beat(), "the relay answered the heartbeat").toBe(true); },
   };
-  const heartbeat = createHeartbeatController({
-    api: send,
-    pollMs: 60_000,
-    getSessionReady: () => true,
-    getHeartbeatTimer: () => timer,
-    setHeartbeatTimer: (value) => { timer = value; },
-    getActiveQueueMessageId: () => "",
-    getSteeringState: () => ({ turnActive: false, autoCompactWindow: { active: null, backgroundWork: worker.backgroundWork } }),
+  base.use({
+    getSteering: () => ({ turnActive: false, autoCompactWindow: { active: null, backgroundWork: worker.backgroundWork } }),
     ...(digest ? {
       getBackgroundTaskIds: () => tasks.map((task) => task.taskId),
       onResyncBackgroundTasks: () => worker.publish({ resync: true }),
     } : {}),
   });
-  worker.beat = async () => { expect(await heartbeat.pulseHeartbeat(), "the relay answered the heartbeat").toBe(true); };
   return worker;
 }
 

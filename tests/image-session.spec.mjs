@@ -9,6 +9,10 @@ import { runDirectOpenAIImageTurn, shouldUseDirectOpenAIImageApi } from "../shar
 import { closeComposerSettings, composerControl, selectComposerOption } from "./composer-settings-helpers.mjs";
 import { FAKE_OPENAI_KEY, readPngSize, solidPng, startFakeOpenAIImages } from "./fake-openai-images.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { createFakeWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * OpenAI image sessions end to end: the key and Base URL in Settings →
@@ -24,7 +28,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *
  * The relay is its own (one relay and one fake for the file, the steps in
  * order). It runs no worker: the spec takes each image turn off the queue as
- * a session worker does (GET /api/pending) and runs it with the workers' own
+ * the session's worker (helpers/fake-worker.mjs) and runs it with the workers' own
  * image path (shared/worker-runtime/direct-openai-image.mjs), which hands it
  * to the relay's execute route; the relay sends the request to the fake and
  * the previews to the page. For the agent, the spec calls the relay_tool
@@ -84,6 +88,7 @@ test.describe("OpenAI image sessions", () => {
 
   let fake = null;
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
 
   async function api(route, { method = "GET", body, headers = {} } = {}) {
     const response = await fetch(`${relay.baseUrl}${route}`, {
@@ -100,28 +105,31 @@ test.describe("OpenAI image sessions", () => {
     body: { conversationId, action, args },
   });
 
-  // What a session worker uses to talk to its relay.
-  const workerApi = () => createApiClient({ serverUrl: relay.baseUrl, token: relay.token });
-
   /**
-   * One queued image row, taken and run as a session worker runs it. With
-   * `conversationId` the row must be that conversation's; `onIdle` is asked
+   * One queued image row of a conversation, taken and run as its session
+   * worker runs it. `conversationId` may be a function for a conversation
+   * that is still being created (it answers "" until then); `onIdle` is asked
    * between polls (it may throw to give up).
    */
-  async function takeImageTurn({ conversationId = "", onIdle = null, timeoutMs = TURN_TIMEOUT_MS } = {}) {
-    const worker = workerApi();
+  async function takeImageTurn({ conversationId, onIdle = null, timeoutMs = TURN_TIMEOUT_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const { message } = await worker("GET", "/api/pending");
+      const id = typeof conversationId === "function" ? await conversationId() : conversationId;
+      const worker = id ? createFakeWorker({ ...onRelay, sessionId: id, conversationId: id }) : null;
+      const message = worker ? (await worker.poll()).payload?.message || null : null;
       if (message) {
-        if (conversationId && String(message.conversationId) !== conversationId) {
-          throw new Error(`Another conversation's row was handed out: ${String(message.conversationId).slice(0, 8)}`);
-        }
         if (!shouldUseDirectOpenAIImageApi(message)) {
           throw new Error(`Not an image turn: provider ${message.providerType}, model ${message.providerModel || message.model}`);
         }
-        const result = await runDirectOpenAIImageTurn({ api: worker, message, requestOptions: { longCall: true } });
-        return { message, result };
+        // What a session worker uses to talk to its relay.
+        const api = createApiClient({ serverUrl: relay.baseUrl, token: relay.token, getHeaders: () => worker.headers });
+        try {
+          const result = await runDirectOpenAIImageTurn({ api, message, requestOptions: { longCall: true } });
+          return { message, result };
+        } finally {
+          // The image path settled the row itself.
+          worker.release(message.id);
+        }
       }
       if (onIdle) await onIdle();
       await sleep(150);
@@ -197,16 +205,11 @@ test.describe("OpenAI image sessions", () => {
 
   test("New Chat starts an image chat; a custom size goes out, previews show while it runs, then the image", async ({ page }) => {
     let bootstrapResponse = null;
-    // A relay that cannot start a worker answers a valid bootstrap 409 after
-    // it committed the conversation; the success payload a real relay sends
-    // is restored for the client (as in deepseek-provider.spec.mjs).
+    // The relay's answer to the bootstrap, as the page gets it.
     await page.route("**/api/conversation/bootstrap", async (route) => {
       const response = await route.fetch();
       const text = await response.text();
       try { bootstrapResponse = JSON.parse(text); } catch { bootstrapResponse = null; }
-      if (response.status() === 409 && bootstrapResponse?.conversationCreated) {
-        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...bootstrapResponse, ok: true }) });
-      }
       return route.fulfill({ response, body: text });
     });
     await loadApp(page);
@@ -345,25 +348,10 @@ test.describe("OpenAI image sessions", () => {
 
     // The conversation the agent runs in, with its turn taken by a "worker":
     // the approval card sits on that turn. Nothing else is queued now.
-    const queued = await api("/api/message", {
-      method: "POST",
-      body: { text: "plan the posters for the spring fair", relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const orchestrator = String(queued.payload.conversationId);
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: orchestrator, conversation_id: orchestrator },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    const dequeueHeaders = queued.payload.ownerSessionId ? { "x-relay-session-id": String(queued.payload.ownerSessionId) } : {};
-    let orchestratorRunning = false;
-    for (let attempt = 0; attempt < 40 && !orchestratorRunning; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers: dequeueHeaders });
-      orchestratorRunning = String(dequeued.payload?.message?.id || "") === String(queued.payload.messageId);
-      if (!orchestratorRunning) await sleep(250);
-    }
-    expect(orchestratorRunning, "the orchestrating conversation's message was handed out").toBe(true);
+    // Made as the web client makes a chat: bound to its session from the start.
+    const queued = await startConversation({ text: "plan the posters for the spring fair" }, onRelay);
+    const orchestrator = String(queued.conversationId);
+    await queued.worker.take(queued.messageId);
 
     // The image the agent attaches, in the new session's folder.
     const workDir = fs.realpathSync.native(fs.mkdtempSync(path.join(relay.stateRoot, "poster-work-")));
@@ -389,6 +377,11 @@ test.describe("OpenAI image sessions", () => {
     // worker (the new session's image row), until the row is taken.
     let approved = false;
     const ran = await takeImageTurn({
+      // The new session, once the relay has made it: its worker takes the row.
+      conversationId: async () => {
+        const listed = await api("/api/conversations");
+        return String((listed.payload?.conversations || []).find((conversation) => conversation.title === "spring fair poster")?.id || "");
+      },
       onIdle: async () => {
         if (settled) throw new Error(`create_session ended before its turn ran: ${settled.status} ${JSON.stringify(settled.payload)}`);
         if (approved) return;

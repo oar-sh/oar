@@ -26,6 +26,7 @@ import {
   isRemoteRelayApprovalQuestion,
   isRemoteRelayWriteAction,
   normalizeRemoteRelayLink,
+  normalizeRemoteRelayAgentPromptsBeforeAsking,
   normalizeRemoteRelayMaxWaitSeconds,
   normalizeRemoteRelayOrigin,
   normalizeRemoteRelayPermission,
@@ -144,6 +145,17 @@ test('the longest-wait setting has a range, a step and a default', () => {
   assert.equal(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled, 'agent_sessions_enabled');
   assert.equal(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds, 'remote_relay_max_wait_seconds');
   assert.equal(AGENT_SESSIONS_SOCKET_EVENT, 'agent_sessions_settings_updated');
+});
+
+test('the loop guard limit: 0 never asks, else 10–500 in steps of 10; anything else is the default 30', () => {
+  assert.equal(REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking, 30);
+  assert.deepEqual([REMOTE_RELAY_LIMITS.agentPromptsMin, REMOTE_RELAY_LIMITS.agentPromptsMax, REMOTE_RELAY_LIMITS.agentPromptsStep], [10, 500, 10]);
+  assert.equal(REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking, 'remote_relay_agent_prompts_before_asking');
+  assert.equal(REMOTE_RELAY_SETTING_KEYS.loopGuardOff, 'remote_relay_loop_guard_off');
+  for (const kept of [0, 10, 30, 120, 500]) assert.equal(normalizeRemoteRelayAgentPromptsBeforeAsking(kept), kept);
+  for (const value of [5, 501, 15, -10, 30.5, '120', '0', '', null, undefined, Number.NaN, true]) {
+    assert.equal(normalizeRemoteRelayAgentPromptsBeforeAsking(value), 30, String(value));
+  }
 });
 
 test('create_session takes repo and branch with provider claude-cloud, and with no other', () => {

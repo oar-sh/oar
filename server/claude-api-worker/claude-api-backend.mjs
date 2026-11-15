@@ -121,9 +121,7 @@ const FOREIGN_CLI_VARIABLES = Object.freeze([
   // tools file for its own. The relay's Claude configuration
   // (CLAUDE_CONFIG_DIR, CLAUDE_CODE_EXECUTABLE) is not on it.
   'COPILOT_ALLOW_ALL',
-  'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
   'COPILOT_SDK_PATH',
-  'EXTENSION_PATH',
   'COPILOT_MODEL',
   'COPILOT_RELAY_MODEL',
   'CLAUDE_RELAY_MODEL',

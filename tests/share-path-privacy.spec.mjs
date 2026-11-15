@@ -1,6 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayDbPath, relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // Path privacy in shared views, against the shared e2e relay (default mode:
 // hide the path, show the file name). One turn names a host path in its tool
@@ -13,41 +17,20 @@ import { relayDbPath, relayToken } from "./e2e-env.mjs";
 // read-only, its record filtered too, with no Stop. Settings → Sharing sets
 // the mode, and a share link follows it.
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
 const HOST_FILE = "/home/dev/work/demo/src/app.js";
 const HOST_CHILD_FILE = "/home/dev/work/demo/lib/parser.js";
 
 async function seedTurn(request, headers, stamp) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text: `Fix the report builder ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+  // Made as the web client makes a chat: bound to its session from the start.
+  const started = await startConversation({ text: `Fix the report builder ${stamp}` });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
+  await started.worker.take(messageId);
   const runId = `toolu_share_${stamp}`;
-  expect((await request.post("/api/activity", { headers, data: { messageId, conversationId, mode: "agent", text: `Read ${HOST_FILE}` } })).ok()).toBeTruthy();
+  expect((await request.post("/api/activity", { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", text: `Read ${HOST_FILE}` } })).ok()).toBeTruthy();
   expect((await request.post("/api/subagent-run", {
     headers,
-    data: { messageId, conversationId, subagentRunId: runId, displayName: "Survey the parser", status: "running", subagentType: "Explore", timelineOwner: "worker" },
+    data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Survey the parser", status: "running", subagentType: "Explore", timelineOwner: "worker" },
   })).ok()).toBeTruthy();
   expect((await request.post("/api/subagent-timeline", {
     headers,
@@ -62,10 +45,7 @@ async function seedTurn(request, headers, stamp) {
       header: { status: "completed" },
     },
   })).ok()).toBeTruthy();
-  expect((await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `Fixed ${HOST_FILE}; src/util.js needs a look too.`, model: "gpt-5.4-mini", mode: "agent" },
-  })).ok()).toBeTruthy();
+  expect((await respondAsWorker(messageId, { conversationId, text: `Fixed ${HOST_FILE}; src/util.js needs a look too.`, model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
   return { conversationId, runId };
 }
 

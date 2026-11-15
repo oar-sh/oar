@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 
-import { buildDequeuedRelayMessage } from './messages-routes.mjs';
 import { makeRouteDeps, captureRoutes, invokeRoute } from './messages-routes-test-harness.mjs';
 import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
@@ -45,7 +44,7 @@ function seedConversation(db, id, { provider = 'openai', model = 'gpt-image-2', 
   `).run(`rs-${id}`, id, id, `key-${id}`, model, provider, model, NOW, NOW);
 }
 
-function boot(t, { continuity = true, provider = 'openai', model = 'gpt-image-2', cwd = null, references = [] } = {}) {
+function boot(t, { provider = 'openai', model = 'gpt-image-2', cwd = null, references = [] } = {}) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oar-image-inputs-')));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
   const dirs = {
@@ -73,7 +72,6 @@ function boot(t, { continuity = true, provider = 'openai', model = 'gpt-image-2'
     MAX_UPLOAD_ATTACHMENTS: 6,
     DEFAULT_RELAY_MODE: 'agent',
     configuredConversationSessionMode: 'isolated',
-    featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: continuity },
     imageOperationService: createImageOperationService({ db, repository: stmts, uuidv4: () => crypto.randomUUID() }),
     getOpenAIProviderSettings: () => ({ configured: true, enabled: true, model: 'gpt-image-2', models: ['gpt-image-2', 'dall-e-3', 'gpt-5'] }),
     resolveRequestedModel: (value) => ({ ok: true, model: String(value || 'gpt-5.4-mini'), available: ['gpt-5.4-mini'] }),
@@ -363,29 +361,6 @@ test('the composer\'s image body: a custom size, count, format and background re
   assert.equal(refused.status, 400, JSON.stringify(refused.body));
   assert.match(refused.body.error, /aspect ratio/);
   assert.deepEqual(relay.counts(), before);
-});
-
-test('without image continuity the worker gets the turn\'s options as imageOptions', async (t) => {
-  const relay = boot(t, { continuity: false });
-  relay.stmts.writeConversationImageDefaults(CONV, { size: '1536x1024' });
-  const file = relay.write('a.png');
-  const sent = await relay.agentSend({ imagePaths: [file], image: { count: 2, background: 'transparent' } });
-  assert.equal(sent.status, 200, JSON.stringify(sent.body));
-  assert.equal(relay.operation(sent.body.messageId), undefined);
-  const row = relay.stmts.findQById.get(sent.body.messageId);
-  const message = buildDequeuedRelayMessage({
-    msg: row,
-    stmts: relay.stmts,
-    parseAttachments: (raw) => JSON.parse(raw || '[]'),
-    ensureRuntimeSessionBinding: () => relay.stmts.getRuntimeSessionByConversation.get(CONV),
-    configuredConversationSessionMode: 'isolated',
-    normalizeRelayMode: (value) => value,
-    defaultRelayMode: 'agent',
-    defaultModel: 'gpt-5',
-  });
-  assert.deepEqual(message.imageOptions, { size: '1536x1024', count: 2, background: 'transparent' });
-  assert.equal(message.attachments[0].type, 'image/png');
-  assert.ok(message.attachments[0].sha256);
 });
 
 test('an agent\'s image turn ignores @file: tokens; the owner\'s keeps them', async (t) => {

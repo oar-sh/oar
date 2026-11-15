@@ -33,12 +33,10 @@ function makeDeps(outcomes) {
     normalizeRelayMode: (value) => String(value || '').trim().toLowerCase() || null,
     DEFAULT_RELAY_MODE: 'agent',
     MAX_UPLOAD_BYTES: 1024 * 1024,
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
     runtimeState: {},
     queueCounts: () => ({ pendingCount: 0, processingCount: 1, parkedCount: 0 }),
     sessionWorkerRegistry: { getWorker: () => null, upsertWorker: () => {} },
     sessionWorkerSupervisor: {},
-    relayBridgeOwnerService: { normalizeIdentity: (identity) => ({ ...identity, pid: Number(identity.pid) || null }) },
     noteRestartTurnOutcome: (row, outcome) => outcomes.push([row?.id, outcome]),
   };
 }

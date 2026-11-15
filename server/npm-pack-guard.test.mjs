@@ -61,8 +61,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // principals, the owner secret store, browser sessions and their
 // migration, the auth routes, Settings → Security) took it to 678; the
 // peer keys that follow it add their own. 760 since 2026-11-12: 0.9.27
-// features (auth, peer keys, security UI) took it to 694 entries.
-const MAX_ENTRIES = 760;
+// features (auth, peer keys, security UI) took it to 694 entries. 690
+// since 2026-11-14: the Copilot CLI extension left the package (695 entries
+// before, 664 after).
+const MAX_ENTRIES = 690;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -155,15 +157,16 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
   // dependencies of OAR (the pins ship as pin.json and pin-lock.json).
   const manifests = paths.filter((p) => /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json)$/.test(p));
   assert.deepEqual(manifests, ['package.json'], `npm manifests besides the package's own:\n${manifests.join('\n')}`);
+  // The Copilot CLI extension is gone: Copilot runs on the SDK worker.
   assert.ok(
-    paths.some((p) => p.startsWith('.github/extensions/web-relay/')),
-    'tarball is missing the Copilot CLI extension',
+    !paths.some((p) => p.startsWith('.github/')),
+    'tarball ships files from .github/',
   );
   // A checkout's database backups (server/backups) never go into the package.
   const { files = [] } = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
   assert.ok(files.includes('!server/backups/'), 'package.json files must leave out server/backups/');
   // Developer documentation lives on GitHub, not in the package.
-  for (const absent of ['server/README.md', '.github/extensions/web-relay/README.md']) {
+  for (const absent of ['server/README.md']) {
     assert.ok(!paths.includes(absent), `tarball ships ${absent}, which belongs on GitHub only`);
   }
   // No install script of OAR's own: npm 12 skips one the user did not

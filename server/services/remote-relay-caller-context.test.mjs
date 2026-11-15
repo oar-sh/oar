@@ -113,6 +113,7 @@ test('the caller context comes from the live turn, the runtime binding and the c
     originRelayIds: [],
     origins: [],
     origin: null,
+    turnRows: [{ kind: '', origin: null }],
   });
 });
 
@@ -747,4 +748,79 @@ test('the approval card carries its variant and summary in its context', async (
   const envelope = JSON.parse(questionRow(db, 'question-1').request);
   assert.equal(envelope.context.variant, 'create_session');
   assert.equal(envelope.context.summary, 'New session requested by \'report builder\': Sidebar, claude-sonnet-5');
+});
+
+// ─── The loop guard's card ───────────────────────────────────────────────────
+
+/** A loop guard (or plain) card on q-1, answered with `answer` on the first poll. */
+async function answeredApproval(answer, { agentPrompts = 30, relay = RELAY } = {}) {
+  let harness;
+  harness = setup({
+    onSleep: () => {
+      harness.db.prepare(`UPDATE relay_questions SET status = 'answered', answer = ? WHERE id = 'question-1'`).run(answer);
+    },
+  });
+  seedConversation(harness.db);
+  seedTurn(harness.db, { id: 'q-1' });
+  const result = await harness.context.requestApproval({
+    conversationId: 'c-1',
+    callerContext: harness.context.getCallerContext('c-1'),
+    relay,
+    action: 'send',
+    args: { session: 'conv-remote-1', text: 'Next step' },
+    agentPrompts,
+  });
+  return { result, row: questionRow(harness.db, 'question-1'), pushed: harness.pushed };
+}
+
+test('a loop guard card has three choices and says where the session choice is revoked; other cards keep two', async () => {
+  const loop = await answeredApproval('Allow');
+  assert.deepEqual(JSON.parse(loop.row.choices), ['Allow', 'Allow for this session', 'Deny']);
+  const context = JSON.parse(loop.row.request).context;
+  assert.equal(context.variant, 'loop_guard');
+  assert.match(context.rationale, /Allow for this session stops asking in this conversation until you revoke it in Settings → Relays → Agent sessions\./);
+  // The push reads the variant off the formatted question.
+  assert.equal(loop.pushed[0].context.variant, 'loop_guard');
+
+  const local = await answeredApproval('Allow', { relay: { id: 'local', name: 'win-test', local: true } });
+  assert.ok(JSON.parse(local.row.request).context.rationale.length <= 240, 'within the stored rationale cap');
+
+  const plain = await answeredApproval('Allow', { agentPrompts: 0 });
+  assert.deepEqual(JSON.parse(plain.row.choices), ['Allow', 'Deny']);
+  assert.doesNotMatch(JSON.parse(plain.row.request).context.rationale, /this session/);
+});
+
+test('the loop guard card resolves Allow once, Allow for this session and Deny; typed text is still refused', async () => {
+  assert.deepEqual((await answeredApproval('Allow')).result, { approved: true, scope: 'once' });
+  assert.deepEqual((await answeredApproval(' allow FOR this session ')).result, { approved: true, scope: 'session' });
+  assert.deepEqual((await answeredApproval('Deny')).result, { approved: false });
+  const typed = (await answeredApproval('yes, for the session')).result;
+  assert.equal(typed.approved, false);
+  assert.match(typed.error, /neither Allow nor Deny/);
+  // Only a loop guard card knows the third choice.
+  const plain = (await answeredApproval('Allow for this session', { agentPrompts: 0 })).result;
+  assert.equal(plain.approved, false);
+  assert.match(plain.error, /neither Allow nor Deny/);
+  assert.deepEqual((await answeredApproval('Allow', { agentPrompts: 0 })).result, { approved: true });
+});
+
+test('turnRows name each processing row: the user\'s, an agent\'s, a relay event, a continuation', () => {
+  const { db, context, repository } = setup();
+  seedConversation(db);
+  seedTurn(db, { id: 'q-user', processingAt: '2026-09-20T09:55:00.000Z' });
+  seedTurn(db, { id: 'q-agent', processingAt: '2026-09-20T09:56:00.000Z' });
+  repository.setMessageOrigin('q-agent', { kind: 'agent', relayId: 'relay-self-id', conversationId: 'c-lead', local: true, hops: 0 });
+  seedTurn(db, { id: 'q-event', processingAt: '2026-09-20T09:57:00.000Z' });
+  db.prepare(`UPDATE messages SET kind = 'relay-event' WHERE id = 'q-event'`).run();
+  seedContinuation(db, { id: 'q-cont', at: '2026-09-20T09:58:00.000Z' });
+  const rows = context.getCallerContext('c-1').turnRows;
+  assert.deepEqual(rows.map((row) => row.kind), ['', '', 'relay-event', 'continuation']);
+  assert.equal(rows[0].origin, null);
+  assert.equal(rows[1].origin.conversationId, 'c-lead');
+  assert.equal(rows[1].origin.local, true);
+
+  // Off-turn: no rows at all.
+  const idle = setup();
+  seedConversation(idle.db);
+  assert.deepEqual(idle.context.getCallerContext('c-1').turnRows, []);
 });

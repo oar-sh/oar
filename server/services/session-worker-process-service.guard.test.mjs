@@ -6,17 +6,13 @@ import { fileURLToPath } from 'node:url';
 
 // The relay reads the Windows process list through PowerShell; done
 // synchronously that holds the relay's only thread for 0.5-1.5 s idle and
-// for seconds under load (2026-10-01: 502s for a whole Windows relay). Every
-// relay path uses the asynchronous finders; the synchronous ones stay for the
-// legacy extension launcher only, which goes with the extension.
+// for seconds under load (2026-10-01: 502s for a whole Windows relay). The
+// inspector has asynchronous finders only, and no module runs PowerShell
+// synchronously.
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const ALLOWED = new Set([
-  path.join('services', 'session-worker-process-service.mjs'),
-  path.join('services', 'relay-cli-launcher-service.mjs'),
-]);
 const SYNC_FINDER = /\.(findProcessForSession|findProcessesForSession|findWindowsProcessForSession|findWindowsProcessesForSession|findWindowsProcessTreeForSession|getWindowsProcessSnapshot|getPosixProcessSnapshot|stopWindowsPids)\b(?!Async)/;
-const SYNC_POWERSHELL = /execFileSync\w*\(\s*['"]powershell(\.exe)?['"]/;
+const SYNC_POWERSHELL = /execFileSync\w*\(\s*(?:['"]powershell(\.exe)?['"]|systemToolPath\('powershell)/;
 
 function* sourceFiles(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -27,11 +23,10 @@ function* sourceFiles(dir) {
   }
 }
 
-test('no relay module reads the process list synchronously, apart from the inspector and the legacy launcher', () => {
+test('no relay module reads the process list synchronously', () => {
   const offenders = [];
   for (const file of sourceFiles(serverDir)) {
     const relative = path.relative(serverDir, file);
-    if (ALLOWED.has(relative)) continue;
     const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
     lines.forEach((line, index) => {
       if (SYNC_FINDER.test(line) || SYNC_POWERSHELL.test(line)) offenders.push(`${relative}:${index + 1}: ${line.trim()}`);

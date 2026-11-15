@@ -3,7 +3,11 @@ import path from "node:path";
 
 import { expect, test } from "@playwright/test";
 
-import { reserveFreePort, sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { reserveFreePort, startRelayServer } from "./relay-server-harness.mjs";
+import { settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * A preview link survives a relay restart. The spec boots its own relay with
@@ -12,8 +16,8 @@ import { reserveFreePort, sleep, startRelayServer } from "./relay-server-harness
  * the relay on the same state and preview port, and finds the same link
  * answering and the card still offering Open with that link.
  *
- * No worker runs: the turn is a message the spec took off the queue (GET
- * /api/pending) and answered (POST /api/response).
+ * No worker runs: the turn is a message the spec took off the queue and
+ * answered as the session's worker (helpers/fake-worker.mjs).
  */
 
 const PUBLIC_BASE_URL = "http://preview.example.test";
@@ -46,19 +50,6 @@ function createApi(getRelay) {
   };
 }
 
-async function dequeue(api, messageId, ownerSessionId) {
-  const headers = ownerSessionId ? { "x-relay-session-id": ownerSessionId } : {};
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const { status, payload } = await api("/api/pending", { headers });
-    expect(status).toBe(200);
-    const message = payload?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await api("/api/requeue", { method: "POST", body: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
 async function fetchPreview(previewPort, basePath) {
   const response = await fetch(`http://127.0.0.1:${previewPort}${basePath}`, {
     headers: { host: new URL(PUBLIC_BASE_URL).host },
@@ -84,14 +75,10 @@ test.describe("previews across a relay restart", () => {
 
   test("a folder preview keeps its link and its card after the relay restarts", async ({ page }) => {
     const stamp = Date.now();
-    const queued = await api("/api/message", {
-      method: "POST",
-      body: { text: `Publish the site ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const conversationId = String(queued.payload?.conversationId || "");
-    const messageId = String(queued.payload?.messageId || "");
-    await dequeue(api, messageId, String(queued.payload?.ownerSessionId || ""));
+    // Made as the web client makes a chat: bound to its session from the start.
+    // The relay restarts below: the worker follows it to its new address.
+    const { conversationId, messageId, worker } = await startConversation({ text: `Publish the site ${stamp}` }, { baseUrl: () => relay.baseUrl, token: () => relay.token });
+    await worker.take(messageId);
 
     const created = await api("/api/previews", {
       method: "POST",
@@ -101,10 +88,7 @@ test.describe("previews across a relay restart", () => {
     const { url, basePath } = created.payload;
     expect(url).toBe(`${PUBLIC_BASE_URL}${basePath}`);
 
-    const answered = await api("/api/response", {
-      method: "POST",
-      body: { messageId, conversationId, text: `Published ${stamp}`, model: "gpt-5.4-mini", mode: "agent" },
-    });
+    const answered = await worker.respond(messageId, { text: `Published ${stamp}`, model: "gpt-5.4-mini", mode: "agent" });
     expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
 
     const before = await fetchPreview(previewPort, basePath);

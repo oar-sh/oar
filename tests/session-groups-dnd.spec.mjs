@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Dragging sessions in the sidebar, with a mouse on a desktop viewport and
@@ -103,15 +107,15 @@ for (const profile of [
     test.use(profile.use);
 
     let relay = null;
+    const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
     const api = createApi(() => relay);
     const ids = {};
     const groups = {};
 
     const makeChat = async (text) => {
-      const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-      expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-      const conversationId = queued.payload.conversationId;
-      const replied = await api("/api/response", { method: "POST", body: { messageId: queued.payload.messageId, conversationId, text: "reply", model: "gpt-5.4-mini", mode: "agent" } });
+      const queued = await startConversation({ text }, onRelay);
+      const conversationId = queued.conversationId;
+      const replied = await completeTurn(queued, { text: "reply", model: "gpt-5.4-mini", mode: "agent" }, onRelay);
       expect(replied.status).toBe(200);
       return conversationId;
     };
@@ -304,7 +308,7 @@ for (const profile of [
       // The row is listed once it has a message and a reply, as the other chats here.
       const queued = await api("/api/message", { method: "POST", body: { conversationId: created, text: "Started in Alpha batch", relayMode: "agent", model: "gpt-5.4-mini" } });
       expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-      const replied = await api("/api/response", { method: "POST", body: { messageId: queued.payload.messageId, conversationId: created, text: "reply", model: "gpt-5.4-mini", mode: "agent" } });
+      const replied = await completeTurn(queued.payload, { text: "reply", model: "gpt-5.4-mini", mode: "agent" }, onRelay);
       expect(replied.status).toBe(200);
       await expect.poll(() => membersInList(page, groups.alpha)).toEqual([created, ids.loose4, ...before]);
       const rows = await relayRows();

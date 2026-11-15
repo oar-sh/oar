@@ -9,6 +9,7 @@
  */
 
 import { escapeHtml } from './context-usage-view.mjs';
+import { CHART_WINDOWS, normalizeChartWindow, readChartWindow } from './plan-usage-chart-window.mjs';
 import {
   imageUsageBadgesHtml,
   imageUsageCardFacts,
@@ -93,9 +94,20 @@ export function utilizationColor(utilization) {
   return '#3fb950';
 }
 
+// 999, 12.3k, 4.6M, 1.2B, as the server's formatTokenCount (plan-usage-tokens.mjs).
+function formatTokens(n) {
+  const abs = Math.abs(n);
+  const scaled = (divisor, suffix) => `${(n / divisor).toFixed(1).replace(/\.0$/, '')}${suffix}`;
+  if (abs < 1000) return String(Math.round(n));
+  if (abs < 999_950) return scaled(1000, 'k');
+  if (abs < 999_950_000) return scaled(1_000_000, 'M');
+  return scaled(1_000_000_000, 'B');
+}
+
 export function formatAmount(value, unit) {
   const n = toNullableNumber(value);
   if (n === null) return null;
+  if (unit === 'tokens') return formatTokens(n);
   if (unit === 'usd' || unit === 'cny') {
     const rounded = Math.round(n * 100) / 100;
     return `${rounded < 0 ? '-' : ''}${unit === 'cny' ? '¥' : '$'}${Math.abs(rounded).toFixed(2)}`;
@@ -199,15 +211,20 @@ function renderMeter(meter, now) {
   `;
 }
 
+// The theme's series colours (index.html --plan-usage-series-1 to -8).
+const SERIES_COLORS = 8;
+
 /**
  * A chart from `buildChart` data: stacked `columns` (one per item, e.g. a
- * day) or horizontal stacked `bars` (one per item, e.g. a model), drawn with
- * plain HTML and CSS. Colours come from the theme's series variables (fixed
+ * day), horizontal stacked `bars` (one per item, e.g. a model, each as long
+ * as its total against the largest), or a `share` (one item, e.g. a window,
+ * drawn as one line cut into its series, with a list of each part's amount
+ * and share), drawn with plain HTML and CSS. Colours come from the theme's series variables (fixed
  * order, so a series keeps its colour between reads); every item has a text
  * equivalent as its label, a tooltip on hover, focus or tap, and the chart
  * has a legend for more than one series and a table view of the same data.
  */
-function renderChart(chart) {
+function renderChart(chart, { chartWindow = null } = {}) {
   const series = Array.isArray(chart?.series) ? chart.series.filter((entry) => entry && entry.key) : [];
   const items = Array.isArray(chart?.items) ? chart.items.filter((entry) => entry && entry.key) : [];
   if (!series.length || !items.length) return '';
@@ -218,11 +235,16 @@ function renderChart(chart) {
     if ((unit === 'usd' || unit === 'cny') && n !== 0 && Math.abs(n) < 0.01) {
       return `${n < 0 ? '-' : ''}${unit === 'cny' ? '¥' : '$'}${Math.abs(n).toFixed(4)}`;
     }
+    if (unit === 'tokens') return `${formatTokens(n)} tokens`;
     return formatAmount(n, unit) ?? '0';
   };
   const valueOf = (item, key) => Math.max(0, toNullableNumber(item.values?.[key]) ?? 0);
   const totalOf = (item) => series.reduce((sum, entry) => sum + valueOf(item, entry.key), 0);
-  const seriesColor = (index) => `var(--plan-usage-series-${Math.min(index + 1, 5)})`;
+  // Eight series colours in a fixed order; "other" and anything past the eighth are grey.
+  const colorKeys = series.map((entry) => entry.key);
+  const seriesColor = (index) => (colorKeys[index] === 'other' || index >= SERIES_COLORS
+    ? 'var(--plan-usage-series-other)'
+    : `var(--plan-usage-series-${index + 1})`);
   const partsText = (item) => {
     const total = totalOf(item);
     return series
@@ -238,13 +260,22 @@ function renderChart(chart) {
     return `${item.label}: ${amount(total)}${parts ? ` (${parts})` : ''}`;
   };
   const max = Math.max(0, ...items.map(totalOf));
+  // A column's tooltip opens towards the chart's middle in its first and
+  // last fifth (index.html), so it stays on screen at any column count.
+  const edge = Math.ceil(items.length * 0.2);
+  const columnEdge = (index) => {
+    if (index < edge) return ' plan-usage-chart-col-start';
+    return index >= items.length - edge ? ' plan-usage-chart-col-end' : '';
+  };
+  // Every column and every bar against the largest, so their lengths compare.
   const segments = (item, dimension) => series.map((entry, index) => {
     const value = valueOf(item, entry.key);
     if (value <= 0) return '';
-    const base = dimension === 'height' ? max : totalOf(item);
-    const share = base > 0 ? (value / base) * 100 : 0;
+    const share = max > 0 ? (value / max) * 100 : 0;
     return `<span class="plan-usage-chart-seg" data-series="${escapeHtml(entry.key)}" style="${dimension}:${share.toFixed(2)}%;background:${seriesColor(index)}" title="${escapeHtml(`${entry.label} ${amount(value)}`)}"></span>`;
   }).join('');
+
+  if (chart.kind === 'share') return renderShareChart(chart, { series, item: items[0], amount, valueOf, seriesColor, windowAttrs: chartWindowAttrs(chart, chartWindow) });
 
   const plot = chart.kind === 'bars'
     ? `<div class="plan-usage-chart-bars">${items.map((item) => `
@@ -254,16 +285,28 @@ function renderChart(chart) {
           <span class="plan-usage-chart-row-value">${escapeHtml(amount(totalOf(item)))}</span>
           <span class="plan-usage-chart-tip" role="tooltip">${escapeHtml(itemText(item))}</span>
         </div>`).join('')}</div>`
-    : `<div class="plan-usage-chart-columns" style="--plan-usage-columns:${items.length}">${items.map((item) => `
-        <div class="plan-usage-chart-col${totalOf(item) > 0 ? '' : ' plan-usage-chart-col-empty'}" tabindex="0" aria-label="${escapeHtml(itemText(item))}" data-item="${escapeHtml(item.key)}">
+    : `<div class="plan-usage-chart-columns" style="--plan-usage-columns:${items.length}">${items.map((item, index) => `
+        <div class="plan-usage-chart-col${totalOf(item) > 0 ? '' : ' plan-usage-chart-col-empty'}${columnEdge(index)}" tabindex="0" aria-label="${escapeHtml(itemText(item))}" data-item="${escapeHtml(item.key)}">
           <span class="plan-usage-chart-stack" aria-hidden="true">${segments(item, 'height')}</span>
           <span class="plan-usage-chart-tip" role="tooltip">${escapeHtml(itemText(item))}</span>
         </div>`).join('')}
-        <span class="plan-usage-chart-axis" aria-hidden="true"><span>${escapeHtml(items[0].label)}</span><span>${escapeHtml(items[items.length - 1].label)}</span></span>
+        <span class="plan-usage-chart-axis" aria-hidden="true">${axisLabels(items).map((label) => `<span>${escapeHtml(label)}</span>`).join('')}</span>
       </div>`;
 
+  // A columns chart says its peak day and its total in words above the plot,
+  // and its legend gives each series' total, so a narrow screen has the
+  // figures without a tooltip; a series with nothing in the window is left out.
+  const columns = chart.kind !== 'bars';
+  const seriesTotal = (entry) => items.reduce((sum, item) => sum + valueOf(item, entry.key), 0);
+  const peakItem = columns ? items.reduce((best, item) => (totalOf(item) > totalOf(best) ? item : best), items[0]) : null;
+  const scale = columns && max > 0
+    ? `<div class="plan-usage-chart-scale"><span>Peak ${escapeHtml(amount(max))} · ${escapeHtml(peakItem.label)}</span><span>Total ${escapeHtml(amount(items.reduce((sum, item) => sum + totalOf(item), 0)))}</span></div>`
+    : '';
+  const legendEntries = series
+    .map((entry, index) => ({ entry, index, total: seriesTotal(entry) }))
+    .filter((part) => !columns || part.total > 0);
   const legend = series.length > 1
-    ? `<ul class="plan-usage-chart-legend">${series.map((entry, index) => `<li><span class="plan-usage-chart-swatch" style="background:${seriesColor(index)}" aria-hidden="true"></span>${escapeHtml(entry.label)}</li>`).join('')}</ul>`
+    ? `<ul class="plan-usage-chart-legend">${legendEntries.map(({ entry, index, total }) => `<li><span class="plan-usage-chart-swatch" style="background:${seriesColor(index)}" aria-hidden="true"></span>${escapeHtml(entry.label)}${columns ? `<span class="plan-usage-chart-legend-value">${escapeHtml(amount(total))}</span>` : ''}</li>`).join('')}</ul>`
     : '';
   const table = `
     <details class="plan-usage-chart-table">
@@ -273,18 +316,108 @@ function renderChart(chart) {
         <tbody>${items.filter((item) => totalOf(item) > 0).map((item) => `<tr><th scope="row">${escapeHtml(item.label)}</th>${series.map((entry) => `<td class="plan-usage-detail-value">${escapeHtml(amount(valueOf(item, entry.key)))}</td>`).join('')}${series.length > 1 ? `<td class="plan-usage-detail-value">${escapeHtml(amount(totalOf(item)))}</td>` : ''}</tr>`).join('')}</tbody>
       </table>
     </details>`;
+  const windowAttrs = chartWindowAttrs(chart, chartWindow);
   return `
-    <figure class="plan-usage-chart plan-usage-chart-kind-${chart.kind === 'bars' ? 'bars' : 'columns'}" data-chart-id="${escapeHtml(chart.id)}" role="group" aria-label="${escapeHtml(chart.label)}">
+    <figure class="plan-usage-chart plan-usage-chart-kind-${chart.kind === 'bars' ? 'bars' : 'columns'}" data-chart-id="${escapeHtml(chart.id)}" role="group" aria-label="${escapeHtml(chart.label)}"${windowAttrs}>
       <figcaption class="plan-usage-chart-head">
         <span class="plan-usage-chart-label">${escapeHtml(chart.label)}</span>
         ${chart.summary ? `<span class="plan-usage-chart-summary">${escapeHtml(chart.summary)}</span>` : ''}
       </figcaption>
+      ${scale}
       ${plot}
       ${legend}
       ${chart.note ? `<div class="plan-usage-meter-note">${escapeHtml(chart.note)}</div>` : ''}
       ${table}
     </figure>
   `;
+}
+
+/** The axis under the columns: the first, the middle and the last item's label (two when there are fewer than five). */
+function axisLabels(items) {
+  if (items.length < 5) return [items[0].label, items[items.length - 1].label];
+  return [items[0].label, items[Math.floor((items.length - 1) / 2)].label, items[items.length - 1].label];
+}
+
+/** One of the card's 7, 30 and 90 days charts: hidden unless its window is picked. */
+function chartWindowAttrs(chart, chartWindow) {
+  const windowDays = normalizeChartWindow(chart?.windowDays);
+  return windowDays === null ? '' : ` data-window="${windowDays}"${windowDays === chartWindow ? '' : ' hidden'}`;
+}
+
+/** "46%", or "<1%" for a part too small to round to one. */
+function shareText(value, total) {
+  if (!(total > 0) || !(value > 0)) return '0%';
+  const percent = (value / total) * 100;
+  return percent < 1 ? '<1%' : `${Math.round(percent)}%`;
+}
+
+/**
+ * A `share` chart: one line cut into the item's series, each part as long as
+ * its value and in its series' colour (the same as in the daily chart above
+ * it), largest first with "other" last; below it a list of the parts with
+ * their amount and share, which is also the legend. The parts' names,
+ * amounts and shares are the line's accessible name and each part's tooltip.
+ */
+function renderShareChart(chart, { series, item, amount, valueOf, seriesColor, windowAttrs }) {
+  const parts = series
+    .map((entry, index) => ({ entry, index, value: valueOf(item, entry.key) }))
+    .filter((part) => part.value > 0)
+    .sort((a, b) => (a.entry.key === 'other') - (b.entry.key === 'other') || b.value - a.value || a.index - b.index);
+  const total = parts.reduce((sum, part) => sum + part.value, 0);
+  if (!(total > 0)) return '';
+  const partText = (part) => `${part.entry.label} ${amount(part.value)} (${shareText(part.value, total)})`;
+  const strip = `<div class="plan-usage-chart-strip" role="img" aria-label="${escapeHtml(`${item.label}: ${amount(total)}; ${parts.map(partText).join(', ')}`)}">${parts.map((part) => `<span class="plan-usage-chart-seg" data-series="${escapeHtml(part.entry.key)}" style="width:${((part.value / total) * 100).toFixed(2)}%;background:${seriesColor(part.index)}" title="${escapeHtml(partText(part))}"></span>`).join('')}</div>`;
+  const list = `<ul class="plan-usage-chart-share-list">${parts.map((part) => `
+      <li data-series="${escapeHtml(part.entry.key)}"><span class="plan-usage-chart-swatch" style="background:${seriesColor(part.index)}" aria-hidden="true"></span><span class="plan-usage-chart-share-name">${escapeHtml(part.entry.label)}</span><span class="plan-usage-chart-share-value">${escapeHtml(amount(part.value))}</span><span class="plan-usage-chart-share-pct">${escapeHtml(shareText(part.value, total))}</span></li>`).join('')}</ul>`;
+  const table = `
+    <details class="plan-usage-chart-table">
+      <summary>As a table</summary>
+      <table class="plan-usage-detail-table">
+        <thead><tr><th scope="col"></th><th scope="col">${escapeHtml(item.label)}</th><th scope="col">Share</th></tr></thead>
+        <tbody>${parts.map((part) => `<tr><th scope="row">${escapeHtml(part.entry.label)}</th><td class="plan-usage-detail-value">${escapeHtml(amount(part.value))}</td><td class="plan-usage-detail-value">${escapeHtml(shareText(part.value, total))}</td></tr>`).join('')}<tr><th scope="row">Total</th><td class="plan-usage-detail-value">${escapeHtml(amount(total))}</td><td class="plan-usage-detail-value">100%</td></tr></tbody>
+      </table>
+    </details>`;
+  return `
+    <figure class="plan-usage-chart plan-usage-chart-kind-share" data-chart-id="${escapeHtml(chart.id)}" role="group" aria-label="${escapeHtml(chart.label)}"${windowAttrs}>
+      <figcaption class="plan-usage-chart-head">
+        <span class="plan-usage-chart-label">${escapeHtml(chart.label)}</span>
+        ${chart.summary ? `<span class="plan-usage-chart-summary">${escapeHtml(chart.summary)}</span>` : ''}
+      </figcaption>
+      ${strip}
+      ${list}
+      ${chart.note ? `<div class="plan-usage-meter-note">${escapeHtml(chart.note)}</div>` : ''}
+      ${table}
+    </figure>
+  `;
+}
+
+/**
+ * A card's charts. When some come in windows (7, 30 and 90 days), a picker
+ * (native radios, plan-usage-chart-window.mjs) goes above them and only the
+ * picked window's charts show; a window without any says so instead (with
+ * nothing to chart: no turns, or turns without a cost on a cost tab), so a
+ * longer one can be picked. Charts without a window always show.
+ */
+function renderCharts(charts, { chartWindow, panelId }) {
+  if (!charts.length) return '';
+  const windowed = new Set(charts.map((chart) => normalizeChartWindow(chart?.windowDays)).filter((days) => days !== null));
+  if (!windowed.size) return charts.map((chart) => renderChart(chart)).join('');
+  const picked = normalizeChartWindow(chartWindow) ?? readChartWindow();
+  const name = `plan-usage-chart-window-${panelId}`;
+  const picker = `
+    <fieldset class="plan-usage-chart-window">
+      <legend class="plan-usage-chart-window-legend">Window</legend>
+      ${CHART_WINDOWS.map((days) => `<label><input type="radio" name="${escapeHtml(name)}" value="${days}"${days === picked ? ' checked' : ''}><span>${days} days</span></label>`).join('')}
+    </fieldset>`;
+  const empty = CHART_WINDOWS.filter((days) => !windowed.has(days))
+    .map((days) => `<div class="plan-usage-chart-empty plan-usage-meter-note" data-window="${days}"${days === picked ? '' : ' hidden'}>Nothing to chart in the last ${days} days.</div>`)
+    .join('');
+  return `
+    <div class="plan-usage-charts" data-chart-window="${picked}">
+      ${picker}
+      ${charts.map((chart) => renderChart(chart, { chartWindow: picked })).join('')}
+      ${empty}
+    </div>`;
 }
 
 function renderDetailSection(section) {
@@ -396,7 +529,7 @@ function renderAccountLine(account) {
 // own ones of the same things give way).
 const IMAGE_SPEND_FACT_IDS = new Set(['openai-images-today', 'openai-images-month', 'openai-images-override']);
 
-function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
+function renderCard(card, now, { active = true, timeZone = undefined, chartWindow = null } = {}) {
   // OpenAI images: the spend state (`imageSpend`, live from the socket
   // event too) draws the meter with the cap's 80 % mark, the figures, the
   // badges and the message, in "USD 1.23".
@@ -457,7 +590,7 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
       ${message ? `<div class="plan-usage-message">${escapeHtml(message)}</div>` : ''}
       ${metersHtml}
       ${facts.length ? `<dl class="plan-usage-facts">${facts.map(renderFact).join('')}</dl>` : ''}
-      ${charts.map(renderChart).join('')}
+      ${renderCharts(charts, { chartWindow, panelId })}
       ${facts.length ? `${detailsHtml}${notesHtml}` : `${notesHtml}${detailsHtml}`}
       <div class="plan-usage-card-foot">
         ${capturedLabel ? `<span class="plan-usage-captured">${capturedLabel}</span>` : ''}
@@ -469,10 +602,11 @@ function renderCard(card, now, { active = true, timeZone = undefined } = {}) {
 
 /**
  * One card alone, for a live redraw in the open modal (the OpenAI images
- * card on a new spend state).
+ * card on a new spend state). `chartWindow`: the charts' window, else the
+ * one stored in this browser.
  */
-export function renderPlanUsageCardHtml(card, { now = new Date(), active = true, timeZone = undefined } = {}) {
-  return card ? renderCard(card, now, { active, timeZone }) : '';
+export function renderPlanUsageCardHtml(card, { now = new Date(), active = true, timeZone = undefined, chartWindow = null } = {}) {
+  return card ? renderCard(card, now, { active, timeZone, chartWindow }) : '';
 }
 
 function renderTab(card, activeProvider) {
@@ -488,15 +622,18 @@ function renderTab(card, activeProvider) {
  * @param {Date} [options.now] injectable clock so countdowns are testable
  * @param {string} [options.activeProvider] the session's provider; selects its
  *   tab when that provider has a card
+ * @param {number} [options.chartWindow] the charts' window (7, 30 or 90);
+ *   the one stored in this browser by default, else 30
  * @returns {string} modal body HTML, or '' when there is nothing to render
  */
-export function renderPlanUsageHtml(report, { now = new Date(), activeProvider = '', timeZone = undefined } = {}) {
+export function renderPlanUsageHtml(report, { now = new Date(), activeProvider = '', timeZone = undefined, chartWindow = null } = {}) {
   const providers = Array.isArray(report?.providers) ? report.providers.filter(Boolean) : [];
   if (!providers.length) return '';
   const active = resolveActiveUsageProvider(providers, activeProvider);
+  const picked = normalizeChartWindow(chartWindow) ?? readChartWindow();
   const tabs = providers.map((card) => renderTab(card, active)).join('');
   const cards = providers
-    .map((card) => renderCard(card, now, { active: normalizeUsageProvider(card.provider) === active, timeZone }))
+    .map((card) => renderCard(card, now, { active: normalizeUsageProvider(card.provider) === active, timeZone, chartWindow: picked }))
     .join('');
   return `<div class="plan-usage"><div class="plan-usage-tab-strip" role="tablist" aria-label="Usage providers">${tabs}</div>${cards}</div>`;
 }

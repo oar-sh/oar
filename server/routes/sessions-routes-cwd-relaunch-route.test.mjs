@@ -77,7 +77,6 @@ function setup(overrides = {}) {
     stopPlatform = 'win32',
     stopOverrides = {},
     runtimeWorkspaceRootPath = '',
-    pendingSessionCwd = '',
     workspaceRootAllowList = [],
     sdkSessionId = SID,
   } = overrides;
@@ -85,15 +84,14 @@ function setup(overrides = {}) {
   const app = createMockApp();
   let configuredRootPath = '';
   let runtimeRootPath = runtimeWorkspaceRootPath || '';
-  let pendingCwd = pendingSessionCwd || '';
 
   // Mirrors buildConversationWorkspaceRootState: a running session reports its
-  // runtime root as the current CWD, falling back to the pending/configured root.
+  // runtime root as the current CWD, falling back to the configured root.
   const buildState = () => ({
     sdkSessionId,
     configuredWorkspaceRootPath: configuredRootPath || null,
     runtimeWorkspaceRootPath: runtimeRootPath || null,
-    currentWorkspaceRootPath: runtimeRootPath || pendingCwd || configuredRootPath || null,
+    currentWorkspaceRootPath: runtimeRootPath || configuredRootPath || null,
   });
 
   const deps = {
@@ -136,21 +134,12 @@ function setup(overrides = {}) {
       runtimeRootPath = rootPath;
       return { ok: true, learned: true, state: buildState() };
     },
-    setPendingSessionCwd: () => null,
-    consumePendingSessionCwd: () => {
-      calls.push(['consumePendingSessionCwd']);
-      const previous = pendingCwd;
-      pendingCwd = '';
-      return previous || null;
-    },
-    getPendingSessionCwd: () => pendingCwd || null,
     workspaceRootAllowList,
 
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => true,
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     readSessionTranscriptMessages: () => [],
@@ -163,10 +152,6 @@ function setup(overrides = {}) {
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
 
     countActiveConversationQueueRows: { get: () => ({ count: activeQueueCount }) },
@@ -206,7 +191,6 @@ function setup(overrides = {}) {
     emitted,
     getConfiguredRootPath: () => configuredRootPath,
     getRuntimeRootPath: () => runtimeRootPath,
-    getPendingCwd: () => pendingCwd,
     processAlive,
   };
 }
@@ -367,7 +351,7 @@ test('a genuine relaunch reports workspaceRootApplied:true', async () => {
 test('a relaunch out of a live CWD reports the new CWD, not the killed CLI\'s', async () => {
   // The session was running in ROOT_B; the pre-stop state therefore still names
   // ROOT_B. Reporting it back is what left the header and the file explorer
-  // showing the old CWD until the next session-sync.
+  // showing the old CWD until the next turn.
   const { app, getRuntimeRootPath } = setup({ runtimeWorkspaceRootPath: ROOT_B });
   const res = await relaunch(app, { rootPath: ROOT_A });
 
@@ -389,15 +373,6 @@ test('the relaunch broadcast carries the new CWD so every client updates', async
   assert.equal(payload.currentWorkspaceRootPath, ROOT_A);
   assert.equal(payload.runtimeWorkspaceRootPath, ROOT_A);
   assert.equal(payload.workspaceRootApplied, true);
-});
-
-test('the pending CWD of the killed CLI is dropped on a successful relaunch', async () => {
-  const { app, getPendingCwd, calls } = setup({ pendingSessionCwd: ROOT_B });
-  const res = await relaunch(app, { rootPath: ROOT_A });
-
-  assert.equal(res.body.currentWorkspaceRootPath, ROOT_A);
-  assert.equal(getPendingCwd(), '', 'a stale pending CWD would resurface as the current CWD');
-  assert.ok(calls.some(([name]) => name === 'consumePendingSessionCwd'));
 });
 
 test('a reused process keeps reporting the directory it is actually in', async () => {

@@ -2,6 +2,10 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
 import { clickHeaderAction } from "./header-actions-helpers.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The 🙈 list of messages hidden from shared viewers, against the shared e2e
@@ -19,20 +23,10 @@ import { clickHeaderAction } from "./header-actions-helpers.mjs";
  */
 
 async function seedTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok(), `POST /api/message answered ${queued.status()}`).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const userId = String(body?.messageId || "").trim();
-  expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId: userId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const started = await startConversation({ text });
+  const { conversationId, messageId: userId } = started;
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   const loaded = await request.get(`/api/conversation/${conversationId}`, { headers });
   const replyId = String((await loaded.json()).messages.find((message) => message.role === "assistant")?.id || "");
   expect(replyId).toBeTruthy();

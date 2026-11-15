@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { relayPresence, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * relay_restarted end to end, without a model: an idle conversation
@@ -23,6 +27,7 @@ test.describe.serial("woken when the relay runs again", () => {
   test.describe.configure({ timeout: 240_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   let heartbeat = null;
   let conversationId = "";
   const title = `release coordinator ${Date.now()}`;
@@ -62,28 +67,18 @@ test.describe.serial("woken when the relay runs again", () => {
 
   test.beforeAll(async () => {
     relay = await startRelayServer({ token: randomUUID() });
-    heartbeat = setInterval(() => {
-      api("/api/heartbeat", { method: "POST", body: {} }).catch(() => {});
-    }, 2_000);
+    heartbeat = relayPresence(onRelay);
     expect((await api("/api/settings/agent-sessions", { method: "POST", body: { enabled: true } })).status).toBe(200);
     // An idle conversation: its first turn taken off the queue and answered.
-    const queued = await api("/api/message", { method: "POST", body: { text: title, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    conversationId = queued.payload.conversationId;
-    const { messageId, ownerSessionId } = queued.payload;
-    expect((await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } })).status).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    let handed = false;
-    for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-      handed = String((await api("/api/pending", { headers })).payload?.message?.id || "") === messageId;
-      if (!handed) await sleep(250);
-    }
-    expect(handed, "the first message was handed out").toBe(true);
-    expect((await api("/api/response", { method: "POST", body: { messageId, conversationId, text: "ready", model: "gpt-5.4-mini" } })).status).toBe(200);
+    const started = await startConversation({ text: title }, onRelay);
+    conversationId = started.conversationId;
+    const { messageId, worker } = started;
+    await worker.take(messageId);
+    expect((await worker.respond(messageId, { text: "ready", model: "gpt-5.4-mini" })).status).toBe(200);
   });
 
   test.afterAll(async () => {
-    clearInterval(heartbeat);
+    heartbeat?.stop();
     heartbeat = null;
     if (relay) await relay.stop();
     relay = null;

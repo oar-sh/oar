@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // "Expand thoughts while an agent works" (Settings › Appearance,
 // mirrored in the 🧠 modal), against the shared e2e relay. A turn is queued
@@ -17,43 +21,13 @@ const SHOT_DIR = String(process.env.OAR_E2E_SCREENSHOT_DIR || "").trim();
 const PHONE = { width: 390, height: 844 };
 const DESKTOP = { width: 1280, height: 900 };
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-async function startTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+// Made as the web client makes a chat: bound to its session from the start.
+async function startTurn(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
+  await started.worker.take(messageId);
   return { conversationId, messageId };
-}
-
-// The worker's heartbeat while the turn runs: without it the CLI reads as
-// offline after a while and the live bubble goes with it.
-function keepWorkerAlive(request, headers, messageId) {
-  const beat = () => request.post("/api/heartbeat", { headers, data: { activeQueueMessageId: messageId } }).catch(() => {});
-  void beat();
-  const timer = setInterval(beat, 2_000);
-  return () => clearInterval(timer);
 }
 
 async function openConversationPage(page, token, conversationId, { expanded = null } = {}) {
@@ -87,12 +61,11 @@ test.describe("thoughts setting", () => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const { conversationId, messageId } = await startTurn(request, headers, `Plan the widget cache ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Plan the widget cache ${stamp}`);
     const thought = (reasoningId, text, done = false) => request.post("/api/thought", {
       headers,
-      data: { messageId, conversationId, mode: "agent", reasoningId, text, done },
+      data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", reasoningId, text, done },
     });
-    const stopBeating = keepWorkerAlive(request, headers, messageId);
 
     try {
       expect((await thought(`r1-${stamp}`, "The widget cache needs a size cap first.", true)).ok()).toBeTruthy();
@@ -120,8 +93,7 @@ test.describe("thoughts setting", () => {
       await expect(liveRow(page, `r3-${stamp}`)).toBeVisible();
       expect(await isOpen(liveRow(page, `r3-${stamp}`))).toBe(true);
     } finally {
-      stopBeating();
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 
@@ -129,12 +101,11 @@ test.describe("thoughts setting", () => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const { conversationId, messageId } = await startTurn(request, headers, `Size the widget pool ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Size the widget pool ${stamp}`);
     const thought = (reasoningId, text, done = false) => request.post("/api/thought", {
       headers,
-      data: { messageId, conversationId, mode: "agent", reasoningId, text, done },
+      data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", reasoningId, text, done },
     });
-    const stopBeating = keepWorkerAlive(request, headers, messageId);
 
     try {
       expect((await thought(`q1-${stamp}`, "The pool holds sixteen widgets today.", true)).ok()).toBeTruthy();
@@ -179,8 +150,7 @@ test.describe("thoughts setting", () => {
         await shoot(page, `settings-appearance-${viewport[0]}`, page.locator("#appearance-browser-note"));
       }
     } finally {
-      stopBeating();
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 
@@ -189,10 +159,10 @@ test.describe("thoughts setting", () => {
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
     const runId = `toolu_thoughts_${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Explore the widget store ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Explore the widget store ${stamp}`);
     expect((await request.post("/api/subagent-run", {
       headers,
-      data: { messageId, conversationId, subagentRunId: runId, displayName: "Explore the widget store", status: "completed", subagentType: "Explore", timelineOwner: "worker" },
+      data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Explore the widget store", status: "completed", subagentType: "Explore", timelineOwner: "worker" },
     })).ok()).toBeTruthy();
     expect((await request.post("/api/subagent-timeline", {
       headers,
@@ -208,7 +178,7 @@ test.describe("thoughts setting", () => {
         ],
       },
     })).ok()).toBeTruthy();
-    expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "Store explored.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+    expect((await respondAsWorker(messageId, { conversationId, text: "Store explored.", model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
 
     for (const [name, viewport] of [["phone", PHONE], ["desktop", DESKTOP]]) {
       await page.setViewportSize(viewport);
@@ -254,8 +224,7 @@ test.describe("thoughts setting", () => {
       const headers = { Authorization: `Bearer ${token}` };
       const stamp = Date.now();
       const runId = `toolu_thoughts_live_${stamp}`;
-      const { conversationId, messageId } = await startTurn(request, headers, `Watch the widget audit ${stamp}`);
-      const stopBeating = keepWorkerAlive(request, headers, messageId);
+      const { conversationId, messageId } = await startTurn(`Watch the widget audit ${stamp}`);
       const timeline = (entries, header) => request.post("/api/subagent-timeline", {
         headers,
         data: { conversationId, subagentRunId: runId, entries, ...(header ? { header } : {}) },
@@ -263,7 +232,7 @@ test.describe("thoughts setting", () => {
       try {
         expect((await request.post("/api/subagent-run", {
           headers,
-          data: { messageId, conversationId, subagentRunId: runId, displayName: "Audit the widget store", status: "running", subagentType: "Explore", timelineOwner: "worker", background: true },
+          data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Audit the widget store", status: "running", subagentType: "Explore", timelineOwner: "worker", background: true },
         })).ok()).toBeTruthy();
         expect((await timeline([
           { key: "a:1", kind: "thought", text: "Auditing the widget store.", done: true },
@@ -303,9 +272,8 @@ test.describe("thoughts setting", () => {
         expect(await ended.evaluate((node) => node.open)).toBe(!expanded);
         await page.keyboard.press("Escape");
       } finally {
-        stopBeating();
         await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } }).catch(() => {});
-        await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+        await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
       }
     });
   }

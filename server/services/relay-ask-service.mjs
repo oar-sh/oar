@@ -26,6 +26,12 @@
  *
  * A pending ask ends when its session is archived or deleted (cancelled,
  * nobody told) and moves with a compaction. Closed asks are kept a week.
+ *
+ * The relay asks too: the loop guard's card for a held schedule firing
+ * (createLoopGuardCard). It has no asker (`created_by` NULL, so no agent may
+ * withdraw it) and `creator_json` `{ system: 'loop_guard', scheduleId }`,
+ * which never reads as a paired relay's creator. Its answer or dismissal goes
+ * to `onSystemAnswer` as well; the relay withdraws it once no firing is held.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -44,6 +50,7 @@ import { relayAsksTableProblem } from '../migrations/0023-relay-asks.mjs';
 const LOG_PREFIX = '[relay-asks]';
 const SELF = 'self';
 const PRUNE_INTERVAL_MS = 60 * 60_000;
+const LOOP_GUARD_SYSTEM = 'loop_guard';
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -86,6 +93,14 @@ export function normalizeRelayAskCreator(raw) {
   return creator.relayId ? creator : null;
 }
 
+/** 'loop_guard' for the relay's own card (no asker, the system marker), else null. */
+function systemOf(row) {
+  if (!row || toText(row.created_by)) return null;
+  const raw = parseJson(row.creator_json, null);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || toText(raw.relayId)) return null;
+  return raw.system === LOOP_GUARD_SYSTEM ? LOOP_GUARD_SYSTEM : null;
+}
+
 export function createRelayAskService({
   db,
   emit = () => {},
@@ -94,6 +109,9 @@ export function createRelayAskService({
   relayEvents = null,
   // push-dispatch-service.mjs notifyQuestion, for urgency "now".
   pushQuestion = () => {},
+  // The relay's own cards (the loop guard's): called with the ask once the
+  // person answered or dismissed it.
+  onSystemAnswer = () => {},
   now = () => Date.now(),
   newId = () => `${RELAY_ASK_ID_PREFIX}${randomBytes(6).toString('hex')}`,
   logger = console,
@@ -160,6 +178,11 @@ export function createRelayAskService({
     countPendingHere: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE relay_id = 'self' AND status = 'pending'`),
     countPendingIn: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE relay_id = 'self' AND conversation_id = ? AND status = 'pending'`),
     countPendingBy: db.prepare(`SELECT COUNT(*) AS n FROM relay_asks WHERE created_by = ? AND status = 'pending'`),
+    // The relay's own cards in a conversation (filtered again on the parsed marker).
+    listPendingSystemIn: db.prepare(`
+      SELECT * FROM relay_asks WHERE relay_id = 'self' AND conversation_id = ? AND status = 'pending'
+        AND created_by IS NULL AND creator_json LIKE '%"system"%'
+    `),
     close: db.prepare(`
       UPDATE relay_asks SET status = ?, answer = ?, choice = ?, answered_at = ?, answered_via = ?, updated_at = ?
       WHERE id = ? AND status = 'pending'
@@ -226,9 +249,12 @@ export function createRelayAskService({
     const asker = conversation(row.created_by);
     const options = parseJson(row.options_json, []);
     const closed = toText(row.status) !== 'pending';
+    const system = mirror ? null : systemOf(row);
     return {
       id: mirror ? toText(row.remote_id) : row.id,
       kind: RELAY_ASK_KIND,
+      // The relay's own card, not an agent's question.
+      ...(system ? { system } : {}),
       ...(mirror ? { relayId: row.relay_id } : {}),
       session: {
         id: row.conversation_id,
@@ -341,6 +367,67 @@ export function createRelayAskService({
     return ask;
   }
 
+  /**
+   * The loop guard's card for a held firing, in the conversation that set
+   * the schedule: the relay's own words and options, urgency "now", pushed
+   * even while a device is active.
+   */
+  function createLoopGuardCard({ conversationId, scheduleId = null, question, options = [] } = {}) {
+    requireAvailable();
+    const session = conversation(conversationId);
+    if (!isLive(session)) throw new RelayAskError('notFound', `No live session ${toText(conversationId)} on this relay.`);
+    const checked = normalizeRelayAskInput({ question, options, urgency: 'now' });
+    if (!checked.ok) throw new RelayAskError('invalid', checked.error);
+    const id = newId();
+    const at = isoNow();
+    const values = [
+      id, SELF, null, session.id, null, null,
+      JSON.stringify({ system: LOOP_GUARD_SYSTEM, scheduleId: clip(scheduleId, 200) || null }),
+      checked.value.question, JSON.stringify(checked.value.options), null, null, 'now', at, at,
+    ];
+    if (sql.insertWithQueue) sql.insertWithQueue.run(...values, null);
+    else sql.insert.run(...values);
+    const row = sql.get.get(id);
+    log(`${id} in ${shortId(session.id)} by the loop guard`);
+    changed(row);
+    try { relayEvents?.noteQuestion?.({ id, conversationId: session.id, prompt: checked.value.question, choices: checked.value.options, kind: RELAY_ASK_KIND }); } catch {}
+    try {
+      void pushQuestion({ id, conversationId: session.id, prompt: checked.value.question, choices: checked.value.options, context: { variant: LOOP_GUARD_SYSTEM } });
+    } catch {}
+    return shape(row);
+  }
+
+  function pendingSystemRows(conversationId) {
+    if (!available) return [];
+    return sql.listPendingSystemIn.all(toText(conversationId)).filter((row) => systemOf(row) === LOOP_GUARD_SYSTEM);
+  }
+
+  /** The conversation's pending loop guard card, or null. */
+  function pendingLoopGuardCard(conversationId) {
+    const row = pendingSystemRows(conversationId)[0];
+    return row ? shape(row) : null;
+  }
+
+  /** No firing of the conversation is held any more: the relay takes its card back. */
+  function withdrawLoopGuardCards(conversationId) {
+    let withdrawn = 0;
+    for (const row of pendingSystemRows(conversationId)) {
+      const at = isoNow();
+      if (!sql.close.run('withdrawn', null, null, at, null, at, row.id).changes) continue;
+      withdrawn += 1;
+      log(`${row.id} withdrawn by the loop guard`);
+      changed(sql.get.get(row.id));
+    }
+    return withdrawn;
+  }
+
+  function noteSystemAnswer(row) {
+    if (!systemOf(row)) return;
+    try { onSystemAnswer(shape(row)); } catch (error) {
+      warn(`${row.id} loop guard answer not applied: ${toText(error?.message || error).slice(0, 200)}`);
+    }
+  }
+
   function get(id) {
     if (!available) return null;
     const row = sql.get.get(toText(id));
@@ -425,7 +512,9 @@ export function createRelayAskService({
     const row = closeHere(id, 'answered', { answer: checked.value.answer, choice: checked.value.choice, via });
     log(`${row.id} answered${via ? ` from relay ${clip(via, 30)}` : ''}`);
     changed(row);
-    return tell(row);
+    const told = tell(row);
+    noteSystemAnswer(row);
+    return told;
   }
 
   /** The owner dismissed it: the asker is told there will be no answer. */
@@ -433,7 +522,9 @@ export function createRelayAskService({
     const row = closeHere(id, 'dismissed', { via });
     log(`${row.id} dismissed${via ? ` from relay ${clip(via, 30)}` : ''}`);
     changed(row);
-    return tell(row);
+    const told = tell(row);
+    noteSystemAnswer(row);
+    return told;
   }
 
   /**
@@ -641,6 +732,9 @@ export function createRelayAskService({
     isAvailable: () => available,
     problem: () => problem,
     create,
+    createLoopGuardCard,
+    pendingLoopGuardCard,
+    withdrawLoopGuardCards,
     get,
     listHere,
     listOf,

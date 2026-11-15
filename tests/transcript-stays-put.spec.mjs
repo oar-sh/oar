@@ -3,6 +3,15 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, bootstrapConversation, createFakeWorker, relayPresence, respondAsWorker, settleFakeWorkers } from "./helpers/fake-worker.mjs";
+
+// A running turn a test studied (`runningTurn`) ends with the test; any other
+// turn a fake worker still holds then fails it.
+test.afterEach(async () => {
+  for (const conversation of conversations) await conversation.endRunningTurns();
+  conversations.clear();
+  await settleFakeWorkers();
+});
 
 /**
  * The transcript stays where the reader is. It moves by itself in two cases
@@ -10,7 +19,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *
  * Without a model, on a relay of the spec's own (the agent-sessions setting
  * is switched on for the approval card and the event row): the spec plays the
- * worker (GET /api/pending, POST /api/stream, POST /api/response), asks
+ * worker (helpers/fake-worker.mjs, POST /api/stream), asks
  * questions (POST /api/relay-question), posts boards (POST /api/relay-board),
  * queues another relay's prompt (POST /api/message with an `origin`) and
  * subscribes one conversation to another (POST /api/remote-relays/tool).
@@ -52,7 +61,10 @@ const DEVICES = {
 const SEND_SETTING_KEY = "copilot_scroll_on_send";
 
 let relay = null;
+const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
 let heartbeat = null;
+// Every conversation a test made, for the end of the test.
+const conversations = new Set();
 
 async function api(route, { method = "GET", body, headers = {} } = {}) {
   const response = await fetch(`${relay.baseUrl}${route}`, {
@@ -70,71 +82,76 @@ async function post(route, body, headers) {
   return result.payload;
 }
 
-// A conversation and the worker's side of it.
-function createConversation({ bound = true } = {}) {
+// A conversation and the worker's side of it. Made as the web client makes
+// one, bound to its session from the start, by its first message.
+function createConversation() {
   let conversationId = "";
   let ownerSessionId = "";
+  // The turns `runningTurn` started that nothing answered yet.
+  const running = new Set();
+
+  // The conversation's worker, played by the spec.
+  const worker = () => createFakeWorker({ ...onRelay, sessionId: ownerSessionId || conversationId, conversationId });
 
   async function dequeue(messageId) {
-    const headers = ownerSessionId ? { "x-relay-session-id": ownerSessionId } : {};
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const message = (await api("/api/pending", { headers })).payload?.message || null;
-      if (!message) { await sleep(120); continue; }
-      if (String(message.id) === String(messageId)) return;
-      await api("/api/requeue", { method: "POST", body: { messageId: String(message.id) } });
-      await sleep(100);
-    }
-    throw new Error(`timed out dequeuing ${messageId}`);
+    await worker().take(messageId);
   }
 
   async function queue(text, extra = {}) {
+    const first = !conversationId;
+    if (first) conversationId = await bootstrapConversation({ title: text }, onRelay);
     const body = await post("/api/message", {
-      text, relayMode: "agent", model: "gpt-5.4-mini", conversationId: conversationId || undefined, ...extra,
+      text, relayMode: "agent", model: "gpt-5.4-mini", conversationId, ...extra,
     });
-    if (conversationId) return String(body.messageId);
-    conversationId = String(body.conversationId || "");
-    ownerSessionId = String(body.ownerSessionId || "");
+    if (first) ownerSessionId = String(body.ownerSessionId || "");
     return String(body.messageId);
   }
 
-  async function bind() {
-    await post("/api/session-sync", { sdk_session_id: `pw-stay-${randomUUID()}`, conversation_id: conversationId });
-  }
-
-  function answer(messageId, text) {
-    return post("/api/response", { messageId, conversationId, text, model: "gpt-5.4-mini", mode: "agent" });
+  async function answer(messageId, text) {
+    running.delete(messageId);
+    const result = await respondAsWorker(messageId, { conversationId, text, model: "gpt-5.4-mini", mode: "agent" });
+    expect(result.status, `/api/response: ${JSON.stringify(result.payload)}`).toBe(200);
+    return result.payload;
   }
 
   async function turn(text, reply = `Answer to ${text}. ${FILLER.repeat(3)}`) {
-    const first = !conversationId;
     const messageId = await queue(text);
     await dequeue(messageId);
-    if (first && bound) await bind();
     await answer(messageId, reply);
     return messageId;
   }
 
   // A message the "worker" has taken: the turn runs until it is answered.
   async function runningTurn(text, extra = {}) {
-    const first = !conversationId;
     const messageId = await queue(text, extra);
     await dequeue(messageId);
-    if (first && bound) await bind();
+    running.add(messageId);
     return messageId;
   }
 
+  // The running turns still held end, as the worker would end them.
+  async function endRunningTurns() {
+    const held = worker().holding;
+    for (const messageId of running) {
+      if (held.includes(messageId)) await respondAsWorker(messageId, { conversationId, text: "Ended with the test.", model: "gpt-5.4-mini", mode: "agent" }).catch(() => null);
+    }
+    running.clear();
+  }
+
   function stream(messageId, text) {
-    return post("/api/stream", { messageId, conversationId, text, mode: "agent", done: false });
+    return post("/api/stream", { ...attemptOf(messageId), messageId, conversationId, text, mode: "agent", done: false });
   }
 
   function ask(messageId, prompt, choices = ["Ship it", "Wait"]) {
     return post("/api/relay-question", {
+      ...attemptOf(messageId),
       queueId: messageId, messageId, conversationId, mode: "agent", prompt, choices, allowFreeform: true, timeout_ms: 120_000,
     });
   }
 
   function board(messageId) {
     return post("/api/relay-board", {
+      ...attemptOf(messageId),
       queueId: messageId,
       messageId,
       conversationId,
@@ -195,15 +212,17 @@ function createConversation({ bound = true } = {}) {
     });
   }
 
-  return {
-    queue, dequeue, bind, answer, turn, runningTurn, stream, hideFromShares, backgroundTasks, ask, board, tool, pendingCards, approvalCard, answerCard,
+  const conversation = {
+    queue, dequeue, answer, endRunningTurns, turn, runningTurn, stream, hideFromShares, backgroundTasks, ask, board, tool, pendingCards, approvalCard, answerCard,
     get conversationId() { return conversationId; },
   };
+  conversations.add(conversation);
+  return conversation;
 }
 
 // Long enough for several screens on either viewport.
-async function longConversation(turns = 8, { bound = true } = {}) {
-  const conversation = createConversation({ bound });
+async function longConversation(turns = 8) {
+  const conversation = createConversation();
   for (let index = 0; index < turns; index += 1) await conversation.turn(`Question ${index}. ${FILLER.repeat(3)}`);
   return conversation;
 }
@@ -418,14 +437,14 @@ test.describe.configure({ timeout: 120_000 });
 test.beforeAll(async () => {
   relay = await startRelayServer({ token: randomUUID() });
   // A relay that hears from no worker hands running turns back to the queue.
-  heartbeat = setInterval(() => { api("/api/heartbeat", { method: "POST", body: {} }).catch(() => {}); }, 2_000);
+  heartbeat = relayPresence(onRelay);
   await post("/api/models/snapshot", { source: "e2e-harness:copilot-ready", models: ["gpt-5.4-mini"] });
   await post("/api/settings/pwa-app-name", { appName: "bench-relay" });
   await post("/api/settings/agent-sessions", { enabled: true });
 });
 
 test.afterAll(async () => {
-  clearInterval(heartbeat);
+  heartbeat?.stop();
   heartbeat = null;
   if (relay) await relay.stop();
   relay = null;
@@ -645,7 +664,7 @@ for (const [name, device] of Object.entries(DEVICES)) {
 
       // A frame for a turn that has ended, as a slow worker sends it; the
       // test reads the socket's frames to know that it arrived.
-      await post("/api/stream", { messageId: done, conversationId: reader.conversationId, text: "Late text", mode: "agent", done: false });
+      await post("/api/stream", { ...attemptOf(done), messageId: done, conversationId: reader.conversationId, text: "Late text", mode: "agent", done: false });
       await expect.poll(() => frames.count).toBeGreaterThan(0);
       await page.waitForTimeout(300);
       await expect(page.locator("#thinking-indicator")).toHaveCount(0);
@@ -731,27 +750,6 @@ for (const [name, device] of Object.entries(DEVICES)) {
       expect((await readingPosition(page)).scrollTop).toBeGreaterThan(position.scrollTop);
       // A reload is no news.
       await expectButton(page, "plain");
-    });
-
-    test("a worker binds the conversation's session: the page opens it again where the reader was", async ({ page }) => {
-      // A conversation takes no second message before it is bound: one
-      // turn, with a reply long enough to scroll in.
-      const reader = createConversation({ bound: false });
-      let reply = "";
-      for (let step = 0; step < 24; step += 1) reply += `Paragraph ${step}. ${FILLER.repeat(3)}\n\n`;
-      await reader.turn(`Summarise this. ${FILLER.repeat(4)}`, reply);
-      const grow = await growEarlierMessage(page, reader.conversationId);
-      await openConversation(page, reader.conversationId);
-      await goToEnd(page);
-      const read = await readBlockAt(page, "p", "Paragraph 9.");
-
-      // Opened again, the question above the reader has grown.
-      grow.start();
-      await reloadAfter(page, reader.conversationId, () => reader.bind());
-      await expect(page.locator("#messages .msg[data-message-id]").first()).toContainText("Added since.");
-      await expectBlockAt(page, "p", "Paragraph 9.", read);
-      await page.waitForTimeout(1_200);
-      await expectBlockAt(page, "p", "Paragraph 9.", read);
     });
 
     test("Hide on a message while scrolled up leaves the reader where they are", async ({ page }) => {

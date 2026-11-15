@@ -57,7 +57,7 @@ const QUOTA_EXHAUSTED = {
 /**
  * `hint` carries structured signals that outrank the prose. Only quota is
  * modelled today; the prose branches below are unchanged and remain the sole
- * classifier when no hint is supplied, which is the extension's path.
+ * classifier when no hint is supplied.
  */
 function classifyTerminalError(text, hint = {}) {
   // Checked before the prose so a structurally-flagged quota error lands in

@@ -80,9 +80,11 @@ const {
   cliRowState,
   cliRowNote,
   cliRowActions,
+  confirmCliInstall,
   installLogSummary,
   isCliInstallBusy,
 } = await import('./cli-install-ui.js');
+const { closeSummaryModal } = await import('./store.js');
 
 const el = (id) => document.getElementById(id);
 
@@ -195,6 +197,38 @@ test('a detect-only provider renders read-only with its reason', () => {
   assert.equal(el('cli-copilot-install-btn').hidden, true);
   assert.equal(el('cli-copilot-update-btn').hidden, true);
   assert.equal(el('cli-copilot-note').textContent, copilot.blockedReason);
+});
+
+test('a Copilot row carries the login hint, and its confirm sheet the command\'s checksum note', async () => {
+  const install = {
+    display: 'curl -fsSL https://raw.githubusercontent.com/github/copilot-cli/main/install.sh | bash',
+    targetDir: '~/.local/bin',
+    detail: 'Nothing is installed unless the script checked the download against the release\'s checksum file.',
+  };
+  const copilot = providerRow({
+    id: 'copilot',
+    label: 'GitHub Copilot CLI',
+    binary: 'copilot',
+    hint: 'Install it here, then run copilot once in a terminal on the relay host and log in.',
+    commands: { install },
+  });
+  applyCliInstallState(payload({ copilot }));
+  assert.deepEqual(cliRowActions(copilot), ['install']);
+  assert.equal(el('cli-copilot-install-btn').hidden, false);
+  assert.equal(el('cli-copilot-note').textContent, copilot.hint);
+  assert.equal(el('cli-copilot-note').hidden, false);
+  // A managed copy's note and the hint read as one line.
+  assert.equal(
+    cliRowNote({ ...copilot, installed: true, blockedReason: 'Installed with npm.', hint: 'To log in, run copilot.' }),
+    'Installed with npm. To log in, run copilot.',
+  );
+
+  await confirmCliInstall('copilot', 'install');
+  const body = el('summary-modal-body').innerHTML;
+  assert.ok(body.includes(install.display));
+  assert.ok(body.includes('<code>~/.local/bin</code>'));
+  assert.ok(body.includes('checked the download against the release'));
+  closeSummaryModal();
 });
 
 test('a running install streams the log and freezes every provider (single flight)', () => {

@@ -7,15 +7,20 @@ import {
   AGENT_SESSIONS_SOCKET_EVENT,
   agentSessionsSavedText,
   agentSessionsViewModel,
+  clampAgentPrompts,
   clampWaitSeconds,
   classifyAgentSessionsLoad,
+  formatAgentPromptsLabel,
   formatWaitMinutesLabel,
+  loopGuardOffListHtml,
   normalizeAgentSessionsLimits,
   normalizeAgentSessionsSettings,
 } from './agent-sessions-settings.mjs';
 
-const LIMITS = { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 };
-const SETTINGS = { enabled: true, maxWaitSeconds: 600, limits: LIMITS, maxActiveSessions: 4 };
+// The loop guard's range rides along in the same limits.
+const PROMPT_LIMITS = { minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 };
+const LIMITS = { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, ...PROMPT_LIMITS };
+const SETTINGS = { enabled: true, maxWaitSeconds: 600, agentPromptsBeforeAsking: 30, loopGuardOff: [], limits: LIMITS, maxActiveSessions: 4 };
 
 test('the socket event and the defaults are the ones the relay documents', () => {
   assert.equal(AGENT_SESSIONS_SOCKET_EVENT, 'agent_sessions_settings_updated');
@@ -61,12 +66,12 @@ test('unusable limits fall back to the defaults', () => {
   assert.deepEqual(normalizeAgentSessionsLimits({ minWaitSeconds: 'x', maxWaitSeconds: -5, stepSeconds: 0 }), LIMITS);
   assert.deepEqual(
     normalizeAgentSessionsLimits({ minWaitSeconds: 60, maxWaitSeconds: 1800, stepSeconds: 30 }),
-    { minWaitSeconds: 60, maxWaitSeconds: 1800, stepSeconds: 30 },
+    { minWaitSeconds: 60, maxWaitSeconds: 1800, stepSeconds: 30, ...PROMPT_LIMITS },
   );
   // A maximum below the minimum would make a slider that cannot move.
   assert.deepEqual(
     normalizeAgentSessionsLimits({ minWaitSeconds: 600, maxWaitSeconds: 300, stepSeconds: 60 }),
-    { minWaitSeconds: 600, maxWaitSeconds: 600, stepSeconds: 60 },
+    { minWaitSeconds: 600, maxWaitSeconds: 600, stepSeconds: 60, ...PROMPT_LIMITS },
   );
 });
 
@@ -80,6 +85,8 @@ test('the state takes the payload and keeps what a partial one leaves out', () =
   assert.deepEqual(normalizeAgentSessionsSettings({}), {
     enabled: false,
     maxWaitSeconds: 600,
+    agentPromptsBeforeAsking: 30,
+    loopGuardOff: [],
     limits: LIMITS,
     maxActiveSessions: null,
   });
@@ -153,4 +160,46 @@ test('the status line says what was saved', () => {
     agentSessionsSavedText('maxWaitSeconds', { ...SETTINGS, maxWaitSeconds: 1500 }),
     'Agents may wait up to 25 min per tool call.',
   );
+});
+
+// ─── The loop guard ──────────────────────────────────────────────────────────
+
+const LOOP_LIMITS = { ...LIMITS, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 };
+
+test('the loop guard number: its view model, "Never ask" at 0, and what a typed value becomes', () => {
+  const view = (agentPromptsBeforeAsking) => agentSessionsViewModel({ settings: normalizeAgentSessionsSettings({ ...SETTINGS, limits: LOOP_LIMITS, agentPromptsBeforeAsking }) }).agentPrompts;
+  assert.deepEqual(view(30), { min: 0, max: 500, step: 10, value: 30, label: 'Ask after 30 prompts', disabled: false });
+  assert.deepEqual(view(0), { min: 0, max: 500, step: 10, value: 0, label: 'Never ask', disabled: false });
+  assert.equal(formatAgentPromptsLabel(120), 'Ask after 120 prompts');
+  // An older relay that sends no number: the default, and a partial payload keeps it.
+  const older = normalizeAgentSessionsSettings(SETTINGS);
+  assert.equal(older.agentPromptsBeforeAsking, 30);
+  assert.deepEqual(older.loopGuardOff, []);
+  assert.equal(normalizeAgentSessionsSettings({ enabled: false }, { ...older, agentPromptsBeforeAsking: 0 }).agentPromptsBeforeAsking, 0);
+  assert.equal(agentSessionsViewModel({ settings: null, loadFailed: true }).agentPrompts.disabled, true);
+  assert.equal(agentSessionsViewModel({ settings: older, saving: true }).agentPrompts.disabled, true);
+
+  for (const [typed, sent] of [[0, 0], ['4', 0], [5, 10], [14, 10], [15, 20], [499, 500], [9000, 500], ['', 30], ['x', 30], [null, 30]]) {
+    assert.equal(clampAgentPrompts(typed, LOOP_LIMITS, 30), sent, String(typed));
+  }
+  assert.equal(agentSessionsSavedText('agentPromptsBeforeAsking', { agentPromptsBeforeAsking: 0 }), 'The loop guard never asks now.');
+  assert.equal(agentSessionsSavedText('agentPromptsBeforeAsking', { agentPromptsBeforeAsking: 50 }), 'The loop guard asks after 50 prompts between agents.');
+  assert.equal(agentSessionsSavedText('loopGuardOff', {}), 'The loop guard asks in that session again.');
+});
+
+test('the off-list renders one row per session with Revoke, its titles escaped', () => {
+  const settings = normalizeAgentSessionsSettings({
+    ...SETTINGS,
+    loopGuard: { off: [{ conversationId: 'c-lead', title: '<img src=x onerror=alert(1)> & "Lead"', since: '2026-11-14T10:00:00.000Z' }, { conversationId: 'c-untitled-1234', title: '' }, { title: 'no id' }] },
+  });
+  assert.equal(settings.loopGuardOff.length, 2, 'an entry without an id is dropped');
+  const { html, hidden } = agentSessionsViewModel({ settings }).loopGuardOff;
+  assert.equal(hidden, false);
+  assert.match(html, /Loop guard off for: <strong>&lt;img src=x onerror=alert\(1\)&gt; &amp; &quot;Lead&quot;<\/strong>/);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /data-loop-guard-revoke="c-lead"/);
+  assert.match(html, /Loop guard off for: <strong>session c-untitl<\/strong>/);
+  assert.equal((html.match(/>Revoke<\/button>/g) || []).length, 2);
+  assert.match(loopGuardOffListHtml([{ conversationId: 'c-1', title: 'A' }], { disabled: true }), / disabled>Revoke/);
+  assert.equal(agentSessionsViewModel({ settings: normalizeAgentSessionsSettings(SETTINGS) }).loopGuardOff.hidden, true, 'nothing listed: hidden');
 });

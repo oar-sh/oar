@@ -26,7 +26,6 @@ const ANTHROPIC_NAMES = Object.freeze(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKE
 
 // Every kind, with what it needs to get as far as the spawn.
 const KINDS = Object.freeze({
-  copilot: {},
   'copilot-sdk': { COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdk', COPILOT_SDK_PATH: '/opt/copilot-sdk' },
   claude: { COPILOT_WEB_RELAY_WORKER_KIND: 'claude', CLAUDE_RELAY_MODEL: 'claude-sonnet-5-5' },
   'claude-cloud': { COPILOT_WEB_RELAY_WORKER_KIND: 'claude-cloud', CLAUDE_CLOUD_RELAY_MODEL: 'claude-sonnet-5-5' },
@@ -128,7 +127,6 @@ function tmuxLaunchHarness() {
       processInspector: {
         findProcessForSessionAsync: () => ({ processId: process.pid, commandLine: 'node worker --session-id session-5' }),
       },
-      prepareOarMcpConfigImpl: () => null,
       locateExecutableImpl: () => true,
       allowProcessReuse: false,
       tmuxPollAttempts: 1,
@@ -190,7 +188,6 @@ async function detachedLaunchEnv(platform, env) {
       },
       execFileSyncImpl: () => { throw new Error('tmux missing'); },
       processInspector: { findProcessForSessionAsync: () => (platform === 'win32' ? { processId: process.pid } : null) },
-      prepareOarMcpConfigImpl: () => null,
       prepareWorkerLogFileImpl: () => null,
       locateExecutableImpl: () => true,
       allowProcessReuse: false,

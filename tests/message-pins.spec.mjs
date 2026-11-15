@@ -2,6 +2,10 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
 import { clickHeaderAction } from "./header-actions-helpers.mjs";
+import { completeTurn, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Pinned messages, against the shared e2e relay.
@@ -20,25 +24,13 @@ import { clickHeaderAction } from "./header-actions-helpers.mjs";
  * over the window that was jumped to.
  */
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function seedTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok(), `POST /api/message answered ${queued.status()}`).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const userId = String(body?.messageId || "").trim();
-  expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId: userId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  // Made as the web client makes a chat: bound to its session from the start.
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "").trim();
+  const userId = String(started.messageId || "").trim();
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   const loaded = await request.get(`/api/conversation/${conversationId}`, { headers });
   const replyId = String((await loaded.json()).messages.find((message) => message.role === "assistant")?.id || "");
   expect(replyId).toBeTruthy();
@@ -83,20 +75,6 @@ async function openConversationPage(page, token, conversationId) {
   // Only the socket's connect handler turns the dot green: from here on this
   // page receives the pin broadcasts.
   await expect(page.locator("#cli-dot")).toHaveClass("online");
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders }).catch(() => null);
-    if (dequeued?.ok()) {
-      const message = (await dequeued.json())?.message || null;
-      if (message && String(message.id) === messageId) return;
-      if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    }
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
 }
 
 const bubble = (page, messageId) => page.locator(`#messages .msg[data-message-id="${messageId}"]`);
@@ -264,15 +242,10 @@ test("a jump to a pinned message holds while a turn is running", async ({ page, 
 
   try {
     // The spec is the worker: it takes the turn and leaves it running.
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Keep working ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok(), `POST /api/message answered ${queued.status()}`).toBeTruthy();
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    runningId = String(queuedBody?.messageId || "");
-    await dequeue(request, headers, runningId, String(queuedBody?.ownerSessionId || ""));
+    const started = await startConversation({ text: `Keep working ${stamp}` });
+    conversationId = String(started.conversationId || "");
+    runningId = String(started.messageId || "");
+    await started.worker.take(runningId);
     // Sixty older messages: the window around the oldest one ends well before
     // the end of the conversation.
     const oldestId = insertOlderMessages(conversationId, stamp, 30)[0];
@@ -292,11 +265,8 @@ test("a jump to a pinned message holds while a turn is running", async ({ page, 
     await expect(bubble(page, oldestId)).toBeInViewport();
 
     // The turn ends and the page refreshes itself: the window still stays.
-    const finished = await request.post("/api/response", {
-      headers,
-      data: { messageId: runningId, conversationId, text: "Done.", model: "gpt-5.4-mini", mode: "agent" },
-    });
-    expect(finished.ok()).toBeTruthy();
+    const finished = await respondAsWorker(runningId, { conversationId, text: "Done.", model: "gpt-5.4-mini", mode: "agent" });
+    expect(finished.ok).toBeTruthy();
     runningId = "";
     await expect(page.locator("#thinking-indicator")).toHaveCount(0);
     await page.waitForTimeout(1_500);
@@ -304,10 +274,7 @@ test("a jump to a pinned message holds while a turn is running", async ({ page, 
     await expect(pinButton(page).locator(".header-icon-count")).toHaveText("1");
   } finally {
     if (runningId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId: runningId, conversationId, text: "Done.", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(runningId, { conversationId, text: "Done.", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
     if (conversationId) await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
   }

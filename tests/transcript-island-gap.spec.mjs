@@ -1,11 +1,15 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { bootstrapConversation, createFakeWorker, respondAsWorker, settleFakeWorkers } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // Live rows for a window that ends above the conversation's end, end to end
 // without a model: the spec queues messages with POST /api/message, takes
-// them off the queue with GET /api/pending and answers with POST
-// /api/response, as a worker does, while the page is open, so every row
-// arrives live.
+// them off the queue and answers them as the session's worker
+// (helpers/fake-worker.mjs) while the page is open, so every row arrives
+// live.
 //
 // - A jump into the history (here: to an early message, as a pin or a search
 //   result does) puts a window on the page that ends above the end. Live rows
@@ -24,7 +28,6 @@ const DEVICES = {
   desktop: { viewport: { width: 1280, height: 860 } },
   phone: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3 },
 };
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function createRelay(request) {
   const headers = { Authorization: `Bearer ${relayToken()}` };
@@ -32,58 +35,40 @@ function createRelay(request) {
   let ownerSessionId = "";
 
   async function dequeue(messageId) {
-    const claimHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const pending = await request.get("/api/pending", { headers: claimHeaders });
-      const message = (await pending.json())?.message || null;
-      if (!message) { await sleep(120); continue; }
-      if (String(message.id) === String(messageId)) return;
-      await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-      await sleep(100);
-    }
-    throw new Error(`timed out dequeuing ${messageId}`);
+    await createFakeWorker({ sessionId: ownerSessionId || conversationId, conversationId }).take(messageId);
   }
 
   async function queue(text) {
+    // The conversation is made as the web client makes one, bound to its
+    // session before its first message; every message then names it.
+    if (!conversationId) conversationId = await bootstrapConversation({ title: text });
     const queued = await request.post("/api/message", {
       headers,
-      data: { text, relayMode: "agent", model: "gpt-5.4-mini", conversationId: conversationId || undefined },
+      data: { text, relayMode: "agent", model: "gpt-5.4-mini", conversationId },
     });
     expect(queued.ok(), await queued.text()).toBeTruthy();
     const body = await queued.json();
-    if (!conversationId) {
-      conversationId = String(body.conversationId || "");
-      ownerSessionId = String(body.ownerSessionId || "");
-      await dequeue(body.messageId);
-      const bound = await request.post("/api/session-sync", {
-        headers,
-        data: { sdk_session_id: `pw-island-${Date.now()}`, conversation_id: conversationId },
-      });
-      expect(bound.ok()).toBeTruthy();
-      return { messageId: String(body.messageId), taken: true };
-    }
-    return { messageId: String(body.messageId), taken: false };
+    if (!ownerSessionId) ownerSessionId = String(body.ownerSessionId || "");
+    return { messageId: String(body.messageId) };
   }
 
   async function answer(messageId, text) {
-    const answered = await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text, model: "gpt-5.4-mini", mode: "agent" },
-    });
-    expect(answered.ok(), await answered.text()).toBeTruthy();
+    const answered = await respondAsWorker(messageId, { conversationId, text, model: "gpt-5.4-mini", mode: "agent" });
+    expect(answered.ok, JSON.stringify(answered.payload)).toBeTruthy();
   }
 
   // A question and its answer, taken off the queue as a worker does.
   async function turn(text, reply = `Answer to ${text}. ${FILLER.repeat(2)}`) {
     const queued = await queue(text);
-    if (!queued.taken) await dequeue(queued.messageId);
+    await dequeue(queued.messageId);
     await answer(queued.messageId, reply);
     return queued.messageId;
   }
 
-  // A question and its answer written before the page opens: no worker.
+  // A question and its answer written before the page opens.
   async function seedTurn(text, reply) {
     const queued = await queue(text);
+    await dequeue(queued.messageId);
     await answer(queued.messageId, reply);
     return queued.messageId;
   }
@@ -97,6 +82,11 @@ function createRelay(request) {
 
   async function cleanup() {
     if (!conversationId) return;
+    // A turn the worker still holds ends before the conversation goes.
+    const worker = createFakeWorker({ sessionId: ownerSessionId || conversationId, conversationId });
+    for (const held of worker.holding) {
+      await worker.respond(held, { text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
+    }
     await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});
   }
 

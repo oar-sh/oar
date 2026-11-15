@@ -12,6 +12,10 @@ import {
   startFakeClaudeCloudApi,
 } from "./fake-claude-cloud-api.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Agent sessions: an agent creates and drives sessions on its OWN relay with
@@ -29,17 +33,19 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *    a created session's first turn stays queued. That is what the cap counts,
  *    and it makes the fifth concurrent create deterministic;
  *  - one that really launches Claude Cloud workers against the fake API of
- *    tests/claude-cloud.spec.mjs (same setup: routing on, a tmux server of its
- *    own), for a `claude-cloud` create with `repo` and `branch`.
+ *    tests/claude-cloud.spec.mjs (same setup: a tmux server of its own), for
+ *    a `claude-cloud` create with `repo` and `branch`.
  *
  * The approval card needs a turn to sit on. On the plain relay the spec takes
- * the orchestrating conversation's message off the queue as a worker would
- * (GET /api/pending); on the cloud relay the orchestrating conversation is a
+ * the orchestrating conversation's message off the queue as its worker
+ * (helpers/fake-worker.mjs); on the cloud relay the orchestrating conversation is a
  * cloud chat whose turn the fake keeps open ("slow").
  */
 
 const SETTINGS_SHAPE = {
-  limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+  agentPromptsBeforeAsking: 30,
+  loopGuard: { off: [] },
+  limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 },
   maxActiveSessions: 4,
 };
 const APPROVAL_TIMEOUT = 20_000;
@@ -93,6 +99,7 @@ test.describe.serial("agent sessions on this relay", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const api = createApi(() => relay);
   const tool = createToolCaller(api);
   let orchestrator = "";
@@ -102,22 +109,11 @@ test.describe.serial("agent sessions on this relay", () => {
   // A conversation whose first message a "worker" has taken: its turn is
   // processing, as it is while an agent's tool call arrives. Called while no
   // other message is queued on this relay, so the dequeue can only return it.
+  // Made as the web client makes a chat: bound to its session from the start.
   async function conversationWithRunningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, messageId, ownerSessionId } = queued.payload;
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: conversationId, conversation_id: conversationId },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return conversationId;
-      await sleep(250);
-    }
-    throw new Error("The orchestrating conversation's message was never handed out");
+    const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+    await worker.take(messageId);
+    return conversationId;
   }
 
   test.beforeAll(async () => {
@@ -409,16 +405,12 @@ test.describe.serial("an agent starts a Claude Cloud session on this relay", () 
         tmuxDir = path.join(stateRoot, "tmux");
         fs.mkdirSync(tmuxDir, { recursive: true, mode: 0o700 });
         return {
-          COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
           OAR_CLAUDE_CLOUD_API_BASE_URL: fake.baseUrl,
           CLAUDE_CODE_OAUTH_TOKEN: FAKE_CLOUD_TOKEN,
           TMUX_TMPDIR: tmuxDir,
           // Not a tmux pane of whoever started the suite.
           TMUX: "",
           TMUX_PANE: "",
-          // Only cloud conversations are created here. Should anything else ever
-          // be launched, it runs this instead of a Copilot CLI.
-          COPILOT_WEB_RELAY_CLI_EXECUTABLE: "/bin/false",
         };
       },
     });

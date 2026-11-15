@@ -35,14 +35,15 @@ function pendingHandler(deps) {
   return handler;
 }
 
-async function invokePending(handler) {
+// The poller names its session, as every caller of the route does.
+async function invokePending(handler, headers = { 'x-relay-session-id': 'sess-gate-4c1d' }) {
   const captured = { status: 200, body: null };
   const res = {
     setHeader() {},
     status(code) { captured.status = code; return res; },
     json(payload) { captured.body = payload; return res; },
   };
-  await handler({ params: {}, body: {}, headers: {}, query: {} }, res);
+  await handler({ params: {}, body: {}, headers, query: {} }, res);
   return captured;
 }
 
@@ -53,11 +54,11 @@ function makeDeps({ runtimeState, calls }) {
     stmts: makeStmts(),
     io: { emit: () => {} },
     touchCli: () => {},
+    ts: () => '2026-01-01T00:00:00.000Z',
     uuidv4: () => 'generated-id',
     normalizeRelayMode: (value) => String(value || '').trim().toLowerCase() || null,
     DEFAULT_RELAY_MODE: 'agent',
     MAX_UPLOAD_BYTES: 1024 * 1024,
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
     runtimeState,
     // The first thing the route does past its gates: reaching it means a
     // dequeue was attempted.
@@ -93,7 +94,17 @@ test('without a queued restart the pending route goes on to dequeue', async () =
   const { body } = await invokePending(pendingHandler(makeDeps({ runtimeState, calls })));
 
   assert.notEqual(body?.reason, RELAY_SHUTDOWN_QUEUED_REASON);
-  assert.deepEqual(calls, ['queueCounts'], 'the route reaches the dequeue');
+  assert.equal(calls[0], 'queueCounts', 'the route reaches the dequeue');
+});
+
+test('a poller that names no session is refused before any gate or dequeue', async () => {
+  const calls = [];
+  const runtimeState = { relayPaused: false, relayShutdownQueued: false, relayShutdown: { status: 'idle' } };
+  const { status, body } = await invokePending(pendingHandler(makeDeps({ runtimeState, calls })), {});
+
+  assert.equal(status, 400);
+  assert.match(body.error, /x-relay-session-id/);
+  assert.deepEqual(calls, [], 'no dequeue is attempted');
 });
 
 test('the queued shutdown waits for processing turns only', () => {

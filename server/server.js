@@ -8,7 +8,7 @@ const runtimeArgs = process.argv.slice(2);
 const interactiveStdio = process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY;
 
 // `--relay-runtime` marks the child this script spawned. `--supervised` means an
-// outer supervisor (the CLI extension) owns restarts and needs to observe exit
+// outer supervisor owns restarts and needs to observe exit
 // code 75 itself, so the runtime runs in this process instead of a grandchild.
 if (isRelayRuntimeInvocation(runtimeArgs) || isExternallySupervised(runtimeArgs)) {
   await import('./server-runtime.mjs');

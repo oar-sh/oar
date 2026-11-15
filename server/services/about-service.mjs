@@ -298,9 +298,8 @@ async function fileSize(fsImpl, filePath) {
  * @param {string|null} [deps.buildId] the relay's build id (shared/build-id.mjs), to tell the workers on other code
  * @param {string} [deps.installMethod]
  * @param {string} deps.startedAt ISO time this relay process started
- * @param {() => object} [deps.getProviderSettings] `{ github: { enabled, engine }, claude: { enabled }, … }`
+ * @param {() => object} [deps.getProviderSettings] `{ github: { enabled }, claude: { enabled }, … }`
  * @param {() => object} [deps.getCachedCliProviders] the CLI install service's cached rows, by CLI id
- * @param {() => boolean} [deps.isRelayCliOnline] the Copilot relay CLI is connected
  * @param {() => object[]} [deps.listWorkers] the session worker registry's entries
  * @param {() => object|null} [deps.getUpdateState] buildUpdateStatePayload()
  * @param {() => object|null} [deps.getAgentSdkStatus] the agent SDK store's snapshot(); its `installed` versions come first
@@ -319,7 +318,6 @@ export function createAboutService({
   packageRoot = null,
   getProviderSettings = () => ({}),
   getCachedCliProviders = () => ({}),
-  isRelayCliOnline = () => false,
   listWorkers = () => [],
   getUpdateState = () => null,
   getAgentSdkStatus = null,
@@ -403,30 +401,24 @@ export function createAboutService({
   function describeProviders(workerCounts) {
     const settings = getProviderSettings() || {};
     const cli = getCachedCliProviders() || {};
-    const relayCliOnline = isRelayCliOnline() === true;
     const agentSdks = readAgentSdkSnapshot();
     const rows = [];
     for (const id of Object.keys(ABOUT_PROVIDER_LABELS)) {
       const entry = settings[id];
       if (!entry || entry.enabled !== true) continue;
-      const engine = id === 'github' ? (entry.engine === 'sdk' ? 'sdk' : 'extension') : null;
-      // Copilot on the extension engine and OpenAI run in the relay CLI; every
-      // other provider runs one worker process per active session.
-      const viaRelayCli = id === 'openai' || (id === 'github' && engine === 'extension');
+      // Every provider runs one worker process per active session; Copilot and
+      // OpenAI share the Copilot SDK worker.
       const runningWorkers = workerCounts.get(id) || 0;
       const cliRow = PROVIDER_CLI_IDS[id] ? cli[PROVIDER_CLI_IDS[id]] : null;
       const sdkPackage = ABOUT_PROVIDER_SDK_PACKAGES[id] || null;
       rows.push({
         id,
         label: ABOUT_PROVIDER_LABELS[id],
-        engine,
         cliVersion: cliRow?.installed ? (cliRow.version || null) : null,
         cliCheckedAt: cliRow?.checkedAt || null,
         sdkPackage,
         sdkVersion: sdkPackage ? sdkVersionFor(id, agentSdks) : null,
-        state: viaRelayCli
-          ? (relayCliOnline ? 'online' : 'offline')
-          : (runningWorkers > 0 ? 'online' : 'idle'),
+        state: runningWorkers > 0 ? 'online' : 'idle',
         runningWorkers,
       });
     }

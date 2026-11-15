@@ -79,10 +79,7 @@ function boot({ provider = 'claude', model = MODEL, claudeApi = {}, getClaudeApi
     emitToClientsExceptSessionId: (event, payload) => emitted.push({ event, payload }),
     claudeBillingSwitchService,
     claudeApiUsageService: createClaudeApiUsageService({ db, timeZone: 'UTC', logger: { log() {}, warn() {} } }),
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId } = {}) => (String(sessionId || '').trim() ? { sessionId: String(sessionId).trim() } : null),
-    },
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
     // What POST /api/response reads besides the database.
     relayActivityForResponse: () => [],
     relayActivityForQueueMessage: () => [],

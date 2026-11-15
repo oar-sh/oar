@@ -4,6 +4,10 @@ import { expect, test } from "@playwright/test";
 
 import { relayBaseUrl, relayToken } from "./e2e-env.mjs";
 import { startRelayServer } from "./relay-server-harness.mjs";
+import { settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The relay_tool tool path end to end, without a model
@@ -39,15 +43,10 @@ async function queueMessage(baseUrl, token, text, extra = {}) {
   return payload;
 }
 
-// A new conversation, bound to a session the way a worker would bind it, so it
-// accepts follow-up messages (no CLI runs here to do that).
+// A new conversation, made the way the web client makes one: bound to its
+// session from the start, so it accepts follow-up messages.
 async function newConversation(baseUrl, token, text, extra = {}) {
-  const { conversationId } = await queueMessage(baseUrl, token, text, extra);
-  const synced = await api(baseUrl, token, "/api/session-sync", {
-    method: "POST",
-    body: { sdk_session_id: conversationId, conversation_id: conversationId },
-  });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
+  const { conversationId } = await startConversation({ text, message: extra }, { baseUrl, token });
   return conversationId;
 }
 

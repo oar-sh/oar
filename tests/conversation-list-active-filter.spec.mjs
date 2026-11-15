@@ -5,6 +5,10 @@ import { expect, test } from "@playwright/test";
 
 import { resolveDatabaseFile } from "../server/services/database-file.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, completeTurn, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The sidebar's 🔥 toggle (active sessions only), against a relay of its own:
@@ -44,6 +48,7 @@ test.describe.serial("the 🔥 active filter in the sidebar", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const api = createApi(() => relay);
   const seeded = { plan: "", old: "", working: "", recent: "" };
   const sessions = { working: "", old: "" };
@@ -59,14 +64,13 @@ test.describe.serial("the 🔥 active filter in the sidebar", () => {
     }
   }
 
-  async function chat(title) {
-    const queued = await api("/api/message", { method: "POST", body: { text: title, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    return { conversationId: queued.payload.conversationId, messageId: queued.payload.messageId };
-  }
+  // A chat made as the web client makes one: bound to its session (its own
+  // id) from the start.
+  const chat = (title) => startConversation({ text: title }, onRelay);
 
-  async function reply(conversationId, messageId) {
-    const replied = await api("/api/response", { method: "POST", body: { messageId, conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" } });
+  // A whole turn by a worker that ends.
+  async function reply(turn) {
+    const replied = await completeTurn(turn, { text: "done", model: "gpt-5.4-mini", mode: "agent" }, onRelay);
     expect(replied.status).toBe(200);
   }
 
@@ -102,15 +106,11 @@ test.describe.serial("the 🔥 active filter in the sidebar", () => {
     // A plan card waits in this one: its turn ran, posted the card, and ended.
     const plan = await chat("Plan the storage migration");
     seeded.plan = plan.conversationId;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending");
-      if (String(dequeued.payload?.message?.id || "") === plan.messageId) break;
-      if (attempt === 39) throw new Error("the plan turn was never handed out");
-      await sleep(200);
-    }
+    await plan.worker.take(plan.messageId);
     const board = await api("/api/relay-board", {
       method: "POST",
       body: {
+        ...attemptOf(plan.messageId),
         queueId: plan.messageId,
         messageId: plan.messageId,
         conversationId: plan.conversationId,
@@ -123,22 +123,20 @@ test.describe.serial("the 🔥 active filter in the sidebar", () => {
       },
     });
     expect(board.status, JSON.stringify(board.payload)).toBe(200);
-    await reply(plan.conversationId, plan.messageId);
+    expect((await respondAsWorker(plan.messageId, { text: "done", model: "gpt-5.4-mini", mode: "agent" })).status).toBe(200);
 
     const old = await chat("Old notes on the backlog");
     seeded.old = old.conversationId;
-    await reply(old.conversationId, old.messageId);
+    // The session the /api/status answer gains a worker for: the conversation's own.
+    sessions.old = old.conversationId;
+    await reply(old);
     const working = await chat("Build the release bundle");
     seeded.working = working.conversationId;
-    await reply(working.conversationId, working.messageId);
-    for (const key of ["working", "old"]) {
-      sessions[key] = `playwright-active-filter-${key}-${Date.now()}`;
-      const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: sessions[key], conversation_id: seeded[key] } });
-      expect(synced.status).toBe(200);
-    }
+    sessions.working = working.conversationId;
+    await reply(working);
     const recent = await chat("Recently finished review");
     seeded.recent = recent.conversationId;
-    await reply(recent.conversationId, recent.messageId);
+    await reply(recent);
 
     // Everything but the recent one is hours old.
     for (const key of ["plan", "old", "working"]) setUpdatedAt(seeded[key], 3 * 60 * MINUTE);

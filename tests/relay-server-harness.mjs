@@ -5,9 +5,9 @@
  * callers cannot drift apart:
  *
  *  - `run-e2e.mjs` boots the one server every spec shares; and
- *  - a spec that needs a *differently configured* relay (tests/copilot-engine.spec.mjs
- *    needs one with session-worker routing on, which the shared server pins off)
- *    boots its own throwaway server with the same isolation guarantees.
+ *  - a spec that needs a *differently configured* relay (one that launches
+ *    workers, say, which the shared server never does) boots its own throwaway
+ *    server with the same isolation guarantees.
  *
  * The guarantee that matters: a test server must see none of the host's state —
  * not its config file, not its home directory, not its session-state dir, not
@@ -245,7 +245,7 @@ export function removeStateRoot(stateRoot) {
 
 /**
  * The server environment. `overrides` is applied last so a spec-owned server can
- * deliberately relax one pin (routing, the SDK path) without copying the block.
+ * deliberately relax one pin (the SDK path) or set a flag without copying the block.
  * `baseEnv` is what the pins go over: the host's environment for e2e, an
  * environment built from nothing for a scratch relay
  * (tests/helpers/scratch-relay-env.mjs).
@@ -288,30 +288,19 @@ export function buildRelayServerEnv({
     // log and worker logs stay in its own state.
     COPILOT_WEB_RELAY_LOG_DIR: path.join(stateRoot, "logs"),
     COPILOT_WEB_RELAY_CONFIG: path.join(stateRoot, "config.json"),
-    // Pin session-worker routing OFF. Feature flags now live in app_settings
-    // (this server's database is isolated and empty, so registry defaults —
-    // routing ON — would apply), and the env override is the layer that wins
-    // over both. Routing-on cannot work for queue specs here: owned rows are
-    // only released to a live worker lifecycle, and this server runs with CLI
-    // spawn disabled, so every owned dequeue would block on "spawn-failed".
-    // The routing queue logic itself is covered by the route-level suites
-    // (messages-routes-session-worker*.test.mjs); the spec helpers still send
-    // x-relay-session-id whenever a queue response carries an ownerSessionId,
-    // so a future routed harness works without spec changes.
-    COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "0",
-    // Pinned so the flag's default flip (off -> on) can't change e2e behavior
-    // wholesale: continuation routing adds strict ownership rejections on
-    // clarification answers, and a spec that wants them should un-pin this
-    // deliberately rather than inherit them by default.
-    COPILOT_REMOTE_SESSION_WORKER_CONTINUATION_ROUTING_ENABLED: "0",
+    // Every queued row belongs to its conversation's session, and this
+    // server launches no worker (CLI spawn is disabled, see the end of this
+    // block). A spec plays the worker through tests/helpers/fake-worker.mjs,
+    // which registers the test process as the session's worker and keeps its
+    // heartbeat while it holds a turn.
     // Kill the update-check service outright: the isolated test server must
     // never reach oar.sh, and update checking is opt-in anyway — a spec that
     // exercises the update flow un-pins this and points
     // OAR_UPDATE_MANIFEST_URL at its own stub server.
     OAR_NO_UPDATE_CHECK: "1",
-    // Pinned for the same reason routing is: without it the relay derives the
-    // path from whatever Copilot CLI the host happens to have installed, and the
-    // Copilot engine setting would refuse (or accept) differently per machine.
+    // Pinned so no host state leaks in: without it the relay derives the
+    // path from whatever Copilot CLI the host happens to have installed, and
+    // Copilot launches would find (or miss) an SDK differently per machine.
     COPILOT_SDK_PATH: sdkStubDir,
     // The startup SDK-session import sweep reads ~/.copilot/session-state:
     // on a developer host it would import the live relay's real Copilot

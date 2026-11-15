@@ -16,7 +16,7 @@ function seed(db, id, title, { origin = null } = {}) {
     .run(id, title, at, at, origin ? JSON.stringify(origin) : null);
 }
 
-function setup() {
+function setup({ onSystemAnswer } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   seed(db, LEAD, 'Lead');
@@ -35,6 +35,7 @@ function setup() {
       noteQuestionAnswered: (outcome) => answered.push(outcome),
     },
     pushQuestion: (question) => pushed.push(question),
+    ...(onSystemAnswer ? { onSystemAnswer } : {}),
     now: () => clock,
     newId: () => `ask_fixture${String(++counter).padStart(2, '0')}`,
     logger: { log() {}, warn() {} },
@@ -270,4 +271,69 @@ test('a compaction emits each moved ask of this relay once, with its new convers
   emitted.length = 0;
   assert.equal(service.carryToCompacted(LEAD, NEXT), 0);
   assert.equal(emitted.length, 0, 'nothing moved, nothing emitted');
+});
+
+// ─── The loop guard's card ───────────────────────────────────────────────────
+
+const LOOP_CARD = { question: "Schedule 'Night check' into 'Cache layer' is held by the loop guard (30 prompts since your last message).", options: ['Allow once', 'Allow for this session', 'Leave held'] };
+
+test('the loop guard\'s card has no asker, so no agent may withdraw it; it is pushed and found again until closed', () => {
+  const { service, db, pushed } = setup();
+  const card = service.createLoopGuardCard({ conversationId: LEAD, scheduleId: 'sch_1', ...LOOP_CARD });
+  assert.equal(card.system, 'loop_guard');
+  assert.equal(card.askedBy, null);
+  assert.equal(card.onBehalf, false);
+  assert.equal(card.urgency, 'now');
+  const row = db.prepare(`SELECT created_by, creator_json FROM relay_asks WHERE id = ?`).get(card.id);
+  assert.equal(row.created_by, null);
+  assert.deepEqual(JSON.parse(row.creator_json), { system: 'loop_guard', scheduleId: 'sch_1' });
+  assert.deepEqual(pushed.at(-1).context, { variant: 'loop_guard' });
+  assert.equal(service.pendingLoopGuardCard(LEAD).id, card.id);
+  assert.equal(service.pendingLoopGuardCard(WORKER), null);
+  for (const by of [{ byConversationId: LEAD }, { byConversationId: '' }, { byRelayId: 'instance-lab' }]) {
+    assert.throws(() => service.withdraw(card.id, by), (error) => error.code === 'forbidden', JSON.stringify(by));
+  }
+  // The relay takes it back itself.
+  assert.equal(service.withdrawLoopGuardCards(LEAD), 1);
+  assert.equal(service.pendingLoopGuardCard(LEAD), null);
+  assert.equal(service.withdrawLoopGuardCards(LEAD), 0);
+});
+
+test('onSystemAnswer is called on the loop guard card\'s answer and dismissal, never for an agent\'s ask', () => {
+  const seen = [];
+  const { service, answered } = setup({ onSystemAnswer: (ask) => seen.push(ask) });
+  const agentAsk = service.create({ conversationId: WORKER, createdBy: LEAD, ...QUESTION });
+  service.answer(agentAsk.id, { choice: 'Postgres' });
+  const agentDismissed = service.create({ conversationId: WORKER, createdBy: LEAD, ...QUESTION });
+  service.dismiss(agentDismissed.id);
+  assert.deepEqual(seen, []);
+
+  const card = service.createLoopGuardCard({ conversationId: LEAD, scheduleId: 'sch_1', ...LOOP_CARD });
+  service.answer(card.id, { choice: 'Allow once' });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].choice, 'Allow once');
+  assert.equal(seen[0].conversationId, LEAD);
+  // The conversation that set the schedule hears the outcome like any ask's.
+  assert.deepEqual(answered.at(-1).notify, [LEAD]);
+  const second = service.createLoopGuardCard({ conversationId: LEAD, scheduleId: 'sch_1', ...LOOP_CARD });
+  service.dismiss(second.id);
+  assert.equal(seen.length, 2);
+  assert.equal(seen[1].status, 'dismissed');
+});
+
+test('a paired relay\'s creator is never read as the system marker', () => {
+  const seen = [];
+  const { service } = setup({ onSystemAnswer: (ask) => seen.push(ask) });
+  const ask = service.create({
+    conversationId: LEAD,
+    creator: { relayId: 'instance-lab', relayName: 'lab', system: 'loop_guard', scheduleId: 'sch_x' },
+    question: 'Ship?',
+    options: ['Yes', 'No'],
+  });
+  assert.equal(ask.system, undefined);
+  assert.equal(service.pendingLoopGuardCard(LEAD), null);
+  assert.equal(service.withdrawLoopGuardCards(LEAD), 0);
+  service.answer(ask.id, { choice: 'Yes' });
+  assert.deepEqual(seen, []);
+  assert.equal(service.withdraw(service.create({ conversationId: LEAD, creator: { relayId: 'instance-lab' }, question: 'Again?' }).id, { byRelayId: 'instance-lab' }).status, 'withdrawn');
 });

@@ -53,7 +53,6 @@ function windowsLaunch({ env = {}, child = fakeStartChild({ exit: 0 }), found = 
     env: { ...WIN_ENV, ...env },
     platform: 'win32',
     allowProcessReuse: false,
-    prepareOarMcpConfigImpl: () => null,
     prepareWorkerLogFileImpl: () => null,
     locateExecutableImpl: locate,
     // The fixture folders exist on no host; a failed spawn would be put down to them.
@@ -231,7 +230,6 @@ test('a start that returns during the grace is not a failure', async () => {
     env: { ...WIN_ENV },
     platform: 'win32',
     allowProcessReuse: false,
-    prepareOarMcpConfigImpl: () => null,
     prepareWorkerLogFileImpl: () => null,
     locateExecutableImpl: () => 'located',
     processInspector: { async findProcessForSessionAsync() { return null; } },

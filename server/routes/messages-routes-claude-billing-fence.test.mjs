@@ -45,7 +45,6 @@ function boot({ provider = 'claude', switchedAt = null } = {}) {
       db,
       stmts,
       nowIso: NOW,
-      routingEnabled: true,
       requesterSessionId: SID,
       workerKind,
       onBillingFence: (fence) => fences.push(fence),
@@ -146,7 +145,6 @@ test('the worker loop says billing-swap when the fence held the row back', async
     db: app.db,
     stmts: app.stmts,
     nowIso: NOW,
-    routingEnabled: true,
     requesterSessionId: SID,
     workerKind: 'claude',
     onBillingFence: (fence) => fences.push(fence),
@@ -203,27 +201,23 @@ test('a worker that states a non-Claude kind never claims a Claude chat\'s row',
 // GET /api/pending as tests/usage-limit-pause-routes.spec.mjs drives it: a
 // chat queued as a Copilot one (its row unstamped), then made a Claude chat,
 // dequeued by a poller that names its session but states no kind.
-async function pendingAs(app, sessionId, { routing = true, claudeApiClaimCheck = null, onClaudeBillingFence = null, registry = null } = {}) {
+async function pendingAs(app, sessionId, { claudeApiClaimCheck = null, onClaudeBillingFence = null, registry = null, workersStateTheirKind = null } = {}) {
   const { makeRouteDeps, captureRoutes, invokeRoute } = await import('./messages-routes-test-harness.mjs');
   const deps = makeRouteDeps({
     db: app.db,
     stmts: app.stmts,
     io: { emit() {}, volatile: { emit() {} } },
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: routing },
     queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
     parseAttachments: () => [],
     hydrateAttachment: (value) => value,
     ensureRuntimeSessionBinding: (conversationId) => app.stmts.getRuntimeSessionByConversation.get(conversationId) || null,
     configuredConversationSessionMode: 'isolated',
     DEFAULT_RELAY_MODE: 'agent',
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId: sid } = {}) => (String(sid || '').trim() ? { sessionId: String(sid).trim() } : null),
-      observe: () => ({ accepted: true }),
-    },
     sessionWorkerRegistry: registry || { getWorker: () => null, upsertWorker() {} },
     claudeApiClaimCheck,
     onClaudeBillingFence,
-    runtimeState: { featureFlags: {}, relayPaused: false },
+    workersStateTheirKind,
+    runtimeState: { relayPaused: false },
     ts: () => NOW,
     uuidv4: () => 'uuid-1',
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
@@ -238,17 +232,15 @@ async function pendingAs(app, sessionId, { routing = true, claudeApiClaimCheck =
 }
 
 test('GET /api/pending hands a Claude chat\'s row to a poller of unknown kind while the chat never switched (the usage-limit spec\'s worker)', async () => {
-  for (const routing of [true, false]) {
-    const app = boot({ provider: 'github' });
-    app.enqueue('q-seed');
-    assert.equal(app.row('q-seed').provider, null, 'queued while the chat was a Copilot one');
-    app.db.prepare(`UPDATE runtime_sessions SET provider_type = 'claude' WHERE id = 'rs-1'`).run();
-    const fences = [];
-    const { status, body } = await pendingAs(app, SID, { routing, onClaudeBillingFence: (fence) => fences.push(fence) });
-    assert.equal(status, 200, JSON.stringify(body));
-    assert.equal(body.message?.id, 'q-seed', `routing ${routing}: ${JSON.stringify(body)}`);
-    assert.deepEqual(fences, []);
-  }
+  const app = boot({ provider: 'github' });
+  app.enqueue('q-seed');
+  assert.equal(app.row('q-seed').provider, null, 'queued while the chat was a Copilot one');
+  app.db.prepare(`UPDATE runtime_sessions SET provider_type = 'claude' WHERE id = 'rs-1'`).run();
+  const fences = [];
+  const { status, body } = await pendingAs(app, SID, { onClaudeBillingFence: (fence) => fences.push(fence) });
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(body.message?.id, 'q-seed', JSON.stringify(body));
+  assert.deepEqual(fences, []);
 });
 
 test('GET /api/pending: a switched chat is fenced (kind unknown) and asks for the swap; a stated kind is taken at its word', async () => {
@@ -329,4 +321,34 @@ test('a page\'s row on the key is not claimed while this month\'s cap is reached
   assert.match(refused.fences[0].refusal.error, /\$1\.20, has reached the monthly cap of \$1\.00/);
   settings.monthlyCapUsd = 2;
   assert.equal(app.claim('claude-api', { claudeApiClaimCheck }).message?.id, 'q-1');
+});
+
+test('GET /api/pending on a relay that launches its workers: a poller that never said its kind is handed nothing and is not registered', async () => {
+  // A message queued while a Copilot CLI an earlier version started still
+  // polls: it waits for the session's worker.
+  const app = boot({ provider: 'github' });
+  app.enqueue('q-1');
+  const upserts = [];
+  const unstated = await pendingAs(app, SID, {
+    workersStateTheirKind: () => true,
+    registry: { getWorker: () => null, upsertWorker: (state) => { upserts.push(state); } },
+  });
+  assert.equal(unstated.status, 200, JSON.stringify(unstated.body));
+  assert.equal(unstated.body.message ?? null, null);
+  assert.equal(unstated.body.reason, 'worker-kind-unstated');
+  assert.equal(app.row('q-1').status, 'pending');
+  assert.deepEqual(upserts, []);
+  // The same poller, registered by its heartbeat with a pid and no kind.
+  const heartbeating = await pendingAs(app, SID, {
+    workersStateTheirKind: () => true,
+    registry: { getWorker: () => ({ sdkSessionId: SID, pid: 4242, status: 'ready', kind: null }), upsertWorker() {} },
+  });
+  assert.equal(heartbeating.body.message ?? null, null);
+  assert.equal(app.row('q-1').status, 'pending');
+  // A worker that said its kind is served as before.
+  const stated = await pendingAs(app, SID, {
+    workersStateTheirKind: () => true,
+    registry: { getWorker: () => ({ sdkSessionId: SID, pid: 4242, status: 'ready', kind: 'copilot-sdk' }), upsertWorker() {} },
+  });
+  assert.equal(stated.body.message?.id, 'q-1', JSON.stringify(stated.body));
 });

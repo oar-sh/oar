@@ -47,6 +47,20 @@
  * (endOwnWait with `received`) drops it, and a turn_end that comes later is
  * never recorded for it. Errors and questions of the turn still go.
  *
+ * Late replies (migrations/0042-late-replies.mjs): a prompt no wait handed
+ * a final outcome for stays open, and the sweeper
+ * (relay-late-reply-service.mjs, reading through the dispatcher's
+ * readOwnReplies) finds its reply. recordLateReply writes it into the
+ * sender's conversation (followed along its compactions) as an urgent
+ * `late_reply` event under the subscription id `reply:<message id>`: no
+ * subscription stands behind it, and the turn it starts is a relay-event
+ * turn like any. An ack-only reply, a cancelled turn and a gone target
+ * ride along with the next event message instead of waking it (or go
+ * after lateReplyRideKeepMs). An open prompt's turn_end is not recorded
+ * for its sender: the late reply carries the whole reply. A sender that is
+ * gone makes the reply undeliverable, and a target on this relay is told
+ * (`reply_undelivered`).
+ *
  * `transferSubscriptions` moves every subscription of one watcher, with its
  * undelivered events, to another: a watcher is replaced without a moment
  * where events go nowhere.
@@ -83,7 +97,9 @@ import { randomBytes, randomUUID } from 'node:crypto';
 
 import {
   RELAY_EVENT_DEFAULT_TYPES,
+  RELAY_EVENT_DELIVERY_TYPES,
   RELAY_EVENT_HEARTBEAT_TYPE,
+  RELAY_EVENT_LATE_REPLY_TYPE,
   RELAY_EVENT_LIMITS,
   RELAY_EVENT_LINK_LOST_TYPE,
   RELAY_EVENT_LINK_RESTORED_TYPE,
@@ -91,6 +107,7 @@ import {
   RELAY_EVENT_QUESTION_ANSWERED_TYPE,
   RELAY_EVENT_RELAY_LEVEL_TYPES,
   RELAY_EVENT_RELAY_RESTARTED_TYPE,
+  RELAY_EVENT_REPLY_UNDELIVERED_TYPE,
   RELAY_EVENT_SUBAGENT_FINISHED_TYPE,
   RELAY_EVENT_SUBSCRIBABLE_TYPES,
   RELAY_EVENT_TYPES,
@@ -98,6 +115,7 @@ import {
   buildRelayEventMessageText,
   compileRelayEventMatch,
   effectiveRelayEventTypes,
+  isLateReplyAck,
   isLegacyDefaultRelayEventTypes,
   isRelayEventType,
   isRelayLevelOnly,
@@ -112,6 +130,7 @@ import {
   SENSITIVE_FILE_QUESTION_KIND,
   isPersonOnlyQuestion,
 } from '../../shared/relay-asks.mjs';
+import { createLateReplyService } from './relay-late-reply-service.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
 export const RELAY_EVENT_SELF_RELAY_ID = 'self';
@@ -183,6 +202,8 @@ const OWN_WAIT_GRACE_MS = 60_000;
 // The watcher's own prompts are kept a day: longer than any digest or quiet
 // window holds their turn_end.
 export const RELAY_EVENT_OWN_PROMPT_KEEP_MS = 25 * HOUR_MS;
+// An open one (owed a late reply) as long as the sweeper looks for its reply.
+export const RELAY_EVENT_OPEN_PROMPT_KEEP_MS = RELAY_EVENT_LIMITS.lateReplyKeepDays * DAY_MS + HOUR_MS;
 // A watched set must look idle twice, this far apart, before all_idle fires:
 // a task's end and the continuation turn it opens are seconds apart.
 const ALL_IDLE_SETTLE_MS = 10_000;
@@ -190,6 +211,12 @@ const LOG_PREFIX = '[relay-events]';
 // The `subscription_id` of an answer told to the conversations that asked:
 // no subscription stands behind it (noteQuestionAnswered).
 const ASK_DELIVERY_PREFIX = 'ask:';
+// The same for a late reply (`reply:<message id>`) and for the replier's
+// word that it reached nobody (`undelivered:<message id>`).
+const REPLY_DELIVERY_PREFIX = 'reply:';
+const UNDELIVERED_PREFIX = 'undelivered:';
+// What an open prompt's turn_end is not recorded for: the late reply brings it.
+const OWED_LATE_STATES = new Set(['delivered', 'ack']);
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -311,6 +338,8 @@ export function createRelayEventService({
         AND subscription_id NOT IN (SELECT id FROM relay_event_subscriptions WHERE end_reason = 'fired')
         AND json_extract(payload_json, '$.ends') IS NULL
         AND substr(subscription_id, 1, ${ASK_DELIVERY_PREFIX.length}) <> '${ASK_DELIVERY_PREFIX}'
+        AND substr(subscription_id, 1, ${REPLY_DELIVERY_PREFIX.length}) <> '${REPLY_DELIVERY_PREFIX}'
+        AND substr(subscription_id, 1, ${UNDELIVERED_PREFIX.length}) <> '${UNDELIVERED_PREFIX}'
     `),
     // Wake-ups: the event messages that carried more than a heartbeat.
     countWakes: db.prepare(`
@@ -387,6 +416,50 @@ export function createRelayEventService({
     get: db.prepare(`SELECT * FROM relay_event_own_prompts WHERE message_id = ?`),
     markReceived: db.prepare(`UPDATE relay_event_own_prompts SET received_at = ? WHERE message_id = ? AND watcher_conversation_id = ?`),
     pruneBefore: db.prepare(`DELETE FROM relay_event_own_prompts WHERE created_at < ?`),
+  } : null;
+  // Migration 0042: without it no late reply is looked for, and turn_ends go as before.
+  const lateSql = ownSql && db.prepare(`PRAGMA table_info(relay_event_own_prompts)`).all().some((column) => column.name === 'late_state') ? {
+    insert: db.prepare(`
+      INSERT OR IGNORE INTO relay_event_own_prompts (message_id, watcher_conversation_id, relay_id, session_id, created_at, late_next_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
+    // A row an older version wrote (after a rollback) has no late_next_at:
+    // due at once. One whose reply a wait received there is not open.
+    listDue: db.prepare(`
+      SELECT * FROM relay_event_own_prompts
+      WHERE late_state IS NULL AND received_at IS NULL AND (late_next_at IS NULL OR late_next_at <= ?)
+      ORDER BY late_next_at ASC, created_at ASC LIMIT ?
+    `),
+    setNextAt: db.prepare(`UPDATE relay_event_own_prompts SET late_next_at = ? WHERE message_id = ? AND late_state IS NULL`),
+    nudge: db.prepare(`
+      UPDATE relay_event_own_prompts SET late_next_at = ?
+      WHERE late_state IS NULL AND received_at IS NULL AND relay_id = ? AND session_id = ?
+    `),
+    // A paired relay past its reads of a pass: each of its due rows moves on
+    // by the pass from its own time (NULL counts as now), so their order
+    // stays and the next pass reads the next ones.
+    deferRelay: db.prepare(`
+      UPDATE relay_event_own_prompts SET late_next_at = strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(late_next_at, ?), ?)
+      WHERE late_state IS NULL AND relay_id = ? AND (late_next_at IS NULL OR late_next_at <= ?)
+    `),
+    // Only an open row closes: a second recording changes nothing.
+    close: db.prepare(`UPDATE relay_event_own_prompts SET late_state = ?, late_at = ? WHERE message_id = ? AND late_state IS NULL`),
+    // A wait handed the agent a final outcome: open, or recorded but not delivered yet.
+    markReturned: db.prepare(`
+      UPDATE relay_event_own_prompts SET late_state = 'returned', late_at = ?
+      WHERE message_id = ? AND (late_state IS NULL OR late_state IN ('delivered', 'ack'))
+    `),
+    getCompactedInto: db.prepare(`SELECT compacted_into FROM conversations WHERE id = ?`),
+    dropUndeliveredReply: db.prepare(`DELETE FROM relay_events WHERE subscription_id = ? AND delivered_at IS NULL`),
+    // A riding-along row nothing took along within its keep.
+    listStaleRides: db.prepare(`
+      SELECT id, watcher_conversation_id, payload_json, created_at FROM relay_events
+      WHERE delivered_at IS NULL AND type = '${RELAY_EVENT_LATE_REPLY_TYPE}'
+        AND json_extract(payload_json, '$.detail.rides') = 1 AND created_at < ?
+      ORDER BY id ASC
+    `),
+    pruneOpenBefore: db.prepare(`DELETE FROM relay_event_own_prompts WHERE late_state IS NULL AND created_at < ?`),
+    pruneClosedBefore: db.prepare(`DELETE FROM relay_event_own_prompts WHERE late_state IS NOT NULL AND created_at < ?`),
   } : null;
   // Without migration 0012 the table has no remote_sync column.
   const deleteEndedSubscriptionsBefore = available
@@ -1112,10 +1185,11 @@ export function createRelayEventService({
       const ending = heartbeat ? [] : matches
         .filter(({ row, hit }) => Number(row.once || 0) === 1 && (!toText(row.match) || hit))
         .map(({ row }) => row.id);
-      // The watcher already has this reply: it waited for it itself. One
-      // that ends a one-shot subscription still goes, or it would never end.
-      if (!ending.length && ownReplyReceived(watcher, event)) {
-        log(`conv=${shortId(watcher)} turn_end of ${shortId(sessionId)} not recorded: the watcher received that reply itself`);
+      // The watcher already has this reply (it waited for it itself), or
+      // gets it as a late reply. One that ends a one-shot subscription still
+      // goes, or it would never end.
+      if (!ending.length && ownReplyCovered(watcher, event)) {
+        log(`conv=${shortId(watcher)} turn_end of ${shortId(sessionId)} not recorded: the watcher received that reply itself or gets it as a late reply`);
         continue;
       }
       const payload = { ...stored, subscriptionIds: matches.map(({ row }) => row.id), ...(ending.length ? { ends: ending } : {}) };
@@ -1170,14 +1244,20 @@ export function createRelayEventService({
     return wait && wait.until > now() ? wait.until : 0;
   }
 
-  /** Whether a turn_end is of the watcher's own prompt whose finished reply it received. */
-  function ownReplyReceived(watcher, event) {
+  /**
+   * Whether a turn_end is of the watcher's own prompt whose finished reply it
+   * received, or that is owed a late reply (open, or delivered as one): the
+   * late reply carries the whole reply. A wait that returned without the
+   * reply, and a prompt from before the upgrade, keep their turn_end.
+   */
+  function ownReplyCovered(watcher, event) {
     if (!ownSql || toText(event?.type) !== 'turn_end') return false;
     const messageId = toText(event?.detail?.messageId);
     if (!messageId) return false;
     try {
       const own = ownSql.get.get(messageId);
-      return !!own && own.watcher_conversation_id === watcher && !!own.received_at;
+      if (!own || own.watcher_conversation_id !== watcher) return false;
+      return !!own.received_at || (!!lateSql && (own.late_state === null || OWED_LATE_STATES.has(own.late_state)));
     } catch {
       return false;
     }
@@ -1216,8 +1296,9 @@ export function createRelayEventService({
    * for at once. Urgent events and heartbeats are never held; a turn_end the
    * watcher is waiting for itself waits for that wait; the others go when
    * the first of the subscriptions that took them lets them (one without
-   * options at once). Rebuilt from the rows and the subscriptions each
-   * time, so a restart changes nothing.
+   * options at once). A riding-along late reply (`riding`) goes with the
+   * first other event that goes, never alone. Rebuilt from the rows and the
+   * subscriptions each time, so a restart changes nothing.
    */
   function planDelivery(watcher, rows) {
     const subscriptions = new Map(activeRows().filter((row) => row.watcher_conversation_id === watcher).map((row) => [row.id, row]));
@@ -1233,7 +1314,7 @@ export function createRelayEventService({
       subscriptions.set(id, fired);
       return fired;
     };
-    return rows.map((row) => {
+    const plan = rows.map((row) => {
       const payload = parseJson(row.payload_json, null);
       const open = { row, payload, releaseAt: 0, held: null, subscriptionId: null, digestSubscriptionId: null };
       if (Number(row.urgent) === 1 || isHeartbeatRow(row)) return open;
@@ -1253,6 +1334,9 @@ export function createRelayEventService({
       }
       return best ? { ...open, ...best } : open;
     });
+    const rides = (entry) => toText(entry.row.type) === RELAY_EVENT_LATE_REPLY_TYPE && entry.payload?.detail?.rides === true;
+    const carrier = Math.min(...plan.filter((entry) => !rides(entry)).map((entry) => entry.releaseAt));
+    return plan.map((entry) => (rides(entry) ? { ...entry, releaseAt: carrier, riding: true } : entry));
   }
 
   function readyDue(watcher, undelivered) {
@@ -1273,8 +1357,8 @@ export function createRelayEventService({
   /** The next flush: what is ready by the usual rules, else the first held event's time. */
   function dueAtFor(watcher, plan) {
     const at = now();
-    const ready = plan.filter((entry) => entry.releaseAt <= at).map((entry) => entry.row);
-    const dues = plan.filter((entry) => entry.releaseAt > at).map((entry) => entry.releaseAt);
+    const ready = plan.filter((entry) => entry.releaseAt <= at && !entry.riding).map((entry) => entry.row);
+    const dues = plan.filter((entry) => entry.releaseAt > at && Number.isFinite(entry.releaseAt)).map((entry) => entry.releaseAt);
     if (ready.length) dues.push(readyDue(watcher, ready));
     return Math.min(...dues);
   }
@@ -1290,6 +1374,8 @@ export function createRelayEventService({
     }
     if (!undelivered.length) return;
     const dueAt = urgent ? now() : dueAtFor(watcher, planDelivery(watcher, undelivered));
+    // Only riding-along rows: they wait for the next event.
+    if (!Number.isFinite(dueAt)) return;
     const current = flushTimers.get(watcher);
     if (current && current.dueAt <= dueAt) return;
     if (current) clearTimer(current.timer);
@@ -1870,12 +1956,16 @@ export function createRelayEventService({
       return touched.get(watcher);
     };
     let changed = false;
+    // Sessions there whose turn ended: this relay's open prompts to them are due.
+    const turnsEnded = new Set();
     db.transaction(() => {
       for (const item of Array.isArray(response.events) ? response.events : []) {
         const payload = item?.payload && typeof item.payload === 'object' ? item.payload : null;
-        if (!payload || !isRelayEventType(payload.type)) continue;
+        // Late replies are this relay's own deliveries, never a paired relay's.
+        if (!payload || !isRelayEventType(payload.type) || RELAY_EVENT_DELIVERY_TYPES.includes(toText(payload.type))) continue;
         const named = (Array.isArray(payload.subscriptionIds) ? payload.subscriptionIds : []).map(toText);
         const payloadSessionId = payload.session && typeof payload.session === 'object' ? remoteText(payload.session.id, 200) : '';
+        if (payloadSessionId && (payload.type === 'turn_end' || payload.type === 'error')) turnsEnded.add(payloadSessionId);
         const groups = new Map();
         for (const remoteId of named) {
           const row = byRemote.get(remoteId);
@@ -1890,8 +1980,9 @@ export function createRelayEventService({
           if (toText(payload.type) === RELAY_EVENT_HEARTBEAT_TYPE && mine.every((row) => inQuietHours(row))) continue;
           const endingRemote = new Set((Array.isArray(payload.ends) ? payload.ends : []).map(toText));
           const ends = mine.filter((row) => endingRemote.has(row.remote_subscription_id)).map((row) => row.id);
-          // The watcher's own reply it received: dropped, unless it ends a one-shot subscription.
-          if (!ends.length && ownReplyReceived(watcher, { type: toText(payload.type), detail: { messageId: cleanRemoteDetail(payload.detail).messageId } })) continue;
+          // The watcher's own reply it received or gets as a late reply:
+          // dropped, unless it ends a one-shot subscription.
+          if (!ends.length && ownReplyCovered(watcher, { type: toText(payload.type), detail: { messageId: cleanRemoteDetail(payload.detail).messageId } })) continue;
           // The stored event is built from the allow-listed fields of the
           // payload, never from the payload itself.
           const detail = cleanRemoteDetail(payload.detail);
@@ -1956,6 +2047,7 @@ export function createRelayEventService({
     if (!replay) {
       for (const [watcher, entry] of touched) if (entry.kept) scheduleFlush(watcher, { urgent: entry.urgent });
     }
+    for (const sessionId of turnsEnded) lateReplies?.nudge(relay, sessionId);
     if (changed) broadcast();
     return touched;
   }
@@ -2181,7 +2273,10 @@ export function createRelayEventService({
     const id = toText(messageId);
     if (!ownSql || !watcher || !id) return false;
     try {
-      ownSql.insert.run(id, watcher, toText(relayId) || RELAY_EVENT_SELF_RELAY_ID, toText(sessionId), isoNow());
+      const at = isoNow();
+      // Open at once: the sweeper skips it while a wait on it runs.
+      if (lateSql) lateSql.insert.run(id, watcher, toText(relayId) || RELAY_EVENT_SELF_RELAY_ID, toText(sessionId), at, at);
+      else ownSql.insert.run(id, watcher, toText(relayId) || RELAY_EVENT_SELF_RELAY_ID, toText(sessionId), at);
       return true;
     } catch (error) {
       warn(`own prompt not noted conv=${shortId(watcher)}: ${toText(error?.message || error).slice(0, 200)}`);
@@ -2217,11 +2312,15 @@ export function createRelayEventService({
    * with the reply), so the turn's turn_end is dropped (unless it ends a
    * one-shot subscription, which the watcher must hear of) and one that
    * comes later is not recorded. Otherwise the held turn_end goes as usual.
+   * `returned` (implied by `received`): the agent got a final outcome, so no
+   * late reply follows, and one recorded but not delivered yet is dropped.
+   * Returns `{ dropped, lateReplyAt }`: the turn_ends dropped, and when a
+   * late reply of it was delivered already (null when none).
    */
-  function endOwnWait(token, { received = false } = {}) {
+  function endOwnWait(token, { received = false, returned = received } = {}) {
     const watcher = toText(token?.watcher);
     const id = toText(token?.messageId);
-    if (!watcher || !id) return 0;
+    if (!watcher || !id) return { dropped: 0, lateReplyAt: null };
     const key = ownWaitKey(watcher, id);
     const wait = ownWaits.get(key);
     if (wait) {
@@ -2229,6 +2328,24 @@ export function createRelayEventService({
       if (wait.count <= 0) ownWaits.delete(key);
     }
     let dropped = 0;
+    let lateReplyAt = null;
+    if ((received || returned) && lateSql) {
+      try {
+        db.transaction(() => {
+          const recorded = lateSql.dropUndeliveredReply.run(`${REPLY_DELIVERY_PREFIX}${id}`).changes > 0;
+          const own = ownSql.get.get(id);
+          if (recorded || (own && own.late_state === null)) lateSql.markReturned.run(isoNow(), id);
+          else if (own && OWED_LATE_STATES.has(own.late_state)) lateReplyAt = own.late_at || null;
+        })();
+        lateReplies?.forget(id);
+      } catch (error) {
+        warn(`own prompt not marked returned conv=${shortId(watcher)}: ${toText(error?.message || error).slice(0, 200)}`);
+      }
+    } else if (lateSql) {
+      // No final outcome (the wait ran out or its call was abandoned): the
+      // sweeper looks at the next pass, not after its cadence step.
+      try { lateSql.setNextAt.run(isoNow(), id); } catch {}
+    }
     if (received && ownSql) {
       try {
         db.transaction(() => {
@@ -2246,8 +2363,139 @@ export function createRelayEventService({
       if (dropped) log(`conv=${shortId(watcher)} received the reply it waited for: ${dropped} turn_end not delivered`);
     }
     scheduleFlush(watcher);
-    return dropped;
+    return { dropped, lateReplyAt };
   }
+
+  // ─── Late replies ──────────────────────────────────────────────────────────
+
+  /** The conversation `id` continues in (its compactions followed, at most 20) when that one is live, else null. */
+  function liveSuccessor(id) {
+    let current = toText(id);
+    try {
+      for (let step = 0; step < 20; step += 1) {
+        const next = toText(lateSql.getCompactedInto.get(current)?.compacted_into);
+        if (!next || next === current) break;
+        current = next;
+      }
+    } catch {}
+    return isLive(conversation(current)) ? current : null;
+  }
+
+  /**
+   * The final outcome of an open prompt (a wait's, or `{ status: 'gone' }`
+   * for a target that is gone) goes into the sender's conversation as a late
+   * reply: at once, or riding along with the next event message for an ack,
+   * a cancelled turn or a gone target. Exactly once: the ledger row closes
+   * in the same transaction, and only an open one does. A sender that is
+   * gone makes it undeliverable. Returns the row's new state, or null when
+   * the row was not open.
+   */
+  function recordLateReply({ watcher, relayId = RELAY_EVENT_SELF_RELAY_ID, sessionId, messageId, outcome = {}, sentAt = null } = {}) {
+    if (!lateSql) return null;
+    const id = toText(messageId);
+    const prompt = { watcher: toText(watcher), relayId: toText(relayId) || RELAY_EVENT_SELF_RELAY_ID, sessionId: toText(sessionId), messageId: id, sentAt };
+    const to = liveSuccessor(prompt.watcher);
+    if (!to) return closeLateReply(prompt, 'undeliverable', 'the sender is gone');
+    const status = toText(outcome.status) || 'done';
+    const reply = String(outcome.reply?.text ?? '');
+    // A failure note or a stop is never an ack: it always wakes the sender.
+    const ack = status === 'done' && isLateReplyAck(reply);
+    const rides = ack || status === 'cancelled' || status === 'gone';
+    const remote = prompt.relayId !== RELAY_EVENT_SELF_RELAY_ID;
+    const at = isoNow();
+    const images = Array.isArray(outcome.reply?.images) ? outcome.reply.images.slice(0, 8) : [];
+    const event = {
+      v: RELAY_EVENT_VERSION,
+      relay: { id: prompt.relayId, name: (remote ? toText(outcome.relayName) : toText(relayName())) || null },
+      session: { id: prompt.sessionId, title: toText(outcome.sessionTitle) || (remote ? null : toText(conversation(prompt.sessionId)?.title) || null) },
+      type: RELAY_EVENT_LATE_REPLY_TYPE,
+      at,
+      detail: {
+        messageId: id,
+        status,
+        reply: reply.trim() ? reply : null,
+        ...(toText(outcome.note) ? { note: String(outcome.note).slice(0, 1000) } : {}),
+        ...(images.length ? { images } : {}),
+        sentAt: toText(sentAt) || null,
+        ...(ack ? { ack: true } : {}),
+        ...(rides ? { rides: true } : {}),
+      },
+      subscriptionIds: [],
+    };
+    const state = status === 'gone' ? 'target_gone' : (ack ? 'ack' : 'delivered');
+    let closed = false;
+    db.transaction(() => {
+      closed = lateSql.close.run(state, at, id).changes > 0;
+      if (closed) sql.insertEvent.run(`${REPLY_DELIVERY_PREFIX}${id}`, to, prompt.relayId, prompt.sessionId, event.type, rides ? 0 : 1, JSON.stringify(event), at);
+    })();
+    if (!closed) return null;
+    log(`conv=${shortId(to)} late reply of ${shortId(prompt.sessionId)} to prompt ${shortId(id)}: ${status}${rides ? ', riding along' : ''}`);
+    scheduleFlush(to, { urgent: !rides });
+    return state;
+  }
+
+  /**
+   * An open prompt that gets no late reply: `gave_up` (no final outcome in
+   * time, or the pairing is gone) or `undeliverable` (the sender is gone; a
+   * target on this relay is told once, a paired one only in the log).
+   * Returns the state, or null when the row was not open.
+   */
+  function closeLateReply(prompt, state, reason = '') {
+    if (!lateSql) return null;
+    const at = isoNow();
+    const target = toText(prompt.sessionId);
+    const tell = state === 'undeliverable' && prompt.relayId === RELAY_EVENT_SELF_RELAY_ID && isLive(conversation(target));
+    let closed = false;
+    db.transaction(() => {
+      closed = lateSql.close.run(state, at, prompt.messageId).changes > 0;
+      if (!closed || !tell) return;
+      const sender = conversation(prompt.watcher);
+      const event = buildEvent(RELAY_EVENT_REPLY_UNDELIVERED_TYPE, target, {
+        messageId: prompt.messageId,
+        watcherId: prompt.watcher,
+        watcherTitle: toText(sender?.title) || null,
+        sentAt: toText(prompt.sentAt) || null,
+        reason: !sender || toText(sender.status) === 'deleted' ? 'deleted' : 'archived',
+      });
+      sql.insertEvent.run(`${UNDELIVERED_PREFIX}${prompt.messageId}`, target, RELAY_EVENT_SELF_RELAY_ID, target, event.type, 0, JSON.stringify({ ...event, subscriptionIds: [] }), at);
+    })();
+    if (!closed) return null;
+    log(`prompt ${shortId(prompt.messageId)} of conv=${shortId(prompt.watcher)} to ${shortId(target)}${prompt.relayId === RELAY_EVENT_SELF_RELAY_ID ? '' : ` on ${shortId(prompt.relayId)}`}: ${state}${reason ? ` (${reason})` : ''}${tell ? '; the target is told' : ''}`);
+    if (tell) scheduleFlush(target);
+    return state;
+  }
+
+  function promptOf(row) {
+    return {
+      watcher: toText(row?.watcher_conversation_id),
+      relayId: toText(row?.relay_id) || RELAY_EVENT_SELF_RELAY_ID,
+      sessionId: toText(row?.session_id),
+      messageId: toText(row?.message_id),
+      sentAt: row?.created_at || null,
+    };
+  }
+
+  // The sweeper (relay-late-reply-service.mjs) over the ledger above.
+  const lateReplies = lateSql ? createLateReplyService({
+    selfRelayId: RELAY_EVENT_SELF_RELAY_ID,
+    store: {
+      listDue: (at, limit) => lateSql.listDue.all(at, limit),
+      setNextAt: (messageId, at) => lateSql.setNextAt.run(at, messageId),
+      deferRelay: (relayId, byMs, due) => lateSql.deferRelay.run(due, `+${byMs / 1000} seconds`, relayId, due),
+      nudge: (relayId, sessionId, at) => lateSql.nudge.run(at, relayId, sessionId).changes,
+      watcherLive: (watcher) => !!liveSuccessor(watcher),
+      ownWaitLive: (watcher, messageId) => (ownWaits.get(ownWaitKey(watcher, messageId))?.until || 0) > now(),
+      deliver: (row, outcome) => {
+        const { watcher, ...rest } = promptOf(row);
+        return recordLateReply({ watcher, ...rest, outcome });
+      },
+      close: (row, state, reason) => closeLateReply(promptOf(row), state, reason),
+    },
+    now,
+    setTimer,
+    clearTimer,
+    logger,
+  }) : null;
 
   // ─── Hooks ─────────────────────────────────────────────────────────────────
 
@@ -2279,6 +2527,9 @@ export function createRelayEventService({
   /** A turn ended with a reply (`status` done or stopped). */
   function noteTurnEnd({ conversationId, queueMessageId = '', replyText = '', status = 'done' } = {}) {
     if (!available) return;
+    // Its prompts' senders that no longer wait get the reply now; a steered
+    // prompt's reply came with this turn too.
+    lateReplies?.nudge(RELAY_EVENT_SELF_RELAY_ID, conversationId);
     // A turn that answered relay events tells no other watcher: two
     // watchers of each other would otherwise wake each other for good.
     if (!isRelayEventTurn(queueMessageId)) {
@@ -2296,6 +2547,7 @@ export function createRelayEventService({
   /** A turn or the session failed: `kind` turn_failed, usage_limit, worker_died. */
   function noteError({ conversationId, kind = 'turn_failed', message = '', queueMessageId = '' } = {}) {
     if (!available) return;
+    lateReplies?.nudge(RELAY_EVENT_SELF_RELAY_ID, conversationId);
     record('error', conversationId, {
       kind,
       message: String(message || '').slice(0, 1000),
@@ -2620,7 +2872,18 @@ export function createRelayEventService({
     const at = now();
     const events = sql.deleteDeliveredBefore.run(new Date(at - RELAY_EVENT_DELIVERED_KEEP_MS).toISOString()).changes;
     const subscriptions = deleteEndedSubscriptionsBefore.run(new Date(at - RELAY_EVENT_ENDED_SUBSCRIPTION_KEEP_MS).toISOString()).changes;
-    ownSql?.pruneBefore.run(new Date(at - RELAY_EVENT_OWN_PROMPT_KEEP_MS).toISOString());
+    if (lateSql) {
+      lateSql.pruneOpenBefore.run(new Date(at - RELAY_EVENT_OPEN_PROMPT_KEEP_MS).toISOString());
+      lateSql.pruneClosedBefore.run(new Date(at - RELAY_EVENT_OWN_PROMPT_KEEP_MS).toISOString());
+      for (const row of lateSql.listStaleRides.all(new Date(at - RELAY_EVENT_LIMITS.lateReplyRideKeepMs).toISOString())) {
+        if (!sql.deleteEvent.run(row.id).changes) continue;
+        const detail = parseJson(row.payload_json, {})?.detail || {};
+        const hours = Math.round((at - (Date.parse(String(row.created_at)) || at)) / HOUR_MS);
+        log(`conv=${shortId(row.watcher_conversation_id)} riding late reply (${detail.ack ? 'ack' : toText(detail.status) || 'done'}) to prompt ${shortId(detail.messageId)} dropped after ${hours} h: nothing took it along`);
+      }
+    } else {
+      ownSql?.pruneBefore.run(new Date(at - RELAY_EVENT_OWN_PROMPT_KEEP_MS).toISOString());
+    }
     for (const [key, wait] of ownWaits) {
       if (wait.until <= at) ownWaits.delete(key);
     }
@@ -2657,10 +2920,12 @@ export function createRelayEventService({
       }, sweepIntervalMs);
     };
     tick();
+    lateReplies?.start();
   }
 
   function stop() {
     started = false;
+    lateReplies?.stop();
     if (sweepTimer) clearTimer(sweepTimer);
     sweepTimer = null;
     if (allIdleTimer) clearTimer(allIdleTimer);
@@ -2699,6 +2964,10 @@ export function createRelayEventService({
     noteOwnPrompt,
     beginOwnWait,
     endOwnWait,
+    // The dispatcher hands the sweeper its read (readOwnReplies).
+    setLateReplyReader: (reader) => lateReplies?.setReader(reader),
+    passLateReplies: () => lateReplies?.pass() || Promise.resolve(null),
+    recordLateReply,
     areOptionsAvailable: () => optionsAvailable,
     noteTurnEnd,
     noteError,

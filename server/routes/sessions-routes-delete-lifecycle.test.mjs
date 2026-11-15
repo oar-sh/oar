@@ -107,8 +107,6 @@ function setup(state = {}) {
       markDeletedSdkSession: { run: (id) => events.push(`tombstone:${id}`) },
       getMessages: { all: () => [] },
       getRuntimeSessionByConversation: { get: () => state.runtimeSession || null },
-      upsertSdkDeleteRequest: { run: (sid, convId) => events.push(`queued-sdk-delete:${sid}:${convId}`) },
-      deleteSdkDeleteRequest: { run: (sid) => events.push(`cleared-sdk-delete:${sid}`) },
     },
     runtimeState: {},
     config: {},
@@ -136,13 +134,11 @@ function setup(state = {}) {
     resolveConversationWorkspaceState: () => null,
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'session-id',
-    touchCli() {},
     markCliOffline() {},
     fetchUsageSummary() {},
     readSessionTranscriptMessages: () => [],
@@ -155,10 +151,6 @@ function setup(state = {}) {
     DEFAULT_CONVERSATION_SESSION_MODE: 'isolated',
     DEFAULT_MODEL: 'gpt-5',
     remotePath: '',
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     backgroundTaskStore: {
       get: (id) => state.backgroundTasks?.[id] || [],
       replace: (id, tasks) => events.push(`tasks-cleared:${id}:${tasks.length}`),
@@ -675,7 +667,7 @@ test('a Copilot conversation\'s session is deleted through the runtime', async (
   await withTmpDir(async (stateRoot) => {
     fs.mkdirSync(path.join(stateRoot, 'sdk-1'));
     const deleted = [];
-    const { del, events } = setup({
+    const { del } = setup({
       sessionStateRoot: stateRoot,
       runtimeSession: { provider_type: 'github' },
       sdkSessionImportService: {
@@ -689,8 +681,6 @@ test('a Copilot conversation\'s session is deleted through the runtime', async (
     assert.equal(response.statusCode, 200);
     assert.equal(response.body.cliSessionDeleted, true);
     assert.deepEqual(deleted, ['sdk-1']);
-    assert.ok(events.includes('cleared-sdk-delete:sdk-1'));
-    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
   });
 });
 
@@ -707,7 +697,6 @@ test('a Copilot conversation deleted before its first turn has no CLI session to
     assert.equal(response.body.cliSessionDeleted, null);
     // Asking would only get "Session file not found" back.
     assert.deepEqual(deleted, []);
-    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
     assert.ok(events.includes('sql:DELETE FROM conversations'));
   });
 });
@@ -718,7 +707,7 @@ test('a session folder the runtime keeps no session file for is removed directly
     const otherSessionDir = path.join(stateRoot, 'sdk-2');
     fs.mkdirSync(path.join(sessionDir, 'files'), { recursive: true });
     fs.mkdirSync(otherSessionDir);
-    const { del, events } = setup({
+    const { del } = setup({
       sessionStateRoot: stateRoot,
       runtimeSession: { provider_type: 'github' },
       sdkSessionImportService: {
@@ -730,11 +719,10 @@ test('a session folder the runtime keeps no session file for is removed directly
     assert.equal(response.body.cliSessionDeleted, true);
     assert.equal(fs.existsSync(sessionDir), false);
     assert.equal(fs.existsSync(otherSessionDir), true, 'another session stays');
-    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
   });
 });
 
-test('a Copilot session the runtime cannot delete goes on the SDK delete queue, and the conversation is still deleted', async () => {
+test('a Copilot session the runtime cannot delete is left in place, and the conversation is still deleted', async () => {
   // A runtime that is itself "not found" is no answer about the session.
   const failures = [
     'runtime unavailable',
@@ -752,10 +740,8 @@ test('a Copilot session the runtime cannot delete goes on the SDK delete queue, 
       const response = await del();
       assert.equal(response.statusCode, 200, failure);
       assert.equal(response.body.cliSessionDeleted, false, failure);
-      assert.ok(events.includes('queued-sdk-delete:sdk-1:conv-1'), failure);
-      assert.ok(!events.includes('cleared-sdk-delete:sdk-1'), failure);
       assert.ok(events.includes('sql:DELETE FROM conversations'), failure);
-      assert.equal(fs.existsSync(sessionDir), true, `left for the queue: ${failure}`);
+      assert.equal(fs.existsSync(sessionDir), true, `left in place: ${failure}`);
     });
   }
 });
@@ -766,7 +752,7 @@ test('a session id that is not a plain folder name is never joined into a path',
     const outside = path.join(tmp, 'outside');
     fs.mkdirSync(stateRoot);
     fs.mkdirSync(outside);
-    const { del, events } = setup({
+    const { del } = setup({
       sessionStateRoot: stateRoot,
       conversation: { sdk_session_id: '../outside' },
       runtimeSession: { provider_type: 'github' },
@@ -778,7 +764,6 @@ test('a session id that is not a plain folder name is never joined into a path',
     assert.equal(response.statusCode, 200);
     assert.equal(response.body.cliSessionDeleted, null);
     assert.equal(fs.existsSync(outside), true);
-    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
   });
 });
 
@@ -803,7 +788,6 @@ test('a conversation only imported from the Copilot CLI is hidden, and its CLI s
     assert.ok(!events.some((event) => /^(kill|mark-killed|registry-removed|tasks-cleared):/.test(event)), events.join(' | '));
     assert.deepEqual(importer.deletedSessions, []);
     assert.equal(fs.existsSync(sessionDir), true);
-    assert.ok(!events.some((event) => event.startsWith('queued-sdk-delete:')));
     // Hidden, and tombstoned so the importer does not bring it back.
     assert.ok(events.includes('tombstone:conv-1'));
     assert.ok(events.includes('sql:DELETE FROM conversations'));
@@ -887,7 +871,6 @@ test('deleting a cloud conversation archives its cloud session without waiting f
   assert.equal(response.body.cliSessionDeleted, null, 'there is no CLI session on this host');
   assert.deepEqual(archived, [CLOUD_SESSION_ID]);
   assert.equal(events.includes('emit:conversation_deleted:conv-1'), true);
-  assert.equal(events.some((event) => event.startsWith('queued-sdk-delete')), false, 'never handed to the Copilot delete queue');
   assert.equal(logs.length, 0);
   release();
   await settleBackground();

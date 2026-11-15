@@ -66,7 +66,7 @@ test('runtime_sessions migration adds the cursor_agent_id column', () => {
 test('worker launch env binds cursor sessions with the stored API key', () => {
   const launchSource = sliceBetween(
     'function buildSessionWorkerLaunchEnvForSession(',
-    '\nconst relayCliLauncherService',
+    '\nfunction buildSessionWorkerLaunchEnvWithAgentToken(',
   );
   assert.match(launchSource, /if \(providerType === 'cursor'\) \{/);
   assert.match(launchSource, /applyCursorProviderEnvironment\(cleared, \{/);

@@ -43,7 +43,6 @@ const PER_CONVERSATION_ENTRIES = [
   "chat-menu-stop-sharing",
   "chat-menu-preview-shared",
   "chat-menu-archive",
-  "chat-menu-inspect-tmux",
   "chat-menu-change-cwd",
   "chat-menu-git-changes",
   "chat-menu-kill-session",
@@ -95,16 +94,15 @@ for (const profile of [
       return (body.conversations || []).length;
     }
 
-    // A conversation row exists after a bootstrap even when its worker cannot
-    // start (CLI spawn is disabled on the test relay), which answers 409 with
-    // the id of the committed conversation.
+    // A conversation row exists after a bootstrap: the test relay launches no
+    // worker (CLI spawn is disabled), defers the launch and answers 200.
     async function seedConversation(request, title) {
       const response = await request.post(api("/api/conversation/bootstrap"), {
         headers,
         data: { title, model: "gpt-5.4-mini" },
       });
       const body = await response.json();
-      expect([200, 409]).toContain(response.status());
+      expect(response.status(), JSON.stringify(body)).toBe(200);
       const conversationId = String(body?.conversationId || "").trim();
       expect(conversationId).toBeTruthy();
       return conversationId;

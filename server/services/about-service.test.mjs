@@ -224,7 +224,7 @@ function aboutService(overrides = {}) {
     installMethod: 'git-checkout',
     startedAt: '2026-03-02T11:00:00.000Z',
     getProviderSettings: () => ({
-      github: { enabled: true, engine: 'extension' },
+      github: { enabled: true },
       openai: { enabled: false },
       claude: { enabled: true },
       cursor: { enabled: true },
@@ -235,7 +235,6 @@ function aboutService(overrides = {}) {
       claude: { installed: true, version: '2.1.251', checkedAt: '2026-03-02T11:30:00.000Z' },
       grok: { installed: false, version: null, checkedAt: null },
     }),
-    isRelayCliOnline: () => true,
     listWorkers: () => [
       { conversationId: 'conv-fixture-report', status: 'ready', pid: 101 },
       { conversationId: 'conv-fixture-report', status: 'exited', pid: 102 },
@@ -265,10 +264,10 @@ test('describe lists the enabled providers with versions and state', async () =>
   assert.deepEqual(about.providers.map((row) => row.id), ['github', 'claude', 'cursor']);
   const [copilot, claude, cursor] = about.providers;
   assert.deepEqual(
-    { engine: copilot.engine, cli: copilot.cliVersion, sdk: copilot.sdkVersion, state: copilot.state },
-    { engine: 'extension', cli: '1.0.82', sdk: null, state: 'online' },
-    'the extension engine runs in the relay CLI, not on the SDK',
+    { cli: copilot.cliVersion, sdk: copilot.sdkVersion, state: copilot.state },
+    { cli: '1.0.82', sdk: null, state: 'idle' },
   );
+  assert.equal('engine' in copilot, false, 'Copilot has one engine, so About names none');
   assert.deepEqual(
     { cli: claude.cliVersion, sdk: claude.sdkVersion, state: claude.state, running: claude.runningWorkers },
     { cli: '2.1.251', sdk: '0.3.292', state: 'online', running: 1 },
@@ -286,19 +285,27 @@ test('describe lists the enabled providers with versions and state', async () =>
   assert.deepEqual(about.stats.turnsByProvider.map((row) => row.label), ['GitHub Copilot', 'Claude Code', 'Cursor']);
 });
 
-test('the Copilot SDK engine runs the SDK the Copilot CLI ships: the CLI version, no package', async () => {
+test('Copilot runs the SDK the Copilot CLI ships: the CLI version, no package', async () => {
   const { service } = aboutService({
-    getProviderSettings: () => ({ github: { enabled: true, engine: 'sdk' } }),
-    isRelayCliOnline: () => false,
+    getProviderSettings: () => ({ github: { enabled: true } }),
     listWorkers: () => [],
     // A stale caller's version for Copilot is not shown either.
     sdkVersions: { github: '1.0.17', claude: '0.3.292', cursor: '1.0.36' },
   });
   const [copilot] = (await service.describe()).providers;
   assert.deepEqual(
-    { engine: copilot.engine, cli: copilot.cliVersion, sdkPackage: copilot.sdkPackage, sdk: copilot.sdkVersion, state: copilot.state },
-    { engine: 'sdk', cli: '1.0.82', sdkPackage: null, sdk: null, state: 'idle' },
+    { cli: copilot.cliVersion, sdkPackage: copilot.sdkPackage, sdk: copilot.sdkVersion, state: copilot.state },
+    { cli: '1.0.82', sdkPackage: null, sdk: null, state: 'idle' },
   );
+});
+
+test('OpenAI is online by its own workers, like every other provider', async () => {
+  const { service } = aboutService({
+    getProviderSettings: () => ({ github: { enabled: true }, openai: { enabled: true } }),
+    listWorkers: () => [],
+  });
+  const rows = (await service.describe()).providers;
+  assert.deepEqual(rows.map((row) => [row.id, row.state, row.runningWorkers]), [['github', 'idle', 0], ['openai', 'idle', 0]]);
 });
 
 test('the installed SDK versions come from the agent SDK store, read for each answer', async () => {
@@ -346,7 +353,7 @@ test('without a store, or with one that fails, the versions come from node_modul
       packageRoot: root,
       fsImpl,
       getAgentSdkStatus,
-      getProviderSettings: () => ({ github: { enabled: true, engine: 'sdk' }, claude: { enabled: true }, cursor: { enabled: true } }),
+      getProviderSettings: () => ({ github: { enabled: true }, claude: { enabled: true }, cursor: { enabled: true } }),
     });
     const rows = (await service.describe()).providers;
     assert.deepEqual(rows.map((row) => [row.id, row.sdkVersion]), [['github', null], ['claude', '0.3.300'], ['cursor', '1.0.40']]);

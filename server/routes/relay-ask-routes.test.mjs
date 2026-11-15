@@ -12,6 +12,9 @@ import { REMOTE_RELAY_ERROR_CODES as CODES } from '../../shared/remote-relay-con
 import { questionExpiresAt } from '../../shared/question-timeout.mjs';
 import { registerAskUserRoutes } from './ask-user-routes.mjs';
 import { registerRelayAskRoutes } from './relay-ask-routes.mjs';
+import { createPushDispatchService } from '../services/push-dispatch-service.mjs';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 
 // The routes of questions that don't block: the browser's (the session's
 // cards, the Inbox), the question routes an ask's id goes through, and the
@@ -62,7 +65,7 @@ function formatQuestionRow(row) {
   };
 }
 
-function boot({ inboundEnabled = true, client = null, boards = false, questionNotice = null, pairedRelays = null } = {}) {
+function boot({ inboundEnabled = true, client = null, boards = false, questionNotice = null, pairedRelays = null, pushQuestion = undefined } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   seed(db);
@@ -71,6 +74,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
   const asks = createRelayAskService({
     db,
     relayEvents: { noteQuestion() {}, noteQuestionAnswered: (outcome) => told.push(outcome) },
+    ...(pushQuestion ? { pushQuestion } : {}),
     logger: { log() {}, warn() {} },
   });
   const remoteRelayInbound = {
@@ -89,7 +93,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
     io: { emit() {} },
     db,
     stmts,
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
     uuidv4: () => 'unused',
     ts: () => NOW,
     questionExpiresAt,
@@ -595,4 +599,208 @@ test('a paired relay never gets an ask\'s queueId: ask, withdraw, status and its
   const inbox = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
   assert.ok(inbox.body.items.some((item) => item.kind === 'ask' && item.question === 'Own?'));
   for (const item of inbox.body.items.filter((entry) => entry.kind === 'ask')) assert.equal('queueId' in item, false, 'Inbox');
+});
+
+// A card's push carries a choice button; the service worker answers it with
+// the payload's data alone. The chain here: this relay's push of the card,
+// the worker's tap on a choice, the answer route.
+const SW_SOURCE = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
+const SW_SCOPE = 'https://relay-a.example.test/';
+const CARD_SESSION = 'sdk-fixture-4e2b';
+
+function seedSessionCard(db, { id = 'card-session', continuationId = null, continuationQuestionId = null } = {}) {
+  db.prepare(`
+    INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, sdk_session_id, continuation_id, continuation_question_id, status, created_at, expires_at)
+    VALUES (?, 'q-turn', ?, 'q-turn', 'agent', 'Ship the patch?', ?, ?, ?, ?, ?, 'pending', ?, '2999-01-01T00:00:00.000Z')
+  `).run(id, SESSION, JSON.stringify(['Ship', 'Hold']), JSON.stringify({ request: null, context: null, allowFreeform: true }),
+    CARD_SESSION, continuationId, continuationQuestionId, NOW);
+  return id;
+}
+
+async function pushedQuestionData(db, question) {
+  const payloads = [];
+  const push = createPushDispatchService({
+    db,
+    webpush: { sendNotification: async (_subscription, body) => { payloads.push(JSON.parse(body)); return { statusCode: 201 }; } },
+    hasActiveDevice: () => false,
+    uuid: () => 'sub-fixture-1',
+    logger: { warn() {}, log() {} },
+  });
+  push.upsertSubscription({ deviceId: 'device-fixture', endpoint: 'https://push.example.test/device-fixture', keys: { p256dh: 'p', auth: 'a' } });
+  await push.notifyQuestion(question);
+  assert.equal(payloads.length, 1, 'one push');
+  return payloads[0].data;
+}
+
+// The service worker's tap on choice `index`; returns the answer POST's body.
+async function tapChoice(data, index) {
+  const listeners = new Map();
+  const posts = [];
+  const self = {
+    location: { href: `${SW_SCOPE}sw.js?v=1`, origin: new URL(SW_SCOPE).origin },
+    registration: { scope: SW_SCOPE, showNotification: async () => {} },
+    clients: { matchAll: async () => [], openWindow: async () => null },
+    addEventListener: (type, handler) => listeners.set(type, handler),
+  };
+  const context = vm.createContext({
+    self, URL, console, queueMicrotask,
+    fetch: async (url, options) => {
+      posts.push({ url, body: JSON.parse(options?.body || '{}') });
+      const response = { ok: false, status: 500, json: async () => ({}), clone: () => response };
+      return response;
+    },
+  });
+  vm.runInContext(SW_SOURCE, context);
+  let done = null;
+  listeners.get('notificationclick')({
+    action: `choice-${index}`,
+    notification: { data, close() {} },
+    waitUntil: (promise) => { done = promise; },
+  });
+  await done;
+  assert.equal(posts.length, 1, 'one answer POST');
+  assert.equal(posts[0].url, `${SW_SCOPE}api/relay-question/${encodeURIComponent(data.questionId)}/answer`);
+  return posts[0].body;
+}
+
+test('a card with a session is answered from its push notification: the tap names the card\'s session', async () => {
+  const fx = boot();
+  const id = seedSessionCard(fx.db);
+  const data = await pushedQuestionData(fx.db, formatQuestionRow(fx.db.prepare(`SELECT * FROM relay_questions WHERE id = ?`).get(id)));
+  const body = await tapChoice(data, 1);
+  const answered = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id }, body });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.deepEqual({ ...fx.card(id) }, { status: 'answered', answer: 'Hold' });
+});
+
+test('the session check stays: an answer without the card\'s session, or with another, is refused', async () => {
+  const fx = boot();
+  const id = seedSessionCard(fx.db);
+  const bare = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id }, body: { answer: 'Ship' } });
+  assert.equal(bare.status, 403);
+  assert.equal(bare.body.error, 'session mismatch');
+  const other = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id }, body: { answer: 'Ship', sdk_session_id: 'sdk-fixture-other' } });
+  assert.equal(other.status, 403);
+  assert.equal(fx.card(id).status, 'pending');
+});
+
+test('with continuation routing on, a card of a continuation is answered from its push like the in-app card: by its session', async () => {
+  const fx = boot();
+  const id = seedSessionCard(fx.db, { continuationId: 'cont-fixture-81', continuationQuestionId: 'cq-fixture-3' });
+  const data = await pushedQuestionData(fx.db, formatQuestionRow(fx.db.prepare(`SELECT * FROM relay_questions WHERE id = ?`).get(id)));
+  const body = await tapChoice(data, 0);
+  const answered = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id }, body });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.deepEqual({ ...fx.card(id) }, { status: 'answered', answer: 'Ship' });
+});
+
+// A card only the person answers, and a tool permission card, open the app
+// from their push: no choice buttons, no session, a tap opens the
+// conversation. Other questions keep their one-tap answer.
+function seedContextCard(db, id, context) {
+  db.prepare(`
+    INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, choices, request, sdk_session_id, status, created_at, expires_at)
+    VALUES (?, 'q-turn', ?, 'q-turn', 'agent', 'Go ahead?', ?, ?, ?, 'pending', ?, '2999-01-01T00:00:00.000Z')
+  `).run(id, SESSION, JSON.stringify(['Allow', 'Deny']), JSON.stringify({ request: null, context, allowFreeform: false }), CARD_SESSION, NOW);
+  return id;
+}
+
+// The service worker draws the push, then the person taps its body.
+async function showAndTapBody(payload) {
+  const listeners = new Map();
+  const shown = [];
+  const opened = [];
+  const posts = [];
+  const self = {
+    location: { href: `${SW_SCOPE}sw.js?v=1`, origin: new URL(SW_SCOPE).origin },
+    registration: { scope: SW_SCOPE, showNotification: async (title, options) => { shown.push(options); } },
+    clients: { matchAll: async () => [], openWindow: async (url) => { opened.push(url); return null; } },
+    addEventListener: (type, handler) => listeners.set(type, handler),
+  };
+  const context = vm.createContext({
+    self, URL, console, queueMicrotask,
+    Notification: { maxActions: 2 },
+    fetch: async (url, options) => {
+      posts.push({ url, body: options?.body });
+      const response = { ok: true, status: 200, json: async () => ({}), clone: () => response };
+      return response;
+    },
+  });
+  vm.runInContext(SW_SOURCE, context);
+  let done = null;
+  listeners.get('push')({ data: { json: () => payload }, waitUntil: (promise) => { done = promise; } });
+  await done;
+  assert.equal(shown.length, 1, 'one notification');
+  listeners.get('notificationclick')({
+    action: '',
+    notification: { data: shown[0].data, close() {} },
+    waitUntil: (promise) => { done = promise; },
+  });
+  await done;
+  return { actions: shown[0].actions, opened, posts };
+}
+
+async function pushedQuestionPayload(db, question) {
+  const payloads = [];
+  const push = createPushDispatchService({
+    db,
+    webpush: { sendNotification: async (_subscription, body) => { payloads.push(JSON.parse(body)); return { statusCode: 201 }; } },
+    hasActiveDevice: () => false,
+    uuid: () => 'sub-fixture-2',
+    logger: { warn() {}, log() {} },
+  });
+  push.upsertSubscription({ deviceId: 'device-fixture', endpoint: 'https://push.example.test/device-fixture', keys: { p256dh: 'p', auth: 'a' } });
+  await push.notifyQuestion(question);
+  assert.equal(payloads.length, 1, 'one push');
+  return payloads[0];
+}
+
+const OPENS_APP_CARDS = [
+  ['a relay approval of its own agent\'s call', { source: 'remote_relay', header: 'Remote relay' }],
+  ['a Safety check', { source: 'ClaudeSafetyCheck', personOnly: true }],
+  ['a Safety check on a sensitive file', { source: 'ClaudeSafetyCheck', personOnly: true, kind: 'sensitive-file' }],
+  ['a Claude Cloud permission', { source: 'ClaudeCloudPermission' }],
+  ['a card marked person-only', { source: 'AskUserQuestion', personOnly: true }],
+  ['a Copilot tool permission in ask mode', { source: 'onPermissionRequest', permissionKind: 'shell' }],
+];
+
+for (const [label, cardContext] of OPENS_APP_CARDS) {
+  test(`${label}: its push has no answer buttons and no session, and a tap opens the conversation`, async () => {
+    const fx = boot();
+    const id = seedContextCard(fx.db, `card-opens-${OPENS_APP_CARDS.findIndex(([name]) => name === label)}`, cardContext);
+    const payload = await pushedQuestionPayload(fx.db, formatQuestionRow(fx.db.prepare(`SELECT * FROM relay_questions WHERE id = ?`).get(id)));
+    assert.equal(payload.data.questionId, id);
+    assert.equal('choices' in payload.data, false, 'no choices');
+    assert.equal('sdkSessionId' in payload.data, false, 'no session');
+    const tapped = await showAndTapBody(payload);
+    assert.equal(tapped.actions.length, 0, 'no buttons drawn');
+    assert.deepEqual(tapped.posts, [], 'nothing answered');
+    assert.deepEqual(tapped.opened, [`${SW_SCOPE}?push_conv=${SESSION}`]);
+    assert.equal(fx.card(id).status, 'pending');
+  });
+}
+
+test('a Copilot question that is no permission keeps its one-tap answer', async () => {
+  const fx = boot();
+  const id = seedContextCard(fx.db, 'card-copilot-input', { source: 'onUserInputRequest', rationale: 'Copilot asks.' });
+  const payload = await pushedQuestionPayload(fx.db, formatQuestionRow(fx.db.prepare(`SELECT * FROM relay_questions WHERE id = ?`).get(id)));
+  assert.deepEqual(payload.data.choices, ['Allow', 'Deny']);
+  assert.equal(payload.data.sdkSessionId, CARD_SESSION);
+  const body = await tapChoice(payload.data, 0);
+  const answered = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id }, body });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.deepEqual({ ...fx.card(id) }, { status: 'answered', answer: 'Allow' });
+});
+
+test('an urgent ask keeps its one-tap answer: it is a question, not an approval', async () => {
+  const pushed = [];
+  const fx = boot({ pushQuestion: (question) => pushed.push(question) });
+  const ask = fx.asks.create({ conversationId: SESSION, createdBy: LEAD, urgency: 'now', ...QUESTION });
+  assert.equal(pushed.length, 1, 'urgency "now" pushes');
+  const payload = await pushedQuestionPayload(fx.db, pushed[0]);
+  assert.deepEqual(payload.data.choices, ['Postgres', 'SQLite']);
+  const body = await tapChoice(payload.data, 1);
+  const answered = await fx.call('POST', '/api/relay-question/:id/answer', { params: { id: ask.id }, body });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  assert.equal(fx.asks.get(ask.id).status, 'answered');
 });

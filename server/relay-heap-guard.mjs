@@ -7,7 +7,7 @@ import { resolveDataDir } from './services/data-dir-resolution.mjs';
 
 // The config.json key an operator sets to pin the runtime's heap (MB). A key
 // and not an env var: a shell's NODE_OPTIONS is lost on the next relaunch by
-// systemd, an autostart launcher or the CLI extension; config.json is read by
+// systemd or an autostart launcher; config.json is read by
 // every one of them.
 export const HEAP_LIMIT_CONFIG_KEY = 'heapLimitMb';
 export const MIN_HEAP_LIMIT_MB = 512;

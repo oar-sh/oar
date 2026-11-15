@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { createApiClient } from "../shared/worker-runtime/api-client.mjs";
-import { createHeartbeatController } from "../shared/worker-runtime/heartbeat.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { fakeWorkerFor, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A queued relay restart shows a banner on every page: the sessions it waits
 // for (links), how long it has waited, that new messages are held, the
@@ -11,8 +13,8 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 // restarts by itself.
 //
 // The relay is never restarted here. The queued restart waits for a turn
-// this process holds open (handed out over /api/pending, kept alive by the
-// real heartbeat controller) and is cancelled before the turn is answered;
+// this process holds open as the session's worker (helpers/fake-worker.mjs,
+// kept alive by its heartbeat) and is cancelled before the turn is answered;
 // "Restart now" is answered by page.route. Each block boots its OWN relay:
 // a queued restart holds every turn of the relay it runs on.
 
@@ -25,68 +27,42 @@ function apiOf(relay) {
 }
 
 /**
- * A session worker as the relay sees one: its identity headers, a task set,
- * the real heartbeat naming the turn it works on.
+ * A session worker as the relay sees one (helpers/fake-worker.mjs), with a
+ * task set: the heartbeat names the turn it holds and the tasks it runs.
  */
-function fakeWorker(relay, conversationId) {
-  const client = createApiClient({
-    serverUrl: relay.baseUrl,
-    token: relay.token,
-    getHeaders: () => ({
-      "x-relay-session-id": conversationId,
-      "x-relay-conversation-id": conversationId,
-      "x-relay-process-pid": String(process.pid),
-    }),
-  });
-  let timer = null;
+function fakeWorker(relay, queued) {
+  const base = fakeWorkerFor(queued, { baseUrl: () => relay.baseUrl, token: () => relay.token });
   const worker = {
+    base,
     tasks: [],
-    activeMessageId: "",
-    publish: () => client("POST", "/api/background-tasks", { conversationId, tasks: worker.tasks }),
+    publish: async () => {
+      const published = await base.post("/api/background-tasks", { conversationId: base.sessionId, tasks: worker.tasks });
+      expect(published.status, JSON.stringify(published.payload)).toBe(200);
+    },
+    beat: async () => { expect(await base.beat(), "the relay answered the heartbeat").toBe(true); },
   };
-  const heartbeat = createHeartbeatController({
-    api: client,
-    pollMs: 60_000,
-    getSessionReady: () => true,
-    getHeartbeatTimer: () => timer,
-    setHeartbeatTimer: (value) => { timer = value; },
-    getActiveQueueMessageId: () => worker.activeMessageId,
-    getSteeringState: () => ({ turnActive: !!worker.activeMessageId }),
+  base.use({
+    getSteering: () => ({ turnActive: base.holding.length > 0 }),
     getBackgroundTaskIds: () => worker.tasks.map((task) => task.taskId),
     onResyncBackgroundTasks: () => worker.publish(),
   });
-  worker.beat = async () => { expect(await heartbeat.pulseHeartbeat(), "the relay answered the heartbeat").toBe(true); };
   return worker;
 }
 
 /** A conversation with one turn handed out and still running. */
 async function runningTurn(relay, text) {
-  const api = apiOf(relay);
-  const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const { conversationId, messageId, ownerSessionId } = queued.payload;
-  const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-  const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-  let handed = false;
-  for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-    handed = String((await api("/api/pending", { headers })).payload?.message?.id || "") === messageId;
-    if (!handed) await sleep(250);
-  }
-  expect(handed, "the message was handed out").toBe(true);
-  const worker = fakeWorker(relay, conversationId);
-  worker.activeMessageId = messageId;
-  await worker.beat();
+  const started = await startConversation({ text }, { baseUrl: relay.baseUrl, token: relay.token });
+  const { conversationId, messageId } = started;
+  const worker = fakeWorker(relay, started);
+  await worker.base.take(messageId);
   return { conversationId, messageId, worker };
 }
 
 /** A conversation whose turn is answered, with a worker that runs one background shell. */
 async function backgroundOnly(relay, text, description) {
-  const api = apiOf(relay);
   const turn = await runningTurn(relay, text);
-  const answered = await api("/api/response", { method: "POST", body: { messageId: turn.messageId, conversationId: turn.conversationId, text: "started it in the background", model: "gpt-5.4-mini" } });
+  const answered = await turn.worker.base.respond(turn.messageId, { text: "started it in the background", model: "gpt-5.4-mini" });
   expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
-  turn.worker.activeMessageId = "";
   turn.worker.tasks.push({ taskId: `task_fixture_${Date.now()}`, taskType: "local_bash", description, startedAt: Date.now() - 60_000 });
   await turn.worker.beat();
   await turn.worker.publish();

@@ -195,7 +195,7 @@ for (const profile of [
 
     test("a shared viewer has no About entry", async ({ request, browser }) => {
       const bootstrap = await request.post(api("/api/conversation/bootstrap"), { headers, data: { title: "Sample chat to share", model: "gpt-5.4-mini" } });
-      expect([200, 409]).toContain(bootstrap.status());
+      expect(bootstrap.status()).toBe(200);
       const conversationId = String((await bootstrap.json())?.conversationId || "").trim();
       expect(conversationId).toBeTruthy();
       try {

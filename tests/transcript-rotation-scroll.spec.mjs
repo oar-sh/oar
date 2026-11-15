@@ -1,5 +1,9 @@
 import { expect, test, devices } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, bootstrapConversation, fakeWorkerFor, respondAsWorker, settleFakeWorkers } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // Rotating a phone reflows every transcript row (twice the width, half the
 // height), and the browser keeps scrollTop as pixels: a reader at the end of
@@ -12,26 +16,12 @@ test.use({ ...pixelPortrait });
 const PORTRAIT = { width: 412, height: 839 };
 const LANDSCAPE = { width: 839, height: 412 };
 const FILLER = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const claimHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const pending = await request.get("/api/pending", { headers: claimHeaders });
-    const message = (await pending.json())?.message || null;
-    if (!message) { await sleep(120); continue; }
-    if (String(message.id) === String(messageId)) return message;
-    await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(100);
-  }
-  throw new Error(`timed out dequeuing ${messageId}`);
-}
-
 // A long conversation: each turn is a question and an answer of several
 // wrapped lines, so the portrait transcript is many screens tall.
 async function seedLongConversation(request, headers, turns) {
-  let conversationId = "";
-  let ownerSessionId = "";
+  // Made as the web client makes a chat: bound to its session before its
+  // first message.
+  const conversationId = await bootstrapConversation({ title: `Question 0. ${FILLER}` });
   for (let index = 0; index < turns; index += 1) {
     const queued = await request.post("/api/message", {
       headers,
@@ -39,35 +29,20 @@ async function seedLongConversation(request, headers, turns) {
         text: `Question ${index}. ${FILLER.repeat(4)}`,
         relayMode: "agent",
         model: "gpt-5.4-mini",
-        conversationId: conversationId || undefined,
+        conversationId,
       },
     });
     expect(queued.ok()).toBeTruthy();
     const body = await queued.json();
-    if (!conversationId) {
-      conversationId = String(body.conversationId || "");
-      ownerSessionId = String(body.ownerSessionId || "");
-      await dequeue(request, headers, body.messageId, ownerSessionId);
-      const bound = await request.post("/api/session-sync", {
-        headers,
-        data: { sdk_session_id: `pw-rotation-${Date.now()}`, conversation_id: conversationId },
-      });
-      expect(bound.ok()).toBeTruthy();
-    } else {
-      await dequeue(request, headers, body.messageId, ownerSessionId);
-    }
-    const answered = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId: body.messageId,
-        conversationId,
-        text: `Answer ${index}. ${FILLER.repeat(4)}`,
-        model: "gpt-5.4-mini",
-        reasoningEffort: "high",
-        mode: "agent",
-      },
+    await fakeWorkerFor(body).take(body.messageId);
+    const answered = await respondAsWorker(body.messageId, {
+      conversationId,
+      text: `Answer ${index}. ${FILLER.repeat(4)}`,
+      model: "gpt-5.4-mini",
+      reasoningEffort: "high",
+      mode: "agent",
     });
-    expect(answered.ok()).toBeTruthy();
+    expect(answered.ok).toBeTruthy();
   }
   return conversationId;
 }
@@ -182,12 +157,13 @@ test("the keyboard opening keeps a focused question-card reply box in view", asy
     expect(queued.ok()).toBeTruthy();
     const queuedBody = await queued.json();
     messageId = String(queuedBody.messageId || "");
-    await dequeue(request, headers, messageId, String(queuedBody.ownerSessionId || ""));
+    await fakeWorkerFor(queuedBody).take(messageId);
     const questionIds = [];
     for (let index = 0; index < 3; index += 1) {
       const created = await request.post("/api/relay-question", {
         headers,
         data: {
+          ...attemptOf(messageId),
           queueId: messageId,
           messageId,
           conversationId,
@@ -241,10 +217,7 @@ test("the keyboard opening keeps a focused question-card reply box in view", asy
     expect((await readTranscriptPosition(page)).distanceFromBottom).toBeLessThanOrEqual(1);
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
     if (conversationId) {
       await request.delete(`/api/conversation/${encodeURIComponent(conversationId)}`, { headers }).catch(() => {});

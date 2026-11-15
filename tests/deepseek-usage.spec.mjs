@@ -248,12 +248,18 @@ test.describe("DeepSeek usage card", () => {
     expect(meters["deepseek-monthly-budget"]).toMatchObject({ unit: "cny", allowance: 20, estimated: true, resetAt: month.nextStart });
     expect(meters["deepseek-monthly-budget"].used).toBe(month.start === "2026-10-01" ? 10.04 : 0);
     const charts = Object.fromEntries(card.charts.map((chart) => [chart.id, chart]));
-    expect(charts["deepseek-daily-spend"]).toMatchObject({ kind: "columns", unit: "cny", series: [{ key: "deepseek-flash", label: "DeepSeek Flash" }] });
-    expect(charts["deepseek-daily-spend"].items.length).toBe(30);
-    expect(charts["deepseek-daily-spend"].items.some((item) => item.values["deepseek-flash"] > 0)).toBe(true);
+    expect(charts["deepseek-daily-spend-30d"]).toMatchObject({ kind: "columns", unit: "cny", series: [{ key: "deepseek-flash", label: "DeepSeek Flash" }] });
+    expect(charts["deepseek-daily-spend-30d"].items.length).toBe(30);
+    expect(charts["deepseek-daily-spend-30d"].items.some((item) => item.values["deepseek-flash"] > 0)).toBe(true);
+    // The daily chart comes in 7, 30 and 90 days for the picker; the split is all time.
+    expect(charts["deepseek-daily-spend-30d"].windowDays).toBe(30);
+    expect(charts["deepseek-daily-spend-90d"]).toMatchObject({ windowDays: 90 });
+    expect(charts["deepseek-daily-spend-90d"].items.length).toBe(90);
+    expect(charts["deepseek-spend-shares"].windowDays).toBeUndefined();
+    expect(charts["deepseek-spend-shares"].note).toMatch(/^All time\./);
     // The history's first day (2026-10-21) is named while it is inside the 30 days.
     const chartStart = addDays(new Date().toISOString().slice(0, 10), -29);
-    expect(charts["deepseek-daily-spend"].note).toMatch("2026-10-21" > chartStart ? /^Daily history on this relay starts Oct 21; / : /^Estimated, by UTC day, from the turns of this relay\.$/);
+    expect(charts["deepseek-daily-spend-30d"].note).toMatch("2026-10-21" > chartStart ? /^Daily history on this relay starts Oct 21; / : /^Estimated, by UTC day, from the turns of this relay\.$/);
     // 1M hits at the miss price would be ¥2.00; they cost ¥0.04.
     expect(charts["deepseek-spend-shares"]).toMatchObject({ kind: "bars", unit: "cny", summary: "Cache saved about ¥1.96" });
     expect(charts["deepseek-spend-shares"].series.map((entry) => entry.key)).toEqual(["hit", "miss", "output"]);
@@ -274,7 +280,7 @@ test.describe("DeepSeek usage card", () => {
     const balanceBar = panel.locator('[data-meter-id="deepseek-balance-cny"]');
     await expect(balanceBar).toContainText("¥0.00 of ¥110.00 used · ¥110.00 left");
     await expect(panel.locator('[data-meter-id="deepseek-monthly-budget"]')).toContainText("of ¥20.00 used");
-    const daily = panel.locator('[data-chart-id="deepseek-daily-spend"]');
+    const daily = panel.locator('[data-chart-id="deepseek-daily-spend-30d"]');
     await expect(daily).toBeVisible();
     await expect(daily).toHaveAttribute("aria-label", "Daily spend, last 30 days");
     expect(await daily.locator(".plan-usage-chart-col").count()).toBe(30);
@@ -294,6 +300,18 @@ test.describe("DeepSeek usage card", () => {
     expect(light).not.toBe("rgba(0, 0, 0, 0)");
     expect(light).not.toBe(dark);
     await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
+
+    // The picker switches the daily chart; "Where the money goes" stays, all time.
+    await expect(panel.locator('.plan-usage-chart-window input[value="30"]')).toBeChecked();
+    await panel.locator(".plan-usage-chart-window label", { hasText: "90 days" }).click();
+    await expect(daily).toBeHidden();
+    await expect(panel.locator('[data-chart-id="deepseek-daily-spend-90d"]')).toBeVisible();
+    expect(await panel.locator('[data-chart-id="deepseek-daily-spend-90d"] .plan-usage-chart-col').count()).toBe(90);
+    await expect(shares).toBeVisible();
+    await expect(shares).not.toHaveAttribute("hidden", /.*/);
+    await expect(shares).not.toHaveAttribute("data-window", /.*/);
+    await panel.locator(".plan-usage-chart-window label", { hasText: "30 days" }).click();
+    await expect(daily).toBeVisible();
   });
 
   test("the charts keep their layout on a phone in portrait and landscape and on a desktop, in both themes", async ({ page, request }, testInfo) => {
@@ -366,7 +384,7 @@ test.describe("DeepSeek usage card", () => {
         }, theme);
         // Each figure lays its parts out top to bottom across its whole
         // width; the plot alone is a grid (one column per day) or rows.
-        for (const id of ["deepseek-daily-spend", "deepseek-spend-shares"]) {
+        for (const id of ["deepseek-daily-spend-30d", "deepseek-spend-shares"]) {
           const layout = await panel.locator(`[data-chart-id="${id}"]`).evaluate((figure) => {
             const box = figure.getBoundingClientRect();
             const parts = [...figure.children].filter((node) => getComputedStyle(node).display !== "none");
@@ -390,7 +408,7 @@ test.describe("DeepSeek usage card", () => {
               .toBeGreaterThanOrEqual(layout.parts[index - 1].bottom - 1);
           }
         }
-        const columnWidth = await panel.locator('[data-chart-id="deepseek-daily-spend"] .plan-usage-chart-col').first().evaluate((node) => node.getBoundingClientRect().width);
+        const columnWidth = await panel.locator('[data-chart-id="deepseek-daily-spend-30d"] .plan-usage-chart-col').first().evaluate((node) => node.getBoundingClientRect().width);
         expect(columnWidth, `${viewport.name} ${theme}: a day's column`).toBeGreaterThan(3);
         // Every figure is on show (the balance and spend rows, both tables
         // open), and the card fits the screen's width.
@@ -438,6 +456,18 @@ test.describe("DeepSeek usage card", () => {
           clip: { x: Math.max(0, box.x - 8), y: Math.max(0, box.y - 8), width: box.width + 16, height: box.height + 16 },
         });
         await restoreHeightCaps(page, panel, viewport);
+        // At 90 days: the columns lose their gaps and keep 2.5px or more,
+        // the card still fits, the split is unchanged.
+        await panel.locator(".plan-usage-chart-window label", { hasText: "90 days" }).click();
+        const ninety = panel.locator('[data-chart-id="deepseek-daily-spend-90d"]');
+        await expect(ninety).toBeVisible();
+        const ninetyWidth = await ninety.locator(".plan-usage-chart-col").first().evaluate((node) => node.getBoundingClientRect().width);
+        expect(ninetyWidth, `${viewport.name} ${theme}: a day's column at 90 days`).toBeGreaterThanOrEqual(2.5);
+        expect(await panel.evaluate((node) => node.scrollWidth - node.clientWidth), `${viewport.name} ${theme} 90 days: the card is wider than its box`).toBeLessThanOrEqual(0);
+        await expect(shares).toBeVisible();
+        await ninety.scrollIntoViewIfNeeded();
+        await page.screenshot({ path: path.join(shotDir, `deepseek-card-${viewport.name}-${theme}-90d-screen.png`) });
+        await panel.locator(".plan-usage-chart-window label", { hasText: "30 days" }).click();
       }
     }
     await page.evaluate(() => { document.documentElement.removeAttribute("data-theme"); });
@@ -964,7 +994,7 @@ test.describe("DeepSeek usage export import", () => {
     const notes = Object.fromEntries(card.notes.map((note) => [note.id, note.text]));
     expect(notes["deepseek-actual"]).toMatch(new RegExp(`^Actual figures from the DeepSeek export on the days it covers \\(the last through ${addDays(exportDay, 1)} 00:00 UTC\\+01:00\\), estimated on the others\\. On export days the export's cost includes the web searches\\.`));
     expect(notes["deepseek-spend"]).toMatch(/^Spend, actual and estimated: ¥/);
-    expect(card.charts.find((chart) => chart.id === "deepseek-daily-spend").note).toMatch(/^Actual from the DeepSeek export on the days it covers, by its days; estimated on the others/);
+    expect(card.charts.find((chart) => chart.id === "deepseek-daily-spend-30d").note).toMatch(/^Actual from the DeepSeek export on the days it covers, by its days; estimated on the others/);
     // The budget bar of a month with export days is not flagged "estimated";
     // on the 1st the export is all last month's, and this month's bar is.
     const budget = card.meters.find((meter) => meter.id === "deepseek-monthly-budget");

@@ -1,5 +1,5 @@
 // Shared touch/click activation helpers for the header menus (chat actions menu,
-// sidebar toggle, theme button, tmux inspector menu).
+// sidebar toggle, theme button).
 //
 // These activate on `pointerup` and then swallow the follow-up synthetic click on
 // the *same* element. That is only safe when the surrounding menu is an overlay

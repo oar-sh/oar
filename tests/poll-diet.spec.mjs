@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 import Database from "better-sqlite3";
 import { relayDbPath, relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The live poll's diet, against the shared e2e relay. A busy window: six
 // finished turns, each with 230 main-agent tool lines (the finished cap
@@ -23,32 +27,6 @@ const TURNS = 6;
 const MAIN_LINES = 230;
 const SUBAGENT_LINES = 50;
 const THOUGHTS = 8;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-// The worker's heartbeat while the turn runs: without it the CLI reads as
-// offline after a while and the live bubble goes with it.
-function keepWorkerAlive(request, headers, messageId) {
-  const beat = () => request.post("/api/heartbeat", { headers, data: { activeQueueMessageId: messageId } }).catch(() => {});
-  void beat();
-  const timer = setInterval(beat, 2_000);
-  return () => clearInterval(timer);
-}
 
 // Six finished turns before the running one, as a busy session leaves them.
 function seedFinishedTurns(conversationId, stamp) {
@@ -103,17 +81,15 @@ test.describe("poll diet", () => {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const queued = await request.post("/api/message", { headers, data: { text: `Wrap up the widget cache ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.ok()).toBeTruthy();
-    const body = await queued.json();
-    const conversationId = String(body.conversationId);
-    const messageId = String(body.messageId);
-    await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+    // Made as the web client makes a chat: bound to its session from the start.
+    const started = await startConversation({ text: `Wrap up the widget cache ${stamp}` });
+    const conversationId = String(started.conversationId);
+    const messageId = String(started.messageId);
+    await started.worker.take(messageId);
     const replies = seedFinishedTurns(conversationId, stamp);
-    const stopBeating = keepWorkerAlive(request, headers, messageId);
 
     try {
-      expect((await request.post("/api/activity", { headers, data: { messageId, conversationId, mode: "agent", text: "Tool (view): src/widgets/index.js" } })).ok()).toBeTruthy();
+      expect((await request.post("/api/activity", { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", text: "Tool (view): src/widgets/index.js" } })).ok()).toBeTruthy();
 
       const isPoll = (response) => response.url().includes(`/api/conversation/${conversationId}?`);
       const isHeldPoll = (response) => isPoll(response) && response.url().includes("heldDetails=");
@@ -208,8 +184,7 @@ test.describe("poll diet", () => {
         await page.evaluate(() => window.updateTheme("dark"));
       }
     } finally {
-      stopBeating();
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 });

@@ -76,6 +76,15 @@ export function createSessionWorkerSupervisor({
   // Told about launch episodes, for the note in the conversation:
   // ({ type: 'exhausted' | 'retry-failed' | 'stopped' | 'launched', sdkSessionId, lifecycle }).
   onLaunchState = null,
+  // Whether every worker of this relay says its kind (heartbeat, socket
+  // hello); a function, asked at each reuse. Unset: no worker has to.
+  workersStateTheirKind = null,
+  // What the process at a pid is: (pid) → { pid, startTime, commandLine }
+  // or null (createProcessIdentityReader). Asked for a process that
+  // registered by itself and never said its kind, until a read tells what it
+  // is, so a worker of an earlier version is reused and only a process that
+  // is no session worker is not. Unset: such a process is never reused.
+  readProcessIdentity = null,
   idleEvictionMs = 0,
   // Copilot-kind workers boot a full CLI (auth, model catalog, workspace scan)
   // before their extension can heartbeat; measured median is ~35s. A 30s
@@ -174,6 +183,10 @@ export function createSessionWorkerSupervisor({
       firstObservedHeartbeatAtMs: null,
       monitorLoggedAtMs: null,
       killedAtMs: null,
+      // What an identity read told of a process that never said its kind:
+      // { pid, reusable }, for that pid only. A read that told nothing is
+      // not kept.
+      unstatedProcessVerdict: null,
     };
     lifecycleBySession.set(sessionId, state);
     return state;
@@ -360,8 +373,67 @@ export function createSessionWorkerSupervisor({
     }
   }
 
-  function shouldReuseLiveWorker(worker) {
+  // A process that registered for the session by itself (its pid is not the
+  // one a launch here started or reused) and never said what kind of worker
+  // it is, on a relay whose workers all do: a worker of an earlier version,
+  // which said no kind, or no worker at all, e.g. a Copilot CLI an earlier
+  // version started that still heartbeats. Its identity read decides
+  // (readUnstatedProcess); without one it is not reused.
+  function isUnstatedForeignProcess(worker) {
+    if (workersStateTheirKind?.() !== true || worker?.kind) return false;
+    const pid = Number(worker?.pid);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    return lifecycleBySession.get(normalizeSessionId(worker?.sdkSessionId))?.launchPid !== pid;
+  }
+
+  function unstatedProcessVerdict(worker) {
+    const verdict = lifecycleBySession.get(normalizeSessionId(worker?.sdkSessionId))?.unstatedProcessVerdict;
+    return verdict && verdict.pid === Number(worker?.pid) ? verdict : null;
+  }
+
+  function needsIdentityRead(worker) {
+    return typeof readProcessIdentity === 'function'
+      && isUnstatedForeignProcess(worker)
+      && !unstatedProcessVerdict(worker);
+  }
+
+  // Reads what the process at the worker's pid is: 'worker' when its command
+  // line is a session worker's (`node <kind>-session-worker.mjs`, of any
+  // kind: the launch's own test, judgeListedSessionProcess), 'other' when it
+  // is known and is no session worker's, 'unknown' when it cannot be read:
+  // no identity, or no command line. An empty one is none: Windows lists a
+  // process the relay may not open (one an elevated relay started) with a
+  // null CommandLine, which the process list makes ''.
+  // The first two are kept for the pid. 'unknown' is not: the process is
+  // reused for the one call (a launch beside a live worker could give the
+  // session two) and read again at the next, so one failed read never
+  // makes a process that is no session worker the session's for good.
+  async function readUnstatedProcess(sessionId, worker) {
+    const pid = Number(worker.pid);
+    let identity = null;
+    try {
+      identity = await readProcessIdentity(pid);
+    } catch {
+      identity = null;
+    }
+    const commandLine = typeof identity?.commandLine === 'string' ? identity.commandLine.trim() : '';
+    if (!commandLine) return 'unknown';
+    const reusable = commandLine.toLowerCase().includes('-session-worker');
+    setLifecycle(sessionId, { unstatedProcessVerdict: { pid, reusable } });
+    return reusable ? 'worker' : 'other';
+  }
+
+  // `unreadPid`: the pid of a process that never said its kind and whose
+  // read in this call told nothing; reused for this call only.
+  function isUnreadThisCall(worker, unreadPid) {
+    return unreadPid !== null && Number(worker?.pid) === unreadPid && isUnstatedForeignProcess(worker);
+  }
+
+  function shouldReuseLiveWorker(worker, { unreadPid = null } = {}) {
     if (!worker || !hasWorkerIdentity(worker)) return false;
+    if (isUnstatedForeignProcess(worker)
+      && unstatedProcessVerdict(worker)?.reusable !== true
+      && !isUnreadThisCall(worker, unreadPid)) return false;
     const pidProbe = checkPidLiveness(worker);
     if (pidProbe.checked) return pidProbe.alive;
     const status = String(worker?.status || '').trim().toLowerCase();
@@ -602,28 +674,45 @@ export function createSessionWorkerSupervisor({
       return { ok: false, error: 'missing-session-id', worker: null };
     }
 
-    if (isKillBlocked(sessionId)) {
-      const lifecycle = getOrCreateLifecycle(sessionId);
-      return {
-        ok: false,
-        error: 'session-killed',
-        worker: registry.getWorker(sessionId) || null,
-        lifecycle: toLifecycleSnapshot(sessionId, lifecycle),
-      };
+    const killedResult = () => ({
+      ok: false,
+      error: 'session-killed',
+      worker: registry.getWorker(sessionId) || null,
+      lifecycle: toLifecycleSnapshot(sessionId, getOrCreateLifecycle(sessionId)),
+    });
+    if (isKillBlocked(sessionId)) return killedResult();
+
+    // A process that never said its kind is read first. Only then is
+    // anything awaited here: every other call decides in the caller's tick.
+    // A kill may come meanwhile, and the entry may change: both are read
+    // again below.
+    const candidate = registry.getWorker(sessionId);
+    let unreadPid = null;
+    if (allowProcessReuse
+      && !hasStartupFailureReason(getOrCreateLifecycle(sessionId))
+      && needsIdentityRead(candidate)) {
+      const verdict = await readUnstatedProcess(sessionId, candidate);
+      if (isKillBlocked(sessionId)) return killedResult();
+      if (verdict === 'unknown') unreadPid = Number(candidate.pid);
     }
 
     const existing = registry.getWorker(sessionId);
     const existingLifecycle = getOrCreateLifecycle(sessionId);
     const blockedByStartupFailure = hasStartupFailureReason(existingLifecycle);
-    if (allowProcessReuse && !blockedByStartupFailure && shouldReuseLiveWorker(existing)) {
+    if (allowProcessReuse && !blockedByStartupFailure && shouldReuseLiveWorker(existing, { unreadPid })) {
       const nowAtMs = nowMs();
       const reusedWorker = setWorkerState(sessionId, {
         ...existing,
         sdkSessionId: sessionId,
-        status: 'ready',
+        // A worker in a turn stays 'processing': finding its process alive
+        // ends no turn.
+        status: String(existing?.status || '').trim().toLowerCase() === 'processing' ? 'processing' : 'ready',
       });
       const lifecycle = getOrCreateLifecycle(sessionId);
-      if (!lifecycle.awaitingHeartbeat && !lifecycle.firstObservedHeartbeatAtMs) {
+      // A process reused unread is not recorded as this relay's launch: its
+      // pid would then never be read again.
+      if (!isUnreadThisCall(existing, unreadPid)
+        && !lifecycle.awaitingHeartbeat && !lifecycle.firstObservedHeartbeatAtMs) {
         noteLaunch(sessionId, {
           mode: 'reused',
           pid: existing?.pid || null,
@@ -672,6 +761,18 @@ export function createSessionWorkerSupervisor({
         queueDepth: existing?.queueDepth || 0,
         retryCount: lifecycle.retryCount || existing?.retryCount || 0,
       });
+      // A worker that registered for the session while this launch ran: its
+      // heartbeat, socket hello or claim set a pid that is alive and not the
+      // one this attempt started from. That worker keeps the entry however
+      // the launch ends. A status change alone (markIdle from a send, a stop,
+      // a requeue) is no registration, nor is the pid the entry already had.
+      const liveWorkerRegisteredSinceStart = () => {
+        const current = registry.getWorker(sessionId);
+        if (!current) return null;
+        const registered = checkPidLiveness(current).alive
+          && Number(current.pid) !== Number(startingState.pid || 0);
+        return registered ? current : null;
+      };
 
       try {
         if (typeof spawnWorker === 'function') {
@@ -685,10 +786,15 @@ export function createSessionWorkerSupervisor({
             return buildStartBlockedResult();
           }
           // Not launched, and not a failure either (the agent SDK it needs is
-          // still installing, agent-sdk-launch-gate.mjs): no worker, no
-          // restart backoff, no launch note; the turn stays queued until the
-          // gate hands the session its launch back.
+          // still installing, agent-sdk-launch-gate.mjs, or a test relay
+          // launches no worker at all): no worker, no restart backoff, no
+          // launch note; the turn stays queued until the gate hands the
+          // session its launch back, or a worker reports by itself.
           if (spawned?.deferred) {
+            const registeredWorker = liveWorkerRegisteredSinceStart();
+            if (registeredWorker) {
+              return { ok: true, reused: true, worker: registeredWorker, lifecycle: toLifecycleSnapshot(sessionId) };
+            }
             const waitingState = setWorkerState(sessionId, {
               sdkSessionId: sessionId,
               // No worker yet ('new'), so nothing waits for its heartbeat.
@@ -701,10 +807,27 @@ export function createSessionWorkerSupervisor({
             });
             return { ok: true, deferred: String(spawned.deferred), reused: false, worker: waitingState, lifecycle: toLifecycleSnapshot(sessionId) };
           }
+          // A launch that does not know its pid yet, while a worker registered
+          // meanwhile (the launched process's own first heartbeat, say):
+          // nothing is written over that worker's entry, so a turn it holds
+          // ('processing') does not read as idle. It is observed the way the
+          // reuse of a live worker above observes one.
+          const launchedPid = Number.isInteger(Number(spawned?.pid)) ? Number(spawned.pid) : null;
+          const registeredWorker = launchedPid > 0 ? null : liveWorkerRegisteredSinceStart();
+          if (registeredWorker) {
+            const registeredLifecycle = getOrCreateLifecycle(sessionId);
+            if (!registeredLifecycle.awaitingHeartbeat && !registeredLifecycle.firstObservedHeartbeatAtMs) {
+              noteLaunch(sessionId, { mode: 'reused', pid: registeredWorker.pid || null, atMs: nowMs() });
+            }
+            clearRestartSchedule(sessionId, { resetDegradedState: false });
+            assessSessionHealth(sessionId, registeredWorker, { questionPending: false });
+            notifyLaunchState('launched', sessionId);
+            return { ok: true, reused: true, worker: registeredWorker, lifecycle: toLifecycleSnapshot(sessionId) };
+          }
           const readyState = setWorkerState(sessionId, {
             ...startingState,
             workerId: String(spawned?.workerId || startingState.workerId || `worker-${sessionId.slice(0, 8)}`).trim(),
-            pid: Number.isInteger(Number(spawned?.pid)) ? Number(spawned.pid) : null,
+            pid: launchedPid,
             status: 'ready',
             retryCount: 0,
             lastError: null,
@@ -736,6 +859,13 @@ export function createSessionWorkerSupervisor({
         notifyLaunchState('launched', sessionId);
         return { ok: true, reused: false, worker: simulatedReady, lifecycle: toLifecycleSnapshot(sessionId) };
       } catch (error) {
+        // A failed launch next to a live worker: logged, and nothing else.
+        // No 'error' over its entry, no restart, no count toward the limit.
+        const registeredWorker = liveWorkerRegisteredSinceStart();
+        if (registeredWorker) {
+          emitMonitorLog(`worker launch failed session=${sessionId.slice(0, 8)}, kept the worker that registered meanwhile (pid ${registeredWorker.pid || 'none'}): ${String(error?.message || error || 'unknown spawn failure').trim()}`);
+          return { ok: true, reused: true, worker: registeredWorker, lifecycle: toLifecycleSnapshot(sessionId) };
+        }
         const scheduled = scheduleRestart(sessionId, error, { incrementRetry: true });
         const failed = setWorkerState(sessionId, {
           ...startingState,

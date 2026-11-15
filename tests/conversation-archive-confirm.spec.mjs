@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Archiving a chat whose process is live asks first, on a desktop and a phone
@@ -15,44 +19,19 @@ import { relayToken } from "./e2e-env.mjs";
  *   confirmation the relay still refuses it until the turn is done.
  */
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function seed(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const messageId = String(body?.messageId || "").trim();
+// A conversation with one finished turn and no worker, made as the web client
+// makes one: bound to its session (its own id) from the start.
+async function seed(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "").trim();
   expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  // The turn, by a worker that ends.
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   return conversationId;
 }
 
 // Claims one queued message as the relay's runner would, so its turn runs.
-async function claim(request, headers, messageId, ownerSessionId = "") {
-  const claimHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const pending = await request.get("/api/pending", { headers: claimHeaders });
-    expect(pending.ok()).toBeTruthy();
-    const message = (await pending.json())?.message || null;
-    if (!message) {
-      await sleep(250);
-      continue;
-    }
-    if (String(message.id || "") === messageId) return;
-    await request.post("/api/requeue", { headers, data: { messageId: String(message.id || "") } }).catch(() => {});
-    await sleep(120);
-  }
-  throw new Error("Timed out claiming the seeded message");
-}
-
 async function archivedFlag(request, headers, conversationId) {
   const response = await request.get(`/api/conversations?archived=true`, { headers });
   expect(response.ok()).toBeTruthy();
@@ -88,13 +67,9 @@ for (const profile of [
       const token = relayToken();
       const headers = { Authorization: `Bearer ${token}` };
       const stamp = Date.now();
-      const sdkSessionId = `playwright-archive-confirm-${profile.name}-${stamp}`;
-      const green = await seed(request, headers, `archive-confirm-green-${profile.name}-${stamp}`);
-      const synced = await request.post("/api/session-sync", {
-        headers,
-        data: { sdk_session_id: sdkSessionId, conversation_id: green },
-      });
-      expect(synced.ok()).toBeTruthy();
+      const green = await seed(`archive-confirm-green-${profile.name}-${stamp}`);
+      // The session the /api/status answer gains a worker for: the conversation's own.
+      const sdkSessionId = green;
       await page.route("**/api/status", async (route) => {
         const response = await route.fetch();
         if (!response.ok()) return route.fulfill({ response });
@@ -167,17 +142,13 @@ for (const profile of [
       } finally {
         await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
         await request.delete(`/api/conversation/${green}`, { headers }).catch(() => {});
-        await request.post("/api/sdk-session-delete/result", {
-          headers,
-          data: { sdk_session_id: sdkSessionId, ok: true },
-        }).catch(() => {});
       }
     });
 
     test("an offline chat archives at once, with no dialog", async ({ page, request }) => {
       const token = relayToken();
       const headers = { Authorization: `Bearer ${token}` };
-      const offline = await seed(request, headers, `archive-confirm-offline-${profile.name}-${Date.now()}`);
+      const offline = await seed(`archive-confirm-offline-${profile.name}-${Date.now()}`);
 
       try {
         await openSidebar(page, token, profile.touch);
@@ -203,15 +174,10 @@ for (const profile of [
       let answered = false;
 
       try {
-        const queued = await request.post("/api/message", {
-          headers,
-          data: { text: `archive-confirm-running-${profile.name}-${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-        });
-        expect(queued.ok()).toBeTruthy();
-        const queuedBody = await queued.json();
-        conversationId = String(queuedBody?.conversationId || "");
-        messageId = String(queuedBody?.messageId || "");
-        await claim(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+        const started = await startConversation({ text: `archive-confirm-running-${profile.name}-${stamp}` });
+        conversationId = String(started.conversationId || "");
+        messageId = String(started.messageId || "");
+        await started.worker.take(messageId);
 
         await openSidebar(page, token, profile.touch);
         const row = page.locator(`#conv-list .conv-item[data-conversation-id="${conversationId}"]`);
@@ -235,18 +201,12 @@ for (const profile of [
         await expect(row).toBeVisible();
         expect(await archivedFlag(request, headers, conversationId)).toBe(false);
 
-        const responded = await request.post("/api/response", {
-          headers,
-          data: { messageId, conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" },
-        });
-        expect(responded.ok()).toBeTruthy();
+        const responded = await respondAsWorker(messageId, { conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" });
+        expect(responded.ok).toBeTruthy();
         answered = true;
       } finally {
         if (messageId && !answered) {
-          await request.post("/api/response", {
-            headers,
-            data: { messageId, conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" },
-          }).catch(() => {});
+          await respondAsWorker(messageId, { conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
         }
         if (conversationId) await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
       }

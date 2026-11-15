@@ -233,7 +233,6 @@ function registerRoutes(calls) {
     queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
     requestRelayShutdown: (args) => { calls.push(['shutdown', args]); return { accepted: true, status: 'queued' }; },
     cancelRelayShutdown: (args) => { calls.push(['cancel', args]); return { cancelled: true }; },
-    featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: false },
   }));
 }
 
@@ -269,10 +268,10 @@ test('image-operation execute is refused through a proxy or the tunnel, local ca
       const response = await relay.call(route, { method: 'POST', headers: { ...auth, ...headers }, body: {} });
       assert.equal(response.status, 403, JSON.stringify(headers));
     }
-    // Past the boundary: the feature flag answers.
+    // Past the boundary: the operation lookup answers (this relay has none).
     const local = await relay.call(route, { method: 'POST', headers: auth, body: {} });
     assert.equal(local.status, 404);
-    assert.match((await local.json()).error, /not enabled/);
+    assert.match((await local.json()).error, /Image operation not found/);
   } finally {
     await relay.close();
   }

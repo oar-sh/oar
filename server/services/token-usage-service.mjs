@@ -42,6 +42,19 @@ const PRICED_FIELDS = Object.freeze(['inputTokens', 'outputTokens', 'cacheWriteT
 // How far a worker's `at` may be off the relay's clock before the relay's
 // own time is taken instead.
 const AT_SKEW_MS = 24 * 60 * 60 * 1000;
+// How many relay-local days `readPeriods` hands the charts, today included.
+const CHART_DAYS = 90;
+
+/**
+ * The calendar day `count` days after `day` (before, when negative), both
+ * `YYYY-MM-DD`: date maths on the calendar date itself, so a DST change in
+ * between neither drops nor doubles a day.
+ */
+export function shiftDay(day, count) {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + count);
+  return date.toISOString().slice(0, 10);
+}
 
 function dayFormatter(timeZone) {
   try {
@@ -92,6 +105,19 @@ function addDayRow(totals, row) {
 /** The fields some rows of `totals` reported and others did not. */
 export function partlyReportedFields(totals) {
   return TURN_TOKEN_FIELDS.filter((field) => totals.reported[field] > 0 && totals.reported[field] < totals.rows);
+}
+
+// A day row for the charts: its counts as booked (NULL stays null).
+function chartDayOut(row) {
+  return {
+    day: row.day,
+    model: row.model,
+    ...Object.fromEntries(TURN_TOKEN_FIELDS.map((field) => [field, row[COLUMN[field]]])),
+    costUsd: row.cost_usd,
+    unknownCostTokens: Number(row.unknown_cost_tokens || 0),
+    turnCount: Number(row.turn_count || 0),
+    backfill: row.source === 'backfill',
+  };
 }
 
 function turnRowOut(row) {
@@ -327,13 +353,16 @@ export function createTokenUsageService({
    * counted, copied days included; `backfilled` says which periods hold days
    * copied at the upgrade (whose input includes cache writes),
    * `backfillThrough` the last such day and `firstTurnsDay` the first day a
-   * turn was booked.
+   * turn was booked. `days` holds the day rows of the last `chartDays`
+   * relay-local days (today included) for the charts, one per day, model and
+   * source, oldest first.
    */
-  function readPeriods({ provider, now: nowMs = now() } = {}) {
+  function readPeriods({ provider, now: nowMs = now(), chartDays = CHART_DAYS } = {}) {
     const s = ready();
     if (!s) return null;
     const today = localDay(nowMs);
     const month = today.slice(0, 7);
+    const chartStart = shiftDay(today, -(Math.max(1, Math.floor(chartDays) || CHART_DAYS) - 1));
     const groups = new Map();
     const rows = provider ? s.listDayRows.all(provider) : s.listAllDayRows.all();
     for (const row of rows) {
@@ -349,9 +378,11 @@ export function createTokenUsageService({
           backfilled: { today: false, month: false, allTime: false },
           backfillThrough: null,
           firstTurnsDay: null,
+          days: [],
         };
         groups.set(key, group);
       }
+      if (row.day >= chartStart && row.day <= today) group.days.push(chartDayOut(row));
       let model = group.models.get(row.model);
       if (!model) {
         model = { model: row.model, today: emptyTotals(), month: emptyTotals(), allTime: emptyTotals() };
@@ -377,6 +408,7 @@ export function createTokenUsageService({
         .map((group) => ({
           ...group,
           models: [...group.models.values()].sort((a, b) => a.model.localeCompare(b.model)),
+          days: group.days.sort((a, b) => a.day.localeCompare(b.day) || a.model.localeCompare(b.model) || Number(a.backfill) - Number(b.backfill)),
         })),
     };
   }

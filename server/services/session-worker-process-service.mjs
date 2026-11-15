@@ -1,6 +1,6 @@
 'use strict';
 
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { readFile } from 'fs/promises';
 
 import { collectProcessDescendants, isChildProcessOf } from '../../shared/worker-runtime/process-tree.mjs';
@@ -37,8 +37,6 @@ function scoreWindowsWorkerCandidate(proc) {
   const name = String(proc?.name || '').trim().toLowerCase();
   const cmd = String(proc?.commandLine || '').trim().toLowerCase();
   if (name === 'copilot.exe') return 400;
-  if (name === 'gh.exe' && cmd.includes('copilot')) return 300;
-  if (cmd.includes('gh copilot')) return 250;
   if (cmd.includes('copilot.cmd') || cmd.includes('copilot-win32')) return 225;
   if (name === 'cmd.exe' || name === 'powershell.exe' || name === 'conhost.exe') return 50;
   return 100;
@@ -149,8 +147,6 @@ function isWindowsSessionMatch(proc, target, targetPattern) {
 }
 
 // ─── Matchers over a snapshot that is already read ───────────────────────────
-// Shared by the synchronous finders (the legacy extension launcher) and the
-// asynchronous ones (everything else), so both see the same processes.
 
 /** The session's worker candidates on win32, best first (wrappers last). */
 export function selectWindowsProcessesForSession(snapshot, targetSessionId) {
@@ -272,8 +268,6 @@ function looksLikeCopilotWorkerProcess(proc) {
   if (name === 'tmux' || name.startsWith('tmux:')) return false;
   if (/^(?:server\s+)?tmux(?:\s|$)/.test(cmd)) return false;
   if (name === 'copilot.exe') return true;
-  if (name === 'gh.exe' && cmd.includes('gh') && cmd.includes('copilot')) return true;
-  if (cmd.includes('gh copilot')) return true;
   // Every node worker's entry script is named `<kind>-session-worker.mjs` and
   // is invoked as `node <script> --session-id <id>` — none of the CLI markers
   // below (no `--allow-all`, no `@github/copilot` path) appear on their command
@@ -340,6 +334,11 @@ function isMissingProcessError(error) {
  *   since boot; the command line from /proc/<pid>/cmdline.
  * - Windows: the process list's `createdAt` (ms since 1970), read through
  *   `readProcessSnapshot({ fresh })` (the inspector's shared, cached read).
+ *   A listed process with no command line is one the relay may not open
+ *   (Win32_Process gives a null CommandLine, e.g. for one an elevated relay
+ *   started): its command line is null, not known to be empty. Windows lists
+ *   no ended process, so there is no zombie to tell apart here; on Linux an
+ *   empty command line is one (judgeSessionWorkerProcess: 'other').
  * - macOS and the other POSIX systems: `ps -o lstart= -o args= -p <pid>`.
  */
 export function createProcessIdentityReader({
@@ -400,7 +399,11 @@ export function createProcessIdentityReader({
       .map(normalizeWindowsProcess)
       .find((proc) => proc.processId === pid);
     if (!found) return null;
-    return { pid, startTime: found.createdAt > 0 ? String(found.createdAt) : null, commandLine: found.commandLine };
+    return {
+      pid,
+      startTime: found.createdAt > 0 ? String(found.createdAt) : null,
+      commandLine: found.commandLine.trim() ? found.commandLine : null,
+    };
   }
 
   return async function identityOf(value, { fresh = false } = {}) {
@@ -470,6 +473,54 @@ export function mayReuseSessionWorkerRow({ row, current, sdkSessionId, isAlive =
 }
 
 /**
+ * What a launch does with the process a fresh process-list row names for a
+ * session (`row`, `current` and `isAlive` as for mayReuseSessionWorkerRow):
+ * - 'worker': reuse it. It may be reused by its identity, and its command
+ *   line is a session worker's (`node <kind>-session-worker.mjs`), of
+ *   whatever kind: a worker of another kind than the session now has (a
+ *   Claude chat whose billing was switched) is replaced by the billing fence
+ *   and the swap, when it may be, never by a launch.
+ * - 'leftover': stop it, then launch. The process at the pid is the
+ *   session's by what was read about it ('ours'), and it is no session
+ *   worker: a Copilot CLI an earlier version started for the session.
+ * - 'none': neither. No process, another one at the pid, or one that is no
+ *   such worker and about which nothing could be read: never stopped.
+ */
+export function judgeListedSessionProcess({ row, current, sdkSessionId, isAlive = () => false } = {}) {
+  if (!mayReuseSessionWorkerRow({ row, current, sdkSessionId, isAlive })) return 'none';
+  if (String(row?.commandLine || '').toLowerCase().includes('-session-worker')) return 'worker';
+  const createdAt = Number(row?.createdAt);
+  const before = createdAt > 0 ? { pid: Number(row.processId), startTime: String(createdAt) } : null;
+  return judgeSessionWorkerProcess(current, { sdkSessionId, before }) === 'ours' ? 'leftover' : 'none';
+}
+
+/**
+ * Stops a 'leftover' through `stop`, the caller's stop of every process of
+ * the session (stopSessionWorkerProcesses, as the kill route calls it), and
+ * logs one line per process it stopped, or one line when it could not.
+ * Never throws: the launch goes on either way.
+ */
+export async function stopLeftoverSessionProcess({ sdkSessionId, stop = null, log = () => {} } = {}) {
+  const session = String(sdkSessionId || '').trim().slice(0, 8);
+  const say = (line) => { try { log(`worker launcher: session=${session} ${line}`); } catch {} };
+  let stopped = null;
+  try {
+    stopped = typeof stop === 'function' ? await stop() : null;
+  } catch (error) {
+    stopped = { ok: false, pids: [], remainingPids: [], error: error?.message || String(error) };
+  }
+  if (!stopped) return null;
+  const remaining = new Set(stopped.remainingPids || []);
+  for (const pid of stopped.pids || []) {
+    if (!remaining.has(pid)) say(`stopped pid=${pid}, a process of this session that is no session worker (left by an earlier version)`);
+  }
+  if (stopped.ok !== true) {
+    say(`could not stop the processes of this session that are no session worker${remaining.size ? ` (pid=${[...remaining].join(',')})` : ''}: ${stopped.error || 'unknown error'}; the worker starts beside them`);
+  }
+  return stopped;
+}
+
+/**
  * What the process a fresh process-list row names is, for
  * mayReuseSessionWorkerRow (`current`). On Windows the row is the identity:
  * it comes from a read of the whole list that began after the caller, with
@@ -500,7 +551,6 @@ export async function identityOfListedWorker(row, { platform = process.platform,
 
 export function createSessionWorkerProcessInspector({
   platform = process.platform,
-  execFileSyncImpl = execFileSync,
   execFileImpl = execFile,
   // Where Windows keeps PowerShell (the bare name when it is not there).
   systemToolPath = windowsSystemToolPath,
@@ -512,67 +562,9 @@ export function createSessionWorkerProcessInspector({
   const cacheMs = Math.max(0, Number(snapshotCacheMs) || 0);
   const slowMs = Math.max(0, Number(slowReadMs) || 0);
 
-  // ─── Synchronous readers ──────────────────────────────────────────────────
-  // They hold the relay's thread for the whole PowerShell run (0.5-1.5 s idle,
-  // seconds under load) and stay only for the legacy extension launcher
-  // (relay-cli-launcher-service.mjs), which goes with the extension. Every
-  // other caller uses the asynchronous finders below.
-
-  function getPosixProcessSnapshot() {
-    if (platform === 'win32') return [];
-    const output = execFileSyncImpl('ps', ['-eo', 'pid=,ppid=,comm=,args=', '-ww'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return parsePosixProcessSnapshot(output);
-  }
-
-  function getWindowsProcessSnapshot() {
-    if (platform !== 'win32') return [];
-    const output = execFileSyncImpl(systemToolPath('powershell.exe'), ['-NoProfile', '-Command', WINDOWS_PROCESS_SNAPSHOT_SCRIPT], {
-      // stderr is kept (not shown): a failed read reports it.
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      maxBuffer: WINDOWS_PROCESS_SNAPSHOT_MAX_BUFFER,
-    });
-    return parseWindowsProcessSnapshot(output);
-  }
-
-  function findWindowsProcessesForSession(targetSessionId) {
-    if (platform !== 'win32' || !normalizeSessionId(targetSessionId)) return [];
-    return selectWindowsProcessesForSession(getWindowsProcessSnapshot(), targetSessionId);
-  }
-
-  function findWindowsProcessForSession(targetSessionId) {
-    return firstNonWrapper(findWindowsProcessesForSession(targetSessionId));
-  }
-
-  function findWindowsProcessTreeForSession(targetSessionId) {
-    if (platform !== 'win32' || !normalizeSessionId(targetSessionId)) return [];
-    return selectWindowsProcessTreeForSession(getWindowsProcessSnapshot(), targetSessionId);
-  }
-
-  function findPosixProcessesForSession(targetSessionId) {
-    if (platform === 'win32' || !normalizeSessionId(targetSessionId)) return [];
-    return selectPosixProcessesForSession(getPosixProcessSnapshot(), targetSessionId);
-  }
-
-  function findPosixProcessForSession(targetSessionId) {
-    return findPosixProcessesForSession(targetSessionId)[0] || null;
-  }
-
-  function findProcessesForSession(targetSessionId) {
-    return platform === 'win32'
-      ? findWindowsProcessesForSession(targetSessionId)
-      : findPosixProcessesForSession(targetSessionId);
-  }
-
-  function findProcessForSession(targetSessionId) {
-    return platform === 'win32'
-      ? findWindowsProcessForSession(targetSessionId)
-      : findPosixProcessForSession(targetSessionId);
-  }
-
-  // ─── Asynchronous readers ─────────────────────────────────────────────────
+  // ─── Readers ──────────────────────────────────────────────────────────────
+  // All off the thread: a synchronous PowerShell run holds the relay's only
+  // thread for 0.5-1.5 s idle and for seconds under load.
 
   /**
    * The win32 list without holding the caller's thread for it: a session
@@ -793,16 +785,7 @@ export function createSessionWorkerProcessInspector({
     ));
   }
 
-  function stopWindowsPids(pids) {
-    const ids = uniquePids(pids);
-    if (!ids.length) return [];
-    execFileSyncImpl(systemToolPath('powershell.exe'), ['-NoProfile', '-Command', buildStopWindowsPidsScript(ids)], {
-      stdio: ['ignore', 'ignore', 'ignore'],
-    });
-    return ids;
-  }
-
-  /** stopWindowsPids off the thread. Resolves to the pids asked for; rejects when PowerShell failed or timed out. */
+  /** Stops the processes (and what they started) off the thread. Resolves to the pids asked for; rejects when PowerShell failed or timed out. */
   function stopWindowsPidsAsync(pids) {
     const ids = uniquePids(pids);
     if (!ids.length) return Promise.resolve([]);
@@ -825,22 +808,12 @@ export function createSessionWorkerProcessInspector({
   return {
     normalizeSessionId,
     parseSessionIdFromCommandLine,
-    findProcessForSession,
-    findProcessesForSession,
-    findPosixProcessForSession,
-    findPosixProcessesForSession,
-    getPosixProcessSnapshot,
-    findWindowsProcessesForSession,
-    findWindowsProcessForSession,
-    findWindowsProcessTreeForSession,
-    getWindowsProcessSnapshot,
     readWindowsProcessSnapshot,
     readProcessSnapshot,
     getLastRead,
     findProcessForSessionAsync,
     findProcessesForSessionAsync,
     findWindowsProcessTreeForSessionAsync,
-    stopWindowsPids,
     stopWindowsPidsAsync,
   };
 }

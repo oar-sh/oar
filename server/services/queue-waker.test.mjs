@@ -88,6 +88,38 @@ function makeWaker(overrides = {}) {
   };
 }
 
+test('every prime first fails the rows of conversations that are gone, switched off or not, and a throw there costs nothing else', async () => {
+  const calls = [];
+  const prime = createPendingWorkerPrimer({
+    failGoneRows: () => { calls.push('sweep'); return 1; },
+    listPendingOwnerSessionIds: () => { calls.push('list'); return [{ sdk_session_id: 'sess-sweep-1' }]; },
+    ensureWorker: async () => { calls.push('launch'); return { ok: true }; },
+  });
+  assert.equal(await prime('test'), 1);
+  assert.deepEqual(calls, ['sweep', 'list', 'launch']);
+
+  // A relay that launches no worker (a test relay) still ends such rows.
+  const offCalls = [];
+  const off = createPendingWorkerPrimer({
+    isEnabled: () => false,
+    failGoneRows: () => { offCalls.push('sweep'); return 0; },
+    listPendingOwnerSessionIds: () => { offCalls.push('list'); return []; },
+    ensureWorker: async () => ({ ok: true }),
+  });
+  assert.equal(await off('test'), 0);
+  assert.deepEqual(offCalls, ['sweep']);
+
+  const warnings = [];
+  const throwing = createPendingWorkerPrimer({
+    failGoneRows: () => { throw new Error('database is locked'); },
+    listPendingOwnerSessionIds: () => [{ sdk_session_id: 'sess-sweep-2' }],
+    ensureWorker: async () => ({ ok: true }),
+    warn: (line) => warnings.push(line),
+  });
+  assert.equal(await throwing('test'), 1);
+  assert.deepEqual(warnings, ['QUEUE     gone-conversation sweep failed err=database is locked']);
+});
+
 test('a wake hands out, primes and arms the maintenance pass', async () => {
   const { waker, calls } = makeWaker();
   assert.equal(waker.wake('retry-due'), true);

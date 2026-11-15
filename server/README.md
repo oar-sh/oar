@@ -4,8 +4,8 @@ A Node.js web server that lets you chat with your local coding agents from any d
 
 Three runtimes can serve a conversation, selected when the conversation is created:
 
-- **GitHub Copilot CLI** (default) — executed by the `web-relay` CLI extension and its session workers.
-- **OpenAI (BYOK)** — the Copilot CLI running in BYOK mode against an OpenAI-compatible endpoint, plus a direct Images API path for image conversations.
+- **GitHub Copilot** (default) — the Copilot SDK worker in `server/copilot-worker/` (worker kind `copilot-sdk`, one Node process per conversation), on the SDK that comes with the installed GitHub Copilot CLI (see [SDK auto-detection behavior](#sdk-auto-detection-behavior)).
+- **OpenAI (BYOK)** — the same Copilot SDK worker in BYOK mode against an OpenAI-compatible endpoint, plus a direct Images API path for image conversations.
 - **Claude (Agent SDK)** — a dedicated Node worker in `server/claude-worker/` that speaks the same relay contracts.
 
 See [Claude Agent SDK provider](#claude-agent-sdk-provider) for the third runtime.
@@ -20,34 +20,21 @@ This project now runs in package-wide ESM mode (`"type": "module"` in `package.j
 
 ## Starting the Server
 
-If you run `gh copilot` and the web-relay extension is loaded (project-local or user-global),
-the extension auto-starts `server.js` when needed and keeps the relay listener singleton
-while letting session-affine CLI workers run in parallel.
+The relay is started with `oar start`, the service (`oar service install`; on Windows the
+autostart, `oar autostart`), or `npm start` (`node server/server.js`) in a checkout. Every
+provider, Copilot included, runs in a session worker the relay starts for each conversation:
+Copilot, OpenAI BYOK and OpenAI image sessions on the Copilot SDK worker in
+`server/copilot-worker/` (see [Session Worker Management](#session-worker-management)).
 
 On Linux/macOS, session-affine worker launches prefer detached `tmux` sessions when `tmux`
 is available, using the worker SDK session id as the tmux session name so you can attach
-for debugging without changing the Windows launch path. Worker processes now launch from the
-relay repository root so the project-local `web-relay` extension is always discoverable; the
-session's actual target workspace is still passed via `COPILOT_WORKSPACE_ROOT` / `INIT_CWD`.
+for debugging without changing the Windows launch path. A worker starts in its session's
+working directory, which it also gets as `COPILOT_WORKSPACE_ROOT` / `INIT_CWD`.
 
-The web client now includes a read-only **Inspect tmux console** action in the conversation
-three-dot menu. It streams only from active relay session workers and only while the viewer
-is actively watching that session.
-
-> **Single-owner rule:** Use either extension-managed relay transport **or** standalone `relay.mjs`, never both at the same time.
+> **Single-owner rule:** Run one relay per checkout or install.
 > Agent/runtime restart policy is defined in `.github/copilot-instructions.md`.
 
-Launch Copilot CLI from the repository root with extensions enabled and no initial user prompt:
-
-```bash
-npm run copilot:relay
-```
-
-That runs `gh copilot -- --allow-all` from the repo root, so the
-extension is discovered and the relay starts immediately. If you installed the extension
-globally, plain `gh copilot` from any repository is enough.
-
-Or manually:
+In a checkout:
 
 ```bash
 node server/server.js
@@ -55,24 +42,14 @@ node server/server.js
 
 This starts the web server and stays attached to the terminal, respawning its
 worker child across restarts. Ctrl+C (or closing the terminal) stops both.
-A Copilot CLI session with the extension attaches separately.
 
-If you install this repo locally with `npm link` or `npm install -g .`, the `copilot-remote`
-command starts the web relay server if needed and then launches `gh copilot` in the same shell
-from whatever folder you run it in. If a relay is already live, it reuses it instead of starting
-a second owner.
-
-`copilot-remote` also prepares a user-global `web-relay` extension wrapper by default. You can run
-`copilot-remote --install-extension` to install/update only the wrapper and exit.
-
-Relay server output is redirected to a logfile under `%LOCALAPPDATA%\copilot-remote\logs` by
-default (or `COPILOT_WEB_RELAY_LOG_DIR` if set), so the terminal stays reserved for the CLI.
-
-The global launcher no longer injects a bootstrap prompt; it just starts `gh copilot` directly
-after the relay is ready.
+`oar start` runs the relay in the background and writes its output to `server.log` and
+`server-err.log` in its log folder: `COPILOT_WEB_RELAY_LOG_DIR` if set, else `logs` in the OAR
+state root of a global install; in a checkout `logs` under `%LOCALAPPDATA%\copilot-remote` on
+Windows, `${XDG_CONFIG_HOME:-~/.config}/copilot-remote` elsewhere.
 
 If you need a specific `server/config.json` for token or tunnel settings, set
-`COPILOT_WEB_RELAY_CONFIG` to that file before launching. The global npm install does not include
+`COPILOT_WEB_RELAY_CONFIG` to that file before starting. The global npm install does not include
 the repo-local gitignored config file by default.
 
 Mode summary — one entry point, role chosen by argv:
@@ -84,63 +61,40 @@ Mode summary — one entry point, role chosen by argv:
   systemd instead, which restarts the whole service from the code on disk; it relaunches the
   worker itself when that cannot be done within 30 s.
 - `node server/server.js --supervised`: runs the server in this process and exits 75 instead of
-  restarting itself, leaving that to whoever spawned it. This is what the CLI extension passes.
-- `node server/relay.mjs`: the standalone Copilot relay, started by hand after the server is up.
-  Manual escape hatch only — never alongside extension-managed transport.
+  restarting itself, leaving that to whoever spawned it. Nothing in OAR starts it that way now.
 
-Role flags are argv, not env, on purpose: the server's environment is inherited by tmux worker
-sessions and by the Copilot CLI it launches, and the extension spawns the next server from that
-same environment — so an env flag would decide the role of unrelated servers down the tree.
-
-On Windows, the visible relay launcher path now targets a stable per-workspace Windows Terminal window name so later foreground launches reuse the same window instead of opening new desktop windows. Keep the hidden/stdio path as a fallback only.
+Role flags are argv, not env, on purpose: the server's environment is inherited by the session
+workers it launches (under tmux too) and by the agent CLIs they start — so an env flag would
+decide the role of unrelated servers down the tree.
 
 ### Runtime safety checklist (avoid duplicate relay workers)
 
 1. Stop stale detached watchdog/relay processes before restart.
 2. Keep exactly one listener on port `3333`.
 3. The relay singleton lock is stored at `server/data/relay-server.lock` (stale locks are auto-recovered).
-4. In extension-managed mode, do not start a second server or run `node relay.mjs`.
+4. Do not start a second server.
 5. Verify `/api/status` shows `cliOnline: true` and queue counts are moving or zero.
 6. Follow relay restart policy from `.github/copilot-instructions.md`.
-7. In extension-managed mode, use `POST /api/relay/shutdown` for manual restart requests.
+7. Use `POST /api/relay/shutdown` for manual restart requests.
    - It is queued until the relay is idle, so it will not stop an in-flight turn immediately.
    - Send `{ "restart": true }` when you want a self-restart instead of a plain shutdown.
 8. Do not run tests that spawn Copilot CLI clients unless the user explicitly permits it.
 
 Script necessity note:
 
-- Extension-managed relay does not call npm scripts directly; it starts `server.js --supervised` itself.
-- Extension-managed relay supervision includes bounded auto-restart while the CLI session is active,
-  and is now the only supervisor in that mode.
 - `npm start` is a plain alias for `node server/server.js`; there is no other start script.
 - Manual restart policy is defined in `.github/copilot-instructions.md`.
 
-## Global extension install (user-scoped)
-
-Copilot also scans a user extensions directory, so you can make this extension available
-across repositories:
-
-```text
-C:\Users\<you>\.copilot\extensions\web-relay\extension.mjs
-```
-
-With global install, starting `gh copilot` in any workspace will load this extension and keep
-the relay tied to that workspace CWD instead of forcing a fixed repo launcher.
-
-If you also keep a project-local copy, extension management can show two `web-relay` entries.
-Keep only one active to prevent duplicate loading.
-
-For global install, use `copilot-remote --install-extension` (recommended) or manually place a
-wrapper `extension.mjs` there that imports your repository extension entrypoint. Then set one of
-these environment variables so it can find your relay server files:
-
-- `COPILOT_WEB_RELAY_SERVER_DIR` (recommended) → absolute path to the `server` folder
-- `COPILOT_WEB_RELAY_ROOT` → repo root that contains `server\`
-- Optional overrides: `COPILOT_WEB_RELAY_CONFIG`, `COPILOT_WEB_RELAY_TOOLS`, `COPILOT_WEB_RELAY_LOG_DIR`
-
-Project-local extensions still take precedence if the same extension name exists in both locations.
-
 The startup banner shows your access URLs and token.
+
+### The Copilot CLI extension wrapper of earlier versions
+
+Earlier versions wrote a user-global wrapper, `~/.copilot/extensions/web-relay/extension.mjs`
+(under `USERPROFILE` on Windows; `COPILOT_CONFIG_HOME` overrides `~/.copilot`), so that the
+Copilot CLI started a relay when it loaded it. Nothing writes it any more. When it is the
+generated one and the extension it loads is gone, the relay removes it once at start (log line
+"removed the Copilot CLI extension wrapper of an earlier version: <path>"), and `oar update`
+removes it too. `oar uninstall` still removes it.
 
 ## Accessing the UI
 
@@ -164,9 +118,8 @@ Each CLI session now tracks its own workspace root:
 - the workspace browser follows the selected session's effective CWD instead of one relay-global root
 
 Startup CWD learning prefers explicit session/launcher hints such as `COPILOT_WORKSPACE_ROOT`,
-then other runtime cwd hints (`INIT_CWD`, `PWD`, session metadata). The extension startup sync
-deliberately skips `process.cwd()` so the relay host directory never silently masquerades as a
-project root. Sessions without an explicit configured CWD launch in the relay's working directory.
+then other runtime cwd hints (`INIT_CWD`, `PWD`, session metadata). Sessions without an explicit
+configured CWD launch in the relay's working directory.
 
 A plain `cd <path>` chat command persists to that conversation's configured CWD only — it does not
 affect other sessions or the global relay root.
@@ -240,7 +193,8 @@ If you host the relay behind a subpath, set `remotePath` in `server/config.json`
 ## Model Selection
 
 The composer's **⚙** settings (the label row above the message box) include a model picker.
-Models are now populated dynamically from the active Copilot CLI runtime using
+Models are now populated dynamically from the installed Copilot CLI runtime
+(`services/copilot-model-discovery-service.mjs`, through the Copilot SDK) using
 raw model IDs (no relay-specific aliases). The selected model ID is sent as-is
 for each message.
 
@@ -250,8 +204,6 @@ Behavior notes:
 - Selection is persisted in browser storage and reused if still available.
 - If live discovery is temporarily unavailable, the relay can use cached/current
   model state and shows a warning banner.
-- In extension-managed mode, the relay still switches model per message and
-  reports the active model used in the response.
 
 ### A message without a model, an effort or a mode
 
@@ -300,11 +252,11 @@ Open **Settings → Providers → OpenAI** to save an OpenAI API key, the defaul
 if none) and an optional **Base URL** (`https://api.openai.com/v1` when empty; any
 OpenAI-compatible endpoint, or the capture proxy `server/tools/capture-proxy.mjs`). **Enable OpenAI
 API key for New Chat model selection** makes OpenAI selectable in New Chat without re-entering the
-key. An OpenAI conversation runs on the Copilot engine the relay has selected, extension or SDK:
+key. An OpenAI conversation runs on the Copilot SDK worker:
 the worker is started with `COPILOT_PROVIDER_TYPE=openai`, `COPILOT_PROVIDER_BASE_URL` (the saved
 base URL), `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_WIRE_API` and `COPILOT_MODEL`
-(`applyOpenAIProviderEnvironment`); the CLI reads them on the extension engine, the SDK worker
-turns them into the session's provider (`copilot-worker/copilot-byok-provider.mjs`). Started
+(`applyOpenAIProviderEnvironment`) and turns them into the session's provider
+(`copilot-worker/copilot-byok-provider.mjs`). Started
 conversations keep their provider and lock the composer to their model.
 
 GPT-5, `codex-*` and the o1/o3/o4 models use the Responses API; other OpenAI models use Chat
@@ -354,7 +306,7 @@ not hide another's success — the cached list is kept and a warning is surfaced
 ## Claude Agent SDK provider
 
 Claude conversations are executed by `server/claude-worker/claude-session-worker.mjs`, a plain Node
-process spawned per conversation. It is not part of the Copilot CLI extension: it connects to the
+process spawned per conversation. Like the Copilot SDK worker, it connects to the
 same worker WebSocket, sends the same heartbeats, and posts to the same activity/stream/thought/
 response endpoints, but runs turns through `@anthropic-ai/claude-agent-sdk` instead of the Copilot SDK.
 
@@ -616,15 +568,15 @@ coarse system/tools + messages + buffer split is synthesized into the same shape
 
 `applyClaudeProviderEnvironment` sets these on the worker launch environment:
 
-- `COPILOT_WEB_RELAY_WORKER_KIND=claude` — selects the Claude worker instead of the Copilot CLI
+- `COPILOT_WEB_RELAY_WORKER_KIND=claude` — selects the Claude worker instead of the Copilot SDK worker
 - `CLAUDE_RELAY_MODEL` — the conversation's model, used when a turn carries none
 
 Also honored by the worker: `COPILOT_WORKSPACE_ROOT` (cwd), `COPILOT_WEB_RELAY_CONFIG` (relay config
 path), `CLAUDE_CODE_EXECUTABLE` (explicit Claude Code binary), and
 `COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH` (override for the worker script location).
 
-On Linux/macOS the Claude worker still launches inside a `tmux` session named after the SDK session
-id, but without the `script`-based pseudo-TTY the Copilot workers need — it is a plain Node process.
+On Linux/macOS the Claude worker launches inside a `tmux` session named after the SDK session
+id, as a plain Node process like every worker.
 On Windows it opens a `Claude Worker <id>` terminal window.
 
 ### Provider-aware usage snapshots
@@ -1109,7 +1061,7 @@ carries its own expiry.
 1. **Inactivity (`processingTimeoutMs`, default 10 min).** Measured from `owner_last_claimed_at`,
    which every worker heartbeat refreshes for the message it is working on — *not* from when the turn
    began. A turn that legitimately runs for hours of tool calls keeps pushing the cutoff forward.
-   `processing_at` is only the fallback for rows with no owner (session-worker routing disabled).
+   `processing_at` is only the fallback for rows with no owner.
    While the CLI is offline the window shrinks to 45 s.
 2. **Absolute ceiling (Settings → Max turn duration, default 60 min).** Measured from the later of
    `processing_at` and the turn's last answered question (`relay_questions.answered_at`): answering
@@ -1144,8 +1096,9 @@ ends the turn.
   collapsible **🤖 <name>** sections containing that run's thoughts and activity.
 - Reloading mid-turn repaints both the reply preview and every subagent bubble from persisted stream
   rows (`deriveInFlightStreamTextByThread`).
-- The Copilot extension propagates the SDK `agentId` onto question/tool activity, so subagent-issued
-  `ask_user` calls and tool results land in the right bubble. Re-discovering a known run no longer
+- The Copilot SDK worker files subagent events by the SDK `agentId` on the event
+  (`copilot-worker/copilot-sdk-event-normalizer.mjs`), so subagent-issued `ask_user` calls and
+  tool results land in the right bubble. Re-discovering a known run no longer
   demotes it to a root or renames it.
 
 ## Conversation list active-turn flag
@@ -1220,13 +1173,34 @@ with `match` after the first one that matches (a heartbeat never ends it). An ev
 `{ v, relay: { id, name }, session: { id, title }, type, at, detail }`; `relay.id` is `self` for this
 relay's sessions, the paired relay's registry id for its sessions (then `replayed: true` marks one it
 kept while the link was down). `link_lost` and `link_restored` are not subscribed to: they frame such
-a replay.
+a replay. `late_reply` and `reply_undelivered` are not subscribed to either, and never taken from a
+paired relay (`RELAY_EVENT_DELIVERY_TYPES`): see the late replies below.
+
+**Late replies** (`services/relay-late-reply-service.mjs`, migration 0042): a prompt a conversation
+sent with `send` or `create_session` stays open in `relay_event_own_prompts` (`late_state` NULL)
+until a wait hands the agent a final outcome (`done`, `failed`, `stopped`, `cancelled`, the tool call
+not abandoned: `returned`). The sweeper looks for an open prompt's reply with the dispatcher's
+`readOwnReplies` (the reads a wait uses, one read per session for all its open prompts, through no
+gate) every 15 s for due rows, at once when the session's turn ends (`noteTurnEnd`/`noteError`, or an
+imported paired `turn_end`/`error`), by the age cadence in `RELAY_EVENT_LATE_REPLY_CADENCE` otherwise;
+at most 50 rows a pass, 10 reads per paired relay, 4 at once (2 to one paired relay). A final outcome
+becomes a `late_reply` event (`reply:<message id>`, urgent) in the sender's conversation, its
+compactions followed; an ack (`isLateReplyAck`), a cancelled turn and a gone target are not urgent and
+ride along with the watcher's next released event (dropped after 24 h). The ledger row closes in the
+same transaction (`delivered`, `ack`, `target_gone`), so it is delivered once. A sender that is gone
+closes it `undeliverable`, and a target on this relay gets one `reply_undelivered` event
+(`undelivered:<message id>`); 7 days without a final outcome, or a removed pairing, close it
+`gave_up`. An open or delivered prompt's `turn_end` is not recorded for its sender (the late reply
+carries the whole reply, up to 8,000 characters, never cut by the 40-line cap); rows from before the
+upgrade are `before_upgrade` and keep their `turn_end`. For end-to-end tests only,
+`OAR_LATE_REPLY_TEST_PASS_MS` (100 to 60000) runs a pass that often and makes every open row due at
+each pass instead of by the cadence (`tests/late-replies.spec.mjs` sets 1000); unset, nothing changes.
 
 **Delivery** (`services/relay-event-service.mjs`): an event message is a `messages` row (role
 `user`, `kind = 'relay-event'`) plus a pending queue row, as the usage-limit follow-up is. The worker
 decides what it becomes, as for any message: a new turn when the watcher is idle; a steer into the
-running turn for Claude and the Copilot SDK engine; the next turn for Cursor, Grok, Claude Cloud and
-the Copilot extension engine. Events that arrive while the watcher's event row is still pending
+running turn for Claude and the Copilot SDK worker; the next turn for Cursor, Grok and Claude
+Cloud. Events that arrive while the watcher's event row is still pending
 (not delivered yet, or handed back as a held steer) are written into that row
 (`message_updated`), so a busy watcher gets one follow-up, never one turn per batch. The dequeue
 payload carries `messageKind: 'relay-event'`, and the Claude and Copilot workers then push the text
@@ -1278,8 +1252,8 @@ free text, and agents do not know their conversation id), while the tool knows t
   that records one `relay_restarted` event for every active subscription of this relay's live
   watchers that names it (not a paired relay's, not a mirror), so each start is told once; a
   `once` subscription ends with it. Without a row the line says the relay did not record how it
-  stopped (for example a crash, a forced stop or a reboot). On Windows a stop by the supervisor or
-  the CLI extension ends the process without its signal handler, so an ordinary stop there may read
+  stopped (for example a crash, a forced stop or a reboot). On Windows a stop by the supervisor
+  ends the process without its signal handler, so an ordinary stop there may read
   like that too. A row older than 30 days (`RELAY_LAST_EXIT_MAX_AGE_MS`) is not taken as the run
   just before (an older OAR, which neither writes nor takes it, may have run in between): it is
   dropped, its `noWake` with it. A younger one is used; the line shows its stop time, so a relay
@@ -1446,9 +1420,15 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
   nothing]`. Such a message is not the user's for the agent-prompt loop guard.
 - **Loop guard and hops.** A firing into another session is a prompt of the conversation that set
   it: the dispatcher's `admitScheduledFiring` counts it on that conversation's loop guard, and once
-  the guard wants the user (`agentPromptsBeforeAsking`) the firing is held (`held_since`,
-  `heldForApproval`), looked at again every minute, and goes after the user wrote there. The guard
-  lives in memory, so a relay restart starts it again, as for `send`. The schedule stores the
+  the guard wants the user (the `agentPromptsBeforeAsking` setting; never with 0 or while the
+  conversation is on the off-list) the firing is held (`held_since`, `heldForApproval`), looked at
+  again every minute, and goes after the user wrote there. Its first hold puts one ask into the
+  conversation that set it (`relayAsks.createLoopGuardCard`: `created_by` NULL, `creator_json`
+  `{ system: 'loop_guard', scheduleId }`, urgency `now`, pushed past an active device), one per
+  conversation; **Allow once** starts the count again, **Allow for this session** puts the
+  conversation on the off-list (`onSystemAnswer` → `loopGuardCardAnswered`), **Leave held**, Dismiss
+  or typed text change nothing. The next firing of that conversation that goes withdraws it. The
+  count lives in memory, so a relay restart starts it again, as for `send`. The schedule stores the
   provenance of the turn that set it (`origin_json`: for another session the origin a `send` would
   carry, for its own conversation the origin of the prompt that turn acted on, none for the user's
   own words) and puts it on each message, so the fired turn has the same hops as the one that set it.
@@ -1520,7 +1500,8 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
 ## Image conversations (OpenAI BYOK)
 
 Choosing **OpenAI Image (BYOK)** in New Chat creates a conversation whose replies are generated
-images, calling the OpenAI Images API directly rather than going through a CLI worker.
+images. Its turns run on the Copilot SDK worker, which hands each one to the direct OpenAI Images
+API path (`shared/worker-runtime/direct-openai-image.mjs`) instead of a model session.
 
 - The New Chat dialog swaps **Reasoning effort** for **Quality**, and adds a **Size** picker whose
   options depend on the model (`dall-e-2`: 256/512/1024 squares; `dall-e-3`: 1024 plus the two
@@ -1532,7 +1513,7 @@ images, calling the OpenAI Images API directly rather than going through a CLI w
   *Editing …* chip); the next message is queued as an edit of that image instead of a fresh
   generation. Image operations are recorded so a follow-up can continue from the right source image.
 - Deleting a conversation garbage-collects its generated images.
-- Continuity is gated by the `IMAGE_CONVERSATION_CONTINUITY_ENABLED` feature flag (on by default).
+- Continuity is always on.
 
 ## Conversation sharing and per-message visibility
 
@@ -1608,9 +1589,10 @@ title "Queued behind the running turn: plan mode and the writing modes do not st
 
 **The plan card** ("Plan ready for review", a `plan_ready` board) offers, for every provider and in
 this order: "Approve plan" (`approve_only`), "Implement in autopilot" (`autopilot`), "Stop here and
-prompt myself" (`interactive`) and "Stop here" (`exit_only`). The Copilot CLI (extension mode) may
-bring its own list (for example "Implement with autopilot fleet", `autopilot_fleet`); "Approve plan"
-is added first to it. Cards pending from before the upgrade get "Approve plan" too. What each queues:
+prompt myself" (`interactive`) and "Stop here" (`exit_only`). A card pending from an earlier
+version may carry its own list (for example "Implement with autopilot fleet", `autopilot_fleet`);
+"Approve plan" is added first to it, as to every card pending from before the upgrade. What each
+queues:
 
 - `approve_only` marks the plan approved and queues "Plan approved by the user. Do not implement.
   Finish only the plan-only steps you were given, then stop." That one turn runs in agent mode
@@ -1693,34 +1675,16 @@ the same from a terminal, and rollback is `oar update --to <previous>`.
 
 ## Feature flags
 
-Feature flags are declared in one registry (`server/features.mjs`) and managed
-from the web UI's Settings → Features tab, which renders each flag with its
-user-facing description. Current flags and defaults:
-
-- `SESSION_WORKER_ROUTING_ENABLED` — ON by default; per-conversation worker
-  processes with ownership and crash recovery (off = legacy shared polling).
-- `SESSION_WORKER_CONTINUATION_ROUTING_ENABLED` — ON by default; strict
-  ownership validation when routing clarification answers back to the asking
-  worker.
-- `SESSION_WORKER_FALLBACK_RESTART_ENABLED` — OFF by default; reserved rollout
-  gate, no effect yet.
-- `IMAGE_CONVERSATION_CONTINUITY_ENABLED` — ON by default; keeps
-  generated-image context across turns so *Edit this image* can continue from
-  the right source image.
-
-Resolution happens once at relay startup, with this precedence:
-
-1. Registry defaults
-2. Stored settings (`app_settings` rows, written by the Features tab via
-   `GET/POST /api/settings/features`)
-3. Environment override: `COPILOT_REMOTE_{FLAG_NAME}` (`true/false`, `1/0`,
-   `yes/no`, `on/off`)
-
-Changes saved in the Features tab take effect after a relay restart; the tab
-shows a restart notice and offers the queue-idle-deferred restart. A legacy
-`features` key in `config.json` is migrated into `app_settings` once at boot
-and stripped from the file. Unknown flag names and invalid values are ignored
-safely.
+There are none. Session worker routing (a worker process per conversation, with
+ownership and crash recovery), strict ownership checks on clarification answers
+and generated-image continuity are always on. Switches of older versions are
+ignored: the `feature_*` rows in `app_settings`, the variables
+`COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED`,
+`COPILOT_REMOTE_SESSION_WORKER_CONTINUATION_ROUTING_ENABLED`,
+`COPILOT_REMOTE_SESSION_WORKER_FALLBACK_RESTART_ENABLED` and
+`COPILOT_REMOTE_IMAGE_CONVERSATION_CONTINUITY_ENABLED`, and a `features` key in
+`config.json`. When one of them says off, the relay logs one line at start
+naming it; the stored values stay in the database.
 
 Question bridge rule:
 
@@ -1738,25 +1702,29 @@ Question bridge rule:
 ## Session Worker Management
 
 Each conversation has its own worker process, keyed by the conversation's SDK session id: one
-worker per session, and a session's turns never move to another worker. A Copilot conversation on
-the *Extension* engine runs the `copilot` CLI with the web-relay extension; every other one
-(Claude, Claude Cloud, Cursor, Grok, and Copilot on the *SDK* engine; OpenAI conversations run on
-whichever Copilot engine is selected) runs a plain Node worker (`NODE_WORKER_DESCRIPTORS` in
-`services/session-worker-launch-service.mjs`). The supervisor
+worker per session, and a session's turns never move to another worker. Every conversation runs a
+plain Node worker (`NODE_WORKER_DESCRIPTORS` in `services/session-worker-launch-service.mjs`);
+Copilot, OpenAI BYOK and OpenAI image conversations run on the Copilot SDK worker (worker kind
+`copilot-sdk`). An unknown worker kind is not launched. There is no engine choice for Copilot: a
+stored `copilot_engine=extension` from an earlier version is ignored, and the relay says so once at
+start ("the Copilot Extension engine is gone, Copilot runs on the SDK worker; ignoring
+copilot_engine=extension (app setting)"). The supervisor
 (`services/session-worker-supervisor-service.mjs`) keeps the lifecycle, health and restart limits,
 the launch service spawns, `services/session-worker-stop-service.mjs` stops, and the dead-worker
-recovery lives in `server-runtime.mjs`. Most of it acts only while the
-`SESSION_WORKER_ROUTING_ENABLED` feature flag is on.
+recovery lives in `server-runtime.mjs`.
 
 ### Lifecycle and health
 
 - Registry status: `starting` → `ready` ⇄ `processing`, and `error`. A send, the primer for queued
   messages and `POST /api/session-worker/:sdkSessionId/launch` call `ensureWorker`, which reuses a
-  live process of the session (found in the process list, or the tmux pane) and launches one
-  otherwise.
+  live worker process of the session (found in the process list, or the tmux pane) and launches one
+  otherwise. A process of the session that is not its worker, such as a Copilot CLI an earlier
+  version left running, is stopped first (`worker launcher: session=<id> stopped pid=<pid>, a
+  process of this session that is no copilot-sdk-session-worker.mjs (left by an earlier version or
+  another provider)`).
 - Heartbeats: every worker posts `POST /api/heartbeat` every 10 s, and any frame on its worker
   socket counts as one too. The supervisor uses them only at the start: a launched worker that has
-  sent none within 90 s (`heartbeatTimeoutMs`; a Copilot CLI takes about 35 s to boot) is degraded
+  sent none within 90 s (`heartbeatTimeoutMs`) is degraded
   as `startup-heartbeat-timeout`. After its first heartbeat a worker is judged by its pid, not by
   missed beats.
 - Health (`uiState`, in `/api/status` with the worker list): `green` healthy, `red` a question card
@@ -1790,6 +1758,12 @@ for up to 10 minutes after the first exhaustion, and after that only when a laun
 cannot be started the conversation shows a note (`services/worker-launch-note-service.mjs`). A
 successful launch resets the count.
 
+A Copilot SDK worker is launched with the SDK of the installed GitHub Copilot CLI, looked up on
+every launch (see [SDK auto-detection behavior](#sdk-auto-detection-behavior)). Without one there
+is no Copilot on the relay: starting a Copilot, OpenAI BYOK or OpenAI image session fails like any
+launch above, and the launch note gives as its cause "Copilot SDK not found. Install the GitHub
+Copilot CLI and run it once (copilot --version); no relay restart is needed. Looked in: …".
+
 ### Stopping a worker
 
 `stopSessionWorkerProcesses` serves **☠️ Kill session** (`POST /api/session-worker/:sdkSessionId/kill`),
@@ -1805,12 +1779,11 @@ start it again at once; the launch route clears that block.
 ### Launch modes and environment
 
 - **Linux/macOS with `tmux`:** a detached tmux session named after the SDK session id
-  (`tmux attach -t <sdk-session-id>`), running `sh -lc`: the extension engine's CLI under `script`
-  for a pseudo-TTY, a Node worker with its output appended to its worker log.
-- **Linux/macOS without tmux:** a detached child process, a Node worker's output into its log.
+  (`tmux attach -t <sdk-session-id>`), running `sh -lc`: the Node worker with its output appended
+  to its worker log.
+- **Linux/macOS without tmux:** a detached child process, the worker's output into its log.
 - **Windows:** `cmd /c start` opens one console window per worker, titled `<Kind> Worker <first 8
-  characters of the session id>`; the extension engine runs `gh copilot -- --allow-all
-  --session-id <id>`.
+  characters of the session id>`.
 
 The launch environment is the relay's own, taken once at boot (`buildSessionWorkerLaunchEnv`), plus
 per launch the conversation's working directory as `COPILOT_WORKSPACE_ROOT` and `INIT_CWD`,
@@ -1826,27 +1799,27 @@ worker is started with them. Any other variable, such as
 `OAR_TURN_STALL_*_MS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `XAI_API_KEY`, only from the tmux
 server's environment or the login profile (see [Session workers under
 tmux](../docs/configuration.md#environment-variables)). `COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN` makes
-every launch fail (`cli-spawn-disabled`), for test relays.
+the relay launch no worker, for test relays: a launch is deferred (`cli-spawn-disabled`), not
+failed, and the turn stays queued for a worker that reports by itself.
 
 ## How It Works
 
 ```
-[Browser] ←── WebSocket ──→ [server.js :3333] ←── WebSocket-first relay ──→ [Copilot CLI session]
+[Browser] ←── WebSocket ──→ [server.js :3333] ←── worker WebSocket ──→ [session worker, one per conversation]
 ```
 
 1. Browser sends a message → stored in server queue
-2. The relay worker socket delivers queued turns to the bound CLI session immediately
-3. The CLI processes the turn and posts the response to `POST /api/response`  
+2. The relay worker socket delivers queued turns to the conversation's session worker immediately
+3. The worker runs the turn and posts the response to `POST /api/response`  
 4. Server broadcasts response via Socket.io → appears in browser instantly
 
 ## Monitoring Mode (CLI)
 
-After launching the server, the CLI opens a worker WebSocket link:
+A session worker the relay launched opens a worker WebSocket link:
 - Identifies itself with the bound SDK session id and worker pid
 - Receives queued turns over `ws(s)://.../api/session-worker/ws`
 - Reconnects starting at 1 second, with exponential backoff capped at 8 seconds
   (see [Worker link reconnects](#worker-link-reconnects))
-- Falls back to `GET /api/pending` only while the worker socket is unavailable
 - Processes any message with full PC access (file system, commands, etc.)
 - Posts the response back
 - CLI appears **online** (green dot) in the web UI while the relay is connected
@@ -1862,8 +1835,8 @@ After launching the server, the CLI opens a worker WebSocket link:
 
 ### Worker link reconnects
 
-Every session worker (Copilot SDK, Claude, Claude Cloud, Cursor, Grok) and the Copilot CLI extension
-use the same link, `shared/worker-runtime/worker-websocket-link.mjs`. Its reconnect rules:
+Every session worker (Copilot SDK, Claude, Claude Cloud, Cursor, Grok) uses the same link,
+`shared/worker-runtime/worker-websocket-link.mjs`. Its reconnect rules:
 
 - A connection counts as made at the relay's first `server.hello`, which the relay sends as soon as it
   accepts the socket. A socket still connecting, or open without that hello, after 15 seconds
@@ -1887,27 +1860,15 @@ The relay's detached-worker watch (`services/detached-worker-watch-service.mjs`)
 behind this: it replaces a worker that has had no socket for 60 seconds while a message waits, but
 never while a turn or background work of that session runs, so the link has to reconnect by itself.
 
-### Session activation behavior (important)
-
-In extension-managed mode, the web server can already be running while the CLI is still
-shown as offline. The worker socket starts when the Copilot session becomes active
-(`onSessionStart`), which usually happens after your first prompt in the CLI.
-
-This means the following startup sequence is expected:
-1. Open `http://localhost:3333` and briefly see "CLI is offline"
-2. Send one message in the CLI
-3. Extension opens the worker socket and queued web messages begin processing
-
-If a conversation is still unbound when the CLI first sees it, the extension now claims it through `/api/session-sync` before processing so the browser can send back to the same SDK session. A separate startup sync to `/api/session-workspace-root` reports the CLI working directory for the already-bound session; it no longer creates a placeholder conversation on its own.
+### Troubleshooting
 
 | Symptom | Check |
 |---|---|
 | UI says "CLI is offline" | Verify `/api/status` works with the auth cookie or `Authorization: Bearer <token>` and shows `cliOnline: true` |
-| UI flaps online/offline after restart | Ensure you are not mixing extension-managed mode with standalone `relay.mjs`, and confirm only one relay process owns port `3333` |
-| "Web relay connected" banner repeats too often | Ensure only one extension instance is active; banner dedupe now persists across extension restarts for the same CLI session and reprints only when relay details change |
-| No response after sending | Tail `server\ext-debug.log` and confirm `onSessionStart fired` + `startPolling called` |
-| Wrong model used | Check logs for `Model selected: requested=... active=...` |
-| Question card stuck | Answer in the card UI; logs should show `relay question created` and `relay question answered` |
+| UI flaps online/offline after restart | Confirm only one relay process owns port `3333` |
+| No response after sending | Follow the message in the relay log (`QUEUED`, `DEQUEUED`, `RESPONSE`) and in the session's worker log (`worker-<sdk session id>.log` in the same folder) |
+| A Copilot or OpenAI session does not start | The conversation's launch note names the cause; "Copilot SDK not found" means the GitHub Copilot CLI is not installed or has not run once (see [SDK auto-detection behavior](#sdk-auto-detection-behavior)) |
+| Question card stuck | Answer in the card UI; the worker log should show `relay question created` |
 | Tunnel not connecting | Check server console for `[ssh-tunnel]` lines; confirm SSH key auth works without password |
 | Tunnel keeps reconnecting | VPS `sshd_config` needs `GatewayPorts no` (default) — Caddy handles the public port |
 
@@ -1916,10 +1877,10 @@ If a conversation is still unbound when the CLI first sees it, the extension now
 ### Worker Launcher
 
 - Each worker opens its own console window through `cmd /c start`, titled `<Kind> Worker <first 8
-  characters of the session id>` (`Copilot Worker`, `Claude Worker`, `Cursor Worker`, `Grok Worker`,
-  `Claude Cloud Worker`, `Copilot SDK Worker`); a relaunch opens a new window.
-- Node workers run `node <kind>-session-worker.mjs --session-id <id>` directly; the extension engine
-  runs `gh copilot -- --allow-all --session-id <id>`.
+  characters of the session id>` (`Copilot SDK Worker`, `Claude Worker`, `Cursor Worker`,
+  `Grok Worker`, `Claude Cloud Worker`, `DeepSeek Worker`, `Claude API Worker`); a relaunch opens
+  a new window.
+- Workers run `node <kind>-session-worker.mjs --session-id <id>` directly.
 
 ### Path Handling
 
@@ -1927,12 +1888,6 @@ If a conversation is still unbound when the CLI first sees it, the extension now
 - **Path format** — `C:/Users/alice/project/file.txt` (forward slashes, drive letter prefix).
 - **Directory listing** — Uses PowerShell via `Get-ChildItem` for recursive listings (faster than fs.readdir on large directories).
 - **Workspace root** — Must be an absolute Windows path; relative paths or UNC paths (`\\server\share`) are handled but may behave unexpectedly.
-
-### Model Refresh
-
-- Model discovery on Windows invokes `copilot.ps1` via PowerShell with `-ExecutionPolicy Bypass` to bypass execution policy restrictions.
-- Command: `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "copilot help config | Select-String -Pattern 'gpt'"`.
-- If PowerShell is not available, falls back to direct `copilot help config` (may fail due to execution policy).
 
 ### Environment Variables
 
@@ -1950,10 +1905,9 @@ If a conversation is still unbound when the CLI first sees it, the extension now
 
 All authenticated routes accept an HttpOnly auth cookie or an `Authorization: Bearer <token>` header.
 
-`GET /api/status` now also includes `readyBanner`, a preformatted relay-info payload used by the CLI extension to print the access window directly in the Copilot CLI client when relay connectivity is established.
-It also includes `restartOrchestrator` with the current relay-side restart transaction state.
-It also includes `relayShutdown`, which reports queued manual relay shutdown/restart state separately from the worker restart orchestrator.
-Queue metrics include `parkedCount` for turns deferred behind restart/rebind gates.
+`GET /api/status` now also includes `readyBanner`, a preformatted relay-info payload (the lines the relay prints at start; `oar url` reads its `remoteUrl`).
+It also includes `relayShutdown`, which reports the queued manual relay shutdown/restart state.
+Queue metrics include `parkedCount`: turns an earlier version parked behind its session restart gate. Nothing parks a turn now; such a turn stays parked until it is cancelled in its conversation, and the relay logs their number at start.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -2001,14 +1955,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/conversation/:id/billing` | Move a Claude chat between the subscription and the saved API key: `{ to: "claude" \| "claude-api", by?: "user" \| "agent" \| "usage-limit", message? }` → `{ ok, conversationId, changed, provider, released, billing }`; with `message` (an `/api/message` body) the switch and the send are one transaction and the answer is the send's. Refusals are `400`/`404`/`409` with a `code` (`CLAUDE_BILLING_*`, `CLAUDE_API_NOT_CONFIGURED`, `CLAUDE_NOT_CONFIGURED`, `CLAUDE_API_CAP_REACHED`); emits `conversation_billing`. See [Billing switch](#billing-switch) |
 | POST | `/api/conversation/:id/compact` | Compact a conversation into a new one with carry-over summary seed |
 | DELETE | `/api/conversation/:id` | Delete a conversation: stops its session worker, deletes its CLI session, removes its rows. A Claude API conversation's Claude Code session is deleted as a Claude one's (it is in the same place). A Claude Cloud conversation's cloud session is archived at Anthropic in the background (never waited for). A Copilot session the relay only imported and never ran is hidden and tombstoned instead: nothing is stopped and its CLI session is kept. `409 conversation-active` (`reason: turn-running` / `background-tasks`) while it is still working; `409 worker-stop-failed` when its worker survives the stop (nothing deleted) |
-| GET | `/api/sdk-session-delete/pending` | (CLI relay) Fetch next pending SDK session delete request |
-| POST | `/api/sdk-session-delete/result` | (CLI relay) Report SDK session delete result |
-| POST | `/api/session-sync` | (CLI relay) Sync conversation↔SDK binding and optionally confirm orchestrator rebind completion |
-| POST | `/api/session-workspace-root` | (CLI relay) Report the startup workspace CWD for a session once it is known |
-| GET | `/api/pending` | (CLI) Fetch next pending message |
+| GET | `/api/pending` | (Worker) The next pending message of the session named in `x-relay-session-id`, for a process that plays that session's worker over HTTP (the e2e fake worker); the workers take their turns over the worker socket. Without the header `400` |
 | POST | `/api/response` | (CLI) Submit response for a message |
-| GET | `/api/restart-orchestrator` | Read relay restart orchestrator state |
-| POST | `/api/restart-orchestrator/request` | Queue a restart transaction for a target SDK session |
 | POST | `/api/activity` | (CLI) Push in-flight tool activity for current message; web search/fetch entries may include bounded queries, URLs, and output previews, while `store_memory`/`vote_memory` entries include available memory metadata |
 | POST | `/api/stream` | (CLI) Push in-flight assistant text stream for current pending message |
 | POST | `/api/relay/pause` | Pause dequeueing and drop currently queued messages |
@@ -2024,15 +1972,19 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/relay-question/:id/timeout` | (CLI/UI) Mark a relay question timed out |
 | POST | `/api/heartbeat` | (CLI) Keep CLI status alive. A session worker may send `backgroundTasks: { count, digest }`; the answer carries `resyncBackgroundTasks: true` when the relay's set for that worker differs |
 | GET | `/api/status` | Overall status |
-| GET | `/api/about` | The About OAR modal: `version`, `commit` (the checkout's HEAD read from `.git`, else a `gitHead` stamp in package.json, else `null`), `startedAt` and `uptimeSeconds` of the relay process; `providers[]` (enabled ones only: `cliVersion` from the CLI probe cache, never a new probe, `sdkVersion` from node_modules, `state` `online`/`offline` for the relay CLI that runs Copilot's extension engine and OpenAI, `online`/`idle` with `runningWorkers` for the others); `stats` (conversations, messages, turns = replies, `turnsByProvider`, `firstConversationAt`); `usage` (only what is stored: Copilot premium requests, Cursor and Grok tokens and cost, Claude Cloud cost); `relay` (`dbBytes` = database + WAL, `runningWorkers`); `update` (latest version only while the opt-in check is on). The totals are read in rowid ranges of 10 000 messages with the event loop free in between, and kept for 60 s |
+| GET | `/api/cli/status` | The provider CLI panel of Settings (Copilot, Claude, Grok): per CLI whether it is installed, its version, path and install method, whether it can be installed or updated from here (and why not, for a copy installed some other way), plus the running or last install. Probing runs the CLIs, so the answer is kept 30 s; `?force=1` probes again |
+| POST | `/api/cli/install` | `{ provider, action }` starts that install or update (`action` defaults to `install`); its output and end come over the socket. One install at a time relay-wide: the same click again joins the running one (`reused: true`), another gets 409. For Copilot it is counted done only once the SDK folder exists after the CLI's first run, and the Copilot model list is read again |
+| POST | `/api/cli/install/cancel` | Stops the running install |
+| GET | `/api/about` | The About OAR modal: `version`, `commit` (the checkout's HEAD read from `.git`, else a `gitHead` stamp in package.json, else `null`), `startedAt` and `uptimeSeconds` of the relay process; `providers[]` (enabled ones only: `cliVersion` from the CLI probe cache, never a new probe, `sdkVersion` from node_modules, `state` `online`/`idle` with `runningWorkers`, from each provider's own workers); `stats` (conversations, messages, turns = replies, `turnsByProvider`, `firstConversationAt`); `usage` (only what is stored: Copilot premium requests, Cursor and Grok tokens and cost, Claude Cloud cost); `relay` (`dbBytes` = database + WAL, `runningWorkers`); `update` (latest version only while the opt-in check is on). The totals are read in rowid ranges of 10 000 messages with the event loop free in between, and kept for 60 s |
 | GET | `/api/models` | Live/cached model catalog used by the UI picker |
 | POST | `/api/models/snapshot` | (CLI/relay) Publish discovered model snapshot |
 | POST | `/api/conversation/:id/refresh-history` | Re-import an existing conversation's history through the local Copilot SDK |
 | GET | `/api/context/:conversationId` | Context metrics for a conversation or `sdk_session_id`. Copilot sessions are parsed from session-state events (falling back to a labeled lower-bound completion-token estimate when full legacy buckets are missing); Claude sessions are served from the breakdown their worker stored, and so are Cursor, Grok, Claude Cloud and Claude API sessions; a Claude API session also gets the Claude session's running auto-compact window and the folder's commit attribution. All return the same normalized `contextUsage` view alongside `providerType` and the runtime's own `text` dump |
 | GET | `/api/context` | Same payload when a `conversationId` query is provided; otherwise returns a missing-selection response |
-| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars', unit, series[], items[{ key, label, values }], note, summary }`) are `deepseek-daily-spend` (30 UTC days stacked by model) and `deepseek-spend-shares` (per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); `?providers=deepseek` reads it live. While a Claude API key is saved or the provider is on, a Claude API card is added: today's and this month's estimated spend and tokens per model in relay-local days, and the monthly cap (see [Usage and the monthly cap](#usage-and-the-monthly-cap)). Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
+| GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars' | 'share', unit, series[], items[{ key, label, values }], note, summary, windowDays? }`) are `deepseek-daily-spend-7d`, `-30d` and `-90d` (UTC days stacked by model, each with `windowDays` 7, 30 or 90 for the page's window picker) and `deepseek-spend-shares` (all time, no `windowDays`; per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); every other card gets its own charts from the token booking the same way (`<provider>-daily-spend|daily-tokens[-<billing>]-<n>d`, kind `columns`, and `<provider>-spend-shares|token-shares[-<billing>]-<n>d`, kind `share`: one item `last-<n>d` whose values are keyed by the daily chart's `model:<name>` series, every model of the 90 days, largest first; relay-local days); `?providers=deepseek` reads it live. While a Claude API key is saved or the provider is on, a Claude API card is added: today's and this month's estimated spend and tokens per model in relay-local days, and the monthly cap (see [Usage and the monthly cap](#usage-and-the-monthly-cap)). Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
+| GET | `/api/settings/copilot` | Always `{ engine: 'sdk', engines: ['sdk'] }`: Copilot has one engine, the SDK worker, and nothing to set. Kept for paired relays on older versions that read it; there is no POST |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`, `attributionMode`, `backgroundCommandLimitMinutes` with the slider bounds `backgroundCommandLimitMinMinutes`, `backgroundCommandLimitMaxMinutes`, `backgroundCommandLimitStepMinutes`, `backgroundCommandLimitDefaultMinutes`) |
 | POST | `/api/settings/claude` | Enable/disable Claude, set the default model, the enabled model subset, the attribution mode or `backgroundCommandLimitMinutes` (clamped to 30…480 and snapped to 30-minute steps; not a number is `400`; read by Claude sessions spawned afterwards); triggers discovery and unstarted-conversation reconciliation |
 | GET | `/api/settings/claude-cloud` | Read Claude Cloud settings: `{ enabled, defaultModel, environmentId, environments: [{ id, name }] \| null, environmentsError, account: { loggedIn, email, orgName, subscriptionType } \| null, token: { source, hasToken, expiresAt }, models }`. `token` says where the login is read from (`env`, `file`, `none`) and when it runs out, never the token. `environments` is `null` while the provider is off or the host has no login: nothing is asked of Anthropic then |
@@ -2060,7 +2012,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/subagent-run` | (Worker) Register/update a subagent run. A new run needs the spawning turn's `messageId`; an update to a known run may omit it (a background agent's end arrives between turns). Optional header fields: `subagentType`, `model`, `modelInherited`, `taskId`, `background`, `timelineOwner`; a post without `status` leaves the run's state alone. Emits `subagent_status` with the whole header |
 | POST | `/api/subagent-timeline` | (Worker) `{ conversationId, subagentRunId, taskId?, entries: [{ key, kind, text, done?, toolName?, toolUseId?, metadata? }], header? }` → `{ ok, stored, truncated }`. Kinds: `thought`, `tool_call`, `tool_result`, `text`, `child`, `note`. Fenced by the run row, not by an open turn; an unknown run whose `header.parentSubagentId` is known is created under the parent's turn, an unknown run whose `taskId` (or `header.taskId`) a run of the conversation carries is written to that run (a resumed agent; when the post sets that finished run `running` again, the relay adds a note where it resumed), anything else is `404 unknown_run`. `header.status: 'running'` clears the run's end time. Sends `subagent_timeline` `{ conversationId, messageId, subagentRunId, entries, truncated }`, volatile, only to the pages watching the run (`subagent_viewer_watch`) |
 | GET | `/api/conversation/:conversationId/subagent/:subagentRunId` | One run's record for the viewer: `?after=<seq>&limit=<n>` (default 500, max 2000) → `{ run, entries, children, nextAfter, complete }`. `entries` are those after `after` plus any still open; `run.legacy` marks a record rebuilt from the lane rows |
-| POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Queue an `abort_subagent` control for the session's worker (`{ parentMessageId?, clientId? }` → `{ ok, queued, acknowledgement }`; `not-found`, `message-mismatch`, `already-cancelled` and `already-finished` queue nothing). The Claude worker stops a background sub-agent (`stopTask`), the Copilot SDK worker a background agent (`rpc.tasks.cancel`), the extension engine tries the SDK session's abort methods; any other run, or worker, answers "not supported". Workers read controls only while a turn runs. Whole-turn **Stop** always works |
+| POST | `/api/conversation/:conversationId/subagent/:subagentRunId/cancel` | Queue an `abort_subagent` control for the session's worker (`{ parentMessageId?, clientId? }` → `{ ok, queued, acknowledgement }`; `not-found`, `message-mismatch`, `already-cancelled` and `already-finished` queue nothing). The Claude worker stops a background sub-agent (`stopTask`), the Copilot SDK worker a background agent (`rpc.tasks.cancel`); any other run, or worker, answers "not supported". Workers read controls only while a turn runs. Whole-turn **Stop** always works |
 | PATCH | `/api/conversation/:id/message/:messageId/share-visibility` | Hide or unhide a single message from shared views |
 | PATCH | `/api/conversation/:id/message/:messageId/pin` | `{ pinned }` → pin or unpin a single message; answers with the conversation's pin list and broadcasts `conversation_pins_updated` |
 | POST | `/api/conversation/:id/share` | The conversation's read-only share link, made if it has none (one active share per conversation): `{ token, shareUrl, path, created }`; a new one sends `share_created` |
@@ -2090,7 +2042,7 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | GET | `/api/remote-relays/peer-key/check` | (Relay to relay, with the key just delivered) `{ issuer, holder, seq }` of that key |
 | POST | `/api/remote-relays/peer-key/request` | (Relay to relay: its key, one retired less than 7 days ago, or this relay's token with `{ relayId }`) A new key, delivered to that relay's stored address, never in the answer; once a minute per relay. On this relay's token, `relink: true` (that relay added this one again from its pairing link) renews a key revoked here, like Renew key, without the minute; an issuance already on its way is the one it waits for |
 | GET | `/api/remote-relays/summary` | (Worker) `{ count, online, localEnabled }`: the number of paired relays, how many of them are online, and whether agent sessions are switched on. Workers register `relay_tool` when `count` is above zero or `localEnabled` is `true` |
-| POST | `/api/remote-relays/tool` | (Worker) One `relay_tool` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target |
+| POST | `/api/remote-relays/tool` | (Worker) One `relay_tool` tool call: `{ conversationId, action, args }`. For a paired relay the relay checks the mention unlock, the permission, the hop limit and (ask/plan mode) the user's approval, then forwards the call to the remote. For this relay itself (named by its name or `this`; refused with `REMOTE_RELAY_LOCAL_DISABLED` while agent sessions are off) it checks instead that the call does not aim at the caller's own conversation (`REMOTE_RELAY_OWN_SESSION`) and, for `create_session`, that the caller was not created by an agent (`REMOTE_RELAY_NESTED_SESSION`), that fewer than 4 sessions it created have a turn queued or running (`REMOTE_RELAY_SESSION_LIMIT`) and that the user allowed it once for the conversation; the call then runs against this relay's own routes in-process. A `model` in `create_session` or `send` is checked first, before any approval card, against the list New Chat offers for the provider on the target (`/api/models` for Copilot and OpenAI, the provider settings routes for Claude, Cursor, Grok and Claude Cloud): one it does not list is refused with `REMOTE_RELAY_UNKNOWN_MODEL`, `suggestions` (the close matches) and `models`, and nothing is created or sent. Casing follows the list; a Claude alias (`opus`, `sonnet`, `haiku`, with an optional `[1m]`) resolves to the newest listed model of its family by version number (a date suffix ignored, the undated id first, `[1m]` ids only when the alias asks and they are listed); a `[1m]` id with only its base listed runs as the base, with a note; a Copilot id with its effort (`gpt-5.4-high`) goes to the bootstrap and the first prompt as the listed id plus `reasoningEffort` (an explicit `effort` wins, and a note says so), but only when the catalogue lists that effort for the id (`reasoningByModel`): `gpt-5.1-codex-max` with only `gpt-5.1-codex` listed is unknown, with the base suggested; `auto` passes. `send` also takes the provider's whole discovered list (`availableModels`) and the session's own model, as the message route does. Without a list (discovery has not run, the route did not answer; `auto` alone is no list) the model goes on unchecked and `modelNote` says so, as it does when the bootstrap binds another model than the one asked. A provider not set up there answers `REMOTE_RELAY_PROVIDER_UNAVAILABLE` before its model is looked at. The bootstrap route itself checks a Copilot model from an agent against Copilot's own models: an unknown one is refused (`COPILOT_MODEL_UNAVAILABLE`, with `supportedModels` and `suggestedModels`; another provider's model gets that provider's answer), a listed one is bound in the list's casing, an effort-suffixed one as the listed id plus that effort when `reasoningByModel` lists it; the browser's New Chat keeps its fallback to the current model. `wait_seconds` is cut to the `maxWaitSeconds` setting for every target. The loop guard counts the prompting calls (`send`, `create_session`, `answer_question`, a `schedule` into another session) per conversation, for every target, and past the `agentPromptsBeforeAsking` setting raises a card with **Allow**, **Allow for this session** (the conversation goes on the off-list, `remote_relay_loop_guard_off`) and **Deny**; never with `0` or for a conversation on the off-list. A `send` to the session whose agent created the caller (`origin_json`; on this relay followed along `compacted_into`) is not counted while the caller's turn holds at least one of that session's prompts and its processing rows are nothing but those prompts and the user's own messages |
 | GET | `/api/relay-events/subscriptions` | Every active [relay event subscription](#relay-event-subscriptions) (`{ available, subscriptions }`); refused to other relays' agents |
 | DELETE | `/api/relay-events/subscriptions/:id` | The user's Unsubscribe (a paired relay's subscription too: it learns with its next fetch); refused to other relays' agents |
 | POST | `/api/relay-events/remote/subscribe` | (Relay to relay) A paired relay's agent subscribes to sessions here: `{ watcher: { conversationId, title }, subscriber: { name }, scope, sessions, events?, once?, match?, stalled_minutes?, heartbeat_minutes?, dry_run? }` → `{ ok, subscription }`. Another relay's request only, inbound switch on; see [Across paired relays](#across-paired-relays) |
@@ -2107,8 +2059,8 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
 | POST | `/api/background-task-settled` | (Worker) How a background task ended: `{ conversationId, taskId, toolUseId?, taskRunId?, status, summary?, reason?, description?, taskType?, startedAt? }` (Claude worker, from `task_notification`; the last three describe a task that was in its published set) |
 | GET | `/api/remote-relays/inflight` | (Worker) Number of `relay_tool` calls running for `conversationId` |
 | GET/POST | `/api/settings/remote-relays` | This relay's `publicUrl` and `inboundEnabled` (accept prompts from other relays' agents) |
-| GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `relay_tool`; `maxWaitSeconds` (default `600`) is the longest wait of one `relay_tool` call, for this relay and paired ones |
-| POST | `/api/settings/agent-sessions` | `{ enabled?, maxWaitSeconds? }` → `{ ok: true, …the GET body }`, and the socket event `agent_sessions_settings_updated` with the GET body. `enabled` must be a boolean and `maxWaitSeconds` a whole number of seconds inside `limits` and on its step; anything else is `400` with `{ ok: false, error }` and nothing is stored |
+| GET | `/api/settings/agent-sessions` | Agent sessions: `{ enabled, maxWaitSeconds, agentPromptsBeforeAsking, loopGuard: { off: [{ conversationId, title, since }] }, limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 }, maxActiveSessions: 4 }`. `enabled` (default `false`) lets this relay's agents start and use sessions on it through `relay_tool`; `maxWaitSeconds` (default `600`) is the longest wait of one `relay_tool` call, for this relay and paired ones; `agentPromptsBeforeAsking` (default `30`, `0` = never ask) is the loop guard's limit, for this relay and paired ones; `loopGuard.off` lists the conversations answered "Allow for this session" (newest first, at most 200, archived and deleted ones dropped on read) |
+| POST | `/api/settings/agent-sessions` | `{ enabled?, maxWaitSeconds?, agentPromptsBeforeAsking?, loopGuardOff?: { revoke: [conversationId] } }` → `{ ok: true, …the GET body }`, and the socket event `agent_sessions_settings_updated` with the GET body (also sent when an "Allow for this session" adds a conversation). `enabled` must be a boolean, `maxWaitSeconds` a whole number of seconds inside `limits` and on its step, `agentPromptsBeforeAsking` `0` or a whole number inside its limits and on its step, `loopGuardOff.revoke` a list of conversation ids; anything else is `400` with `{ ok: false, error }` and nothing is stored |
 
 ### Manual relay shutdown / self-restart
 
@@ -2144,10 +2096,10 @@ Queue metrics include `parkedCount` for turns deferred behind restart/rebind gat
   - `waitingFor`: `[{ conversationId, title, turns }]`, the sessions with a processing turn
   - `held`: `{ count, conversations: [{ conversationId, title, count }] }`, pending and parked messages
   - `backgroundTasks`: `[{ conversationId, title, count, detail, survives, why }]`, sessions with running background work of a live worker (the task panel's sets and running sub-agent runs, through `background-work-view.mjs`), then sessions with console tasks held since the last restart (`background-task-store.mjs` `listRestored`), which no worker has confirmed yet: `survives: null`
-  - `survival`: `{ action, workersSurvive, summary }`. Workers are separate processes (tmux, detached, a console window) and outlive a restart, which the relay's supervisor or the CLI extension takes, and a shutdown. Under a systemd user service (detected from `INVOCATION_ID` and a `.service` cgroup) a restart is handed to systemd and restarts the whole service; the relay starts its workers in scopes of their own (`systemd-run --user --scope`), so they survive that and a stop, and the summary adds that a worker on a tmux server or in a process started before 0.9.20 may stop once. Where the relay does not start them in scopes (systemd-run missing or without a bus, a system service, a relay that is not the unit's own) they may stop with the service (`survives: false`, shown as "may stop"). A Claude Cloud session runs at Anthropic and always survives
+  - `survival`: `{ action, workersSurvive, summary }`. Workers are separate processes (tmux, detached, a console window) and outlive a restart, which the relay's supervisor takes, and a shutdown. Under a systemd user service (detected from `INVOCATION_ID` and a `.service` cgroup) a restart is handed to systemd and restarts the whole service; the relay starts its workers in scopes of their own (`systemd-run --user --scope`), so they survive that and a stop, and the summary adds that a worker on a tmux server or in a process started before 0.9.20 may stop once. Where the relay does not start them in scopes (systemd-run missing or without a bus, a system service, a relay that is not the unit's own) they may stop with the service (`survives: false`, shown as "may stop"). A Claude Cloud session runs at Anthropic and always survives
   - while queued also `holdsNewTurns`, `maxWaitMs`, `waitingSince` (start of the current period), `deadlineAt` (`null` without a limit), `question`, `keptWaiting`
 - Ownership after an intentional restart follows the argv role, so exactly one supervisor acts on exit 75:
-  - `server.js --supervised` exits 75 and relaunches under `.github/extensions/web-relay/server-lifecycle/managed-server.mjs`
+  - `server.js --supervised` exits 75 and leaves the relaunch to whoever started it (nothing in OAR starts it that way now)
   - bare `node server/server.js` keeps its supervisor attached, respawns the `--relay-runtime` child, and keeps the same terminal session alive
 
 ### Interrupted turns after a restart
@@ -2431,11 +2383,11 @@ The migration `server/migrations/0001-add-structured-answer.mjs` creates the `st
 
 ### Elicitation Flow
 
-1. **Agent sends multi-field question** → Copilot SDK sends `ElicitationRequest` with `requestSchema` (JSON schema).
-2. **Extension bridges question** → `.github/extensions/web-relay/skills/question-routing-hooks.mjs` detects structured schema and registers it in the relay.
+1. **Agent sends multi-field question** → the Copilot runtime calls the session's `onElicitationRequest` with a `requestedSchema` (JSON schema).
+2. **Worker bridges question** → the Copilot SDK worker (`server/copilot-worker/copilot-question-bridge.mjs`) registers it in the relay as a relay question carrying the schema (`POST /api/relay-question`).
 3. **Browser renders form** → `server/public/app/question-schema-view.mjs` generates UI from the JSON schema (text inputs, checkboxes, dropdowns, etc.).
-4. **User submits form** → `ask-user-view.js` validates and POSTs to `/api/ask-user` with `structuredAnswer` payload.
-5. **Relay stores + returns** → Answer stored in `structured_answer` column; extension retrieves via `/api/pending` and returns `ElicitationResponse` to SDK.
+4. **User submits form** → `ask-user-view.js` validates and POSTs to `/api/relay-question/:id/answer` with `structuredAnswer` payload.
+5. **Relay stores + returns** → Answer stored in `structured_answer` column; the worker reads it (`GET /api/relay-question/:id`) and returns it to the SDK as the elicitation's answer.
 
 ### Schema Example
 
@@ -2470,18 +2422,15 @@ The migration `server/migrations/0001-add-structured-answer.mjs` creates the `st
 
 ## Relay Tool Guidance
 
-The CLI extension (`.github/extensions/web-relay/extension.mjs`) and the Copilot SDK worker
-(`copilot-worker/copilot-prompt-context.mjs`) load `relay-tools.md` (`COPILOT_WEB_RELAY_TOOLS`
-overrides the path) for shared tool guidance.
+The Copilot SDK worker (`copilot-worker/copilot-prompt-context.mjs`) loads `relay-tools.md`
+(`COPILOT_WEB_RELAY_TOOLS` overrides the path) for shared tool guidance.
 
 How to embed media in a reply (a markdown image naming the file's absolute host path; the page
 renders images and turns video and audio into players) is one text,
 `shared/media-embed-instructions.mjs`. The Claude worker appends it to the system prompt, the
 Copilot SDK worker to its relay guidance, the Cursor and Grok workers put it in front of the first
-prompt each worker process sends. The
-Copilot extension engine's prompt builder (`shared/worker-runtime/prompt-context.mjs`) does not add
-it and `relay-tools.md` does not contain it, and a Claude Cloud session gets no relay guidance at
-all, so those two are not told.
+prompt each worker process sends. `relay-tools.md` does not contain it, and a Claude Cloud
+session gets no relay guidance at all, so it is not told.
 
 The browser UI keeps the usage button (**📊**) in the chat header, or as **📊 Check Usage** in the
 **︙** menu when the header has no room for it, and that button continues to call `/api/usage`
@@ -2544,18 +2493,12 @@ service).
 | `pushVapidSubject` | `mailto:copilot-remote@example.com` | Contact URI sent to push services |
 | `sharedPresenceMaxPerConversation`, `sharedPresenceMaxGlobal` | `200`, `5000` | Caps of the shared-view watcher count |
 | `cliBinaries` | *(written by the relay)* | Provider CLI paths resolved by an install from Settings, applied at startup |
-| `cliPort` | `4445` | Port of the standalone `relay.mjs`; the preview lane refuses it |
-| `features` | — | Legacy: moved into the database once at startup, then the **Features** tab |
+| `cliPort` | — | Ignored without a warning: the port of the removed standalone `server/relay.mjs`. It no longer keeps a port from the preview lane |
+| `features` | — | Ignored; when it turns a feature off, the relay says so once in its log at start |
 | `sdkVersion` | *(latest detected)* | Optional semver pin (for example `1.0.63`) used by relay SDK auto-detection |
 | `sdkPath` | *(auto-detected)* | Optional absolute override for Copilot SDK entry path (`.../copilot-sdk/index.js`) |
-| `cliPath` | *(auto-detected)* | Optional absolute override for Copilot CLI app path (`.../app.js`) |
-| `restartGracefulTimeoutMs` | `8000` | Graceful shutdown wait before force fallback |
-| `restartReadyCooldownMs` | `1000` | How long the worker restart orchestrator still holds dequeue after a restart transaction is ready |
-| `restartShutdownTimeoutMs` | `45000` | Drain timeout while waiting for active queue jobs |
-| `restartSpawnTimeoutMs` | `18000` | Max wait for resume process to leave online state |
-| `restartRebindTimeoutMs` | `20000` | Max wait for session-sync rebind confirmation |
-| `restartMaxAttempts` | `3` | Max restart attempts before terminal exhaustion |
-| `restartRetryBackoffMs` | `[1000,3000,7000]` | Deterministic retry backoff schedule |
+| `cliPath` | *(auto-detected)* | Optional absolute override for Copilot CLI app path (`.../app.js`), only together with `sdkPath`; a worker always starts the `app.js` beside its SDK folder |
+| `restartGracefulTimeoutMs`, `restartReadyCooldownMs`, `restartShutdownTimeoutMs`, `restartSpawnTimeoutMs`, `restartRebindTimeoutMs`, `restartMaxAttempts`, `restartRetryBackoffMs` | — | Ignored without a warning: they tuned the removed restart orchestrator (the restart of a session's Copilot CLI), never **🌄 Restart web relay** |
 | `sshTunnel.mode` | `disabled` | Tunnel mode (`disabled` or `managed`) |
 | `sshTunnel.enabled` | `false` | Legacy alias for mode (`true` => `managed`, `false` => `disabled`) |
 | `sshTunnel.required` | `false` | Pause dequeue when tunnel is disconnected in managed mode |
@@ -2579,16 +2522,30 @@ service).
 
 ### SDK auto-detection behavior
 
-- Relay first honors explicit `sdkPath` + `cliPath` from `config.json` when both are set.
-- Otherwise it auto-detects the highest available semver under platform-specific install roots:
-  - **Windows:** `%LOCALAPPDATA%\copilot\pkg`
-  - **Linux:** `$XDG_CACHE_HOME/copilot/pkg` (default `~/.cache/copilot/pkg`), then `$XDG_DATA_HOME/copilot/pkg` (default `~/.local/share/copilot/pkg`)
-  - **macOS:** `~/Library/Application Support/copilot/pkg`
-- Within each root it checks platform subdirs (`<platform>-<arch>`, then `universal`) and picks the highest version containing both:
-  - `copilot-sdk/index.js`
-  - `app.js`
-- Optional environment override: set `COPILOT_PKG_DIR` to force a specific pkg base directory.
-- Optional config pin: set `sdkVersion` to require an exact version during auto-detection.
+The Copilot SDK is the `copilot-sdk` folder inside a version folder of the GitHub Copilot CLI:
+installing the SDK means installing the Copilot CLI (`npm i -g @github/copilot` or the vendor's
+installer) and running it once. The lookup (`server/copilot-sdk-runtime.mjs`,
+`resolveInstalledCopilotPaths` and `getCopilotBaseDirs`) runs on every worker launch, so a CLI
+installed or updated while the relay runs is found without a restart.
+
+- `COPILOT_SDK_PATH` in the environment wins, as given.
+- Then `sdkPath` from `config.json` (with `cliPath`, the two as given; alone, the version folder
+  it lies in).
+- Otherwise it scans the version folders (`<base>/<platform>-<arch>/<version>/` and
+  `<base>/universal/<version>/`) under these bases, in this order:
+  1. `$COPILOT_PKG_DIR`
+  2. `$COPILOT_PKG_CACHE_HOME/pkg`, then `$COPILOT_CACHE_HOME/pkg`
+  3. the platform cache: `%LOCALAPPDATA%\copilot\pkg` on Windows, `~/Library/Caches/copilot/pkg`
+     on macOS, `${XDG_CACHE_HOME:-~/.cache}/copilot/pkg` on Linux
+  4. `~/.copilot/pkg`
+  5. the places earlier versions searched: `~/Library/Application Support/copilot/pkg` on macOS,
+     `${XDG_DATA_HOME:-~/.local/share}/copilot/pkg` on Linux
+- A version folder counts only with both `copilot-sdk/index.js` and `app.js`. The newest version
+  across all bases wins; a tie goes to the earlier base.
+- Optional config pin: set `sdkVersion` to ask for one exact version.
+- Without an SDK a Copilot, OpenAI BYOK or OpenAI image session does not start: "Copilot SDK not
+  found. Install the GitHub Copilot CLI and run it once (copilot --version); no relay restart is
+  needed. Looked in: …" (see [Launch failures and backoff](#launch-failures-and-backoff)).
 
 ## SSH Reverse Tunnel
 
@@ -2673,7 +2630,7 @@ relay.example.com {
 When `required=true` and tunnel is down:
 - Relay stays running internally
 - `/api/pending` returns `{ paused: true, reason: "ssh_tunnel_required" }` 
-- Extension stops dequeuing turns
+- No turns are dequeued
 - Browser sees "waiting for tunnel to reconnect..." status
 - Once tunnel reconnects, queue resumes automatically
 
@@ -2696,24 +2653,6 @@ npm start
 - `sshTunnel.mode` is now the canonical switch. Use `disabled` for direct relay deployments and `managed` for reverse SSH.
 - `sshTunnel.enabled` still works for compatibility and maps to `mode`.
 - Add `sshTunnel.required: true` only when queue dequeue must stop until the tunnel reconnects.
-
-`restartOrchestrator` in `/api/status` and `/api/restart-orchestrator` now exposes
-attempt/retry/timeout fields (`attempts`, `maxAttempts`, `retryAt`, `retryBackoffMs`,
-`spawnDeadlineAt`, `rebindDeadlineAt`) plus terminal outcomes
-(`terminalOutcomeCode`, `terminalOutcomeMessage`, `terminalOutcomeAttempts`).
-Failure classes are deterministic: transient timeouts (`spawn-timeout`, `rebind-timeout`)
-retry with bounded backoff; session mismatch conflicts (`transaction-mismatch`, `target-mismatch`)
-are terminal and stop retrying.  
-`POST /api/session-sync` accepts optional orchestrator correlation/target/rebind fields:
-`orchestrator_correlation_id`, `orchestrator_target_session_id`, and `rebind_completed`
-(or `rebind_state=completed`). Rebind mismatches return `409` with `retryable`/`terminal`.
-The extension dequeue/send path treats this restart-orchestrator flow as authoritative and
-does not attempt in-process runtime session switch calls.
-
-This worker restart-orchestrator flow is separate from the manual relay self-restart state
-reported as `relayShutdown`.
-
-
 
 ## Database Migrations
 
@@ -2969,7 +2908,7 @@ working with the corresponding feature inert rather than crashing at startup.
 | `data/db-backup-progress.json` | While a backup is written, with the writer's pid and identity: `oar start` says "backing up", `oar backup` refuses, a start waits; one a killed writer left is removed at the next start |
 | `data/db-backup-wait.json` | While a start waits for an `oar backup` of the same database (and during its own copy beside it), with the relay's pid: `oar start` leaves the relay running |
 | `backups/` | A checkout's database backups, `oar-<version>-<time>-<reason>.db` (gitignored, not packed; a global install keeps them in the state root's `backups/`) |
-| `relay-tools.md` | Markdown tool guidance loaded by the relay extension |
+| `relay-tools.md` | Markdown tool guidance loaded by the Copilot SDK worker |
 | `claude-worker/` | Claude Agent SDK session worker (turn runner, ask-user bridge, attachments, SDK message normalizer) |
 | `claude-cloud-worker/` | Claude Cloud session worker (turn runner over the cloud session's event stream, event normalizer) |
 | `../shared/claude-cloud/` | Claude Cloud API client, the reader of the Claude CLI's login, repository/branch/model string rules |

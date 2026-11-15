@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
-import { createTokenUsageService, partlyReportedFields } from './token-usage-service.mjs';
+import { createTokenUsageService, partlyReportedFields, shiftDay } from './token-usage-service.mjs';
 import { normalizeTurnTokenUsageReport } from '../../shared/turn-token-usage.mjs';
 
 const silent = { warn() {}, log() {} };
@@ -304,4 +304,57 @@ test('a worker without an attempt id names one per process: a requeued turn afte
   service.recordTurn({ conversationId: 'conv-1', provider: 'github', report: report({ runId: 'proc-2', models: [{ model: 'gpt-5.5', inputTokens: 20 }] }) });
   assert.equal(turnRows(db).length, 2);
   assert.equal(day(db)[0].input_tokens, 50);
+});
+
+// A day row as the booking leaves it, for the chart window tests.
+function insertDay(db, { day, provider = 'cursor', billing = '', model = 'composer-2', source = 'turns', input = 10, cost = null }) {
+  db.prepare(`
+    INSERT INTO token_usage_days (day, provider, billing, model, source, input_tokens, output_tokens, cost_usd, turn_count, first_seen_at, last_seen_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, 'x')
+  `).run(day, provider, billing, model, source, input, cost, `${day}T08:00:00.000Z`, `${day}T08:00:00.000Z`);
+}
+
+test('shiftDay: calendar arithmetic across a month, a year and a DST change', () => {
+  assert.equal(shiftDay('2026-11-15', -89), '2026-08-18');
+  assert.equal(shiftDay('2026-03-01', -1), '2026-02-28');
+  assert.equal(shiftDay('2026-12-31', 1), '2027-01-01');
+  assert.equal(shiftDay('2026-10-26', -1), '2026-10-25');
+  assert.equal(shiftDay('2026-10-25', 1), '2026-10-26');
+});
+
+test('days: exactly the last 90 relay-local days in Berlin, a window holding the DST end', () => {
+  // Nov 15 in Berlin: 89 days back is Aug 18, 90 back Aug 17; Oct 25 is the 25-hour day.
+  const { db, service } = setup({ at: '2026-11-15T10:00:00.000Z', timeZone: 'Europe/Berlin' });
+  for (const day of ['2026-08-17', '2026-08-18', '2026-10-25', '2026-10-26', '2026-11-15']) insertDay(db, { day });
+  const [group] = service.readPeriods({ provider: 'cursor' }).groups;
+  assert.deepEqual(group.days.map((row) => row.day), ['2026-08-18', '2026-10-25', '2026-10-26', '2026-11-15']);
+  // The periods still see every row.
+  assert.equal(group.periods.allTime.rows, 5);
+  assert.equal(group.since, '2026-08-17');
+  // A shorter window on request.
+  assert.deepEqual(service.readPeriods({ provider: 'cursor', chartDays: 22 }).groups[0].days.map((row) => row.day), ['2026-10-25', '2026-10-26', '2026-11-15']);
+});
+
+test('days: Auckland just after its midnight is already the next day there', () => {
+  // 11:30 UTC is 00:30 on Nov 16 in Auckland (UTC+13): today is the 16th.
+  const { db, service } = setup({ at: '2026-11-15T11:30:00.000Z', timeZone: 'Pacific/Auckland' });
+  for (const day of ['2026-08-18', '2026-08-19', '2026-11-15', '2026-11-16', '2026-11-17']) insertDay(db, { day });
+  const periods = service.readPeriods({ provider: 'cursor' });
+  assert.equal(periods.today, '2026-11-16');
+  assert.deepEqual(periods.groups[0].days.map((row) => row.day), ['2026-08-19', '2026-11-15', '2026-11-16']);
+});
+
+test('days: backfill rows marked, NULL stays null, each billing group its own days', () => {
+  const { db, service } = setup({ at: '2026-11-02T12:00:00.000Z' });
+  insertDay(db, { day: '2026-10-15', provider: 'claude-api', model: 'claude-sonnet-5-5', source: 'backfill', input: 500, cost: 0.1 });
+  service.recordTurn({ conversationId: 'conv-1', provider: 'claude-api', report: report({ models: [{ model: 'claude-sonnet-5-5', inputTokens: 2, outputTokens: 1 }] }) });
+  const [api] = service.readPeriods({ provider: 'claude-api' }).groups;
+  assert.deepEqual(api.days, [
+    { day: '2026-10-15', model: 'claude-sonnet-5-5', inputTokens: 500, outputTokens: 1, cacheWriteTokens: null, cacheReadTokens: null, reasoningTokens: null, costUsd: 0.1, unknownCostTokens: 0, turnCount: 1, backfill: true },
+    { day: '2026-11-02', model: 'claude-sonnet-5-5', inputTokens: 2, outputTokens: 1, cacheWriteTokens: null, cacheReadTokens: null, reasoningTokens: null, costUsd: null, unknownCostTokens: 0, turnCount: 1, backfill: false },
+  ]);
+  service.recordTurn({ conversationId: 'conv-1', provider: 'github', report: report({ turnId: 'p', models: [{ model: 'gpt-5.5', inputTokens: 7 }] }) });
+  service.recordTurn({ conversationId: 'conv-1', provider: 'github', billing: 'byok-openai', report: report({ turnId: 'k', models: [{ model: 'gpt-5.5', inputTokens: 9 }] }) });
+  const groups = service.readPeriods({ provider: 'github' }).groups;
+  assert.deepEqual(groups.map((group) => [group.billing, group.days.map((row) => row.inputTokens)]), [['', [7]], ['byok-openai', [9]]]);
 });

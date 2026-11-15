@@ -38,18 +38,15 @@ function boot() {
     db.prepare(`INSERT INTO queue (id, conversation_id, text, relay_mode, status, timestamp, processing_at, owner_sdk_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, conversationId, `text of ${id}`, relayMode, status, at, status === 'processing' ? at : null, owner);
   };
-  const claim = (options = {}) => dequeuePendingMessage({ db, stmts, nowIso: LATER, ...options })?.id || null;
+  // The claim of conversation X's worker (its session id is X's own id),
+  // unless the test names another session.
+  const claim = (options = {}) => dequeuePendingMessage({ db, stmts, nowIso: LATER, requesterSessionId: X, ...options })?.id || null;
   const status = (id) => stmts.findQById.get(id)?.status;
   return { db, stmts, queue, claim, status };
 }
 
-// The claim paths a requester can take (dequeuePendingMessage).
-const PATHS = {
-  global: (fx) => fx.stmts.findPending.get(LATER)?.id || null,
-  legacy: (fx) => fx.claim(),
-  affinity: (fx) => fx.claim({ requesterSessionId: WORKER }),
-  routed: (fx) => fx.claim({ requesterSessionId: WORKER, routingEnabled: true }),
-};
+// The claim of a worker that owns rows of both conversations.
+const claimAsWorker = (fx) => fx.claim({ requesterSessionId: WORKER });
 
 test('an "Approve plan" follow-up waits for the running plan turn instead of steering into it', () => {
   const fx = boot();
@@ -82,27 +79,23 @@ test('a message on the same side of plan mode steers as before', () => {
   assert.equal(plan.claim(), 'plan-steer');
 });
 
-for (const [name, claimOn] of Object.entries(PATHS)) {
-  test(`(a) while one conversation's row is held, another's is claimed: ${name} path`, () => {
-    const fx = boot();
-    // The legacy relay takes unowned rows only; the worker paths their own.
-    const owner = name === 'legacy' ? null : WORKER;
-    fx.queue('x-plan-turn', 'plan', { status: 'processing', owner });
-    fx.queue('x-held', 'agent', { owner });
-    fx.queue('y-row', 'agent', { conversationId: Y, owner });
-    assert.equal(claimOn(fx), 'y-row');
-    assert.equal(fx.status('x-held'), 'pending');
-  });
-}
+test('(a) while one conversation\'s row is held, another\'s is claimed', () => {
+  const fx = boot();
+  fx.queue('x-plan-turn', 'plan', { status: 'processing', owner: WORKER });
+  fx.queue('x-held', 'agent', { owner: WORKER });
+  fx.queue('y-row', 'agent', { conversationId: Y, owner: WORKER });
+  assert.equal(claimAsWorker(fx), 'y-row');
+  assert.equal(fx.status('x-held'), 'pending');
+});
 
 test('(b) a later row of the held conversation does not overtake the held one, whatever its mode', () => {
   const fx = boot();
   fx.queue('x-plan-turn', 'plan', { status: 'processing', owner: WORKER });
   fx.queue('x-held', 'agent', { owner: WORKER });
   fx.queue('x-later-plan', 'plan', { owner: WORKER });
-  for (const claimOn of Object.values(PATHS)) assert.equal(claimOn(fx), null);
+  assert.equal(claimAsWorker(fx), null);
   fx.stmts.setDone.run('{}', 'x-plan-turn');
-  assert.equal(PATHS.routed(fx), 'x-held', 'the order is kept');
+  assert.equal(claimAsWorker(fx), 'x-held', 'the order is kept');
 });
 
 test('(c) the held row is claimed once the live turn ends, however it ends', () => {
@@ -152,21 +145,21 @@ test('every claim query carries the hold', () => {
   const repository = createMessageRepository(db);
   const claims = Object.entries(repository)
     .filter(([name, stmt]) => /^findPending/.test(name) && stmt?.source && /FROM queue\b/.test(stmt.source) && /status = 'pending'/.test(stmt.source));
-  assert.deepEqual(claims.map(([name]) => name).sort(), ['findPending', 'findPendingForLegacyRelay', 'findPendingForSessionAffinity', 'findPendingForWorker']);
+  assert.deepEqual(claims.map(([name]) => name).sort(), ['findPendingForWorker']);
   for (const [name, stmt] of claims) assert.ok(stmt.source.includes(PLAN_BOUNDARY_HOLD_MARK), name);
-  // The route's owner-transfer scan (a stranded row another worker owns).
+  // The route file prepares no claim of its own.
   const routes = fs.readFileSync(new URL('./messages-routes.mjs', import.meta.url), 'utf8');
-  const scan = routes.slice(routes.indexOf('const findPendingOwnedByOtherSession'), routes.indexOf('const transferPendingOwnerToSession'));
-  assert.ok(scan.includes("planBoundaryHoldSql('q')"));
+  assert.equal(routes.includes('planBoundaryHoldSql('), false);
 });
 
 test('fail closed: a claim statement without the hold still never hands out a held row', () => {
   const fx = boot();
   fx.queue('x-plan-turn', 'plan', { status: 'processing' });
   fx.queue('x-held', 'agent');
-  const unguarded = fx.db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY timestamp ASC, rowid ASC LIMIT 1`);
-  const stmts = { ...fx.stmts, findPendingForLegacyRelay: unguarded };
-  assert.equal(dequeuePendingMessage({ db: fx.db, stmts, nowIso: LATER }), null);
+  // The worker claim's parameters (time, session), without the hold.
+  const unguarded = fx.db.prepare(`SELECT * FROM queue WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) AND conversation_id = ? ORDER BY timestamp ASC, rowid ASC LIMIT 1`);
+  const stmts = { ...fx.stmts, findPendingForWorker: unguarded };
+  assert.equal(dequeuePendingMessage({ db: fx.db, stmts, nowIso: LATER, requesterSessionId: X }), null);
   assert.equal(fx.status('x-held'), 'pending');
 });
 
@@ -195,7 +188,7 @@ test('a row without a mode runs as agent, so the hold treats it as a writing mod
   live.queue('x-empty-turn', '', { status: 'processing' });
   assert.equal(live.claim(), null, 'or with an empty one');
   live.queue('x-agent-steer', 'agent', { conversationId: Y });
-  assert.equal(live.claim(), 'x-agent-steer');
+  assert.equal(live.claim({ requesterSessionId: Y }), 'x-agent-steer');
 
   const pending = boot();
   pending.queue('x-plan-turn', 'plan', { status: 'processing' });

@@ -7,7 +7,7 @@ const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 // General leads: `SETTINGS_TABS[0]` is the tab a first-time visitor lands on.
 // A remembered tab or a deep link to General still lands there after its
 // Appearance block got a tab of its own.
-export const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications', 'features'];
+export const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications'];
 // Copilot leads: it is the default provider, and `SETTINGS_PROVIDER_TABS[0]`
 // is also the sub-tab a first-time visitor lands on.
 const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'claude-api', 'claude-cloud', 'grok', 'cursor', 'deepseek'];

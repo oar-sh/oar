@@ -11,6 +11,7 @@ import {
   REMOTE_RELAY_SOCKET_EVENT,
   REMOTE_RELAY_ERROR_CODES,
   checkRemoteRelayUrlPolicy,
+  normalizeRemoteRelayAgentPromptsBeforeAsking,
   normalizeRemoteRelayLink,
   normalizeRemoteRelayMaxWaitSeconds,
   normalizeRemoteRelayPermission,
@@ -29,6 +30,10 @@ import { normalizePeerKeyFields } from './remote-relay-peer-keys.mjs';
 //   agent_sessions_enabled       this relay's own agents may start and use
 //                                sessions on it (the local target; off by default)
 //   remote_relay_max_wait_seconds the longest wait of one relay_tool call
+//   remote_relay_agent_prompts_before_asking
+//                                the loop guard's limit (0: never ask)
+//   remote_relay_loop_guard_off  the conversations the loop guard is off for
+//                                ("Allow for this session"), until revoked
 //
 // Tokens never leave through listPublic(), the socket event or any route; only
 // the outbound client reads them (list()/get()/resolve() are server-internal).
@@ -56,6 +61,10 @@ const HEALTH_CHECK_TIMEOUT_MS = 10_000;
 // Cloudflare and reverse-proxy answers that mean "the relay behind me is down".
 const GATEWAY_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524, 530]);
 const LAST_ERROR_MAX = 300;
+// The loop guard's off-list: at most this many conversations, the oldest
+// dropped first.
+const LOOP_GUARD_OFF_MAX = 200;
+const LOOP_GUARD_TITLE_MAX = 200;
 
 function toText(value) {
   return String(value ?? '').trim();
@@ -223,6 +232,9 @@ export function createRemoteRelayRegistry({
   // is gone from the list: the event link tells that relay its
   // subscriptions ended.
   onRemove = () => {},
+  // Whether a conversation is still live (neither archived nor deleted): the
+  // loop guard's off-list drops the others on read.
+  isLiveConversation = () => true,
 } = {}) {
   let cachedInstanceId = '';
   let healthTimer = null;
@@ -412,17 +424,128 @@ export function createRemoteRelayRegistry({
     return {
       enabled: enabled === true || enabled === 1 || ['true', '1', 'on'].includes(toText(enabled).toLowerCase()),
       maxWaitSeconds: normalizeRemoteRelayMaxWaitSeconds(readJsonSetting(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds)),
+      agentPromptsBeforeAsking: normalizeRemoteRelayAgentPromptsBeforeAsking(readJsonSetting(REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking)),
+      loopGuard: {
+        off: Object.entries(readLoopGuardOff())
+          .map(([conversationId, entry]) => ({ conversationId, ...entry }))
+          .sort((a, b) => String(b.since).localeCompare(String(a.since))),
+      },
       limits: {
         minWaitSeconds: REMOTE_RELAY_LIMITS.waitMaxFloorSeconds,
         maxWaitSeconds: REMOTE_RELAY_LIMITS.waitMaxCeilingSeconds,
         stepSeconds: REMOTE_RELAY_LIMITS.waitMaxStepSeconds,
+        // The loop guard's limit: 0 never asks, else this range and step.
+        minAgentPrompts: REMOTE_RELAY_LIMITS.agentPromptsMin,
+        maxAgentPrompts: REMOTE_RELAY_LIMITS.agentPromptsMax,
+        agentPromptsStep: REMOTE_RELAY_LIMITS.agentPromptsStep,
       },
       maxActiveSessions: REMOTE_RELAY_LIMITS.localActiveSessions,
     };
   }
 
+  function emitAgentSessions() {
+    const settings = getAgentSessionsSettings();
+    try {
+      emit(AGENT_SESSIONS_SOCKET_EVENT, settings);
+    } catch (error) {
+      logger?.warn?.(`[remote-relays] agent sessions event failed: ${error?.message || error}`);
+    }
+    return settings;
+  }
+
   /**
-   * `{ enabled?, maxWaitSeconds? }`. Nothing is rounded or clamped here: a
+   * The loop guard's off-list, `{ <conversationId>: { since, title } }`:
+   * entries of archived or deleted conversations are dropped (and the list
+   * stored without them).
+   */
+  function readLoopGuardOff() {
+    const raw = readJsonSetting(REMOTE_RELAY_SETTING_KEYS.loopGuardOff);
+    const stored = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const list = {};
+    let pruned = false;
+    for (const [id, entry] of Object.entries(stored)) {
+      const conversationId = toText(id);
+      // A lookup that fails keeps the entry: only a conversation known gone drops it.
+      let live = !!conversationId;
+      try {
+        live = live && isLiveConversation(conversationId) !== false;
+      } catch {}
+      if (!live) {
+        pruned = true;
+        continue;
+      }
+      list[conversationId] = {
+        since: capOrNull(entry?.since, 40) || '',
+        title: capOrNull(entry?.title, LOOP_GUARD_TITLE_MAX) || '',
+      };
+    }
+    if (pruned) writeLoopGuardOff(list);
+    return list;
+  }
+
+  function writeLoopGuardOff(list) {
+    const kept = Object.entries(list)
+      .sort(([, a], [, b]) => String(b.since).localeCompare(String(a.since)))
+      .slice(0, LOOP_GUARD_OFF_MAX);
+    writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.loopGuardOff, Object.fromEntries(kept));
+  }
+
+  /** Is the loop guard off for this conversation ("Allow for this session")? */
+  function isLoopGuardOff(conversationId) {
+    const id = toText(conversationId);
+    return !!id && Object.prototype.hasOwnProperty.call(readLoopGuardOff(), id);
+  }
+
+  /** "Allow for this session": the loop guard is off for it until revoked. */
+  function setLoopGuardOff(conversationId, { title = '' } = {}) {
+    const id = toText(conversationId);
+    if (!id) return false;
+    const list = readLoopGuardOff();
+    list[id] = { since: nowIso(), title: capOrNull(title, LOOP_GUARD_TITLE_MAX) || '' };
+    writeLoopGuardOff(list);
+    emitAgentSessions();
+    return true;
+  }
+
+  /** Revoke: the loop guard counts for these conversations again. */
+  function revokeLoopGuardOff(ids = []) {
+    const list = readLoopGuardOff();
+    let removed = 0;
+    for (const id of Array.isArray(ids) ? ids : []) {
+      const key = toText(id);
+      if (key && Object.prototype.hasOwnProperty.call(list, key)) {
+        delete list[key];
+        removed += 1;
+      }
+    }
+    if (removed) {
+      writeLoopGuardOff(list);
+      emitAgentSessions();
+    }
+    return removed;
+  }
+
+  /** A compaction: the successor keeps the guard off, from the same moment. */
+  function carryLoopGuardOff(sourceId, targetId, { title = '' } = {}) {
+    const from = toText(sourceId);
+    const to = toText(targetId);
+    const stored = readJsonSetting(REMOTE_RELAY_SETTING_KEYS.loopGuardOff);
+    const entry = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored[from] : null;
+    if (!from || !to || from === to || !entry) return false;
+    const list = readLoopGuardOff();
+    delete list[from];
+    list[to] = {
+      since: capOrNull(entry.since, 40) || nowIso(),
+      title: capOrNull(title, LOOP_GUARD_TITLE_MAX) || capOrNull(entry.title, LOOP_GUARD_TITLE_MAX) || '',
+    };
+    writeLoopGuardOff(list);
+    emitAgentSessions();
+    return true;
+  }
+
+  /**
+   * `{ enabled?, maxWaitSeconds?, agentPromptsBeforeAsking?, loopGuardOff?:
+   * { revoke: [conversationId] } }`. Nothing is rounded or clamped here: a
    * value outside the range, or off the slider's step, is refused, so what the
    * settings page shows is what was stored.
    */
@@ -438,15 +561,22 @@ export function createRemoteRelayRegistry({
         return invalid(`maxWaitSeconds must be a whole number of seconds from ${min} to ${max}, in steps of ${step}`);
       }
     }
+    const prompts = input.agentPromptsBeforeAsking;
+    if (prompts !== undefined && normalizeRemoteRelayAgentPromptsBeforeAsking(prompts) !== prompts) {
+      const { agentPromptsMin: min, agentPromptsMax: max, agentPromptsStep: step } = REMOTE_RELAY_LIMITS;
+      return invalid(`agentPromptsBeforeAsking must be 0 (never ask) or a whole number from ${min} to ${max}, in steps of ${step}`);
+    }
+    const revoke = input.loopGuardOff?.revoke;
+    if (input.loopGuardOff !== undefined
+      && (!Array.isArray(revoke) || revoke.some((id) => typeof id !== 'string' || !id.trim()))) {
+      return invalid('loopGuardOff must be { revoke: [conversation ids] }');
+    }
     if (input.enabled !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.agentSessionsEnabled, input.enabled);
     if (input.maxWaitSeconds !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.maxWaitSeconds, input.maxWaitSeconds);
-    const settings = getAgentSessionsSettings();
-    try {
-      emit(AGENT_SESSIONS_SOCKET_EVENT, settings);
-    } catch (error) {
-      logger?.warn?.(`[remote-relays] agent sessions event failed: ${error?.message || error}`);
-    }
-    return { ok: true, ...settings };
+    if (prompts !== undefined) writeJsonSetting(REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking, prompts);
+    // One event either way: a revoke that dropped something announces it itself.
+    if (revoke?.length && revokeLoopGuardOff(revoke)) return { ok: true, ...getAgentSessionsSettings() };
+    return { ok: true, ...emitAgentSessions() };
   }
 
   // ─── Remote relays ─────────────────────────────────────────────────────────
@@ -980,6 +1110,10 @@ export function createRemoteRelayRegistry({
     notifySelfChanged: emitChange,
     getAgentSessionsSettings,
     setAgentSessionsSettings,
+    isLoopGuardOff,
+    setLoopGuardOff,
+    revokeLoopGuardOff,
+    carryLoopGuardOff,
     list,
     listAll,
     listPublic,

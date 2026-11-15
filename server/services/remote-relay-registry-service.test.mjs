@@ -483,7 +483,9 @@ test('agent sessions are off by default, wait 600 s at most, and say so in one s
   assert.deepEqual(registry.getAgentSessionsSettings(), {
     enabled: false,
     maxWaitSeconds: 600,
-    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    agentPromptsBeforeAsking: 30,
+    loopGuard: { off: [] },
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 },
     maxActiveSessions: 4,
   });
   assert.deepEqual(events, [], 'reading emits nothing');
@@ -726,4 +728,111 @@ test('a boot that did not move the token out of the config converts nothing and 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─── The loop guard as a setting ─────────────────────────────────────────────
+
+function loopGuardSetup({ live = () => true, settings = {} } = {}) {
+  const store = createSettingsStore(settings);
+  const events = [];
+  let tick = 0;
+  const registry = createRemoteRelayRegistry({
+    readSetting: store.readSetting,
+    writeSetting: store.writeSetting,
+    client: createFakeClient({}),
+    now: () => new Date(Date.UTC(2026, 10, 14, 10, 0, tick++)),
+    emit: (event, payload) => events.push({ event, payload }),
+    logger: { warn() {} },
+    isLiveConversation: (id) => live(id),
+  });
+  return { registry, store, events };
+}
+
+test('the loop guard limit is 30 by default; 0 and 500 are stored, and the event carries the number', () => {
+  const { registry, store, events } = loopGuardSetup();
+  assert.equal(registry.getAgentSessionsSettings().agentPromptsBeforeAsking, 30);
+  for (const value of [0, 500, 10]) {
+    const saved = registry.setAgentSessionsSettings({ agentPromptsBeforeAsking: value });
+    assert.equal(saved.ok, true);
+    assert.equal(saved.agentPromptsBeforeAsking, value);
+    assert.equal(store.values.get(REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking), String(value));
+    assert.equal(events.at(-1).event, AGENT_SESSIONS_SOCKET_EVENT);
+    assert.equal(events.at(-1).payload.agentPromptsBeforeAsking, value);
+  }
+});
+
+test('a loop guard limit outside 0 or 10–500 in steps of 10 is refused with 400, and nothing is stored', () => {
+  const { registry, store, events } = loopGuardSetup();
+  for (const value of [7, 505, 15, -10, '30', 30.5, null]) {
+    const refused = registry.setAgentSessionsSettings({ enabled: true, agentPromptsBeforeAsking: value });
+    assert.equal(refused.ok, false, JSON.stringify(value));
+    assert.equal(refused.status, 400);
+    assert.match(refused.error, /agentPromptsBeforeAsking must be 0 \(never ask\) or a whole number from 10 to 500, in steps of 10/);
+  }
+  for (const loopGuardOff of [{}, { revoke: 'c-1' }, { revoke: [''] }, { revoke: [3] }]) {
+    assert.equal(registry.setAgentSessionsSettings({ loopGuardOff }).status, 400, JSON.stringify(loopGuardOff));
+  }
+  assert.equal(store.values.size, 0);
+  assert.deepEqual(events, []);
+  // A stored value the relay did not write reads as the default.
+  const read = (value) => loopGuardSetup({ settings: { [REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking]: value } }).registry.getAgentSessionsSettings().agentPromptsBeforeAsking;
+  assert.equal(read('0'), 0);
+  assert.equal(read('120'), 120);
+  assert.equal(read('"120"'), 30);
+  assert.equal(read('7'), 30);
+});
+
+test('the off-list: set, list, revoke through the settings route and directly, carry on a compaction', () => {
+  const { registry, store, events } = loopGuardSetup();
+  assert.equal(registry.isLoopGuardOff('c-lead'), false);
+  assert.equal(registry.setLoopGuardOff('c-lead', { title: 'Lead <b>' }), true);
+  registry.setLoopGuardOff('c-other', { title: 'Other' });
+  assert.equal(registry.isLoopGuardOff('c-lead'), true);
+  assert.equal(events.at(-1).event, AGENT_SESSIONS_SOCKET_EVENT, 'the settings page hears of it');
+  const off = registry.getAgentSessionsSettings().loopGuard.off;
+  assert.deepEqual(off.map((entry) => [entry.conversationId, entry.title]), [['c-other', 'Other'], ['c-lead', 'Lead <b>']], 'newest first');
+  assert.match(off[1].since, /^2026-11-14T10:00:0\dZ$|^2026-11-14T10:00:0\d\.000Z$/);
+  assert.deepEqual(Object.keys(JSON.parse(store.values.get(REMOTE_RELAY_SETTING_KEYS.loopGuardOff))).sort(), ['c-lead', 'c-other']);
+
+  const revoked = registry.setAgentSessionsSettings({ loopGuardOff: { revoke: ['c-other', 'c-unknown'] } });
+  assert.equal(revoked.ok, true);
+  assert.deepEqual(revoked.loopGuard.off.map((entry) => entry.conversationId), ['c-lead']);
+  assert.equal(registry.isLoopGuardOff('c-other'), false);
+
+  const since = registry.getAgentSessionsSettings().loopGuard.off[0].since;
+  assert.equal(registry.carryLoopGuardOff('c-lead', 'c-lead-2', { title: 'Lead (compacted)' }), true);
+  assert.equal(registry.isLoopGuardOff('c-lead'), false);
+  assert.deepEqual(registry.getAgentSessionsSettings().loopGuard.off, [{ conversationId: 'c-lead-2', title: 'Lead (compacted)', since }]);
+  assert.equal(registry.carryLoopGuardOff('c-none', 'c-x'), false, 'nothing to carry');
+
+  assert.equal(registry.revokeLoopGuardOff(['c-lead-2']), 1);
+  assert.deepEqual(registry.getAgentSessionsSettings().loopGuard.off, []);
+});
+
+test('the off-list drops archived and deleted conversations on read, keeps them when the lookup fails, and holds 200', () => {
+  const gone = new Set();
+  let failing = false;
+  const { registry, store } = loopGuardSetup({
+    live: (id) => {
+      if (failing) throw new Error('database busy');
+      return !gone.has(id);
+    },
+  });
+  registry.setLoopGuardOff('c-lead', { title: 'Lead' });
+  registry.setLoopGuardOff('c-archived', { title: 'Archived' });
+  gone.add('c-archived');
+  failing = true;
+  assert.equal(registry.getAgentSessionsSettings().loopGuard.off.length, 2, 'an unreadable lookup drops nothing');
+  failing = false;
+  assert.deepEqual(registry.getAgentSessionsSettings().loopGuard.off.map((entry) => entry.conversationId), ['c-lead']);
+  assert.equal(registry.isLoopGuardOff('c-archived'), false);
+  assert.deepEqual(Object.keys(JSON.parse(store.values.get(REMOTE_RELAY_SETTING_KEYS.loopGuardOff))), ['c-lead'], 'stored without it');
+
+  for (let index = 0; index < 205; index += 1) registry.setLoopGuardOff(`c-${index}`, { title: `S ${index}` });
+  const off = registry.getAgentSessionsSettings().loopGuard.off;
+  assert.equal(off.length, 200);
+  assert.equal(off[0].conversationId, 'c-204', 'the newest kept');
+  assert.equal(registry.isLoopGuardOff('c-lead'), false, 'the oldest dropped');
+  assert.equal(registry.isLoopGuardOff('c-4'), false);
+  assert.equal(registry.isLoopGuardOff('c-5'), true);
 });

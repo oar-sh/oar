@@ -220,9 +220,9 @@ export function normalizeCopilotWorkerUsage(raw) {
  *
  * The snapshot is written per turn and never expires on its own, so without a
  * cutoff a card would keep presenting one turn's numbers as current forever —
- * including after the relay is switched back to the extension engine, where no
- * new snapshot will ever arrive to replace it. A week is long enough to survive
- * a holiday and short enough that nothing on the card is quietly ancient.
+ * including when no new SDK worker turn ever arrives to replace it. A week is
+ * long enough to survive a holiday and short enough that nothing on the card
+ * is quietly ancient.
  */
 export const COPILOT_WORKER_USAGE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -253,7 +253,7 @@ function formatSnapshotAge(capturedAt, now) {
  * Additive by design: the meters above come from the account-level quota API
  * and are already correct for SDK sessions (they spend the same account's
  * allowance), so this only adds the per-turn detail no relay-side source can
- * see. Absent — extension engine, no turn yet, or a snapshot older than
+ * see. Absent — no turn yet, or a snapshot older than
  * `COPILOT_WORKER_USAGE_MAX_AGE_MS` — the card renders exactly as it did before.
  *
  * The section always says WHEN it was captured. These are one turn's numbers,

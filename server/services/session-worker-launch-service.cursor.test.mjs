@@ -79,13 +79,13 @@ test('disabled claude applier does not clear the cursor worker kind', () => {
   assert.equal('CLAUDE_RELAY_MODEL' in env, false);
 });
 
-test('resolveWorkerKind normalizes known kinds and defaults to copilot', () => {
+test('resolveWorkerKind normalizes known kinds and answers none for the rest', () => {
   assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'cursor' }), 'cursor');
   assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: ' Cursor ' }), 'cursor');
   assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'claude' }), 'claude');
-  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'mystery' }), 'copilot');
-  assert.equal(resolveWorkerKind({}), 'copilot');
-  assert.equal(resolveWorkerKind(), 'copilot');
+  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'mystery' }), '');
+  assert.equal(resolveWorkerKind({}), '');
+  assert.equal(resolveWorkerKind(), '');
   assert.equal(isCursorWorkerEnvironment({ COPILOT_WEB_RELAY_WORKER_KIND: 'cursor' }), true);
   assert.equal(isCursorWorkerEnvironment({ COPILOT_WEB_RELAY_WORKER_KIND: 'claude' }), false);
 });
@@ -358,48 +358,6 @@ const HOST_FAMILY_UNSET = "for oar_host_var in $(env | sed -n 's/^\\([A-Za-z_][A
   + 'CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS|CLAUDE_AGENT_SDK_VERSION|CLAUDE_AGENT_SDK_CLIENT_APP|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_PROJECT_DIR|CLAUDE_ENV_FILE|'
   + 'CLAUDE_CODE_SESSION_*|CLAUDE_CODE_*_SESSION_ID|CLAUDE_CODE_MESSAGING_*) unset "$oar_host_var";; esac; done; unset oar_host_var; ';
 
-test('copilot tmux command output is byte-identical: the unset prefix, then the pre-cursor exports and exec', () => {
-  const command = buildTmuxWorkerShellCommand('session-2', {
-    COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/bin/copilot',
-    COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
-    COPILOT_WEB_RELAY_NODE: '/opt/node/bin/node',
-  });
-  assert.equal(
-    command,
-    // The unset prefix, written out: the host Claude session's variables
-    // (HOST_CLAUDE_SESSION_ENV_VARS), the inherited worker log file
-    // (WORKER_LOG_FILE_ENV),
-    "unset CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN "
-    + "CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ATTENDED CLAUDE_CODE_EXECPATH "
-    + "CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS CLAUDE_AGENT_SDK_VERSION CLAUDE_AGENT_SDK_CLIENT_APP CLAUDE_PID CLAUDE_EFFORT "
-    + "CLAUDE_PROJECT_DIR CLAUDE_ENV_FILE "
-    + "COPILOT_WEB_RELAY_WORKER_LOG_FILE "
-    // every per-launch variable (TMUX_WORKER_EXPORTED_ENV_VARS) this launch
-    // exports no value for,
-    + "COPILOT_ALLOW_ALL GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS COPILOT_WEB_RELAY_ROOT COPILOT_WEB_RELAY_SERVER_DIR "
-    + "COPILOT_WEB_RELAY_TOOLS COPILOT_WEB_RELAY_LOG_DIR COPILOT_WEB_RELAY_DATA_DIR "
-    + "COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH COPILOT_SDK_PATH EXTENSION_PATH COPILOT_PROVIDER_TYPE "
-    + "COPILOT_PROVIDER_BASE_URL COPILOT_PROVIDER_WIRE_API COPILOT_MODEL COPILOT_WEB_RELAY_WORKER_KIND "
-    + "COPILOT_RELAY_MODEL COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_PROVIDER_MAX_OUTPUT_TOKENS "
-    + "CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE CLAUDE_RELAY_MODEL CLAUDE_CLOUD_RELAY_MODEL "
-    + "OAR_CLAUDE_CLOUD_API_BASE_URL CURSOR_RELAY_MODEL CURSOR_AGENT_STORE_DIR DEEPSEEK_RELAY_MODEL "
-    + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR CLAUDE_API_RELAY_MODEL OAR_ANTHROPIC_API_BASE_URL "
-    + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
-    + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED OAR_AGENT_SDK_DIR_CLAUDE OAR_AGENT_SDK_DIR_CURSOR COPILOT_WORKSPACE_ROOT INIT_CWD "
-    // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
-    + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY OAR_AGENT_TOKEN CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
-    + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "
-    // Then the host session's variables by family, from whatever the shell holds.
-    + HOST_FAMILY_UNSET
-    + "export COPILOT_WEB_RELAY_CONFIG='/repo/server/config.json'; "
-    + "export COPILOT_WEB_RELAY_CLI_EXECUTABLE='/usr/bin/copilot'; "
-    + "export SESSION_ID='session-2'; "
-    // The CLI is a Node program too: the relay's Node folder ends its PATH.
-    + `case ":$PATH:" in *:'/opt/node/bin':*) ;; *) PATH="$PATH:"'/opt/node/bin';; esac; export PATH; `
-    + "exec script -q -c ''\\''/usr/bin/copilot'\\'' --allow-all --session-id '\\''session-2'\\''' /dev/null",
-  );
-});
-
 test('claude tmux command output is byte-identical: the unset prefix, then the pre-cursor exports and exec', () => {
   const command = buildTmuxWorkerShellCommand('session-1', {
     COPILOT_WEB_RELAY_WORKER_KIND: 'claude',
@@ -421,16 +379,16 @@ test('claude tmux command output is byte-identical: the unset prefix, then the p
     + "COPILOT_WEB_RELAY_WORKER_LOG_FILE "
     // every per-launch variable (TMUX_WORKER_EXPORTED_ENV_VARS) this launch
     // exports no value for,
-    + "COPILOT_ALLOW_ALL GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS COPILOT_WEB_RELAY_SERVER_DIR "
-    + "COPILOT_WEB_RELAY_TOOLS COPILOT_WEB_RELAY_LOG_DIR COPILOT_WEB_RELAY_DATA_DIR COPILOT_WEB_RELAY_CLI_EXECUTABLE "
-    + "COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH COPILOT_SDK_PATH EXTENSION_PATH COPILOT_PROVIDER_TYPE "
+    + "COPILOT_ALLOW_ALL COPILOT_WEB_RELAY_SERVER_DIR "
+    + "COPILOT_WEB_RELAY_TOOLS COPILOT_WEB_RELAY_LOG_DIR COPILOT_WEB_RELAY_DATA_DIR "
+    + "COPILOT_SDK_PATH COPILOT_PROVIDER_TYPE "
     + "COPILOT_PROVIDER_BASE_URL COPILOT_PROVIDER_WIRE_API COPILOT_MODEL "
     + "COPILOT_RELAY_MODEL COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_PROVIDER_MAX_OUTPUT_TOKENS "
     + "CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECUTABLE CLAUDE_CLOUD_RELAY_MODEL "
     + "OAR_CLAUDE_CLOUD_API_BASE_URL CURSOR_RELAY_MODEL CURSOR_AGENT_STORE_DIR DEEPSEEK_RELAY_MODEL "
     + "DEEPSEEK_BASE_URL DEEPSEEK_CLAUDE_CONFIG_DIR CLAUDE_API_RELAY_MODEL OAR_ANTHROPIC_API_BASE_URL "
     + "GROK_RELAY_MODEL GROK_CLI_COMMAND GROK_ALWAYS_APPROVE "
-    + "OAR_MCP_SERVER OAR_MCP_SERVER_ATTACHED OAR_AGENT_SDK_DIR_CLAUDE OAR_AGENT_SDK_DIR_CURSOR COPILOT_WORKSPACE_ROOT INIT_CWD "
+    + "OAR_MCP_SERVER OAR_AGENT_SDK_DIR_CLAUDE OAR_AGENT_SDK_DIR_CURSOR COPILOT_WORKSPACE_ROOT INIT_CWD "
     // and every secret (WORKER_SECRET_ENV_VARS) it carries no value for.
     + "COPILOT_PROVIDER_API_KEY CURSOR_API_KEY OAR_AGENT_TOKEN CLAUDE_CODE_OAUTH_TOKEN DEEPSEEK_API_KEY OAR_CLAUDE_API_KEY "
     + "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; "

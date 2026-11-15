@@ -526,7 +526,7 @@ test('a columns chart: one column per item stacked by series, a text equivalent 
   assert.match(html, /class="plan-usage-chart-label">Daily spend, last 3 days</);
   assert.match(html, /style="--plan-usage-columns:3"/);
   // Each column says what it holds; an empty day says so.
-  assert.match(html, /class="plan-usage-chart-col" tabindex="0" aria-label="Aug 6: \$3\.00 \(Model A \$1\.00 \(33%\), Model B \$2\.00 \(67%\)\)" data-item="2026-08-06"/);
+  assert.match(html, /class="plan-usage-chart-col plan-usage-chart-col-start" tabindex="0" aria-label="Aug 6: \$3\.00 \(Model A \$1\.00 \(33%\), Model B \$2\.00 \(67%\)\)" data-item="2026-08-06"/);
   assert.match(html, /class="plan-usage-chart-col plan-usage-chart-col-empty" tabindex="0" aria-label="Aug 7: nothing"/);
   assert.match(html, /aria-label="Aug 8: \$4\.01 \(Model A \$4\.00 \(100%\), Model B \$0\.0050 \(0%\)\)"/);
   // Heights are shares of the tallest column; colours come from the theme's series variables in order.
@@ -536,7 +536,9 @@ test('a columns chart: one column per item stacked by series, a text equivalent 
   // A zero segment is not drawn.
   assert.equal((html.match(/plan-usage-chart-seg/g) || []).length, 4);
   assert.match(html, /<span class="plan-usage-chart-tip" role="tooltip">Aug 6: \$3\.00/);
-  assert.match(html, /<ul class="plan-usage-chart-legend"><li><span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-1\)" aria-hidden="true"><\/span>Model A<\/li><li>[^<]*<span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-2\)" aria-hidden="true"><\/span>Model B<\/li><\/ul>/);
+  // The legend gives each series' total in the window; above the plot, the peak day and the total.
+  assert.match(html, /<ul class="plan-usage-chart-legend"><li><span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-1\)" aria-hidden="true"><\/span>Model A<span class="plan-usage-chart-legend-value">\$5\.00<\/span><\/li><li>[^<]*<span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-2\)" aria-hidden="true"><\/span>Model B<span class="plan-usage-chart-legend-value">\$2\.0\d<\/span><\/li><\/ul>/);
+  assert.match(html, /<div class="plan-usage-chart-scale"><span>Peak \$4\.0\d · Aug 8<\/span><span>Total \$7\.0\d<\/span><\/div>/);
   assert.match(html, /class="plan-usage-chart-axis" aria-hidden="true"><span>Aug 6<\/span><span>Aug 8<\/span>/);
   assert.match(html, /class="plan-usage-meter-note">Estimated, by UTC day\.</);
   // The table has the same numbers, without the empty day.
@@ -575,6 +577,82 @@ test('a bars chart: one row per item with its shares, the total beside it, and a
   const none = renderPlanUsageHtml(report({ meters: [], charts: [{ ...chart, items: [] }, { ...chart, series: [] }, null] }), { now: NOW });
   assert.doesNotMatch(none, /plan-usage-chart/);
   assert.doesNotMatch(renderPlanUsageHtml(report(), { now: NOW }), /plan-usage-chart/);
+});
+
+test('a bars chart: every bar against the largest, so a smaller total draws a shorter bar', () => {
+  const chart = {
+    id: 'shares',
+    label: 'Where the money goes',
+    kind: 'bars',
+    unit: 'usd',
+    series: [{ key: 'hit', label: 'Cache hit' }, { key: 'miss', label: 'Cache miss' }],
+    items: [
+      { key: 'flash', label: 'Flash', values: { hit: 1, miss: 3 } },
+      { key: 'pro', label: 'Pro', values: { hit: 0.5, miss: 0.5 } },
+    ],
+  };
+  const html = renderPlanUsageHtml(report({ meters: [], charts: [chart] }), { now: NOW });
+  assert.match(html, /data-series="hit" style="width:25\.00%;[^"]*" title="Cache hit \$1\.00"/);
+  assert.match(html, /data-series="miss" style="width:75\.00%;[^"]*" title="Cache miss \$3\.00"/);
+  assert.match(html, /data-series="hit" style="width:12\.50%;[^"]*" title="Cache hit \$0\.50"/);
+  assert.match(html, /data-series="miss" style="width:12\.50%;[^"]*" title="Cache miss \$0\.50"/);
+});
+
+test('a share chart: one line cut by model, largest first and "Other models" last, each in its series colour, with a list of amounts and shares', () => {
+  const chart = {
+    id: 'claude-spend-shares-30d',
+    label: 'Where it would go at API prices, last 30 days',
+    kind: 'share',
+    unit: 'usd',
+    windowDays: 30,
+    series: [
+      { key: 'model:Fable 5.2', label: 'Fable 5.2' },
+      { key: 'model:Haiku 5.5', label: 'Haiku 5.5' },
+      { key: 'model:Opus 5.5', label: 'Opus 5.5' },
+      { key: 'other', label: 'Other models' },
+    ],
+    items: [{ key: 'last-30d', label: 'Last 30 days', values: { 'model:Fable 5.2': 190, 'model:Haiku 5.5': 0, 'model:Opus 5.5': 1700, other: 110 } }],
+    note: "Claude Code's figure at API prices; the subscription is billed flat, this is not charged.",
+  };
+  const html = renderPlanUsageHtml(report({ meters: [], charts: [chart] }), { now: NOW, chartWindow: 30 });
+  assert.match(html, /<figure class="plan-usage-chart plan-usage-chart-kind-share" data-chart-id="claude-spend-shares-30d" role="group" aria-label="Where it would go at API prices, last 30 days" data-window="30">/);
+  // One line; each part as long as its share of the total, in the colour its series has in the daily chart.
+  assert.match(html, /<div class="plan-usage-chart-strip" role="img" aria-label="Last 30 days: \$2000\.00; Opus 5\.5 \$1700\.00 \(85%\), Fable 5\.2 \$190\.00 \(10%\), Other models \$110\.00 \(6%\)">/);
+  const segs = [...html.matchAll(/class="plan-usage-chart-seg" data-series="([^"]+)" style="width:([\d.]+)%;background:var\(--plan-usage-series-(\d)\)"/g)].map((m) => [m[1], m[2], m[3]]);
+  assert.deepEqual(segs, [['model:Opus 5.5', '85.00', '3'], ['model:Fable 5.2', '9.50', '1']]);
+  // "Other models" is grey, wherever it sits.
+  assert.match(html, /data-series="other" style="width:5\.50%;background:var\(--plan-usage-series-other\)"/);
+  // A model with nothing draws no part and no row.
+  assert.doesNotMatch(html, /Haiku 5\.5/);
+  // The list is the legend: swatch, name, amount, share.
+  assert.match(html, /<li data-series="model:Opus 5\.5"><span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-3\)" aria-hidden="true"><\/span><span class="plan-usage-chart-share-name">Opus 5\.5<\/span><span class="plan-usage-chart-share-value">\$1700\.00<\/span><span class="plan-usage-chart-share-pct">85%<\/span><\/li>/);
+  assert.doesNotMatch(html, /plan-usage-chart-legend|plan-usage-chart-bars|plan-usage-chart-row/);
+  assert.match(html, /class="plan-usage-meter-note">Claude Code&#39;s figure at API prices/);
+  assert.match(html, /<tr><th scope="row">Total<\/th><td class="plan-usage-detail-value">\$2000\.00<\/td><td class="plan-usage-detail-value">100%<\/td><\/tr>/);
+  // A part under 1% says so; a share with nothing in it draws nothing.
+  const tiny = renderPlanUsageHtml(report({ meters: [], charts: [{ ...chart, items: [{ ...chart.items[0], values: { 'model:Opus 5.5': 999, 'model:Fable 5.2': 1 } }] }] }), { now: NOW, chartWindow: 30 });
+  assert.match(tiny, /<span class="plan-usage-chart-share-pct">&lt;1%<\/span>/);
+  const empty = renderPlanUsageHtml(report({ meters: [], charts: [{ ...chart, items: [{ ...chart.items[0], values: {} }] }] }), { now: NOW, chartWindow: 30 });
+  assert.doesNotMatch(empty, /plan-usage-chart-kind-share/);
+});
+
+test('series colours: eight in a fixed order, then grey; "other" is grey wherever it sits', () => {
+  const series = Array.from({ length: 10 }, (_, index) => ({ key: `model:m${index}`, label: `M${index}` }));
+  const chart = {
+    id: 'many',
+    label: 'Where the money goes, last 30 days',
+    kind: 'share',
+    unit: 'usd',
+    series,
+    items: [{ key: 'last-30d', label: 'Last 30 days', values: Object.fromEntries(series.map((entry, index) => [entry.key, 20 - index])) }],
+  };
+  const html = renderPlanUsageHtml(report({ meters: [], charts: [chart] }), { now: NOW });
+  const colours = [...html.matchAll(/<li data-series="model:m(\d)"><span class="plan-usage-chart-swatch" style="background:var\(--plan-usage-series-([\w]+)\)"/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(colours, [['0', '1'], ['1', '2'], ['2', '3'], ['3', '4'], ['4', '5'], ['5', '6'], ['6', '7'], ['7', '8'], ['8', 'other'], ['9', 'other']]);
+  // Every model is listed and in the table, none folded away.
+  assert.equal((html.match(/<th scope="row">M\d<\/th>/g) || []).length, 10);
+  const daily = renderPlanUsageHtml(report({ meters: [], charts: [{ id: 'd', label: 'Daily', kind: 'columns', unit: 'usd', series: [{ key: 'model:a', label: 'A' }, { key: 'other', label: 'Other models' }], items: [{ key: '2026-08-08', label: 'Aug 8', values: { 'model:a': 1, other: 1 } }] }] }), { now: NOW });
+  assert.match(daily, /data-series="other" style="height:[\d.]+%;background:var\(--plan-usage-series-other\)"/);
 });
 
 test('a note with a label and a value is a row of figures; on a card with figures the sentences follow the tables', () => {
@@ -671,4 +749,113 @@ test('the OpenAI images card draws its meter, figures and badges from the spend 
   assert.match(reached, /Cap reached/);
   assert.match(reached, /Daily image cap reached/);
   assert.equal(normalizeUsageProvider('openai-image'), 'openai');
+});
+
+test('the tokens unit: 999, 12.3k, 4.6M, 1.2B on the column, the tooltip, the bar total and the table', () => {
+  assert.deepEqual([999, 12_300, 4_600_000, 1_234_500_000, 0].map((value) => formatAmount(value, 'tokens')), ['999', '12.3k', '4.6M', '1.2B', '0']);
+  const daily = {
+    id: 'github-daily-tokens-7d',
+    label: 'Daily tokens, last 7 days',
+    kind: 'columns',
+    unit: 'tokens',
+    windowDays: 7,
+    series: [{ key: 'model:a', label: 'Opus 5.5' }, { key: 'model:b', label: 'GPT' }],
+    items: [{ key: '2026-08-08', label: 'Aug 8', values: { 'model:a': 1_200_000_000, 'model:b': 999 } }],
+  };
+  const split = {
+    id: 'github-token-shares-7d',
+    label: 'Where the tokens go, last 7 days',
+    kind: 'bars',
+    unit: 'tokens',
+    windowDays: 7,
+    series: [{ key: 'inputTokens', label: 'Fresh input' }, { key: 'cacheReadTokens', label: 'Cache reads' }],
+    items: [{ key: 'Opus 5.5', label: 'Opus 5.5', values: { inputTokens: 12_300, cacheReadTokens: 4_600_000 } }],
+  };
+  const html = renderPlanUsageHtml(report({ meters: [], charts: [daily, split] }), { now: NOW, chartWindow: 7 });
+  assert.match(html, /class="plan-usage-chart-col plan-usage-chart-col-start" tabindex="0" aria-label="Aug 8: 1\.2B tokens \(Opus 5\.5 1\.2B tokens \(100%\), GPT 999 tokens \(0%\)\)"/);
+  assert.match(html, /<span class="plan-usage-chart-tip" role="tooltip">Aug 8: 1\.2B tokens \(Opus 5\.5 1\.2B tokens/);
+  assert.match(html, /class="plan-usage-chart-row-value">4\.6M tokens</);
+  assert.match(html, /title="Fresh input 12\.3k tokens"/);
+  assert.match(html, /<td class="plan-usage-detail-value">1\.2B tokens<\/td>/);
+});
+
+const windowChart = (windowDays, extra = {}) => ({
+  id: `grok-daily-spend-${windowDays}d`,
+  label: `Daily spend, last ${windowDays} days`,
+  kind: 'columns',
+  unit: 'usd',
+  windowDays,
+  series: [{ key: 'model:grok-5', label: 'grok-5' }],
+  items: [{ key: '2026-08-08', label: 'Aug 8', values: { 'model:grok-5': windowDays / 10 } }],
+  ...extra,
+});
+
+test('the window picker: on a card with windowed charts only, the picked window shown, the others hidden', () => {
+  const charts = [windowChart(7), windowChart(30), windowChart(90)];
+  const html = renderPlanUsageHtml(multiReport(
+    { provider: 'grok', label: 'Grok', charts },
+    { provider: 'cursor', label: 'Cursor', charts: [] },
+  ), { now: NOW, activeProvider: 'grok', chartWindow: 30 });
+  const grok = panelHtml(html, 'grok');
+  assert.match(grok, /<div class="plan-usage-charts" data-chart-window="30">/);
+  assert.match(grok, /<fieldset class="plan-usage-chart-window">\s*<legend class="plan-usage-chart-window-legend">Window<\/legend>/);
+  assert.deepEqual([...grok.matchAll(/<input type="radio" name="plan-usage-chart-window-grok" value="(\d+)"( checked)?>/g)].map((match) => [match[1], Boolean(match[2])]), [
+    ['7', false], ['30', true], ['90', false],
+  ]);
+  assert.match(grok, /<label><input type="radio" name="plan-usage-chart-window-grok" value="7"><span>7 days<\/span><\/label>/);
+  assert.match(grok, /data-chart-id="grok-daily-spend-7d" role="group" aria-label="Daily spend, last 7 days" data-window="7" hidden>/);
+  assert.match(grok, /data-chart-id="grok-daily-spend-30d" role="group" aria-label="Daily spend, last 30 days" data-window="30">/);
+  assert.match(grok, /data-chart-id="grok-daily-spend-90d" role="group" aria-label="Daily spend, last 90 days" data-window="90" hidden>/);
+  assert.doesNotMatch(grok, /Nothing to chart in the last/);
+  // No windowed charts, no picker.
+  assert.doesNotMatch(panelHtml(html, 'cursor'), /plan-usage-chart-window|plan-usage-charts/);
+  // Another window picked: its charts show.
+  const ninety = panelHtml(renderPlanUsageHtml(multiReport({ provider: 'grok', label: 'Grok', charts }), { now: NOW, chartWindow: 90 }), 'grok');
+  assert.match(ninety, /value="90" checked>/);
+  assert.match(ninety, /data-window="90">/);
+  assert.match(ninety, /data-window="30" hidden>/);
+  // A bad window falls back to the stored one (none in Node: 30).
+  assert.match(renderPlanUsageHtml(multiReport({ provider: 'grok', label: 'Grok', charts }), { now: NOW, chartWindow: 31 }), /value="30" checked>/);
+});
+
+test('a chart without a window is never hidden; an empty window says so and keeps the picker', () => {
+  const allTime = { id: 'deepseek-spend-shares', label: 'Where the money goes', kind: 'bars', unit: 'usd', series: [{ key: 'miss', label: 'Cache miss' }], items: [{ key: 'flash', label: 'Flash', values: { miss: 1 } }] };
+  const html = renderPlanUsageHtml(multiReport({ provider: 'deepseek', label: 'DeepSeek', charts: [windowChart(30), windowChart(90), allTime] }), { now: NOW, chartWindow: 7 });
+  assert.match(html, /data-chart-id="deepseek-spend-shares" role="group" aria-label="Where the money goes">/);
+  assert.match(html, /value="7" checked>/);
+  assert.match(html, /<div class="plan-usage-chart-empty plan-usage-meter-note" data-window="7">Nothing to chart in the last 7 days\.<\/div>/);
+  assert.doesNotMatch(html, /data-window="30">/);
+  // Picked 30: the empty line is there for 7, hidden.
+  const thirty = renderPlanUsageHtml(multiReport({ provider: 'deepseek', label: 'DeepSeek', charts: [windowChart(30), windowChart(90)] }), { now: NOW, chartWindow: 30 });
+  assert.match(thirty, /data-window="7" hidden>Nothing to chart in the last 7 days\./);
+  // A report kept from before windows: no picker, charts as before.
+  const old = renderPlanUsageHtml(multiReport({ provider: 'grok', label: 'Grok', charts: [{ ...windowChart(30), windowDays: undefined }] }), { now: NOW });
+  assert.doesNotMatch(old, /plan-usage-chart-window|data-window/);
+  assert.match(old, /data-chart-id="grok-daily-spend-30d" role="group" aria-label="Daily spend, last 30 days">/);
+});
+
+test('the picker and its charts are escaped', () => {
+  const html = renderPlanUsageHtml(multiReport({ provider: 'x"<y>', label: 'X', charts: [windowChart(30, { id: 'c"<1>', label: 'L <b>' })] }), { now: NOW, chartWindow: 30 });
+  assert.match(html, /name="plan-usage-chart-window-x&quot;&lt;y&gt;"/);
+  assert.match(html, /data-chart-id="c&quot;&lt;1&gt;" role="group" aria-label="L &lt;b&gt;" data-window="30">/);
+  assert.doesNotMatch(html, /<b>|<y>/);
+});
+
+test('a column in the first or last fifth opens its tooltip towards the middle, at 7, 30 and 90 days', () => {
+  const edgesOf = (count) => {
+    const items = Array.from({ length: count }, (_, index) => ({ key: `d${index}`, label: `D${index}`, values: { a: index % 2 } }));
+    const html = renderPlanUsageHtml(report({ meters: [], charts: [{ id: 'c', label: 'C', kind: 'columns', unit: 'usd', series: [{ key: 'a', label: 'A' }], items }] }), { now: NOW });
+    return [...html.matchAll(/class="plan-usage-chart-col(?: plan-usage-chart-col-empty)?( plan-usage-chart-col-(start|end))?" tabindex="0" aria-label="[^"]*" data-item="d(\d+)"/g)]
+      .map((match) => match[2] || 'middle');
+  };
+  const runs = (edges) => ['start', 'middle', 'end'].map((name) => edges.filter((edge) => edge === name).length);
+  // A fifth, rounded up, at each end.
+  assert.deepEqual(edgesOf(7), ['start', 'start', 'middle', 'middle', 'middle', 'end', 'end']);
+  assert.deepEqual(runs(edgesOf(30)), [6, 18, 6]);
+  assert.deepEqual(runs(edgesOf(90)), [18, 54, 18]);
+  // In order: the starts first, the ends last.
+  const ninety = edgesOf(90);
+  assert.deepEqual([ninety[17], ninety[18], ninety[71], ninety[72]], ['start', 'middle', 'middle', 'end']);
+  // A single column is a start.
+  assert.deepEqual(edgesOf(1), ['start']);
 });

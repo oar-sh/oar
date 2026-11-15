@@ -1,6 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The red "ran on <provider>" chip, owner view against shared view.
@@ -14,20 +18,13 @@ import { relayToken, relayDbPath } from "./e2e-env.mjs";
  */
 
 async function seedTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok(), `POST /api/message answered ${queued.status()}`).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const userId = String(body?.messageId || "").trim();
+  // Made as the web client makes a chat: bootstrap binds it to the Copilot
+  // provider (the model's), which the spec then rewrites in the database.
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "").trim();
   expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId: userId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   const loaded = await request.get(`/api/conversation/${conversationId}`, { headers });
   const replyId = String((await loaded.json()).messages.find((message) => message.role === "assistant")?.id || "");
   expect(replyId).toBeTruthy();

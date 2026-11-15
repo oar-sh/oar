@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { STEER_FOLDED_TEXT } from "../shared/steer-settle-markers.mjs";
-import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { startRelayServer } from "./relay-server-harness.mjs";
+import { createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Agent exchanges, end to end without a model: a prompt another agent sent
@@ -17,9 +21,10 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  * A relay of the spec's own (the agent-sessions setting is switched on here).
  * No worker runs: the spec queues messages with POST /api/message (another
  * relay's agent's prompt carries its `origin` there), takes them off the
- * queue with GET /api/pending and answers with POST /api/response, as a
- * worker does. The prompt of an agent on this relay comes through the
- * relay_tool tool route, from a conversation whose turn is running.
+ * queue and answers them as their session's worker
+ * (helpers/fake-worker.mjs). The prompt of an agent on this relay comes
+ * through the relay_tool tool route, from a conversation whose turn is
+ * running.
  */
 
 const REMOTE_ORIGIN = {
@@ -55,6 +60,7 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
 
   let relay = null;
   const api = createApi(() => relay);
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   let session = "";
   let sessionOwner = "";
   let orchestrator = "";
@@ -70,22 +76,11 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
   // What a worker does to start a turn. Only the message asked for is ever
   // pending when this runs, so the dequeue can return nothing else.
   async function take(messageId, owner = sessionOwner) {
-    const headers = owner ? { "x-relay-session-id": String(owner) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      const handed = String(dequeued.payload?.message?.id || "");
-      if (handed === messageId) return;
-      if (handed) throw new Error(`The queue handed out ${handed.slice(0, 8)} instead of ${messageId.slice(0, 8)}`);
-      await sleep(250);
-    }
-    throw new Error(`Message ${messageId.slice(0, 8)} was never handed out`);
+    await createFakeWorker({ ...onRelay, sessionId: owner }).take(messageId);
   }
 
   async function answer(messageId, text, extra = {}) {
-    const posted = await api("/api/response", {
-      method: "POST",
-      body: { messageId, conversationId: session, text, model: "gpt-5.4-mini", ...extra },
-    });
+    const posted = await respondAsWorker(messageId, { conversationId: session, text, model: "gpt-5.4-mini", ...extra });
     expect(posted.status, JSON.stringify(posted.payload)).toBe(200);
     expect(posted.payload?.ignored, JSON.stringify(posted.payload)).toBeUndefined();
   }
@@ -95,12 +90,10 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
     expect((await api("/api/settings/pwa-app-name", { method: "POST", body: { appName: "linux-test" } })).status).toBe(200);
     expect((await api("/api/settings/agent-sessions", { method: "POST", body: { enabled: true } })).status).toBe(200);
 
-    // The user starts the session.
-    const first = await queue("report builder: collect the numbers");
+    // The user starts the session, as the web client does: bound from the start.
+    const first = await startConversation({ text: "report builder: collect the numbers" }, onRelay);
     session = first.conversationId;
     sessionOwner = first.ownerSessionId || "";
-    const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: session, conversation_id: session } });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
     ids.first = first.messageId;
     await take(ids.first);
     await answer(ids.first, "The numbers are collected.");
@@ -111,9 +104,8 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
     await answer(ids.remote, REMOTE_REPLY);
 
     // An agent on this relay prompts it, from a conversation whose turn runs.
-    const lead = await queue("nightly digest: ask the report builder for the totals");
+    const lead = await startConversation({ text: "nightly digest: ask the report builder for the totals" }, onRelay);
     orchestrator = lead.conversationId;
-    expect((await api("/api/session-sync", { method: "POST", body: { sdk_session_id: orchestrator, conversation_id: orchestrator } })).status).toBe(200);
     await take(lead.messageId, lead.ownerSessionId || "");
     const sent = await api("/api/remote-relays/tool", {
       method: "POST",
@@ -121,10 +113,7 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
     });
     expect(sent.status, JSON.stringify(sent.payload)).toBe(200);
     ids.local = sent.payload.message_id;
-    const leadAnswer = await api("/api/response", {
-      method: "POST",
-      body: { messageId: lead.messageId, conversationId: orchestrator, text: "Asked.", model: "gpt-5.4-mini" },
-    });
+    const leadAnswer = await respondAsWorker(lead.messageId, { conversationId: orchestrator, text: "Asked.", model: "gpt-5.4-mini" });
     expect(leadAnswer.status).toBe(200);
     await take(ids.local);
     await answer(ids.local, "Totals: 42 rows, 3 sheets.");
@@ -143,6 +132,7 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
     await take(ids.steeredHost);
     ids.steer = (await queue("and a column for May, please", { conversationId: session })).messageId;
     await answer(ids.steeredHost, "Totals row added, with a column for May.");
+    await take(ids.steer);
     await answer(ids.steer, STEER_FOLDED_TEXT, { kind: "folded" });
 
     // The other way round: an agent's prompt steered into the user's turn.
@@ -150,6 +140,7 @@ test.describe.serial("an agent's prompt folds into one row, the reply to it neve
     await take(ids.userHost);
     ids.agentSteer = (await queue("sidebar polish: use the dark palette", { conversationId: session, origin: REMOTE_ORIGIN })).messageId;
     await answer(ids.userHost, "The chart is drawn, in the dark palette.");
+    await take(ids.agentSteer);
     await answer(ids.agentSteer, STEER_FOLDED_TEXT, { kind: "folded" });
 
     // An agent's prompt whose turn is running when the page opens.

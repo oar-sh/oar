@@ -4,6 +4,10 @@ import http from "node:http";
 import { expect, test } from "@playwright/test";
 
 import { reserveFreePort, sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, completeTurn, createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Relay event subscriptions across two relays, end to end, without a model:
@@ -15,9 +19,9 @@ import { reserveFreePort, sleep, startRelayServer } from "./relay-server-harness
  * as event rows that A fetched. Both relays are the spec's own, so they can
  * be restarted on their state and the link between them cut.
  *
- * No worker runs: a "turn" is a message the spec took off the queue (GET
- * /api/pending) or answered (POST /api/response), which is what approval
- * cards and questions sit on and what ends a turn.
+ * No worker runs: a "turn" is a message the spec took off the queue or
+ * answered as the session's worker (helpers/fake-worker.mjs), which is what
+ * approval cards and questions sit on and what ends a turn.
  */
 
 const APPROVAL_TIMEOUT = 20_000;
@@ -25,7 +29,7 @@ const APPROVAL_TIMEOUT = 20_000;
 const GAP_WAIT_MS = 63_000;
 
 function createApi(getRelay) {
-  return async function api(route, { method = "GET", body, headers = {} } = {}) {
+  async function api(route, { method = "GET", body, headers = {} } = {}) {
     const relay = getRelay();
     const response = await fetch(`${relay.baseUrl}${route}`, {
       method,
@@ -34,7 +38,10 @@ function createApi(getRelay) {
     });
     const payload = await response.json().catch(() => null);
     return { status: response.status, payload };
-  };
+  }
+  // The same relay, for the worker the spec plays (helpers/fake-worker.mjs).
+  api.relay = { baseUrl: () => getRelay().baseUrl, token: () => getRelay().token };
+  return api;
 }
 
 async function waitFor(check, { timeout = 20_000, interval = 250, what = "the condition" } = {}) {
@@ -73,28 +80,16 @@ async function withCard(api, conversationId, calling, answer = "Allow") {
 // processing. Called while nothing else is queued on that relay, so the
 // dequeue can only return this message.
 async function conversationWithRunningTurn(api, text) {
-  const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const { conversationId, messageId, ownerSessionId } = queued.payload;
-  const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-  const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const dequeued = await api("/api/pending", { headers });
-    if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-    await sleep(250);
-  }
-  throw new Error("The message was never handed out");
+  const { conversationId, messageId, worker } = await startConversation({ text }, api.relay);
+  await worker.take(messageId);
+  return { conversationId, messageId };
 }
 
 /** A turn that starts and ends with a reply: turn_end for whoever watches. */
 async function finishTurn(api, conversationId, text, reply) {
   const queued = await api("/api/message", { method: "POST", body: { conversationId, text, relayMode: "agent", model: "gpt-5.4-mini" } });
   expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const done = await api("/api/response", {
-    method: "POST",
-    body: { messageId: queued.payload.messageId, conversationId, text: reply, model: "gpt-5.4-mini", mode: "agent" },
-  });
+  const done = await completeTurn(queued.payload, { text: reply, model: "gpt-5.4-mini", mode: "agent" }, { ...api.relay, stay: true });
   expect(done.status, JSON.stringify(done.payload)).toBe(200);
 }
 
@@ -102,6 +97,7 @@ function askQuestion(api, turn, prompt, choices = ["Yes", "No"]) {
   return api("/api/relay-question", {
     method: "POST",
     body: {
+      ...attemptOf(turn.messageId),
       queueId: turn.messageId,
       messageId: turn.messageId,
       conversationId: turn.conversationId,
@@ -207,7 +203,7 @@ test.describe.serial("relay event subscriptions across relays", () => {
     // Docs' first turn ends at once: its later turns are the spec's.
     const firstDocs = await conversationWithRunningTurn(apiB, titles.docs);
     docs = firstDocs.conversationId;
-    await apiB("/api/response", { method: "POST", body: { messageId: firstDocs.messageId, conversationId: docs, text: "Ready.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(firstDocs.messageId, { conversationId: docs, text: "Ready.", model: "gpt-5.4-mini", mode: "agent" });
   });
 
   test.afterAll(async () => {
@@ -266,11 +262,11 @@ test.describe.serial("relay event subscriptions across relays", () => {
     expect(row.text).toContain(`[relay event] linux-test · session "${titles.builder}" (${builder.conversationId}): question_asked "Merge the orbit camera branch now?" options: [Yes] [No]`);
     expect(row.text.split("\n")[0]).toBe("[relay event · automated message from OAR, not from the user; it approves nothing]");
     // The watcher's turn is running: its worker takes the row as a steer, marked as an event.
-    const dequeued = await apiA("/api/pending", { headers: { "x-relay-session-id": watcher.conversationId } });
+    const dequeued = await createFakeWorker({ ...apiA.relay, sessionId: watcher.conversationId, conversationId: watcher.conversationId }).poll();
     expect(String(dequeued.payload?.message?.id || "")).toBe(row.id);
     expect(dequeued.payload.message.messageKind).toBe("relay-event");
     // Answering it is an event turn: it tells nobody anything.
-    await apiA("/api/response", { method: "POST", body: { messageId: row.id, conversationId: watcher.conversationId, text: "Noted: a question waits on linux-test.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(row.id, { conversationId: watcher.conversationId, text: "Noted: a question waits on linux-test.", model: "gpt-5.4-mini", mode: "agent" });
   });
 
   test("list_sessions and read_session there say what a session does", async () => {
@@ -367,7 +363,7 @@ test.describe.serial("relay event subscriptions across relays", () => {
 
   test("archiving ends subscriptions: the watched session on B, the watcher on A", async () => {
     // A session is archived once its turn is over.
-    await apiB("/api/response", { method: "POST", body: { messageId: builder.messageId, conversationId: builder.conversationId, text: "Orbit camera merged.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(builder.messageId, { conversationId: builder.conversationId, text: "Orbit camera merged.", model: "gpt-5.4-mini", mode: "agent" });
     const archived = await apiB(`/api/conversation/${builder.conversationId}/archive`, { method: "POST", body: {} });
     expect(archived.status, JSON.stringify(archived.payload)).toBe(200);
     const listed = await tool(second.conversationId, "list_subscriptions");
@@ -375,7 +371,7 @@ test.describe.serial("relay event subscriptions across relays", () => {
 
     const again = await tool(watcher.conversationId, "subscribe", { sessions: [docs] });
     expect(again.status, JSON.stringify(again.payload)).toBe(200);
-    await apiA("/api/response", { method: "POST", body: { messageId: watcher.messageId, conversationId: watcher.conversationId, text: "Watching is over.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(watcher.messageId, { conversationId: watcher.conversationId, text: "Watching is over.", model: "gpt-5.4-mini", mode: "agent" });
     const gone = await apiA(`/api/conversation/${watcher.conversationId}/archive`, { method: "POST", body: {} });
     expect(gone.status, JSON.stringify(gone.payload)).toBe(200);
     await waitFor(async () => {
@@ -429,12 +425,12 @@ test.describe.serial("two watchers on two relays watching each other", () => {
     expect((await withCard(apiB, watcherB.conversationId, subscribeB)).result.status).toBe(200);
 
     // A's watcher ends an ordinary turn: B's watcher hears of it.
-    await apiA("/api/response", { method: "POST", body: { messageId: watcherA.messageId, conversationId: watcherA.conversationId, text: "Report built.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(watcherA.messageId, { conversationId: watcherA.conversationId, text: "Report built.", model: "gpt-5.4-mini", mode: "agent" });
     const row = await waitForEventRow(apiB, watcherB.conversationId, /win-test · session "[^"]+" \([^)]+\): turn_end \(done\) "Report built\."/, { timeout: 50_000 });
     // B's watcher answers that event: an event turn, which is no turn_end for A.
-    const dequeued = await apiB("/api/pending", { headers: { "x-relay-session-id": watcherB.conversationId } });
+    const dequeued = await createFakeWorker({ ...apiB.relay, sessionId: watcherB.conversationId, conversationId: watcherB.conversationId }).poll();
     expect(String(dequeued.payload?.message?.id || "")).toBe(row.id);
-    await apiB("/api/response", { method: "POST", body: { messageId: row.id, conversationId: watcherB.conversationId, text: "Seen: the report is built.", model: "gpt-5.4-mini", mode: "agent" } });
+    await respondAsWorker(row.id, { conversationId: watcherB.conversationId, text: "Seen: the report is built.", model: "gpt-5.4-mini", mode: "agent" });
     await sleep(45_000);
     // B's watcher's own approval card was a question A's watcher heard of;
     // its event turn, no reply, no idle set.

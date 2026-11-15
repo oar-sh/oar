@@ -1,6 +1,6 @@
 // The single emit-gating rule every worker's stream channel uses.
 //
-// Mirrors the gating the Copilot extension's stream publisher applies, so
+// Mirrors the gating the removed Copilot CLI extension's stream publisher applied, so
 // `relay_stream` traffic stays comparable across providers and engines: a
 // conversation run on Claude, Cursor, Grok or Copilot produces the same shape
 // of incremental updates for the same prose. It was copied byte-for-byte into

@@ -250,8 +250,8 @@ export function modelMetadataFromDescriptor(descriptor = {}) {
 
 /**
  * The `{ models, contextLimitsByModel, modelMetadataByModel }` triple every
- * `/api/models/snapshot` publisher sends, so the worker, the standalone relay
- * and the server-side discovery cannot drift in what they publish.
+ * `/api/models/snapshot` publisher sends, so the worker and the server-side
+ * discovery cannot drift in what they publish.
  */
 export function buildModelSnapshotFields(descriptors = []) {
   const list = Array.isArray(descriptors) ? descriptors.filter((entry) => entry?.modelId) : [];

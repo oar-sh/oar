@@ -8,8 +8,8 @@ A conversation that has no message and nothing queued yet is moved back to Copil
 
 | Runtime | Enable via | Auth | Notes |
 | ------- | ---------- | ---- | ----- |
-| **Copilot** (default) | always available | the relay host's Copilot CLI login | Two engines: the headless **SDK** worker (default) or the Copilot CLI with OAR's **Extension**. The only runtime that reports Copilot usage |
-| **OpenAI (BYOK)** | ⚙️ Settings → Providers → OpenAI | your API key, stored in the relay database | Runs the Copilot runtime, on either engine, against an OpenAI-compatible endpoint |
+| **Copilot** (default) | always available | the relay host's Copilot CLI login | A headless Node worker per conversation, on the SDK that comes with the Copilot CLI. The only runtime that reports Copilot usage |
+| **OpenAI (BYOK)** | ⚙️ Settings → Providers → OpenAI | your API key, stored in the relay database | Runs the Copilot runtime against an OpenAI-compatible endpoint; needs the Copilot CLI installed on the relay host |
 | **OpenAI Image (BYOK)** | ⚙️ Settings → Providers → OpenAI | the same key | The relay calls the OpenAI Images API itself; a chat whose replies are images |
 | **Claude (Agent SDK)** | ⚙️ Settings → Providers → Claude | the relay host's Claude login, **switchable from the panel** | A dedicated Node worker per conversation. The Claude Code CLI can be installed and updated from the panel |
 | **Claude API** | ⚙️ Settings → Providers → Claude API | your Claude Console API key, stored in the relay database | The Claude worker on the key instead of the host's Claude login; billed to the Console organisation the key belongs to. A Claude chat can switch between the two |
@@ -28,27 +28,15 @@ OAR itself sends nothing anywhere but the update check, which is off until you e
 
 None of them comes in OAR's package. The Copilot CLI is yours to install, and the relay downloads the Claude and Cursor SDKs from npm only for a provider you set up or use (see [Agent SDKs](install.md#agent-sdks)).
 
-## GitHub Copilot — engine choice
+## GitHub Copilot
 
 *On oar.sh: [GitHub Copilot](https://oar.sh/docs/providers/github-copilot/)*
 
-Copilot conversations, and OpenAI (BYOK) ones, run on one of two engines, chosen in **⚙️ Settings → Providers → Copilot → Copilot engine**. The setting is per relay and is read whenever a conversation's worker starts; sessions already running keep their engine until their worker restarts.
+Copilot conversations, and OpenAI (BYOK) and OpenAI Image ones, run in a headless Node worker per conversation that drives the SDK of the relay host's Copilot CLI. The worker has [mid-turn steering](web-ui.md#while-a-turn-runs), the [background task panel](web-ui.md#background-tasks) with a working **Stop**, **Cancel** on a steered message the runtime has not picked up yet, and multi-select question cards, for every Copilot model, hosted or BYOK. There is no terminal (TUI) view of a Copilot session and no built-in Copilot CLI slash commands.
 
-| Engine | What runs | Notes |
-| ------ | --------- | ----- |
-| **SDK** (default) | A headless Node worker per conversation, driving the Copilot CLI's bundled SDK runtime | Needs only a Copilot CLI that is installed and signed in; there is no extension to install or keep in sync. This engine has [mid-turn steering](web-ui.md#while-a-turn-runs), the [background task panel](web-ui.md#background-tasks) with a working **Stop**, **Cancel** on a steered message the runtime has not picked up yet, and multi-select question cards, for every Copilot model, hosted or BYOK. There is no TUI: the tmux console shows the worker's log |
-| **Extension** | The Copilot CLI in a terminal session with OAR's web-relay extension loaded | The engine OAR started with. **🖥️ Inspect tmux console** shows the live Copilot TUI (Linux and macOS, with tmux). Messages sent during a turn queue behind it |
+The relay downloads nothing for Copilot: the SDK is the `copilot-sdk` folder inside the Copilot CLI's version folder, so it is there once the [GitHub Copilot CLI](https://github.com/github/copilot-cli) is installed and has run once (`copilot --version`). **⚙️ Settings → Providers → Copilot** can install and update the CLI and does that first run itself (see [Installing a provider CLI from the relay](#installing-a-provider-cli-from-the-relay)); you still log in once in a terminal on the relay host by running `copilot`. The relay looks for it each time a Copilot, OpenAI (BYOK) or OpenAI Image conversation's worker starts, so a CLI installed or updated while the relay runs is found without a restart. It takes the newest version in the Copilot CLI's package folders (`~/.cache/copilot/pkg` on Linux, `~/Library/Caches/copilot/pkg` on macOS, `%LOCALAPPDATA%\copilot\pkg` on Windows, and `~/.copilot/pkg`; `COPILOT_PKG_DIR` adds a location), unless `COPILOT_SDK_PATH` names the runtime's `copilot-sdk` directory directly. When it finds none, the worker does not start and the turn fails with *"Copilot SDK not found. Install the GitHub Copilot CLI and run it once (copilot --version); no relay restart is needed. Looked in: …"*, naming the folders it searched.
 
-Neither engine needs an SDK from npm, so the relay downloads nothing for Copilot: the SDK engine runs the SDK that comes with the Copilot CLI, and the extension's `@github/copilot-sdk/extension` import is resolved by the CLI that loads it.
-
-The SDK engine has been the default since 0.9.2. A relay where nobody has saved a choice uses it whenever it can and falls back to **Extension** when it cannot; a saved choice always wins. Saving **SDK** is refused, with the reason shown in place of the engine description, when:
-
-- *"The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve)…"*: the relay found no Copilot CLI runtime at startup. It looks in the Copilot CLI's package cache, newest version first (`~/.cache/copilot/pkg` on Linux, `~/Library/Application Support/copilot/pkg` on macOS, `%LOCALAPPDATA%\copilot\pkg` on Windows; `COPILOT_PKG_DIR` adds a location), unless `COPILOT_SDK_PATH` names the runtime's `copilot-sdk` directory directly. Install or upgrade the Copilot CLI, run it once, **and restart the relay**: the launch environment is snapshotted at startup, so a CLI installed since then is not visible yet.
-- *"The SDK engine requires session worker routing, which is disabled on this relay (SESSION_WORKER_ROUTING_ENABLED)…"*: with routing off no SDK worker is ever spawned. Turn **Session worker routing** back on in **⚙️ Settings → Features** (it is on by default) and restart the relay.
-
-A refusal never changes the stored engine; the select snaps back to the engine the relay actually runs.
-
-SDK-engine turns report their own per-turn billing to the relay, which appears as the **Last SDK worker turn** section on the Copilot card in **Check Usage**. The card's meters come from the account-level quota API and are correct for both engines.
+Copilot turns report their own per-turn billing to the relay, which appears as the **Last SDK worker turn** section on the Copilot card in **Check Usage**. The card's meters come from the account-level quota API.
 
 ## OpenAI (BYOK) and OpenAI Image
 
@@ -56,8 +44,8 @@ SDK-engine turns report their own per-turn billing to the relay, which appears a
 
 Save your key in **⚙️ Settings → Providers → OpenAI**, together with the **OpenAI model ID** (default `gpt-4o`) and an optional **Base URL** (default `https://api.openai.com/v1`). **Enable OpenAI API key for New Chat model selection** is on once a key is saved, and saving discovers the endpoint's models from `/v1/models`.
 
-- **OpenAI (BYOK)** conversations run the Copilot runtime against that endpoint with your key, on whichever Copilot engine is selected.
-- **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it. The relay calls the OpenAI Images API itself (`/images/generations`, or `/images/edits` with the attached or generated images, all of them in order, the first as the base) on both Copilot engines; these turns never go to the Copilot runtime. A new image chat starts on the first of `gpt-image-2.5-flare`, `gpt-image-2.5-flare-2026-09-08` and `gpt-image-2` that the key's model list has, else on the first `gpt-image-*` model listed; a newer model the list offers is used only when you pick it. With no `gpt-image-*` model on, an image chat without a model is refused (`OPENAI_IMAGE_NO_MODEL`).
+- **OpenAI (BYOK)** conversations run the Copilot runtime against that endpoint with your key. They need the Copilot CLI installed on the relay host (see [GitHub Copilot](#github-copilot)), not signed in.
+- **OpenAI Image (BYOK)** conversations are chats whose replies are images. **New Chat** asks for **Quality** and **Size** instead of reasoning effort, and **Edit this image** under a generated image iterates on it. The relay calls the OpenAI Images API itself (`/images/generations`, or `/images/edits` with the attached or generated images, all of them in order, the first as the base); these turns never go to the Copilot runtime, but an image conversation's worker is the Copilot one, so the Copilot CLI must be installed on the relay host here too. A new image chat starts on the first of `gpt-image-2.5-flare`, `gpt-image-2.5-flare-2026-09-08` and `gpt-image-2` that the key's model list has, else on the first `gpt-image-*` model listed; a newer model the list offers is used only when you pick it. With no `gpt-image-*` model on, an image chat without a model is refused (`OPENAI_IMAGE_NO_MODEL`).
 
 In an image chat the composer's **⚙** settings have **Image size** (the model's sizes, and **Custom…** for any W×H a gpt-image model takes, checked as you type: an invalid size keeps the message as a draft), **Quality**, **Count** (1 to 4; not on dall-e-3), and for gpt-image models **Format** (PNG, WebP, JPEG) and **Background** (Auto, Transparent, Opaque; Transparent not with JPEG). This browser keeps the size, count, format, background and preset per chat; the quality is saved with the chat. While the image is made the reply's bubble shows a placeholder with a running timer, the size and the quality, then the partial previews gpt-image models stream (two per image), then the final image. A second try after a failed first one starts the placeholder over. Previews are for your open clients only: they are no part of the transcript, of shared views, of the media gallery or of what agents read, and their files are deleted when the turn ends, well or not. dall-e models send no previews.
 
@@ -76,7 +64,7 @@ A reply with no text of its own reads like `1 image · 1536x1024 · gpt-image-2`
 
 When OpenAI does not answer in time (3 minutes for a new image, 5 for an edit, the whole stream of previews included; `openaiImageGenerateTimeoutMs` and `openaiImageEditTimeoutMs` in [config.json](configuration.md)), answers with a server error, or the connection or the stream of previews breaks, the relay tries once more and then ends the turn with a note that says whether the request may have been billed (`OpenAI did not answer within 180 s (tried twice); the request may have been billed; retry the message.`). A refusal from OpenAI (a 4xx, a rate limit or an exhausted quota included) is not retried; the note carries OpenAI's message. The one exception is a 400 that names the stream fields (an OpenAI-compatible endpoint that streams no images): the request goes once more without them, and that resend is the second of the two requests, so if it fails the turn ends there. A stream that breaks off or runs out of time after every image it was asked for arrived keeps those images and is not sent again. When the second try succeeds after one that may have reached OpenAI (a timeout, a server error, a broken connection), the reply says so after its line: `Note: OpenAI did not answer the first try within 180 s; it was sent once more and the first try may have been billed as well.` A first try that never left the relay (OpenAI could not be reached) adds no note. An image turn whose request went out is never put back into the queue, and a relay restart during the call ends it with the same "may have been billed" note, so one message costs at most two requests to OpenAI.
 
-**What image turns cost, and the daily cap.** The relay prices every try of an image turn as it ends, from the usage OpenAI reports and OpenAI's published rates for that model (the table in `shared/openai-image-prices.mjs`, each entry with its source and date). Where OpenAI reports no usage for a try that may have been billed (a timeout, a server error, a broken connection or stream, a reply the relay could not read), the relay books an estimate from the model, size and quality instead: the image's output, 100 output tokens for each partial preview that arrived (0 to 2 per image), and an allowance for the input that is an assumption, as OpenAI publishes no input counts (500 text tokens for the prompt, 4,000 image tokens per attached image). The amount a request holds against the cap while it runs is the same estimate without partials. A model the table does not know is booked at the dearest price the table lists for that size and quality, across all its models, and marked "(price unknown, estimated)". A turn of several images whose stream broke off after some of them books only the usage OpenAI reported for those. With image continuity off, a try cut off by a relay restart is not booked. The reply line ends with the turn's cost (`1 image · 1536x1024 · gpt-image-2.5-flare · ~USD 0.04`, "(estimate)" where a part is one), the conversation's ︙ menu shows what its images cost, and **Check Usage** has an **OpenAI images** card with today, this month and the cap (see [Usage and context](web-ui.md#usage-and-context)).
+**What image turns cost, and the daily cap.** The relay prices every try of an image turn as it ends, from the usage OpenAI reports and OpenAI's published rates for that model (the table in `shared/openai-image-prices.mjs`, each entry with its source and date). Where OpenAI reports no usage for a try that may have been billed (a timeout, a server error, a broken connection or stream, a reply the relay could not read), the relay books an estimate from the model, size and quality instead: the image's output, 100 output tokens for each partial preview that arrived (0 to 2 per image), and an allowance for the input that is an assumption, as OpenAI publishes no input counts (500 text tokens for the prompt, 4,000 image tokens per attached image). The amount a request holds against the cap while it runs is the same estimate without partials. A model the table does not know is booked at the dearest price the table lists for that size and quality, across all its models, and marked "(price unknown, estimated)". A turn of several images whose stream broke off after some of them books only the usage OpenAI reported for those. The reply line ends with the turn's cost (`1 image · 1536x1024 · gpt-image-2.5-flare · ~USD 0.04`, "(estimate)" where a part is one), the conversation's ︙ menu shows what its images cost, and **Check Usage** has an **OpenAI images** card with today, this month and the cap (see [Usage and context](web-ui.md#usage-and-context)).
 
 The relay stops image turns at a daily cap, **USD 5** unless you change it in **Daily image cap (USD)** under **⚙️ Settings → Providers → OpenAI** and press **Save cap** (0 means no cap, at most 10,000, two decimals); the line under it shows today's spend, this month's and what is in flight. The day is the relay's local day. Before each request goes out, the relay adds that request's estimate to what today already cost, the estimates and unknown-price stand-ins included (on purpose, unlike the Claude API cap, which counts priced spend only), and to the requests still running; above the cap the request is not sent and the turn ends with a note (`OPENAI_IMAGE_DAILY_CAP_REACHED`). From 80 % on, the reply line ends with today's figure (`· today USD 4.10 of 5.00 (82 %)`) and image chats show it above the composer; once the cap is reached that line turns red and says so. Once the cap is reached, a new message to an image model is refused before it is queued, for you and for agents alike; a running turn finishes, and other models are never affected. **Allow past the cap for today** in the same place (**Allow for today** once the cap is reached) lifts the cap until midnight relay time, and **Stop allowing** sets it back; only you can set them there, a paired relay cannot.
 
@@ -311,8 +299,8 @@ Like Claude chats, DeepSeek turns are not included in the Copilot usage line. Th
 
 ## Installing a provider CLI from the relay
 
-Grok runs as a CLI on the relay host, and Claude's login is managed with the Claude Code CLI there.
-The failure mode used to be a dead end: a turn fails with *"Grok CLI was not found on PATH"* and
+Grok runs as a CLI on the relay host, Claude's login is managed with the Claude Code CLI there, and
+the Copilot SDK comes with the Copilot CLI. The failure mode used to be a dead end: a turn fails with *"Grok CLI was not found on PATH"* and
 the only fix is a shell on the host — the one thing the relay exists to avoid. The Copilot, Claude, and Grok sub-tabs therefore carry a CLI row at the top:
 
 ```
@@ -335,8 +323,23 @@ Grok CLI    1.0.13 · ~/.grok/bin/grok · native · up to date  [ Update  ]
 - If your Claude was installed with npm into a folder the relay user cannot write, `claude doctor`
   says so and the button becomes **Switch to native installer** — Anthropic's own recommended fix.
   The npm copy stays where it is; the native build takes precedence on PATH.
-- The **Copilot** row is read-only: that CLI is managed with npm on the host, so there is nothing
-  the relay could usefully run.
+- **Copilot** installs with GitHub's install script on Linux and macOS (fetched from
+  `https://raw.githubusercontent.com/github/copilot-cli/main/install.sh`) and with
+  `npm install -g @github/copilot` on Windows; **Update** runs `copilot update`.
+  - The script runs without a terminal, so it never asks to edit your shell profile, and it installs
+    `copilot` into `~/.local/bin` (the relay finds it there even when that folder is not on your PATH).
+  - Nothing is installed unless the script checked the download against the release's checksum file.
+    The script itself would skip that check when the checksum file cannot be fetched or the host has
+    no `sha256sum` or `shasum`; the relay then fails the install instead and leaves any earlier
+    `copilot` in place. On Windows npm checks the package against the registry's integrity hash.
+  - The SDK only exists after the CLI's first run, so after an install or an update the relay runs
+    `copilot --version` once (it unpacks the CLI's package, which can take several seconds) and
+    counts the install as done only when it then finds the SDK folder. A Copilot chat started after
+    that uses it, without a relay restart.
+  - `copilot update` writes to your user cache, never to the folder the CLI is installed in, so it
+    works for a CLI installed with npm, Homebrew or into a system folder too. Such a copy is not
+    reinstalled or removed from the panel; the row says so.
+  - Log in once in a terminal on the relay host: run `copilot` and follow its login.
 
 When a turn fails because a CLI is missing or signed out, the failed reply itself carries the fix as
 a button — **Install Grok CLI**, **Sign in to Grok**, **Claude settings** — which opens the right

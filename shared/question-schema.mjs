@@ -2,8 +2,8 @@
 
 /**
  * Shared helpers for working with `ask_user` / elicitation `requestedSchema`
- * forms. Used by the relay server, the web UI (via a browser copy of the same
- * logic), and the extension bridge so single- and multi-field structured forms
+ * forms. Used by the relay server and the web UI (via a browser copy of the same
+ * logic) so single- and multi-field structured forms
  * are handled consistently.
  *
  * A requestedSchema follows a restricted subset of JSON Schema:

@@ -160,12 +160,6 @@ function boot() {
     relayActivityForResponse: (responseId) => stmts.listActivityByResponse.all(responseId),
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
     computeRetryDelayMs: () => 0,
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId } = {}) => {
-        const normalized = String(sessionId || '').trim();
-        return normalized ? { sessionId: normalized } : null;
-      },
-    },
     usageLimitPauseService,
   });
   const captured = captureRoutes(deps);
@@ -178,7 +172,6 @@ function dequeueForWorker({ db, stmts, deps }) {
     db,
     stmts,
     nowIso: new Date().toISOString(),
-    routingEnabled: false,
     requesterSessionId: CONV,
   });
   if (!row) return null;

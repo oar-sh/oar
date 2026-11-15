@@ -121,7 +121,7 @@ function boot({
     workspaceRootPayload: () => ({}),
     queueCounts: () => ({ pendingCount: 0, processingCount: 0 }),
     emitToClientsExceptSessionId: () => {},
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
     remoteRelayInbound,
     ...providerDeps,
   });

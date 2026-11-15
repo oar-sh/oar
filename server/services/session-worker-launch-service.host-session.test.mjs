@@ -66,7 +66,6 @@ const KEPT_SETTINGS = Object.freeze({
 // One launch environment per provider, each with the host's session variables
 // on it, as the relay has them when it was started under Claude Code.
 const PROVIDERS = [
-  { kind: 'copilot', modelVar: null, env: () => ({ ...RELAY_ENV }) },
   { kind: 'copilot-sdk', modelVar: 'COPILOT_RELAY_MODEL', env: () => applyCopilotSdkProviderEnvironment(RELAY_ENV, { enabled: true, model: 'gpt-5.4-mini' }) },
   { kind: 'claude', modelVar: 'CLAUDE_RELAY_MODEL', env: () => applyClaudeProviderEnvironment(RELAY_ENV, { enabled: true, model: 'claude-opus-5' }) },
   { kind: 'claude-cloud', modelVar: 'CLAUDE_CLOUD_RELAY_MODEL', env: () => applyClaudeCloudProviderEnvironment(RELAY_ENV, { enabled: true, model: 'claude-opus-5' }) },
@@ -113,7 +112,6 @@ async function launchUnderTmux(env) {
     tmuxPollAttempts: 1,
     tmuxPollDelayMs: 1,
     createSecretEnvFileImpl: () => ({ filePath: '/tmp/copilot-relay-worker-test/provider.env', cleanup() {} }),
-    prepareOarMcpConfigImpl: () => null,
     locateExecutableImpl: () => true,
   });
   const newSession = calls.find((call) => call.args?.[0] === 'new-session');
@@ -135,7 +133,6 @@ async function launchDetached(env, platform) {
     execFileSyncImpl: () => { throw new Error('tmux missing'); },
     processInspector: { findProcessForSessionAsync: () => (platform === 'win32' ? { processId: process.pid } : null) },
     prepareWorkerLogFileImpl: () => null,
-    prepareOarMcpConfigImpl: () => null,
     locateExecutableImpl: () => true,
     allowProcessReuse: false,
     detachedPollAttempts: 1,
@@ -168,9 +165,7 @@ test('under tmux no provider\'s worker gets the host Claude session variables, a
       assert.equal(key in tmuxEnv, false, `${provider.kind} tmux env carries ${key}`);
     }
     assert.equal('PWD' in tmuxEnv, false, `${provider.kind} tmux env carries PWD`);
-    if (provider.kind !== 'copilot') {
-      assert.match(shellCommand, new RegExp(`export COPILOT_WEB_RELAY_WORKER_KIND='${provider.kind}';`), provider.kind);
-    }
+    assert.match(shellCommand, new RegExp(`export COPILOT_WEB_RELAY_WORKER_KIND='${provider.kind}';`), provider.kind);
     if (provider.modelVar) {
       assert.match(shellCommand, new RegExp(`export ${provider.modelVar}='[^']+';`), `${provider.kind} exports its model`);
       assert.equal(provider.modelVar in tmuxEnv, false, `${provider.kind} tmux env carries ${provider.modelVar}`);
@@ -187,7 +182,7 @@ test('without tmux (detached and Windows) no provider\'s worker gets the host Cl
       const env = await launchDetached(provider.env(), platform);
       assertNoHostSessionVariables(env, `${provider.kind} ${platform}`);
       // The worker's own values are intact.
-      if (provider.kind !== 'copilot') assert.equal(env.COPILOT_WEB_RELAY_WORKER_KIND, provider.kind, platform);
+      assert.equal(env.COPILOT_WEB_RELAY_WORKER_KIND, provider.kind, platform);
       if (provider.modelVar) assert.ok(env[provider.modelVar], `${provider.kind} ${platform} keeps ${provider.modelVar}`);
       assert.equal(env.CLAUDE_CONFIG_DIR, '/srv/oar/claude-config', `${provider.kind} ${platform}`);
       assert.equal(env.SESSION_ID, 'session-3', `${provider.kind} ${platform}`);
@@ -215,7 +210,7 @@ test('under tmux every provider\'s command unsets the host session\'s variables 
     for (const key of ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'CLAUDE_CONFIG_DIR']) {
       assert.equal(names.has(key), true, `${provider.kind} keeps ${key}`);
     }
-    if (provider.kind !== 'copilot') assert.equal(names.has('COPILOT_WEB_RELAY_WORKER_KIND'), true, provider.kind);
+    assert.equal(names.has('COPILOT_WEB_RELAY_WORKER_KIND'), true, provider.kind);
   }
 });
 

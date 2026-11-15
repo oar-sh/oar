@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // E2E cover for the workflow progress tree
 // (docs/plans/workflow-progress-tree.md): a Claude session worker publishes a
@@ -10,9 +14,10 @@ import { relayToken } from "./e2e-env.mjs";
 // Everything is injected into the isolated test server per the e2e isolation
 // contract: the conversation is created through POST /api/message (which
 // commits the row even though the queued turn never runs — CLI spawn is
-// disabled), and the task set is published through the same authenticated
-// endpoint the worker uses (standard bearer auth, REPLACE semantics). No live
-// CLI, no host state.
+// disabled; the card test bootstraps it first, as the web client does, since
+// a fake worker answers its turn), and the task set is published through the
+// same authenticated endpoint the worker uses (standard bearer auth, REPLACE
+// semantics). No live CLI, no host state.
 
 const WORKFLOW_MODEL = "claude-sonnet-5";
 
@@ -166,34 +171,25 @@ test.describe("finished background task cards in the transcript", () => {
     const seedText = `workflow-card-render-${Date.now()}`;
     let conversationId = "";
     try {
-      // Seed the conversation + queued turn (the isolated server never spawns
-      // a CLI, so the queue row just waits for its response)...
-      const queued = await request.post("/api/message", {
-        headers,
-        data: { text: seedText, relayMode: "autopilot", model: "gpt-5.4-mini" },
-      });
-      expect(queued.ok()).toBeTruthy();
-      const queuedBody = await queued.json();
-      conversationId = String(queuedBody?.conversationId || "");
-      const messageId = String(queuedBody?.messageId || "");
+      // Seed the conversation + queued turn, made as the web client makes a
+      // chat, bound to its session (the isolated server never spawns a CLI,
+      // so the queue row just waits for its response)...
+      const started = await startConversation({ text: seedText, relayMode: "autopilot" });
+      conversationId = String(started.conversationId || "");
+      const messageId = String(started.messageId || "");
       expect(conversationId).toBeTruthy();
       expect(messageId).toBeTruthy();
 
       // ...then finalize it exactly like a session worker whose workflows
       // settled during the turn: two runs, one completed, one failed.
-      const responded = await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "Both workflows finished; details in the cards below.",
-          model: WORKFLOW_MODEL,
-          mode: "autopilot",
-          workflowRuns: [finishedDigest(), stoppedDigest()],
-        },
+      const responded = await completeTurn(started, {
+        text: "Both workflows finished; details in the cards below.",
+        model: WORKFLOW_MODEL,
+        mode: "autopilot",
+        workflowRuns: [finishedDigest(), stoppedDigest()],
       });
-      expect(responded.ok()).toBeTruthy();
-      expect((await responded.json())?.ok).toBe(true);
+      expect(responded.ok).toBeTruthy();
+      expect(responded.payload?.ok).toBe(true);
 
       await page.goto(`/?token=${encodeURIComponent(token)}`);
       await page.waitForLoadState("networkidle");

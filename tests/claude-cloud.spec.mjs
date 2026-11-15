@@ -35,14 +35,12 @@ import { startRelayServer } from "./relay-server-harness.mjs";
  * loopback port the relay and its workers are pointed at with
  * OAR_CLAUDE_CLOUD_API_BASE_URL. Nothing in this file can reach Anthropic.
  *
- * The shared e2e relay cannot run this: it never launches a worker and pins
- * session-worker routing off. So the spec boots its own relay (as
- * tests/copilot-engine.spec.mjs does), isolated the same way, with three
- * differences:
+ * The shared e2e relay cannot run this: it never launches a worker. So the
+ * spec boots its own relay (relay-server-harness.mjs), isolated the same way,
+ * with three differences:
  *
- *  - worker launches are allowed and routing is on. Only cloud conversations
- *    are created here, and the Copilot CLI path is pointed at a command that
- *    does nothing, so no other kind of worker can start;
+ *  - worker launches are allowed. Only cloud conversations are created
+ *    here, so no other kind of worker is started;
  *  - the relay's port and token are written to its config.json before boot,
  *    because that is where a worker finds its relay;
  *  - tmux gets its own socket directory inside the state root, so the workers
@@ -215,16 +213,12 @@ test.beforeAll(async () => {
       tmuxDir = path.join(stateRoot, "tmux");
       fs.mkdirSync(tmuxDir, { recursive: true, mode: 0o700 });
       return {
-        COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
         OAR_CLAUDE_CLOUD_API_BASE_URL: fake.baseUrl,
         CLAUDE_CODE_OAUTH_TOKEN: FAKE_CLOUD_TOKEN,
         TMUX_TMPDIR: tmuxDir,
         // Not a tmux pane of whoever started the suite.
         TMUX: "",
         TMUX_PANE: "",
-        // Only cloud conversations are created here. Should anything else ever
-        // be launched, it runs this instead of a Copilot CLI.
-        COPILOT_WEB_RELAY_CLI_EXECUTABLE: "/bin/false",
       };
     },
   });

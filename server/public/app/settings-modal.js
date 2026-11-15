@@ -7,8 +7,6 @@ import {
 import {
   apiFetch,
   loadClaudeSettings,
-  loadCopilotSettings,
-  updateCopilotSettings,
   loadCursorSettings,
   loadCursorAllowanceSettings,
   updateCursorAllowanceSettings,
@@ -35,11 +33,8 @@ import {
   updateRestartResumeSetting as requestRestartResumeSetting,
   loadSubagentRecordRetentionSetting,
   updateSubagentRecordRetentionSetting as requestSubagentRecordRetentionSetting,
-  loadFeatureFlagSettings,
-  updateFeatureFlagSetting as requestFeatureFlagSetting,
   loadModelRefreshSettings,
   updateModelRefreshSettings as requestModelRefreshSettings,
-  requestRelayRestart,
 } from './api-client.js';
 import {
   formatModelRefreshIntervalLabel,
@@ -54,7 +49,6 @@ import {
 } from './claude-background-command-limit-options.mjs';
 import { DEFAULT_TASK_STALL_MINUTES } from './task-console-render.mjs';
 import { setTaskStallThreshold } from './background-tasks-view.mjs';
-import { describeRelayRestartError } from './relay-restart-error.mjs';
 import { refreshRelayRestartMaxWaitSetting } from './relay-restart-ui.js';
 import { syncFontScaleSelect } from './font-scaling.js';
 import { syncInstalledAppUiState, syncPwaAppNameInput } from './pwa-install.js';
@@ -693,101 +687,6 @@ export async function refreshOpenAISettingsState() {
   const settings = await loadOpenAISettings();
   if (!settings) return null;
   return applyOpenAISettingsState(settings);
-}
-
-// Copilot has no key and no model list in settings — it authenticates through
-// the host's `copilot` login and its catalog comes from the CLI — so the only
-// thing this panel owns is which engine runs Copilot conversations.
-let copilotSettingsUpdateInFlight = false;
-let copilotSettingsState = { engine: 'extension' };
-// The reason the last save was refused, shown in place of the engine
-// description. Every apply sets it — so a later success, a refresh, or a
-// broadcast from another tab all clear it by simply not passing one.
-let copilotSettingsSaveError = '';
-
-function setCopilotSettingsControlsDisabled(disabled) {
-  for (const id of ['copilot-engine-select', 'copilot-save-btn']) {
-    const element = document.getElementById(id);
-    if (element) element.disabled = disabled;
-  }
-}
-
-export function applyCopilotSettingsState(settings = {}, { error = '' } = {}) {
-  copilotSettingsSaveError = String(error || '');
-  const engine = String(settings?.engine || copilotSettingsState.engine || 'extension').trim().toLowerCase();
-  copilotSettingsState = { engine: engine === 'sdk' ? 'sdk' : 'extension' };
-  const select = document.getElementById('copilot-engine-select');
-  const status = document.getElementById('copilot-settings-status');
-  // A select has no free text to lose, so unlike the Claude model input there
-  // is no dirty-tracking here: a socket refresh may always overwrite it — but
-  // never while the user's own save is still in flight.
-  if (select && !copilotSettingsUpdateInFlight) select.value = copilotSettingsState.engine;
-  if (status) {
-    if (copilotSettingsSaveError) {
-      status.textContent = copilotSettingsSaveError;
-      status.dataset.state = 'error';
-    } else {
-      status.textContent = copilotSettingsState.engine === 'sdk'
-        ? 'New Copilot conversations run on the headless SDK worker. No tmux inspector for these sessions.'
-        : 'New Copilot conversations run on the Copilot CLI with the web-relay extension.';
-      status.dataset.state = copilotSettingsState.engine === 'sdk' ? 'active' : 'unconfigured';
-    }
-  }
-  return copilotSettingsState;
-}
-
-export async function refreshCopilotSettingsState() {
-  const settings = await loadCopilotSettings();
-  if (!settings) return null;
-  return applyCopilotSettingsState(settings);
-}
-
-async function syncCopilotSettingsInputs() {
-  const status = document.getElementById('copilot-settings-status');
-  if (!status) return;
-  const settings = await refreshCopilotSettingsState();
-  if (!settings) {
-    status.textContent = 'Unable to load Copilot settings.';
-    status.dataset.state = 'error';
-  }
-}
-
-export async function saveCopilotSettings() {
-  if (copilotSettingsUpdateInFlight) return;
-  const select = document.getElementById('copilot-engine-select');
-  const engine = String(select?.value || '').trim().toLowerCase() || 'extension';
-  copilotSettingsUpdateInFlight = true;
-  setCopilotSettingsControlsDisabled(true);
-  // What to render once the save settles: the server's answer when it accepted,
-  // the last known state plus a reason when it did not. Assigned in the body,
-  // applied ONCE in the `finally` — clearing the in-flight flag early just to
-  // apply mid-try, then applying again on the way out, made the success path
-  // render twice and made the flag's meaning depend on which branch you were in.
-  let settled = copilotSettingsState;
-  let saveError = '';
-  try {
-    const result = await updateCopilotSettings({ engine });
-    if (!result) throw new Error('Failed to save Copilot settings.');
-    settled = result;
-    showTransientRelayNotice(
-      String(result.engine) === 'sdk'
-        ? 'Copilot engine set to SDK. New conversations use the headless worker; running sessions keep their engine until they restart.'
-        : 'Copilot engine set to Extension. New conversations use the Copilot CLI.',
-      6000,
-    );
-  } catch (error) {
-    // The relay refuses the SDK engine with a specific, actionable reason (no
-    // resolved SDK path; session-worker routing disabled). It goes in the
-    // status line as well as the alert, because the alert is gone the moment it
-    // is dismissed and the panel would otherwise show the old engine with no
-    // explanation of why the choice did not stick.
-    saveError = String(error?.message || 'Failed to save Copilot settings.');
-    alert(saveError);
-  } finally {
-    copilotSettingsUpdateInFlight = false;
-    setCopilotSettingsControlsDisabled(false);
-    applyCopilotSettingsState(settled, { error: saveError });
-  }
 }
 
 let claudeSettingsUpdateInFlight = false;
@@ -1846,136 +1745,6 @@ export async function updateWindowsAutostartMode(mode) {
   }
 }
 
-// ─── Features tab ─────────────────────────────────────────────────────────────
-// Flags are resolved once at relay boot; the rows here render entirely from the
-// server's registry payload (labels and descriptions live in server/features.mjs),
-// and the restart notice appears whenever a stored value differs from the
-// running snapshot. Rows are dynamic, so listeners are attached during render
-// instead of via inline onchange globals.
-
-let featureFlagsState = null;
-let featureFlagsUpdateInFlight = false;
-let featuresRestartButtonBound = false;
-
-function featureToggleId(name) {
-  return `feature-toggle-${String(name || '').toLowerCase()}`;
-}
-
-function syncFeatureFlagsSection() {
-  const list = document.getElementById('features-flag-list');
-  if (!list) return;
-  list.textContent = '';
-  const flags = Array.isArray(featureFlagsState?.flags) ? featureFlagsState.flags : [];
-  for (const flag of flags) {
-    const row = document.createElement('div');
-    row.className = 'settings-row settings-gap';
-
-    const label = document.createElement('label');
-    label.htmlFor = featureToggleId(flag.name);
-    label.textContent = flag.label || flag.name;
-    row.appendChild(label);
-
-    const checkbox = document.createElement('input');
-    checkbox.id = featureToggleId(flag.name);
-    checkbox.type = 'checkbox';
-    checkbox.checked = flag.effectiveNext === true;
-    checkbox.disabled = featureFlagsUpdateInFlight || flag.envOverride !== null;
-    checkbox.setAttribute('aria-label', flag.label || flag.name);
-    checkbox.addEventListener('change', () => {
-      void updateFeatureFlagFromToggle(flag.name, checkbox.checked);
-    });
-    row.appendChild(checkbox);
-    list.appendChild(row);
-
-    const help = document.createElement('div');
-    help.className = 'settings-help settings-gap-xs';
-    let text = String(flag.description || '');
-    if (flag.envOverride !== null) {
-      text += ` Pinned ${flag.envOverride ? 'on' : 'off'} by COPILOT_REMOTE_${flag.name} in the relay's environment; the toggle is locked while that variable is set.`;
-    }
-    if (flag.restartRequired) {
-      text += ' Restart pending: the saved value takes effect after the relay restarts.';
-    }
-    help.textContent = text;
-    list.appendChild(help);
-  }
-
-  const notice = document.getElementById('features-restart-notice');
-  if (notice) notice.hidden = featureFlagsState?.restartRequired !== true;
-  const restartBtn = document.getElementById('features-restart-btn');
-  if (restartBtn) {
-    restartBtn.disabled = featureFlagsUpdateInFlight;
-    if (!featuresRestartButtonBound) {
-      featuresRestartButtonBound = true;
-      restartBtn.addEventListener('click', () => { void restartRelayForFeatureFlags(); });
-    }
-  }
-}
-
-function setFeaturesSettingsStatus(text) {
-  const status = document.getElementById('features-settings-status');
-  if (!status) return;
-  status.hidden = !text;
-  status.textContent = text || '';
-}
-
-export async function refreshFeatureFlagsSection() {
-  syncFeatureFlagsSection();
-  const result = await loadFeatureFlagSettings();
-  if (!result || !Array.isArray(result.flags)) {
-    setFeaturesSettingsStatus('Failed to load feature flags from the relay.');
-    return;
-  }
-  featureFlagsState = result;
-  setFeaturesSettingsStatus('');
-  syncFeatureFlagsSection();
-}
-
-async function updateFeatureFlagFromToggle(name, enabled) {
-  if (featureFlagsUpdateInFlight) {
-    syncFeatureFlagsSection();
-    return;
-  }
-  featureFlagsUpdateInFlight = true;
-  syncFeatureFlagsSection();
-  try {
-    const result = await requestFeatureFlagSetting(name, enabled);
-    if (!result || !Array.isArray(result.flags)) {
-      alert('Failed to update the feature flag.');
-      return;
-    }
-    featureFlagsState = result;
-  } finally {
-    featureFlagsUpdateInFlight = false;
-    syncFeatureFlagsSection();
-  }
-}
-
-async function restartRelayForFeatureFlags() {
-  if (featureFlagsUpdateInFlight) return;
-  featureFlagsUpdateInFlight = true;
-  syncFeatureFlagsSection();
-  try {
-    let result = null;
-    try {
-      result = await requestRelayRestart({ reason: 'feature-flags-changed' });
-    } catch (error) {
-      const { kind, text } = describeRelayRestartError(error);
-      if (kind === 'refused') alert(text);
-      else showTransientRelayNotice(text, 9000);
-      return;
-    }
-    if (!result?.ok) {
-      alert('Failed to request a relay restart.');
-      return;
-    }
-    showTransientRelayNotice('Relay restart requested. It will restart once the running turns finish; queued messages wait for it.');
-  } finally {
-    featureFlagsUpdateInFlight = false;
-    syncFeatureFlagsSection();
-  }
-}
-
 function readShowSuspendHostSetting() {
   const stored = String(readLocalStorage(SHOW_SUSPEND_HOST_STORAGE_KEY) || '').trim().toLowerCase();
   if (!stored) return true;
@@ -2120,7 +1889,6 @@ export function openSettingsModal(tab, providerTab) {
   syncFontScaleSelect();
   syncPwaAppNameInput();
   syncDefaultSessionWorkspaceRootInput();
-  void syncCopilotSettingsInputs();
   openAISettingsInputsDirty = false;
   ensureOpenAISettingsInputTracking();
   void syncOpenAISettingsInputs();
@@ -2168,7 +1936,6 @@ export function openSettingsModal(tab, providerTab) {
   void refreshRemoteRelaysSection();
   void refreshSecuritySection();
   void refreshAgentSessionsSection();
-  void refreshFeatureFlagsSection();
   void refreshUpdateSection();
   const wasOpen = !!modal?.classList.contains('visible');
   modal?.classList.add('visible');

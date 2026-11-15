@@ -30,7 +30,9 @@ const APPEARANCE_IDS = [
 
 test('Appearance is the second tab, right after General', () => {
   const tabs = [...document.querySelectorAll('#settings-modal [data-settings-tab]')];
-  assert.deepEqual(tabs.map((tab) => tab.dataset.settingsTab), ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications', 'features']);
+  assert.deepEqual(tabs.map((tab) => tab.dataset.settingsTab), ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications']);
+  assert.equal(el('settings-tab-features'), null);
+  assert.equal(el('settings-panel-features'), null);
   const tab = el('settings-tab-appearance');
   assert.equal(tab.textContent.trim(), 'Appearance');
   assert.equal(tab.getAttribute('role'), 'tab');
@@ -103,4 +105,12 @@ test('a remembered or deep-linked General still opens General; unknown tabs fall
   assert.equal(selectSettingsTab().tab, 'general');
   localStorage.clear();
   assert.equal(selectSettingsTab().tab, 'general');
+});
+
+test('a remembered Features tab, which is gone, opens General', () => {
+  localStorage.setItem('copilot_settings_tab', 'features');
+  assert.equal(selectSettingsTab().tab, 'general');
+  assert.equal(el('settings-panel-general').hidden, false);
+  assert.equal(localStorage.getItem('copilot_settings_tab'), 'general');
+  localStorage.clear();
 });

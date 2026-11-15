@@ -115,12 +115,6 @@ function boot({ foreignKeys = true } = {}) {
     relayActivityForResponse: (responseId) => stmts.listActivityByResponse.all(responseId),
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
     computeRetryDelayMs: () => 0,
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId, conversationId } = {}) => {
-        const normalized = String(sessionId || '').trim();
-        return normalized ? { sessionId: normalized, conversationId: String(conversationId || '').trim() || null } : null;
-      },
-    },
     sessionWorkerRegistry: registry,
     // The worker socket: records what the relay pushed; `deliverable` models
     // whether a live socket exists for the session.
@@ -151,11 +145,16 @@ async function enqueueMessage(fx, text = 'steer me', conversationId = CONV) {
   return body.messageId;
 }
 
-// The worker loop's delivery leg via the real exported helpers: the row goes
-// processing with a minted attempt. Ownership is then pinned the way the
-// worker-lease claim records it.
+// The worker loop's delivery leg via the real exported helpers: the
+// conversation's worker claims the row (processing, a minted attempt, the
+// worker lease). Ownership is then pinned to `owner`, or cleared for null.
 function dequeueOwnedBy(fx, owner = CONV) {
-  const row = dequeuePendingMessage({ db: fx.db, stmts: fx.stmts, nowIso: new Date().toISOString() });
+  const row = dequeuePendingMessage({
+    db: fx.db,
+    stmts: fx.stmts,
+    nowIso: new Date().toISOString(),
+    requesterSessionId: CONV,
+  });
   if (!row) return null;
   const delivered = buildDequeuedRelayMessage({
     msg: row,
@@ -168,9 +167,7 @@ function dequeueOwnedBy(fx, owner = CONV) {
     defaultRelayMode: fx.deps.DEFAULT_RELAY_MODE,
     defaultModel: MODEL,
   });
-  if (owner) {
-    fx.db.prepare(`UPDATE queue SET owner_sdk_session_id = ?, owner_last_claimed_at = ? WHERE id = ?`).run(owner, NOW, delivered.id);
-  }
+  fx.db.prepare(`UPDATE queue SET owner_sdk_session_id = ?, owner_last_claimed_at = ? WHERE id = ?`).run(owner, owner ? NOW : null, delivered.id);
   return delivered;
 }
 

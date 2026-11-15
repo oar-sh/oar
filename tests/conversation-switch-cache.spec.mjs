@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Switching back to a conversation already viewed on the page draws it at
@@ -12,45 +16,17 @@ import { relayToken } from "./e2e-env.mjs";
  * the spec in the worker's place.
  */
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId = "") {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const response = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(response.ok()).toBeTruthy();
-    const message = (await response.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(150);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-// A session-bound conversation with a finished first turn.
+// A session-bound conversation with a finished first turn, made as the web
+// client makes one.
 async function seedConversation(request, headers, title, stamp) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text: `${title} ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
+  const started = await startConversation({ text: `${title} ${stamp}` });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
   expect(conversationId).toBeTruthy();
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
-  const synced = await request.post("/api/session-sync", {
-    headers,
-    data: { sdk_session_id: `pw-sid-cache-${stamp}-${conversationId.slice(0, 8)}`, conversation_id: conversationId },
-  });
-  expect(synced.ok()).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `${title} first reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const { worker } = started;
+  await worker.take(messageId);
+  const responded = await worker.respond(messageId, { text: `${title} first reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   return { conversationId, title: `${title} ${stamp}` };
 }
 
@@ -61,12 +37,8 @@ async function addTurn(request, headers, conversationId, text, reply) {
     data: { conversationId, text, relayMode: "agent", model: "gpt-5.4-mini" },
   });
   expect(queued.ok()).toBeTruthy();
-  const { messageId } = await queued.json();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: reply, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const responded = await completeTurn(await queued.json(), { text: reply, model: "gpt-5.4-mini", mode: "agent" }, { stay: true });
+  expect(responded.ok).toBeTruthy();
 }
 
 // Holds the answer of the next transcript read of the conversation until

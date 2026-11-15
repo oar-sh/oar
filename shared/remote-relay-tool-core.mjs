@@ -2,7 +2,7 @@
 //
 // Every adapter (Claude's in-process MCP server, Cursor's customTools, the
 // Copilot SDK engine's session tools, and the OAR stdio MCP server that Grok
-// and the Copilot extension engine reach) registers the SAME name, description
+// reaches) registers the SAME name, description
 // and schema from the contract and forwards every call to the one local relay
 // endpoint. The relay does the gating, the approval, the forwarding and the
 // waiting; nothing here knows about remote relays beyond the wire shape.

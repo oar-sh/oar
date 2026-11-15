@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The "watching N sessions" chip opens its list as a popover that is fully
@@ -11,8 +15,9 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  * a hit test at the list's centre has to land on the list. Escape and a
  * click elsewhere close it; Unsubscribe in it ends the subscription.
  *
- * No worker runs: a "turn" is a message the spec took off the queue
- * (GET /api/pending), which is what a subscribe call sits on.
+ * No worker runs: a "turn" is a message the spec took off the queue as the
+ * session's worker (helpers/fake-worker.mjs), which is what a subscribe call
+ * sits on.
  */
 
 const APPROVAL_TIMEOUT = 20_000;
@@ -23,6 +28,7 @@ test.describe.serial("the watching list opens unclipped", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const suffix = Date.now();
   // Long on purpose: the list's row must still keep its button on a phone.
   const watchedTitle = `terrain shader rewrite with a much longer working title ${suffix}`;
@@ -46,21 +52,9 @@ test.describe.serial("the watching list opens unclipped", () => {
   });
 
   async function conversationWithRunningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, messageId, ownerSessionId } = queued.payload;
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: conversationId, conversation_id: conversationId },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-      await sleep(250);
-    }
-    throw new Error("The message was never handed out");
+    const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+    await worker.take(messageId);
+    return { conversationId, messageId };
   }
 
   async function approveNextCard(conversationId) {

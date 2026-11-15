@@ -95,7 +95,6 @@ function overlayDescriptors(closers) {
     { name: 'new-conversation-model-modal', find: byId('new-conversation-model-modal'), isOpen: isVisible, close: closers.closeNewConversationModelModal },
     { name: 'git-changes-modal', find: byId('git-changes-modal'), isOpen: isVisible, close: closers.closeGitChangesModal },
     { name: 'git-diff-modal', find: byId('git-diff-modal'), isOpen: isVisible, close: closers.closeGitDiffViewer },
-    { name: 'tmux-inspector-modal', find: byId('tmux-inspector-modal'), isOpen: isVisible, close: closers.closeTmuxInspector },
     { name: 'image-annotate-modal', find: byId('image-annotate-modal'), isOpen: isVisible, close: closers.closeAnnotateEditor },
     { name: 'relay-watch-panel', find: byId('relay-watch-panel'), isOpen: isShown, close: closers.closeRelayWatchPanel },
     { name: 'questions-panel', find: byId('questions-panel'), isOpen: isShown, close: closers.closeQuestionsPanel },

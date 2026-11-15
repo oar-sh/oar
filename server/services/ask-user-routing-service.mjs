@@ -15,7 +15,6 @@ function loadRelayQuestionColumns(db) {
 }
 
 export function createAskUserRoutingService(db, options = {}) {
-  const continuationRoutingEnabled = options?.continuationRoutingEnabled === true;
   const sessionWorkerRegistry = options?.sessionWorkerRegistry || null;
   const relayQuestionColumns = loadRelayQuestionColumns(db);
   const hasContinuationColumns =
@@ -69,19 +68,17 @@ export function createAskUserRoutingService(db, options = {}) {
       ? normalizeId(sessionWorkerRegistry?.getWorkerByWorkerId?.(ownerWorkerId)?.sdkSessionId)
       : null;
 
-    if (continuationRoutingEnabled) {
-      if (rowContinuationId && incomingContinuationId && rowContinuationId !== incomingContinuationId) {
-        return { ok: false, error: 'continuation mismatch' };
-      }
-      if (rowContinuationQuestionId && incomingContinuationQuestionId && rowContinuationQuestionId !== incomingContinuationQuestionId) {
-        return { ok: false, error: 'continuation question mismatch' };
-      }
-      if (rowConversation && incomingConversation && rowConversation !== incomingConversation) {
-        return { ok: false, error: 'conversation mismatch' };
-      }
-      if (rowSession && workerOwnerSessionId && rowSession !== workerOwnerSessionId) {
-        return { ok: false, error: 'owner mismatch' };
-      }
+    if (rowContinuationId && incomingContinuationId && rowContinuationId !== incomingContinuationId) {
+      return { ok: false, error: 'continuation mismatch' };
+    }
+    if (rowContinuationQuestionId && incomingContinuationQuestionId && rowContinuationQuestionId !== incomingContinuationQuestionId) {
+      return { ok: false, error: 'continuation question mismatch' };
+    }
+    if (rowConversation && incomingConversation && rowConversation !== incomingConversation) {
+      return { ok: false, error: 'conversation mismatch' };
+    }
+    if (rowSession && workerOwnerSessionId && rowSession !== workerOwnerSessionId) {
+      return { ok: false, error: 'owner mismatch' };
     }
 
     const expectedSession = rowSession || workerOwnerSessionId;

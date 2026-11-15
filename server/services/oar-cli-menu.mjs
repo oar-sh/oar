@@ -62,7 +62,6 @@ export const MENU_ENTRIES = Object.freeze([
   { id: 'service', label: 'Install or remove the service' },
   { id: 'update', label: 'Update' },
   { id: 'doctor', label: 'Doctor' },
-  { id: 'copilot', label: 'Copilot session' },
   { id: 'quit', label: 'Quit' },
 ]);
 
@@ -170,7 +169,8 @@ export async function runMenu({
       if (key === 'interrupt') throw new PromptAborted();
       if (key === 'quit') return MENU_ENTRIES.length - 1;
       if (key === 'enter') return selected;
-      if (typeof key === 'number') {
+      // A digit past the last entry is not one (q is Quit).
+      if (typeof key === 'number' && key < MENU_ENTRIES.length - 1) {
         selected = key;
         return selected;
       }
@@ -183,9 +183,9 @@ export async function runMenu({
   });
   const pickByNumber = async () => {
     for (;;) {
-      const answer = (await askLine('Choose (1-9, q): ', { input, output })).toLowerCase();
+      const answer = (await askLine(`Choose (1-${MENU_ENTRIES.length - 1}, q): `, { input, output })).toLowerCase();
       if (answer === 'q') return MENU_ENTRIES.length - 1;
-      if (/^[1-9]$/.test(answer)) return Number(answer) - 1;
+      if (/^[1-9]$/.test(answer) && Number(answer) < MENU_ENTRIES.length) return Number(answer) - 1;
     }
   };
 

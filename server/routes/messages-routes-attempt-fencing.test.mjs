@@ -79,7 +79,7 @@ function makeAskUserDeps() {
       attemptId: row.attempt_id || null,
       prompt: row.prompt,
     }),
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
   };
 }
 
@@ -128,12 +128,6 @@ function bootFencedRoutes() {
     relayActivityForResponse: (responseId) => stmts.listActivityByResponse.all(responseId),
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
     computeRetryDelayMs: () => 0,
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId } = {}) => {
-        const normalized = String(sessionId || '').trim();
-        return normalized ? { sessionId: normalized } : null;
-      },
-    },
     ...makeAskUserDeps(),
   });
   const routes = captureRoutes(deps);
@@ -166,14 +160,12 @@ async function enqueueMessage(post, text = 'hello') {
 }
 
 // The worker loop's delivery leg via the same exported helpers the real loop
-// runs. `routed: true` exercises the worker-lease claim statement, the default
-// exercises the legacy setProcessing claim — both must mint an attempt.
-function dequeueForWorker({ db, stmts, deps }, { nowIso = new Date().toISOString(), routed = false } = {}) {
+// runs: the worker-lease claim statement, which must mint an attempt.
+function dequeueForWorker({ db, stmts, deps }, { nowIso = new Date().toISOString() } = {}) {
   const row = dequeuePendingMessage({
     db,
     stmts,
     nowIso,
-    routingEnabled: routed,
     requesterSessionId: CONV,
   });
   if (!row) return null;
@@ -199,7 +191,6 @@ test('a claim mints an attempt id, a requeue clears it, and the next claim mints
   const msgId = await enqueueMessage(fx.post);
   assert.equal(fx.rowOf(msgId).attempt_id, null, 'a pending row carries no attempt');
 
-  // Legacy (non-lease) claim path.
   const delivered = dequeueForWorker(fx);
   assert.equal(delivered?.id, msgId);
   assert.ok(delivered.attemptId, 'the delivered payload exposes the minted attemptId');
@@ -213,8 +204,8 @@ test('a claim mints an attempt id, a requeue clears it, and the next claim mints
   assert.equal(requeued.attempt_id, null, 'requeue must clear attempt_id');
   assert.equal(requeued.retry_count, 1);
 
-  // Routed (worker-lease) claim path mints a DIFFERENT attempt.
-  const redelivered = dequeueForWorker(fx, { nowIso: futureIso(), routed: true });
+  // The next claim mints a DIFFERENT attempt.
+  const redelivered = dequeueForWorker(fx, { nowIso: futureIso() });
   assert.equal(redelivered?.id, msgId);
   assert.ok(redelivered.attemptId);
   assert.notEqual(redelivered.attemptId, delivered.attemptId, 'each claim is its own attempt');

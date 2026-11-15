@@ -3,13 +3,20 @@
 // (agent auth §13.2: a paired relay's "Turn on push there", the rotation
 // dialog's "Open there", the new sign-in push). The link opens UI only: it
 // changes no setting, and it carries no value for any field. The tab must be
-// one of the Settings tabs; anything else is ignored. Read once, then taken
-// out of the address.
+// one of the Settings tabs or a retired one; anything else is ignored. Read
+// once, then taken out of the address.
 
 export const SETTINGS_DEEP_LINK_TABS = Object.freeze([
-  'general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications', 'features',
+  'general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications',
 ]);
+// A tab that is gone: an old link to it opens Settings at General.
+const RETIRED_TABS = new Map([['features', 'general']]);
 const PARAMS = ['settings', 'add-relay'];
+
+function linkedTab(raw) {
+  if (SETTINGS_DEEP_LINK_TABS.includes(raw)) return raw;
+  return RETIRED_TABS.get(raw) || '';
+}
 
 /** `{ tab, addRelay, cleanedPath }`: cleanedPath is null when the URL needs no rewrite. */
 export function readSettingsDeepLink(href) {
@@ -21,7 +28,7 @@ export function readSettingsDeepLink(href) {
   }
   if (!PARAMS.some((param) => url.searchParams.has(param))) return { tab: '', addRelay: false, cleanedPath: null };
   const raw = String(url.searchParams.get('settings') || '').trim().toLowerCase();
-  const tab = SETTINGS_DEEP_LINK_TABS.includes(raw) ? raw : '';
+  const tab = linkedTab(raw);
   const addRelay = tab === 'relays' && url.searchParams.get('add-relay') === '1';
   for (const param of PARAMS) url.searchParams.delete(param);
   return { tab, addRelay, cleanedPath: `${url.pathname}${url.search}${url.hash}` };
@@ -47,8 +54,8 @@ export function requestSettingsTab(rawTab, {
   history = window.history,
   title = document.title,
 } = {}) {
-  const tab = String(rawTab || '').trim().toLowerCase();
-  if (!SETTINGS_DEEP_LINK_TABS.includes(tab)) return 'ignored';
+  const tab = linkedTab(String(rawTab || '').trim().toLowerCase());
+  if (!tab) return 'ignored';
   let gated = false;
   try { gated = isAuthGateVisible() === true; } catch { gated = false; }
   if (!gated) {

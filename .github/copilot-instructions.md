@@ -1,48 +1,43 @@
 # Copilot Relay Operating Instructions
 
-When changing anything related to the web relay (`server/` or `.github/extensions/web-relay/`):
+When changing anything related to the web relay (`server/`, `shared/`, `bin/`):
 
-1. Use a **single runtime owner**. Do not mix extension-managed mode with standalone relay mode.
-   - **Extension-managed (default):** let `.github/extensions/web-relay/extension.mjs` own server supervision (it starts `server.js --supervised`) and polling/heartbeat.
-   - **Standalone dev mode:** start the server, then `node server/relay.mjs` by hand, only when you intentionally are not relying on extension polling.
-   - Never run a second server, `node server/relay.mjs`, and extension polling together.
-   - `node server/server.js` is the only server entry point (`npm start` is an alias for it). Its role is argv-driven — `--relay-runtime` marks the supervisor's worker child, `--supervised` hands restart ownership to the spawner. Never signal the role through the environment; it is inherited by tmux workers and the Copilot CLI.
+1. Use a **single runtime owner**: one relay per checkout or install.
+   - The relay is started with `oar start`, the service (`oar service install`), or `npm start` (`node server/server.js`) in a checkout. Every provider, Copilot included, runs in a session worker the relay starts for each conversation (Copilot, OpenAI BYOK and OpenAI image sessions on the Copilot SDK worker in `server/copilot-worker/`).
+   - Never run a second server beside the one that owns the port.
+   - `node server/server.js` is the only server entry point (`npm start` is an alias for it). Its role is argv-driven — `--relay-runtime` marks the supervisor's worker child, `--supervised` hands restart ownership to the spawner. Never signal the role through the environment; it is inherited by tmux workers and the agent CLIs.
    - Never kill or restart the node process bound to port `3333` unless the user explicitly gives permission to restart the web relay.
 2. Before any restart, stop stale relay/watchdog processes from earlier runs (especially detached shells) so only one web relay remains bound to `:3333`.
-   3. For extension-managed mode, only restart the web relay after explicit user permission. Manual restarts must use the authenticated localhost API (`POST /api/relay/shutdown`); do not use direct process kills or respawn scripts.
-      - Include `restart: true` in the request body for an intentional self-restart; omit it for a plain shutdown.
-      - Preferred restart request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.
-      - `POST /api/relay/shutdown` is queued and only actually exits once the current turn is idle, so do not wait for it to "interrupt" an in-flight turn.
-      - Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide (**Restart now** in the web UI).
-4. Keep the main Copilot CLI session running so extension polling can continue.
-5. Verify relay health after changes:
-   - `GET /api/status` reports `cliOnline: true`
+3. Only restart the web relay after explicit user permission. Manual restarts must use the authenticated localhost API (`POST /api/relay/shutdown`); do not use direct process kills or respawn scripts.
+   - Include `restart: true` in the request body for an intentional self-restart; omit it for a plain shutdown.
+   - Preferred restart request body: `{ "reason": "manual-restart", "requestedBy": "localhost-api", "restart": true }`.
+   - `POST /api/relay/shutdown` is queued and only actually exits once the current turn is idle, so do not wait for it to "interrupt" an in-flight turn.
+   - Never pass `immediate` in that request body: it restarts without waiting for the running turns, which only the user may decide (**Restart now** in the web UI).
+4. Verify relay health after changes:
+   - `GET /api/status` answers, and `sessionWorker.workers[]` lists the workers of the running conversations
    - Queue is draining (`pendingCount`/`processingCount` moving or zero)
    - Exactly one listener owns port `3333`
-6. Check logs for startup and processing errors:
-   - Relay/server logs from `server.js`
-   - Extension debug log: `server/logs/ext-debug.log`
-7. If the CLI asks a clarification question, answer it in the web relay question card UI element (displayed in the relay dashboard) instead of auto-answering in code. If no clarification question appears, proceed with the next step.
-8. Per-message execution mode now lives in the browser composer (`plan` / `ask` / `agent` / `autopilot`) and is stored with each queued turn.
-9. When a turn needs user input, always use `ask_user` rather than asking inline text.
-10. In `autopilot`, still use `ask_user` for clarification; the relay bridge will capture it and show a web question card even if the direct SDK question hook is bypassed.
-11. Do not spawn Copilot CLI client instances for tests or debugging without explicit user permission; ask first if a test would launch one.
-12. When tracing a stuck or missing message, follow this exact sequence to locate where it stopped:
+5. Check logs for startup and processing errors:
+   - Relay/server logs from `server.js` (`server/logs/server.log` in a checkout; `oar doctor` names the folder of an install)
+   - Session worker logs in the same folder: `worker-<conversation id>.log`
+6. If the agent asks a clarification question, answer it in the web relay question card UI element (displayed in the relay dashboard) instead of auto-answering in code. If no clarification question appears, proceed with the next step.
+7. Per-message execution mode lives in the browser composer (`plan` / `ask` / `agent` / `autopilot`) and is stored with each queued turn.
+8. When a turn needs user input, always use `ask_user` rather than asking inline text.
+9. In `autopilot`, still use `ask_user` for clarification; the worker passes it to the relay, which shows a web question card.
+10. Do not spawn Copilot CLI client instances for tests or debugging without explicit user permission; ask first if a test would launch one.
+11. When tracing a stuck or missing message, follow this exact sequence to locate where it stopped:
    - Collect identifiers first: `conversation_id`, approximate timestamp, and message text (or `message_id` if available).
    - Trace server flow in `server/logs/server.log` for that conversation:
      - `QUEUED` (accepted by relay)
      - `DEQUEUED` (picked for execution)
      - `RESPONSE` (completed)
-   - Trace extension flow in `server/logs/ext-debug.log` for same window:
-     - `session.send: queuing for msgId ...`
-     - `session.sendAndWait: completed ...` (or failure/retry signals)
+   - Trace the worker in `server/logs/worker-<conversation id>.log` for the same window: the turn it received, and its completion or failure.
    - Check DB queue truth in the relay's database, `server/data/oar.db` (`server/data/copilot.db` on installs from before 0.9.20; `oar doctor` names it), `queue` table, for the specific row status (`pending`/`processing`/`done`) and ownership (`owner_sdk_session_id`, `runtime_session_id`).
    - Check live runtime snapshot via authenticated `GET /api/status`:
      - `sessionWorker.workers[]` entry for the target `sdkSessionId`
-     - `activeBridgeOwner`
      - queue counters (`pendingCount`, `processingCount`)
    - Validate worker PID reality: if status says `ready/processing` but the worker PID is not running, treat as stale worker registration.
-    - Conclude with a one-line stop point: **accepted but not dequeued**, **dequeued but no response**, or **response emitted but UI missed update**.
+   - Conclude with a one-line stop point: **accepted but not dequeued**, **dequeued but no response**, or **response emitted but UI missed update**.
 
 Do not consider relay-related work complete until restart + status + log checks pass.
 
@@ -61,7 +56,7 @@ Do not consider relay-related work complete until restart + status + log checks 
   path from `tests/e2e-env.mjs` only — never read `server/config.json`, never open
   `server/data/oar.db` (or `copilot.db`), and never target `http://127.0.0.1:3333` from a test.
 - **Never run `tests/agents/` smoke tests or anything that sends prompts through the live
-  relay or spawns Copilot CLI clients without explicit user permission** (see rule 11 above).
+  relay or spawns Copilot CLI clients without explicit user permission** (see rule 10 above).
   They are excluded from `npm test` on purpose.
 
 ## Writing Tests

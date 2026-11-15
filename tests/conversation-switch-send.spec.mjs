@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, fakeWorkerFor, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Switching conversations quickly, then sending in the one the user stopped
@@ -21,46 +25,16 @@ import { relayToken } from "./e2e-env.mjs";
  * stream is posted by the spec in the worker's place.
  */
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId = "") {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const response = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(response.ok()).toBeTruthy();
-    const message = (await response.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(150);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
 // A finished first turn on a session-bound conversation: follow-ups from the
-// composer are accepted only there.
+// composer are accepted only there. Made as the web client makes one.
 async function seedConversation(request, headers, title, stamp) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text: `${title} ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
+  const started = await startConversation({ text: `${title} ${stamp}` });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
   expect(conversationId).toBeTruthy();
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
-  const synced = await request.post("/api/session-sync", {
-    headers,
-    data: { sdk_session_id: `pw-sid-switch-${stamp}-${conversationId.slice(0, 8)}`, conversation_id: conversationId },
-  });
-  expect(synced.ok()).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `${title} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  await started.worker.take(messageId);
+  const responded = await respondAsWorker(messageId, { conversationId, text: `${title} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   return { conversationId, title: `${title} ${stamp}` };
 }
 
@@ -174,20 +148,17 @@ for (const profile of [
 
     // The worker's part: it takes the message and streams the start of a reply.
     async function streamReply(request, headers, sent, streamText) {
-      await dequeue(request, headers, sent.messageId, sent.ownerSessionId);
+      await fakeWorkerFor(sent).take(sent.messageId);
       const streamed = await request.post("/api/stream", {
         headers,
-        data: { messageId: sent.messageId, conversationId: sent.conversationId, text: streamText, mode: "agent", done: false },
+        data: { ...attemptOf(sent.messageId), messageId: sent.messageId, conversationId: sent.conversationId, text: streamText, mode: "agent", done: false },
       });
       expect(streamed.ok()).toBeTruthy();
     }
 
     async function finish(request, headers, sent) {
       if (!sent?.conversationId || !sent?.messageId) return;
-      await request.post("/api/response", {
-        headers,
-        data: { messageId: sent.messageId, conversationId: sent.conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(sent.messageId, { conversationId: sent.conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
 
     // A send the relay refuses for a reason the user can act on says that
@@ -352,13 +323,13 @@ for (const profile of [
         await pick(page, last.conversationId);
         await expect(page.locator("#chat-title")).toHaveText(last.title);
         sent = await send(page, text);
-        await dequeue(request, headers, sent.messageId, sent.ownerSessionId);
+        await fakeWorkerFor(sent).take(sent.messageId);
         await expect(page.locator("#thinking-indicator")).toHaveCount(1);
 
         frames.drop = true;
         const streamed = await request.post("/api/stream", {
           headers,
-          data: { messageId: sent.messageId, conversationId: sent.conversationId, text: streamText, mode: "agent", done: false },
+          data: { ...attemptOf(sent.messageId), messageId: sent.messageId, conversationId: sent.conversationId, text: streamText, mode: "agent", done: false },
         });
         expect(streamed.ok()).toBeTruthy();
         await expect.poll(() => frames.dropped).toBeGreaterThan(0);

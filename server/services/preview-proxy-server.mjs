@@ -198,7 +198,7 @@ function errorPage({ title, detail }) {
   code { background: #1e2128; padding: .1rem .35rem; border-radius: 4px; color: #e6e8ec; }
 </style></head>
 <body><main><h1>${escapeHtml(title)}</h1><p>${detail}</p>
-<p>Served by the copilot-remote preview lane.</p></main></body></html>`;
+<p>Served by the OAR preview lane.</p></main></body></html>`;
 }
 
 function sendErrorPage(res, status, { title, detail }) {

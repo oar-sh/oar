@@ -65,13 +65,6 @@ function makeDeps({ queueRow = null, runtimeSessionsBySid = {}, conversationProv
     resolveRequestedModel: () => ({ ok: false, error: 'unsupported', available: [] }),
     getOpenAIProviderSettings: () => ({ configured: false, enabled: false, model: '', models: [] }),
     getCursorProviderSettings: () => ({ enabled: false, model: '', models: [] }),
-    featureFlags: {},
-    relayBridgeOwnerService: {
-      normalizeIdentity: (raw) => {
-        const sessionId = String(raw?.sessionId || '').trim();
-        return sessionId ? { sessionId } : null;
-      },
-    },
     readSessionTranscriptMessages: () => [],
     resolveSessionStateRoot: () => '/tmp',
     ensureSessionId: () => 'session-1',

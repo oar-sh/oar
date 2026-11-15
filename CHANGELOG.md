@@ -3,6 +3,351 @@
 All notable changes to OAR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow semver.
 
+## [Unreleased]
+
+## [0.9.28] — 2026-11-15
+
+Highlights: Copilot runs on the SDK worker only, and **Settings →
+Providers → Copilot** installs and updates the Copilot CLI for it. The
+Copilot extension engine is gone, and with it `oar copilot`, the relay
+that Copilot started, the Copilot terminal view with **🖥️ Inspect tmux
+console**, the hand-started `server/relay.mjs` and the session restart
+orchestrator; the **Settings → Features** tab is gone too, and what its
+switches turned on is always on. The loop guard's limit is a setting
+(30 prompts by default, 10 to 500, or never ask), its card can stop asking
+for one session until you revoke that, reports to the session that started
+a session are free, and a held schedule firing asks you in the Inbox. A
+reply to a prompt an agent stopped waiting for still reaches it, as a late
+reply. Every Check Usage tab draws a daily chart and a split by model, over
+the last 7, 30 or 90 days.
+
+### Added
+
+- **Install and update the Copilot CLI from Settings → Providers →
+  Copilot.** Linux and macOS use GitHub's install script, into
+  `~/.local/bin`; Windows uses `npm install -g @github/copilot`; Update
+  runs `copilot update`. Nothing is installed unless the download's
+  checksum was checked. The relay runs the CLI once afterwards so its
+  SDK is there, and Copilot chats use it without a relay restart. You
+  still log in once in a terminal on the relay host (`copilot`).
+  `oar doctor` and the panel give `copilot --version` 30 seconds, since
+  its first run after an install unpacks the CLI.
+- **Usage charts on every Check Usage tab.** Claude, Claude Cloud, the
+  Claude API, Copilot, Cursor, Grok and OpenAI images get the two charts
+  the DeepSeek tab has: a daily chart stacked by model and a split by
+  model, one line cut into every model with each model's amount and share
+  listed under it, largest first, from the per-day token booking. Both
+  show every model, each in the same one of eight colours, and the daily
+  chart names its peak day, its total and each model's total, with taller
+  columns on a phone. DeepSeek's daily chart does the same. The Claude
+  API, Grok and OpenAI images chart the money; Claude and Claude Cloud
+  chart Claude Code's figure at API prices, labelled as not charged;
+  Copilot and Cursor, which report no cost per turn, chart tokens. The
+  Copilot tab gets a second pair for your own OpenAI key.
+- **A 7 / 30 / 90 days picker above the charts,** one choice for every
+  tab, remembered in the browser (30 at first). DeepSeek's daily chart
+  takes it too; its "Where the money goes" stays all time and says so. A
+  window with nothing to chart says "Nothing to chart in the last 7
+  days."; a tab with nothing in 90 days has no charts.
+- **"Allow for this session" on the loop guard's card.** Besides Allow
+  and Deny, the card that asks whether an agent may keep prompting other
+  agents now offers to stop asking in that session. It holds until you
+  revoke it under Settings → Relays → Agent sessions (**Loop guard off
+  for: … · Revoke**), survives relay restarts, follows a compaction, and
+  ends when the session is archived or deleted.
+- **A held schedule firing asks in the Inbox.** A schedule that fires
+  into another session and is held by the loop guard puts one card into
+  the conversation that set it (**Allow once**, **Allow for this
+  session**, **Leave held**). It does not block that conversation's agent.
+  It is withdrawn when a firing of that conversation goes again; after an
+  unschedule it stays until you answer or dismiss it.
+- **A reply to a prompt nobody waits for any more is delivered.** When an
+  agent prompts another session with `wait_seconds` 0, or its wait runs
+  out, the reply now comes into its conversation by itself as a late reply
+  (a relay event): from a session on this relay as soon as its turn ends,
+  from a paired relay within 15 seconds at first. An ack-only reply
+  (`[ack] …`, "Received.") wakes nobody and rides along with the next
+  event message. A session on this relay whose reply reached nobody,
+  because the sender was archived or deleted, is told once.
+
+### Changed
+
+- **A prompt the agent did not wait for brings a late reply instead of a
+  turn_end.** A watcher subscribed to the session it prompted no longer
+  gets that turn's `turn_end` preview: the late reply carries the whole
+  reply.
+- **Session worker routing, continuation answer routing and generated-image
+  continuity are always on.** They were on by default and could be turned
+  off in Settings → Features; that tab is gone, with the reserved Worker
+  fallback restart switch, which had no effect.
+- **Copilot runs on the SDK worker only.** Copilot, OpenAI (BYOK) and
+  OpenAI Image conversations each run in a headless worker on the SDK
+  that comes with the Copilot CLI. The relay looks the SDK up each time
+  such a worker starts, so a Copilot CLI installed or updated while the
+  relay runs is used without a relay restart.
+- **About shows the OpenAI row like every other provider:** online or
+  idle from its own workers.
+- **`oar doctor` checks the `copilot` command** instead of `gh`.
+- **The `oar` menu has eight entries and Quit.** A digit beyond them is
+  no longer taken as Quit, and the numbered prompt says `1-8`.
+- **`oar --migrate-from <dir>` without a command** answers
+  "--migrate-from needs a command." (it belongs to `oar setup`); it used
+  to start `oar copilot`.
+- **The preview lane's "not found" page and one autostart error say
+  OAR.** They still named the project by its old name.
+- **A Cursor worker on an older build is replaced as soon as its turn
+  ends.** After an update, a Cursor worker that still ran the earlier code
+  was replaced only after ten minutes without a delivery or a turn end.
+  Cursor workers now state their kind, so they take the recycle path of
+  the Claude, Claude API and DeepSeek workers: replaced once the session
+  is idle, without waiting for the CLI, and handed nothing meanwhile.
+  Background shells and tasks, which the Cursor SDK does not report, end
+  with the old worker. This applies from the update after this one: a
+  Cursor worker of an earlier version states no kind and still gets the
+  ten minutes. So does one in a git checkout that runs the Cursor SDK
+  from its own `node_modules`.
+- **Deleting a Copilot, OpenAI (BYOK) or OpenAI Image conversation tries
+  its Copilot CLI session once.** The relay deletes the CLI's session
+  through the SDK while it deletes the conversation (one deleted before
+  its first turn has none yet). When that fails, the conversation is
+  deleted all the same, the relay log says *[delete] Copilot session …
+  was not deleted: …*, and the session's state stays under
+  `~/.copilot/session-state/`. Earlier versions queued such a session for
+  the Copilot CLI extension to retry; nothing retries it now.
+- **The loop guard's limit is a setting.** Settings → Relays → Agent
+  sessions → **Loop guard** sets after how many prompts to other agents,
+  without a message from you, the next one asks you: 30 by default, 10
+  to 500 in steps of 10, or 0 to never ask. It applies to prompts to
+  paired relays and to this relay, whether or not agent sessions are on.
+- **Reports to the session that started a session are free.** A
+  session's `send` to the session whose agent created it is not counted
+  by the loop guard while its turn holds at least one of that session's
+  prompts and nothing but those prompts and your own messages; a turn
+  with a relay event, a scheduled prompt or a continuation in it still
+  counts, and so do the starting session's own prompts.
+- **The session worker socket still accepts `?token=`.** The 0.9.27 notes
+  said this would be removed in the next version; it stays in 0.9.28 and
+  goes in a later release.
+
+### Removed
+
+- **The Copilot Extension engine** and the engine choice in Settings →
+  Providers → Copilot. `POST /api/settings/copilot` is gone; `GET` stays
+  and answers the one engine, `sdk`, for paired relays on an earlier
+  version.
+- **The fallback to the extension when the Copilot SDK is not found.**
+  Such a relay has no Copilot: a Copilot, OpenAI (BYOK) or OpenAI Image
+  conversation fails with a message that names the missing SDK.
+- **`oar copilot`** (with `--install-extension` and
+  `--no-install-extension`), the menu's **Copilot session** entry and
+  **`npm run copilot:relay`**, the Copilot terminal session with the
+  relay attached. `oar copilot` and a bare `oar -- <args>` now end with a
+  line that says the command was removed and points at `oar start`.
+  `bin/bat/oar.bat`, the Windows command shim of a git checkout, is gone
+  too.
+- **The relay started by Copilot.** The extension started a relay as soon
+  as the Copilot CLI loaded it (through the global wrapper, or inside the
+  repository). The relay is started with `oar start` or the service.
+- **Attaching an own Copilot CLI session** to an OAR conversation.
+- **The terminal (TUI) view of a Copilot session and "🖥️ Inspect tmux
+  console"** in the conversation menu, and with it xterm.js, which only
+  that view loaded. Nothing takes the entry's place in this version; a
+  view of the session worker's log is planned there for a later one.
+  Until then a session's output is in its `worker-<session>.log` in the
+  relay's `logs` folder. Session workers still run under tmux where it is
+  installed.
+- **Built-in Copilot CLI slash commands.** The SDK worker has none.
+- **`node server/relay.mjs`, the standalone mode.** The Copilot relay
+  started by hand beside a running relay, which polled `GET /api/pending`
+  for work, is gone. Nothing started it, and beside a relay that launches
+  its own workers it could take a message away from its conversation's
+  worker.
+- **The session restart orchestrator and the bridge owner.** The relay no
+  longer restarts a session's Copilot CLI and waits for it to bind again;
+  only the removed extension used that. `/api/status` has no
+  `restartOrchestrator` field. The relay's own restart (**🌄 Restart web
+  relay**, `POST /api/relay/shutdown` with `restart: true`, `oar
+  restart`) is unchanged, and a relay started with `server.js
+  --supervised` still works.
+- **The routes only the extension and `server/relay.mjs` called:**
+  `POST /api/session-sync`, `POST /api/session-workspace-root`,
+  `GET /api/sdk-session-delete/pending`,
+  `POST /api/sdk-session-delete/result`, `GET /api/restart-orchestrator`,
+  `POST /api/restart-orchestrator/request`, `/rebind` and `/bridge-exit`,
+  `POST /api/relay/recover-processing` and `POST /api/relay-session-link`.
+  `GET /api/pending` stays for a process that plays a session's worker
+  over HTTP: it needs the session in `x-relay-session-id` (`400` without
+  it) and hands out only that session's messages. The workers take their
+  turns over the worker socket.
+- **The polling address at start.** The console banner no longer prints
+  *CLI polling URL (for monitoring mode)*, and `readyBanner` in
+  `/api/status` has no `pollingUrl`.
+
+### Fixed
+
+- **DeepSeek's "Where the money goes" bars compare.** Each model's bar
+  was drawn full width, whatever it cost; it is now as long as its spend
+  against the model that cost most, still split into its parts.
+- **A wait abandoned at the moment the reply arrived no longer marks it as
+  received.** The reply then reached nobody, and that turn's `turn_end`
+  was held back too. It now comes as a late reply.
+- **A message of a conversation that was never bound to a session runs in
+  that conversation.** Such a message has no session of its own: a
+  schedule or event subscription firing into it, a board follow-up,
+  or a message carried into a compacted chat. A Copilot or OpenAI one
+  could be picked up by the worker of another conversation, even a Claude
+  one, and run there. Any other provider's waited without a worker and
+  never ran. It now belongs to its conversation's own session: that
+  worker is started for it, with the conversation's provider and working
+  folder, and no other worker takes it.
+- **A message whose conversation is gone no longer stays pending.** If the
+  relay stopped in the middle of deleting a conversation, the
+  conversation's waiting messages counted as pending and kept the host
+  from suspending, for good. They now fail shortly after the delete, and
+  at once when the relay starts.
+- **Old waiting messages do not suddenly run.** When the relay starts,
+  messages that waited longer than 24 hours for a worker the relay never
+  started fail with a note in their conversation (“not run; resend it if
+  it is still wanted”). Younger ones run.
+- **macOS finds the Copilot SDK.** The relay looked for the Copilot
+  CLI's version folders in `~/Library/Application Support/copilot/pkg`;
+  the CLI writes them to `~/Library/Caches/copilot/pkg`. That folder is
+  now searched first, the old one after it.
+- **A message handed back during a session restart runs again.** A
+  worker that handed a message back while the session restart
+  orchestrator was draining, restarting or awaiting a rebind parked it,
+  and with session worker routing on (the default) nothing released a
+  parked row: the chat showed a queued turn that never ran. The
+  orchestrator is gone (see Removed), and a message handed back goes back
+  to pending with the usual retry delay.
+  Messages parked earlier stay parked: the relay logs their number when
+  it starts, and they can be cancelled in the conversation.
+- **A choice button on a question notification answers the question.**
+  The button sent the answer without the question's session, so the
+  relay refused it ("session mismatch") for every question an agent
+  session asked, and the tap only opened the conversation. The push now
+  carries the question's session and the button sends it along, as the
+  card in the app does, so other questions are answered with one tap.
+  Approval, Safety-check and tool-permission cards (relay approvals,
+  Claude Cloud permissions, Copilot's ask-mode tool permissions) get no
+  answer buttons: tapping their notification opens the conversation. A
+  phone whose service worker has not updated yet keeps opening the
+  conversation until it does.
+- **A failed worker launch no longer takes a running turn away.** When
+  the relay launched a session's worker and the launch failed while
+  that session's worker had just reported in (after a relay restart, or
+  a worker the relay had lost track of), the failure overwrote the
+  worker's entry and dropped its process id. Within half a minute the
+  relay could take the worker for dead and take its running turn back.
+  The worker now keeps its entry; the failed launch is only logged, with
+  no restart and no count toward the restart limit. A deferred launch
+  and one that reports no process id leave such a worker alone too.
+- **A loop guard card pushes even while an OAR tab is open.** A tab on
+  any session counted as having seen it, so neither this relay nor a
+  paired one pushed it, and agents waited on the card unnoticed.
+
+### Upgrade notes
+
+- **Anything that started `server/relay.mjs` or the Copilot relay.** A
+  script, systemd unit, tmux line or Windows scheduled task that ran
+  `node server/relay.mjs`, `npm run copilot:relay`, `oar copilot` or the
+  Copilot CLI to bring the relay up now fails or starts nothing: remove it.
+  Start the relay with `oar start`, or at boot with `oar service install`
+  (in a git checkout `npm start` or `node server/server.js`); it starts
+  every session's worker itself. A unit or task that already runs
+  `oar start`, `oar service` or `server/server.js` (`--supervised` too)
+  needs no change. A script that called the removed restart routes
+  (`/api/restart-orchestrator…`, `POST /api/relay/recover-processing`)
+  restarts the relay with
+  `oar restart` or `POST /api/relay/shutdown` with `restart: true`
+  instead.
+- **The loop guard asks after 30 prompts, as before.** The number is now
+  **Settings → Relays → Agent sessions → Loop guard** (10 to 500 in steps
+  of 10, or 0 to never ask), stored as `remote_relay_agent_prompts_before_asking`
+  in `app_settings`.
+- **Migration 0042 adds three columns to `relay_event_own_prompts`.**
+  Prompts sent in the hour before the update can still get a late reply;
+  older ones keep their `turn_end` as before.
+- **The feature switches are ignored.** The four `COPILOT_REMOTE_*`
+  variables (`COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED` and the
+  continuation, fallback restart and image continuity ones), the
+  `feature_*` settings rows and a `features` key in `config.json` no
+  longer change anything. A relay that had one set to off runs with it on
+  and says so once in its log at start. `GET/POST /api/settings/features`
+  and the `features` field of `/api/status` are gone; a page loaded before
+  the update shows *Failed to load feature flags from the relay.* in its
+  Features tab until it reloads.
+- **A relay set to the Extension engine runs on the SDK worker.** The
+  stored choice is ignored and kept, and the relay says so once in its log
+  at start: *the Copilot Extension engine is gone, Copilot runs on the SDK
+  worker; ignoring copilot_engine=extension (app setting)*. A Copilot CLI
+  session of the old engine that still runs after the update is handed no
+  further turn, even while it still reports to the relay. It is stopped
+  when its conversation gets its next turn, and an SDK worker takes over
+  (the log names it: *worker launcher: session=… stopped pid=…, a process
+  of this session that is no session worker (left by an earlier
+  version)*). Until that turn it keeps running.
+- **Copilot, OpenAI (BYOK) and OpenAI Image conversations need the
+  Copilot CLI** installed on the relay host and run once (`copilot
+  --version`). A relay that does not find the SDK has no Copilot, and
+  those conversations fail with *Copilot SDK not found. Install the
+  GitHub Copilot CLI and run it once (copilot
+  --version); no relay restart is needed. Looked in: …*
+- **The old global wrapper is removed.** Earlier versions' `oar copilot`
+  wrote `~/.copilot/extensions/web-relay/extension.mjs`, which would now
+  fail on every start of the Copilot CLI. The relay removes it at its
+  first start, and `oar update` removes it too, when it is the generated
+  one and the extension it loads is gone (*removed the Copilot CLI
+  extension wrapper of an earlier version: …* in the log). A wrapper
+  edited by hand stays. `oar uninstall` still removes it.
+- **The relay is started with `oar start` or the service only**, no
+  longer by starting the Copilot CLI.
+- **The Copilot engine select is gone.** A page loaded before the update
+  still shows it in Settings → Providers → Copilot, and changing it there
+  shows *Failed to update Copilot settings* until the page reloads.
+- **The restart orchestrator's config keys and `cliPort` are ignored**,
+  without a warning: `restartGracefulTimeoutMs`, `restartReadyCooldownMs`,
+  `restartShutdownTimeoutMs`, `restartSpawnTimeoutMs`,
+  `restartRebindTimeoutMs`, `restartMaxAttempts`, `restartRetryBackoffMs`
+  and `cliPort` in `config.json`. A `cliPort` no longer keeps the preview
+  lane off its port.
+- **Half-deleted conversations go.** A conversation an earlier version
+  left hidden and half deleted, waiting for a clean-up only the extension
+  reported, is removed at the first start, with its messages. This is
+  not new: the relay has retried unfinished deletes at every start, and
+  without that clean-up the delete goes through.
+- **Leftovers in the database.** The `sdk_delete_requests` and
+  `relay_restart_orchestrator` tables stay in an existing database and
+  are no longer read; a new database no longer gets the second one.
+
+### Downgrade notes
+
+Going back to 0.9.27: `oar update --to 0.9.27` or `npm install -g
+@oar-sh/oar@0.9.27` (in a git checkout: `git checkout v0.9.27`, then a
+relay restart).
+
+- **The switches come back as they were.** 0.9.27 reads its stored
+  feature values again: nothing was deleted, so a switch you had set to
+  off is off again there.
+- **The Extension engine comes back.** 0.9.27 reads `copilot_engine`
+  again, and its `oar copilot` writes the global wrapper again on its next
+  run.
+- **Late replies stop.** 0.9.27 ignores the three new columns; a late
+  reply recorded but not delivered yet stays undelivered.
+- **The loop guard is fixed at 30 again.** 0.9.27 ignores the stored
+  limit and the **Loop guard off for** list (`remote_relay_loop_guard_off`),
+  so a session you allowed asks again after 30 prompts; both stay in the
+  database and count again after the next update.
+- **The Copilot CLI stays installed.** 0.9.27 has no install button but
+  uses a CLI that 0.9.28 installed: on Linux and Windows it finds its SDK
+  as before. On macOS 0.9.27 looks only in
+  `~/Library/Application Support/copilot/pkg`, not in
+  `~/Library/Caches/copilot/pkg` where the CLI writes its versions, and
+  falls back to the Extension engine.
+- **Updating again after going back:** a prompt 0.9.27 sent and no wait
+  received the reply to (it keeps them a day) gets its late reply then;
+  one whose reply a wait received does not.
+
 ## [0.9.27] — 2026-11-13
 
 Highlights: a new security model, in plain words. Agents no longer hold

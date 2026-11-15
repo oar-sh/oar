@@ -3,9 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { createApiClient } from "../shared/worker-runtime/api-client.mjs";
-import { createHeartbeatController } from "../shared/worker-runtime/heartbeat.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // What a relay restart used to drop although the workers kept running, and
 // the opt-in note for a turn it cut off:
@@ -18,11 +20,16 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
 //    again, gets one relay note in its conversation.
 //
 // This spec boots its OWN relay and restarts it on the same state. The
-// "worker" is this process: the real heartbeat controller and API client of
-// the session workers.
+// "worker" is this process (helpers/fake-worker.mjs: the real heartbeat
+// controller of the session workers).
 
 let relay = null;
-const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "oar-e2e-task-registry-"));
+// The relay restarts on the same port; the workers follow whichever runs.
+const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
+// The shells' output files, made by the tests that use them and removed
+// after them (not at module load: every process that loads this file would
+// make one).
+let outputDir = "";
 
 function api(route, { method = "GET", body, headers = {} } = {}) {
   return fetch(`${relay.baseUrl}${route}`, {
@@ -46,64 +53,44 @@ async function restartRelay() {
 
 // A queued message taken off the queue by "the worker": processing, owned.
 async function runningTurn(text) {
-  const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-  const { conversationId, messageId, ownerSessionId } = queued.payload;
-  const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-  const sessionId = String(ownerSessionId || conversationId);
-  let handed = false;
-  for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-    handed = String((await api("/api/pending", { headers: { "x-relay-session-id": sessionId } })).payload?.message?.id || "") === messageId;
-    if (!handed) await sleep(250);
-  }
-  expect(handed, "the message was handed out").toBe(true);
-  return { conversationId, messageId, sessionId };
+  const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+  await worker.take(messageId);
+  return { conversationId, messageId, sessionId: worker.sessionId };
 }
 
 async function idleConversation(text) {
   const turn = await runningTurn(text);
-  const answered = await api("/api/response", { method: "POST", body: { messageId: turn.messageId, conversationId: turn.conversationId, text: "started it in the background", model: "gpt-5.4-mini" } });
+  const answered = await respondAsWorker(turn.messageId, { conversationId: turn.conversationId, text: "started it in the background", model: "gpt-5.4-mini" });
   expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
   return turn;
 }
 
+/**
+ * A session worker as the relay sees one (helpers/fake-worker.mjs), with a
+ * task set it owns.
+ */
 function fakeWorker(sessionId, conversationId) {
-  const posts = [];
   const tasks = [];
-  const client = createApiClient({
-    serverUrl: relay.baseUrl,
-    token: relay.token,
-    getHeaders: () => ({
-      "x-relay-session-id": sessionId,
-      "x-relay-conversation-id": conversationId,
-      "x-relay-process-pid": String(process.pid),
-    }),
-  });
-  // The relay changes under the worker: every call goes to the current one.
-  const send = async (method, route, body) => {
-    posts.push({ route, body });
-    return client(method, route, body);
+  const base = createFakeWorker({ ...onRelay, sessionId, conversationId });
+  // What this worker sent from here on: its heartbeats and task posts.
+  const from = base.calls.length;
+  const send = async (route, body) => {
+    const sent = await base.post(route, body);
+    expect(sent.status, `${route}: ${JSON.stringify(sent.payload)}`).toBe(200);
   };
-  let timer = null;
   const worker = {
-    posts,
+    base,
+    get posts() { return base.calls.slice(from); },
     tasks,
-    publish: (extra = {}) => send("POST", "/api/background-tasks", { conversationId: sessionId, tasks, ...extra }),
-    settle: (body) => send("POST", "/api/background-task-settled", { conversationId: sessionId, ...body }),
+    publish: (extra = {}) => send("/api/background-tasks", { conversationId: sessionId, tasks, ...extra }),
+    settle: (body) => send("/api/background-task-settled", { conversationId: sessionId, ...body }),
+    beat: async () => { expect(await base.beat(), "the relay answered the heartbeat").toBe(true); },
   };
-  const heartbeat = createHeartbeatController({
-    api: send,
-    pollMs: 60_000,
-    getSessionReady: () => true,
-    getHeartbeatTimer: () => timer,
-    setHeartbeatTimer: (value) => { timer = value; },
-    getActiveQueueMessageId: () => "",
-    getSteeringState: () => ({ turnActive: false, autoCompactWindow: { active: null, backgroundWork: false } }),
+  base.use({
+    getSteering: () => ({ turnActive: false, autoCompactWindow: { active: null, backgroundWork: false } }),
     getBackgroundTaskIds: () => tasks.map((task) => task.taskId),
     onResyncBackgroundTasks: () => worker.publish({ resync: true }),
   });
-  worker.beat = async () => { expect(await heartbeat.pulseHeartbeat(), "the relay answered the heartbeat").toBe(true); };
   return worker;
 }
 
@@ -113,26 +100,13 @@ function shellTask(name, lines) {
   return { taskId: `task_fixture_${name}_${Date.now()}`, taskType: "local_bash", description: `npm run ${name}`, startedAt: Date.now() - 60_000, outputPath, outputKind: "file" };
 }
 
-const ROUTED = { COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1" };
-
-// A conversation bound to its session: a first turn, answered.
+// A conversation bound to its session (made as the web client makes one): a
+// first turn, answered.
 async function boundConversation() {
-  const first = await api("/api/message", { method: "POST", body: { text: "set up the scene", relayMode: "agent", model: "gpt-5.4-mini" } });
-  expect(first.status, JSON.stringify(first.payload)).toBe(200);
-  const { conversationId, ownerSessionId } = first.payload;
-  const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-  // An owned row goes only to a worker the relay knows: one heartbeat first.
-  const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId), "x-relay-process-pid": String(process.pid) } : {};
-  if (ownerSessionId) await fakeWorker(String(ownerSessionId), conversationId).beat();
-  let handed = false;
-  for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-    handed = String((await api("/api/pending", { headers })).payload?.message?.id || "") === first.payload.messageId;
-    if (!handed) await sleep(250);
-  }
-  expect(handed, "the first message was handed out").toBe(true);
-  expect((await api("/api/response", { method: "POST", body: { messageId: first.payload.messageId, conversationId, text: "scene ready", model: "gpt-5.4-mini" } })).status).toBe(200);
-  return conversationId;
+  const first = await startConversation({ text: "set up the scene" }, onRelay);
+  await first.worker.take(first.messageId);
+  expect((await first.worker.respond(first.messageId, { text: "scene ready", model: "gpt-5.4-mini" })).status).toBe(200);
+  return first.conversationId;
 }
 
 // A message its session's "worker" takes off the queue: processing, owned.
@@ -142,14 +116,7 @@ async function ownedRunningTurn(conversationId, text) {
   const { messageId, ownerSessionId } = queued.payload;
   expect(ownerSessionId, "the turn is owned by the session").toBe(conversationId);
   const worker = fakeWorker(ownerSessionId, conversationId);
-  await worker.beat();
-  let handed = false;
-  for (let attempt = 0; attempt < 40 && !handed; attempt += 1) {
-    const pending = await api("/api/pending", { headers: { "x-relay-session-id": ownerSessionId, "x-relay-process-pid": String(process.pid) } });
-    handed = String(pending.payload?.message?.id || "") === messageId;
-    if (!handed) await sleep(250);
-  }
-  expect(handed, "the turn was handed to its worker").toBe(true);
+  await worker.base.take(messageId);
   return { conversationId, messageId, worker };
 }
 
@@ -173,13 +140,15 @@ test.describe.serial("the task registry across a relay restart", () => {
   test.setTimeout(150_000);
 
   test.beforeAll(async () => {
+    outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "oar-e2e-task-registry-"));
     relay = await startRelay();
   });
 
   test.afterAll(async () => {
     if (relay) await relay.stop();
     relay = null;
-    fs.rmSync(outputDir, { recursive: true, force: true });
+    if (outputDir) fs.rmSync(outputDir, { recursive: true, force: true });
+    outputDir = "";
   });
 
   test("a running shell's console and an ended row come back; the worker's set makes the shell live again", async ({ page }) => {
@@ -259,14 +228,13 @@ test.describe.serial("the task registry across a relay restart", () => {
   });
 });
 
-// Session worker routing on (the harness pins it off for queue specs): a
-// turn is owned by its session's worker, and that worker's heartbeat is what
-// tells the relay, after the restart, that it no longer has the turn.
+// A turn is owned by its session's worker, and that worker's heartbeat is
+// what tells the relay, after the restart, that it no longer has the turn.
 test.describe.serial("a turn a relay restart cut off", () => {
   test.setTimeout(150_000);
 
   test.beforeAll(async () => {
-    relay = await startRelayServer({ token: randomUUID(), overrides: ROUTED });
+    relay = await startRelayServer({ token: randomUUID() });
   });
 
   test.afterAll(async () => {
@@ -283,15 +251,19 @@ test.describe.serial("a turn a relay restart cut off", () => {
     const startedConversation = await boundConversation();
     const freshConversation = await boundConversation();
     const started = await ownedRunningTurn(startedConversation, `refactor the orbit camera ${Date.now()}`);
-    const activity = await api("/api/activity", { method: "POST", body: { messageId: started.messageId, conversationId: started.conversationId, text: "Reading src/camera.ts" } });
+    const activity = await api("/api/activity", { method: "POST", body: { ...attemptOf(started.messageId), messageId: started.messageId, conversationId: started.conversationId, text: "Reading src/camera.ts" } });
     expect(activity.status, JSON.stringify(activity.payload)).toBe(200);
     const fresh = await ownedRunningTurn(freshConversation, `rename the zoom helper ${Date.now()}`);
 
     await relay.kill();
-    relay = await startRelayServer({ token: relay.token, port: relay.port, state: relay.state, overrides: ROUTED });
+    // The workers live on, without the turns: let go while the relay is
+    // down, so no heartbeat tells the new one that a turn is still held.
+    started.worker.base.release(started.messageId);
+    fresh.worker.base.release(fresh.messageId);
+    relay = await startRelayServer({ token: relay.token, port: relay.port, state: relay.state });
     expect((await api("/api/settings/restart-resume")).payload.enabled, "a setting of the relay").toBe(true);
 
-    // The workers live on, without the turns: their heartbeats say so.
+    // Their heartbeats say that they have no turn.
     const notesOf = async (conversationId) => ((await api(`/api/conversation/${conversationId}?limit=20`)).payload?.messages || [])
       .filter((message) => message.kind === "relay-restart-resume");
     await expect.poll(async () => {

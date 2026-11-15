@@ -11,12 +11,10 @@ import { relayToken } from "./e2e-env.mjs";
 // request body wiring, server-side validation, and the configured root landing
 // on the created conversation.
 //
-// One conversion is unavoidable: the isolated server runs with
-// COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1, so a fully valid bootstrap still 409s
-// at the worker-spawn step — after the conversation and its configured root
-// were created. The route tap converts exactly that failure into the success
-// payload the browser would receive on a real relay; every other response
-// (validation rejections included) passes through untouched.
+// The isolated server runs with COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1: it
+// defers the worker launch, and a fully valid bootstrap answers 200. The route
+// tap only records what was posted and answered; every response (validation
+// rejections included) passes through untouched.
 
 // platform-agnostic: the recents list is echoed through /api/status and rendered
 // as text; these are opaque strings, never resolved against the host filesystem.
@@ -67,13 +65,6 @@ test.describe("New Chat modal CWD picker", () => {
         bootstrapResponse = JSON.parse(text);
       } catch {
         bootstrapResponse = null;
-      }
-      if (response.status() === 409 && bootstrapResponse?.conversationId) {
-        return route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ ok: true, conversationId: bootstrapResponse.conversationId }),
-        });
       }
       return route.fulfill({ response, body: text });
     });

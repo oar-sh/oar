@@ -165,7 +165,7 @@ async function startRelay(name, { db = null, port = 0, settings: kept = null, ow
     return res.json({ items: [] });
   });
   app.post('/api/conversation/:id/billing', auth, (_req, res) => res.json({ ok: true }));
-  app.post('/api/settings/features', auth, (_req, res) => res.json({ ok: true }));
+  app.post('/api/settings/pwa-app-name', auth, (_req, res) => res.json({ ok: true }));
   app.get('/api/status', auth, (_req, res) => res.json({ ok: true, version: '0.9.27' }));
 
   async function call(route, { method = 'GET', token = state.ownerToken, headers = {}, body } = {}) {
@@ -408,7 +408,7 @@ test('least privilege: a key outside the relay routes gets 403 REMOTE_RELAY_PEER
   const key = a.entryFor(b).peerToken;
   for (const [method, route] of [
     ['POST', '/api/conversation/c-1/billing'],
-    ['POST', '/api/settings/features'],
+    ['POST', '/api/settings/pwa-app-name'],
     ['POST', '/api/remote-relays/pair'],
     ['GET', '/api/remote-relays'],
     ['PATCH', `/api/remote-relays/${b.entryFor(a).id}`],
@@ -919,7 +919,7 @@ test('one way with an inbound-only key: B lists A as inbound only, A keeps the k
   assert.deepEqual([request.verified, request.origin.entryId, request.origin.relayName], [true, holder.id, 'relay-alpha']);
   await a.client.request(a.entryFor(b), 'GET', '/api/relay-asks/remote/inbox');
   // Same scope as a two-way key: settings and pairing stay out.
-  for (const [method, route] of [['POST', '/api/settings/features'], ['POST', '/api/remote-relays/pair'], ['GET', '/api/remote-relays']]) {
+  for (const [method, route] of [['POST', '/api/settings/pwa-app-name'], ['POST', '/api/remote-relays/pair'], ['GET', '/api/remote-relays']]) {
     const answer = await b.call(route, { method, token: entry.peerToken, body: method === 'GET' ? undefined : {} });
     assert.deepEqual([answer.status, answer.body.code], [403, CODES.peerScope], `${method} ${route}`);
   }

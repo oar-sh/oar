@@ -503,7 +503,6 @@ test('host-local script path: group moves and the queued restart work with OAR_A
       queueCounts: () => ({ pendingCount: 0, processingCount: 0, parkedCount: 0 }),
       requestRelayShutdown: (args) => { shutdowns.push(args); return { accepted: true, status: 'queued' }; },
       cancelRelayShutdown: () => ({ cancelled: true }),
-      featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: false },
     }));
     registerConversationGroupRoutes(app, { auth: relayAuth.auth, io: { emit() {} }, conversationGroups: groups, remoteRelayInbound: null });
     app.post('/api/settings/openai', relayAuth.auth, (_req, res) => res.json({ ok: true }));
@@ -577,7 +576,6 @@ test('the oar CLI\'s own token may stop the relay and restart it now, over loopb
       cancelRelayShutdown: () => ({ cancelled: true }),
       // The real check: a proxy or tunnel header makes a request not local.
       isTrulyLocalRequest: createLocalRequestCheck().isTrulyLocal,
-      featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: false },
     }));
     const relay = await listen(app);
     try {

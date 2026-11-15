@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // "Tool lines shown while an agent works" (Settings › Appearance),
 // against the shared e2e relay. A turn is queued and taken off the queue; its
@@ -25,43 +29,11 @@ const SUB_LINES = 150;
 const POLL_BYTES_BOUND = 30_000;
 const MAIN_LINES = 12;
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-async function startTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+async function startTurn(text) {
+  // Made as the web client makes a chat: bound to its session from the start.
+  const { conversationId, messageId, worker } = await startConversation({ text });
+  await worker.take(messageId);
   return { conversationId, messageId };
-}
-
-// The worker's heartbeat while the turn runs: without it the CLI reads as
-// offline after a while and the live bubble goes with it.
-function keepWorkerAlive(request, headers, messageId) {
-  const beat = () => request.post("/api/heartbeat", { headers, data: { activeQueueMessageId: messageId } }).catch(() => {});
-  void beat();
-  const timer = setInterval(beat, 2_000);
-  return () => clearInterval(timer);
 }
 
 async function openConversationPage(page, token, conversationId, cap = null) {
@@ -98,20 +70,19 @@ test.describe("live tool lines", () => {
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
     const runIds = SUBAGENTS.map((_, index) => `toolu_cap_${index}_${stamp}`);
-    const { conversationId, messageId } = await startTurn(request, headers, `Map the widget code ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Map the widget code ${stamp}`);
     const activity = (text, subagentRunId = undefined) => request.post("/api/activity", {
       headers,
-      data: { messageId, conversationId, mode: "agent", text, ...(subagentRunId ? { subagentRunId } : {}) },
+      data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", text, ...(subagentRunId ? { subagentRunId } : {}) },
     });
     const mainLine = (n) => `Tool (view): src/widget-main-${n}.js`;
     const subLine = (run, n) => `Tool (grep): widget-${run}-part-${n}`;
-    const stopBeating = keepWorkerAlive(request, headers, messageId);
 
     try {
       for (const [index, runId] of runIds.entries()) {
         expect((await request.post("/api/subagent-run", {
           headers,
-          data: { messageId, conversationId, subagentRunId: runId, displayName: SUBAGENTS[index], status: "running", subagentType: "Explore" },
+          data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: SUBAGENTS[index], status: "running", subagentType: "Explore" },
         })).ok()).toBeTruthy();
       }
       // Main lines 1…10 between the sub-agents' bursts, 11 after them; the
@@ -184,8 +155,7 @@ test.describe("live tool lines", () => {
       await expect(subRows(runIds[0])).toHaveCount(SUB_LINES + 1);
       await expect(subRows(runIds[2])).toHaveCount(SUB_LINES);
     } finally {
-      stopBeating();
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 

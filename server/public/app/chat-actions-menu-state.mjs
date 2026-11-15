@@ -5,8 +5,8 @@
 // Restart web relay, Select Models, Check Usage, the queue, Day/Night, the PWA
 // version) are shown whenever the app is signed in, so Settings can be reached
 // on a fresh install, where no conversation exists yet. Per-conversation ones
-// (Edit title, Share, Stop sharing, Preview as shared, Archive, Inspect tmux,
-// Change CWD, Git changes, Kill session, Open on claude.ai) are hidden, not
+// (Edit title, Share, Stop sharing, Preview as shared, Archive, Change CWD,
+// Git changes, Kill session, Open on claude.ai) are hidden, not
 // greyed, while nothing is open: an empty screen offers what can be done there
 // and nothing else.
 //
@@ -62,7 +62,6 @@ export const CHAT_ACTIONS_MENU_ENTRY_IDS = Object.freeze([
   'chat-menu-archive',
   'chat-menu-group',
   'chat-menu-refresh-history',
-  'chat-menu-inspect-tmux',
   'chat-menu-select-models',
   'chat-menu-change-cwd',
   'chat-menu-git-changes',
@@ -184,7 +183,6 @@ export function resolveChatActionsMenuState({
   entries['chat-menu-preview-shared'] = perConversation();
   entries['chat-menu-archive'] = perConversation();
   entries['chat-menu-group'] = perConversation();
-  entries['chat-menu-inspect-tmux'] = perConversation();
   entries['chat-menu-git-changes'] = perConversation();
   // A cloud session has no working directory on the relay host to change.
   entries['chat-menu-change-cwd'] = hasConversation && !cloud ? shown() : hidden();

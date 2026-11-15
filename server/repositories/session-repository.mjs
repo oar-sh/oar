@@ -189,14 +189,8 @@ export function createSessionRepository(db) {
         // deleted sdk sessions tombstones (hide rediscovered SDK sessions after UI delete)
         listDeletedSdkSessions: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions`),
         getDeletedSdkSession: db.prepare(`SELECT sdk_session_id FROM deleted_sdk_sessions WHERE sdk_session_id = ? LIMIT 1`),
-        upsertRelaySessionLink: db.prepare(`
-          INSERT INTO relay_session_links (sdk_session_id, conversation_id, created_at)
-          VALUES (?, ?, ?)
-          ON CONFLICT(sdk_session_id) DO UPDATE SET conversation_id = excluded.conversation_id
-        `),
         getRelaySessionLink: db.prepare(`SELECT * FROM relay_session_links WHERE sdk_session_id = ?`),
         markDeletedSdkSession: db.prepare(`INSERT OR REPLACE INTO deleted_sdk_sessions (sdk_session_id, deleted_at) VALUES (?, ?)`),
-        clearDeletedSdkSession: db.prepare(`DELETE FROM deleted_sdk_sessions WHERE sdk_session_id = ?`),
         deleteDeletedSdkSessions: db.prepare(`DELETE FROM deleted_sdk_sessions`),
 
         // recent workspace roots (relay-owned CWD history)
@@ -255,56 +249,6 @@ export function createSessionRepository(db) {
         `),
         deleteAppSetting: db.prepare(`DELETE FROM app_settings WHERE key = ?`),
 
-        // SDK session delete bridge queue (server <-> extension)
-        upsertSdkDeleteRequest: db.prepare(`
-          INSERT INTO sdk_delete_requests (
-            sdk_session_id, conversation_id, status, requested_at, updated_at, processing_at, retry_count, next_attempt_at, last_error
-          ) VALUES (?, ?, 'pending', ?, ?, NULL, 0, NULL, NULL)
-          ON CONFLICT(sdk_session_id) DO UPDATE SET
-            conversation_id = COALESCE(excluded.conversation_id, sdk_delete_requests.conversation_id),
-            status = 'pending',
-            requested_at = excluded.requested_at,
-            updated_at = excluded.updated_at,
-            processing_at = NULL,
-            retry_count = 0,
-            next_attempt_at = NULL,
-            last_error = NULL
-        `),
-        dequeueSdkDeleteRequest: db.prepare(`
-          SELECT sdk_session_id, conversation_id, retry_count, requested_at
-          FROM sdk_delete_requests
-          WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-          ORDER BY requested_at ASC
-          LIMIT 1
-        `),
-        setSdkDeleteRequestProcessing: db.prepare(`
-          UPDATE sdk_delete_requests
-          SET status = 'processing', processing_at = ?, updated_at = ?, last_error = NULL
-          WHERE sdk_session_id = ? AND status = 'pending'
-        `),
-        resetStaleSdkDeleteProcessing: db.prepare(`
-          UPDATE sdk_delete_requests
-          SET status = 'pending', processing_at = NULL, updated_at = ?
-          WHERE status = 'processing' AND processing_at < ?
-        `),
-        getSdkDeleteRequestBySessionId: db.prepare(`
-          SELECT sdk_session_id, conversation_id, status, retry_count, requested_at, updated_at, next_attempt_at, last_error
-          FROM sdk_delete_requests
-          WHERE sdk_session_id = ?
-          LIMIT 1
-        `),
-        setSdkDeleteRequestPendingWithError: db.prepare(`
-          UPDATE sdk_delete_requests
-          SET status = 'pending',
-              processing_at = NULL,
-              retry_count = retry_count + 1,
-              next_attempt_at = ?,
-              updated_at = ?,
-              last_error = ?
-          WHERE sdk_session_id = ?
-        `),
-        deleteSdkDeleteRequest: db.prepare(`DELETE FROM sdk_delete_requests WHERE sdk_session_id = ?`),
-        deleteSdkDeleteRequests: db.prepare(`DELETE FROM sdk_delete_requests`),
         // SDK session import ledger
         getSdkSessionImport: db.prepare(`
           SELECT sdk_session_id, conversation_id, status, attempt_count, started_at, completed_at,
@@ -343,11 +287,6 @@ export function createSessionRepository(db) {
           WHERE status = 'processing'
         `),
         resetSdkSessionImports: db.prepare(`DELETE FROM sdk_session_imports`),
-        listDeletedConversationsBySdkSessionId: db.prepare(`
-          SELECT id, sdk_session_id
-          FROM conversations
-          WHERE status = 'deleted' AND sdk_session_id = ?
-        `),
         // public conversation shares (the rest lives in share-repository.mjs)
         touchConversationShare: db.prepare(`
           UPDATE conversation_shares

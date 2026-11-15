@@ -174,7 +174,7 @@ The relay does not take these variables from its own environment. BYOK in OAR is
 
 - For an OpenAI conversation the relay sets `COPILOT_PROVIDER_TYPE=openai`, `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_API_KEY` and `COPILOT_MODEL` on that conversation's worker, plus `COPILOT_PROVIDER_WIRE_API` (`responses` for `gpt-5*`, `codex-*`, `o1`, `o3` and `o4-*` models, `completions` for the rest).
 - It removes these variables from every other worker, so a `COPILOT_PROVIDER_*` set in the relay's environment never turns GitHub-hosted Copilot conversations into BYOK ones. Only the `openai` type is used; `azure` and `anthropic` are not available through OAR.
-- `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` and `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` in the relay's environment do apply: on Copilot's SDK engine they replace, for OpenAI conversations, the token limits OAR knows for the model (see [Environment variables](configuration.md#environment-variables)).
+- `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` and `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` in the relay's environment do apply: they replace, for OpenAI conversations, the token limits OAR knows for the model (see [Environment variables](configuration.md#environment-variables)).
 
 ## Source references
 

@@ -9,10 +9,10 @@
 //     carries the `requestedSchema`, the relay validates the submission, and
 //     the answer comes back as `structuredAnswer` (`askStructured`).
 //
-// Both are wired to the SAME relay endpoints the extension's
-// `skills/question-bridge.mjs` uses, so a question raised by the SDK engine
+// Both are wired to the SAME relay endpoints the removed Copilot CLI
+// extension's question bridge used, so a question raised by the SDK engine
 // renders as the identical card, answers through the identical route, and
-// honours the identical timeout as one raised by the extension engine.
+// honours the identical timeout.
 //
 // The polling/timeout/abort loop is NOT re-implemented here: it is
 // `createAskUserBridge(...).waitForRelayQuestionAnswer` from
@@ -31,6 +31,7 @@ import {
   QUESTION_TIMEOUT_CONTINUATION_TEXT,
 } from '../../shared/question-timeout.mjs';
 import { describePermissionRequest } from './copilot-sdk-adapter.mjs';
+import { TOOL_PERMISSION_QUESTION_SOURCE } from '../../shared/relay-asks.mjs';
 
 /** Choice labels for a permission card. Freeform text is treated as denial. */
 export const PERMISSION_APPROVE_CHOICE = 'Approve';
@@ -274,7 +275,7 @@ export function createCopilotQuestionBridge({
       prompt: `Copilot wants to run:\n\n${description}\n\nApprove this action?`,
       choices: [PERMISSION_APPROVE_CHOICE, PERMISSION_DENY_CHOICE],
       allowFreeform: true,
-      source: 'onPermissionRequest',
+      source: TOOL_PERMISSION_QUESTION_SOURCE,
       rationale: 'Copilot requested permission to run a tool in ask mode. Approve runs it; Deny or a typed reply refuses it, and a typed reply tells Copilot why.',
       extra: {
         requestId: String(request?.requestId || '') || undefined,

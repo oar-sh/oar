@@ -17,7 +17,7 @@
  * not of the relay runtime: every worker is its own process (tmux, a
  * detached process, a console window on Windows) and keeps its tasks when
  * the runtime exits. A restart (exit 75) is taken by the relay's own
- * supervisor or by the Copilot CLI extension, which start a new runtime;
+ * supervisor or by an outer one (`--supervised`), which start a new runtime;
  * the workers report back to it. Under a systemd user service the
  * supervisor hands that restart to systemd, which stops and starts the
  * whole service, and a shutdown stops it: systemd ends every process of the
@@ -39,8 +39,8 @@ function toText(value) {
 /**
  * How this relay process is run, from its environment and argv: whether a
  * systemd service runs it (`unit`: the service, `userManager`: a user's
- * systemd runs it, not the system's), and whether an outer supervisor (the
- * Copilot CLI extension, `--supervised`) owns its restarts. The supervisor
+ * systemd runs it, not the system's), and whether an outer supervisor
+ * (`--supervised`) owns its restarts. The supervisor
  * and the runtime ask the same way.
  */
 export function detectRelayHosting({

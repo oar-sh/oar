@@ -7,7 +7,6 @@ export const OAR_RELEASES_URL = 'https://github.com/oar-sh/oar/releases';
 
 const STATE_LABELS = Object.freeze({
   online: 'online',
-  offline: 'offline',
   idle: 'idle',
 });
 
@@ -128,8 +127,6 @@ function externalLink(href, text) {
 
 function providerDetails(provider) {
   const parts = [];
-  if (provider.engine === 'extension') parts.push('extension engine');
-  if (provider.engine === 'sdk') parts.push('SDK engine');
   if (provider.cliVersion) parts.push(`CLI ${provider.cliVersion}`);
   if (provider.sdkVersion) parts.push(`SDK ${provider.sdkVersion}`);
   return parts.join(' · ');

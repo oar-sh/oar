@@ -167,12 +167,6 @@ function boot({ withRemoteRelays = true } = {}) {
     relayActivityForResponse: (responseId) => stmts.listActivityByResponse.all(responseId),
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
     computeRetryDelayMs: () => 0,
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId } = {}) => {
-        const normalized = String(sessionId || '').trim();
-        return normalized ? { sessionId: normalized } : null;
-      },
-    },
     pushDispatchService,
     // The ask-user routes' stand-ins (see messages-routes-attempt-fencing).
     questionExpiresAt,
@@ -182,7 +176,7 @@ function boot({ withRemoteRelays = true } = {}) {
     parseQuestionRequest: () => null,
     normalizeQuestionChoices: (choices) => (Array.isArray(choices) ? choices.map((c) => String(c)) : []),
     formatQuestionRow: (row) => ({ id: row.id, conversationId: row.conversation_id, status: row.status }),
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
     ...(remoteRelayInbound ? { remoteRelayInbound } : {}),
   });
   const routes = captureRoutes(deps);
@@ -567,7 +561,8 @@ test('another relay\'s agent can neither see nor answer this relay\'s remote rel
   assert.equal(fx.stmts.getQuestion.get(ordinaryId).status, 'pending');
 
   // The user decides.
-  const userAnswer = await fx.post('/api/relay-question/:id/answer', { answer: 'Allow' }, { params: { id: 'approval-1' } });
+  // As the card view does: the answer names the card's session.
+  const userAnswer = await fx.post('/api/relay-question/:id/answer', { answer: 'Allow', sdk_session_id: CONV }, { params: { id: 'approval-1' } });
   assert.equal(userAnswer.status, 200, JSON.stringify(userAnswer.body));
   release();
   assert.deepEqual(await decision, { approved: true });
@@ -592,7 +587,7 @@ test('an approval card takes no typed text: anything but Allow or Deny is refuse
     action: 'send',
     args: { session: 'conv-b-1', text: 'Rebuild the sidebar' },
   });
-  const answer = (text) => fx.post('/api/relay-question/:id/answer', { answer: text }, { params: { id: 'approval-1' } });
+  const answer = (text) => fx.post('/api/relay-question/:id/answer', { answer: text, sdk_session_id: CONV }, { params: { id: 'approval-1' } });
 
   for (const typed of ['yes', 'ok', 'allow it']) {
     const refused = await answer(typed);
@@ -666,11 +661,11 @@ test('a card with choices and no stored flag takes only its choices, as the card
   const id = asked.body.question.id;
   assert.equal(fx.stmts.getQuestion.get(id).request, null);
 
-  const typed = await fx.post('/api/relay-question/:id/answer', { answer: 'something darker' }, { params: { id } });
+  const typed = await fx.post('/api/relay-question/:id/answer', { answer: 'something darker', sdk_session_id: CONV }, { params: { id } });
   assert.equal(typed.status, 400);
   assert.deepEqual(typed.body.choices, ['Light', 'Dark']);
   assert.equal(fx.stmts.getQuestion.get(id).status, 'pending');
-  const picked = await fx.post('/api/relay-question/:id/answer', { answer: 'dark' }, { params: { id } });
+  const picked = await fx.post('/api/relay-question/:id/answer', { answer: 'dark', sdk_session_id: CONV }, { params: { id } });
   assert.equal(picked.status, 200, JSON.stringify(picked.body));
   assert.equal(fx.stmts.getQuestion.get(id).answer, 'Dark');
 });
@@ -774,7 +769,7 @@ test('an agent token, with no remote header, answers no card of any conversation
   }
   assert.equal(fx.stmts.getQuestion.get(id).status, 'pending');
   // The person answers it.
-  const owner = await fx.post('/api/relay-question/:id/answer', { answer: 'Dark' }, { params: { id } });
+  const owner = await fx.post('/api/relay-question/:id/answer', { answer: 'Dark', sdk_session_id: CONV }, { params: { id } });
   assert.equal(owner.status, 200, JSON.stringify(owner.body));
 });
 

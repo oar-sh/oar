@@ -1,5 +1,9 @@
 import { devices, expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // Mobile regression suite for the Change CWD picker.
 //
@@ -29,30 +33,22 @@ const RECENT_ROOTS = Array.from(
  */
 test.describe.serial("Change CWD picker on mobile", () => {
   const token = relayToken();
-  const headers = { Authorization: `Bearer ${token}` };
   let conversationId = "";
   let messageId = "";
   /** Set by the route stubs whenever the UI actually submits. */
   let posted = null;
 
-  test.beforeAll(async ({ request }) => {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `mobile cwd picker ${Date.now()}`, relayMode: "ask", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const body = await queued.json();
-    conversationId = String(body?.conversationId || "");
-    messageId = String(body?.messageId || "");
+  test.beforeAll(async () => {
+    // Made as the web client makes a chat: bound to its session from the start.
+    const started = await startConversation({ text: `mobile cwd picker ${Date.now()}`, relayMode: "ask" });
+    conversationId = String(started.conversationId || "");
+    messageId = String(started.messageId || "");
     expect(conversationId).toBeTruthy();
   });
 
   test.afterAll(async ({ request }) => {
     if (!messageId || !conversationId) return;
-    await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text: "done", status: "completed" },
-    }).catch(() => {});
+    await completeTurn({ conversationId, messageId }, { text: "done", status: "completed" }).catch(() => {});
   });
 
   test.beforeEach(async ({ page }) => {
@@ -279,17 +275,11 @@ test.describe("Change CWD picker keyboard access", () => {
   // descriptor inside a describe would force a new worker and Playwright rejects it.
   test.use({ viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false, deviceScaleFactor: 1 });
 
-  test("arrow keys, Enter and Escape drive the listbox", async ({ page, request }) => {
+  test("arrow keys, Enter and Escape drive the listbox", async ({ page }) => {
     const token = relayToken();
-    const headers = { Authorization: `Bearer ${token}` };
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `cwd keyboard ${Date.now()}`, relayMode: "ask", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const body = await queued.json();
-    const conversationId = String(body?.conversationId || "");
-    const messageId = String(body?.messageId || "");
+    const started = await startConversation({ text: `cwd keyboard ${Date.now()}`, relayMode: "ask" });
+    const conversationId = String(started.conversationId || "");
+    const messageId = String(started.messageId || "");
 
     try {
       await page.route("**/api/status", async (route) => {
@@ -347,10 +337,7 @@ test.describe("Change CWD picker keyboard access", () => {
       await expect(page.locator("#change-cwd-selected-path")).toHaveValue(expectedPath);
     } finally {
       if (messageId && conversationId) {
-        await request.post("/api/response", {
-          headers,
-          data: { messageId, conversationId, text: "done", status: "completed" },
-        }).catch(() => {});
+        await completeTurn({ conversationId, messageId }, { text: "done", status: "completed" }).catch(() => {});
       }
     }
   });

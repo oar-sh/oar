@@ -197,7 +197,7 @@ test.describe.serial("Provider CLI install rows", () => {
     relay = null;
   });
 
-  test("reports every provider as not installed, and says why Copilot has no button", async ({ page }) => {
+  test("reports every provider as not installed, and Copilot says where its login happens", async ({ page }) => {
     await loadApp(page);
     await openProviderSettings(page, "grok");
 
@@ -212,10 +212,9 @@ test.describe.serial("Provider CLI install rows", () => {
 
     await openProviderSettings(page, "copilot");
     await expect(status(page, "copilot")).toHaveText("Not installed");
-    // Detect-only: the npm-global CLI cannot be installed from here, and the row
-    // says so instead of offering a button that could only ever fail.
-    await expect(installBtn(page, "copilot")).toBeHidden();
-    await expect(note(page, "copilot")).toContainText("Managed with npm on this host");
+    await expect(installBtn(page, "copilot")).toBeVisible();
+    // The relay installs the CLI; the login stays in a terminal.
+    await expect(note(page, "copilot")).toContainText("run copilot once in a terminal on the relay host and log in");
   });
 
   test("a failed Grok turn offers Install Grok CLI, and it opens the confirm sheet", async ({ page }) => {
@@ -363,7 +362,7 @@ test.describe.serial("Provider CLI install rows", () => {
     await dismissBtn(page, "claude").click();
   });
 
-  test("refuses an unknown provider and a detect-only one", async ({ request }) => {
+  test("refuses an unknown provider and an unknown action", async ({ request }) => {
     // The id is looked up in the frozen descriptor table; there is no path from
     // a request body to a command.
     const unknown = await request.post(`${relay.baseUrl}/api/cli/install`, {
@@ -372,13 +371,6 @@ test.describe.serial("Provider CLI install rows", () => {
     });
     expect(unknown.status()).toBe(400);
     expect((await unknown.json()).error).toBe("Unknown CLI provider");
-
-    const detectOnly = await request.post(`${relay.baseUrl}/api/cli/install`, {
-      headers: authHeaders(),
-      data: { provider: "copilot", action: "install" },
-    });
-    expect(detectOnly.status()).toBe(400);
-    expect((await detectOnly.json()).error).toMatch(/Managed with npm/);
 
     const unknownAction = await request.post(`${relay.baseUrl}/api/cli/install`, {
       headers: authHeaders(),

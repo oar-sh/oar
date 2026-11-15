@@ -44,6 +44,7 @@ export function createRemoteRelayRepository(db) {
   const getMessageOrigin = db.prepare(`SELECT origin_json FROM messages WHERE id = ?`);
   const setConversationOrigin = db.prepare(`UPDATE conversations SET origin_json = ? WHERE id = ?`);
   const getConversationOrigin = db.prepare(`SELECT origin_json FROM conversations WHERE id = ?`);
+  const getCompactedInto = db.prepare(`SELECT compacted_into FROM conversations WHERE id = ?`);
   const listUserMessageOrigins = db.prepare(`
     SELECT DISTINCT origin_json FROM messages
     WHERE conversation_id = ? AND role = 'user' AND origin_json IS NOT NULL
@@ -147,6 +148,10 @@ export function createRemoteRelayRepository(db) {
     },
     getConversationOrigin(conversationId) {
       return parseOrigin(getConversationOrigin.get(String(conversationId || ''))?.origin_json);
+    },
+    /** The conversation a compaction continued this one in, or null. */
+    compactedSuccessor(conversationId) {
+      return String(getCompactedInto.get(String(conversationId || ''))?.compacted_into || '').trim() || null;
     },
     /**
      * Did an agent on the relay with this instance id (the `relayId` of an

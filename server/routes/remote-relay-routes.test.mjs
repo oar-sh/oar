@@ -217,9 +217,27 @@ test('agent sessions settings: off and 600 s by default, with the slider\'s rang
   assert.deepEqual(read.body, {
     enabled: false,
     maxWaitSeconds: 600,
-    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    agentPromptsBeforeAsking: 30,
+    loopGuard: { off: [] },
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 },
     maxActiveSessions: 4,
   });
+});
+
+test('agent sessions settings carry the loop guard limit and revoke its off-list on the same route', async () => {
+  const { route, values } = setup();
+  const post = route('POST /api/settings/agent-sessions');
+  values.set(REMOTE_RELAY_SETTING_KEYS.loopGuardOff, JSON.stringify({ 'c-lead': { since: '2026-11-14T10:00:00.000Z', title: 'Lead' } }));
+  assert.deepEqual((await callRoute(route('GET /api/settings/agent-sessions'))).body.loopGuard, { off: [{ conversationId: 'c-lead', since: '2026-11-14T10:00:00.000Z', title: 'Lead' }] });
+  const saved = await callRoute(post, { body: { agentPromptsBeforeAsking: 0, loopGuardOff: { revoke: ['c-lead'] } } });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(saved.body.agentPromptsBeforeAsking, 0);
+  assert.deepEqual(saved.body.loopGuard, { off: [] });
+  for (const body of [{ agentPromptsBeforeAsking: 15 }, { agentPromptsBeforeAsking: '30' }, { loopGuardOff: { revoke: 'c-lead' } }]) {
+    const refused = await callRoute(post, { body });
+    assert.equal(refused.statusCode, 400, JSON.stringify(body));
+  }
+  assert.equal(values.get(REMOTE_RELAY_SETTING_KEYS.agentPromptsBeforeAsking), '0');
 });
 
 test('agent sessions settings are saved one field at a time and answer the whole state', async () => {
@@ -229,7 +247,9 @@ test('agent sessions settings are saved one field at a time and answer the whole
     ok: true,
     enabled,
     maxWaitSeconds,
-    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60 },
+    agentPromptsBeforeAsking: 30,
+    loopGuard: { off: [] },
+    limits: { minWaitSeconds: 120, maxWaitSeconds: 3600, stepSeconds: 60, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 },
     maxActiveSessions: 4,
   });
 

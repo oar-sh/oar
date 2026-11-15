@@ -6,7 +6,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import { createSdkSessionSyncService } from '../services/sdk-session-sync-service.mjs';
 import { serveFileWithRangeSupport } from '../services/file-serving.mjs';
 import { stripRelayPromptContext } from '../services/relay-prompt-sanitizer.mjs';
 import { describeWindowsAutostart, handMadeLines, switchBlockers } from '../services/windows-boot-autostart-service.mjs';
@@ -480,45 +479,6 @@ export function claudeAttributionSettingsFields(settings = {}) {
     attributionMode,
     attributionModes: [...CLAUDE_ATTRIBUTION_MODES],
     attributionExample: claudeAttributionTrailer(claudeAttributionModelLabel(model)),
-  };
-}
-
-/**
- * The Copilot provider settings update. Only one field today — which engine
- * runs Copilot conversations — and it is validated against the enum here so
- * the route can 400 a typo rather than persisting a value that would silently
- * read back as the default forever.
- */
-export function parseCopilotSettingsUpdateRequest(body = {}) {
-  const payload = body && typeof body === 'object' ? body : {};
-  const hasEngine = Object.prototype.hasOwnProperty.call(payload, 'engine');
-  if (!hasEngine) return { ok: false, error: 'No Copilot settings update provided' };
-  const engine = String(payload.engine || '').trim().toLowerCase();
-  if (engine !== 'extension' && engine !== 'sdk') {
-    return { ok: false, error: 'Invalid Copilot engine' };
-  }
-  return { ok: true, engine };
-}
-
-export const COPILOT_ENGINES = Object.freeze(['extension', 'sdk']);
-
-/**
- * The wire shape of the Copilot provider settings, from whatever the runtime
- * handed back. One builder for the GET, the POST and the socket broadcast, so
- * the three cannot describe the relay differently.
- *
- * `extension` is the fallback for anything unrecognised because it is the
- * engine that has been shipping: a relay that cannot say which engine it is on
- * must not claim to be on the experimental one.
- */
-export function buildCopilotSettingsPayload(settings = {}) {
-  const engine = String(settings?.engine || '').trim().toLowerCase();
-  const engines = Array.isArray(settings?.engines) && settings.engines.length
-    ? settings.engines
-    : [...COPILOT_ENGINES];
-  return {
-    engine: COPILOT_ENGINES.includes(engine) ? engine : 'extension',
-    engines,
   };
 }
 
@@ -1191,102 +1151,6 @@ async function stopIdleWorkspaceRootSession({
   return { ok: true, stoppedPids: stopped.pids || [] };
 }
 
-export function learnWorkspaceRootFromSessionSync({
-  learnConversationWorkspaceRoot = null,
-  setWorkspaceRoot = null,
-  sdkSessionId = '',
-  conversationId = '',
-  workspaceRootPath = '',
-} = {}) {
-  const nextRootPath = String(workspaceRootPath || '').trim();
-  if (!nextRootPath) {
-    return { ok: false, learned: false, changed: false, error: 'Missing workspace root path' };
-  }
-  if (typeof learnConversationWorkspaceRoot !== 'function' && typeof setWorkspaceRoot !== 'function') {
-    return { ok: false, learned: false, changed: false, error: 'Workspace root updates are unavailable' };
-  }
-
-  if (typeof learnConversationWorkspaceRoot !== 'function') {
-    const legacyResult = setWorkspaceRoot(nextRootPath, { reason: 'session-sync-cwd' });
-    if (!legacyResult?.changed && legacyResult?.error) {
-      return {
-        ok: false,
-        learned: false,
-        changed: false,
-        error: legacyResult.error,
-      };
-    }
-    return {
-      ok: true,
-      learned: true,
-      changed: !!legacyResult?.changed,
-      rootPath: legacyResult?.rootPath || nextRootPath,
-      rootName: legacyResult?.rootName || null,
-      state: null,
-    };
-  }
-
-  const convId = String(conversationId || '').trim();
-  if (!convId) {
-    // No conversation id — try to update an existing conversation already bound to this
-    // sdk session (e.g. a rebind or a session that is reconnecting).
-    const sid = String(sdkSessionId || '').trim();
-    if (sid && typeof learnConversationWorkspaceRoot === 'function') {
-      const sdkResult = learnConversationWorkspaceRoot({
-        sdkSessionId: sid,
-        conversationId: '',
-        rootPath: nextRootPath,
-        seedConfigured: true,
-      });
-      if (sdkResult?.ok && sdkResult.state?.conversationId) {
-        const state = sdkResult.state;
-        return {
-          ok: true,
-          learned: true,
-          changed: String(state?.runtimeWorkspaceRootPath || '').trim().toLowerCase() === nextRootPath.toLowerCase(),
-          rootPath: state?.runtimeWorkspaceRootPath || state?.currentWorkspaceRootPath || nextRootPath,
-          rootName: state?.runtimeWorkspaceRootName || state?.currentWorkspaceRootName || null,
-          state,
-        };
-      }
-    }
-    // No conversation found — caller should store as a pending session CWD.
-    return {
-      ok: true,
-      learned: false,
-      changed: false,
-      rootPath: nextRootPath,
-      rootName: null,
-      state: null,
-    };
-  }
-
-  const result = learnConversationWorkspaceRoot({
-    sdkSessionId,
-    conversationId: convId,
-    rootPath: nextRootPath,
-    seedConfigured: true,
-  });
-  if (!result?.ok) {
-    return {
-      ok: false,
-      learned: false,
-      changed: false,
-      error: result?.error || 'Failed to learn workspace root',
-    };
-  }
-  const state = result?.state || null;
-
-  return {
-    ok: true,
-    learned: true,
-    changed: String(state?.runtimeWorkspaceRootPath || '').trim().toLowerCase() === nextRootPath.toLowerCase(),
-    rootPath: state?.runtimeWorkspaceRootPath || state?.currentWorkspaceRootPath || nextRootPath,
-    rootName: state?.runtimeWorkspaceRootName || state?.currentWorkspaceRootName || null,
-    state,
-  };
-}
-
 const MAX_CONVERSATION_TITLE_LENGTH = 120;
 const FALLBACK_RELAY_MODE = 'agent';
 
@@ -1556,7 +1420,6 @@ export function persistConversationTitle({
 }
 
 export function buildSessionWorkerStatusPayload({
-  featureFlags = null,
   supervisorSnapshot = null,
   queueRows = [],
   // What the last read of the process list did ({ at, durationMs, processes,
@@ -1673,9 +1536,6 @@ export function buildSessionWorkerStatusPayload({
   }
 
   return {
-    enabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
-    continuationRoutingEnabled: featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true,
-    fallbackRestartEnabled: featureFlags?.SESSION_WORKER_FALLBACK_RESTART_ENABLED === true,
     uiState: normalizeWorkerStatusText(snapshot?.health?.uiState, 'white'),
     degradedReason: normalizeWorkerStatusText(snapshot?.health?.degradedReason, null),
     health: snapshot?.health && typeof snapshot.health === 'object' ? snapshot.health : null,
@@ -2336,8 +2196,7 @@ export function registerSessionsRoutes(app, deps) {
     getOpenAIProviderSettings = () => ({ configured: false, enabled: false, model: 'gpt-4o' }),
     setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
     refreshOpenAIProviderModels = async () => ({ ok: false, models: [], error: 'OpenAI model discovery is unavailable' }),
-    getCopilotProviderSettings = () => ({ engine: 'extension', engines: ['extension', 'sdk'] }),
-    setCopilotProviderSettings = () => ({ ok: false, error: 'Copilot settings are unavailable' }),
+    getCopilotProviderSettings = () => ({ engine: 'sdk', engines: ['sdk'] }),
     // Server-side Copilot model discovery (Phase 5A) — optional so route tests
     // that don't exercise the catalog can omit it. When present it also gets
     // the models_updated broadcaster, since only this module knows how to
@@ -2408,9 +2267,6 @@ export function registerSessionsRoutes(app, deps) {
     resolveConversationWorkspaceState,
     updateConversationConfiguredWorkspaceRoot,
     learnConversationWorkspaceRoot,
-    setPendingSessionCwd,
-    consumePendingSessionCwd,
-    getPendingSessionCwd = () => null,
     // Opt-in. An empty list disables the check entirely, which is the default
     // and preserves the historical "any existing directory" behaviour.
     workspaceRootAllowList = [],
@@ -2418,7 +2274,6 @@ export function registerSessionsRoutes(app, deps) {
     localhostOnly,
     listenHost,
     ensureSessionId,
-    touchCli,
     markCliOffline,
     fetchUsageSummary,
     // Optional personal-scope billing detail; absent in tests and whenever the
@@ -2464,10 +2319,6 @@ export function registerSessionsRoutes(app, deps) {
     DEFAULT_CONVERSATION_SESSION_MODE,
     DEFAULT_MODEL,
     remotePath,
-    computeRetryDelayMs,
-    relayRestartOrchestrator,
-    relayBridgeOwnerService,
-    featureFlags,
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
     sessionWorkerProcessInspector,
@@ -2489,8 +2340,6 @@ export function registerSessionsRoutes(app, deps) {
     getSharePathPrivacyMode = () => DEFAULT_SHARE_PATH_PRIVACY_MODE,
     setSharePathPrivacyMode = () => ({ ok: false, error: 'Path privacy settings are unavailable' }),
     sharePathKnownRoots = () => ({ roots: [], userNames: [] }),
-    getFeatureFlagsSettingsState = () => [],
-    setFeatureFlagSetting = () => ({ ok: false, error: 'Feature settings are unavailable' }),
     getPwaAppName = () => '',
     setPwaAppName = () => ({ ok: false, status: 500, error: 'App name settings are unavailable' }),
     getBackgroundTaskTimeoutMinutes = () => DEFAULT_BACKGROUND_TASK_TIMEOUT_MINUTES,
@@ -2532,7 +2381,6 @@ export function registerSessionsRoutes(app, deps) {
   // Copilot's catalog as every route here serves it: without the image ids
   // its runtime cannot serve (an OpenAI Image chat takes them from OpenAI).
   const getModelCatalogState = () => withoutCopilotImageModels(readCopilotModelCatalogState());
-  const sdkSessionSyncService = createSdkSessionSyncService(db);
   // Built on first use: many route tests hand in a database without tables.
   let shareRepositoryInstance = shareRepository;
   let shareAccessLogInstance = null;
@@ -2573,11 +2421,6 @@ export function registerSessionsRoutes(app, deps) {
     } catch {}
     return ids;
   }
-  // Generic synchronous transaction runner for the session-sync route: binding
-  // validation, workspace learning and the binding writes must commit or roll
-  // back as one unit (audit #21).
-  const sessionSyncTransaction = db.transaction((work) => work());
-
   /**
    * Drops draft references to the given blobs and reclaims any that no longer
    * have a reference at all. Blobs still referenced by a sent message survive.
@@ -2599,7 +2442,6 @@ export function registerSessionsRoutes(app, deps) {
     }
   }
 
-  const SDK_DELETE_STALE_PROCESSING_MS = 60_000;
   const CLI_SESSION_DELETE_TIMEOUT_MS = 10_000;
   const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
   // A session id that is safe to join into a path under the session-state root.
@@ -2875,41 +2717,10 @@ export function registerSessionsRoutes(app, deps) {
     return workspaceRootRateLimiter.consume(`${scope}:${extractClientIp(req)}`, nowMs);
   }
 
-  function readBridgeIdentity(req) {
-    return relayBridgeOwnerService?.normalizeIdentity?.({
-      pid: req.headers['x-relay-process-pid'],
-      parentPid: req.headers['x-relay-parent-pid'],
-      sessionId: req.headers['x-relay-session-id'],
-      conversationId: req.headers['x-relay-conversation-id'],
-    }) || null;
-  }
-
   function shortId(value) {
     const text = String(value || '').trim();
     if (!text) return 'none';
     return `${text.slice(0, 8)}…`;
-  }
-
-  function markWorkerSessionSeen({ sdkSessionId, conversationId, runtimeSessionId } = {}) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return null;
-    const existing = sessionWorkerRegistry?.getWorker?.(sid) || null;
-    return sessionWorkerRegistry?.upsertWorker?.({
-      ...(existing || {}),
-      sdkSessionId: sid,
-      conversationId: String(conversationId || '').trim() || existing?.conversationId || null,
-      runtimeSessionId: String(runtimeSessionId || '').trim() || existing?.runtimeSessionId || null,
-      status: existing?.status || 'new',
-    }) || null;
-  }
-
-  function enqueueSdkDeleteRequest(sdkSessionId, conversationId = null) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return false;
-    const nowIso = new Date().toISOString();
-    const convId = String(conversationId || '').trim() || null;
-    stmts.upsertSdkDeleteRequest.run(sid, convId, nowIso, nowIso);
-    return true;
   }
 
   /**
@@ -3000,11 +2811,10 @@ export function registerSessionsRoutes(app, deps) {
   }
 
   /**
-   * The Copilot session, through the runtime's own deleteSession(). When that
-   * fails the request goes on the SDK delete queue, which a CLI-side consumer
-   * (the extension engine) still works off.
+   * The Copilot session, through the runtime's own deleteSession(). Nothing
+   * retries one that fails: its state stays in the session-state folder.
    */
-  async function deleteCopilotCliSession({ sdkSessionId, conversationId }) {
+  async function deleteCopilotCliSession({ sdkSessionId }) {
     const stateRoot = String(resolveSessionStateRoot?.() || '').trim();
     const sessionDir = stateRoot && SESSION_FOLDER_ID_PATTERN.test(sdkSessionId) ? path.join(stateRoot, sdkSessionId) : '';
     // A conversation deleted before its first turn has no session on disk yet
@@ -3027,8 +2837,7 @@ export function registerSessionsRoutes(app, deps) {
         return { deleted: sessionDir ? true : null };
       }
       console.warn(`[delete] Copilot session ${shortId(sdkSessionId)} was not deleted: ${reason}`);
-      enqueueSdkDeleteRequest(sdkSessionId, conversationId);
-      return { deleted: false, queued: true };
+      return { deleted: false };
     }
   }
 
@@ -3040,7 +2849,7 @@ export function registerSessionsRoutes(app, deps) {
       if (provider === 'deepseek') return deleteDeepSeekCliSession({ conversation, runtimeSession });
       if (!sdkSessionId) return { deleted: null };
       if (!provider || provider === 'github' || provider === 'openai') {
-        return await deleteCopilotCliSession({ sdkSessionId, conversationId });
+        return await deleteCopilotCliSession({ sdkSessionId });
       }
       return { deleted: null };
     } catch (error) {
@@ -3049,36 +2858,6 @@ export function registerSessionsRoutes(app, deps) {
       console.warn(`[delete] CLI session of ${shortId(conversationId)} was not deleted: ${error?.message || error}`);
       return { deleted: false };
     }
-  }
-
-  function finalizeDeletedConversationsForSdkSession(sdkSessionId) {
-    const sid = String(sdkSessionId || '').trim();
-    if (!sid) return [];
-    const rows = stmts.listDeletedConversationsBySdkSessionId.all(sid);
-    const finalized = [];
-    for (const row of rows) {
-      const conversationId = String(row?.id || '').trim();
-      if (!conversationId) continue;
-      cleanupGeneratedImagesForConversation({
-        conversationId,
-        sdkSessionId: sid,
-        messageRows: stmts.getMessages?.all?.(conversationId) || [],
-        parseAttachments,
-        hydrateAttachment,
-        resolveSessionStateRoot,
-      });
-      const orphanedUploads = collectOrphanedUploadsFromConversation(conversationId);
-      const leftGroupId = conversationGroups?.forgetConversation?.(conversationId) || null;
-      hardDeleteConversationRows(conversationId);
-      deleteOrphanedUploads(orphanedUploads);
-      io.emit('conversation_deleted', { conversationId });
-      if (leftGroupId) emitGroupChanged(leftGroupId, [conversationId]);
-      try { relayEventService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
-      try { relayScheduleService?.noteConversationGone?.(conversationId, { deleted: true }); } catch {}
-      try { relayAskService?.noteConversationGone?.(conversationId); } catch {}
-      finalized.push(conversationId);
-    }
-    return finalized;
   }
 
   /**
@@ -3667,292 +3446,6 @@ export function registerSessionsRoutes(app, deps) {
       conversationUpdatedAt: row.conversation_updated_at || null,
     }));
     res.json({ sessions });
-  });
-
-  // GET /api/sdk-session-delete/pending — relay extension fetches next pending SDK delete request
-  app.get('/api/sdk-session-delete/pending', auth, (req, res) => {
-    touchCli();
-    const nowIso = new Date().toISOString();
-    const staleCutoff = new Date(Date.now() - SDK_DELETE_STALE_PROCESSING_MS).toISOString();
-    stmts.resetStaleSdkDeleteProcessing.run(nowIso, staleCutoff);
-    const dequeue = db.transaction(() => {
-      const next = stmts.dequeueSdkDeleteRequest.get(nowIso);
-      if (!next?.sdk_session_id) return null;
-      const claimed = stmts.setSdkDeleteRequestProcessing.run(nowIso, nowIso, next.sdk_session_id);
-      if (claimed.changes === 0) return null;
-      return {
-        sdkSessionId: next.sdk_session_id,
-        conversationId: next.conversation_id || null,
-        retryCount: Number(next.retry_count || 0),
-        requestedAt: next.requested_at || nowIso,
-      };
-    });
-    const request = dequeue();
-    return res.json({ request });
-  });
-
-  // POST /api/sdk-session-delete/result — relay extension reports SDK delete result
-  app.post('/api/sdk-session-delete/result', auth, (req, res) => {
-    touchCli();
-    const sdkSessionId = String(req.body?.sdk_session_id || '').trim();
-    const ok = req.body?.ok === true;
-    const unsupported = req.body?.unsupported === true;
-    const errorText = String(req.body?.error || '').trim() || 'Unknown SDK delete failure';
-    if (!sdkSessionId) return res.status(400).json({ error: 'Missing sdk_session_id' });
-
-    if (ok || unsupported) {
-      stmts.deleteSdkDeleteRequest.run(sdkSessionId);
-      const finalizedConversationIds = finalizeDeletedConversationsForSdkSession(sdkSessionId);
-      sessionWorkerRegistry?.removeWorker?.(sdkSessionId);
-      if (!finalizedConversationIds.length) {
-        io.emit('conversation_deleted', { conversationId: sdkSessionId });
-      }
-      return res.json({ ok: true, unsupported, finalizedConversationIds });
-    }
-
-    const nowIso = new Date().toISOString();
-    const current = stmts.getSdkDeleteRequestBySessionId.get(sdkSessionId);
-    if (!current) return res.json({ ok: true, ignored: 'request_missing' });
-    const nextRetryCount = Number(current.retry_count || 0) + 1;
-    const nextAttemptAt = new Date(Date.now() + computeRetryDelayMs(nextRetryCount)).toISOString();
-    stmts.setSdkDeleteRequestPendingWithError.run(nextAttemptAt, nowIso, errorText, sdkSessionId);
-    io.emit('conversation_delete_pending', {
-      sdkSessionId,
-      conversationId: current.conversation_id || null,
-      retryCount: nextRetryCount,
-      nextAttemptAt,
-      error: errorText,
-    });
-    return res.json({ ok: true, pending: true, retryCount: nextRetryCount, nextAttemptAt });
-  });
-
-  app.post('/api/session-sync', auth, (req, res) => {
-    const body = req.body || {};
-    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
-    const sdkSessionId = String(body.sdk_session_id || '').trim();
-    const conversationId = String(body.conversation_id || '').trim();
-    const workspaceRootPath = String(
-      body.workspace_root_path
-      || body.workspaceRootPath
-      || body.cwd
-      || body.current_working_directory
-      || '',
-    ).trim();
-    const orchestratorCorrelationId = String(
-      body.orchestrator_correlation_id
-      || body.orchestrator_transaction_id
-      || body.restart_transaction_id
-      || body.transaction_id
-      || body.correlation_id
-      || '',
-    ).trim();
-    const orchestratorTargetSessionId = String(
-      body.orchestrator_target_session_id
-      || body.restart_target_session_id
-      || body.target_session_id
-      || body.targetSessionId
-      || '',
-    ).trim();
-    const rebindCompleted = body.rebind_completed === true
-      || body.rebind_complete === true
-      || body.rebindConfirmed === true
-      || String(body.rebind_state || body.rebind_signal || '').trim().toLowerCase() === 'completed';
-    if (rebindCompleted) {
-      console.log(
-        `[session-sync] rebind signal sid=${shortId(sdkSessionId)} conv=${shortId(conversationId)} tx=${shortId(orchestratorCorrelationId)} target=${shortId(orchestratorTargetSessionId)}`,
-      );
-    }
-
-    if (!sdkSessionId || !conversationId) {
-      return res.status(400).json({ error: 'Missing sdk_session_id or conversation_id' });
-    }
-
-    try {
-      // Conflicts veto the request BEFORE workspace learning may create or
-      // mutate rows, and the whole set commits atomically — a 409 leaves every
-      // table exactly as the request found it (audit #21). The placeholder
-      // queue-owner rekey inside syncSession lands in this same transaction,
-      // so a dequeue can never read a half-migrated owner id (audit #22).
-      const { workspaceRootSync, sync } = sessionSyncTransaction(() => {
-        sdkSessionSyncService.validateBinding({
-          sdk_session_id: sdkSessionId,
-          conversation_id: conversationId,
-        });
-        const learned = learnWorkspaceRootFromSessionSync({
-          learnConversationWorkspaceRoot,
-          sdkSessionId,
-          conversationId,
-          workspaceRootPath,
-        });
-        return {
-          workspaceRootSync: learned,
-          sync: sdkSessionSyncService.syncSession({
-            sdk_session_id: sdkSessionId,
-            conversation_id: conversationId,
-          }),
-        };
-      });
-      // In-memory half of the placeholder rekey, immediately after the DB half
-      // committed: markWorkerSessionSeen below would otherwise mint a second
-      // registry entry under the real id and strand the placeholder entry.
-      if (sync?.placeholderSdkSessionId) {
-        sessionWorkerRegistry?.rekeyWorker?.(sync.placeholderSdkSessionId, sync.sdkSessionId);
-      }
-      const rebind = relayRestartOrchestrator?.applySessionSync?.({
-        sdkSessionId,
-        conversationId,
-        correlationId: orchestratorCorrelationId || null,
-        targetSessionId: orchestratorTargetSessionId || null,
-        rebindCompleted,
-        signalSource: 'api-session-sync',
-      }) || null;
-      if (rebindCompleted) {
-        console.log(
-          `[session-sync] rebind outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind?.code || 'none')} completed=${rebind?.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
-        );
-      }
-      if (rebindCompleted && rebind?.ok === false && rebind?.conflict) {
-        const statusCode = rebind.retryable ? 409 : 409;
-        return res.status(statusCode).json({
-          error: rebind.message || 'Rebind confirmation conflict',
-          code: rebind.code || 'rebind-conflict',
-          retryable: rebind.retryable === true,
-          terminal: rebind.terminal === true,
-          rebind,
-          restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
-        });
-      }
-      stmts.clearDeletedSdkSession.run(sdkSessionId);
-      // If the session reported its CWD before the conversation was bound,
-      // the pending entry is no longer needed — the workspace root has been
-      // persisted to the conversation by workspaceRootSync above.
-      if (workspaceRootSync.learned === true && typeof consumePendingSessionCwd === 'function') {
-        consumePendingSessionCwd(sdkSessionId);
-      }
-      markWorkerSessionSeen({
-        sdkSessionId: sync?.sdkSessionId || sdkSessionId,
-        conversationId: sync?.conversationId || conversationId,
-        runtimeSessionId: sync?.runtimeSessionId || null,
-      });
-      io.emit('conversation_session_bound', {
-        conversationId: sync?.conversationId || conversationId,
-        sdkSessionId: sync?.sdkSessionId || sdkSessionId,
-        runtimeSessionId: sync?.runtimeSessionId || null,
-      });
-      if (workspaceRootSync.ok && workspaceRootSync.state?.conversationId) {
-        const workspaceHints = workspaceRootPayload();
-        io.emit('conversation_workspace_root_updated', {
-          conversationId: workspaceRootSync.state.conversationId,
-          sdkSessionId: workspaceRootSync.state.sdkSessionId || sync?.sdkSessionId || sdkSessionId,
-          configuredWorkspaceRootPath: workspaceRootSync.state.configuredWorkspaceRootPath || null,
-          configuredWorkspaceRootName: workspaceRootSync.state.configuredWorkspaceRootName || null,
-          runtimeWorkspaceRootPath: workspaceRootSync.state.runtimeWorkspaceRootPath || null,
-          runtimeWorkspaceRootName: workspaceRootSync.state.runtimeWorkspaceRootName || null,
-          currentWorkspaceRootPath: workspaceRootSync.state.currentWorkspaceRootPath || null,
-          currentWorkspaceRootName: workspaceRootSync.state.currentWorkspaceRootName || null,
-          recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
-        });
-      }
-      const workspaceHints = workspaceRootPayload();
-      return res.json({
-        ok: true,
-        session: {
-          conversationId: sync?.conversationId || conversationId,
-          sdkSessionId: sync?.sdkSessionId || sdkSessionId,
-          runtimeSessionId: sync?.runtimeSessionId || null,
-          createdRuntimeSession: sync?.createdRuntimeSession === true,
-        },
-        workspaceRoot: workspaceRootSync.ok ? {
-          learned: workspaceRootSync.learned === true,
-          changed: workspaceRootSync.changed === true,
-          rootPath: workspaceRootSync.rootPath || workspaceRootPath || null,
-          rootName: workspaceRootSync.rootName || null,
-          recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
-        } : null,
-        rebind: rebind ? {
-          considered: rebind.considered === true,
-          completed: rebind.completed === true,
-          awaitingRebind: rebind.awaitingRebind === true,
-          code: rebind.code || null,
-          retryable: rebind.retryable === true,
-          terminal: rebind.terminal === true,
-          expected: rebind.expected || null,
-        } : null,
-        bindingState: 'bound',
-        restartOrchestrator: rebind?.state || relayRestartOrchestrator?.getState?.() || null,
-        activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
-      });
-    } catch (error) {
-      const statusCode = Number(error?.statusCode || 500);
-      const retryable = statusCode >= 500;
-      const payload = {
-        error: error?.message || 'Failed to sync session',
-        code: statusCode === 409 ? 'binding-conflict' : 'session-sync-failed',
-        retryable,
-        terminal: !retryable,
-      };
-      return res.status(Number.isInteger(statusCode) ? statusCode : 500).json(payload);
-    }
-  });
-
-  app.post('/api/session-workspace-root', auth, (req, res) => {
-    const sdkSessionId = String(req.body?.sdk_session_id || req.body?.sdkSessionId || '').trim();
-    const conversationId = String(req.body?.conversation_id || req.body?.conversationId || '').trim();
-    const workspaceRootPath = String(
-      req.body?.workspace_root_path
-      || req.body?.workspaceRootPath
-      || req.body?.cwd
-      || req.body?.current_working_directory
-      || '',
-    ).trim();
-    const result = learnWorkspaceRootFromSessionSync({
-      learnConversationWorkspaceRoot,
-      sdkSessionId,
-      conversationId,
-      workspaceRootPath,
-    });
-    if (!result.ok) {
-      return res.status(400).json({
-        ok: false,
-        error: result.error || 'Failed to learn workspace root',
-      });
-    }
-    // When no conversation was found to update (new session before any message),
-    // store the CWD in the per-session pending map so it can be used as a display
-    // fallback and consumed when the session later binds to a conversation.
-    if (!result.learned && sdkSessionId && workspaceRootPath) {
-      setPendingSessionCwd(sdkSessionId, workspaceRootPath);
-    }
-    if (result.state?.conversationId) {
-      const workspaceHints = workspaceRootPayload();
-      io.emit('conversation_workspace_root_updated', {
-        conversationId: result.state.conversationId,
-        sdkSessionId: result.state.sdkSessionId || sdkSessionId || null,
-        configuredWorkspaceRootPath: result.state.configuredWorkspaceRootPath || null,
-        configuredWorkspaceRootName: result.state.configuredWorkspaceRootName || null,
-        runtimeWorkspaceRootPath: result.state.runtimeWorkspaceRootPath || null,
-        runtimeWorkspaceRootName: result.state.runtimeWorkspaceRootName || null,
-        currentWorkspaceRootPath: result.state.currentWorkspaceRootPath || null,
-        currentWorkspaceRootName: result.state.currentWorkspaceRootName || null,
-        recentWorkspaceRoots: Array.isArray(workspaceHints?.recentWorkspaceRoots) ? workspaceHints.recentWorkspaceRoots : [],
-      });
-    }
-    return res.json({
-      ok: true,
-      learned: true,
-      changed: result.changed === true,
-      workspaceRootPath: result.rootPath || workspaceRootPath || null,
-      workspaceRootName: result.rootName || null,
-      conversationId: result.state?.conversationId || conversationId || null,
-      sdkSessionId: result.state?.sdkSessionId || sdkSessionId || null,
-      configuredWorkspaceRootPath: result.state?.configuredWorkspaceRootPath || null,
-      configuredWorkspaceRootName: result.state?.configuredWorkspaceRootName || null,
-      runtimeWorkspaceRootPath: result.state?.runtimeWorkspaceRootPath || null,
-      runtimeWorkspaceRootName: result.state?.runtimeWorkspaceRootName || null,
-      currentWorkspaceRootPath: result.state?.currentWorkspaceRootPath || null,
-      currentWorkspaceRootName: result.state?.currentWorkspaceRootName || null,
-      ...workspaceRootPayload(),
-    });
   });
 
   /**
@@ -6246,12 +5739,10 @@ export function registerSessionsRoutes(app, deps) {
     // Belt and braces: if a process was reused anyway, or the "new" pid is one we
     // just tried to kill, the requested directory did not take. Say so.
     const launchedPid = Number(launched.worker?.pid) || null;
-    // `state` was resolved before the stop, so its runtime/pending values still
-    // describe the CLI we just killed. They are only meaningful for the reuse
+    // `state` was resolved before the stop, so its runtime value still
+    // describes the CLI we just killed. It is only meaningful for the reuse
     // check — never as the directory we report back.
-    const preLaunchRootPath = state?.runtimeWorkspaceRootPath
-      || (typeof getPendingSessionCwd === 'function' ? getPendingSessionCwd(sdkSessionId) : '')
-      || '';
+    const preLaunchRootPath = state?.runtimeWorkspaceRootPath || '';
     const reusedExistingProcess = launched.reused === true
       || (launchedPid !== null && stoppedPids.includes(launchedPid));
     const reuseCheck = reusedExistingProcess
@@ -6260,12 +5751,11 @@ export function registerSessionsRoutes(app, deps) {
     const workspaceRootApplied = !reusedExistingProcess && !(reuseCheck.comparable && reuseCheck.mismatch);
 
     // A fresh process launched in the requested directory, so the stale runtime
-    // root (and the pending CWD reported by the dead CLI) must be replaced now.
-    // Waiting for the new CLI's session-sync leaves every client showing the old
-    // CWD in the header and the file explorer until the next turn.
+    // root must be replaced now.
+    // Waiting for the new CLI leaves every client showing the old CWD in the
+    // header and the file explorer until the next turn.
     let effectiveState = state;
     if (workspaceRootApplied) {
-      if (typeof consumePendingSessionCwd === 'function') consumePendingSessionCwd(sdkSessionId);
       const learned = typeof learnConversationWorkspaceRoot === 'function'
         ? learnConversationWorkspaceRoot({
           conversationId,
@@ -6576,7 +6066,6 @@ export function registerSessionsRoutes(app, deps) {
     hardDeleteConversationRows(id);
     remoteRelayInbound?.repository?.forgetConversation?.(id);
     deleteOrphanedUploads(orphanedUploads);
-    if (sdkSessionId && !cliSession.queued) stmts.deleteSdkDeleteRequest?.run?.(sdkSessionId);
     io.emit('conversation_deleted', { conversationId: id });
     if (wasShared) io.emit('share_revoked', { conversationId: id });
     if (leftGroupId) emitGroupChanged(leftGroupId, [id]);
@@ -7435,9 +6924,8 @@ export function registerSessionsRoutes(app, deps) {
           workspaceRootWarning = `The chat was created, but its working directory could not be set: ${workspaceRootResult?.error || 'unknown error'}. It starts in the default directory.`;
         }
       }
-      const routingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
-      const ownerSessionId = routingEnabled ? conversationId : null;
-      if (ownerSessionId && typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+      const ownerSessionId = conversationId;
+      if (typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
         sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
         const ensureResult = await sessionWorkerSupervisor.ensureWorker(ownerSessionId);
         if (!ensureResult?.ok) {
@@ -7475,7 +6963,7 @@ export function registerSessionsRoutes(app, deps) {
           const pendingDepth = Number(queueCounts?.().pendingCount || 0);
           sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
         }
-      } else if (ownerSessionId) {
+      } else {
         // Same state as the 409 above: the conversation is committed, only the
         // worker is missing, so the client gets what it needs to open it.
         return res.status(500).json({
@@ -7495,9 +6983,7 @@ export function registerSessionsRoutes(app, deps) {
       }
 
       const conversation = stmts.getConvAnyStatus.get(conversationId) || null;
-      const ownerWorker = ownerSessionId
-        ? (sessionWorkerSupervisor?.getWorkerState?.(ownerSessionId) || sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null)
-        : null;
+      const ownerWorker = sessionWorkerSupervisor?.getWorkerState?.(ownerSessionId) || sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
       return res.json({
         ok: true,
         ...remoteOriginAnswerFields(remoteRequest),
@@ -7514,7 +7000,7 @@ export function registerSessionsRoutes(app, deps) {
         runtimeSessionId: runtimeSession?.id || null,
         ownerSessionId,
         worker: ownerWorker,
-        lifecycle: ownerSessionId ? (sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null) : null,
+        lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(ownerSessionId) || null,
         selectedModel,
         selectedProviderType: bootstrapProviderType,
         preferredRelayMode,
@@ -7527,7 +7013,6 @@ export function registerSessionsRoutes(app, deps) {
         currentWorkspaceRootPath: workspaceRootState?.currentWorkspaceRootPath || null,
         currentWorkspaceRootName: workspaceRootState?.currentWorkspaceRootName || null,
         workspaceRootWarning,
-        warning: routingEnabled ? null : 'Session worker routing is disabled; worker prestart skipped.',
         ...workspaceRootPayload(),
       });
     } catch (error) {
@@ -7568,16 +7053,13 @@ export function registerSessionsRoutes(app, deps) {
       .map((row) => normalizeWorkerStatusText(row?.sdk_session_id))
       .filter(Boolean);
     const sessionWorkerStatus = buildSessionWorkerStatusPayload({
-      featureFlags,
       supervisorSnapshot: sessionWorkerSupervisor?.snapshot?.({ pendingQuestionSessionIds }) || null,
       queueRows: listSessionWorkerQueueRows.all(...SESSION_WORKER_STATUS_QUEUE_STATES),
       processList: sessionWorkerProcessInspector?.getLastRead?.() || null,
       relayBuildId: runtimeState.buildId ?? null,
       recycleStatus: readWorkerRecycleStatus(),
     });
-    const activeRuntimeSessionCount = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
-      ? Number(sessionWorkerStatus?.onlineBoundProcessCount || 0)
-      : runtimeSessionBindingCount;
+    const activeRuntimeSessionCount = Number(sessionWorkerStatus?.onlineBoundProcessCount || 0);
     res.json({
       cliOnline: runtimeState.cliOnline,
       relayPaused: runtimeState.relayPaused,
@@ -7630,14 +7112,10 @@ export function registerSessionsRoutes(app, deps) {
         valid: runtimeState.cloudflaredTunnelState?.valid ?? true,
       },
       workerWebSocket: runtimeState.workerWebSocketStatus || null,
-      tmuxInspector: runtimeState.tmuxInspectorStatus || null,
-      activeBridgeOwner: runtimeState.activeBridgeOwner || null,
-      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
       relayShutdown: runtimeState.relayShutdown || null,
       hostSuspend: runtimeState.hostSuspend || null,
       usageLimit: runtimeState.usageLimit || null,
       platform: process.platform,
-      features: featureFlags || {},
       sessionWorker: sessionWorkerStatus,
       version: runningVersion || null,
       update: typeof buildUpdateStatePayload === 'function' ? buildUpdateStatePayload() : null,
@@ -7905,38 +7383,10 @@ export function registerSessionsRoutes(app, deps) {
     name: String(req.params?.name ?? ''),
   }));
 
-  // Copilot has no credentials or model list of its own in settings (it
-  // authenticates through the host's `copilot` login and its catalog comes from
-  // the CLI), so this pair carries exactly one thing: which engine runs it.
-  //
-  // The GET response, the POST response and the socket broadcast are the same
-  // three consumers of one shape, so it is built once here — three hand-rolled
-  // copies is how a field ends up present on two of them.
+  // Copilot has one engine, the SDK worker, and nothing to set. The GET stays
+  // so that paired relays on an older version that read it keep working.
   app.get('/api/settings/copilot', auth, (_req, res) => {
-    return res.json(buildCopilotSettingsPayload(getCopilotProviderSettings()));
-  });
-
-  app.post('/api/settings/copilot', auth, (req, res) => {
-    const parsed = parseCopilotSettingsUpdateRequest(req.body);
-    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
-    const result = setCopilotProviderSettings(parsed);
-    if (!result?.ok) {
-      // The setter distinguishes "malformed" (400) from "this relay cannot run
-      // that engine" (409), and the reason string is written to be read by a
-      // human in the settings panel — pass it through verbatim.
-      return res.status(Number(result?.status) || 400)
-        .json({ error: result?.error || 'Failed to update Copilot settings' });
-    }
-    const settingsPayload = buildCopilotSettingsPayload(result);
-    // No model catalog is emitted with this: the engine switch does not change
-    // which models exist, only which process runs them. Running workers are
-    // deliberately left alone — the new engine applies to the next spawn.
-    io.emit('copilot_settings_updated', settingsPayload);
-    // Fire-and-forget: an engine flip to SDK is exactly when the extension
-    // stops publishing snapshots, so re-run the server-side discovery in the
-    // background (it dedupes/skips on its own; a failure keeps the catalog).
-    void copilotModelDiscoveryService?.refresh?.('settings-change');
-    return res.json({ ok: true, ...settingsPayload });
+    return res.json(getCopilotProviderSettings());
   });
 
   app.get('/api/settings/claude', auth, (_req, res) => {
@@ -8241,6 +7691,17 @@ export function registerSessionsRoutes(app, deps) {
         models: Array.isArray(settings?.models) ? settings.models : [],
         availableModels: Array.isArray(settings?.availableModels) ? settings.availableModels : [],
       });
+      return;
+    }
+    if (providerId === 'copilot') {
+      // The install found the SDK, so discovery can now start a Copilot
+      // client; a catalog it publishes reaches clients through the
+      // setOnCatalogUpdated listener above.
+      try {
+        await copilotModelDiscoveryService?.refresh?.('cli-install');
+      } catch (error) {
+        console.log(`[cli-install] Copilot model refresh after install failed: ${error?.message || error}`);
+      }
     }
   });
 
@@ -8966,31 +8427,6 @@ export function registerSessionsRoutes(app, deps) {
     return res.json(pwaAppNamePayload(result.appName));
   });
 
-  const featureFlagsSettingsPayload = () => {
-    const flags = getFeatureFlagsSettingsState();
-    return {
-      flags,
-      restartRequired: flags.some((flag) => flag.restartRequired === true),
-    };
-  };
-
-  app.get('/api/settings/features', auth, (_req, res) => {
-    res.json(featureFlagsSettingsPayload());
-  });
-
-  app.post('/api/settings/features', auth, (req, res) => {
-    const name = String(req.body?.name || '').trim();
-    const enabled = req.body?.enabled;
-    if (!name) return res.status(400).json({ error: 'name is required' });
-    if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be a boolean' });
-    const result = setFeatureFlagSetting(name, enabled);
-    if (!result.ok) {
-      const status = result.error === 'Unknown feature flag' ? 400 : 500;
-      return res.status(status).json({ error: result.error });
-    }
-    return res.json(featureFlagsSettingsPayload());
-  });
-
   /**
    * Merge the two Windows autostart services into one mode-shaped state.
    * A ready boot task wins the mode call even when a Startup .cmd also
@@ -9270,122 +8706,6 @@ export function registerSessionsRoutes(app, deps) {
     if (!conversationId) return res.status(400).json({ ok: false, error: 'Missing conversationId' });
     const result = usageLimitPauseService.cancel({ conversationId });
     return res.json({ ok: true, cancelled: !!result.cancelled, messageId: result.messageId || null, pause: result.state });
-  });
-
-  app.get('/api/restart-orchestrator', auth, (req, res) => {
-    ensureSessionId(req, res);
-    return res.json({ orchestrator: relayRestartOrchestrator?.getState?.() || null });
-  });
-
-  app.post('/api/restart-orchestrator/request', auth, (req, res) => {
-    const targetSessionId = String(req.body?.targetSessionId || req.body?.target_session_id || '').trim();
-    if (!targetSessionId) return res.status(400).json({ error: 'Missing targetSessionId' });
-    const result = relayRestartOrchestrator?.requestRestart({
-      targetSessionId,
-      reason: String(req.body?.reason || 'manual-request').trim() || 'manual-request',
-    });
-    if (!result?.ok) return res.status(400).json({ error: result?.error || 'request rejected', orchestrator: result?.state || null });
-    return res.json({ ok: true, ...result });
-  });
-
-  app.post('/api/restart-orchestrator/rebind', auth, (req, res) => {
-    touchCli();
-    relayBridgeOwnerService?.observe?.(readBridgeIdentity(req));
-    const body = req.body || {};
-    const sdkSessionId = String(body.sdk_session_id || body.sdkSessionId || '').trim();
-    const conversationId = String(body.conversation_id || body.conversationId || '').trim() || null;
-    const orchestratorCorrelationId = String(
-      body.orchestrator_correlation_id
-      || body.orchestrator_transaction_id
-      || body.restart_transaction_id
-      || body.transaction_id
-      || body.correlation_id
-      || '',
-    ).trim();
-    const orchestratorTargetSessionId = String(
-      body.orchestrator_target_session_id
-      || body.restart_target_session_id
-      || body.target_session_id
-      || body.targetSessionId
-      || '',
-    ).trim();
-    if (!sdkSessionId) {
-      return res.status(400).json({ error: 'Missing sdk_session_id' });
-    }
-    console.log(
-      `[relay-rebind] request sid=${shortId(sdkSessionId)} conv=${shortId(conversationId)} tx=${shortId(orchestratorCorrelationId)} target=${shortId(orchestratorTargetSessionId)}`,
-    );
-    const rebind = relayRestartOrchestrator?.applySessionSync?.({
-      sdkSessionId,
-      conversationId,
-      correlationId: orchestratorCorrelationId || null,
-      targetSessionId: orchestratorTargetSessionId || null,
-      rebindCompleted: true,
-      signalSource: 'api-restart-orchestrator-rebind',
-    }) || null;
-    if (!rebind) {
-      return res.status(503).json({
-        error: 'Restart orchestrator unavailable',
-        code: 'restart-orchestrator-unavailable',
-      });
-    }
-    if (rebind.ok === false && rebind.conflict) {
-      console.warn(
-        `[relay-rebind] conflict sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} code=${String(rebind.code || 'none')} retryable=${rebind.retryable === true ? 'yes' : 'no'} terminal=${rebind.terminal === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
-      );
-      return res.status(409).json({
-        error: rebind.message || 'Rebind confirmation conflict',
-        code: rebind.code || 'rebind-conflict',
-        retryable: rebind.retryable === true,
-        terminal: rebind.terminal === true,
-        rebind,
-        restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
-      });
-    }
-    console.log(
-      `[relay-rebind] outcome sid=${shortId(sdkSessionId)} tx=${shortId(orchestratorCorrelationId)} completed=${rebind.completed === true ? 'yes' : 'no'} state=${String(rebind?.state?.state || 'unknown')}`,
-    );
-    return res.json({
-      ok: rebind.ok === true,
-      rebind: {
-        considered: rebind.considered === true,
-        completed: rebind.completed === true,
-        awaitingRebind: rebind.awaitingRebind === true,
-        code: rebind.code || null,
-        retryable: rebind.retryable === true,
-        terminal: rebind.terminal === true,
-        expected: rebind.expected || null,
-      },
-      restartOrchestrator: rebind.state || relayRestartOrchestrator?.getState?.() || null,
-      activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
-    });
-  });
-
-  app.post('/api/restart-orchestrator/bridge-exit', auth, (req, res) => {
-    const requester = readBridgeIdentity(req);
-    const activeOwner = relayBridgeOwnerService?.getOwner?.() || null;
-    console.log(
-      `[bridge-exit] request ownerSid=${shortId(requester?.sessionId)} ownerPid=${String(requester?.pid || 'none')} tx=${shortId(req.body?.transactionId)} target=${shortId(req.body?.targetSessionId)}`,
-    );
-    if (activeOwner && requester && !relayBridgeOwnerService?.isOwner?.(requester)) {
-      return res.status(409).json({
-        error: 'Bridge exit rejected for non-owner requester',
-        code: 'bridge-owner-mismatch',
-        activeBridgeOwner: activeOwner,
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-      });
-    }
-
-    const orchestratorState = relayRestartOrchestrator?.getState?.() || null;
-    console.log(
-      `[bridge-exit] outcome tx=${shortId(orchestratorState?.transactionId)} target=${shortId(orchestratorState?.targetSessionId)} state=${String(orchestratorState?.state || 'unknown')} launcher=skipped`,
-    );
-    return res.json({
-      ok: true,
-      activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
-      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-      launcher: null,
-    });
   });
 
   // Each provider tab's switch, "New" tags and fallback warning.

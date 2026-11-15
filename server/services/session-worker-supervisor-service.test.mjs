@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { createSessionWorkerRegistry } from './session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './session-worker-supervisor-service.mjs';
+import { createProcessIdentityReader } from './session-worker-process-service.mjs';
 
 test('supervisor waits for startup heartbeat when launched pid is unknown', async () => {
   const registry = createSessionWorkerRegistry();
@@ -628,4 +629,288 @@ test('the end of a kill block is reported: when its grace runs out, or when the 
 
   supervisor.clearRestartSchedule('sess-c', { resetKilledMarker: true });
   assert.deepEqual(lifted, ['sess-a', 'sess-b'], 'no block, nothing to report');
+});
+
+// A relay that launches its workers itself: every one of them says its kind.
+function supervisorOverEntry(entry, {
+  workersStateTheirKind = () => true,
+  spawned = { workerId: 'worker-new', pid: 9100 },
+  readProcessIdentity = null,
+} = {}) {
+  const registry = createSessionWorkerRegistry();
+  if (entry) registry.upsertWorker({ sdkSessionId: 'abc-123', ...entry });
+  const spawns = [];
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    isPidAlive: () => true,
+    workersStateTheirKind,
+    readProcessIdentity,
+    spawnWorker: async (sessionId, options) => {
+      spawns.push({ sessionId, ...options });
+      return spawned;
+    },
+  });
+  return { registry, supervisor, spawns };
+}
+
+test('a live process that heartbeats and never said its kind is no worker to reuse: the launch runs', async () => {
+  // What the heartbeat of a Copilot CLI an earlier version started leaves.
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' });
+  supervisor.noteSessionHeartbeat('abc-123');
+  const result = await supervisor.ensureWorker('abc-123');
+  assert.equal(result.ok, true);
+  assert.equal(result.reused, false);
+  assert.deepEqual(spawns, [{ sessionId: 'abc-123', allowProcessReuse: true }]);
+  assert.equal(result.worker.pid, 9100);
+});
+
+test('a live worker that said its kind is reused as before', async () => {
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready', kind: 'copilot-sdk' });
+  const result = await supervisor.ensureWorker('abc-123');
+  assert.equal(result.reused, true);
+  assert.equal(result.worker.pid, 4242);
+  assert.deepEqual(spawns, []);
+});
+
+test('the worker a launch just started is reused before it has said its kind', async () => {
+  const { supervisor, spawns } = supervisorOverEntry(null);
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, false);
+  const again = await supervisor.ensureWorker('abc-123');
+  assert.equal(again.reused, true);
+  assert.equal(again.worker.pid, 9100);
+  assert.equal(spawns.length, 1);
+});
+
+test('a launch that knew no pid: the worker is reused, and so is the one that then names its pid and kind', async () => {
+  const { registry, supervisor, spawns } = supervisorOverEntry(null, { spawned: { workerId: 'worker-new', pid: null } });
+  await supervisor.ensureWorker('abc-123');
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  registry.upsertWorker({ ...registry.getWorker('abc-123'), pid: 9200, kind: 'claude' });
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.equal(spawns.length, 1);
+});
+
+test('a relay that launches no worker takes a process that never said its kind for the session\'s worker', async () => {
+  for (const workersStateTheirKind of [() => false, null]) {
+    const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { workersStateTheirKind });
+    assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+    assert.deepEqual(spawns, []);
+  }
+});
+
+// What the identity reader (createProcessIdentityReader) says about a pid:
+// the command lines are made up, in the shapes the launch starts and an
+// earlier version left.
+function identityReader(commandLine) {
+  const reads = [];
+  const readProcessIdentity = async (pid) => {
+    reads.push(pid);
+    return { pid, startTime: '123456', commandLine };
+  };
+  return { reads, readProcessIdentity };
+}
+
+const WORKERS_OF_AN_EARLIER_VERSION = [
+  ['copilot-sdk', 'node /home/dev/oar/server/copilot-worker/copilot-sdk-session-worker.mjs --session-id abc-123'],
+  ['cursor', 'node /home/dev/oar/server/cursor-worker/cursor-session-worker.mjs --session-id abc-123'],
+  ['grok', 'node /home/dev/oar/server/grok-worker/grok-session-worker.mjs --session-id abc-123'],
+  ['claude-cloud', 'node /home/dev/oar/server/claude-cloud-worker/claude-cloud-session-worker.mjs --session-id abc-123'],
+];
+
+for (const [kind, commandLine] of WORKERS_OF_AN_EARLIER_VERSION) {
+  test(`a ${kind} worker of an earlier version that survived a relay restart is reused mid-turn: no launch, its turn stays`, async () => {
+    // It said no kind, and no launch of this relay started it.
+    const { reads, readProcessIdentity } = identityReader(commandLine);
+    const { registry, supervisor, spawns } = supervisorOverEntry(
+      { workerId: 'worker-abc', pid: 4242, status: 'processing' },
+      { readProcessIdentity },
+    );
+    supervisor.noteSessionHeartbeat('abc-123');
+    const result = await supervisor.ensureWorker('abc-123');
+    assert.equal(result.ok, true);
+    assert.equal(result.reused, true);
+    assert.equal(result.worker.pid, 4242);
+    assert.deepEqual(spawns, [], 'no launch, so no process-list read either');
+    assert.equal(registry.getWorker('abc-123').status, 'processing');
+
+    // Read once for that process, not at every delivery.
+    assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+    assert.deepEqual(reads, [4242]);
+    assert.deepEqual(spawns, []);
+  });
+}
+
+test('a worker of an earlier version that is idle is reused as ready', async () => {
+  const { readProcessIdentity } = identityReader(WORKERS_OF_AN_EARLIER_VERSION[0][1]);
+  const { registry, supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.equal(registry.getWorker('abc-123').status, 'ready');
+  assert.deepEqual(spawns, []);
+});
+
+test('a worker that said its kind is reused mid-turn without a read, and its turn stays', async () => {
+  const { reads, readProcessIdentity } = identityReader('bash');
+  const { registry, supervisor, spawns } = supervisorOverEntry(
+    { workerId: 'worker-abc', pid: 4242, status: 'processing', kind: 'grok' },
+    { readProcessIdentity },
+  );
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.equal(registry.getWorker('abc-123').status, 'processing');
+  assert.deepEqual(reads, []);
+  assert.deepEqual(spawns, []);
+});
+
+for (const [what, commandLine] of [
+  ['the Copilot CLI of the removed engine', '/home/dev/.local/bin/copilot --resume abc-123 --allow-all-tools'],
+  ['its script parent', 'script -q -c copilot --resume abc-123 /dev/null'],
+]) {
+  test(`${what}, heartbeating for the session, is not reused: the launch runs`, async () => {
+    const { reads, readProcessIdentity } = identityReader(commandLine);
+    const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+    supervisor.noteSessionHeartbeat('abc-123');
+    const result = await supervisor.ensureWorker('abc-123');
+    assert.equal(result.ok, true);
+    assert.equal(result.reused, false);
+    assert.deepEqual(spawns, [{ sessionId: 'abc-123', allowProcessReuse: true }], 'the launch stops it');
+    assert.equal(result.worker.pid, 9100);
+    assert.deepEqual(reads, [4242]);
+  });
+}
+
+test('two calls at once for a process that is no session worker launch once', async () => {
+  const { reads, readProcessIdentity } = identityReader('/home/dev/.local/bin/copilot --resume abc-123');
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+  const [first, second] = await Promise.all([supervisor.ensureWorker('abc-123'), supervisor.ensureWorker('abc-123')]);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(spawns.length, 1);
+  assert.ok(reads.length >= 1);
+});
+
+test('a process whose identity cannot be read is reused, as one that said its kind', async () => {
+  const readers = [
+    async (pid) => ({ pid, startTime: null, commandLine: null }),
+    async () => null,
+    async () => { throw new Error('ps timed out'); },
+  ];
+  for (const readProcessIdentity of readers) {
+    const { registry, supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'processing' }, { readProcessIdentity });
+    const result = await supervisor.ensureWorker('abc-123');
+    assert.equal(result.reused, true);
+    assert.equal(registry.getWorker('abc-123').status, 'processing');
+    assert.deepEqual(spawns, []);
+  }
+});
+
+// A reader that answers each read with the next of `commandLines`, the
+// last one for good; null is a read that told nothing.
+function identityReaderInTurns(commandLines) {
+  const reads = [];
+  const readProcessIdentity = async (pid) => {
+    const commandLine = commandLines[Math.min(reads.length, commandLines.length - 1)];
+    reads.push(pid);
+    return { pid, startTime: commandLine === null ? null : '123456', commandLine };
+  };
+  return { reads, readProcessIdentity };
+}
+
+test('a process that cannot be read is reused for that call only, read again at each, and never taken for a launch of this relay', async () => {
+  const { reads, readProcessIdentity } = identityReaderInTurns([null]);
+  const { registry, supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'processing' }, { readProcessIdentity });
+  supervisor.noteSessionHeartbeat('abc-123');
+  for (let call = 1; call <= 3; call += 1) {
+    const result = await supervisor.ensureWorker('abc-123');
+    assert.equal(result.reused, true);
+    assert.equal(registry.getWorker('abc-123').status, 'processing');
+    assert.equal(reads.length, call, 'read at every call');
+    assert.notEqual(supervisor.getLifecycleState('abc-123').launchPid, 4242, 'no launch recorded for its pid');
+  }
+  assert.deepEqual(spawns, []);
+});
+
+test('a Windows process whose command line the relay may not read is reused for that call only, and read again at the next', async () => {
+  // Win32_Process lists a process the relay may not open (an elevated relay
+  // started it) with a null CommandLine; the real reader over such a row.
+  const snapshotReads = [];
+  const readProcessIdentity = createProcessIdentityReader({
+    platform: 'win32',
+    readProcessSnapshot: async (options) => {
+      snapshotReads.push(options);
+      return [{ processId: 4242, parentProcessId: 4100, name: 'node.exe', commandLine: null, createdAt: 1_763_100_000_000 }];
+    },
+  });
+  const { registry, supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'processing' }, { readProcessIdentity });
+  supervisor.noteSessionHeartbeat('abc-123');
+
+  const first = await supervisor.ensureWorker('abc-123');
+  assert.equal(first.reused, true);
+  assert.deepEqual(spawns, []);
+  assert.equal(registry.getWorker('abc-123').status, 'processing');
+  assert.equal(snapshotReads.length, 1);
+  assert.notEqual(supervisor.getLifecycleState('abc-123').launchPid, 4242, 'no verdict kept, no launch recorded');
+
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.equal(snapshotReads.length, 2, 'read again');
+  assert.deepEqual(spawns, []);
+});
+
+test('a command line that is only blanks is no command line either', async () => {
+  const { reads, readProcessIdentity } = identityReaderInTurns(['   ']);
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.deepEqual(reads, [4242, 4242]);
+  assert.deepEqual(spawns, []);
+});
+
+test('a process that could not be read once and then reads as no session worker goes to the launch', async () => {
+  // A Copilot CLI of the removed engine, right after an update, while the
+  // process list failed once.
+  const { reads, readProcessIdentity } = identityReaderInTurns([null, '/home/dev/.local/bin/copilot --resume abc-123']);
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+  supervisor.noteSessionHeartbeat('abc-123');
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.deepEqual(spawns, []);
+
+  const second = await supervisor.ensureWorker('abc-123');
+  assert.equal(second.ok, true);
+  assert.equal(second.reused, false);
+  assert.deepEqual(spawns, [{ sessionId: 'abc-123', allowProcessReuse: true }], 'the launch stops it');
+  assert.equal(second.worker.pid, 9100);
+  assert.deepEqual(reads, [4242, 4242]);
+});
+
+test('a process that could not be read once and then reads as a session worker is reused, and read no more', async () => {
+  const { reads, readProcessIdentity } = identityReaderInTurns([null, WORKERS_OF_AN_EARLIER_VERSION[2][1]]);
+  const { registry, supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'processing' }, { readProcessIdentity });
+  supervisor.noteSessionHeartbeat('abc-123');
+  for (let call = 1; call <= 3; call += 1) {
+    assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+    assert.equal(registry.getWorker('abc-123').status, 'processing');
+  }
+  assert.deepEqual(reads, [4242, 4242], 'the read that told is the last');
+  assert.equal(supervisor.getLifecycleState('abc-123').launchPid, 4242);
+  assert.deepEqual(spawns, []);
+});
+
+test('a kill while the identity is read: nothing is reused or launched', async () => {
+  let supervisorRef = null;
+  const readProcessIdentity = async (pid) => {
+    supervisorRef.markKilled('abc-123');
+    return { pid, startTime: '123456', commandLine: WORKERS_OF_AN_EARLIER_VERSION[1][1] };
+  };
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { readProcessIdentity });
+  supervisorRef = supervisor;
+  const result = await supervisor.ensureWorker('abc-123');
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'session-killed');
+  assert.deepEqual(spawns, []);
+});
+
+test('a relay that launches no worker reads no identity', async () => {
+  const { reads, readProcessIdentity } = identityReader('/home/dev/.local/bin/copilot --resume abc-123');
+  const { supervisor, spawns } = supervisorOverEntry({ workerId: 'worker-abc', pid: 4242, status: 'ready' }, { workersStateTheirKind: () => false, readProcessIdentity });
+  assert.equal((await supervisor.ensureWorker('abc-123')).reused, true);
+  assert.deepEqual(reads, []);
+  assert.deepEqual(spawns, []);
 });

@@ -73,13 +73,6 @@ function boot({ sessionId = SESSION, conversationId = SESSION } = {}) {
     resolveConversationRecord: ({ sdkSessionId }) => ({ id: conversationIdOf(sdkSessionId) || sdkSessionId }),
     io: { emit: (event, payload) => emitted.push({ event, payload }) },
     queueCounts: () => ({ pendingCount: 0 }),
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId: sid, conversationId: cid, pid } = {}) => {
-        const id = String(sid || '').trim();
-        return id ? { sessionId: id, conversationId: String(cid || '').trim() || null, pid: Number(pid) || null } : null;
-      },
-      observe() {},
-    },
   }));
   // As the workers send them: the session id in both identity headers.
   const headers = { 'x-relay-session-id': sessionId, 'x-relay-conversation-id': sessionId };

@@ -1,32 +1,13 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, createFakeWorker, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A plan board's action queues the follow-up that carries the plan out. The
 // spec is the worker: it dequeues the turn, posts the board the way a worker
 // does, and then presses the action the way the page does.
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    // The connection may be one that was kept while the page was at work and
-    // has been closed since: the next round asks again.
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders }).catch(() => null);
-    if (!dequeued) {
-      await sleep(200);
-      continue;
-    }
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
 
 test("a plan board action queues its follow-up message", async ({ page, request }) => {
   const token = relayToken();
@@ -36,19 +17,16 @@ test("a plan board action queues its follow-up message", async ({ page, request 
   let messageId = "";
   let followUpId = "";
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Plan the change ${stamp}`, relayMode: "plan", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    messageId = String(queuedBody?.messageId || "");
-    await dequeue(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+    // Made as the web client makes a chat: bound to its session from the start.
+    const started = await startConversation({ text: `Plan the change ${stamp}`, relayMode: "plan" });
+    conversationId = String(started.conversationId || "");
+    messageId = String(started.messageId || "");
+    await started.worker.take(messageId);
 
     const created = await request.post("/api/relay-board", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -78,10 +56,7 @@ test("a plan board action queues its follow-up message", async ({ page, request 
     await expect(board.locator(".relay-board-body")).toContainText("Rename the module");
 
     // The reply takes it over: inside the reply's bubble, no card of its own.
-    await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text: "The plan is ready.", model: "gpt-5.4-mini", mode: "plan" },
-    });
+    await respondAsWorker(messageId, { conversationId, text: "The plan is ready.", model: "gpt-5.4-mini", mode: "plan" });
     const reply = page.locator(`.msg.assistant[data-source-message-id="${messageId}"]`);
     await expect(reply.locator(".msg-bubble")).toContainText("The plan is ready.");
     await expect(reply.locator(".msg-bubble .relay-board-inline")).toHaveCount(1);
@@ -110,13 +85,10 @@ test("a plan board action queues its follow-up message", async ({ page, request 
     await expect(page.locator("#mode-select")).toHaveValue("autopilot");
 
     // The follow-up is a message like any other: a worker is handed it.
-    await dequeue(request, headers, followUpId, String(queuedBody?.ownerSessionId || ""));
+    await started.worker.take(followUpId);
   } finally {
     for (const id of [followUpId, messageId].filter(Boolean)) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId: id, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(id, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
     if (conversationId) await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});
   }
@@ -130,17 +102,14 @@ test("a reply that is the plan shows it once, with the buttons below", async ({ 
   let conversationId = "";
   let messageId = "";
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Plan the split ${stamp}`, relayMode: "plan", model: "gpt-5.4-mini" },
-    });
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    messageId = String(queuedBody?.messageId || "");
-    await dequeue(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+    const started = await startConversation({ text: `Plan the split ${stamp}`, relayMode: "plan" });
+    conversationId = String(started.conversationId || "");
+    messageId = String(started.messageId || "");
+    await started.worker.take(messageId);
     const created = await request.post("/api/relay-board", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -152,10 +121,7 @@ test("a reply that is the plan shows it once, with the buttons below", async ({ 
       },
     });
     expect(created.ok()).toBeTruthy();
-    await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text: `Here is what I would do.\n\n${plan}`, model: "gpt-5.4-mini", mode: "plan" },
-    });
+    await respondAsWorker(messageId, { conversationId, text: `Here is what I would do.\n\n${plan}`, model: "gpt-5.4-mini", mode: "plan" });
 
     await page.setViewportSize({ width: 412, height: 915 });
     await page.addInitScript((id) => { localStorage.setItem("copilot_last_conv", id); }, conversationId);
@@ -169,10 +135,7 @@ test("a reply that is the plan shows it once, with the buttons below", async ({ 
     await page.screenshot({ path: "/tmp/oar-plan-board-in-reply.png" });
   } finally {
     if (messageId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
     if (conversationId) await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});
   }
@@ -184,20 +147,11 @@ const APPROVE_LINE = "Plan approved by the user. Do not implement. Finish only t
 
 /** A plan turn with its card, as a worker leaves it: the reply posted, the card pending. */
 async function planCard(request, headers, { stamp, planOnly = false, actions = null } = {}) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text: `Plan the change ${stamp}`, relayMode: "plan", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  const ownerSessionId = String(body?.ownerSessionId || "");
-  // As a CLI does at its first turn: the conversation is bound to its session,
+  // Made as the web client makes a chat: bound to its session from the start,
   // so a second message can follow.
-  const synced = await request.post("/api/session-sync", { headers, data: { sdk_session_id: conversationId, conversation_id: conversationId } });
-  expect(synced.ok()).toBeTruthy();
-  await dequeue(request, headers, messageId, ownerSessionId);
+  const { conversationId, messageId, worker } = await startConversation({ text: `Plan the change ${stamp}`, relayMode: "plan" });
+  const ownerSessionId = worker.sessionId;
+  await worker.take(messageId);
   if (planOnly) {
     const flagged = await request.patch(`/api/conversation/${conversationId}/preferences`, { headers, data: { planOnly: true } });
     expect(flagged.ok()).toBeTruthy();
@@ -205,6 +159,7 @@ async function planCard(request, headers, { stamp, planOnly = false, actions = n
   const created = await request.post("/api/relay-board", {
     headers,
     data: {
+      ...attemptOf(messageId),
       queueId: messageId,
       messageId,
       conversationId,
@@ -223,10 +178,7 @@ async function planCard(request, headers, { stamp, planOnly = false, actions = n
   });
   expect(created.ok()).toBeTruthy();
   const boardId = String((await created.json())?.board?.id || "");
-  await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: "The plan is ready.", model: "gpt-5.4-mini", mode: "plan" },
-  });
+  await respondAsWorker(messageId, { conversationId, text: "The plan is ready.", model: "gpt-5.4-mini", mode: "plan" });
   return { conversationId, messageId, ownerSessionId, boardId };
 }
 
@@ -267,8 +219,8 @@ test("\"Approve plan\" on a card: its line runs in agent mode once, and the sess
     const followUp = conversation.messages.find((message) => message.id === followUpId);
     expect(followUp.text).toBe(APPROVE_LINE);
     expect(followUp.mode).toBe("agent");
-    await dequeue(request, headers, followUpId, card.ownerSessionId);
-    await request.post("/api/response", { headers, data: { messageId: followUpId, conversationId, text: "Committed the plan doc.", model: "gpt-5.4-mini", mode: "agent" } });
+    await createFakeWorker({ sessionId: card.ownerSessionId }).take(followUpId);
+    await respondAsWorker(followUpId, { conversationId, text: "Committed the plan doc.", model: "gpt-5.4-mini", mode: "agent" });
     // The owner's next message from the composer plans again, and the saved mode stays plan.
     await page.locator("#msg-input").fill(`And the tests? ${Date.now()}`);
     const sending = page.waitForResponse((response) => response.url().endsWith("/api/message") && response.request().method() === "POST");

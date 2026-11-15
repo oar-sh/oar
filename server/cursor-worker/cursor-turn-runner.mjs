@@ -39,7 +39,7 @@ const STALE_HANDLE_IDLE_MS = 30 * 60_000;
 
 // The Cursor SDK's SendOptions carries only model/mode/callbacks — there is
 // no per-turn instruction channel — so ask/autopilot steering rides on the
-// user message text, mirroring the Copilot extension's prompt-context
+// user message text, mirroring the Copilot SDK worker's prompt-context
 // injection. Injected only when the mode changes so the session transcript
 // is not spammed with repeated instructions.
 const MODE_NUDGES = {
@@ -149,7 +149,7 @@ export function createCursorTurnRunner({
   // Running relay_tool calls, same family: the relay may be waiting up to
   // 600 s for a remote turn (plus an approval card) with no SDK traffic.
   let pendingRemoteRelayCalls = 0;
-  // Mirrors the Copilot extension's lastPromptedRelayMode: full mode
+  // Mirrors the Copilot SDK worker's lastPromptedRelayMode: full mode
   // instructions ride on the first message of a mode and on mode changes only.
   let lastNudgedRelayMode = '';
   // Like Grok's once-per-worker capability guidance: the Cursor SDK has no

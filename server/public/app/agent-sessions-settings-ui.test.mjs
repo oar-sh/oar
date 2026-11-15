@@ -347,3 +347,66 @@ test('the app wires the section: window handlers, the modal refresh, the socket 
   assert.match(sockets, /socket\.on\(AGENT_SESSIONS_SOCKET_EVENT, /);
   assert.match(sockets, /applyAgentSessionsSettingsState\(payload\)/);
 });
+
+// ─── The loop guard ──────────────────────────────────────────────────────────
+
+const loopInput = () => el('agent-sessions-loop-guard-input');
+const loopLabel = () => el('agent-sessions-loop-guard-value');
+const offList = () => el('agent-sessions-loop-guard-off');
+
+test('the loop guard number shows the stored limit, saves a change, and says "Never ask" at 0', async () => {
+  await freshSection({ agentPromptsBeforeAsking: 30, loopGuard: { off: [] }, limits: { ...LIMITS, minAgentPrompts: 10, maxAgentPrompts: 500, agentPromptsStep: 10 } });
+  assert.equal(loopInput().type, 'number');
+  assert.equal(loopInput().value, '30');
+  assert.equal(loopInput().min, '0');
+  assert.equal(loopInput().step, '10');
+  assert.equal(loopInput().disabled, false);
+  assert.equal(loopLabel().textContent, 'Ask after 30 prompts');
+  assert.equal(offList().hidden, true);
+
+  loopInput().value = '0';
+  loopInput().dispatchEvent(new window.Event('change'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(requests, [{ method: 'POST', path: '/api/settings/agent-sessions', body: { agentPromptsBeforeAsking: 0 } }]);
+  assert.equal(loopLabel().textContent, 'Never ask');
+  assert.equal(status().textContent, 'The loop guard never asks now.');
+
+  // Off the step: what is sent is a value the relay takes.
+  requests.length = 0;
+  await ui.saveAgentSessionsAgentPrompts('47');
+  assert.deepEqual(requests.map((request) => request.body), [{ agentPromptsBeforeAsking: 50 }]);
+  assert.equal(loopInput().value, '50');
+});
+
+test('the off-list renders escaped titles with Revoke, and Revoke asks the relay to drop that session', async () => {
+  const off = [{ conversationId: 'c-lead', title: '<b>Lead</b>', since: '2026-11-14T10:00:00.000Z' }];
+  await freshSection({ agentPromptsBeforeAsking: 30, loopGuard: { off } });
+  postResponder = (body) => {
+    relayState = { ...relayState, loopGuard: { off: relayState.loopGuard.off.filter((entry) => !body.loopGuardOff.revoke.includes(entry.conversationId)) } };
+    return [200, { ok: true, ...relayState }];
+  };
+  assert.equal(offList().hidden, false);
+  assert.equal(offList().querySelector('strong').textContent, '<b>Lead</b>', 'the title is text, not markup');
+  offList().querySelector('[data-loop-guard-revoke]').click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(requests, [{ method: 'POST', path: '/api/settings/agent-sessions', body: { loopGuardOff: { revoke: ['c-lead'] } } }]);
+  assert.equal(offList().hidden, true);
+  assert.equal(status().textContent, 'The loop guard asks in that session again.');
+
+  // A socket event lists a new one.
+  ui.applyAgentSessionsSettingsState({ ...relayState, loopGuard: { off: [{ conversationId: 'c-2', title: 'Second' }] } });
+  assert.equal(offList().hidden, false);
+  assert.match(offList().textContent, /Loop guard off for: Second/);
+});
+
+test('the api-client sends only the whitelisted fields', async () => {
+  const { updateAgentSessionsSettings } = await import('./api-client.js');
+  requests.length = 0;
+  postResponder = () => [200, { ok: true, ...relayState }];
+  await updateAgentSessionsSettings({ agentPromptsBeforeAsking: 20, loopGuardOff: { revoke: ['c-1', '', 3] }, extra: 'dropped' });
+  await updateAgentSessionsSettings({ agentPromptsBeforeAsking: '20', loopGuardOff: { revoke: 'c-1' } });
+  assert.deepEqual(requests.map((request) => request.body), [
+    { agentPromptsBeforeAsking: 20, loopGuardOff: { revoke: ['c-1'] } },
+    {},
+  ]);
+});

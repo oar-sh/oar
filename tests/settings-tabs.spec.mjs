@@ -112,12 +112,6 @@ const LEGACY_SETTINGS_IDS = [
   "push-event-board-toggle",
   "push-event-cli-offline-toggle",
   "push-device-list",
-  // Features
-  "settings-panel-features",
-  "features-flag-list",
-  "features-restart-notice",
-  "features-restart-btn",
-  "features-settings-status",
   // Updates
   "update-auto-check-toggle",
   "update-check-now-btn",
@@ -161,7 +155,7 @@ const LEGACY_SETTINGS_IDS = [
   "settings-shares-status",
 ];
 
-const TABS = ["general", "appearance", "providers", "relays", "security", "previews", "shares", "notifications", "features"];
+const TABS = ["general", "appearance", "providers", "relays", "security", "previews", "shares", "notifications"];
 // Copilot leads, matching the DOM order in index.html: it is the default
 // provider, so its panel is the one a first-time visitor lands on.
 const PROVIDER_TABS = ["copilot", "openai", "claude", "claude-api", "claude-cloud", "grok", "cursor", "deepseek"];
@@ -212,7 +206,7 @@ async function expectActiveProviderTab(page, providerTab) {
 }
 
 test.describe("tabbed settings modal", () => {
-  test("renders nine top-level tabs with one panel visible at a time", async ({ page }) => {
+  test("renders eight top-level tabs with one panel visible at a time", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 
@@ -486,7 +480,7 @@ test.describe("the tab strip on a phone", () => {
     }, [selector, where]);
   }
 
-  test("Features shows whole when chosen, and the strip's end has no fade", async ({ page }) => {
+  test("Notifications shows whole when chosen, and the strip's end has no fade", async ({ page }) => {
     await loadApp(page);
     await openSettings(page, "general");
 
@@ -506,22 +500,22 @@ test.describe("the tab strip on a phone", () => {
     await scrollStrip(page, TOP_STRIP, "start");
     await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-general")).fade).toBe("right");
 
-    // Features, the last tab: the strip goes to its end, where nothing fades
+    // Notifications, the last tab: the strip goes to its end, where nothing fades
     // on the right. Clicked without Playwright's own scroll into view: the
     // app has to bring it in.
-    await page.locator("#settings-tab-features").dispatchEvent("click");
-    await expectActiveTab(page, "features");
-    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-features")).fade).toBe("left");
-    state = await readStrip(page, TOP_STRIP, "settings-tab-features");
+    await page.locator("#settings-tab-notifications").dispatchEvent("click");
+    await expectActiveTab(page, "notifications");
+    await expect.poll(async () => (await readStrip(page, TOP_STRIP, "settings-tab-notifications")).fade).toBe("left");
+    state = await readStrip(page, TOP_STRIP, "settings-tab-notifications");
     expect(state.scrollLeft).toBeGreaterThanOrEqual(state.room - 1);
     expect(state.mask).toContain("to right");
     expectClear(state);
 
-    // Opened again on Features (from the start): scrolled to it at once.
+    // Opened again on Notifications (from the start): scrolled to it at once.
     await page.evaluate(() => window.closeSettingsModal());
     await scrollStrip(page, TOP_STRIP, "start");
     await openSettings(page);
-    state = await readStrip(page, TOP_STRIP, "settings-tab-features");
+    state = await readStrip(page, TOP_STRIP, "settings-tab-notifications");
     expect(state.fade).toBe("left");
     expectClear(state);
 

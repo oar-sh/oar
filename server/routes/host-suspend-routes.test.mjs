@@ -145,7 +145,7 @@ test('POST /api/relay/shutdown and /api/queue/empty answer a LAN client too', as
 });
 
 test('POST /api/image-operations/:id/execute refuses a LAN peer', async () => {
-  const routes = captureRoutes(makeRouteDeps({ featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: true } }), registerMessagesRoutes);
+  const routes = captureRoutes(makeRouteDeps(), registerMessagesRoutes);
   const lan = await invokeRoute(routes, 'POST', '/api/image-operations/:operationId/execute', { socket: { remoteAddress: '192.168.7.31' }, params: { operationId: 'img_op_demo' } });
   assert.equal(lan.status, 403);
 });

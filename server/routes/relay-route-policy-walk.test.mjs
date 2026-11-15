@@ -86,7 +86,6 @@ function buildApp() {
     MAX_UPLOAD_ATTACHMENTS: 4,
     DEFAULT_RELAY_MODE: 'agent',
     DEFAULT_MODEL: 'gpt-5',
-    featureFlags: {},
     config: { port: 3333 },
   };
   const deps = new Proxy(base, { get: (target, key) => (key in target ? target[key] : stub()) });
@@ -246,13 +245,13 @@ test('every GET behind auth that writes needs the proof key with a cookie (none 
   assert.deepEqual(writing.filter((route) => isCookieOnlyRoute('GET', route.path)).map((route) => route.key), []);
   // The worker plumbing GETs that change state: a cookie alone cannot reach
   // them any more (403 AUTH_SESSION_PROOF without the key).
-  for (const key of ['GET /api/pending', 'GET /api/sdk-session-delete/pending', 'GET /api/control/active', 'GET /api/claude-cloud-session']) {
+  for (const key of ['GET /api/pending', 'GET /api/control/active', 'GET /api/claude-cloud-session']) {
     const route = authedGets.find((candidate) => candidate.key === key);
     assert.ok(route, `${key} is registered behind auth`);
     assert.equal(isCookieOnlyRoute('GET', route.path), false, key);
     assert.equal(isCookieOnlyRoute('HEAD', route.path), false, key);
   }
-  for (const key of ['GET /api/pending', 'GET /api/sdk-session-delete/pending', 'GET /api/control/active']) {
+  for (const key of ['GET /api/pending', 'GET /api/control/active']) {
     assert.ok(writing.some((route) => route.key === key), `${key} is seen as a write`);
   }
   // Every other GET behind auth needs the key too: the list is the only way round it.

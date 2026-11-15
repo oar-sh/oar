@@ -67,8 +67,8 @@ test('a session is archived for the recycle only when no conversation in use sta
   assert.match(body, /return !inUse\(viaRuntime\) && !inUse\(viaSessionId\);/);
 });
 
-test('the recycle starts under routing only, and stops with the runtime timers', () => {
-  assert.match(runtimeSource, /\nif \(featureFlags\?\.SESSION_WORKER_ROUTING_ENABLED === true\) workerRecycleService\.start\(\);\n/);
+test('the recycle starts at boot, and stops with the runtime timers', () => {
+  assert.match(runtimeSource, /\nworkerRecycleService\.start\(\);\n/);
   assert.equal(runtimeSource.split('workerRecycleService.start()').length, 2, 'started in one place');
   const clear = sliceBetween('function clearRuntimeTimers() {', '\n}\n');
   assert.match(clear, /try \{ workerRecycleService\.stop\(\); \} catch \{\}/);
@@ -82,13 +82,12 @@ test('the runtime state hands the recycle status to the routes as a function', (
   assert.match(state, /workerRecycle: \(\) => workerRecycleService\.status\(\),/);
 });
 
-test('the archived sweep runs once, 30 s after the relay listens, under routing, on an unref\'d timer', () => {
+test('the archived sweep runs once, 30 s after the relay listens, on an unref\'d timer', () => {
   const listening = sliceBetween('httpServer.listen(config.port, listenHost, () => {', '\n});');
-  assert.match(listening, /if \(featureFlags\?\.SESSION_WORKER_ROUTING_ENABLED === true\) \{\n    runtimeTimers\.archivedWorkerSweep = setTimeout\(\(\) => \{/);
+  assert.match(listening, /\n  runtimeTimers\.archivedWorkerSweep = setTimeout\(\(\) => \{/);
   assert.match(listening, /sweepArchivedSessionWorkersAtStart\(\)\.catch\(/);
-  assert.match(listening, /\}, 30_000\);\n    runtimeTimers\.archivedWorkerSweep\.unref\?\.\(\);/);
+  assert.match(listening, /\}, 30_000\);\n  runtimeTimers\.archivedWorkerSweep\.unref\?\.\(\);/);
   const sweep = sliceBetween('async function sweepArchivedSessionWorkersAtStart() {', '\n}\n');
-  assert.match(sweep, /if \(featureFlags\?\.SESSION_WORKER_ROUTING_ENABLED !== true\) return null;/);
   assert.match(sweep, /if \(runtimeShutdownStarted\) return null;/);
   assert.match(sweep, /stmts\.listArchivedRuntimeSessionIds\?\.all\?\.\(\)/);
   // A live process is the registry's live pid or one the process list shows.
@@ -156,7 +155,7 @@ test('a worker hello registers the process with its kind and build id, then runs
   const socket = sliceBetween('const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({', '\n});');
   assert.match(socket, /\n  onWorkerHello: noteSessionWorkerHello,\n/);
   const hello = sliceBetween('function noteSessionWorkerHello(', '\n}\n');
-  assert.match(hello, /if \(featureFlags\?\.SESSION_WORKER_ROUTING_ENABLED !== true \|\| runtimeShutdownStarted\) return;/);
+  assert.match(hello, /if \(runtimeShutdownStarted\) return;/);
   assert.match(hello, /if \(sessionWorkerSupervisor\?\.isKillBlocked\?\.\(sid\) !== true\) \{/);
   // An entry with no process behind it (a launch the agent SDK gate
   // deferred) is made ready, as a heartbeat would.
@@ -181,10 +180,38 @@ test('a launch reuses a listed worker only by its identity: the listed process c
   assert.match(spawn, /findProcessForSessionAsync\(normalizedTargetSessionId, \{ fresh: true \}\)/);
   // On Windows the fresh row is the identity; elsewhere the reader is asked.
   assert.match(spawn, /const liveIdentity = liveWorker\?\.processId\n      \? await identityOfListedWorker\(liveWorker, \{ platform: process\.platform, identityOf: readWorkerProcessIdentity \}\)\n      : null;/);
-  assert.match(spawn, /if \(liveWorker\?\.processId && mayReuseSessionWorkerRow\(\{\n      row: liveWorker,\n      current: liveIdentity,\n      sdkSessionId: normalizedTargetSessionId,/);
+  assert.match(spawn, /\? judgeListedSessionProcess\(\{\n        row: liveWorker,\n        current: liveIdentity,\n        sdkSessionId: normalizedTargetSessionId,\n        isAlive: /);
+  assert.match(spawn, /if \(listed === 'worker'\) \{\n      const workerId = /);
   assert.doesNotMatch(spawn, /liveWorker\?\.processId && isProcessAlive\(/, 'liveness alone never decides');
   // The launcher's own reuse check reads with the same reader.
   assert.match(spawn, /readProcessIdentity: readWorkerProcessIdentity,/);
+});
+
+test('a process of the session that is no session worker is stopped as the kill route stops, before the launch', () => {
+  const spawn = sliceBetween('async function spawnSessionWorkerCli(', '\n}\n');
+  const stop = spawn.indexOf("if (listed === 'leftover' && !isCliSpawnDisabled(sessionWorkerLaunchEnv)) {");
+  assert.notEqual(stop, -1, 'a test relay stops nothing');
+  assert.ok(stop < spawn.indexOf('const launched = await launchSessionCli({'));
+  assert.match(spawn.slice(stop), /await stopLeftoverSessionProcess\(\{\n        sdkSessionId: normalizedTargetSessionId,\n        stop: \(\) => stopSessionWorkerProcesses\(\{\n          sdkSessionId: normalizedTargetSessionId,\n          processInspector: sessionWorkerProcessInspector,\n          isPidAliveImpl: isProcessAlive,\n          killTmuxSessionImpl: killTmuxSession,\n        \}\),/);
+  // The reuse reads no launch environment: a worker of any kind is reused.
+  assert.doesNotMatch(spawn.slice(0, stop), /buildSessionWorkerLaunchEnvForSession/);
+});
+
+test('a relay that launches its workers takes no process that never said its kind for a worker: not in the supervisor, not on GET /api/pending', () => {
+  const stated = "workersStateTheirKind: () => !isCliSpawnDisabled(sessionWorkerLaunchEnv),";
+  const supervisor = sliceBetween('const sessionWorkerSupervisor = createSessionWorkerSupervisor({', '\n});');
+  assert.ok(supervisor.includes(stated));
+  assert.equal(runtimeSource.split(stated).length - 1, 2, 'the supervisor and the message routes');
+});
+
+test('the supervisor reads what such a process is from the reader the recycle and the stop use', () => {
+  const supervisor = sliceBetween('const sessionWorkerSupervisor = createSessionWorkerSupervisor({', '\n});');
+  assert.match(supervisor, /\n  readProcessIdentity: readWorkerProcessIdentity,\n/);
+  assert.ok(
+    runtimeSource.indexOf('const readWorkerProcessIdentity = createProcessIdentityReader({')
+      < runtimeSource.indexOf('const sessionWorkerSupervisor = createSessionWorkerSupervisor({'),
+    'built before the supervisor',
+  );
 });
 
 test('the recycle and the stop read what the process at a pid is, from one reader over the inspector\'s list', () => {

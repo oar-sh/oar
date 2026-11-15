@@ -5,6 +5,7 @@ import { buildModelCatalogWithDeepSeekProvider, registerSessionsRoutes } from '.
 import { createDeepSeekSettingsService } from '../services/deepseek-settings-service.mjs';
 import { createPlanUsageService } from '../services/plan-usage-service.mjs';
 import Database from 'better-sqlite3';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 const TEST_KEY = 'sk-test-3333333333333333';
 
@@ -76,8 +77,7 @@ function createBootstrapHarness({
   planUsageService = null,
   deepseekBalanceService = null,
   emitted = [],
-  sessionWorkerSupervisor = null,
-  featureFlags = {},
+  sessionWorkerSupervisor = fakeSessionWorkerSupervisor(),
   supportedRelayModes = ['agent'],
 } = {}) {
   const app = createMockApp();
@@ -138,13 +138,11 @@ function createBootstrapHarness({
     resolveConversationWorkspaceState: () => ({}),
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => true,
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: (_cb) => {},
     ensureRuntimeSessionBinding: (conversationId, model, now, sdkSessionId, options) => {
@@ -159,10 +157,6 @@ function createBootstrapHarness({
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags,
     sessionWorkerSupervisor,
     sessionWorkerRegistry: null,
     resolveSessionStateRoot: () => null,

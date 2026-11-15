@@ -6,6 +6,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Questions that don't block (relay_tool ask) and the Inbox, on two relays
@@ -31,7 +35,7 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *
  * No worker runs: the sessions are conversations a message created, and a
  * "turn" for the one card a turn waits on is a message the spec took off the
- * queue (GET /api/pending).
+ * queue as the session's worker (helpers/fake-worker.mjs).
  */
 
 const DESKTOP = { width: 1280, height: 800 };
@@ -61,8 +65,12 @@ test.describe.serial("the Inbox", () => {
   }
   const apiA = (...args) => apiOf(relayA)(...args);
   const apiB = (...args) => apiOf(relayB)(...args);
+  // The same relays, for the workers the spec plays (helpers/fake-worker.mjs).
+  apiA.relay = { baseUrl: () => relayA.baseUrl, token: () => relayA.token };
+  apiB.relay = { baseUrl: () => relayB.baseUrl, token: () => relayB.token };
   const toolA = (conversationId, action, args = {}) => apiA("/api/remote-relays/tool", { method: "POST", body: { conversationId, action, args } });
 
+  // A session no turn runs in, made by a bare first message (the lead's names linux-test).
   async function conversation(api, text, relayMode = "agent") {
     const queued = await api("/api/message", { method: "POST", body: { text, relayMode, model: "gpt-5.4-mini" } });
     expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
@@ -70,16 +78,10 @@ test.describe.serial("the Inbox", () => {
   }
 
   async function conversationWithRunningTurn(api, text, relayMode = "agent") {
-    const { conversationId, messageId, ownerSessionId } = await conversation(api, text, relayMode);
-    const synced = await api("/api/session-sync", { method: "POST", body: { sdk_session_id: conversationId, conversation_id: conversationId } });
-    expect(synced.status).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-      await sleep(250);
-    }
-    throw new Error("The message was never handed out");
+    // Made as the web client makes a chat: bound to its session from the start.
+    const { conversationId, messageId, worker } = await startConversation({ text, relayMode }, api.relay);
+    await worker.take(messageId);
+    return { conversationId, messageId };
   }
 
   /** The relay events written into a conversation, as their texts. */
@@ -145,7 +147,7 @@ test.describe.serial("the Inbox", () => {
     sessions.waiting = await conversationWithRunningTurn(apiA, `theme picker ${suffix}`);
     const card = await apiA("/api/relay-question", {
       method: "POST",
-      body: { queueId: sessions.waiting.messageId, prompt: "Which theme?", choices: ["Light", "Dark"], allowFreeform: false, timeout_ms: 600_000 },
+      body: { ...attemptOf(sessions.waiting.messageId), queueId: sessions.waiting.messageId, prompt: "Which theme?", choices: ["Light", "Dark"], allowFreeform: false, timeout_ms: 600_000 },
     });
     expect(card.status, JSON.stringify(card.payload)).toBe(200);
     sessions.cardId = card.payload.question.id;
@@ -221,15 +223,15 @@ test.describe.serial("the Inbox", () => {
     // A short window: the Inbox overflows, so there is a scroll height to
     // remember. A long session is open first and scrolled down, as it is
     // when the Inbox is used: its height must not become the Inbox's.
-    const { conversationId: long, messageId: first } = await conversation(apiA, `long chat ${suffix}`);
-    // Bound to its session, so later messages are accepted into it.
-    expect((await apiA("/api/session-sync", { method: "POST", body: { sdk_session_id: long, conversation_id: long } })).status).toBe(200);
-    let messageId = first;
+    // Bound to its session from the start, so it takes more messages.
+    let queued = await startConversation({ text: `long chat ${suffix}` }, apiA.relay);
+    const long = queued.conversationId;
     for (let turn = 0; turn < 8; turn += 1) {
-      expect((await apiA("/api/response", { method: "POST", body: { messageId, conversationId: long, text: `reply ${turn}`, model: "gpt-5.4-mini", mode: "agent" } })).status).toBe(200);
+      // Each turn taken and answered by the session's worker.
+      expect((await completeTurn(queued, { text: `reply ${turn}`, model: "gpt-5.4-mini", mode: "agent" }, { ...apiA.relay, stay: true })).status).toBe(200);
       const next = await apiA("/api/message", { method: "POST", body: { conversationId: long, text: `message ${turn}`, relayMode: "agent", model: "gpt-5.4-mini" } });
       expect(next.status, JSON.stringify(next.payload)).toBe(200);
-      messageId = next.payload.messageId;
+      queued = next.payload;
     }
     await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, long);
     await openApp(page, { width: 1280, height: 360 });
@@ -456,7 +458,8 @@ test.describe.serial("the Inbox", () => {
   }
 
   async function denyOnB(card) {
-    const answered = await apiB(`/api/relay-question/${encodeURIComponent(card.id)}/answer`, { method: "POST", body: { answer: "Deny" } });
+    // As B's page answers it: with the session the card belongs to.
+    const answered = await apiB(`/api/relay-question/${encodeURIComponent(card.id)}/answer`, { method: "POST", body: { answer: "Deny", sdk_session_id: card.conversationId } });
     expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
     await card.waiting;
   }

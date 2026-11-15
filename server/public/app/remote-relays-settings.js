@@ -1,9 +1,8 @@
 // Settings → Relays: this relay's identity for its peers (name, public
 // address, the inbound switch), the list of paired remote relays, and the form
 // that adds one (docs/plans/2026-09-27-remote-relays.md §8, decisions 3, 4, 12,
-// 15 and 23). Rows are dynamic, so their listeners are attached during render
-// (the Features tab does the same); the static controls use inline handlers
-// that bootstrap.js exposes on window.
+// 15 and 23). Rows are dynamic, so their listeners are attached during render;
+// the static controls use inline handlers that bootstrap.js exposes on window.
 
 import { BASE, showTransientRelayNotice } from './store.js';
 import {

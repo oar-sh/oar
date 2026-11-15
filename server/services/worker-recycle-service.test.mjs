@@ -8,6 +8,7 @@ import { createWorkerRecycleService, isWorkerOnOtherBuild, RECYCLE_HOLDS, worker
 import { sweepArchivedWorkers } from './worker-recycle-service.mjs';
 import { createWorkerReplacementFence } from './worker-replacement.mjs';
 import { createKeyedMutex } from './keyed-mutex-service.mjs';
+import { createProcessIdentityReader } from './session-worker-process-service.mjs';
 
 const RELAY = '0.9.21+0123456789ab';
 const OLD = '0.9.20+fedcba987654';
@@ -569,6 +570,33 @@ test('the start time of the old pid unreadable: one worker results, never a seco
   await app.clock.advance(60_000);
   await app.service.sweep();
   assert.equal(app.calls.length, 4, 'done: nothing more');
+});
+
+test('on Windows, a process at the stopped pid the relay may not read is stopped again before the retry launches', async () => {
+  // Win32_Process lists it with a null CommandLine; the real reader over
+  // that row. Taken for another program's, it would be left running and the
+  // retry would launch beside it.
+  const sid = 'sid-win-unread';
+  const readProcessIdentity = createProcessIdentityReader({
+    platform: 'win32',
+    readProcessSnapshot: async () => [{ processId: 42, parentProcessId: 4100, name: 'node.exe', commandLine: null, createdAt: 1_763_100_000_000 }],
+  });
+  const app = setup({
+    workers: [worker(sid, { pid: 42, buildId: OLD })],
+    stop: async (id, opts, { registry }) => {
+      registry.delete(id);
+      return { ok: true, identity: { pid: 42, startTime: '1763000000000' } };
+    },
+    launch: async (id, { registry }) => { registry.set(id, worker(id, { pid: 42, buildId: null })); return { ok: true }; },
+    options: { retryBaseMs: 1_000, readProcessIdentity },
+  });
+  await app.service.sweep();
+  assert.match(app.logs.at(-1), /launch failed sid-win- \(1\): the launch named the stopped pid 42;/);
+
+  await app.clock.advance(1_000);
+  await app.service.sweep();
+  assert.deepEqual(app.calls, [['stop', sid], ['launch', sid], ['stop', sid], ['launch', sid]]);
+  assert.ok(app.logs.includes('[worker-recycle] stopped sid-win- pid 42 again before the launch: the process there could not be told from the stopped one'));
 });
 
 test('the retry of a launch that named the stopped pid: this relay\'s build id ends it, a gone process needs no second stop', async () => {

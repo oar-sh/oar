@@ -144,7 +144,7 @@ async function bootRelay() {
     io: { emit() {} },
     db,
     stmts,
-    runtimeState: { featureFlags: {} },
+    runtimeState: {},
     uuidv4: () => `card-${(questionCounter += 1)}`,
     ts: () => NOW,
     questionExpiresAt,

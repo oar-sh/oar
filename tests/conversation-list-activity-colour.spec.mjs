@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * A ready session's title shows whether it works, in the sidebar and in the
@@ -15,21 +19,15 @@ const COLOURS = {
   light: { working: "rgb(26, 127, 55)", idle: "rgb(76, 139, 92)" },
 };
 
-async function seed(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
-  const messageId = String(body?.messageId || "").trim();
+// A conversation with one finished turn and no worker, made as the web client
+// makes one: bound to its session (its own id) from the start.
+async function seed(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "").trim();
   expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId, conversationId, text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  // The turn, by a worker that ends.
+  const responded = await completeTurn(started, { text: `${text} reply`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   return conversationId;
 }
 
@@ -40,13 +38,9 @@ for (const theme of ["dark", "light"]) {
     const token = relayToken();
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
-    const sdkSessionId = `playwright-activity-colour-${theme}-${stamp}`;
-    const conversationId = await seed(request, headers, `activity-colour-${theme}-${stamp}`);
-    const synced = await request.post("/api/session-sync", {
-      headers,
-      data: { sdk_session_id: sdkSessionId, conversation_id: conversationId },
-    });
-    expect(synced.ok()).toBeTruthy();
+    const conversationId = await seed(`activity-colour-${theme}-${stamp}`);
+    // The session the /api/status answer gains a worker for: the conversation's own.
+    const sdkSessionId = conversationId;
     await page.route("**/api/status", async (route) => {
       const response = await route.fetch();
       if (!response.ok()) return route.fulfill({ response });

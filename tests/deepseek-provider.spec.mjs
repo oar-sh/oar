@@ -52,16 +52,12 @@ test.describe("DeepSeek provider", () => {
 
   test.beforeEach(async ({ page }) => {
     bootstrapResponse = null;
-    // The isolated server cannot spawn workers, so a valid bootstrap 409s
-    // after committing the conversation; the success payload a real relay
-    // returns is restored for the client (as in new-chat-model-reasoning).
+    // The relay's answer to the bootstrap, as the page gets it. The isolated
+    // server launches no worker: the launch is deferred and the chat opens.
     await page.route("**/api/conversation/bootstrap", async (route) => {
       const response = await route.fetch();
       const text = await response.text();
       try { bootstrapResponse = JSON.parse(text); } catch { bootstrapResponse = null; }
-      if (response.status() === 409 && bootstrapResponse?.conversationCreated) {
-        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...bootstrapResponse, ok: true }) });
-      }
       return route.fulfill({ response, body: text });
     });
     await page.addInitScript(() => {

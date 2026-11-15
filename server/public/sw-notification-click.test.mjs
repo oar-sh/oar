@@ -133,6 +133,13 @@ test('this relay\'s own question opens its conversation here, and a choice answe
   assert.equal(worker.opened.length, 1, 'an answer that landed opens nothing');
 });
 
+test('a choice names the card\'s session from the push, so a card with a session takes the answer', async () => {
+  const worker = loadWorker();
+  await worker.click({ type: 'question', questionId: 'q3', conversationId: 'conv-9', choices: ['Ship', 'Hold'], sdkSessionId: 'sdk-fixture-5d1' }, 'choice-0');
+  assert.deepEqual(worker.fetched.map(({ body }) => JSON.parse(body)), [{ answer: 'Ship', sdk_session_id: 'sdk-fixture-5d1' }]);
+  assert.deepEqual(worker.opened, [], 'an answer that landed opens nothing');
+});
+
 test('an answer from a notification goes with the cookie only: credentials included, no Authorization header', async () => {
   const worker = loadWorker();
   await worker.click({ type: 'question', questionId: 'q2', conversationId: 'conv-9', choices: ['Allow', 'Deny'] }, 'choice-0');

@@ -69,7 +69,7 @@ test('the clear chain the relay runs before binding a session removes a stale cl
   const cleared = applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(
     applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(stale))),
   )));
-  assert.equal(resolveWorkerKind(cleared), 'copilot');
+  assert.equal(resolveWorkerKind(cleared), '');
   assert.equal('CLAUDE_CLOUD_RELAY_MODEL' in cleared, false);
 });
 
@@ -91,7 +91,7 @@ test('a relay-level Claude login token is a secret of the two Claude workers and
     assert.deepEqual(
       workerSecretEnvVarsFor(kind ? { COPILOT_WEB_RELAY_WORKER_KIND: kind } : {}),
       ['COPILOT_PROVIDER_API_KEY', 'CURSOR_API_KEY', 'OAR_AGENT_TOKEN'],
-      kind || 'copilot',
+      kind || '(no kind)',
     );
   }
 });
@@ -144,7 +144,7 @@ test('no other worker kind gets the login token: no secret file is written for i
       fsImpl: createRecordingFsImpl(calls),
       tempRoot: '/tmp',
     });
-    assert.equal(secret, null, kind || 'copilot');
+    assert.equal(secret, null, kind || '(no kind)');
     assert.deepEqual(calls, []);
   }
   // And a key that is that worker's own still travels without the token.
@@ -392,7 +392,6 @@ test('launchSessionCli spawns the cloud worker script, never the Copilot CLI', a
 // The kinds that must never see the relay's Claude login token, and the
 // environment each needs to get as far as the spawn.
 const FOREIGN_KINDS = Object.freeze({
-  copilot: { COPILOT_WEB_RELAY_WORKER_KIND: '' },
   'copilot-sdk': { COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdk', COPILOT_SDK_PATH: '/opt/copilot-sdk' },
   cursor: { COPILOT_WEB_RELAY_WORKER_KIND: 'cursor', CURSOR_API_KEY: 'cursor-test-key' },
   grok: { COPILOT_WEB_RELAY_WORKER_KIND: 'grok' },
@@ -422,7 +421,6 @@ test('launchSessionCli starts tmux without the login token for a worker of anoth
       targetSessionId: 'session-7',
       cwd: '/workspace',
       env: { ...kindEnv, COPILOT_WEB_RELAY_ROOT: '/repo', CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value' },
-      prepareOarMcpConfigImpl: () => null,
       ...harness.options,
     });
     const newSessionCall = harness.calls.find((call) => call.args?.[0] === 'new-session');
@@ -475,7 +473,6 @@ async function detachedLaunchEnv(platform, env) {
       },
       execFileSyncImpl: () => { throw new Error('tmux missing'); },
       processInspector: { findProcessForSessionAsync: () => (platform === 'win32' ? { processId: process.pid } : null) },
-      prepareOarMcpConfigImpl: () => null,
       prepareWorkerLogFileImpl: () => null,
       locateExecutableImpl: () => true,
       allowProcessReuse: false,

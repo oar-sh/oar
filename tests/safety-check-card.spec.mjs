@@ -7,6 +7,10 @@ import { createAskUserBridge } from "../shared/ask-user-bridge.mjs";
 import { createCanUseTool } from "../server/claude-worker/claude-sdk-adapter.mjs";
 import { readRelaySecretsFile, relaySecretsPath } from "../server/services/owner-secret-store.mjs";
 import { mintAgentTokenWithKey } from "../shared/relay-credentials.mjs";
+import { settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A Claude session's Safety check card: the CLI's canUseTool call is the
 // test double, the adapter and the question bridge are the real ones, and the
@@ -40,6 +44,7 @@ test.describe.serial("the Safety check card", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const suffix = Date.now();
   const sessions = {};
 
@@ -68,16 +73,9 @@ test.describe.serial("the Safety check card", () => {
   }
 
   async function conversationWithRunningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, messageId, ownerSessionId } = queued.payload;
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-      await sleep(250);
-    }
-    throw new Error("The message was never handed out");
+    const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+    await worker.take(messageId);
+    return { conversationId, messageId };
   }
 
   function canUseToolFor(turn) {

@@ -500,11 +500,6 @@ export async function connectSocket(overrideDeps) {
   socket.on(OPENAI_IMAGE_PRESETS_EVENT, (payload) => {
     applyOpenAIImagePresets(payload);
   });
-  // No view refresh here: the engine switch rebinds nothing — it only changes
-  // which worker the NEXT Copilot conversation spawns.
-  socket.on('copilot_settings_updated', (payload) => {
-    deps?.applyCopilotSettingsState?.(payload || {});
-  });
   socket.on('claude_settings_updated', (payload) => {
     const state = deps?.applyClaudeSettingsState?.(payload || {});
     updateProviderReadinessInputs({ claude: state || payload || null });
@@ -1016,24 +1011,6 @@ export async function connectSocket(overrideDeps) {
   socket.on('conversation_watchers', ({ conversationId, watcherCount }) => {
     setConversationWatcherCount(conversationId, watcherCount);
     deps?.syncChatTitleControls?.();
-  });
-  socket.on('conversation_session_bound', async ({ conversationId, sdkSessionId, runtimeSessionId }) => {
-    const id = String(conversationId || '').trim();
-    if (!id) return;
-    if (conversations[id]) {
-      conversations[id] = {
-        ...conversations[id],
-        sdkSessionId: String(sdkSessionId || conversations[id].sdkSessionId || '').trim() || null,
-        runtimeSessionId: String(runtimeSessionId || conversations[id].runtimeSessionId || '').trim() || null,
-      };
-    }
-    // The composer reads the worker's steering snapshot under the session id
-    // just bound; fetch it now rather than on the next status poll.
-    refreshSessionWorkerStatus().catch(() => {});
-    await refreshConversations();
-    if (currentConvId === id) {
-      await openConversation(id);
-    }
   });
   // A worker's steering snapshot changed (its heartbeat): the composer's
   // Steer/Queue label and the pushed rows' Cancel follow it at once instead of

@@ -163,6 +163,9 @@ export function isPersonOnlyQuestion(context) {
 // The `context.source` of a Claude Cloud permission card
 // (claude-cloud-session-process.mjs): the person's, like a Safety check.
 export const CLOUD_PERMISSION_QUESTION_SOURCE = 'ClaudeCloudPermission';
+// The `context.source` of a Copilot tool permission card in ask mode
+// (copilot-question-bridge.mjs askToolApproval): Approve / Deny.
+export const TOOL_PERMISSION_QUESTION_SOURCE = 'onPermissionRequest';
 const PERSON_ONLY_SOURCES = new Set([
   REMOTE_RELAY_APPROVAL_SOURCE,
   PERSON_ONLY_QUESTION_SOURCE,

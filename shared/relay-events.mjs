@@ -51,7 +51,15 @@ const LINK_EVENT_TYPES = Object.freeze([RELAY_EVENT_LINK_LOST_TYPE, RELAY_EVENT_
 // names nothing else needs no sessions.
 export const RELAY_EVENT_RELAY_RESTARTED_TYPE = 'relay_restarted';
 export const RELAY_EVENT_RELAY_LEVEL_TYPES = Object.freeze([RELAY_EVENT_RELAY_RESTARTED_TYPE]);
-const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBEAT_TYPE, ...LINK_EVENT_TYPES, ...RELAY_EVENT_RELAY_LEVEL_TYPES]);
+// Not subscribable, and never taken from a paired relay: the reply to a
+// prompt the conversation sent and no longer waited for
+// (services/relay-late-reply-service.mjs), and the replier's word that its
+// reply reached nobody (the sender is gone). No subscription stands behind
+// either.
+export const RELAY_EVENT_LATE_REPLY_TYPE = 'late_reply';
+export const RELAY_EVENT_REPLY_UNDELIVERED_TYPE = 'reply_undelivered';
+export const RELAY_EVENT_DELIVERY_TYPES = Object.freeze([RELAY_EVENT_LATE_REPLY_TYPE, RELAY_EVENT_REPLY_UNDELIVERED_TYPE]);
+const ALL_EVENT_TYPES = Object.freeze([...RELAY_EVENT_TYPES, RELAY_EVENT_HEARTBEAT_TYPE, ...LINK_EVENT_TYPES, ...RELAY_EVENT_RELAY_LEVEL_TYPES, ...RELAY_EVENT_DELIVERY_TYPES]);
 
 // Not an event of its own but a narrower task_finished a subscription can
 // name: the end of a task other than a shell command (a sub-agent's). Its
@@ -199,7 +207,59 @@ export const RELAY_EVENT_LIMITS = Object.freeze({
   remoteKeepEvents: 500,
   remoteKeepDays: 7,
   remoteSubscriptionsPerRelay: 100,
+  // Late replies: an open prompt is checked for up to lateReplyKeepDays (by
+  // RELAY_EVENT_LATE_REPLY_CADENCE), every lateReplyPassMs at most
+  // lateReplyRowsPerPass rows with one read per session, at most
+  // lateReplyReadsPerRelay reads to one paired relay and
+  // lateReplyReadsInFlight at once (lateReplyReadsInFlightPerRelay to one
+  // paired relay). A reply of at most lateReplyAckChars ack words rides
+  // along with the next event message, or goes after lateReplyRideKeepMs.
+  lateReplyKeepDays: 7,
+  lateReplyPassMs: 15_000,
+  lateReplyRowsPerPass: 50,
+  lateReplyReadsPerRelay: 10,
+  lateReplyReadsInFlight: 4,
+  lateReplyReadsInFlightPerRelay: 2,
+  lateReplySeenMax: 200,
+  lateReplyAckChars: 80,
+  lateReplyRideKeepMs: 24 * 60 * 60_000,
 });
+
+// When an open prompt is checked next, by its age: toward a paired relay
+// often while it is young; on this relay the end of the target's turn
+// nudges the check, so the cadence is only a fallback. Older than the last
+// step, the prompt is given up.
+export const RELAY_EVENT_LATE_REPLY_CADENCE = Object.freeze([
+  Object.freeze({ underMs: 10 * 60_000, pairedMs: 15_000, localMs: 5 * 60_000 }),
+  Object.freeze({ underMs: 2 * 60 * 60_000, pairedMs: 60_000, localMs: 5 * 60_000 }),
+  Object.freeze({ underMs: 24 * 60 * 60_000, pairedMs: 5 * 60_000, localMs: 5 * 60_000 }),
+  Object.freeze({ underMs: RELAY_EVENT_LIMITS.lateReplyKeepDays * 24 * 60 * 60_000, pairedMs: 30 * 60_000, localMs: 30 * 60_000 }),
+]);
+
+// What an ack-only reply consists of (isLateReplyAck), longest first.
+const ACK_PHRASES = Object.freeze(['thank you', 'got it', 'alles klar']);
+const ACK_WORDS = new Set(['ok', 'okay', 'received', 'noted', 'thanks', 'acknowledged', 'ack', 'roger', 'erhalten', 'danke', 'verstanden']);
+
+/**
+ * Whether a late reply is a pure ack, which wakes nobody: at most
+ * lateReplyAckChars long, and it starts with `[ack]` or is, without
+ * punctuation and emoji, ack words only ("Received.", "ok 👍", "Danke,
+ * erhalten"). A longer `[ack] …` reply carries more: it wakes as any.
+ */
+export function isLateReplyAck(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed || trimmed.length > RELAY_EVENT_LIMITS.lateReplyAckChars) return false;
+  if (/^\[ack\]/i.test(trimmed)) return true;
+  const words = trimmed.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(' ').filter(Boolean);
+  if (!words.length) return false;
+  for (let index = 0; index < words.length;) {
+    const pair = `${words[index]} ${words[index + 1] || ''}`;
+    if (ACK_PHRASES.includes(pair)) index += 2;
+    else if (ACK_WORDS.has(words[index])) index += 1;
+    else return false;
+  }
+  return true;
+}
 
 // The first line of every event message. The model reads only the text, so
 // the framing that it is the relay's and approves nothing is in the text.
@@ -510,11 +570,66 @@ function relayRestartedLine(prefix, detail) {
   return `${since}, ${how}. ${RELAY_RESTARTED_ADVICE}`;
 }
 
-/** One line of the event message, the watcher's to read. */
+/** `14:05Z`, or '' for a time that does not parse. */
+function utcClock(value) {
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(11, 16)}Z` : '';
+}
+
+// A reply's own line breaks stay, each line under the prefix (and `> `), so
+// no line of it reads as one of the user's; other control characters go.
+const IN_LINE_CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+function quotedLines(text) {
+  return String(text ?? '').split(/\r\n|\r|\n/).map((line) => `${RELAY_EVENT_LINE_PREFIX} > ${line.replace(IN_LINE_CONTROLS, ' ')}`.trimEnd());
+}
+
+// The head line of a late reply that carries no reply text says why.
+const LATE_REPLY_WITHOUT_TEXT = Object.freeze({
+  stopped: 'its turn was stopped before it answered',
+  cancelled: 'it got no reply there (cancelled or removed)',
+  gone: 'that session or the prompt is gone there',
+});
+
+/**
+ * A late reply (services/relay-event-service.mjs recordLateReply): the head
+ * line, the outcome's note, the reply as a wait returns it (whole: up to
+ * 8,000 characters, middle-clipped), the images it made. An ack is one line.
+ */
+function lateReplyLines(event, detail) {
+  const id = oneLine(event?.session?.id, 80).replace(/[()]/g, '');
+  const from = `session ${quote(event?.session?.title || 'untitled', 80)} (${id})${isRemoteEvent(event) ? ` on relay ${quote(relayDisplayName(event), 60)}` : ''}`;
+  const sent = utcClock(detail.sentAt);
+  const prompt = `your prompt ${oneLine(detail.messageId, 80)}${sent ? ` of ${sent}` : ''}`;
+  const head = `${RELAY_EVENT_LINE_PREFIX} ${RELAY_EVENT_LATE_REPLY_TYPE}:`;
+  if (detail.ack === true) return `${head} ack from ${from} to ${prompt}: ${quote(detail.reply, RELAY_EVENT_LIMITS.lateReplyAckChars)}`;
+  const status = oneLine(detail.status, 20) || 'done';
+  const reply = String(detail.reply ?? '');
+  const what = LATE_REPLY_WITHOUT_TEXT[status]
+    || (status === 'failed' ? 'its turn failed; the failure text follows' : (reply.trim() ? 'its reply follows' : 'its turn ended without a reply here'));
+  const lines = [`${head} late reply from ${from} to ${prompt}: ${what}; you were no longer waiting for it. Your reply to this message reaches nobody: to answer, use relay_tool send.`];
+  const note = oneLine(detail.note, 600);
+  if (note) lines.push(`${RELAY_EVENT_LINE_PREFIX} note: ${note}`);
+  if (reply.trim()) lines.push(...quotedLines(reply));
+  for (const image of (Array.isArray(detail.images) ? detail.images : []).slice(0, 8)) {
+    const size = Number(image?.width) > 0 && Number(image?.height) > 0 ? ` (${Number(image.width)}x${Number(image.height)})` : '';
+    lines.push(`${RELAY_EVENT_LINE_PREFIX} image: ${oneLine(image?.path, 400)}${size}`);
+  }
+  return lines.join('\n');
+}
+
+/** One line of the event message, the watcher's to read (a late reply: several). */
 export function formatRelayEventLine(event) {
   const type = oneLine(event?.type, 40);
   const detail = event?.detail && typeof event.detail === 'object' ? event.detail : {};
   const prefix = linePrefix(event);
+  if (type === RELAY_EVENT_LATE_REPLY_TYPE) return lateReplyLines(event, detail);
+  if (type === RELAY_EVENT_REPLY_UNDELIVERED_TYPE) {
+    const id = oneLine(detail.watcherId, 80).replace(/[()]/g, '');
+    const sent = utcClock(detail.sentAt);
+    const reason = oneLine(detail.reason, 20) === 'deleted' ? 'deleted' : 'archived';
+    return `${RELAY_EVENT_LINE_PREFIX} ${type}: your reply to session ${quote(detail.watcherTitle || 'untitled', 80)} (${id})${sent ? ` of ${sent}` : ''} reached nobody: that session was ${reason}.`;
+  }
   if (type === RELAY_EVENT_RELAY_RESTARTED_TYPE) return relayRestartedLine(prefix, detail);
   if (type === RELAY_EVENT_LINK_LOST_TYPE) {
     const since = oneLine(detail.since, 40);
@@ -626,10 +741,14 @@ function replayOrder(a, b) {
   return rank(a) - rank(b) || (Date.parse(String(a?.at || '')) || 0) - (Date.parse(String(b?.at || '')) || 0);
 }
 
+// A late reply is the payload: it is never cut, and the cap counts the rest.
 function pushCapped(lines, events) {
-  const shown = events.slice(0, RELAY_EVENT_LIMITS.linesPerMessage);
+  const late = events.filter((event) => toText(event?.type) === RELAY_EVENT_LATE_REPLY_TYPE);
+  const rest = events.filter((event) => !late.includes(event));
+  const shown = rest.slice(0, RELAY_EVENT_LIMITS.linesPerMessage);
   for (const event of shown) lines.push(formatRelayEventLine(event));
-  if (events.length > shown.length) lines.push(`${RELAY_EVENT_LINE_PREFIX} … and ${events.length - shown.length} more`);
+  if (rest.length > shown.length) lines.push(`${RELAY_EVENT_LINE_PREFIX} … and ${rest.length - shown.length} more`);
+  for (const event of late) lines.push(formatRelayEventLine(event));
 }
 
 function distinct(values) {

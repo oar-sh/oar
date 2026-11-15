@@ -119,12 +119,26 @@ other relay. A prompt that already crossed two relays is not passed on to a thir
 unlocked that relay yourself; reading and waiting are never limited. A session that an agent on a
 paired relay started can always send to the session that started it, also when its turn acts on
 prompts from sessions on its own relay, so its report gets back the way its work came; another
-session on that relay, a third relay, or a new session is still held to the limit. When the agent of a
-conversation has sent 30 prompts to agents on other relays without a message from you, the next
-one asks you first with a question card; **Allow** starts the count again.
+session on that relay, a third relay, or a new session is still held to the limit.
+
+**The loop guard.** When the agent of a conversation has sent 30 prompts to other agents (on paired
+relays or on this one) without a message from you, the next one asks you first with a question
+card. The number is the **Loop guard** setting under
+[Agent sessions](#agent-sessions); 0 never asks. The card has three choices: **Allow** lets that
+prompt through and starts the count again; **Allow for this session** also stops asking in that
+conversation until you revoke it in the settings (it survives relay restarts, follows a compaction,
+and ends when the session is archived or deleted); **Deny** refuses that prompt. A session's
+`send` to the session whose agent started it is not counted while its turn holds at least one of
+that session's prompts and nothing but those prompts and your own messages (a relay event, a
+scheduled prompt or a call outside a turn is counted); the starting session's own prompts to it
+are counted. A loop guard card pushes even while an OAR tab is open.
+A schedule that fires into another session counts too; one held by the guard puts a card in the
+conversation that set it (**Allow once**, **Allow for this session**, **Leave held**) that does
+not block its agent. The card is withdrawn when a firing of that conversation goes again; after
+an unschedule it stays until you answer or dismiss it.
 
 **What agents can do.** Every provider gets the same `relay_tool` tool (Claude, Claude API, DeepSeek, Cursor
-and Copilot directly; Grok and the Copilot extension engine through OAR's MCP server). Before 0.9.18
+and Copilot directly; Grok through OAR's MCP server). Before 0.9.18
 it was called `remote_relay`; OAR's MCP server still runs a call to the old name but lists only the
 new one, and Claude's tool is `mcp__relay__relay_tool`. Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
@@ -219,11 +233,47 @@ test runner's; secrets are blanked, as in the owner's console view. Share links 
 A `send`, `create_session` or `wait` call waits for the reply for as long as the agent asks, up to
 **Longest wait per tool call** of the relay the agent runs on (10 minutes unless you changed it,
 see [Agent sessions](#agent-sessions)). When the time is up the agent gets what there is so far
-and can call `wait` again.
+and can call `wait` again. A reply the agent did not wait for (`wait_seconds: 0`, or a wait that ran
+out) is not lost: it comes into the agent's conversation by itself later, as a
+[late reply](#late-replies).
 
 An argument an action does not take is never dropped without a word. `create_session` and
 `update_session` refuse the call, list the arguments they take, and change nothing; every other action still runs and
 names the arguments it did not take in `ignored: [...]`.
+
+### Late replies
+
+When an agent prompts a session and no wait hands it the end of that prompt (it sent with
+`wait_seconds: 0`, its wait ran out, or its tool call was abandoned), the relay it runs on looks for
+the reply by itself and delivers it into the agent's conversation as a relay event, like the
+[events of watched sessions](#watching-sessions): a new turn when the agent is idle, a steer into the
+running turn on Claude and Copilot, the next turn otherwise. No subscription is needed.
+
+```
+[relay event] late_reply: late reply from session "<title>" (<id>) [on relay "<name>"] to your prompt <message id> of <HH:MM>Z: its reply follows; you were no longer waiting for it. Your reply to this message reaches nobody: to answer, use relay_tool send.
+[relay event] > <the reply, line by line, as a wait returns it: up to 8,000 characters>
+```
+
+- **The reply** is the one a `wait` would have returned: a steered prompt's, a background agent's
+  last follow-up once its work has settled, or a stopped or failed turn, which the line says in place
+  of "its reply follows". A `wait` called after the late reply went still answers, and adds "Also
+  delivered to your conversation as a late reply at HH:MMZ."
+- **Acks wake nobody.** A reply of at most 80 characters that starts with `[ack]` or is made only
+  of words like "ok", "received", "noted", "thanks", "got it" (and "erhalten", "danke",
+  "verstanden", "alles klar") comes as one line with the agent's next relay event message, or is
+  dropped after a day. So does a prompt that got no reply (cancelled there) or whose session is gone.
+  A longer reply is a late reply like any, `[ack]` or not.
+- **One hop.** The late reply is no prompt: the agent's reply to it goes nowhere, and the turn it
+  starts tells no watcher. To answer, the agent sends again, and that send counts for the
+  [loop guard](#remote-relays) like any other.
+- **How fast.** On this relay the late reply comes as soon as the other session's turn ends. On a
+  paired relay this relay asks within 15 seconds while the prompt is young, then less often (every
+  minute up to 2 hours, every 5 minutes up to a day, every 30 minutes up to 7 days), and gives up
+  after 7 days. Only the sender's relay does anything, with the reads a `wait` uses, so the other
+  relay may run any version.
+- **Nobody to deliver to.** When the agent's conversation was archived or deleted (a compacted one
+  hands it to its successor), a session on this relay that replied is told once that its reply
+  reached nobody; a paired relay's session is not, and this relay notes it in its log.
 
 ### Images in prompts and replies
 
@@ -324,8 +374,8 @@ question cards stay yours to answer). Switching the setting off closes this rela
   and no agent can set this switch.
 - **Not on itself.** An agent cannot prompt, stop, archive, wait for or change the settings of
   the conversation it runs in.
-- The count of 30 prompts without a message from you (see above) includes prompts to sessions
-  on this relay.
+- The [loop guard](#remote-relays) counts prompts to sessions on this relay as well, whether or
+  not this switch is on.
 
 **What it can start.** A session with any provider that is enabled on this relay (Copilot,
 OpenAI, Claude, Claude API, Cursor, Grok, DeepSeek or Claude Cloud; not an OpenAI Image chat): in a folder
@@ -350,6 +400,13 @@ in steps of one minute. The agent can call `wait` again to keep waiting. The lim
 to this relay's agents when they wait for a session on a paired relay, so the slider can be moved
 whether or not the switch above it is on. A turn that waits is still subject to **Max turn duration**
 under **General** (60 minutes by default), which does not know about the wait.
+
+**Loop guard.** The number field below that slider is how many prompts a conversation's agent may send to
+other agents, here or on a paired relay, without a message from you before the next one asks you:
+30 by default, from 10 to 500 in steps of 10, or 0 to never ask. A change applies at once, also to
+a count already running. Below it, **Loop guard off for:** lists the sessions you answered
+**Allow for this session** for, each with **Revoke**. The count itself lives in memory: a relay
+restart starts it at 0 for every conversation.
 
 ## Watching sessions
 
@@ -402,7 +459,7 @@ named their events keep them. A paired relay that runs an older OAR applies its 
 default and refuses `subagent_finished` by name.
 
 **What it looks like.** OAR writes a short message into the watcher's conversation: a new turn
-when the watcher is idle, a steer into the running turn on Claude and Copilot's SDK engine, the
+when the watcher is idle, a steer into the running turn on Claude and Copilot, the
 next turn otherwise. The message says it is automated, not from you, and that it approves
 nothing; it shows as a compact row, never as one of your messages. Events within 30 seconds come
 as one message; past 20 wake-ups an hour the rest comes as a digest every ten minutes, while
@@ -425,8 +482,8 @@ fewer. Questions and errors are never held back by any of these.
   ignores these, also for "nothing runs any more" and the heartbeat.
 - **No echo of its own replies:** when the watcher prompts a session itself with `send` or
   `create_session` and gets the finished reply back from that call or a later `wait`, that turn's
-  reply does not wake it a second time. Its errors and questions still do, and a prompt it did not
-  wait for (`wait_seconds: 0` and no `wait`) wakes it as before.
+  reply does not wake it a second time. A prompt it did not wait for brings its reply as a
+  [late reply](#late-replies) instead of a `turn_end`. Its errors and questions still come.
 
 Held events survive a restart. The 20-an-hour limit still applies on top. `list_subscriptions`
 shows the options, how many events each subscription holds (`heldCount`) and when they are due
@@ -548,7 +605,9 @@ A paired relay's approval card says what it is about, never what the agent would
 ("New session · the session waits", Loop guard, Write, Session settings, Watch, Start sessions)
 and a line such as `relay B · New session requested by 'X': title, model` or
 `relay B · Loop guard: 30 prompts by 'Y'`, where X is the requesting session. A relay before
-0.9.20 shows "An Allow / Deny card on that relay." instead.
+0.9.20 shows "An Allow / Deny card on that relay." instead. A loop guard card is answered on its
+own relay, with its three choices there, and that relay always pushes it itself, so a paired relay
+normally has nothing left to push for it.
 
 This relay checks each paired relay about every 20 s, even with no browser open, so the badge
 follows within about 20 s. A card a turn there waits on (an approval, or a question the turn is

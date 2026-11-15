@@ -81,13 +81,11 @@ function buildDeps({ root, stmts, sessionWorkerRegistry = null }) {
     resolveConversationWorkspaceState: () => null,
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'session-id',
-    touchCli() {},
     markCliOffline() {},
     fetchUsageSummary() {},
     readSessionTranscriptMessages: () => [],
@@ -100,10 +98,6 @@ function buildDeps({ root, stmts, sessionWorkerRegistry = null }) {
     DEFAULT_CONVERSATION_SESSION_MODE: 'isolated',
     DEFAULT_MODEL: 'gpt-5',
     remotePath: '',
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     sessionWorkerSupervisor: null,
     sessionWorkerRegistry,
     sessionWorkerProcessInspector: null,
@@ -157,83 +151,4 @@ test('DELETE /api/conversation/:id removes generated image files during hard del
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
-
-test('POST /api/sdk-session-delete/result removes generated images when finalizing tombstoned conversations', async () => {
-  const root = path.join(REPO_ROOT, '.test-artifacts', `finalize-generated-images-${process.pid}`);
-  const imagePath = path.join(root, 'sdk-1', 'generated-images', 'conv-1', 'msg-1', 'img-01.png');
-  fs.rmSync(root, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(imagePath), { recursive: true });
-  fs.writeFileSync(imagePath, Buffer.from([4, 5, 6]));
-
-  const app = createMockApp();
-  registerSessionsRoutes(app, buildDeps({
-    root,
-    sessionWorkerRegistry: { removeWorker() {} },
-    stmts: {
-      deleteSdkDeleteRequest: { run() {} },
-      listDeletedConversationsBySdkSessionId: { all: () => [{ id: 'conv-1', sdk_session_id: 'sdk-1' }] },
-      getMessages: {
-        all: () => [
-          {
-            id: 'msg-1',
-            attachments: JSON.stringify([{
-              type: 'image/png',
-              generatedImage: {
-                imageId: 'img-01',
-                messageId: 'msg-1',
-                sessionId: 'sdk-1',
-                relativePath: 'conv-1/msg-1/img-01.png',
-              },
-            }]),
-          },
-        ],
-      },
-    },
-  }));
-
-  try {
-    const handlers = app.routes.get('POST /api/sdk-session-delete/result');
-    const response = await callRoute(handlers, {
-      body: { sdk_session_id: 'sdk-1', ok: true },
-      headers: {},
-      params: {},
-    });
-    assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.body?.finalizedConversationIds, ['conv-1']);
-    assert.equal(fs.existsSync(imagePath), false);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('POST /api/sdk-session-delete/result finalizes local deletion when SDK deletion is unsupported', async () => {
-  const deletedRequests = [];
-  const removedWorkers = [];
-  const app = createMockApp();
-  registerSessionsRoutes(app, buildDeps({
-    root: '',
-    sessionWorkerRegistry: { removeWorker: (id) => removedWorkers.push(id) },
-    stmts: {
-      deleteSdkDeleteRequest: { run: (id) => deletedRequests.push(id) },
-      listDeletedConversationsBySdkSessionId: { all: () => [] },
-    },
-  }));
-
-  const handlers = app.routes.get('POST /api/sdk-session-delete/result');
-  const response = await callRoute(handlers, {
-    body: {
-      sdk_session_id: 'sdk-unsupported',
-      ok: false,
-      unsupported: true,
-      error: 'SDK deleteSession() is unavailable in this CLI runtime',
-    },
-    headers: {},
-    params: {},
-  });
-
-  assert.equal(response.statusCode, 200);
-  assert.equal(response.body?.unsupported, true);
-  assert.deepEqual(deletedRequests, ['sdk-unsupported']);
-  assert.deepEqual(removedWorkers, ['sdk-unsupported']);
 });

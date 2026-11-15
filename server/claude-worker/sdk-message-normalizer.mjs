@@ -424,8 +424,8 @@ export function createSdkMessageNormalizer() {
    * Thinking is republished here (same reasoningId as the streamed frames, so
    * it upserts) which is also the only path that surfaces thinking at all when
    * partial messages are unavailable. Assistant text that shares a message with
-   * tool calls is interim narration and becomes a thought, mirroring the
-   * Copilot extension's reasoning-stream bridge; text on a final, tool-free
+   * tool calls is interim narration and becomes a thought, as the removed
+   * Copilot CLI extension's reasoning-stream bridge did; text on a final, tool-free
    * message is the answer itself and must not be duplicated as a thought.
    */
   function actionsForAssistantMessage(content, parentToolUseId, messageId) {

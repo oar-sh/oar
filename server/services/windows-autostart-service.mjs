@@ -235,7 +235,7 @@ export function launcherScriptsMatch(actual, expected, { ignoreCase = false } = 
 
 function requireLauncherInputs({ packageRoot, nodePath }, what) {
   if (!String(packageRoot || '').trim()) {
-    throw new Error(`${what} requires the copilot-remote package root.`);
+    throw new Error(`${what} requires the OAR package root.`);
   }
   if (!String(nodePath || '').trim()) {
     throw new Error(`${what} requires the Node.js executable path.`);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildCardNote,
+  buildChart,
   formatUtcHourRanges,
   buildMeter,
   buildProviderCard,
@@ -951,4 +952,14 @@ test('an agent resumed without a checkpoint seeds the baseline instead of bookin
   });
   assert.equal(second.delta.rawCostCents, 150);
   assert.equal(second.changed, true);
+});
+
+test('buildChart passes a window of 7, 30 or 90 days and drops anything else', () => {
+  const chart = (windowDays) => buildChart({
+    id: 'c', label: 'C', series: [{ key: 'a', label: 'A' }], items: [{ key: 'd', label: 'D', values: { a: 1 } }], windowDays,
+  });
+  for (const days of [7, 30, 90]) assert.equal(chart(days).windowDays, days);
+  for (const value of [0, 31, '30', null, undefined, 30.5, Number.NaN]) {
+    assert.equal(Object.hasOwn(chart(value), 'windowDays'), false, String(value));
+  }
 });

@@ -66,7 +66,6 @@ test('the menu renders the status header and every entry, the selected one marke
     '  6  Install or remove the service',
     '  7  Update',
     '  8  Doctor',
-    '  9  Copilot session',
     '  q  Quit',
     '',
     'Arrow keys and Enter, or a digit, to choose; q to quit.',
@@ -134,7 +133,7 @@ test('arrow keys move, Enter runs the entry, the menu redraws and q quits', asyn
   assert.ok(terminal.text().startsWith('\x1b[2J\x1b[H'), 'a terminal is cleared before each drawing');
 });
 
-test('a digit runs its entry at once, and an action can end the menu', async () => {
+test('a digit runs its entry at once, one past the entries does nothing, and an action can end the menu', async () => {
   const terminal = fakeTerminal();
   const ran = [];
   const done = runMenu({
@@ -146,6 +145,7 @@ test('a digit runs its entry at once, and an action can end the menu', async () 
     },
   });
   await until(() => terminal.text().includes('Start'), 'the first drawing');
+  terminal.input.write('9');
   terminal.input.write('8');
   await until(() => terminal.text().includes('Press a key'), 'the pause');
   terminal.input.write('x');
@@ -207,19 +207,23 @@ for (const rawMode of [false, 'refused']) {
       loadStatus: async () => STATUS,
       actions: { restart: async () => { ran.push('restart'); } },
     });
-    await until(() => terminal.text().includes('Choose (1-9, q): '), 'the numbered prompt');
+    await until(() => terminal.text().includes('Choose (1-8, q): '), 'the numbered prompt');
+    // 9 is past the entries: asked again.
+    terminal.input.write('9\n');
+    await until(() => count(terminal.text(), 'Choose (1-8, q): ') === 2, 'the prompt again');
     terminal.input.write('3\n');
     await until(() => terminal.text().includes('Press Enter'), 'the pause');
     assert.deepEqual(ran, ['restart']);
     terminal.input.write('\n');
-    await until(() => count(terminal.text(), 'Choose (1-9, q): ') === 2, 'the second prompt');
+    await until(() => count(terminal.text(), 'Choose (1-8, q): ') === 3, 'the second prompt');
     terminal.input.write('q\n');
     assert.deepEqual(await done, { code: 0, reason: 'menu-quit' });
   });
 }
 
-test('the menu has nine numbered entries and Quit', () => {
-  assert.equal(MENU_ENTRIES.length, 10);
+test('the menu has eight numbered entries and Quit', () => {
+  assert.equal(MENU_ENTRIES.length, 9);
+  assert.ok(!MENU_ENTRIES.some((entry) => entry.id === 'copilot'));
   assert.equal(MENU_ENTRIES.at(-1).id, 'quit');
 });
 

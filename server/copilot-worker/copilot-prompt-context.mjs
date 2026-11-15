@@ -2,11 +2,11 @@
 // standing instructions, the relay tool guidance, and the live preview-lane
 // block.
 //
-// This mirrors the extension's `createRelayPromptBuilder`
-// (`shared/worker-runtime/prompt-context.mjs`, relocated from the extension
-// tree for its retirement) and reuses its text verbatim through
+// This mirrors `createRelayPromptBuilder`
+// (`shared/worker-runtime/prompt-context.mjs`, which the removed Copilot CLI
+// extension used) and reuses its text verbatim through
 // `buildModePrompt`, so a conversation reads the same guidance whichever
-// engine ran it. It does NOT reuse the extension's builder
+// engine ran it. It does NOT reuse that builder
 // wholesale for one reason: that builder also composes the message BODY via its
 // own `buildPrompt`, which renders attachments as a text note. This worker
 // passes real `MessageOptions.attachments` to the runtime
@@ -33,12 +33,12 @@ import { loadRelayInstructionsFromFile } from '../../shared/worker-runtime/confi
 export { createPreviewInstructionsProvider, loadRelayInstructionsFromFile };
 
 /**
- * Read `server/relay-tools.md`, honouring the same `COPILOT_WEB_RELAY_TOOLS`
- * override the extension uses.
+ * Read `server/relay-tools.md`, honouring the `COPILOT_WEB_RELAY_TOOLS`
+ * override.
  *
- * The path is resolved relative to THIS module rather than through the
- * extension's `resolveRelayPaths`, whose `../../../server` walk is anchored to
- * the extension's own directory depth and resolves to the wrong place from
+ * The path is resolved relative to THIS module rather than through
+ * `resolveRelayPaths`, whose `../../../server` walk is anchored to the
+ * removed extension's directory depth and resolves to the wrong place from
  * `server/copilot-worker/`. A missing file yields '' (the loader swallows the
  * error), which degrades to "no tool guidance", never to a failed turn.
  */
@@ -52,8 +52,8 @@ export function loadDefaultRelayToolInstructions({ env = process.env } = {}) {
 /**
  * Build the per-turn relay context prefix.
  *
- * The heavy guidance rides along only when the relay mode CHANGED, matching the
- * extension: repeat turns in one mode stay cheap, and the model is not re-read
+ * The heavy guidance rides along only when the relay mode CHANGED, matching
+ * `createRelayPromptBuilder`: repeat turns in one mode stay cheap, and the model is not re-read
  * its standing instructions every message. The mode marker itself is always
  * present.
  *
@@ -67,7 +67,7 @@ export function loadDefaultRelayToolInstructions({ env = process.env } = {}) {
  *
  * `agentMode` is threaded to the runtime natively as well
  * (`copilotAgentModeForRelayMode`); the text is not a substitute for it but a
- * reinforcement, same as on the extension path.
+ * reinforcement.
  */
 export function createCopilotPromptContextBuilder({
   toolInstructions = '',

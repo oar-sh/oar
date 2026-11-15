@@ -31,12 +31,12 @@ test('the DeepSeek settings service is built on the settings table and handed to
 test('a DeepSeek conversation gets its own worker and never falls through to a Copilot launch', () => {
   const launchSource = sliceBetween(
     'function buildSessionWorkerLaunchEnvForSession(',
-    '\nconst relayCliLauncherService = ',
+    '\nfunction buildSessionWorkerLaunchEnvWithAgentToken(',
   );
   // Cleared for every other launch, whatever its provider.
   assert.match(launchSource, /const cleared = [^;]*applyDeepSeekProviderEnvironment\(/);
   const deepseekBranch = launchSource.indexOf("if (providerType === 'deepseek') {");
-  const copilotFallThrough = launchSource.indexOf("const copilotSdkEngine = getCopilotEngine() === 'sdk';");
+  const copilotFallThrough = launchSource.indexOf('const sdkPath = resolveCopilotSdkLaunchPath({ config, env: sessionWorkerLaunchEnv });');
   assert.notEqual(deepseekBranch, -1);
   assert.ok(deepseekBranch < copilotFallThrough, 'the deepseek branch must come before the Copilot fall-through');
   const branch = launchSource.slice(deepseekBranch, copilotFallThrough);

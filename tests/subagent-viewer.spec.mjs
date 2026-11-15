@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 import Database from "better-sqlite3";
 import { relayDbPath, relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The sub-agent viewer, against the shared e2e relay. Everything is published
 // through the routes a session worker posts to (the queued turn never runs:
@@ -15,33 +19,12 @@ import { relayDbPath, relayToken } from "./e2e-env.mjs";
 // whose viewer shows the run: a second page of the same conversation gets
 // none. A record past its retention shows what the sweep removed.
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
-async function startTurn(request, headers, text) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "");
-  const messageId = String(body?.messageId || "");
-  await dequeue(request, headers, messageId, String(body?.ownerSessionId || ""));
+// Made as the web client makes a chat: bound to its session from the start.
+async function startTurn(text) {
+  const started = await startConversation({ text });
+  const conversationId = String(started.conversationId || "");
+  const messageId = String(started.messageId || "");
+  await started.worker.take(messageId);
   return { conversationId, messageId };
 }
 
@@ -90,12 +73,12 @@ test.describe("sub-agent viewer", () => {
     const stamp = Date.now();
     const runId = `toolu_viewer_${stamp}`;
     const childId = `toolu_viewer_child_${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Survey the widget parser ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Survey the widget parser ${stamp}`);
 
     try {
       expect((await request.post("/api/subagent-run", {
         headers,
-        data: { messageId, conversationId, subagentRunId: runId, displayName: "Survey the widget parser", status: "running", subagentType: "general-purpose", timelineOwner: "worker", background: true },
+        data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Survey the widget parser", status: "running", subagentType: "general-purpose", timelineOwner: "worker", background: true },
       })).ok()).toBeTruthy();
       const timeline = (entries, header) => request.post("/api/subagent-timeline", {
         headers,
@@ -202,7 +185,7 @@ test.describe("sub-agent viewer", () => {
 
       // The agent ends; the turn ends; the reply bubble lists it as a row.
       expect((await timeline([], { status: "completed", totalTokens: 52000 })).ok()).toBeTruthy();
-      expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "The parser survey is done.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+      expect((await respondAsWorker(messageId, { conversationId, text: "The parser survey is done.", model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
       const row = page.locator(`.msg .subagent-row[data-subagent-row="${runId}"]`);
       await expect(row).toBeVisible();
       await expect(row).toContainText("Completed");
@@ -220,7 +203,7 @@ test.describe("sub-agent viewer", () => {
       await expect(modal).not.toHaveClass(/visible/);
     } finally {
       await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } }).catch(() => {});
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 
@@ -229,8 +212,8 @@ test.describe("sub-agent viewer", () => {
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
     const runId = `agent-lane-${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Count the widgets ${stamp}`);
-    const publish = (route, data) => request.post(route, { headers, data: { messageId, conversationId, mode: "agent", ...data } });
+    const { conversationId, messageId } = await startTurn(`Count the widgets ${stamp}`);
+    const publish = (route, data) => request.post(route, { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", ...data } });
 
     try {
       expect((await publish("/api/subagent-run", { subagentRunId: runId, displayName: "Count the widgets", status: "running" })).ok()).toBeTruthy();
@@ -261,7 +244,7 @@ test.describe("sub-agent viewer", () => {
 
       expect((await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } })).ok()).toBeTruthy();
       expect((await publish("/api/subagent-run", { subagentRunId: runId, displayName: "Count the widgets", status: "completed" })).ok()).toBeTruthy();
-      expect((await publish("/api/response", { text: "Twelve widgets." })).ok()).toBeTruthy();
+      expect((await respondAsWorker(messageId, { conversationId, mode: "agent", text: "Twelve widgets." })).ok).toBeTruthy();
 
       const row = page.locator(`.msg .subagent-row[data-subagent-row="${runId}"]`);
       await expect(row).toBeVisible();
@@ -275,7 +258,7 @@ test.describe("sub-agent viewer", () => {
       await expect(modal).not.toHaveClass(/visible/);
     } finally {
       await request.post("/api/background-tasks", { headers, data: { conversationId, tasks: [] } }).catch(() => {});
-      await publish("/api/response", { text: "cleanup" }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, mode: "agent", text: "cleanup" }).catch(() => {});
     }
   });
 
@@ -290,7 +273,7 @@ test.describe("sub-agent viewer", () => {
     const runId = `toolu_resume_${stamp}`;
     const sendId = `toolu_resume_send_${stamp}`;
     const taskId = `agent-resume-${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Survey the widget tests ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Survey the widget tests ${stamp}`);
     const timeline = (subagentRunId, entries, header, extra = {}) => request.post("/api/subagent-timeline", {
       headers,
       data: { conversationId, subagentRunId, entries, ...(header ? { header } : {}), ...extra },
@@ -307,14 +290,14 @@ test.describe("sub-agent viewer", () => {
       // The first run: spawned in the background, finished.
       expect((await request.post("/api/subagent-run", {
         headers,
-        data: { messageId, conversationId, subagentRunId: runId, displayName: "Survey the widget tests", status: "running", timelineOwner: "worker", background: true },
+        data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Survey the widget tests", status: "running", timelineOwner: "worker", background: true },
       })).ok()).toBeTruthy();
       expect((await taskSet([agentTask("run-1", runId)])).ok()).toBeTruthy();
       expect((await timeline(runId, [{ key: "w:1", kind: "text", text: "The parser tests pass." }], { taskId })).ok()).toBeTruthy();
       expect((await timeline(runId, [{ key: "w:2", kind: "note", text: "Finished: parser tests checked" }], { status: "completed" })).ok()).toBeTruthy();
       expect((await settle("run-1", runId, "parser tests checked")).ok()).toBeTruthy();
       expect((await taskSet([])).ok()).toBeTruthy();
-      expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "Survey started.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+      expect((await respondAsWorker(messageId, { conversationId, text: "Survey started.", model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
 
       // The resume: the task set names the SendMessage call; so does the record.
       expect((await taskSet([agentTask("run-2", sendId)])).ok()).toBeTruthy();
@@ -349,7 +332,7 @@ test.describe("sub-agent viewer", () => {
       await expect(modal).not.toHaveClass(/visible/);
     } finally {
       await taskSet([]).catch(() => {});
-      await request.post("/api/response", { headers, data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" } }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
     }
   });
 
@@ -358,16 +341,16 @@ test.describe("sub-agent viewer", () => {
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
     const runId = `toolu_retention_${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Old widget survey ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Old widget survey ${stamp}`);
     expect((await request.post("/api/subagent-run", {
       headers,
-      data: { messageId, conversationId, subagentRunId: runId, displayName: "Survey the old widgets", status: "completed", timelineOwner: "worker" },
+      data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Survey the old widgets", status: "completed", timelineOwner: "worker" },
     })).ok()).toBeTruthy();
     expect((await request.post("/api/subagent-timeline", {
       headers,
       data: { conversationId, subagentRunId: runId, entries: workerEntries("old", 0, 4) },
     })).ok()).toBeTruthy();
-    expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "Survey done.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+    expect((await respondAsWorker(messageId, { conversationId, text: "Survey done.", model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
 
     // The record is 100 days old; saving the (default) setting runs a sweep.
     const db = new Database(relayDbPath());
@@ -410,16 +393,16 @@ test.describe("sub-agent viewer on a phone", () => {
     const headers = { Authorization: `Bearer ${token}` };
     const stamp = Date.now();
     const runId = `toolu_phone_${stamp}`;
-    const { conversationId, messageId } = await startTurn(request, headers, `Phone viewer ${stamp}`);
+    const { conversationId, messageId } = await startTurn(`Phone viewer ${stamp}`);
     expect((await request.post("/api/subagent-run", {
       headers,
-      data: { messageId, conversationId, subagentRunId: runId, displayName: "Read the phone layout", status: "completed", timelineOwner: "worker" },
+      data: { ...attemptOf(messageId), messageId, conversationId, subagentRunId: runId, displayName: "Read the phone layout", status: "completed", timelineOwner: "worker" },
     })).ok()).toBeTruthy();
     expect((await request.post("/api/subagent-timeline", {
       headers,
       data: { conversationId, subagentRunId: runId, entries: workerEntries("p", 0, 6) },
     })).ok()).toBeTruthy();
-    expect((await request.post("/api/response", { headers, data: { messageId, conversationId, text: "Layout read.", model: "gpt-5.4-mini", mode: "agent" } })).ok()).toBeTruthy();
+    expect((await respondAsWorker(messageId, { conversationId, text: "Layout read.", model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
 
     await openConversationPage(page, token, conversationId);
     const row = page.locator(`.msg .subagent-row[data-subagent-row="${runId}"]`);

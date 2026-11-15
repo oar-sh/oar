@@ -231,9 +231,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/nginx.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/x86asm.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" integrity="sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" integrity="sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn" crossorigin="anonymous"></script>
 <script>
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
@@ -319,13 +316,20 @@
     /* Claude on an API key: gold, beside the subscription's terracotta. */
     --provider-claude-api: #e3b341;
     /* The usage charts' series, in a fixed order (blue, orange, green,
-       amber; grey for "other"), stepped for the dark surface and checked
-       for colour-vision deficiency and contrast against it. */
+       amber, magenta, deep green, violet, red; grey for "other" and past the
+       eighth), stepped for the dark surface. Neighbours in the order are far
+       apart for normal vision; under colour-vision deficiency some slots come
+       close (blue and violet here), so every chart also names each part in
+       its legend, list or table. */
     --plan-usage-series-1: #3987e5;
     --plan-usage-series-2: #d95926;
     --plan-usage-series-3: #199e70;
     --plan-usage-series-4: #c98500;
-    --plan-usage-series-5: #8b949e;
+    --plan-usage-series-5: #d55181;
+    --plan-usage-series-6: #008300;
+    --plan-usage-series-7: #9085e9;
+    --plan-usage-series-8: #e66767;
+    --plan-usage-series-other: #8b949e;
     --viewport-top-offset: 0px;
     --header-safe-top: max(env(safe-area-inset-top, 0px), var(--viewport-top-offset, 0px));
     /* Compact chrome: about half of the old 14px / 10px (chat) and
@@ -398,12 +402,18 @@
     --provider-claude-cloud: #0369a1;
     --provider-deepseek: #3b5bdb;
     --provider-claude-api: #8a6100;
-    /* The same series order, stepped for the white surface. */
+    /* The same series order, stepped for the white surface; some slots
+       (amber, magenta, green) are under 3:1 against white, so the names and
+       figures beside the charts carry them. */
     --plan-usage-series-1: #2a78d6;
     --plan-usage-series-2: #eb6834;
     --plan-usage-series-3: #1baf7a;
     --plan-usage-series-4: #eda100;
-    --plan-usage-series-5: #656d76;
+    --plan-usage-series-5: #e87ba4;
+    --plan-usage-series-6: #008300;
+    --plan-usage-series-7: #6250d6;
+    --plan-usage-series-8: #e34948;
+    --plan-usage-series-other: #656d76;
     --inline-code-bg: #eff1f3;
   }
   :root {
@@ -2029,9 +2039,6 @@
     font-size: var(--fs-meta-sm);
     line-height: 1.35;
   }
-  /* A long environment variable name breaks rather than run past a phone's
-     dialog edge. */
-  #settings-panel-features .settings-help { overflow-wrap: anywhere; }
   .settings-provider-status[data-state="active"] { color: var(--success); }
   .settings-provider-status[data-state="saved"] { color: var(--accent); }
   .settings-provider-status[data-state="error"] { color: var(--danger); }
@@ -3866,7 +3873,7 @@
     grid-template-columns: repeat(var(--plan-usage-columns, 30), minmax(0, 1fr));
     gap: calc(2px * var(--ui-scale));
     height: calc(72px * var(--ui-scale));
-    padding-bottom: calc(9px * var(--ui-scale));
+    padding-bottom: calc(15px * var(--ui-scale));
     border-bottom: 1px solid var(--border);
   }
   .plan-usage-chart-col {
@@ -3893,11 +3900,12 @@
     height: 2px;
     background: var(--border);
   }
+  /* A small model keeps a hairline: 1px at least, 1px apart. */
   .plan-usage-chart-columns .plan-usage-chart-seg {
     display: block;
     width: 100%;
-    min-height: 2px;
-    margin-top: calc(2px * var(--ui-scale));
+    min-height: 1px;
+    margin-top: 1px;
   }
   .plan-usage-chart-columns .plan-usage-chart-seg:last-child { border-radius: calc(4px * var(--ui-scale)) calc(4px * var(--ui-scale)) 0 0; }
   .plan-usage-chart-axis {
@@ -3936,6 +3944,32 @@
   .plan-usage-chart-bar .plan-usage-chart-seg { display: block; height: 100%; min-width: 2px; }
   .plan-usage-chart-bar .plan-usage-chart-seg:first-child { border-radius: calc(4px * var(--ui-scale)) 0 0 calc(4px * var(--ui-scale)); }
   .plan-usage-chart-bar .plan-usage-chart-seg:last-child { border-radius: 0 calc(4px * var(--ui-scale)) calc(4px * var(--ui-scale)) 0; }
+  /* A share chart: one line cut into its parts, a 2px gap between them, and
+     the list of parts (swatch, name, amount, share) under it. */
+  .plan-usage-chart-strip {
+    display: flex;
+    gap: calc(2px * var(--ui-scale));
+    height: calc(14px * var(--ui-scale));
+  }
+  .plan-usage-chart-strip .plan-usage-chart-seg { display: block; height: 100%; min-width: 3px; flex-shrink: 1; }
+  .plan-usage-chart-strip .plan-usage-chart-seg:first-child { border-radius: calc(4px * var(--ui-scale)) 0 0 calc(4px * var(--ui-scale)); }
+  .plan-usage-chart-strip .plan-usage-chart-seg:last-child { border-radius: 0 calc(4px * var(--ui-scale)) calc(4px * var(--ui-scale)) 0; }
+  .plan-usage-chart-strip .plan-usage-chart-seg:only-child { border-radius: calc(4px * var(--ui-scale)); }
+  .plan-usage-chart-share-list {
+    list-style: none;
+    margin: calc(6px * var(--ui-scale)) 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    column-gap: calc(8px * var(--ui-scale));
+    row-gap: calc(2px * var(--ui-scale));
+    align-items: center;
+    font-size: 0.82rem;
+  }
+  .plan-usage-chart-share-list li { display: contents; }
+  .plan-usage-chart-share-name { min-width: 0; overflow-wrap: anywhere; }
+  .plan-usage-chart-share-value, .plan-usage-chart-share-pct { font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+  .plan-usage-chart-share-pct { color: var(--muted); min-width: 3.2em; }
   .plan-usage-chart-tip {
     display: none;
     position: absolute;
@@ -3961,9 +3995,10 @@
   .plan-usage-chart-row:hover .plan-usage-chart-tip,
   .plan-usage-chart-row:focus .plan-usage-chart-tip { display: block; }
   .plan-usage-chart-col .plan-usage-chart-tip { width: calc(180px * var(--ui-scale)); }
-  .plan-usage-chart-col:first-child .plan-usage-chart-tip,
-  .plan-usage-chart-col:nth-child(-n+6) .plan-usage-chart-tip { left: 0; transform: none; text-align: left; }
-  .plan-usage-chart-col:nth-last-child(-n+7):not(.plan-usage-chart-axis) .plan-usage-chart-tip { left: auto; right: 0; transform: none; text-align: right; }
+  /* The first and last fifth of the columns (renderChart marks them, at 7,
+     30 or 90 days) open their tooltip towards the middle. */
+  .plan-usage-chart-col-start .plan-usage-chart-tip { left: 0; transform: none; text-align: left; }
+  .plan-usage-chart-col-end .plan-usage-chart-tip { left: auto; right: 0; transform: none; text-align: right; }
   .plan-usage-chart-legend {
     display: flex;
     flex-wrap: wrap;
@@ -3975,6 +4010,22 @@
     color: var(--muted);
   }
   .plan-usage-chart-legend li { display: inline-flex; align-items: center; gap: calc(3px * var(--ui-scale)); }
+  .plan-usage-chart-legend-value { margin-left: calc(2px * var(--ui-scale)); color: var(--text); font-variant-numeric: tabular-nums; }
+  /* The peak day and the total, above a columns chart. */
+  .plan-usage-chart-scale {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0 calc(8px * var(--ui-scale));
+    margin-bottom: calc(3px * var(--ui-scale));
+    font-size: 0.74rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  /* On a narrow screen the columns get taller, so thin parts still show. */
+  @media (max-width: 520px) {
+    .plan-usage-chart-columns { height: calc(120px * var(--ui-scale)); }
+  }
   .plan-usage-chart-swatch { display: inline-block; width: calc(10px * var(--ui-scale)); height: calc(10px * var(--ui-scale)); border-radius: calc(3px * var(--ui-scale)); }
   /* A table wider than a narrow screen scrolls inside the card. */
   .plan-usage-chart-table { margin-top: calc(3px * var(--ui-scale)); font-size: 0.78rem; max-width: 100%; overflow-x: auto; }
@@ -3982,6 +4033,17 @@
   .plan-usage-chart-table summary:hover { color: var(--text); }
   .plan-usage-chart-table th { text-align: left; font-weight: 500; color: var(--muted); padding: calc(4px * var(--ui-scale)) calc(2px * var(--ui-scale)); border-bottom: 1px solid var(--border); }
   .plan-usage-chart-table thead th:not(:first-child) { text-align: right; }
+  /* The charts' window picker (plan-usage-chart-window.mjs): native radios as
+     a small segmented control above the charts, wrapping on a phone. At 90
+     days the columns lose their gaps, so a day stays ~3px wide at 320px. */
+  .plan-usage-chart-window { position: relative; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: calc(2px * var(--ui-scale)); margin: calc(6px * var(--ui-scale)) 0 0; padding: 0; border: 0; min-width: 0; font-size: 0.74rem; }
+  .plan-usage-chart-window-legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .plan-usage-chart-window label { position: relative; display: inline-flex; cursor: pointer; }
+  .plan-usage-chart-window input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+  .plan-usage-chart-window span { padding: calc(2px * var(--ui-scale)) calc(7px * var(--ui-scale)); border: 1px solid var(--border); border-radius: calc(6px * var(--ui-scale)); color: var(--muted); white-space: nowrap; }
+  .plan-usage-chart-window input:checked + span { background: var(--bg3); color: var(--text); border-color: var(--accent); }
+  .plan-usage-chart-window input:focus-visible + span { box-shadow: 0 0 0 2px var(--accent); }
+  .plan-usage-chart[data-window="90"] .plan-usage-chart-columns { gap: 0; }
   /* About OAR: the plan-usage cards and tables, stacked. */
   .about-modal { display: flex; flex-direction: column; gap: calc(6px * var(--ui-scale)); }
   .about-section .plan-usage-card-head { margin-bottom: calc(4px * var(--ui-scale)); }
@@ -3994,7 +4056,6 @@
   .about-section .plan-usage-detail-value { white-space: normal; overflow-wrap: anywhere; }
   .about-section .plan-usage-detail-hint { overflow-wrap: anywhere; }
   .about-state[data-state="online"] { color: var(--success); }
-  .about-state[data-state="offline"] { color: var(--warn); }
   .about-state[data-state="idle"] { color: var(--muted); }
   .about-inline-button {
     background: none;
@@ -5562,6 +5623,13 @@
   }
   #agent-sessions-max-wait-slider:disabled { opacity: 0.5; }
   #agent-sessions-status { overflow-wrap: anywhere; }
+  #agent-sessions-loop-guard-input { width: calc(96px * var(--ui-scale)); min-height: calc(28px * var(--ui-scale)); box-sizing: border-box; }
+  #agent-sessions-loop-guard-input:disabled { opacity: 0.5; }
+  #agent-sessions-loop-guard-off[hidden] { display: none; }
+  .agent-sessions-loop-guard-off-row {
+    display: flex; align-items: center; justify-content: space-between; gap: calc(8px * var(--ui-scale));
+    font-size: 0.85rem; min-height: calc(32px * var(--ui-scale)); overflow-wrap: anywhere;
+  }
   /* Transcript card: a preview published during this turn, pinned into the
      response bubble. Compact single row; closed previews keep the label but
      lose the dead link. */
@@ -6131,7 +6199,7 @@
   .annotate-toolbar-gap { flex: 1 1 auto; min-width: calc(8px * var(--ui-scale)); }
   #annotate-toolbar button:disabled { opacity: 0.45; cursor: default; }
 
-  #settings-modal, #summary-modal, #tmux-inspector-modal, #new-conversation-model-modal {
+  #settings-modal, #summary-modal, #new-conversation-model-modal {
     position: fixed;
     inset: 0;
     z-index: 12050;
@@ -6141,7 +6209,7 @@
     background: rgba(0, 0, 0, 0.68);
     padding: calc(9px * var(--ui-scale));
   }
-  #settings-modal.visible, #summary-modal.visible, #tmux-inspector-modal.visible, #new-conversation-model-modal.visible { display: flex; }
+  #settings-modal.visible, #summary-modal.visible, #new-conversation-model-modal.visible { display: flex; }
   .new-conversation-model-dialog {
     width: min(calc(440px * var(--ui-scale)), 100%);
   }
@@ -6303,75 +6371,6 @@
   #new-conversation-cwd-browse {
     min-height: calc(28px * var(--ui-scale));
     margin-top: calc(4px * var(--ui-scale));
-  }
-  .tmux-inspector-dialog {
-    width: min(calc(1120px * var(--ui-scale)), 100%);
-    height: min(80vh, calc(760px * var(--ui-scale)));
-    display: grid;
-    grid-template-rows: auto auto 1fr;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: calc(14px * var(--ui-scale));
-    overflow: hidden;
-  }
-  .tmux-inspector-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: calc(5px * var(--ui-scale));
-    padding: calc(6px * var(--ui-scale)) calc(8px * var(--ui-scale));
-    border-bottom: 1px solid var(--border);
-    background: var(--bg3);
-  }
-  .tmux-inspector-title {
-    font-size: var(--fs-core-composer);
-    font-weight: 600;
-  }
-  .tmux-inspector-meta {
-    display: flex;
-    align-items: center;
-    gap: calc(4px * var(--ui-scale));
-    color: var(--muted);
-    font-size: var(--fs-meta-sm);
-    padding: calc(4px * var(--ui-scale)) calc(8px * var(--ui-scale));
-    border-bottom: 1px solid var(--border);
-  }
-  #tmux-inspector-status[data-state="error"] {
-    color: var(--danger);
-  }
-  #tmux-inspector-close {
-    width: calc(28px * var(--ui-scale));
-    height: calc(28px * var(--ui-scale));
-    border: 1px solid var(--border);
-    border-radius: calc(8px * var(--ui-scale));
-    background: var(--bg2);
-    color: var(--text);
-    cursor: pointer;
-    font-size: 1.15rem;
-    line-height: 1;
-  }
-  #tmux-inspector-close:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  #tmux-inspector-term {
-    width: 100%;
-    height: 100%;
-    min-height: calc(280px * var(--ui-scale));
-    background: #0b0f14;
-    overflow: hidden;
-  }
-  .tmux-inspector-plain-output {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: calc(6px * var(--ui-scale));
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: #dbe6f4;
-    background: #0b0f14;
-    font: calc(12px * var(--ui-scale))/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   }
   .summary-modal-actions {
     display: flex;
@@ -8377,7 +8376,7 @@
       justify-content: flex-start;
     }
 
-    #settings-modal, #summary-modal, #tmux-inspector-modal, #new-conversation-model-modal {
+    #settings-modal, #summary-modal, #new-conversation-model-modal {
       padding: calc(4px * var(--ui-scale));
       align-items: stretch;
       justify-content: center;
@@ -8524,11 +8523,6 @@
     }
     .model-base-group {
       padding: calc(6px * var(--ui-scale)) calc(6px * var(--ui-scale));
-    }
-    .tmux-inspector-dialog {
-      width: 100%;
-      height: calc(var(--app-height) - calc(16px * var(--ui-scale)));
-      border-radius: calc(10px * var(--ui-scale));
     }
   }
 
@@ -8860,7 +8854,6 @@
             <button id="chat-menu-archive" class="chat-actions-menu-item" type="button" role="menuitem">🗄️ Archive conversation</button>
             <button id="chat-menu-group" class="chat-actions-menu-item" type="button" role="menuitem">🧩 Session group…</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
-            <button id="chat-menu-inspect-tmux" class="chat-actions-menu-item" type="button" role="menuitem">🖥️ Inspect tmux console</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models<span id="chat-menu-select-models-dot" class="chat-menu-new-dot" aria-hidden="true" hidden></span></button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
@@ -9182,16 +9175,6 @@
         tabindex="-1"
         data-settings-tab="notifications"
       >Notifications</button>
-      <button
-        id="settings-tab-features"
-        class="settings-tab"
-        type="button"
-        role="tab"
-        aria-selected="false"
-        aria-controls="settings-panel-features"
-        tabindex="-1"
-        data-settings-tab="features"
-      >Features</button>
     </div>
     <div class="summary-body summary-body-form">
       <div
@@ -9263,7 +9246,7 @@
               onchange="updateBackgroundTaskTimeoutSetting(this.value)"
             >
           </div>
-          <div class="settings-help settings-gap-xs">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot's SDK engine. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel. A setting of this relay.</div>
+          <div class="settings-help settings-gap-xs">How long background tasks may keep a session alive after its turn ends: backgrounded commands, subagents and monitors on Claude; background agents and detached shells on Copilot. When the limit is reached the tasks are stopped. Set to 0 for no limit — tasks then run until they finish or you stop them from the composer panel. A setting of this relay.</div>
           <div class="settings-row settings-row-column settings-gap">
             <label for="task-stall-minutes-slider">Mark a background task as quiet after <span id="task-stall-minutes-value">10 min</span></label>
             <input
@@ -9567,9 +9550,9 @@
           aria-labelledby="settings-provider-tab-copilot"
           data-settings-provider-panel="copilot"
         >
-          <!-- Provider CLI status row; cli-install-ui.js drives the state. Copilot
-               is detect-only (npm-global on this host), so its payload carries no
-               commands and every action button stays hidden. -->
+          <!-- Provider CLI status row; cli-install-ui.js drives the state: Install
+               (GitHub's script into ~/.local/bin, npm on Windows), Update
+               (copilot update), Cancel/Dismiss. -->
           <div id="cli-copilot-section" class="settings-gap">
             <div class="settings-row" style="margin-bottom: 0;">
               <span id="cli-copilot-label" class="cli-install-label">GitHub Copilot CLI</span>
@@ -9587,18 +9570,6 @@
               <summary id="cli-copilot-log-summary">Install log</summary>
               <pre id="cli-copilot-log"></pre>
             </details>
-          </div>
-          <div class="settings-row settings-row-column settings-gap">
-            <label for="copilot-engine-select">Copilot engine</label>
-            <select id="copilot-engine-select" aria-label="Copilot engine">
-              <option value="extension">Extension</option>
-              <option value="sdk">SDK — default</option>
-            </select>
-            <div id="copilot-settings-status" class="settings-help settings-provider-status">Loading Copilot settings…</div>
-            <div class="settings-actions">
-              <button id="copilot-save-btn" type="button" class="summary-btn" onclick="saveCopilotSettings()">Save Copilot settings</button>
-            </div>
-            <div class="settings-help">Chooses how GitHub Copilot conversations run. <strong>SDK</strong> is the default: a headless worker per conversation with mid-turn steering and background task cards — no CLI extension to install, but no tmux inspector for those sessions. <strong>Extension</strong> runs the Copilot CLI in a terminal session, which you can attach to with the tmux inspector. A relay where no engine was saved and that cannot run the SDK engine uses Extension. Applies whenever a conversation's worker starts; sessions already running keep their engine until their worker restarts.</div>
           </div>
         </div>
         <div
@@ -10296,6 +10267,22 @@
             >
           </div>
           <div class="settings-help settings-gap-xs">How long an agent may wait for a session in one call, on this relay or a paired one. It can call again to keep waiting.</div>
+          <div class="settings-row settings-row-column settings-gap">
+            <label for="agent-sessions-loop-guard-input">Loop guard <span id="agent-sessions-loop-guard-value">Ask after 30 prompts</span></label>
+            <input
+              id="agent-sessions-loop-guard-input"
+              type="number"
+              min="0"
+              max="500"
+              step="10"
+              value="30"
+              inputmode="numeric"
+              aria-label="Prompts between agents before you are asked (0: never ask)"
+              disabled
+            >
+          </div>
+          <div class="settings-help settings-gap-xs">Once an agent has sent this many prompts to other agents without a message from you, its next one waits for your Allow, on this relay or a paired one. 0 never asks. "Allow for this session" on that card stops asking in one session until you revoke it here.</div>
+          <div id="agent-sessions-loop-guard-off" class="settings-gap-xs" hidden></div>
           <div id="agent-sessions-status" class="settings-help settings-provider-status settings-gap-xs" role="status" aria-live="polite" hidden></div>
         </div>
         <div id="remote-relays-list-section" class="settings-row settings-row-column settings-gap-lg">
@@ -10543,23 +10530,6 @@
           <div class="settings-help">Notifications are only sent while no device has the app in the foreground; a new sign-in is sent at once, to every device but the new one. Content defaults to generic text; message previews are opt-in per device.</div>
         </div>
       </div>
-      <div
-        id="settings-panel-features"
-        class="settings-panel"
-        role="tabpanel"
-        tabindex="0"
-        aria-labelledby="settings-tab-features"
-        data-settings-panel="features"
-        hidden
-      >
-        <div class="settings-help settings-gap">Feature flags are applied when the relay starts. Changes here are saved immediately, but only take effect after the relay restarts.</div>
-        <div id="features-flag-list"></div>
-        <div id="features-restart-notice" class="settings-help settings-gap" hidden>
-          Saved changes differ from the running relay.
-          <button id="features-restart-btn" type="button" style="margin-left: calc(5px * var(--ui-scale));">Restart relay</button>
-        </div>
-        <div id="features-settings-status" class="settings-help settings-gap" hidden></div>
-      </div>
     </div>
   </div>
 </div>
@@ -10649,22 +10619,6 @@
       </div>
     </div>
     <div id="summary-modal-body" class="summary-body"></div>
-  </div>
-</div>
-
-<div id="tmux-inspector-modal" aria-hidden="true">
-  <div class="tmux-inspector-dialog" role="dialog" aria-modal="true" aria-labelledby="tmux-inspector-title">
-    <div class="tmux-inspector-header">
-      <div id="tmux-inspector-title" class="tmux-inspector-title">tmux Console Inspector (read-only)</div>
-      <button id="tmux-inspector-close" type="button" aria-label="Close tmux inspector">×</button>
-    </div>
-    <div class="tmux-inspector-meta">
-      <span>Session:</span>
-      <strong id="tmux-inspector-session"></strong>
-      <span>•</span>
-      <span id="tmux-inspector-status"></span>
-    </div>
-    <div id="tmux-inspector-term" aria-label="tmux console stream"></div>
   </div>
 </div>
 

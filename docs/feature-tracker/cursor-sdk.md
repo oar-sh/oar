@@ -1,6 +1,6 @@
 # Cursor SDK (`@cursor/sdk`)
 
-Updated: 2026-08-16 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
+Updated: 2026-11-14 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
 provider-agnostic relay rows live there.
 
 **Status: implemented and live-validated (2026-08-02).** Fully built and unit-tested against
@@ -63,7 +63,7 @@ secret-env-file mechanism as the OpenAI BYOK key (`createWorkerSecretEnvFile`,
 | --------- | ---------------- |
 | Stale-auth retry | Handles go stale ~4h idle while the API key stays valid. Budget: 2 recreate-and-retry attempts per turn with backoff, covering both the terminal-ERROR-result flavor and thrown `AuthenticationError`s (from `agent.send` or the handle rebuild). Before re-sending, the old abort signal is burned so a parked `ask_user` wait settles, and the failed attempt's still-open subagent runs are closed out. Handles idle > 30 min are recreated proactively (`cursor-turn-runner.mjs`). Rotating the API key in settings stops live Cursor workers so they respawn with the fresh key (`sessions-routes.mjs`). |
 | Turn backstops | The merged stream has a stall watchdog (no SDK traffic for 5 min while the model works, or for 30 min while a tool call is open — including one the SDK does not report, such as the wait on a background shell, counted from `tool-requests-listed` —, fails the run as `cursor.turn-stalled` and cancels it; an open `ask_user` card defers it; see DEVELOPING.md "The stall watchdog"); `readModelContextWindow` is raced against 8s and caches resolved-but-absent windows for 30 min so `composer-2.5`/`grok-4.5` stop paying a `models.list()` round trip per turn; the Stop control starts before `Agent.resume`/params setup so it is never inert (`cursor-sdk-adapter.mjs`, `cursor-turn-runner.mjs`). |
-| Queue isolation contract | Cursor turns are born owned (`owner_sdk_session_id`); `findPendingForLegacyRelay` and `findPendingForWorker` both refuse session-worker-provider rows to other requesters (denylist derived from `shared/provider-routing.mjs`), `executed_provider` records who really answered — on success AND terminal-failure paths — and dead workers are detected in ~30s with owned rows recovered in place. |
+| Queue isolation contract | Cursor turns are born owned (`owner_sdk_session_id`); `findPendingForWorker` hands a row only to its own session's worker, whatever the provider; `executed_provider` records who really answered — on success AND terminal-failure paths — and dead workers are detected in ~30s with owned rows recovered in place. |
 
 ## Session configuration not wired
 
@@ -86,7 +86,7 @@ catalog layer `buildModelCatalogWithCursorProvider` (outermost onion layer), lau
 `resolveWorkerKind`/`applyCursorProviderEnvironment` with the generalized secret-env-file,
 `cursor_agent_id` column, worker-facing routes `POST /api/cursor-agent-id` /
 `/api/cursor-context-usage` (409 unless bound to cursor), and the full settings/New-Chat/badge
-frontend. Rollout requires `SESSION_WORKER_ROUTING_ENABLED` (like Claude) plus a saved key.
+frontend. Rollout requires a saved key.
 
 ## Live validation results (2026-08-02, real key, `composer-2.5`)
 

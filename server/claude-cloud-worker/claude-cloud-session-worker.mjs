@@ -31,6 +31,9 @@ installWorkerLogFile();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEARTBEAT_MS = 10_000;
+// What this worker is, said in every heartbeat and socket hello: the kind
+// the launch service starts it as (COPILOT_WEB_RELAY_WORKER_KIND).
+const WORKER_KIND = 'claude-cloud';
 
 function parseSessionIdArg(argv = process.argv) {
   const index = argv.indexOf('--session-id');
@@ -110,6 +113,7 @@ async function main() {
   const heartbeat = createHeartbeatController({
     api,
     buildId,
+    workerKind: WORKER_KIND,
     pollMs: HEARTBEAT_MS,
     getSessionReady: () => true,
     getHeartbeatTimer: () => heartbeatTimer,
@@ -139,6 +143,7 @@ async function main() {
     getSessionReady: () => true,
     getSessionId: () => sdkSessionId,
     getPid: () => process.pid,
+    workerKind: WORKER_KIND,
     onDeliver: async (pending, reason) => {
       dbg('queue.deliver received', `reason=${reason}`, `msgId=${pending?.message?.id || 'none'}`);
       try {

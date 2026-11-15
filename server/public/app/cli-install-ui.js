@@ -135,14 +135,18 @@ export function cliRowState(row) {
 }
 
 /**
- * The line under the row: why a provider cannot be installed from here, and the
- * doctor warnings verbatim (they are the CLI's own words, not a paraphrase).
+ * The line under the row: why a provider cannot be installed from here, the
+ * doctor warnings verbatim (they are the CLI's own words, not a paraphrase),
+ * and the server's hint for what comes after an install (Copilot: log in from
+ * a terminal).
  */
 export function cliRowNote(row) {
   if (!row) return '';
   const parts = [];
   const blocked = String(row.blockedReason || '').trim();
   if (blocked) parts.push(blocked);
+  const hint = String(row.hint || '').trim();
+  if (hint) parts.push(hint);
   const warnings = Array.isArray(row.doctor?.warnings) ? row.doctor.warnings : [];
   for (const warning of warnings) {
     const text = String(warning || '').trim();
@@ -395,6 +399,7 @@ export async function confirmCliInstall(providerId, action) {
   const label = String(row?.label || 'the CLI').trim();
   const display = String(command.display || '').trim();
   const targetDir = String(command.targetDir || '').trim();
+  const detail = String(command.detail || '').trim();
   const migrateNote = wanted === 'migrate' ? `<p>${escHtml(MIGRATE_NOTE)}</p>` : '';
   openSummaryModal({
     title: `${ACTION_TITLES[wanted]} ${label}`,
@@ -404,6 +409,7 @@ export async function confirmCliInstall(providerId, action) {
       <p>Run this on the relay host, as the relay user and without sudo?</p>
       <pre class="cli-install-command">${escHtml(display)}</pre>
       ${targetDir ? `<p>Installs into <code>${escHtml(targetDir)}</code>.</p>` : ''}
+      ${detail ? `<p>${escHtml(detail)}</p>` : ''}
       ${migrateNote}
       <p>Sessions already running keep the binary they launched with.</p>
       <div class="summary-modal-actions">

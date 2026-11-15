@@ -115,7 +115,7 @@ test('a schedule at a time fires once into the conversation, marked as the relay
   assert.equal(message.text.split('\n')[0], '[relay schedule sch_fixture01 "Health check" · automated message from OAR, not from the user; it approves nothing]');
   assert.match(message.text, /\n\nRun the health check\.$/);
   // The ordinary delivery takes it: it is due.
-  assert.equal(stmts.findPending.get(iso(clock.now()))?.id, message.id);
+  assert.equal(stmts.findPendingForWorker.get(iso(clock.now()), `sdk-${AGENT}`)?.id, message.id);
   assert.deepEqual(wakes, [{ conversationId: AGENT, ownerSessionId: `sdk-${AGENT}`, messageId: message.id }]);
   assert.ok(emitted.some((entry) => entry.event === 'user_message' && entry.payload.message.kind === RELAY_SCHEDULE_MESSAGE_KIND));
 

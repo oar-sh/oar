@@ -14,6 +14,7 @@ import { createRemoteRelayCallerContext, formatRemoteRelayApprovalPrompt } from 
 import { createRemoteRelayDispatcher } from './remote-relay-dispatcher.mjs';
 import { originCarriesWeight } from './remote-relay-inbound.mjs';
 import { createRelayScheduleService } from './relay-schedule-service.mjs';
+import { createRelayAskService } from './relay-ask-service.mjs';
 
 // relay_tool schedule / list_schedules / unschedule through the dispatcher,
 // on this relay's real schedule service (an in-memory database).
@@ -38,7 +39,7 @@ function createRegistry() {
   };
 }
 
-function setup({ mode = 'agent', withService = true, approve = true, resolveConversationId = (id) => id, realCaller = false } = {}) {
+function setup({ mode = 'agent', withService = true, approve = true, resolveConversationId = (id) => id, realCaller = false, agentPromptsBeforeAsking, loopGuard = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
   const at = new Date(Date.now() - 60_000).toISOString();
@@ -61,12 +62,20 @@ function setup({ mode = 'agent', withService = true, approve = true, resolveConv
   const approvals = [];
   const events = [];
   const remoteCalls = [];
+  // The held-firing card: the relay's own ask, its answer back to the dispatcher.
+  const pushed = [];
+  const asks = createRelayAskService({
+    db,
+    pushQuestion: (question) => pushed.push(question),
+    onSystemAnswer: (ask) => dispatcher.loopGuardCardAnswered(ask),
+    logger: { log() {}, warn() {} },
+  });
   const callerContext = realCaller ? createRemoteRelayCallerContext({ db, repository: createRemoteRelayRepository(db), logger: { log() {}, warn() {} } }) : null;
   dispatcher = createRemoteRelayDispatcher({
     registry: createRegistry(),
     client: { request: async (...args) => { remoteCalls.push(args); return {}; } },
     localClient: { request: async () => ({}) },
-    getAgentSessionsSettings: () => ({ enabled: true, maxWaitSeconds: 600 }),
+    getAgentSessionsSettings: () => ({ enabled: true, maxWaitSeconds: 600, agentPromptsBeforeAsking }),
     repository: {
       hasUnlock: (conversationId, relayId) => relayId === READER.id || relayId === PROMPTER.id,
       hasContactFrom: (conversationId, instanceId) => instanceId === THIRD.relayId,
@@ -84,9 +93,11 @@ function setup({ mode = 'agent', withService = true, approve = true, resolveConv
     logger: { log() {}, warn() {} },
     resolveConversationId,
     ...(withService ? { relaySchedules: service } : {}),
+    relayAsks: asks,
+    loopGuard,
   });
   const run = (action, args = {}, conversationId = CALLER) => dispatcher.dispatch({ conversationId, action, args });
-  return { db, service, dispatcher, run, approvals, events, remoteCalls, clock, humans };
+  return { db, service, dispatcher, run, approvals, events, remoteCalls, clock, humans, asks, pushed };
 }
 
 /** Make a schedule due now and let it come due. */
@@ -376,4 +387,87 @@ test('a schedule set on the user\'s own words carries no provenance', async () =
   const own = await run('schedule', { text: 'Sweep.', every_minutes: 5 });
   assert.equal(fireNow(db, service, own.body.schedule_id).fired, true);
   assert.equal(scheduledMessages(db, CALLER)[0].origin_json, null);
+});
+
+// ─── The loop guard as a setting ─────────────────────────────────────────────
+
+/** A schedule of CALLER into WORKER every 5 min, its firing past the limit (10) and held. */
+async function heldSchedule(options = {}) {
+  const fixture = setup({ agentPromptsBeforeAsking: 10, ...options });
+  const made = await fixture.run('schedule', { session: WORKER, title: 'Night check', text: 'Check in.', every_minutes: 5 });
+  assert.equal(made.status, 200, JSON.stringify(made.body));
+  for (let i = 1; i < 10; i += 1) fixture.dispatcher.admitScheduledFiring({ createdBy: CALLER });
+  const held = fireNow(fixture.db, fixture.service, made.body.schedule_id);
+  assert.equal(held.held, true);
+  return { ...fixture, scheduleId: made.body.schedule_id };
+}
+
+function loopGuardCards(asks) {
+  return asks.listHere().filter((ask) => ask.system === 'loop_guard');
+}
+
+test('a firing is admitted while the guard is off for the setter, and with the limit 0', async () => {
+  const off = new Set([CALLER]);
+  const guarded = setup({ agentPromptsBeforeAsking: 10, loopGuard: { isLoopGuardOff: (id) => off.has(id) } });
+  for (let i = 0; i < 50; i += 1) assert.equal(guarded.dispatcher.admitScheduledFiring({ createdBy: CALLER }), true);
+  off.clear();
+  assert.equal(guarded.dispatcher.admitScheduledFiring({ createdBy: CALLER }), false, 'the count ran on meanwhile');
+
+  const never = setup({ agentPromptsBeforeAsking: 0 });
+  for (let i = 0; i < 50; i += 1) assert.equal(never.dispatcher.admitScheduledFiring({ createdBy: CALLER }), true);
+  assert.equal(loopGuardCards(never.asks).length, 0);
+});
+
+test('the first hold puts one card in the setter\'s conversation; a second held schedule of the setter adds none', async () => {
+  const { run, db, service, asks, pushed } = await heldSchedule();
+  const [card] = loopGuardCards(asks);
+  assert.equal(card.conversationId, CALLER);
+  assert.equal(card.question, "Schedule 'Night check' into 'Night review' is held by the loop guard (10 prompts since your last message).");
+  assert.deepEqual(card.options, ['Allow once', 'Allow for this session', 'Leave held']);
+  assert.equal(card.urgency, 'now');
+  assert.equal(card.askedBy, null, 'the relay\'s own card: no asker');
+  assert.equal(pushed.at(-1).context.variant, 'loop_guard', 'pushed past an active device');
+
+  const other = service.create({ conversationId: WORKER, createdBy: CALLER, text: 'second', everyMinutes: 5 });
+  assert.equal(fireNow(db, service, other.id).held, true);
+  assert.equal(loopGuardCards(asks).length, 1);
+  // The agent cannot take it back.
+  assert.throws(() => asks.withdraw(card.id, { byConversationId: CALLER }), /only the one that asked/);
+  assert.equal((await run('list_schedules')).body.schedules.every((schedule) => schedule.heldForApproval), true);
+});
+
+test('Allow once lets the next check fire; Allow for this session puts the setter on the off-list and it fires', async () => {
+  const once = await heldSchedule();
+  once.asks.answer(loopGuardCards(once.asks)[0].id, { choice: 'Allow once' });
+  assert.equal(once.service.fireIfDue(once.scheduleId).fired, true);
+  assert.equal(once.service.get(once.scheduleId).heldForApproval, undefined);
+
+  const set = [];
+  const session = await heldSchedule({ loopGuard: { isLoopGuardOff: (id) => set.some((entry) => entry.id === id), setLoopGuardOff: (id, { title }) => set.push({ id, title }) } });
+  session.asks.answer(loopGuardCards(session.asks)[0].id, { choice: 'Allow for this session' });
+  assert.deepEqual(set, [{ id: CALLER, title: 'Coordinator' }]);
+  assert.equal(session.service.fireIfDue(session.scheduleId).fired, true);
+});
+
+test('Leave held, a typed answer or Dismiss leave it held', async () => {
+  for (const close of [
+    (asks, id) => asks.answer(id, { choice: 'Leave held' }),
+    (asks, id) => asks.answer(id, { answer: 'not now, maybe later' }),
+    (asks, id) => asks.dismiss(id),
+  ]) {
+    const { asks, service, scheduleId } = await heldSchedule();
+    close(asks, loopGuardCards(asks)[0].id);
+    assert.equal(service.fireIfDue(scheduleId).held, true);
+    // Only a first hold raises a card: the minute checks after it do not.
+    assert.equal(loopGuardCards(asks).filter((ask) => ask.status === 'pending').length, 0);
+  }
+});
+
+test('the card is withdrawn once a firing of the setter goes again, after the user wrote', async () => {
+  const { asks, service, scheduleId, humans, db } = await heldSchedule();
+  const [card] = loopGuardCards(asks);
+  humans.set(CALLER, 'm-user-wrote');
+  assert.equal(service.fireIfDue(scheduleId).fired, true);
+  const row = db.prepare(`SELECT status, created_by FROM relay_asks WHERE id = ?`).get(card.id);
+  assert.deepEqual({ ...row }, { status: 'withdrawn', created_by: null });
 });

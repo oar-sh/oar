@@ -70,7 +70,6 @@ test('dequeuePendingMessageForWorkerLoop returns session-killed without calling 
     db: null,
     stmts: {},
     nowIso: new Date().toISOString(),
-    routingEnabled: true,
     requesterSessionId: 'kill-blocked-session',
     sessionWorkerSupervisor: {
       isKillBlocked() {
@@ -102,7 +101,6 @@ test('dequeuePendingMessageForWorkerLoop does not clear kill marker before ensur
     db: null,
     stmts: {},
     nowIso: new Date().toISOString(),
-    routingEnabled: true,
     requesterSessionId: 'ensure-blocked-session',
     sessionWorkerSupervisor: {
       isKillBlocked() {

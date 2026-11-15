@@ -47,6 +47,7 @@ import { migrateTurnSeq } from './migrations/0038-turn-seq.mjs';
 import { migrateMediaIndex } from './migrations/0039-media-index.mjs';
 import { migrateImageSessionDefaults } from './migrations/0040-image-session-defaults.mjs';
 import { migrateBrowserSessions } from './migrations/0041-browser-sessions.mjs';
+import { migrateLateReplies } from './migrations/0042-late-replies.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -571,7 +572,7 @@ db.exec(`
     VALUES (new.rowid, new.text);
   END;
 `);
-// The extension-backed history queue is superseded by the local SDK importer.
+// The history queue the removed Copilot CLI extension served is superseded by the local SDK importer.
 db.exec(`DROP TABLE IF EXISTS sdk_history_fetch_requests`);
 // Only rebuild the FTS index if the virtual table is empty (first migration or new DB).
 // A full rebuild is O(N) in message count and blocks the sync event loop, so we skip it
@@ -710,8 +711,8 @@ if (!queueColumns.includes('attempt_id')) {
   // One processing attempt = one attempt_id: minted on every pending->processing
   // transition (and at continuation birth), cleared by every requeue/recovery,
   // kept on terminal rows so forensics can name the attempt that finalized.
-  // Writers that echo it are fenced; writers that omit it ride legacy semantics
-  // until the extension engine is retired.
+  // Writers that echo it are fenced; writers that omit it (older workers)
+  // ride legacy semantics.
   db.exec(`ALTER TABLE queue ADD COLUMN attempt_id TEXT`);
 }
 if (!queueColumns.includes('continuation_op_id')) {
@@ -1123,6 +1124,15 @@ try {
   migrateBrowserSessions(db);
 } catch (error) {
   console.warn(`[auth] migration 0041 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// Late replies: the state of a sent prompt's reply on 0019's own-prompts
+// table. Without it no late reply is delivered and turn_ends go as before,
+// so a failure is logged and retried next boot.
+try {
+  migrateLateReplies(db);
+} catch (error) {
+  console.warn(`[relay-events] migration 0042 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

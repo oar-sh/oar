@@ -8,7 +8,6 @@ import {
   applyCopilotSdkProviderEnvironment,
   applyOpenAIProviderEnvironment,
   buildTmuxWorkerShellCommand,
-  copilotSdkEngineUnavailableReason,
   isCopilotSdkWorkerEnvironment,
   launchSessionCli,
   resolveCopilotSdkWorkerScriptPath,
@@ -19,64 +18,70 @@ const SDK_PATH = '/home/u/.cache/copilot/pkg/linux-x64/1.0.82/copilot-sdk';
 
 test('resolveWorkerKind accepts every registered node worker and nothing else', () => {
   // Validated against the descriptor table rather than a parallel list of
-  // names, so adding a worker cannot leave it silently routed to the CLI.
+  // names, so adding a worker cannot leave it without a kind.
   for (const kind of ['claude', 'cursor', 'grok', 'copilot-sdk']) {
     assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: kind }), kind);
     assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: ` ${kind.toUpperCase()} ` }), kind);
   }
-  // The extension engine is the ABSENCE of a kind, and so is any typo.
-  assert.equal(resolveWorkerKind({}), 'copilot');
-  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot' }), 'copilot');
-  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdkk' }), 'copilot');
+  // No kind, a kind that no longer exists and a typo are no kind at all:
+  // there is none to fall back to.
+  assert.equal(resolveWorkerKind({}), '');
+  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot' }), '');
+  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdkk' }), '');
   // Inherited Object.prototype keys are not worker kinds.
-  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'constructor' }), 'copilot');
+  assert.equal(resolveWorkerKind({ COPILOT_WEB_RELAY_WORKER_KIND: 'constructor' }), '');
 });
 
-test('the SDK engine is refused when its preconditions are not met', () => {
-  // Saving this engine when it cannot run is a silent no-op with a UI asserting
-  // the opposite, so both refusals name what to do about them.
-  const noSdk = copilotSdkEngineUnavailableReason({ env: { PATH: '/bin' }, routingEnabled: true });
-  assert.match(noSdk, /COPILOT_SDK_PATH/);
-  // The launch environment is snapshotted at boot, so "install the CLI and
-  // re-save" is not enough — the message has to say so.
-  assert.match(noSdk, /restart the relay/i);
-
-  const noRouting = copilotSdkEngineUnavailableReason({
-    env: { COPILOT_SDK_PATH: SDK_PATH },
-    routingEnabled: false,
-  });
-  assert.match(noRouting, /SESSION_WORKER_ROUTING_ENABLED/);
-
-  // Missing SDK is reported first: it is the one the user can fix.
-  assert.match(
-    copilotSdkEngineUnavailableReason({ env: {}, routingEnabled: false }),
-    /COPILOT_SDK_PATH/,
-  );
-  // Defaults are the refusing ones — a caller that forgets to thread context
-  // must not accidentally green-light the engine.
-  assert.ok(copilotSdkEngineUnavailableReason());
-});
-
-test('the SDK engine is available once the path resolved and routing is on', () => {
-  assert.equal(
-    copilotSdkEngineUnavailableReason({
-      env: { COPILOT_SDK_PATH: SDK_PATH },
-      routingEnabled: true,
-    }),
-    null,
+test('a launch whose environment names no worker kind, or an unknown one, starts nothing and says which', async () => {
+  for (const [kind, said] of [[undefined, 'none named'], ['copilot', '"copilot"'], ['copilot-sdkk', '"copilot-sdkk"']]) {
+    const spawnCalls = [];
+    const logged = [];
+    await assert.rejects(
+      launchSessionCli({
+        targetSessionId: 'session-9',
+        cwd: '/workspace',
+        env: { COPILOT_WEB_RELAY_ROOT: '/repo', ...(kind ? { COPILOT_WEB_RELAY_WORKER_KIND: kind } : {}) },
+        platform: 'linux',
+        spawnImpl: (command, args) => { spawnCalls.push({ command, args }); return { pid: 1, unref: () => {} }; },
+        execFileSyncImpl: (command, args) => { spawnCalls.push({ command, args }); return ''; },
+        processInspector: { findProcessForSessionAsync: () => null },
+        allowProcessReuse: false,
+        log: (line) => logged.push(line),
+      }),
+      { message: `worker-kind-unknown: ${said} (COPILOT_WEB_RELAY_WORKER_KIND)` },
+    );
+    assert.deepEqual(spawnCalls, [], 'neither tmux nor a process is started');
+    assert.deepEqual(logged, [`worker launcher: session=session- cannot start: worker-kind-unknown: ${said} (COPILOT_WEB_RELAY_WORKER_KIND)`]);
+  }
+  assert.throws(
+    () => buildTmuxWorkerShellCommand('session-9', { COPILOT_WEB_RELAY_WORKER_KIND: 'copilot' }),
+    /^Error: worker-kind-unknown: "copilot"/,
   );
 });
 
-test('applyCopilotSdkProviderEnvironment sets the worker kind and model when enabled', () => {
+test('applyCopilotSdkProviderEnvironment sets the worker kind, the SDK path and the model when enabled', () => {
   const env = applyCopilotSdkProviderEnvironment(
-    { PATH: '/bin', COPILOT_SDK_PATH: SDK_PATH },
-    { enabled: true, model: 'gpt-5.4-mini' },
+    { PATH: '/bin' },
+    { enabled: true, model: 'gpt-5.4-mini', sdkPath: SDK_PATH },
   );
   assert.equal(env.COPILOT_WEB_RELAY_WORKER_KIND, 'copilot-sdk');
+  assert.equal(env.COPILOT_SDK_PATH, SDK_PATH);
   assert.equal(env.COPILOT_RELAY_MODEL, 'gpt-5.4-mini');
   assert.equal(env.PATH, '/bin');
   assert.equal(isCopilotSdkWorkerEnvironment(env), true);
   assert.equal(resolveWorkerKind(env), 'copilot-sdk');
+});
+
+test('the SDK path handed over for a launch replaces the one in the environment, which is kept when none is', () => {
+  const newer = '/home/dev/.cache/copilot/pkg/linux-x64/1.0.90/copilot-sdk';
+  assert.equal(
+    applyCopilotSdkProviderEnvironment({ COPILOT_SDK_PATH: SDK_PATH }, { enabled: true, sdkPath: newer }).COPILOT_SDK_PATH,
+    newer,
+  );
+  assert.equal(
+    applyCopilotSdkProviderEnvironment({ COPILOT_SDK_PATH: SDK_PATH }, { enabled: true }).COPILOT_SDK_PATH,
+    SDK_PATH,
+  );
 });
 
 test('applyCopilotSdkProviderEnvironment clears its own keys when disabled', () => {
@@ -88,8 +93,8 @@ test('applyCopilotSdkProviderEnvironment clears its own keys when disabled', () 
   });
   assert.equal('COPILOT_WEB_RELAY_WORKER_KIND' in env, false);
   assert.equal('COPILOT_RELAY_MODEL' in env, false);
-  // The SDK path is not this applier's to clear: it is resolved once for every
-  // session and the extension engine needs it too.
+  // The SDK path is not this applier's to clear: a relay started with one in
+  // its environment keeps it for the next launch.
   assert.equal(env.COPILOT_SDK_PATH, SDK_PATH);
   assert.equal(isCopilotSdkWorkerEnvironment(env), false);
 });
@@ -108,9 +113,9 @@ test('enabling without a resolved SDK path fails loudly instead of spawning', ()
   );
 });
 
-test('the SDK engine composes on top of the OpenAI BYOK environment', () => {
-  // One OpenAI configuration drives both engines: the OpenAI applier owns the
-  // COPILOT_PROVIDER_* family and the engine applier only adds the kind.
+test('the SDK worker composes on top of the OpenAI BYOK environment', () => {
+  // The OpenAI applier owns the COPILOT_PROVIDER_* family; this applier only
+  // adds the kind.
   const byok = applyOpenAIProviderEnvironment({ COPILOT_SDK_PATH: SDK_PATH }, {
     enabled: true,
     apiKey: 'sk-test',
@@ -139,12 +144,11 @@ test('resolveCopilotSdkWorkerScriptPath prefers explicit path, then repo root, t
   );
 });
 
-test('tmux shell command for the SDK engine runs node without the script PTY wrapper', () => {
+test('tmux shell command for the SDK worker runs node, with no pseudo-TTY wrapper', () => {
   const env = {
     COPILOT_WEB_RELAY_WORKER_KIND: 'copilot-sdk',
     COPILOT_RELAY_MODEL: 'gpt-5.4-mini',
     COPILOT_SDK_PATH: SDK_PATH,
-    COPILOT_WEB_RELAY_CLI_EXECUTABLE: '/usr/lib/copilot/copilot',
     COPILOT_WEB_RELAY_ROOT: '/repo',
     COPILOT_WEB_RELAY_CONFIG: '/repo/server/config.json',
   };
@@ -170,14 +174,14 @@ test('the BYOK api key never reaches the tmux command line', () => {
     COPILOT_PROVIDER_TYPE: 'openai',
     COPILOT_PROVIDER_API_KEY: 'sk-secret',
   };
-  // The secret must ride the 0600 env file, exactly as on the extension path.
+  // The secret must ride the 0600 env file.
   assert.throws(() => buildTmuxWorkerShellCommand('session-1', env), /worker-secret-env-file-required/);
   const command = buildTmuxWorkerShellCommand('session-1', env, { secretEnvFilePath: '/tmp/x/provider.env' });
   assert.doesNotMatch(command, /sk-secret/);
   assert.match(command, /export COPILOT_PROVIDER_TYPE='openai';/);
 });
 
-test('launchSessionCli spawns node for the SDK engine when tmux is unavailable', async () => {
+test('launchSessionCli spawns node for the SDK worker when tmux is unavailable', async () => {
   const spawnCalls = [];
   const launched = await launchSessionCli({
     targetSessionId: 'session-3',

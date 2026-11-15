@@ -45,7 +45,7 @@ function seedConversation(db, id, { provider = 'openai', model = 'gpt-image-2', 
   `).run(`rs-${id}`, id, id, `key-${id}`, model, provider, model, NOW, NOW);
 }
 
-function boot(t, { continuity = true, provider = 'openai', model = 'gpt-image-2', cwd = null, references = [], settings = {} } = {}) {
+function boot(t, { provider = 'openai', model = 'gpt-image-2', cwd = null, references = [], settings = {} } = {}) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oar-image-inputs-')));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
   const dirs = {
@@ -77,7 +77,6 @@ function boot(t, { continuity = true, provider = 'openai', model = 'gpt-image-2'
     MAX_UPLOAD_ATTACHMENTS: 6,
     DEFAULT_RELAY_MODE: 'agent',
     configuredConversationSessionMode: 'isolated',
-    featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: continuity },
     tokenUsageService,
     imageOperationService: createImageOperationService({ db, repository: stmts, uuidv4: () => crypto.randomUUID() }),
     getOpenAIProviderSettings: () => ({ configured: true, enabled: true, model: 'gpt-image-2', models: ['gpt-image-2', 'dall-e-3', 'gpt-5'] }),

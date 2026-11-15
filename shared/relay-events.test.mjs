@@ -20,6 +20,8 @@ import {
   isRelayLevelOnly,
   isRelayAutomatedDelivery,
   isRelayEventDelivery,
+  isLateReplyAck,
+  RELAY_EVENT_DELIVERY_TYPES,
 } from './relay-events.mjs';
 
 const SESSION = { id: 'conv-fixture-orbit', title: 'Orbit camera' };
@@ -363,4 +365,66 @@ test('a relay event and a scheduled prompt are the relay\'s automated deliveries
   assert.equal(isRelayAutomatedDelivery({ messageKind: 'claude-usage-limit' }), false);
   assert.equal(isRelayAutomatedDelivery({}), false);
   assert.equal(isRelayEventDelivery({ messageKind: 'relay-schedule' }), false, 'the narrower check stays about events');
+});
+
+// ─── Late replies ────────────────────────────────────────────────────────────
+
+const lateReply = (detail, extra = {}) => event('late_reply', { messageId: 'msg-fixture-1', sentAt: '2026-01-01T09:55:00.000Z', ...detail }, extra);
+
+test('isLateReplyAck: [ack] and short replies of ack words are acks, anything with content is not', () => {
+  for (const text of ['[ack] lane 14', '[ACK] noted, thanks', 'Received.', 'ok 👍', 'Danke, erhalten', 'Thank you!', 'got it', 'alles klar']) {
+    assert.equal(isLateReplyAck(text), true, text);
+  }
+  const longAck = 'ok '.repeat(27) + 'ok';
+  assert.equal(longAck.length, 83);
+  const longTagged = `[ack] and one more thing: ${'the export needs a rerun. '.repeat(3)}`;
+  assert.ok(longTagged.length > RELAY_EVENT_LIMITS.lateReplyAckChars);
+  for (const text of ['Received. Next: fix the export and rerun', longAck, longTagged, '', '👍', 'ok, but the tests fail']) {
+    assert.equal(isLateReplyAck(text), false, text);
+  }
+});
+
+test('the late reply text for done, stopped, failed and cancelled, here and on a paired relay', () => {
+  const doneText = formatRelayEventLine(lateReply({ status: 'done', reply: 'First line\nsecond line', note: 'The message was steered into the turn that was already running.' }));
+  assert.equal(doneText.split('\n')[0], '[relay event] late_reply: late reply from session "Orbit camera" (conv-fixture-orbit) to your prompt msg-fixture-1 of 09:55Z: its reply follows; you were no longer waiting for it. Your reply to this message reaches nobody: to answer, use relay_tool send.');
+  assert.deepEqual(doneText.split('\n').slice(1), [
+    '[relay event] note: The message was steered into the turn that was already running.',
+    '[relay event] > First line',
+    '[relay event] > second line',
+  ]);
+  assert.match(formatRelayEventLine(lateReply({ status: 'stopped', note: 'stopped' })), /: its turn was stopped before it answered; you were no longer waiting/);
+  assert.match(formatRelayEventLine(lateReply({ status: 'failed', reply: 'Error: quota' })), /: its turn failed; the failure text follows;[\s\S]*\n\[relay event\] > Error: quota$/);
+  assert.match(formatRelayEventLine(lateReply({ status: 'cancelled' })), /: it got no reply there \(cancelled or removed\);/);
+  assert.match(formatRelayEventLine(lateReply({ status: 'gone' })), /: that session or the prompt is gone there;/);
+  assert.match(formatRelayEventLine(lateReply({ status: 'done' })), /: its turn ended without a reply here;/);
+  const paired = formatRelayEventLine(lateReply({ status: 'done', reply: 'from there', images: [{ path: '/srv/out/a.png', width: 1024, height: 640 }] }, { relay: { id: 'rr_fixture', name: 'lab-relay' } }));
+  assert.match(paired, /^\[relay event\] late_reply: late reply from session "Orbit camera" \(conv-fixture-orbit\) on relay "lab-relay" to your prompt/);
+  assert.match(paired, /\n\[relay event\] image: \/srv\/out\/a\.png \(1024x640\)$/);
+  assert.equal(formatRelayEventLine(lateReply({ ack: true, reply: '[ack] got it' })),
+    '[relay event] late_reply: ack from session "Orbit camera" (conv-fixture-orbit) to your prompt msg-fixture-1 of 09:55Z: "[ack] got it"');
+  assert.equal(formatRelayEventLine(event('reply_undelivered', { watcherId: 'conv-fixture-lead', watcherTitle: 'Lead', sentAt: '2026-01-01T09:55:00.000Z', reason: 'deleted' })),
+    '[relay event] reply_undelivered: your reply to session "Lead" (conv-fixture-lead) of 09:55Z reached nobody: that session was deleted.');
+});
+
+test('a reply\'s own lines never escape the prefix, and a late reply is never cut by the line cap', () => {
+  const text = buildRelayEventMessageText([
+    ...Array.from({ length: 45 }, () => event('turn_end', { preview: 'busy' })),
+    lateReply({ status: 'done', reply: 'one\r\ntwo\u2028still two\nthree\rfour\u0085still four\u2029end' }),
+  ]);
+  const lines = text.split('\n');
+  assert.ok(lines.slice(1).every((line) => line.startsWith('[relay event] ')));
+  assert.ok(lines.includes('[relay event] … and 5 more'));
+  assert.ok(!/[\r\u0085\u2028\u2029]/.test(text), 'no other line break survives');
+  assert.deepEqual(lines.slice(-4), ['[relay event] > one', '[relay event] > two still two', '[relay event] > three', '[relay event] > four still four end']);
+  assert.deepEqual(parseRelayEventMessageText(text).types, ['turn_end', 'late_reply']);
+});
+
+test('late_reply and reply_undelivered are not subscribable by name; an unknown type still renders', () => {
+  for (const type of ['late_reply', 'reply_undelivered']) {
+    assert.ok(!RELAY_EVENT_SUBSCRIBABLE_TYPES.includes(type));
+    assert.ok(!RELAY_EVENT_TYPES.includes(type));
+    assert.ok(RELAY_EVENT_DELIVERY_TYPES.includes(type));
+  }
+  assert.doesNotThrow(() => buildRelayEventMessageText([event('a_later_type', { anything: true })]));
+  assert.match(buildRelayEventMessageText([event('a_later_type')]), /session "Orbit camera" \(conv-fixture-orbit\): a_later_type$/);
 });

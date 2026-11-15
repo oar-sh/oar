@@ -571,16 +571,6 @@ async function settingsRequest(path, body = null, fallbackError = 'Request faile
   }
 }
 
-export async function loadCopilotSettings() {
-  return apiFetch('/api/settings/copilot');
-}
-
-export async function updateCopilotSettings({ engine = undefined } = {}) {
-  const payload = {};
-  if (typeof engine === 'string' && engine.trim()) payload.engine = engine.trim();
-  return settingsRequest('/api/settings/copilot', payload, 'Failed to update Copilot settings');
-}
-
 export async function loadClaudeSettings() {
   return apiFetch('/api/settings/claude');
 }
@@ -1178,6 +1168,11 @@ export async function updateAgentSessionsSettings(patch = {}) {
   const body = {};
   if (typeof patch.enabled === 'boolean') body.enabled = patch.enabled;
   if (Number.isFinite(patch.maxWaitSeconds)) body.maxWaitSeconds = patch.maxWaitSeconds;
+  if (Number.isInteger(patch.agentPromptsBeforeAsking)) body.agentPromptsBeforeAsking = patch.agentPromptsBeforeAsking;
+  if (Array.isArray(patch.loopGuardOff?.revoke)) {
+    const revoke = patch.loopGuardOff.revoke.filter((id) => typeof id === 'string' && id.trim());
+    if (revoke.length) body.loopGuardOff = { revoke };
+  }
   return remoteRelayRequest('/api/settings/agent-sessions', { method: 'POST', body });
 }
 
@@ -1212,17 +1207,6 @@ export async function applyUpdate(version) {
 
 export async function cancelUpdate() {
   return apiFetch('/api/update/cancel', { method: 'POST' });
-}
-
-export async function loadFeatureFlagSettings() {
-  return apiFetch('/api/settings/features');
-}
-
-export async function updateFeatureFlagSetting(name, enabled) {
-  return apiFetch('/api/settings/features', {
-    method: 'POST',
-    body: JSON.stringify({ name: String(name || ''), enabled: enabled === true }),
-  });
 }
 
 export async function launchSessionWorker(sdkSessionId) {

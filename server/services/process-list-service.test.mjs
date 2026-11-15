@@ -172,19 +172,18 @@ test('windows: the list comes from the inspector, read without holding the threa
 
 test('windows: the list asks for what the inspector asks for', async () => {
   // One script, so the worker and the relay read the same fields.
-  let asked = '';
-  let askedSync = '';
+  const asked = [];
   const inspector = createSessionWorkerProcessInspector({
     platform: 'win32',
-    execFileSyncImpl: (_command, args) => { askedSync = args.at(-1); return Buffer.from('[]'); },
-    execFileImpl: (_command, args, _options, done) => { asked = args.at(-1); done(null, '[]'); },
+    execFileImpl: (_command, args, _options, done) => { asked.push(args.at(-1)); done(null, '[]'); },
   });
 
-  inspector.getWindowsProcessSnapshot();
   assert.deepEqual(await createProcessLister({ platform: 'win32', inspector }).list(), []);
+  assert.deepEqual(await inspector.findProcessesForSessionAsync('abc-123', { fresh: true }), []);
 
-  assert.ok(asked);
-  assert.equal(asked, askedSync);
+  assert.equal(asked.length, 2);
+  assert.ok(asked[0]);
+  assert.equal(asked[0], asked[1]);
 });
 
 test('windows: a list that cannot be read or parsed rejects', async () => {

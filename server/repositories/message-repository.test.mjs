@@ -132,10 +132,10 @@ test('routed worker dequeue uses runtime session binding when queue owner is emp
     '',
   );
 
-  const matchingWorkerRow = findPendingForWorker.get(now, 'sdk-a', 'sdk-a');
+  const matchingWorkerRow = findPendingForWorker.get(now, 'sdk-a');
   assert.equal(matchingWorkerRow?.id, 'message-a');
 
-  const wrongWorkerRow = findPendingForWorker.get(now, 'sdk-b', 'sdk-b');
+  const wrongWorkerRow = findPendingForWorker.get(now, 'sdk-b');
   assert.equal(wrongWorkerRow, undefined);
 });
 
@@ -186,11 +186,10 @@ test('repository lists pending worker owners including rows still in retry backo
   assert.deepEqual([...owners].sort(), ['later-sdk', 'owner-sdk', 'runtime-sdk']);
 });
 
-// ─── Legacy-relay dequeue scoping ─────────────────────────────────────────────
-// The Copilot relay CLI polls /api/pending without a session identity and used
-// to fall through to the unscoped global queue. That let it claim and execute
-// cursor/claude/grok conversations' turns on the Copilot plan (the model id is
-// passed verbatim, and ids like claude-opus-5 exist on both sides).
+// ─── Dequeue scoping ──────────────────────────────────────────────────────────
+// Only a worker that names its session claims, and only that session's rows.
+// A requester without one once fell through to the unscoped global queue and
+// ran cursor/claude/grok conversations' turns on the Copilot plan.
 
 function seedProviderConversation(db, { key, providerType, ownerSdkSessionId = '', timestamp }) {
   db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
@@ -206,69 +205,19 @@ function seedProviderConversation(db, { key, providerType, ownerSdkSessionId = '
   `).run(`message-${key}`, `conv-${key}`, `runtime-${key}`, key, timestamp, ownerSdkSessionId);
 }
 
-test('legacy-relay dequeue never returns rows bound to a session-worker provider', () => {
+test('an owned openai row goes to its own worker', () => {
   const db = createTestDb();
   const repo = createMessageRepository(db);
   const now = '2026-08-11T13:00:00.000Z';
 
-  seedProviderConversation(db, { key: 'cursor', providerType: 'cursor', ownerSdkSessionId: 'conv-cursor', timestamp: '2026-08-11T12:00:00.000Z' });
-  seedProviderConversation(db, { key: 'claude', providerType: 'claude', ownerSdkSessionId: 'conv-claude', timestamp: '2026-08-11T12:00:01.000Z' });
-  seedProviderConversation(db, { key: 'grok', providerType: 'grok', ownerSdkSessionId: 'conv-grok', timestamp: '2026-08-11T12:00:02.000Z' });
-
-  // The cursor/claude/grok rows are older, but the relay must skip them all.
-  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
-
-  // An owned github row is a session worker's job too: the worker is starting
-  // up, and the relay polls far faster than a worker boots.
-  seedProviderConversation(db, { key: 'github-owned', providerType: 'github', ownerSdkSessionId: 'copilot-sdk', timestamp: '2026-08-11T12:00:03.000Z' });
-  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
-
-  // Unowned (routing disabled, or no worker responsible) is the relay's work.
-  seedProviderConversation(db, { key: 'github', providerType: 'github', timestamp: '2026-08-11T12:00:04.000Z' });
-  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-github');
-});
-
-test('legacy-relay dequeue leaves an owned openai row to its worker', () => {
-  const db = createTestDb();
-  const repo = createMessageRepository(db);
-  const now = '2026-08-11T13:00:00.000Z';
-
-  // The live regression: an OpenAI image turn owned by a booting worker was
-  // grabbed by the relay ~0.3s after the worker spawned, failed (gpt-image-*
-  // is not a Copilot model) and burned a retry plus a 60s backoff.
   seedProviderConversation(db, { key: 'openai-owned', providerType: 'openai', ownerSdkSessionId: 'conv-openai-owned', timestamp: '2026-08-11T12:00:00.000Z' });
-  assert.equal(repo.findPendingForLegacyRelay.get(now), undefined);
-
-  // The owning worker still claims it through the routed path.
   const claimed = dequeuePendingMessage({
     db,
     stmts: repo,
     nowIso: now,
-    routingEnabled: true,
     requesterSessionId: 'conv-openai-owned',
   });
   assert.equal(claimed?.id, 'message-openai-owned');
-});
-
-test('legacy-relay dequeue serves openai rows and rows with no runtime session', () => {
-  const db = createTestDb();
-  const repo = createMessageRepository(db);
-  const now = '2026-08-11T13:00:00.000Z';
-
-  seedProviderConversation(db, { key: 'openai', providerType: 'openai', timestamp: '2026-08-11T12:00:00.000Z' });
-  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-openai');
-
-  // No runtime session at all (brand-new conversation): defaults to github.
-  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
-    .run('conv-fresh', 'fresh', 'active', '');
-  db.prepare(`
-    INSERT INTO queue (
-      id, conversation_id, runtime_session_id, is_new_conversation, model,
-      model_variant_id, reasoning_effort, relay_mode, text, attachments,
-      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
-    ) VALUES ('message-fresh', 'conv-fresh', NULL, 1, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', 'fresh', NULL, 'pending', '2026-08-11T11:00:00.000Z', 0, NULL, '')
-  `).run();
-  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-fresh');
 });
 
 test('anonymous dequeue skips provider-worker rows but the owning worker still gets them', () => {
@@ -278,13 +227,12 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
 
   seedProviderConversation(db, { key: 'cursor', providerType: 'cursor', ownerSdkSessionId: 'conv-cursor', timestamp: '2026-08-11T12:00:00.000Z' });
 
-  // The relay CLI: routing on, no x-relay-session-id. Must come up empty even
-  // though a pending row exists.
+  // A requester without a session id: must come up empty even though a
+  // pending row exists.
   const stolen = dequeuePendingMessage({
     db,
     stmts,
     nowIso: now,
-    routingEnabled: true,
     requesterSessionId: null,
   });
   assert.equal(stolen, null);
@@ -295,7 +243,6 @@ test('anonymous dequeue skips provider-worker rows but the owning worker still g
     db,
     stmts,
     nowIso: now,
-    routingEnabled: true,
     requesterSessionId: 'conv-cursor',
   });
   assert.equal(claimed?.id, 'message-cursor');
@@ -331,13 +278,11 @@ test('claim ordering: a recovered row with expired backoff keeps its send-order 
   // Newer fresh message, no backoff stamp.
   insert.run('message-fresh', 'conv-1', 'fresh', '2026-09-19T23:09:32.000Z', 0, null, 'sdk-1');
 
-  assert.equal(repo.findPending.get(now)?.id, 'message-recovered');
-  assert.equal(repo.findPendingForSessionAffinity.get(now, 'sdk-1')?.id, 'message-recovered');
-  assert.equal(repo.findPendingForWorker.get(now, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
+  assert.equal(repo.findPendingForWorker.get(now, 'sdk-1')?.id, 'message-recovered');
 
   // An immature backoff stays ineligible entirely.
   db.prepare(`UPDATE queue SET next_attempt_at = '2026-09-19T23:59:00.000Z' WHERE id = 'message-recovered'`).run();
-  assert.equal(repo.findPending.get(now)?.id, 'message-fresh');
+  assert.equal(repo.findPendingForWorker.get(now, 'sdk-1')?.id, 'message-fresh');
 });
 
 test('claim ordering: a recovered older row with a bumped retry_count is claimed before newer ones', () => {
@@ -359,15 +304,11 @@ test('claim ordering: a recovered older row with a bumped retry_count is claimed
 
   // While the recovered row is backing off, fresh work is not blocked behind it.
   const backingOff = '2026-09-24T10:00:20.000Z';
-  assert.equal(repo.findPending.get(backingOff)?.id, 'message-newer');
-  assert.equal(repo.findPendingForSessionAffinity.get(backingOff, 'sdk-1')?.id, 'message-newer');
-  assert.equal(repo.findPendingForWorker.get(backingOff, 'sdk-1', 'sdk-1')?.id, 'message-newer');
+  assert.equal(repo.findPendingForWorker.get(backingOff, 'sdk-1')?.id, 'message-newer');
 
   // Once the backoff matures it goes first again, retry count or not.
   const matured = '2026-09-24T10:01:00.000Z';
-  assert.equal(repo.findPending.get(matured)?.id, 'message-recovered');
-  assert.equal(repo.findPendingForSessionAffinity.get(matured, 'sdk-1')?.id, 'message-recovered');
-  assert.equal(repo.findPendingForWorker.get(matured, 'sdk-1', 'sdk-1')?.id, 'message-recovered');
+  assert.equal(repo.findPendingForWorker.get(matured, 'sdk-1')?.id, 'message-recovered');
 });
 
 test('recovery statements never put a consumed row back to pending, and surface it to fail', () => {
@@ -412,28 +353,6 @@ test('recovery statements never put a consumed row back to pending, and surface 
   assert.equal(repo.clearQueueConsumed.run({ id: 'consumed', conversationId: 'conv-1', owner: 'sdk-other', attemptId: null }).changes, 0);
   assert.equal(repo.clearQueueConsumed.run({ id: 'consumed', conversationId: 'conv-1', owner: 'sdk-1', attemptId: 'attempt-1' }).changes, 1);
   assert.equal(repo.findQById.get('consumed').consumed_at, null);
-});
-
-test('claim ordering: legacy-relay dequeue also keeps expired-backoff rows in send order', () => {
-  const db = createTestDb();
-  const repo = createMessageRepository(db);
-  const now = '2026-09-19T23:14:00.000Z';
-
-  // Unowned github rows: the only kind the legacy relay may claim.
-  const insert = db.prepare(`
-    INSERT INTO queue (
-      id, conversation_id, runtime_session_id, is_new_conversation, model,
-      model_variant_id, reasoning_effort, relay_mode, text, attachments,
-      status, timestamp, retry_count, next_attempt_at, owner_sdk_session_id
-    ) VALUES (?, 'conv-legacy', NULL, 0, 'gpt-5.4-mini', 'gpt-5.4-mini', NULL, 'agent', ?, NULL, 'pending', ?, 0, ?, '')
-  `);
-  db.prepare(`INSERT INTO conversations (id, title, status, sdk_session_id, created_at, updated_at) VALUES ('conv-legacy', 'Legacy', 'active', '', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
-  insert.run('message-legacy-recovered', 'recovered', '2026-09-19T23:09:23.000Z', '2026-09-19T23:09:40.000Z');
-  insert.run('message-legacy-fresh', 'fresh', '2026-09-19T23:09:32.000Z', null);
-
-  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-legacy-recovered');
-  db.prepare(`UPDATE queue SET retry_count = 3 WHERE id = 'message-legacy-recovered'`).run();
-  assert.equal(repo.findPendingForLegacyRelay.get(now)?.id, 'message-legacy-recovered', 'retries do not demote it');
 });
 
 test('executed provider derives from responder identity, never from the response payload', () => {
@@ -501,10 +420,10 @@ test('an identity-less response for a non-github conversation still reports gith
     getRuntimeSessionBySdkSessionId: db.prepare('SELECT * FROM runtime_sessions WHERE sdk_session_id = ?'),
   };
 
-  // The theft case. server/relay.mjs is the only identity-less responder for a
-  // normal turn and it is launched with plain env, so it runs on the Copilot plan
-  // whatever the conversation is bound to. openai belongs in this list: a BYOK
-  // chat turn answered without an identity did NOT use the BYOK key.
+  // The theft case. A normal turn answered without an identity is taken for
+  // the Copilot plan whatever the conversation is bound to. openai belongs in
+  // this list: a BYOK chat turn answered without an identity did NOT use the
+  // BYOK key.
   for (const provider of ['cursor', 'claude', 'grok', 'openai']) {
     assert.equal(resolveExecutedProviderForResponse({
       stmts,
@@ -523,17 +442,6 @@ test('an identity-less response for a non-github conversation still reports gith
     responseBridgeIdentity: { sessionId: 'openai-session' },
     conversationProvider: 'openai',
   }), 'openai');
-});
-
-test('legacy-relay dequeue respects retry backoff windows', () => {
-  const db = createTestDb();
-  const repo = createMessageRepository(db);
-
-  seedProviderConversation(db, { key: 'github', providerType: 'github', timestamp: '2026-08-11T12:00:00.000Z' });
-  db.prepare(`UPDATE queue SET next_attempt_at = '2026-08-11T14:00:00.000Z' WHERE id = 'message-github'`).run();
-
-  assert.equal(repo.findPendingForLegacyRelay.get('2026-08-11T13:00:00.000Z'), undefined);
-  assert.equal(repo.findPendingForLegacyRelay.get('2026-08-11T14:00:01.000Z')?.id, 'message-github');
 });
 
 test('mapUsageSnapshotRow exposes turn delta credits and monthly remaining context', () => {
@@ -797,10 +705,7 @@ test('a continuation row is born processing, owned, and never deliverable', () =
   // Even if something flips it to pending, no delivery path may return it.
   db.prepare(`UPDATE queue SET status = 'pending' WHERE id = 'q-cont'`).run();
   const nowIso = recoveryIsoAgo(-60_000);
-  assert.equal(stmts.findPending.get(nowIso) || null, null);
-  assert.equal(stmts.findPendingForWorker.get(nowIso, 'session-1', 'session-1') || null, null);
-  assert.equal(stmts.findPendingForSessionAffinity.get(nowIso, 'session-1') || null, null);
-  assert.equal(stmts.findPendingForLegacyRelay.get(nowIso) || null, null);
+  assert.equal(stmts.findPendingForWorker.get(nowIso, 'session-1') || null, null);
 });
 
 test('the stale sweep tears down continuations instead of requeueing them', () => {

@@ -507,6 +507,46 @@ test('question pushes from an agent-started turn are unchanged', async () => {
   assert.deepEqual(sends, ['question']);
 });
 
+test('a question push carries the card\'s session for its choice buttons; a paired relay\'s card carries none', async () => {
+  const db = makeDb();
+  const payloads = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { payloads.push(JSON.parse(body)); } },
+  });
+  subscribeDevice(service);
+  await service.notifyQuestion({ id: 'q-s1', conversationId: 'conv-1', prompt: 'Ship it?', choices: ['Ship', 'Hold'], sdkSessionId: 'sdk-fixture-9a0' });
+  await service.notifyQuestion({ id: 'q-s2', conversationId: 'conv-1', prompt: 'Ship it?', choices: ['Ship'] });
+  assert.equal(payloads[0].data.sdkSessionId, 'sdk-fixture-9a0');
+  assert.equal('sdkSessionId' in payloads[1].data, false, 'a card without a session names none');
+  const remote = renderPushNotification({ type: 'question', relayName: 'lab-relay', remoteKind: 'ask_user', data: { questionId: 'q-r', choices: ['A'], sdkSessionId: 'sdk-fixture-9a0' } }, null);
+  assert.equal('sdkSessionId' in remote.data, false);
+  assert.equal('questionId' in remote.data, false);
+});
+
+test('an approval, a Safety check or a tool permission pushes without buttons or session; an ask and a question keep them', async () => {
+  const db = makeDb();
+  const payloads = [];
+  const { service } = makeService(db, {
+    webpush: { sendNotification: async (_subscription, body) => { payloads.push(JSON.parse(body).data); } },
+  });
+  subscribeDevice(service);
+  const card = (id, context) => ({ id, conversationId: 'conv-1', prompt: 'Go?', choices: ['Allow', 'Deny'], sdkSessionId: 'sdk-fixture-77', context });
+  await service.notifyQuestion(card('q-relay', { source: 'remote_relay' }));
+  await service.notifyQuestion(card('q-safety', { source: 'ClaudeSafetyCheck', personOnly: true }));
+  await service.notifyQuestion(card('q-cloud', { source: 'ClaudeCloudPermission' }));
+  await service.notifyQuestion(card('q-tool', { source: 'onPermissionRequest' }));
+  await service.notifyQuestion(card('q-input', { source: 'onUserInputRequest' }));
+  await service.notifyQuestion({ id: 'ask_fixture01', conversationId: 'conv-1', prompt: 'Which?', choices: ['A', 'B'] });
+  assert.deepEqual(payloads.map((data) => [data.questionId, data.choices ?? null, data.sdkSessionId ?? null]), [
+    ['q-relay', null, null],
+    ['q-safety', null, null],
+    ['q-cloud', null, null],
+    ['q-tool', null, null],
+    ['q-input', ['Allow', 'Deny'], 'sdk-fixture-77'],
+    ['ask_fixture01', ['A', 'B'], null],
+  ]);
+});
+
 test('without the origin column (before migration 0005) every turn pushes as before', async () => {
   const db = makeDb();
   const sends = [];
@@ -863,4 +903,27 @@ test('newSignIn: a sign-in no device hears of opens no window, so the next one s
   assert.equal((await service.notifyNewSignIn({ sessionId: 'bs_phone', deviceId: 'phone', via: 'token', isLiveDevice: () => false })).outcome, 'no-subscribers');
   await service.notifyNewSignIn({ sessionId: 'bs_other', deviceId: 'laptop', via: 'terminal', isLiveDevice: (deviceId) => deviceId === 'phone' });
   assert.deepEqual([sent[0].payload.data.count, sent[0].payload.data.quiet, sent[0].payload.data.signOutSessionId], [1, false, 'bs_other']);
+});
+
+test('a loop guard card pushes with a device active; another approval stays suppressed', async () => {
+  const db = makeDb();
+  const sends = [];
+  const { service } = makeService(db, {
+    hasActiveDevice: () => true,
+    webpush: { sendNotification: async (...args) => { sends.push(args); return { statusCode: 201 }; } },
+  });
+  subscribeDevice(service);
+  // A formatted approval question carries its context directly …
+  const loop = await service.notifyQuestion({ id: 'q-loop', conversationId: 'conv-1', prompt: 'Let it go on?', choices: ['Allow', 'Allow for this session', 'Deny'], context: { source: 'remote_relay', variant: 'loop_guard' } });
+  assert.equal(loop.outcome, 'dispatched');
+  assert.equal(sends.length, 1);
+  assert.equal(service.questionNotice('q-loop'), 'reached', 'reached only because a device got it');
+  // … a stored row in its request envelope, and the held-firing ask likewise.
+  await service.notifyQuestion({ id: 'q-row', conversationId: 'conv-1', prompt: 'Go on?', request: JSON.stringify({ context: { source: 'remote_relay', variant: 'loop_guard' } }) });
+  await service.notifyQuestion({ id: 'ask_fixture01', conversationId: 'conv-1', prompt: 'Held', choices: ['Allow once'], context: { variant: 'loop_guard' } });
+  assert.equal(sends.length, 3);
+
+  const write = await service.notifyQuestion({ id: 'q-write', conversationId: 'conv-1', prompt: 'Allow?', context: { source: 'remote_relay', variant: 'write' } });
+  assert.equal(write.outcome, 'suppressed');
+  assert.equal(sends.length, 3);
 });

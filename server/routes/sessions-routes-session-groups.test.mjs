@@ -12,6 +12,7 @@ import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound
 import { asAgent, asOwner } from '../services/relay-principal-test-harness.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { registerConversationGroupRoutes } from './conversation-group-routes.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 // Session groups on the conversation routes, against the REAL schema: a
 // session an agent of this relay creates joins its creator's group at
@@ -116,7 +117,6 @@ function setup(overrides = {}) {
     resolveConversationWorkspaceState: () => null,
     updateConversationConfiguredWorkspaceRoot: () => ({ ok: true }),
     learnConversationWorkspaceRoot: () => ({ ok: true }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     getPendingSessionCwd: () => null,
     workspaceRootAllowList: [],
@@ -124,7 +124,6 @@ function setup(overrides = {}) {
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'client-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     ensureRuntimeSessionBinding: () => ({ id: 'runtime-session-1' }),
@@ -136,12 +135,9 @@ function setup(overrides = {}) {
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
     sessionWorkerRegistry: createSessionWorkerRegistry(),
+    sessionWorkerSupervisor: fakeSessionWorkerSupervisor(),
     sessionHistoryRefreshService: {
       evaluateRefreshIdleState: () => ({ idle: true }),
       replaceRetrievableHistory: () => {},

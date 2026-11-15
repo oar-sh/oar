@@ -321,7 +321,9 @@ async function handleNewSignInClick(event, data) {
   await focusOrOpenSettings(data.open);
 }
 
-async function answerQuestionFromNotification(questionId, answer) {
+// `sdkSessionId` is the card's session from the push payload: the answer
+// route refuses an answer to a card with a session that does not name it.
+async function answerQuestionFromNotification(questionId, answer, sdkSessionId = '') {
   // Same-origin POST with credentials so the HttpOnly auth cookie applies,
   // and the session's key with it.
   const target = scopeUrl(`api/relay-question/${encodeURIComponent(questionId)}/answer`);
@@ -329,7 +331,7 @@ async function answerQuestionFromNotification(questionId, answer) {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...(await sessionProofHeaders(target)) },
-    body: JSON.stringify({ answer }),
+    body: JSON.stringify({ answer, sdk_session_id: String(sdkSessionId || '').trim() || undefined }),
   });
   return { ok: response.ok, status: response.status, signedOut: await isSignedOutResponse(response) };
 }
@@ -379,7 +381,7 @@ async function handleNotificationClick(event) {
     const choice = (Array.isArray(data.choices) ? data.choices : [])[Number(choiceMatch[1])];
     if (choice) {
       event.notification.close();
-      const answered = await answerQuestionFromNotification(data.questionId, String(choice));
+      const answered = await answerQuestionFromNotification(data.questionId, String(choice), data.sdkSessionId);
       // If the answer did not land (expired, already answered, offline), fall
       // through to opening the conversation so the user can see why.
       if (answered.ok) return;

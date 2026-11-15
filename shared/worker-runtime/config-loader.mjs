@@ -25,7 +25,8 @@ function looksLikeServerDir(serverDir) {
 }
 
 /**
- * Where the extension finds the relay, its config and logs. A global install
+ * Where the removed Copilot CLI extension found the relay, its config and
+ * logs; only tests call it now. A global install
  * uses the state root's folders as `oar start` does, and `RELAY_ENV` pins
  * them for the managed relay (not `server/data`, which `npm i -g` deletes).
  * The environment wins; a checkout keeps its `server/` folders.

@@ -133,14 +133,6 @@ function makeRouteDeps({ db, stmts, emitted }) {
     relayActivityForResponse: (responseId) => stmts.listActivityByResponse.all(responseId),
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),
     computeRetryDelayMs: () => 0,
-    // The session worker's HTTP bridge names its session via headers; routes
-    // resolve executed-provider provenance through this identity.
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId } = {}) => {
-        const normalized = String(sessionId || '').trim();
-        return normalized ? { sessionId: normalized } : null;
-      },
-    },
   });
 }
 
@@ -172,7 +164,6 @@ function dequeueForWorker({ db, stmts, deps }) {
     db,
     stmts,
     nowIso: new Date().toISOString(),
-    routingEnabled: false,
     requesterSessionId: CONV,
   });
   if (!row) return null;
@@ -930,6 +921,8 @@ test('the heartbeat fails the settle-failed rows a worker hands over', async () 
   const terminalError = buildSteerSettleFailure(delivered, { variant: 'stopped' });
 
   // Unowned, or owned by another worker: never failed on this worker's word.
+  // With routing on the row is owned from enqueue, so the owner is cleared.
+  db.prepare(`UPDATE queue SET owner_sdk_session_id = NULL WHERE id = ?`).run(delivered.id);
   const unowned = await api('POST', '/api/heartbeat', {
     activeQueueMessageIds: [delivered.id],
     settleFailed: [{ id: delivered.id, attemptId: delivered.attemptId, terminalError }],

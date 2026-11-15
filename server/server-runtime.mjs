@@ -156,7 +156,7 @@ import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
 import { createCopilotModelDiscoveryService } from './services/copilot-model-discovery-service.mjs';
-import { createInstalledCopilotClient, getCopilotBaseDirs, resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
+import { createInstalledCopilotClient, resolveCopilotSdkLaunchPath, resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
 import { createClaudeSessionRootResolver } from './services/claude-session-root-service.mjs';
@@ -173,13 +173,10 @@ import { createProtectedRelayFiles } from './services/relay-protected-files.mjs'
 import { resolveStateLayout } from './services/oar-state-layout.mjs';
 import { ensureDataDirs, resolveDataDir, resolveUploadDir, resolveUploadReadDirs, uploadPathInDirs } from './services/data-dir-resolution.mjs';
 import { mergeStrayMigratedUploads } from './services/oar-state-migration-service.mjs';
-import { createRelayRestartOrchestrator } from './services/relay-restart-orchestrator-service.mjs';
-import { createRelayBridgeOwnerService } from './services/relay-bridge-owner-service.mjs';
-import { createRelayCliLauncherService } from './services/relay-cli-launcher-service.mjs';
 import { createSessionWorkerRegistry, normalizeWorkerKind } from './services/session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './services/session-worker-supervisor-service.mjs';
-import { createProcessIdentityReader, createSessionWorkerProcessInspector, identityOfListedWorker, mayReuseSessionWorkerRow } from './services/session-worker-process-service.mjs';
-import { agentSdkForWorkerKind, applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, copilotSdkEngineUnavailableReason, killTmuxSession, launchSessionCli, resolveWorkerKind } from './services/session-worker-launch-service.mjs';
+import { createProcessIdentityReader, createSessionWorkerProcessInspector, identityOfListedWorker, judgeListedSessionProcess, stopLeftoverSessionProcess } from './services/session-worker-process-service.mjs';
+import { agentSdkForWorkerKind, applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, createCliSpawnDisabledDeferral, isCliSpawnDisabled, killTmuxSession, launchSessionCli, resolveWorkerKind } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
 import {
@@ -213,9 +210,6 @@ import { guardUpgradeSocket } from './services/upgrade-socket-guard.mjs';
 import { createWindowsAutostartService } from './services/windows-autostart-service.mjs';
 import { createWindowsBootAutostartService } from './services/windows-boot-autostart-service.mjs';
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
-import { createTmuxInspectorAccessPolicy } from './services/tmux-inspector-access-policy.mjs';
-import { createTmuxInspectorStreamService } from './services/tmux-inspector-stream-service.mjs';
-import { createTmuxInspectorSocketService } from './services/tmux-inspector-socket-service.mjs';
 import { createSubagentViewerRooms } from './services/subagent-viewer-rooms.mjs';
 import { createTaskOutputRooms } from './services/task-output-rooms.mjs';
 import { createTaskHealthPoller, createTaskOutputSnapshots } from './services/task-output-service.mjs';
@@ -225,13 +219,9 @@ import {
 } from './services/workspace-root-defaults-service.mjs';
 import { installRelayConsoleLog, resolveRelayConsoleLogPath } from './services/relay-console-log.mjs';
 import { isMissingSqliteBindingError, missingSqliteBindingLines } from './services/native-addon-build-service.mjs';
-import {
-  computeFeatureFlagState,
-  FEATURE_REGISTRY,
-  featureSettingKey,
-  migrateLegacyConfigFeatures,
-  resolveBootFeatureFlags,
-} from './features.mjs';
+import { retiredFeatureFlagsLine } from './services/retired-feature-flags.mjs';
+import { cleanUpCopilotWrapperAtStart, retiredCopilotEngineLine } from './services/retired-copilot-extension.mjs';
+import { removeGeneratedCopilotWrapper } from './services/oar-cli-helpers.mjs';
 import { RELAY_RESTART_EXIT_CODE, RELAY_STOP_EXIT_CODE } from './relay-exit-codes.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS, questionExpiresAt } from '../shared/question-timeout.mjs';
 import {
@@ -263,6 +253,8 @@ import { createWorkerScope } from './services/worker-scope.mjs';
 import { createStaleRecoveryClockGuard } from './services/stale-recovery-clock-guard.mjs';
 import { createArmableInterval, createCliPresence } from './services/idle-timers.mjs';
 import { installQueueWakeHook } from './services/queue-wake-hook.mjs';
+import { reportParkedQueueAtBoot } from './services/relay-queue-gate-service.mjs';
+import { failRowsOfGoneConversations, failStaleOwnerlessRowsAtBoot } from './services/ownerless-queue-rows.mjs';
 import { createPendingWorkerPrimer, createQueueWaker } from './services/queue-waker.mjs';
 import { createStaleTurnRecovery } from './services/stale-turn-recovery.mjs';
 import {
@@ -1604,19 +1596,6 @@ const OPENAI_MODEL_SETTING_KEY = 'openai_model';
 const OPENAI_MODELS_SETTING_KEY = 'openai_models';
 const OPENAI_BASE_URL_SETTING_KEY = 'openai_base_url';
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
-// Which engine runs a Copilot (github / openai-provider) conversation: the
-// `copilot` CLI under a PTY with the web-relay extension injected, or the
-// headless SDK worker. The provider SET is unchanged by this — `github` and
-// `openai` stay the provider types, and this only selects the worker kind they
-// spawn, so model catalogs, usage cards and routing all stay put.
-const COPILOT_ENGINE_SETTING_KEY = 'copilot_engine';
-const COPILOT_ENGINES = ['extension', 'sdk'];
-// Phase 6 of the extension retirement (2026-09-07): the headless SDK worker is
-// the default engine. The extension remains reachable two ways until deletion:
-// an explicit stored setting, or automatically when this relay cannot run the
-// SDK engine at all (no resolvable Copilot CLI, or session-worker routing off).
-const DEFAULT_COPILOT_ENGINE = 'sdk';
-const FALLBACK_COPILOT_ENGINE = 'extension';
 const CLAUDE_ENABLED_SETTING_KEY = 'claude_enabled';
 const CLAUDE_MODEL_SETTING_KEY = 'claude_model';
 const CLAUDE_MODELS_SETTING_KEY = 'claude_models';
@@ -2109,27 +2088,6 @@ const MAX_REQUEUE_RETRIES = Number.isFinite(Number(config.maxRequeueRetries))
 const processingTimeoutMs = Number(config.processingTimeoutMs) > 0
   ? Number(config.processingTimeoutMs)
   : DEFAULT_PROCESSING_TIMEOUT_MS;
-const restartGracefulTimeoutMs = Number(config.restartGracefulTimeoutMs) > 0
-  ? Number(config.restartGracefulTimeoutMs)
-  : 8_000;
-const restartReadyCooldownMs = Number(config.restartReadyCooldownMs) > 0
-  ? Number(config.restartReadyCooldownMs)
-  : 1_000;
-const restartShutdownTimeoutMs = Number(config.restartShutdownTimeoutMs) > 0
-  ? Number(config.restartShutdownTimeoutMs)
-  : 45_000;
-const restartSpawnTimeoutMs = Number(config.restartSpawnTimeoutMs) > 0
-  ? Number(config.restartSpawnTimeoutMs)
-  : 18_000;
-const restartRebindTimeoutMs = Number(config.restartRebindTimeoutMs) > 0
-  ? Number(config.restartRebindTimeoutMs)
-  : 20_000;
-const restartMaxAttempts = Number.isFinite(Number(config.restartMaxAttempts))
-  ? Math.max(1, Number(config.restartMaxAttempts))
-  : 3;
-const restartRetryBackoffMs = Array.isArray(config.restartRetryBackoffMs)
-  ? config.restartRetryBackoffMs
-  : [1_000, 3_000, 7_000];
 const localhostOnly = config.localhostOnly === true || String(config.localhostOnly || '').trim().toLowerCase() === 'true';
 const listenHost = localhostOnly ? '127.0.0.1' : '0.0.0.0';
 // Optional containment for client-chosen launch directories. Unset/empty/malformed
@@ -2256,42 +2214,6 @@ function normalizeConversationWorkspaceRootPath(candidatePath) {
   return normalized || null;
 }
 
-// Per-session pending CWD registry. Stores the CLI working directory reported on
-// startup before the session has been bound to any conversation. Consumed when the
-// session eventually binds (via /api/session-sync) and persisted to the DB.
-const pendingSessionCwds = new Map();
-const MAX_PENDING_SESSION_CWDS = 64;
-
-function setPendingSessionCwd(sdkSessionId, cwdPath) {
-  const sid = String(sdkSessionId || '').trim();
-  if (!sid) return false;
-  const normalized = normalizeConversationWorkspaceRootPath(cwdPath);
-  if (!normalized) return false;
-  if (pendingSessionCwds.size >= MAX_PENDING_SESSION_CWDS) {
-    const oldest = pendingSessionCwds.keys().next().value;
-    if (oldest) pendingSessionCwds.delete(oldest);
-  }
-  pendingSessionCwds.set(sid, normalized);
-  // Persist to the DB so the path survives relay restarts and appears in the
-  // "Known CWDs" picker even before the session is bound to a conversation.
-  rememberRecentWorkspaceRoot(normalized);
-  return true;
-}
-
-function getPendingSessionCwd(sdkSessionId) {
-  const sid = String(sdkSessionId || '').trim();
-  if (!sid) return null;
-  return pendingSessionCwds.get(sid) || null;
-}
-
-function consumePendingSessionCwd(sdkSessionId) {
-  const sid = String(sdkSessionId || '').trim();
-  if (!sid) return null;
-  const value = pendingSessionCwds.get(sid) || null;
-  if (value) pendingSessionCwds.delete(sid);
-  return value;
-}
-
 function listRecentWorkspaceRoots(limit = MAX_RECENT_WORKSPACE_ROOTS) {
   const maxItems = Math.max(1, Math.min(MAX_RECENT_WORKSPACE_ROOTS, Number(limit) || MAX_RECENT_WORKSPACE_ROOTS));
   if (!stmts?.listRecentWorkspaceRoots?.all) return [];
@@ -2318,50 +2240,11 @@ function readAppSettingValue(key) {
   return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
 }
 
-/**
- * The Copilot engine setting, normalised. An explicit stored value always
- * wins. Unset (or unrecognised) reads as the SDK default — but only when this
- * relay can actually run the SDK engine: the save path refuses to persist
- * 'sdk' on a relay that cannot honour it, and the default must not sneak past
- * that same guard. A relay with no resolvable Copilot CLI or with
- * session-worker routing disabled falls back to the extension engine so a
- * Copilot conversation can still start at all.
- */
-function getCopilotEngine() {
-  const stored = readAppSettingValue(COPILOT_ENGINE_SETTING_KEY).toLowerCase();
-  if (COPILOT_ENGINES.includes(stored)) return stored;
-  const unavailable = copilotSdkEngineUnavailableReason({
-    env: sessionWorkerLaunchEnv,
-    routingEnabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
-  });
-  return unavailable ? FALLBACK_COPILOT_ENGINE : DEFAULT_COPILOT_ENGINE;
-}
-
+// Copilot (github and openai conversations) runs on the SDK worker and
+// nothing else. The answer keeps its shape for paired relays on a version
+// that still asks which engine this relay runs.
 function getCopilotProviderSettings() {
-  return { engine: getCopilotEngine(), engines: [...COPILOT_ENGINES] };
-}
-
-function setCopilotProviderSettings({ engine } = {}) {
-  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
-    return { ok: false, error: 'Copilot settings are unavailable' };
-  }
-  const normalized = String(engine || '').trim().toLowerCase();
-  if (!COPILOT_ENGINES.includes(normalized)) return { ok: false, error: 'Invalid Copilot engine' };
-  if (normalized === 'sdk') {
-    // Refuse rather than persist a setting that cannot take effect. Both
-    // preconditions are boot-time facts this module owns: the launch
-    // environment is snapshotted once at startup, and the routing flag decides
-    // whether any node worker is ever spawned at all.
-    const unavailable = copilotSdkEngineUnavailableReason({
-      env: sessionWorkerLaunchEnv,
-      routingEnabled: featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true,
-    });
-    // 409, not 400: the request is well-formed, the relay is not in a state to
-    // honour it.
-    if (unavailable) return { ok: false, status: 409, error: unavailable };
-  }
-  stmts.upsertAppSetting.run(COPILOT_ENGINE_SETTING_KEY, normalized, new Date().toISOString());
-  return { ok: true, ...getCopilotProviderSettings() };
+  return { engine: 'sdk', engines: ['sdk'] };
 }
 
 function getTurnCeilingMinutes() {
@@ -2446,31 +2329,6 @@ function setPwaAppName(rawValue) {
   // Settings open on another device show the new name (Settings › Relays).
   try { remoteRelayRegistry.notifySelfChanged(); } catch {}
   return { ok: true, appName: normalized.value };
-}
-
-function getFeatureFlagsSettingsState() {
-  // `featureFlags` is const-declared later in boot; this only runs from request
-  // handlers, well after the snapshot exists (same shape as setCopilotProviderSettings).
-  return computeFeatureFlagState({
-    readSetting: readAppSettingValue,
-    env: process.env,
-    activeFlags: featureFlags,
-  });
-}
-
-function setFeatureFlagSetting(name, enabled) {
-  if (typeof stmts?.upsertAppSetting?.run !== 'function') {
-    return { ok: false, error: 'Feature settings are unavailable' };
-  }
-  const normalized = String(name || '').trim();
-  if (!FEATURE_REGISTRY.some((entry) => entry.name === normalized)) {
-    return { ok: false, error: 'Unknown feature flag' };
-  }
-  if (typeof enabled !== 'boolean') {
-    return { ok: false, error: 'enabled must be a boolean' };
-  }
-  stmts.upsertAppSetting.run(featureSettingKey(normalized), enabled ? '1' : '0', new Date().toISOString());
-  return { ok: true };
 }
 
 const BACKGROUND_TASK_TIMEOUT_SETTING_KEY = 'background_task_timeout_minutes';
@@ -2628,10 +2486,6 @@ function buildConversationWorkspaceRootState(row = null, {
   const conversation = row && typeof row === 'object' ? row : null;
   const conversationId = String(conversation?.id || fallbackConversationId || '').trim() || null;
   const sdkSessionId = String(conversation?.sdk_session_id || fallbackSdkSessionId || conversationId || '').trim() || null;
-  // pendingCwd: CWD reported by the CLI at startup before the session was bound to any
-  // conversation. Used as a fallback so the correct directory is shown as soon as the
-  // session starts, even before the first message is processed.
-  const pendingCwd = sdkSessionId ? getPendingSessionCwd(sdkSessionId) : null;
   const configuredWorkspaceRootPath =
     normalizeConversationWorkspaceRootPath(conversation?.configured_workspace_root_path)
     || null;
@@ -2643,8 +2497,8 @@ function buildConversationWorkspaceRootState(row = null, {
     || null;
   const running = sdkSessionId ? isConversationSessionRunning(sdkSessionId) : false;
   const effectiveWorkspaceRootPath = running
-    ? (runtimeWorkspaceRootPath || pendingCwd || configuredWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath())
-    : (pendingCwd || configuredWorkspaceRootPath || runtimeWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath());
+    ? (runtimeWorkspaceRootPath || configuredWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath())
+    : (configuredWorkspaceRootPath || runtimeWorkspaceRootPath || discoveredCurrentWorkspaceRootPath || currentWorkspaceRootPath());
   const currentWorkspaceRootPathValue = effectiveWorkspaceRootPath || currentWorkspaceRootPath();
   return {
     conversationId,
@@ -2717,15 +2571,12 @@ function learnConversationWorkspaceRoot({ sdkSessionId = '', conversationId = ''
 }
 
 function resolveLaunchWorkspaceRootForSession(sdkSessionId) {
-  const state = resolveConversationWorkspaceState({ sdkSessionId });
-  // Fall back to the pending session CWD (reported by the CLI at startup) before using
-  // the server-wide workspace root, so manually-started sessions with no DB-bound
-  // conversation still launch in the directory where the CLI was originally started.
-  const sid = String(sdkSessionId || '').trim();
+  // The conversation named like the session first: a chat that was never
+  // bound has no session id of its own, and its worker runs under its id.
+  const state = resolveConversationWorkspaceState({ conversationId: sdkSessionId, sdkSessionId });
   const defaultSessionWorkspaceRootPath = getDefaultSessionWorkspaceRootPath();
   return resolveLaunchWorkspaceRootPath({
     configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || '',
-    pendingSessionWorkspaceRootPath: sid ? (getPendingSessionCwd(sid) || '') : '',
     defaultSessionWorkspaceRootPath: defaultSessionWorkspaceRootPath || '',
     workspaceRootPath: currentWorkspaceRootPath(),
   });
@@ -3254,6 +3105,10 @@ function writeCliBinariesToConfig(binaries) {
 const cliInstallService = createCliInstallService({
   readBoundBinaries: readCliBinariesFromConfig,
   writeBoundBinaries: writeCliBinariesToConfig,
+  // A Copilot install is done when a launch would find its SDK: the same
+  // lookup, configuration and environment as buildSessionWorkerLaunchEnvForSession
+  // (called only after an install, long after both exist).
+  findCopilotSdk: () => resolveCopilotSdkLaunchPath({ config, env: sessionWorkerLaunchEnv }),
 });
 // Re-apply what a previous install resolved before anything can spawn a worker,
 // so a restarted relay finds the same binaries it found before — including on a
@@ -3355,20 +3210,9 @@ void deleteArchiveService.retryPendingDeletesOnStartup()
   .catch((error) => {
     console.warn(`Startup delete retry failed: ${error?.message || error}`);
   });
-const relayRestartOrchestrator = createRelayRestartOrchestrator({
-  db,
-  gracefulTimeoutMs: restartGracefulTimeoutMs,
-  readyCooldownMs: restartReadyCooldownMs,
-  shutdownTimeoutMs: restartShutdownTimeoutMs,
-  spawnTimeoutMs: restartSpawnTimeoutMs,
-  rebindTimeoutMs: restartRebindTimeoutMs,
-  maxAttempts: restartMaxAttempts,
-  retryBackoffMs: restartRetryBackoffMs,
-});
 const sessionWorkerRegistry = createSessionWorkerRegistry();
 const sessionWorkerProcessInspector = createSessionWorkerProcessInspector({
   platform: process.platform,
-  execFileSyncImpl: execFileSync,
   execFileImpl: execFile,
   logger: console,
 });
@@ -3380,56 +3224,6 @@ const readWorkerProcessIdentity = createProcessIdentityReader({
   readProcessSnapshot: (options) => sessionWorkerProcessInspector.readProcessSnapshot(options),
 });
 function buildSessionWorkerLaunchEnv() {
-  const normalizePathValue = (value) => {
-    const text = String(value || '').trim();
-    return text || null;
-  };
-  const resolveBootstrapPath = () => {
-    const explicit = normalizePathValue(process.env.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH)
-      || normalizePathValue(process.env.COPILOT_EXTENSION_BOOTSTRAP_PATH);
-    if (explicit && fs.existsSync(explicit)) return explicit;
-
-    const distDir = normalizePathValue(process.env.COPILOT_CLI_DIST_DIR);
-    if (distDir) {
-      const candidate = path.join(distDir, 'preloads', 'extension_bootstrap.mjs');
-      if (fs.existsSync(candidate)) return candidate;
-    }
-
-    const configuredSdkPath = normalizePathValue(config.sdkPath);
-    if (configuredSdkPath) {
-      const versionDir = path.resolve(path.dirname(configuredSdkPath), '..');
-      const candidate = path.join(versionDir, 'preloads', 'extension_bootstrap.mjs');
-      if (fs.existsSync(candidate)) return candidate;
-    }
-    // The CLI cache lives in a per-platform location (LOCALAPPDATA on Windows,
-    // Application Support on macOS, XDG dirs on Linux) — scan the same base
-    // dirs as the SDK client instead of assuming the Linux layout. Selection
-    // deliberately keys on the bootstrap file itself rather than the bundled
-    // SDK: CLI versions without a copilot-sdk directory must still resolve
-    // here for the extension engine.
-    const subdirs = [`${process.platform}-${process.arch}`, 'universal'];
-    const candidates = [];
-    for (const [baseDirIdx, baseDir] of getCopilotBaseDirs().entries()) {
-      for (const [subdirIdx, subdir] of subdirs.entries()) {
-        let entries = [];
-        try { entries = fs.readdirSync(path.join(baseDir, subdir)); } catch { continue; }
-        for (const version of entries) {
-          if (!/^\d+\.\d+\.\d+$/.test(version)) continue;
-          const candidate = path.join(baseDir, subdir, version, 'preloads', 'extension_bootstrap.mjs');
-          if (fs.existsSync(candidate)) candidates.push({ version, baseDirIdx, subdirIdx, candidate });
-        }
-      }
-    }
-    candidates.sort((a, b) => {
-      const aVersion = a.version.split('.').map(Number);
-      const bVersion = b.version.split('.').map(Number);
-      return bVersion[0] - aVersion[0] || bVersion[1] - aVersion[1] || bVersion[2] - aVersion[2]
-        || a.baseDirIdx - b.baseDirIdx || a.subdirIdx - b.subdirIdx;
-    });
-    if (candidates.length) return candidates[0].candidate;
-    return null;
-  };
-
   const next = { ...process.env };
   // Each session gets its own agent token (buildSessionWorkerLaunchEnvWithAgentToken);
   // one this relay inherited (started from an agent's shell) is never passed on.
@@ -3449,43 +3243,6 @@ function buildSessionWorkerLaunchEnv() {
   if (!String(next.COPILOT_WEB_RELAY_LOG_DIR || '').trim()) {
     next.COPILOT_WEB_RELAY_LOG_DIR = path.join(__dirname, 'logs');
   }
-  if (!String(next.EXTENSION_PATH || '').trim()) {
-    const projectExtensionPath = path.join(REPO_ROOT, '.github', 'extensions', 'web-relay', 'extension.mjs');
-    if (fs.existsSync(projectExtensionPath)) {
-      next.EXTENSION_PATH = projectExtensionPath;
-    }
-  }
-  const cliExecutable = normalizePathValue(config.cliPath);
-  if (cliExecutable && !String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
-    next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = cliExecutable;
-  }
-  if (!String(next.COPILOT_WEB_RELAY_CLI_EXECUTABLE || '').trim()) {
-    try {
-      const loaderPath = fs.realpathSync('/usr/bin/copilot');
-      const packageRoot = path.dirname(loaderPath);
-      const nativePath = path.join(
-        packageRoot,
-        'node_modules',
-        `@github/copilot-${process.platform}-${process.arch}`,
-        'copilot',
-      );
-      if (fs.existsSync(nativePath)) {
-        next.COPILOT_WEB_RELAY_CLI_EXECUTABLE = nativePath;
-      }
-    } catch {
-      // Fall back to the copilot executable resolved by PATH.
-    }
-  }
-  const bootstrapPath = resolveBootstrapPath();
-  if (bootstrapPath && !String(next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH || '').trim()) {
-    next.COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH = bootstrapPath;
-  }
-  if (bootstrapPath && !String(next.COPILOT_SDK_PATH || '').trim()) {
-    const bundledSdkPath = path.join(path.dirname(path.dirname(bootstrapPath)), 'copilot-sdk');
-    if (fs.existsSync(path.join(bundledSdkPath, 'extension.js'))) {
-      next.COPILOT_SDK_PATH = bundledSdkPath;
-    }
-  }
   return next;
 }
 const sessionWorkerLaunchEnv = buildSessionWorkerLaunchEnv();
@@ -3499,7 +3256,7 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   // keep the chained clears order-independent), then apply only the bound one.
   const cleared = applyClaudeApiProviderEnvironment(applyDeepSeekProviderEnvironment(applyClaudeCloudProviderEnvironment(applyCopilotSdkProviderEnvironment(applyGrokProviderEnvironment(applyCursorProviderEnvironment(applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(sessionWorkerLaunchEnv))))))));
   // A Claude Cloud conversation gets its own worker and nothing else: it must
-  // never reach the Copilot CLI fall-through at the end of this function. The
+  // never reach the Copilot fall-through at the end of this function. The
   // environment names the worker and the model, no credential.
   if (providerType === 'claude-cloud') {
     const cloudSettings = getClaudeCloudProviderSettings();
@@ -3565,38 +3322,33 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
       command: String(process.env.GROK_CLI_COMMAND || process.env.GROK_COMMAND || '').trim(),
     });
   }
-  // Only the two providers the Copilot CLI serves get this far, so the setting
-  // is read here rather than at the top of the function: claude/cursor/grok
-  // spawns would otherwise pay a DB read whose answer they always discard.
-  //
-  // The toggle picks the WORKER KIND, not the provider type — routing, model
-  // catalogs and usage cards are unaffected. Read per spawn, so flipping the
-  // setting takes effect on the next worker without disturbing running ones.
-  const copilotSdkEngine = getCopilotEngine() === 'sdk';
+  // Only the two providers the Copilot SDK worker serves get this far: github
+  // (and any unknown provider, which binds to github) and openai. The SDK is
+  // the one inside the Copilot CLI's newest version folder, looked up on
+  // every launch: a CLI installed or updated since the relay started is
+  // found, and a version folder that is gone is not used. With none the
+  // lookup throws, and the conversation gets the launch note.
+  const sdkPath = resolveCopilotSdkLaunchPath({ config, env: sessionWorkerLaunchEnv });
   if (providerType !== 'openai') {
-    // github (and any unknown provider, which binds to github): the extension
-    // engine is the absence of a worker kind, the SDK engine names one.
-    if (!copilotSdkEngine) return cleared;
     return applyCopilotSdkProviderEnvironment(cleared, {
       enabled: true,
       model: String(runtimeSession?.provider_model || runtimeSession?.model || '').trim(),
+      sdkPath,
     });
   }
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
-  // BYOK first, engine second: the OpenAI applier owns the COPILOT_PROVIDER_*
-  // family on both engines (the extension's CLI startup layer reads it, and the
-  // SDK worker re-expresses it as SessionConfig.provider because the runtime
-  // ignores it for SDK-created sessions), and the engine applier only adds the
-  // worker kind on top.
+  // BYOK first, worker kind second: the OpenAI applier owns the
+  // COPILOT_PROVIDER_* family (the SDK worker re-expresses it as
+  // SessionConfig.provider because the runtime ignores it for SDK-created
+  // sessions), and the SDK applier adds the worker kind on top.
   const openAiEnv = applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
     apiKey: settings.apiKey,
     model,
     baseUrl: settings.baseUrl,
   });
-  if (!copilotSdkEngine) return openAiEnv;
-  return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model });
+  return applyCopilotSdkProviderEnvironment(openAiEnv, { enabled: true, model, sdkPath });
 }
 // The session's environment plus its agent token: OAR_AGENT_TOKEN is what the
 // worker, its CLI, the CLI's tools and MCP servers authenticate with. It opens
@@ -3616,15 +3368,6 @@ function buildSessionWorkerLaunchEnvWithAgentToken(targetSessionId) {
 // Under a systemd user service, session workers start in scopes of their
 // own (worker-scope.mjs); asked once, at the first worker start.
 const workerScope = createWorkerScope({ hosting: detectRelayHosting(), log: (message) => console.log(`${runtimeLogPrefix()}${message}`) });
-const relayCliLauncherService = createRelayCliLauncherService({
-  cwd: (targetSessionId) => resolveLaunchWorkspaceRootForSession(targetSessionId),
-  env: (targetSessionId) => {
-    const agentToken = agentTokenForConversation(targetSessionId);
-    return agentToken ? { ...sessionWorkerLaunchEnv, [AGENT_TOKEN_ENV]: agentToken } : { ...sessionWorkerLaunchEnv };
-  },
-  log: (message) => console.log(`${runtimeLogPrefix()}${message}`),
-  workerScope,
-});
 
 // The launch gate (agent-sdk-launch-gate.mjs): never waits for an install.
 // A session it held back gets its launch back when the install ends or the
@@ -3640,6 +3383,9 @@ const agentSdkLaunchGate = createAgentSdkLaunchGate({
   },
 });
 
+const deferLaunchWhileCliSpawnDisabled = createCliSpawnDisabledDeferral({
+  log: (line) => console.log(`${runtimeLogPrefix()}${line}`),
+});
 async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true } = {}) {
   const normalizedTargetSessionId = String(targetSessionId || '').trim();
   if (!normalizedTargetSessionId) {
@@ -3672,17 +3418,38 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
     const liveIdentity = liveWorker?.processId
       ? await identityOfListedWorker(liveWorker, { platform: process.platform, identityOf: readWorkerProcessIdentity })
       : null;
-    if (liveWorker?.processId && mayReuseSessionWorkerRow({
-      row: liveWorker,
-      current: liveIdentity,
-      sdkSessionId: normalizedTargetSessionId,
-      isAlive: (pid) => isProcessAlive(pid),
-    })) {
+    // Only a session worker is reused, of whatever kind. A Copilot CLI an
+    // earlier version started for the session is stopped as the kill route
+    // stops a session's processes, and the launch below starts its worker.
+    const listed = liveWorker?.processId
+      ? judgeListedSessionProcess({
+        row: liveWorker,
+        current: liveIdentity,
+        sdkSessionId: normalizedTargetSessionId,
+        isAlive: (pid) => isProcessAlive(pid),
+      })
+      : 'none';
+    if (listed === 'leftover' && !isCliSpawnDisabled(sessionWorkerLaunchEnv)) {
+      await stopLeftoverSessionProcess({
+        sdkSessionId: normalizedTargetSessionId,
+        stop: () => stopSessionWorkerProcesses({
+          sdkSessionId: normalizedTargetSessionId,
+          processInspector: sessionWorkerProcessInspector,
+          isPidAliveImpl: isProcessAlive,
+          killTmuxSessionImpl: killTmuxSession,
+        }),
+        log: (line) => console.warn(`${runtimeLogPrefix()}${line}`),
+      });
+    }
+    if (listed === 'worker') {
       const workerId = `worker-${normalizedTargetSessionId.slice(0, 8)}`;
       console.log(`${runtimeLogPrefix()}worker launcher: reused ${workerId} session=${normalizedTargetSessionId.slice(0, 8)} pid=${liveWorker.processId}`);
       return { workerId, pid: liveWorker.processId };
     }
   }
+  // A test relay launches nothing: deferred for good, so the turn stays
+  // queued for a worker that reports by itself.
+  if (isCliSpawnDisabled(sessionWorkerLaunchEnv)) return deferLaunchWhileCliSpawnDisabled(normalizedTargetSessionId);
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const workerLaunchEnv = buildSessionWorkerLaunchEnvWithAgentToken(normalizedTargetSessionId);
   // Synchronous: nothing between the gate and the launch can start a
@@ -3738,19 +3505,32 @@ const sessionWorkerSupervisor = createSessionWorkerSupervisor({
   diagnosticPlanReference: () => path.join(currentWorkspaceRootPath(), '.cursor', 'plans', 'worker-startup-monitoring-plan.md'),
   log: (message) => console.warn(`${runtimeLogPrefix()}${message}`),
   onLaunchState: (event) => workerLaunchNoteService.handle(event),
+  // Every worker this relay launches says its kind: a process that
+  // heartbeats for a session and never said one is reused only when its
+  // identity read below shows a session worker; otherwise the launch runs
+  // and stops it. A test relay launches none and takes whoever reports.
+  workersStateTheirKind: () => !isCliSpawnDisabled(sessionWorkerLaunchEnv),
+  // What such a process is: a worker of an earlier version (no kind either)
+  // is reused, only a process that is no session worker goes to the launch.
+  // A read that tells something is kept for the pid; one that tells nothing
+  // reuses the process for that call and is repeated at the next.
+  readProcessIdentity: readWorkerProcessIdentity,
   // A kill's grace ended: the session's rows may go to its next worker.
   onKillBlockLifted: () => { wakeSessionWorkerQueue('kill-block-lifted'); },
 });
-// Feature flags moved from config.json into app_settings; adopt any legacy
-// `features` key once, then resolve the boot snapshot (defaults < stored rows
-// < COPILOT_REMOTE_* env). The snapshot is frozen for the process lifetime —
-// the Features settings tab persists changes and asks for a relay restart.
-migrateLegacyConfigFeatures({
-  configPath: CONFIG_PATH,
-  readSetting: readAppSettingValue,
-  writeSetting: (key, value) => stmts.upsertAppSetting.run(key, value, new Date().toISOString()),
-});
-const featureFlags = resolveBootFeatureFlags({ readSetting: readAppSettingValue });
+// The retired feature flags are always on. A stored row, an environment
+// variable or a config.json `features` key that still says "off" is named
+// once here and otherwise ignored; nothing stored is changed.
+const retiredFlagsLine = retiredFeatureFlagsLine({ readSetting: readAppSettingValue, env: process.env, configPath: CONFIG_PATH });
+if (retiredFlagsLine) console.warn(`${runtimeLogPrefix()}${retiredFlagsLine}`);
+// The same for a stored Copilot engine choice of "extension": that engine
+// is gone, the row stays.
+const retiredEngineLine = retiredCopilotEngineLine({ readSetting: readAppSettingValue });
+if (retiredEngineLine) console.warn(`${runtimeLogPrefix()}${retiredEngineLine}`);
+// The wrapper earlier versions wrote into the Copilot CLI's extensions
+// folder loads an extension that no longer exists, and fails on every start
+// of the CLI: removed once here when it is recognisably the generated one.
+cleanUpCopilotWrapperAtStart({ remove: () => removeGeneratedCopilotWrapper(), log: (line) => console.warn(`${runtimeLogPrefix()}${line}`) });
 
 // Settle any persisted self-update attempt from the previous run: an unchanged
 // version after the restart becomes a visible failure carrying the npm log.
@@ -3901,7 +3681,7 @@ async function reconcileUnstartedConversationProviders({ enabled, model, provide
     let workerWasStopped = false;
     let providerWasUpdated = false;
     try {
-      if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+      if (ownerSessionId) {
         workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
       }
       stmts.updateRuntimeSessionProvider.run(
@@ -3997,7 +3777,7 @@ async function rebindUnstartedOpenAIConversationModel({ conversationId, model } 
   let workerWasStopped = false;
   let providerWasUpdated = false;
   try {
-    if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true && ownerSessionId) {
+    if (ownerSessionId) {
       workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
     }
     stmts.updateRuntimeSessionProvider.run(
@@ -5433,7 +5213,7 @@ function hydrateAttachment(raw) {
     att.reference = `@${att.path}`;
     att.contentUrl = uploadContentUrlForSha(sha256);
   }
-  if (featureFlags.IMAGE_CONVERSATION_CONTINUITY_ENABLED === true && att.generatedImage) {
+  if (att.generatedImage) {
     const messageId = String(att.generatedImage.messageId || '').trim();
     const imageId = String(att.generatedImage.imageId || '').trim();
     const node = messageId && imageId ? stmts.getNodeByAttachment?.get(messageId, imageId) : null;
@@ -5682,6 +5462,8 @@ function createCompactedConversation(sourceConversationId) {
   try { relayScheduleService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
   // And so do its questions that don't block, asked in it or by it.
   try { relayAskService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
+  // And an "Allow for this session" on the loop guard.
+  try { remoteRelayRegistry.carryLoopGuardOff(sourceConversationId, targetConversationId, { title: nextTitle }); } catch {}
 
   return {
     sourceConversationId,
@@ -6059,7 +5841,7 @@ const relayScheduleService = createRelayScheduleService({
   },
   // A firing into another session is a prompt of the conversation that set
   // it: the agents' loop guard counts it (and holds it once it wants the user).
-  admitFiring: ({ createdBy }) => remoteRelayDispatcher.admitScheduledFiring({ createdBy }),
+  admitFiring: (firing) => remoteRelayDispatcher.admitScheduledFiring(firing),
   logger: console,
 });
 
@@ -6072,6 +5854,8 @@ const relayAskService = createRelayAskService({
   relayEvents: relayEventService,
   // urgency "now" only.
   pushQuestion: (question) => pushDispatchService.notifyQuestion?.(question),
+  // The loop guard's card for a held firing; the dispatcher is built later.
+  onSystemAnswer: (ask) => remoteRelayDispatcher.loopGuardCardAnswered(ask),
   logger: console,
 });
 if (!relayAskService.isAvailable()) console.warn(`[relay-asks] not available this boot: ${relayAskService.problem()}`);
@@ -6539,7 +6323,7 @@ const sdkSessionImportService = createSdkSessionImportService({
   ),
   logger: console,
 });
-// Phase 5A: server-side Copilot model discovery. Once the extension retires,
+// Server-side Copilot model discovery. Without it,
 // nothing populates the model catalog on a fresh boot until a worker spawns;
 // this asks the installed CLI runtime for `listModels()` directly (deferred —
 // see the listen callback) and feeds updateModelCatalog in-process. It
@@ -6831,10 +6615,6 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
   const requesterSessionId = String(sessionId || '').trim();
   if (!requesterSessionId) return { message: null, reason: 'missing-session-id' };
   touchCli();
-  const sessionWorkerRoutingEnabled = featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
-  if (!sessionWorkerRoutingEnabled) {
-    return { message: null, paused: true, reason: 'session_worker_routing_disabled' };
-  }
   if (sessionWorkerSupervisor?.isKillBlocked?.(requesterSessionId) === true) {
     return {
       message: null,
@@ -6843,9 +6623,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
         requesterSessionId,
         blockedReason: 'session-killed',
         lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
-        fallbackRestart: null,
       },
-      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
     };
   }
   // The process asking is being replaced (the worker recycle passed its holds
@@ -6860,9 +6638,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
         requesterSessionId,
         blockedReason: 'worker-replacement',
         lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
-        fallbackRestart: null,
       },
-      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
     };
   }
   sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
@@ -6932,13 +6708,9 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     db,
     stmts,
     nowIso: new Date().toISOString(),
-    routingEnabled: true,
     requesterSessionId,
     ownerLeaseMs: 60_000,
-    affinityOnly: false,
     sessionWorkerSupervisor,
-    relayRestartOrchestrator,
-    inFlightProcessingCount: Number(counts.processingCount || 0),
     // A Claude chat's row goes only to a worker of its billing: the socket's
     // own word, else what the worker last said in a heartbeat.
     workerKind: workerKind || sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.kind || null,
@@ -6956,9 +6728,7 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
         requesterSessionId,
         blockedReason: String(dequeueResult?.blockedReason || '').trim() || null,
         lifecycle: dequeueResult?.lifecycle || null,
-        fallbackRestart: dequeueResult?.fallbackRestart || null,
       },
-      restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
     };
   }
 
@@ -7056,7 +6826,6 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
       enabled: true,
       requesterSessionId,
     },
-    restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
   };
 }
 
@@ -7193,7 +6962,6 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
 }
 
 function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return;
   if (runtimeShutdownStarted) return;
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -7230,7 +6998,6 @@ function handleWorkerSocketClosed({ sessionId, pid = null } = {}) {
 // One sweep at a time: a slow process list must not pile sweeps up.
 let deadWorkerSweepInFlight = false;
 async function sweepDeadWorkerProcessingRows() {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return 0;
   if (runtimeShutdownStarted) return 0;
   if (deadWorkerSweepInFlight) return 0;
   deadWorkerSweepInFlight = true;
@@ -7427,7 +7194,7 @@ const workerRecycleService = createWorkerRecycleService({
 // build id), and the recycle sweeps, so a stale worker on an agent SDK is
 // fenced before anything is handed to it.
 function noteSessionWorkerHello({ sessionId, pid, kind = null, buildId = null } = {}) {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true || runtimeShutdownStarted) return;
+  if (runtimeShutdownStarted) return;
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   // A killed session's worker is registered by nothing, as the delivery
@@ -7464,7 +7231,6 @@ function noteSessionWorkerHello({ sessionId, pid, kind = null, buildId = null } 
 // still runs for an archived conversation is stopped and stays stopped.
 // Through the recycle's replacement, one session at a time; never throws.
 async function sweepArchivedSessionWorkersAtStart() {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true) return null;
   if (runtimeShutdownStarted) return null;
   // The first lookup reads the process list afresh; the rest share it for the
   // inspector's cache moment, so a long archive costs one read, not one each.
@@ -7534,15 +7300,13 @@ function claudeApiClaimCheck() {
 // A Claude API chat's worker is not launched while Claude API cannot run a
 // turn (no key, switched off, the cap): its waiting rows on the key are
 // failed closed here, as the claim would, instead of a spawn that could only
-// refuse them. True when it was so.
-const listPendingClaudeApiRowsForOwner = db.prepare(`
-  SELECT id FROM queue
-  WHERE status = 'pending' AND NULLIF(owner_sdk_session_id, '') = ?
-    AND COALESCE(kind, '') != 'continuation'
-    AND LOWER(COALESCE(${stmts.setQueueProvider ? 'provider' : 'NULL'}, ?)) = 'claude-api'
-`);
+// refuse them. True when it was so. The session's runtime row is found as
+// the launch finds it: by its session id, else by the conversation named so
+// (a chat that was never bound).
 function failClaudeApiRowsWithoutLaunch(sdkSessionId) {
-  const runtime = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId) || null;
+  const runtime = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId)
+    || stmts.getRuntimeSessionByConversation.get(sdkSessionId)
+    || null;
   if (normalizeClaudeBilling(runtime?.provider_type) !== 'claude-api') return false;
   // A check that cannot answer fails this session's rows on the key closed,
   // as the claim does (messages-routes.mjs, claudeBillingFence).
@@ -7557,7 +7321,7 @@ function failClaudeApiRowsWithoutLaunch(sdkSessionId) {
     };
   }
   if (!refusal) return false;
-  for (const row of listPendingClaudeApiRowsForOwner.all(sdkSessionId, 'claude-api')) {
+  for (const row of stmts.listPendingClaudeApiRowsForSession.all(sdkSessionId, 'claude-api')) {
     handleClaudeBillingFence({ reason: 'claude-api-unavailable', messageId: row.id, refusal });
   }
   console.warn(`${runtimeLogPrefix()}WORKER PRIME skipped session=${sdkSessionId.slice(0, 8)} reason=${refusal.code} — no Claude API worker while Claude API cannot run a turn`);
@@ -7628,8 +7392,7 @@ function sessionHasBackgroundWork(sid) {
 }
 
 const detachedWorkerWatch = createDetachedWorkerWatch({
-  isEnabled: () => featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
-    && !runtimeShutdownStarted
+  isEnabled: () => !runtimeShutdownStarted
     && !relayRestartQueue.isQueued(),
   listWaitingSessionIds: () => (stmts.listPendingWorkerOwnerSessionIds?.all?.(25) || [])
     .map((row) => row?.sdk_session_id),
@@ -7734,32 +7497,18 @@ runtimeTimers.deadWorkerSweep = setInterval(() => {
   });
 }, 30_000);
 if (typeof runtimeTimers.deadWorkerSweep.unref === 'function') runtimeTimers.deadWorkerSweep.unref();
-// Workers on older code are recycled only where the relay launches them;
-// with routing off the service never starts. Its timer is its own (unref'd)
-// and stops with the runtime timers.
-if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true) workerRecycleService.start();
-const tmuxInspectorAccessPolicy = createTmuxInspectorAccessPolicy({
-  sessionWorkerRegistry,
-  sessionWorkerSupervisor,
-});
-const tmuxInspectorStreamService = createTmuxInspectorStreamService({
-  platform: process.platform,
-  pollIntervalMs: 250,
-  historyLines: 400,
-  isSessionAllowed: (sdkSessionId) => tmuxInspectorAccessPolicy.evaluateSession(sdkSessionId),
-});
-const tmuxInspectorSocketService = createTmuxInspectorSocketService({
-  streamService: tmuxInspectorStreamService,
-  accessPolicy: tmuxInspectorAccessPolicy,
-  logger: console,
-});
+// Workers on older code are recycled where the relay launches them. Its
+// timer is its own (unref'd) and stops with the runtime timers.
+workerRecycleService.start();
 
 // No next_attempt_at filter in the listing: rows sitting in retry backoff
 // still need their worker warm, otherwise the poll wins the race the moment
 // the backoff matures and the turn executes on the wrong provider.
 const pendingWorkerPrimer = createPendingWorkerPrimer({
-  isEnabled: () => featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true
-    && !runtimeShutdownStarted
+  failGoneRows: () => failRowsOfGoneConversations({ db, stmts, emit: (event, payload) => io.emit(event, payload), log: (line) => console.warn(`${runtimeLogPrefix()}${line}`) }),
+  isEnabled: () => !runtimeShutdownStarted
+    // A test relay launches no worker, so it primes none either.
+    && !isCliSpawnDisabled(sessionWorkerLaunchEnv)
     && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
     && typeof stmts.listPendingWorkerOwnerSessionIds?.all === 'function',
   listPendingOwnerSessionIds: (limit) => stmts.listPendingWorkerOwnerSessionIds.all(limit),
@@ -7785,7 +7534,7 @@ function wakeSessionWorkerQueue(reason = 'queue-wake') {
 }
 
 function hasPendingWorkerOwnerRows() {
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED !== true || runtimeShutdownStarted) return false;
+  if (runtimeShutdownStarted) return false;
   return (stmts.listPendingWorkerOwnerSessionIds?.all?.(1) || []).length > 0;
 }
 
@@ -7915,7 +7664,6 @@ const cliPresence = createCliPresence({
 });
 let cliOnline   = false;
 let relayPaused = false;
-const relayBridgeOwnerService = createRelayBridgeOwnerService();
 
 const runtimeState = {
   // The relay's own build id, read once at start; null when package.json
@@ -7942,10 +7690,7 @@ const runtimeState = {
   get usageLimit() {
     return { account: usageLimitPauseService.getAccountState(), pauses: usageLimitPauseService.listPauses() };
   },
-  get activeBridgeOwner() { return relayBridgeOwnerService.getOwner(); },
   get workerWebSocketStatus() { return sessionWorkerWebSocketService.status(); },
-  get tmuxInspectorStatus() { return tmuxInspectorSocketService.status(); },
-  get featureFlags() { return featureFlags; },
   get sessionWorkerSupervisor() { return sessionWorkerSupervisor; },
 };
 const windowsAutostartService = createWindowsAutostartService({
@@ -8020,6 +7765,11 @@ const remoteRelayRegistry = createRemoteRelayRegistry({
   onRemove: (entry) => {
     void relayEventLinkService?.noteRelayRemoved(entry);
     try { relayAskService.noteRelayRemoved(entry?.id); } catch {}
+  },
+  // The loop guard's off-list drops archived and deleted conversations.
+  isLiveConversation: (id) => {
+    const conversation = stmts.getConv.get(id);
+    return !!conversation && Number(conversation.archived || 0) !== 1;
   },
   logger: console,
 });
@@ -8163,6 +7913,7 @@ const remoteRelayDispatcher = createRemoteRelayDispatcher({
   relaySchedules: relayScheduleService,
   relayAsks: relayAskService,
   relayAskLink: relayAskLinkService,
+  loopGuard: remoteRelayRegistry,
   logger: console,
 });
 
@@ -8348,7 +8099,6 @@ const sharedRouteDeps = {
   setOpenAIProviderSettings,
   refreshOpenAIProviderModels: trackedModelRefreshers.refreshOpenAIProviderModels,
   getCopilotProviderSettings,
-  setCopilotProviderSettings,
   getClaudeProviderSettings,
   setClaudeProviderSettings: withAgentSdkSetup(setClaudeProviderSettings, 'claude', () => getClaudeProviderSettings()?.enabled === true, 'Claude enabled'),
   refreshClaudeProviderModels: trackedModelRefreshers.refreshClaudeProviderModels,
@@ -8405,7 +8155,6 @@ const sharedRouteDeps = {
   ensureSessionId,
   touchCli,
   markCliOffline,
-  recoverProcessingOlderThan,
   addMsIso,
   computeRetryDelayMs,
   resolveRequestedModel,
@@ -8443,16 +8192,10 @@ const sharedRouteDeps = {
   listKnownPreviewTokens: () => previewRegistry.knownTokens(),
   sendWorkerControl: (sessionId, control) => sessionWorkerWebSocketService.sendControlToSession(sessionId, control),
   emitToClientsExceptSessionId,
-  relayBridgeOwnerService,
-  relayCliLauncherService,
   resolveConversationWorkspaceState,
   updateConversationConfiguredWorkspaceRoot,
   learnConversationWorkspaceRoot,
-  setPendingSessionCwd,
-  consumePendingSessionCwd,
-  getPendingSessionCwd,
   workspaceRootAllowList,
-  featureFlags,
   sessionWorkerSupervisor,
   sessionWorkerRegistry,
   sessionWorkerProcessInspector,
@@ -8504,7 +8247,6 @@ const sharedRouteDeps = {
   formatQuestionRow,
   parseBoardActions,
   formatRelayBoardRow,
-  relayRestartOrchestrator,
   resolveSessionStateRoot,
   resolveClaudeSessionRoot: claudeSessionRootResolver.resolveClaudeSessionRoot,
   resolveDeepSeekSessionRoot: deepseekSessionRootResolver.resolveClaudeSessionRoot,
@@ -8519,8 +8261,6 @@ const sharedRouteDeps = {
   sharePathKnownRoots,
   getBackgroundTaskTimeoutMinutes,
   setBackgroundTaskTimeoutMinutes,
-  getFeatureFlagsSettingsState,
-  setFeatureFlagSetting,
   getPwaAppName,
   setPwaAppName,
   requestRelayShutdown,
@@ -8537,6 +8277,8 @@ const sharedRouteDeps = {
   notifyOpenAIImageSpendChanged: () => openAIImageSpend.notifyImageSpendChanged(),
   claudeApiClaimCheck,
   onClaudeBillingFence: handleClaudeBillingFence,
+  // GET /api/pending hands such a process no turn either.
+  workersStateTheirKind: () => !isCliSpawnDisabled(sessionWorkerLaunchEnv),
   claudeApiPlanUsage,
   getClaudeApiCapState,
   checkClaudeApiCap: (reason) => claudeApiCapWatch.check(reason),
@@ -8642,7 +8384,7 @@ registerAboutRoutes(app, {
     startedAt: RELAY_STARTED_AT,
     packageRoot: PACKAGE_ROOT,
     getProviderSettings: () => ({
-      github: { enabled: true, engine: getCopilotEngine() },
+      github: { enabled: true, engine: getCopilotProviderSettings().engine },
       openai: { enabled: getOpenAIProviderSettings()?.enabled === true },
       claude: { enabled: getClaudeProviderSettings()?.enabled === true },
       'claude-cloud': { enabled: getClaudeCloudProviderSettings()?.enabled === true },
@@ -8651,21 +8393,16 @@ registerAboutRoutes(app, {
       'claude-api': { enabled: getClaudeApiProviderSettings()?.enabled === true },
     }),
     getCachedCliProviders: () => cliInstallService.getCachedStatusSnapshot()?.providers || {},
-    isRelayCliOnline: () => runtimeState.cliOnline === true,
     listWorkers: () => sessionWorkerRegistry.listWorkers(),
     getUpdateState: () => buildUpdateStatePayload(),
     getAgentSdkStatus: () => agentSdkStore.snapshot(),
     describeBackups: () => describeBackups({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, config, sizes: false }),
   }),
 });
-function markCliOffline(reason = 'offline', { clearOwner = true } = {}) {
+function markCliOffline(reason = 'offline') {
   cliPresence.clear();
   const wasOnline = cliOnline;
   cliOnline = false;
-  if (clearOwner) {
-    relayBridgeOwnerService.clearOwner();
-  }
-  relayRestartOrchestrator.noteCliOffline();
   if (wasOnline) {
     console.log(`${runtimeLogPrefix()}CLI OFFLINE${reason ? ` (${reason})` : ''}`);
     io.emit('cli_status', { online: false });
@@ -8725,6 +8462,33 @@ function recoverStaleMessages() {
 }
 runtimeTimers.staleRecovery = setInterval(recoverStaleMessages, STALE_RECOVERY_INTERVAL_MS);
 recoverStaleMessages(); // run immediately on startup
+// Nothing releases a parked row any more. Rows parked by an earlier requeue
+// stay parked; the boot log names how many there are.
+try { reportParkedQueueAtBoot({ stmts, log: (line) => console.log(`${runtimeLogPrefix()}${line}`) }); } catch (error) { console.warn(`${runtimeLogPrefix()}parked queue report failed: ${error?.message || error}`); }
+// Pending rows bound to no session waited for a worker no earlier version
+// started: those older than a day end here with a note, once, before the
+// first prime launches their conversation's worker; younger ones run.
+try {
+  failStaleOwnerlessRowsAtBoot({
+    db,
+    stmts,
+    uuid: uuidv4,
+    emit: (event, payload) => io.emit(event, payload),
+    log: (line) => console.log(`${runtimeLogPrefix()}${line}`),
+    noteError: (payload) => relayEventService?.noteError?.(payload),
+  });
+} catch (error) {
+  console.warn(`${runtimeLogPrefix()}ownerless queue rows check failed: ${error?.message || error}`);
+}
+// The pending rows of conversations that are gone, without the grace the
+// waker's sweep gives a delete in flight: a restart ended every such delete.
+// Otherwise a row inside the grace would wait for the next queue wake, and
+// on an idle host hold back a queued suspend until then.
+try {
+  failRowsOfGoneConversations({ db, stmts, graceMs: 0, emit: (event, payload) => io.emit(event, payload), log: (line) => console.warn(`${runtimeLogPrefix()}${line}`) });
+} catch (error) {
+  console.warn(`${runtimeLogPrefix()}gone conversation rows check failed: ${error?.message || error}`);
+}
 
 function expirePendingQuestions() {
   const now = new Date().toISOString();
@@ -9086,7 +8850,6 @@ function emitToClientsExceptSessionId(event, payload, sessionId) {
 
 function touchCli() {
   cliPresence.touch();
-  relayRestartOrchestrator.noteCliOnline();
   if (!cliOnline) {
     cliOnline = true;
     console.log(`${runtimeLogPrefix()}CLI ONLINE (heartbeat)`);
@@ -9255,7 +9018,6 @@ io.on('connection', (socket) => {
   // Visibility heartbeats for push suppression; also clears a stale
   // deviceVisible flag restored by connectionStateRecovery.
   activeDeviceTracker.registerSocket(socket);
-  tmuxInspectorSocketService.registerSocket(socket);
   subagentViewerRooms.registerSocket(socket);
   taskOutputRooms.registerSocket(socket);
 });
@@ -9303,7 +9065,6 @@ const previewsConfig = normalizePreviewsConfig(config.previews || {}, {
     'localhost',
     '127.0.0.1',
   ],
-  reservedPorts: [config.cliPort],
 });
 for (const previewConfigError of previewsConfig.errors) {
   console.warn(`${runtimeLogPrefix()}PREVIEW LANE disabled: ${previewConfigError}`);
@@ -9469,7 +9230,6 @@ function shutdownRuntime(reason = 'unknown', { exitCode = 0 } = {}) {
   try { relayScheduleService.stop(); } catch {}
   try { relayAskLinkService.stop(); } catch {}
   try { remoteInboxWatchService.stop(); } catch {}
-  tmuxInspectorSocketService.stop();
   stopWorkspaceFileWatcher();
   sshTunnelManager.stop();
   cloudflaredTunnelManager.stop();
@@ -9552,7 +9312,6 @@ function buildRelayReadyBannerData() {
   const networkText = localhostOnly ? 'disabled (localhost only)' : networkUrl;
   const tunnelActive = tunnelState.enabled === true && tunnelState.mode === 'managed';
   const remoteUrl = tunnelActive ? `https://${String(tunnelState.host || '').slice(0, 30)}/` : null;
-  const pollingUrl = `http://localhost:${config.port}/api/pending`;
   const authText = 'token required';
 
   return {
@@ -9563,7 +9322,6 @@ function buildRelayReadyBannerData() {
     remoteUrl,
     remoteBindMode: tunnelState.remoteBindMode,
     authText,
-    pollingUrl,
     localhostOnly,
     listenHost,
     lines: [
@@ -9575,9 +9333,6 @@ function buildRelayReadyBannerData() {
       ...(remoteUrl ? [`║  Remote:     ${remoteUrl.padEnd(47)} ║`] : []),
       ...(remoteUrl ? [`║  Tunnel:     ${(`mode=${tunnelState.remoteBindMode}`).padEnd(47)} ║`] : []),
       `║  Auth:       ${authText.padEnd(47)} ║`,
-      '╠══════════════════════════════════════════════════════════════╣',
-      '║  CLI polling URL (for monitoring mode):                      ║',
-      `║  GET:        ${pollingUrl.padEnd(47)} ║`,
       '╚══════════════════════════════════════════════════════════════╝',
     ],
   };
@@ -9646,15 +9401,12 @@ httpServer.listen(config.port, listenHost, () => {
     });
   }
   // Archived conversations' workers: stopped once, 30 s in, so the workers
-  // that reconnect after the restart and the first prime have settled. With
-  // routing off the relay launches no workers, so there is nothing to sweep.
-  if (featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true) {
-    runtimeTimers.archivedWorkerSweep = setTimeout(() => {
-      runtimeTimers.archivedWorkerSweep = null;
-      sweepArchivedSessionWorkersAtStart().catch((error) => {
-        console.warn(`${runtimeLogPrefix()}WORKER RECYCLE archived sweep failed: ${error?.message || error}`);
-      });
-    }, 30_000);
-    runtimeTimers.archivedWorkerSweep.unref?.();
-  }
+  // that reconnect after the restart and the first prime have settled.
+  runtimeTimers.archivedWorkerSweep = setTimeout(() => {
+    runtimeTimers.archivedWorkerSweep = null;
+    sweepArchivedSessionWorkersAtStart().catch((error) => {
+      console.warn(`${runtimeLogPrefix()}WORKER RECYCLE archived sweep failed: ${error?.message || error}`);
+    });
+  }, 30_000);
+  runtimeTimers.archivedWorkerSweep.unref?.();
 });

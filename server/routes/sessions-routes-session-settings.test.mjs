@@ -69,7 +69,10 @@ function createMockApp() {
   return { routes, get: record('GET'), post: record('POST'), patch: record('PATCH'), put: record('PUT'), delete: record('DELETE'), use() {} };
 }
 
-function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onLaunch = null, processListThrows = false, onWorkspaceState = null } = {}) {
+function setup({ sdkSessionId = '', workerStatus = 'ready', onLaunch = null, processListThrows = false, onWorkspaceState = null } = {}) {
+  // Whether the next worker launch succeeds. A bootstrap launches the new
+  // session's worker too, so a test fails launches only once its sessions exist.
+  const launch = { ok: true };
   const db = new Database(':memory:');
   applySchema(db);
   const stmts = { ...createSessionRepository(db), ...createMessageRepository(db) };
@@ -137,7 +140,6 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
       runtimeRoots.set(conversationId, rootPath);
       return { ok: true, learned: true, state: workspaceState(conversationId) };
     },
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     getPendingSessionCwd: () => null,
     workspaceRootAllowList: [],
@@ -145,7 +147,6 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'client-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     ensureRuntimeSessionBinding: () => ({ id: 'runtime-session-1' }),
@@ -157,10 +158,6 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
     sessionWorkerRegistry: createSessionWorkerRegistry(),
     sessionHistoryRefreshService: { evaluateRefreshIdleState: () => ({ idle: true }), replaceRetrievableHistory: () => {} },
@@ -179,7 +176,7 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
       ensureWorker: async () => {
         calls.push(['ensureWorker']);
         onLaunch?.(db);
-        return launchOk ? { ok: true, worker: { pid: 9999 }, lifecycle: {} } : { ok: false, statusCode: 500, error: 'spawn failed' };
+        return launch.ok ? { ok: true, worker: { pid: 9999 }, lifecycle: {} } : { ok: false, statusCode: 500, error: 'spawn failed' };
       },
     },
     sessionWorkerProcessInspector: {
@@ -252,7 +249,7 @@ function setup({ sdkSessionId = '', workerStatus = 'ready', launchOk = true, onL
   });
   const events = (name) => emitted.filter(([event]) => event === name).map(([, payload]) => payload);
   const row = (id) => db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
-  return { db, stmts, conversationGroups, emitted, events, calls, call, bootstrap, owned, agentMade, asLocalAgent, asPairedAgent, row, creatorOf };
+  return { db, stmts, conversationGroups, emitted, events, calls, launch, call, bootstrap, owned, agentMade, asLocalAgent, asPairedAgent, row, creatorOf };
 }
 
 // ─── The owner's "may start sessions" switch ─────────────────────────────────
@@ -567,16 +564,18 @@ test('cwd: a session that never ran saves the folder; a busy one is refused with
 test('cwd: a session with a CLI is relaunched in the new folder through the owner\'s relaunch path', async () => {
   const fx = setup({ sdkSessionId: 'sess-fixture' });
   const { child } = await fx.agentMade();
+  const launchesBefore = fx.calls.length;
   const moved = await fx.asLocalAgent(child, { settings: { cwd: FOLDER_B } });
   assert.equal(moved.status, 200, JSON.stringify(moved.body));
   assert.equal(moved.body.relaunched, true);
   assert.equal(moved.body.settings.cwd, FOLDER_B);
-  assert.ok(fx.calls.some(([kind]) => kind === 'ensureWorker'));
+  assert.ok(fx.calls.slice(launchesBefore).some(([kind]) => kind === 'ensureWorker'));
 });
 
 test('cwd: a failed relaunch is reported and nothing else is written', async () => {
-  const fx = setup({ sdkSessionId: 'sess-fixture', launchOk: false });
+  const fx = setup({ sdkSessionId: 'sess-fixture' });
   const { child } = await fx.agentMade();
+  fx.launch.ok = false;
   const failed = await fx.asLocalAgent(child, { settings: { cwd: FOLDER_A, effort: 'low' } });
   assert.notEqual(failed.status, 200);
   assert.equal(failed.body.ok, false);
@@ -693,10 +692,11 @@ test('the folder change asks again whether the session is busy right before the 
   });
   const { child } = await fx.agentMade();
   reads = 0;
+  const launchesBefore = fx.calls.length;
   const result = await fx.asLocalAgent(child, { settings: { cwd: FOLDER_B } });
   assert.equal(result.status, 409, JSON.stringify(result.body));
   assert.equal(result.body.code, 'SESSION_BUSY');
-  assert.equal(fx.calls.some(([kind]) => kind === 'ensureWorker'), false, 'nothing relaunched');
+  assert.equal(fx.calls.slice(launchesBefore).some(([kind]) => kind === 'ensureWorker'), false, 'nothing relaunched');
 });
 
 // ─── Round 2: kept groups shown to the owner, the auto group, a late ambiguity ─

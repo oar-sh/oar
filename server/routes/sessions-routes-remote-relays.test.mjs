@@ -10,6 +10,7 @@ import { createSessionWorkerRegistry } from '../services/session-worker-registry
 import { createRelayScheduleService } from '../services/relay-schedule-service.mjs';
 import { withRemotePromptHeader } from '../../shared/remote-relay-contract.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 // The inbound side of remote relays on the conversation routes, against the
 // REAL schema: a conversation another relay's agent bootstraps keeps its
@@ -105,7 +106,6 @@ function setup({ withRemoteRelays = true, modelCatalog = null, extraDeps = () =>
     resolveConversationWorkspaceState: () => null,
     updateConversationConfiguredWorkspaceRoot: () => ({ ok: true }),
     learnConversationWorkspaceRoot: () => ({ ok: true }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     getPendingSessionCwd: () => null,
     workspaceRootAllowList: [],
@@ -113,7 +113,6 @@ function setup({ withRemoteRelays = true, modelCatalog = null, extraDeps = () =>
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'client-remote-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     ensureRuntimeSessionBinding: () => ({ id: 'runtime-session-1' }),
@@ -125,12 +124,9 @@ function setup({ withRemoteRelays = true, modelCatalog = null, extraDeps = () =>
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
     sessionWorkerRegistry: createSessionWorkerRegistry(),
+    sessionWorkerSupervisor: fakeSessionWorkerSupervisor(),
     sessionHistoryRefreshService: {
       evaluateRefreshIdleState: () => ({ idle: true }),
       replaceRetrievableHistory: () => {},

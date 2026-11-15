@@ -21,6 +21,7 @@
  */
 
 import { buildDetailSection } from './plan-usage-contract.mjs';
+import { buildTokenCharts } from './plan-usage-token-charts.mjs';
 import { partlyReportedFields } from './token-usage-service.mjs';
 
 export const TOKEN_SHOWN_FIELDS = Object.freeze(['inputTokens', 'outputTokens', 'cacheWriteTokens', 'cacheReadTokens']);
@@ -103,7 +104,8 @@ export function tokenDayLabel(day) {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 }
 
-function keyName(billing) {
+/** "OpenAI" for an own key's billing (`byok-openai`), as the tab names it. */
+export function ownKeyName(billing) {
   const type = String(billing || '').replace(/^byok-/, '');
   return KEY_NAME[type] || (type ? type.charAt(0).toUpperCase() + type.slice(1) : 'Own key');
 }
@@ -117,7 +119,7 @@ function capitalize(text) {
  * fields some turns left out, the copied days, since when it counts.
  */
 export function tokenSectionNote(group) {
-  const who = group.billing ? keyName(group.billing) : (PROVIDER_NAME[group.provider] || group.provider);
+  const who = group.billing ? ownKeyName(group.billing) : (PROVIDER_NAME[group.provider] || group.provider);
   const backfill = BACKFILLED_PROVIDERS.includes(group.provider) && group.backfilled?.allTime === true;
   const allTime = group.periods.allTime;
   const partly = new Set(partlyReportedFields(allTime));
@@ -186,7 +188,7 @@ export function mergeModelsByLabel(models, modelLabel = null) {
 export function buildTokenSections(group, { modelLabel = null } = {}) {
   if (!group || !group.periods) return [];
   const suffix = group.billing ? `-${group.billing}` : '';
-  const labelSuffix = group.billing ? ` — own ${keyName(group.billing)} key` : '';
+  const labelSuffix = group.billing ? ` — own ${ownKeyName(group.billing)} key` : '';
   const periodRow = (label, totals) => ({
     label,
     value: totals.rows ? formatTokenSplit(totals) : 'no turns',
@@ -225,7 +227,9 @@ export function buildTokenSections(group, { modelLabel = null } = {}) {
  * Append the Tokens sections to every provider card the report holds,
  * from `readPeriods({ provider })`; `modelLabelFor(provider)` may give a
  * tab its model names. A provider with nothing booked gets
- * none; the plan's group comes before the own keys'. Cards are changed in
+ * none; the plan's group comes before the own keys'. Every card but
+ * DeepSeek's (which draws its own) also gets each group's charts
+ * (plan-usage-token-charts.mjs) after its own. Cards are changed in
  * place; a failing read leaves them as they were.
  */
 export function appendTokenSections(cards, readPeriods, { modelLabelFor = null } = {}) {
@@ -243,6 +247,9 @@ export function appendTokenSections(cards, readPeriods, { modelLabelFor = null }
     const modelLabel = typeof modelLabelFor === 'function' ? modelLabelFor(card.provider) : null;
     const sections = groups.flatMap((group) => buildTokenSections(group, { modelLabel }));
     if (sections.length) card.details = [...(Array.isArray(card.details) ? card.details : []), ...sections];
+    if (card.provider === 'deepseek') continue;
+    const charts = groups.flatMap((group) => buildTokenCharts(group, { today: periods.today, modelLabel }));
+    if (charts.length) card.charts = [...(Array.isArray(card.charts) ? card.charts : []), ...charts];
   }
   return cards;
 }

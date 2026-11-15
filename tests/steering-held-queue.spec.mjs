@@ -1,6 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayDbPath } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A Claude turn with an open question card holds steering: the composer must
 // stay usable and say what a send does now ("Queue" — it steers in after the
@@ -9,10 +13,6 @@ import { relayToken, relayDbPath } from "./e2e-env.mjs";
 // a dequeued row, the Claude binding is written straight into its DB, and the
 // worker's part — the heartbeat that advertises steering and reports the
 // hold — is posted by the spec itself with the worker's identity headers.
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function bindConversationToClaude(conversationId) {
   const db = new DatabaseSync(relayDbPath());
@@ -23,25 +23,6 @@ function bindConversationToClaude(conversationId) {
   }
 }
 
-async function dequeueSpecificMessage(request, headers, messageId, ownerSessionId = "") {
-  const dequeueHeaders = String(ownerSessionId || "").trim()
-    ? { ...headers, "x-relay-session-id": String(ownerSessionId).trim() }
-    : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const msg = (await dequeued.json())?.message || null;
-    if (!msg) {
-      await sleep(250);
-      continue;
-    }
-    if (String(msg.id || "") === String(messageId || "")) return;
-    await request.post("/api/requeue", { headers, data: { messageId: String(msg.id || "") } }).catch(() => {});
-    await sleep(120);
-  }
-  throw new Error("Timed out waiting to dequeue the seeded turn");
-}
-
 test("a held Claude turn offers Queue with the reason, and its Stop stays in view on a phone", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
@@ -50,36 +31,26 @@ test("a held Claude turn offers Queue with the reason, and its Stop stays in vie
   let messageId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Held steering seed ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    messageId = String(queuedBody?.messageId || "");
-    await dequeueSpecificMessage(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
-    // Follow-up sends are only accepted on session-bound conversations.
-    const synced = await request.post("/api/session-sync", {
-      headers,
-      data: { sdk_session_id: `pw-sid-held-${stamp}`, conversation_id: conversationId },
-    });
-    expect(synced.ok()).toBeTruthy();
+    // Follow-up sends are only accepted on session-bound conversations: made
+    // as the web client makes a chat, bound from the start.
+    // Its worker is a Claude worker, as the chat is a Claude chat below.
+    const started = await startConversation({ text: `Held steering seed ${stamp}` }, { workerKind: "claude" });
+    conversationId = String(started.conversationId || "");
+    messageId = String(started.messageId || "");
+    const worker = started.worker;
+    await worker.take(messageId);
     bindConversationToClaude(conversationId);
     // What the Claude worker's heartbeat reports while a card is open: it
     // steers (`supported`), and steering is held for the question.
-    const beat = await request.post("/api/heartbeat", {
-      headers: { ...headers, "x-relay-session-id": `pw-sid-held-${stamp}`, "x-relay-conversation-id": conversationId },
-      data: {
-        activeQueueMessageIds: [messageId],
-        steering: { turnActive: true, canSteer: false, holdReason: "question", messageId, supported: true, cancellableIds: [] },
-      },
+    const beat = await worker.beat({
+      steering: { turnActive: true, canSteer: false, holdReason: "question", messageId, supported: true, cancellableIds: [] },
     });
-    expect(beat.ok()).toBeTruthy();
+    expect(beat).toBe(true);
 
     const created = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -140,10 +111,7 @@ test("a held Claude turn offers Queue with the reason, and its Stop stays in vie
     expect(body.conversationId).toBe(conversationId);
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
-      }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }

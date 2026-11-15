@@ -878,8 +878,8 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     const grokSnapshot = readSnapshot('grok');
     // The SDK engine's per-turn detail. Stored under its own key rather than
     // 'github' so it stays clearly additive: the Copilot card's meters come
-    // from the account-level quota API and are correct for both engines, and
-    // an install still on the extension engine simply has no row here.
+    // from the account-level quota API, and an install with no SDK worker
+    // turn yet simply has no row here.
     const copilotWorkerSnapshot = readSnapshot('copilot-sdk');
 
     const providers = [
@@ -949,18 +949,18 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
 
     // Opt-in like Grok: no card while DeepSeek is off.
     if (deepseekConfigured === true) {
-      // The daily chart's 30 days and this calendar month, whichever reaches
-      // further back (UTC days, like the booking).
+      // The daily chart's longest window (90 days) and this calendar month,
+      // whichever reaches further back (UTC days, like the booking).
       const today = generatedAt.slice(0, 10);
       const monthStart = `${today.slice(0, 7)}-01`;
-      const thirtyDaysAgo = new Date(Date.parse(`${today}T00:00:00.000Z`) - 29 * 86_400_000).toISOString().slice(0, 10);
+      const ninetyDaysAgo = new Date(Date.parse(`${today}T00:00:00.000Z`) - 89 * 86_400_000).toISOString().slice(0, 10);
       // The daily rows reach back to the export's first day too, so the card
       // can take the estimate of every day the export covers out of the totals.
       const firstActualDay = [
         ...(Array.isArray(deepseekActuals?.rows) ? deepseekActuals.rows : []),
         ...(Array.isArray(deepseekActuals?.coveredDays) ? deepseekActuals.coveredDays : []),
       ].map((row) => String(row?.day || '')).filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value)).sort()[0] || null;
-      const since = [thirtyDaysAgo, monthStart, firstActualDay].filter(Boolean).sort()[0];
+      const since = [ninetyDaysAgo, monthStart, firstActualDay].filter(Boolean).sort()[0];
       providers.push(buildDeepSeekPlanCard({
         balance: deepseekBalance,
         balanceReferences: recordDeepSeekBalance(deepseekBalance),

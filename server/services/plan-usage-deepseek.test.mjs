@@ -555,7 +555,7 @@ test('the budget month turns over at 00:00 UTC on the 1st: the month before neve
 test('the daily chart: the last 30 UTC days stacked by model, empty days included, with a word on where the history starts', () => {
   const balance = { ok: true, isAvailable: true, balances: [{ currency: 'CNY', total: 110, granted: 10, toppedUp: 100 }], fetchedAt: FETCHED_AT };
   const card = buildDeepSeekPlanCard({ balance, totals: TOTALS, days: DAYS, now: NOW });
-  const daily = card.charts.find((chart) => chart.id === 'deepseek-daily-spend');
+  const daily = card.charts.find((chart) => chart.id === 'deepseek-daily-spend-30d');
   assert.deepEqual([daily.label, daily.kind, daily.unit, daily.items.length], ['Daily spend, last 30 days', 'columns', 'cny', 30]);
   assert.deepEqual(daily.series, [{ key: 'deepseek-flash', label: 'DeepSeek Flash' }, { key: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' }]);
   assert.deepEqual([daily.items[0].key, daily.items[0].label, daily.items.at(-1).key, daily.items.at(-1).label], ['2026-09-22', 'Sep 22', '2026-10-21', 'Oct 21']);
@@ -566,20 +566,60 @@ test('the daily chart: the last 30 UTC days stacked by model, empty days include
   ]);
   assert.equal(daily.note, 'Daily history on this relay starts Sep 30; earlier turns are only in the totals.');
   // A history reaching back the whole 30 days needs no such word.
-  const long = buildDeepSeekPlanCard({ balance, totals: TOTALS, days: { ...DAYS, firstDay: '2026-09-22' }, now: NOW }).charts[0];
+  const daily30 = (card30) => card30.charts.find((chart) => chart.id === 'deepseek-daily-spend-30d');
+  const long = daily30(buildDeepSeekPlanCard({ balance, totals: TOTALS, days: { ...DAYS, firstDay: '2026-09-22' }, now: NOW }));
   assert.equal(long.note, 'Estimated, by UTC day, from the turns of this relay.');
   // Nothing spent in the 30 days: no chart. Without a balance the chart is in dollars.
-  assert.equal(buildDeepSeekPlanCard({ balance, totals: TOTALS, days: { days: DAYS.days.slice(0, 1), firstDay: '2026-09-30' }, now: '2026-11-15T12:00:00.000Z' }).charts.some((chart) => chart.id === 'deepseek-daily-spend'), false);
-  assert.deepEqual(buildDeepSeekPlanCard({ balance: null, totals: TOTALS, days: DAYS, now: NOW }).charts[0].items.at(-1).values, { 'deepseek-flash': 0, 'deepseek-v4-pro': 0.42 });
-  // More models than colours: the known ones keep theirs, the rest are "Other models".
-  const many = buildDeepSeekPlanCard({
+  assert.equal(buildDeepSeekPlanCard({ balance, totals: TOTALS, days: { days: DAYS.days.slice(0, 1), firstDay: '2026-09-30' }, now: '2026-11-15T12:00:00.000Z' }).charts.some((chart) => chart.id === 'deepseek-daily-spend-30d'), false);
+  assert.deepEqual(daily30(buildDeepSeekPlanCard({ balance: null, totals: TOTALS, days: DAYS, now: NOW })).items.at(-1).values, { 'deepseek-flash': 0, 'deepseek-v4-pro': 0.42 });
+  // Five models: every one is a series, the known ones first, none folded away.
+  const many = daily30(buildDeepSeekPlanCard({
     balance,
     totals: TOTALS,
     now: NOW,
     days: { firstDay: '2026-10-01', days: ['deepseek-zeta', 'deepseek-alpha', 'deepseek-v4-pro', 'deepseek-flash', 'deepseek-beta'].map((model, index) => ({ day: '2026-10-21', model, costCny: index + 1, costUsd: index + 1 })) },
-  }).charts[0];
-  assert.deepEqual(many.series.map((entry) => entry.key), ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-alpha', 'other']);
-  assert.deepEqual(many.items.at(-1).values, { 'deepseek-flash': 4, 'deepseek-v4-pro': 3, 'deepseek-alpha': 2, other: 6 });
+  }));
+  assert.deepEqual(many.series.map((entry) => entry.key), ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-alpha', 'deepseek-beta', 'deepseek-zeta']);
+  assert.deepEqual(many.items.at(-1).values, { 'deepseek-flash': 4, 'deepseek-v4-pro': 3, 'deepseek-alpha': 2, 'deepseek-beta': 5, 'deepseek-zeta': 1 });
+});
+
+test('the daily chart comes in 7, 30 and 90 days for the picker; "where the money goes" stays all time, always shown', () => {
+  const balance = { ok: true, isAvailable: true, balances: [{ currency: 'CNY', total: 110, granted: 10, toppedUp: 100 }], fetchedAt: FETCHED_AT };
+  // NOW is Oct 21: Sep 30 is 21 days back, Aug 1 81, Jul 23 90 (out of every window).
+  const days = {
+    firstDay: '2026-07-01',
+    days: [
+      ...DAYS.days,
+      { day: '2026-08-01', model: 'deepseek-v4-pro', costCny: 7, costUsd: 1 },
+      { day: '2026-07-23', model: 'deepseek-zeta', costCny: 9, costUsd: 1 },
+    ],
+  };
+  const card = buildDeepSeekPlanCard({ balance, totals: TOTALS, days, now: NOW });
+  assert.deepEqual(card.charts.map((chart) => [chart.id, chart.label, chart.windowDays, chart.items.length]), [
+    ['deepseek-daily-spend-7d', 'Daily spend, last 7 days', 7, 7],
+    ['deepseek-daily-spend-30d', 'Daily spend, last 30 days', 30, 30],
+    ['deepseek-daily-spend-90d', 'Daily spend, last 90 days', 90, 90],
+    ['deepseek-spend-shares', 'Where the money goes', undefined, 2],
+  ]);
+  const [week, month, quarter] = card.charts;
+  // The same series in every window, from the 90 days: a model keeps its colour.
+  for (const chart of [week, month, quarter]) {
+    assert.deepEqual(chart.series.map((entry) => entry.key), ['deepseek-flash', 'deepseek-v4-pro']);
+  }
+  assert.deepEqual([week.items[0].key, quarter.items[0].key, quarter.items.at(-1).key], ['2026-10-15', '2026-07-24', '2026-10-21']);
+  const total = (chart) => chart.items.reduce((sum, item) => sum + Object.values(item.values).reduce((a, b) => a + b, 0), 0);
+  assert.deepEqual([total(week), total(month), total(quarter)], [9, 109, 116]);
+  assert.equal(Object.hasOwn(card.charts[3], 'windowDays'), false);
+  assert.match(card.charts[3].note, /^All time\./);
+  // Nothing in the last 7 days: no 7-day chart, the others stay.
+  const quiet = buildDeepSeekPlanCard({ balance, totals: TOTALS, days, now: '2026-10-29T12:00:00.000Z' });
+  assert.deepEqual(quiet.charts.map((chart) => chart.id), ['deepseek-daily-spend-30d', 'deepseek-daily-spend-90d', 'deepseek-spend-shares']);
+  // The picker switches the daily chart and leaves the split shown.
+  const html = renderPlanUsageHtml({ providers: [card] }, { activeProvider: 'deepseek', now: new Date(NOW), chartWindow: 7 });
+  assert.match(html, /<input type="radio" name="plan-usage-chart-window-deepseek" value="7" checked>/);
+  assert.match(html, /data-chart-id="deepseek-daily-spend-7d" role="group" aria-label="Daily spend, last 7 days" data-window="7">/);
+  assert.match(html, /data-chart-id="deepseek-daily-spend-30d" role="group" aria-label="Daily spend, last 30 days" data-window="30" hidden>/);
+  assert.match(html, /data-chart-id="deepseek-spend-shares" role="group" aria-label="Where the money goes">/);
 });
 
 test('where the money goes: each model\'s cost split into cache hit, miss and output from its tokens, and what the cache saved', () => {
@@ -596,7 +636,7 @@ test('where the money goes: each model\'s cost split into cache hit, miss and ou
   ]);
   // 2M hits at the miss price would be ¥2.00; they cost ¥0.04.
   assert.equal(shares.summary, 'Cache saved about ¥1.96');
-  assert.equal(shares.note, 'Cache saved: the cache hits at the cache-miss price, less what they cost.');
+  assert.equal(shares.note, 'All time. Cache saved: the cache hits at the cache-miss price, less what they cost.');
   // With searches and fetches a fourth piece appears.
   const withTools = buildDeepSeekPlanCard({
     balance,
@@ -652,7 +692,7 @@ test('the export replaces the estimate per day and model on the days it covers, 
     noteText(card, 'deepseek-actual'),
     'Actual figures from the DeepSeek export on the days it covers (the last through 2026-10-22 00:00 UTC+01:00), estimated on the others. On export days the export\'s cost includes the web searches. Export days follow the export\'s time zone, the estimate\'s UTC.',
   );
-  const daily = card.charts.find((chart) => chart.id === 'deepseek-daily-spend');
+  const daily = card.charts.find((chart) => chart.id === 'deepseek-daily-spend-30d');
   assert.deepEqual(daily.items.filter((item) => Object.values(item.values).some(Boolean)).map((item) => [item.key, item.values]), [
     ['2026-10-20', { 'deepseek-flash': 0.1, 'deepseek-v4-pro': 0 }],
     ['2026-10-21', { 'deepseek-flash': 0.5, 'deepseek-v4-pro': 0 }],

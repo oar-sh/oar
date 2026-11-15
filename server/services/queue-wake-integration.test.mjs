@@ -67,7 +67,7 @@ function startRelay(t) {
       return { pendingCount: map.pending || 0, processingCount: map.processing || 0, parkedCount: map.parked || 0 };
     },
     requestWork: async ({ sessionId }) => {
-      const claimed = dequeuePendingMessage({ db, stmts, nowIso: iso(Date.now()), routingEnabled: true, requesterSessionId: sessionId });
+      const claimed = dequeuePendingMessage({ db, stmts, nowIso: iso(Date.now()), requesterSessionId: sessionId });
       return claimed ? { message: claimed } : null;
     },
     nextDueAtMs: () => {

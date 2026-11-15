@@ -385,10 +385,10 @@ export function isCopilotQuotaError(data) {
 /**
  * Classify a `session.error` payload into a terminal failure record.
  *
- * The wording, `stableCode` and guidance come from the extension's own
+ * The wording, `stableCode` and guidance come from the shared
  * classifier (`send-and-wait-errors.mjs`) rather than being re-typed here, so
  * a conversation that fails on the SDK engine reads identically to one that
- * failed on the extension engine — including `relay.quota-exhausted` and the
+ * failed on the removed extension engine — including `relay.quota-exhausted` and the
  * "Open Check Usage" pointer shipped in 37d2899. The structured quota verdict
  * is passed to that classifier as a hint rather than smuggled in as forged
  * prose, so a quota error is non-retryable however GitHub worded it.

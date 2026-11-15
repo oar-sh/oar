@@ -31,10 +31,10 @@ import { repoRoot, startRelayServer } from "./relay-server-harness.mjs";
  *    heartbeat, /api/response). It loads no SDK: the stub installs package.json
  *    files only, and no model is asked.
  *
- * Its own relay: worker launches allowed, session-worker routing on (the
- * shared relay has neither), the port and token in its config.json (where a
- * worker finds its relay), and tmux, where the host has it, on a socket
- * directory of its own that is killed afterwards.
+ * Its own relay: worker launches allowed (the shared relay launches none),
+ * the port and token in its config.json (where a worker finds its relay), and
+ * tmux, where the host has it, on a socket directory of its own that is
+ * killed afterwards.
  *
  * The Claude provider is switched on by writing its settings rows, as the
  * other Claude specs do: the Settings save would start the SDK install by
@@ -126,7 +126,6 @@ test.describe.serial("the queued first chat with a fake store", () => {
         tmuxDir = path.join(stateRoot, "tmux");
         fs.mkdirSync(tmuxDir, { recursive: true, mode: 0o700 });
         return {
-          COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
           COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: standInWorker,
           COPILOT_WEB_RELAY_AGENT_SDK_INSTALL_COMMAND: path.join(fixtures, `agent-sdk-install-stub${stubExt}`),
           OAR_SDK_DIR: path.join(stateRoot, "sdks"),

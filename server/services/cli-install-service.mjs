@@ -4,7 +4,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { resolveCopilotSdkLaunchPath } from '../copilot-sdk-runtime.mjs';
 import {
+  CLI_LONG_PROBE_TIMEOUT_MS,
   CLI_SPAWN_DISABLED_ERROR,
   MAX_CAPTURED_OUTPUT_CHARS,
   isBatchLauncher as isBatchLauncherImpl,
@@ -61,6 +63,55 @@ export const CLI_INSTALL_STATES = Object.freeze({
 /** Stand-in for the resolved binary in a descriptor's update/migrate argv. */
 const BIN_PLACEHOLDER = '<bin>';
 
+// The raw file, never the gh.io short link: the URL that runs is the one this
+// file names.
+const COPILOT_INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/github/copilot-cli/main/install.sh';
+
+/**
+ * The Copilot CLI's own install script, run the way the relay can vouch for.
+ *
+ * - No terminal: the spawn is detached (a session of its own, so no
+ *   controlling terminal) with stdin closed, and the script's question about
+ *   adding `~/.local/bin` to a shell profile reads `/dev/tty`, which then
+ *   fails to open: the question is skipped and no profile is edited.
+ * - No unchecked binary: the script skips its checksum check without failing
+ *   when `SHA256SUMS.txt` cannot be fetched or no hash tool exists. So the
+ *   script installs into a staging prefix, the hash tool is required up
+ *   front, and the binary moves to `~/.local/bin` only when the script
+ *   printed its "Checksum validated" line. Anything else fails and leaves
+ *   `~/.local/bin` as it was.
+ * - The staging folder sits beside `~/.local/bin`, so the move is a rename
+ *   (a running `copilot` keeps its old file), and a folder a killed install
+ *   left behind is removed by the next run once it is an hour old.
+ */
+// The Windows install, one PowerShell command. The npm package name is
+// quoted: a bare `@name` is PowerShell's splatting syntax.
+const WIN32_COPILOT_NPM_INSTALL = 'if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) { '
+  + "[Console]::Error.WriteLine('npm was not found on PATH. Install Node.js with npm, or install the Copilot CLI yourself.'); "
+  + 'exit 1 }; '
+  + "npm.cmd install -g '@github/copilot'; exit $LASTEXITCODE";
+
+const COPILOT_POSIX_INSTALL_SCRIPT = [
+  'set -euo pipefail',
+  'mkdir -p "$HOME/.local/bin"',
+  'find "$HOME/.local" -maxdepth 1 -type d -name ".copilot-install.*" -mmin +60 -exec rm -rf {} + 2>/dev/null || true',
+  'if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then',
+  '  echo "Error: neither sha256sum nor shasum is installed, so the download could not be checked. Install one and try again." >&2',
+  '  exit 1',
+  'fi',
+  'stage="$(mktemp -d "$HOME/.local/.copilot-install.XXXXXX")"',
+  'trap \'rm -rf -- "$stage"\' EXIT',
+  'trap \'exit 143\' HUP INT TERM',
+  `curl -fsSL ${COPILOT_INSTALL_SCRIPT_URL} -o "$stage/install.sh"`,
+  'PREFIX="$stage" bash "$stage/install.sh" </dev/null 2>&1 | tee "$stage/install.log"',
+  'if ! grep -q "Checksum validated" "$stage/install.log"; then',
+  '  echo "Error: the installer did not check the download against its checksum file (could it be fetched?). Nothing was installed; try again." >&2',
+  '  exit 1',
+  'fi',
+  'mv -f "$stage/bin/copilot" "$HOME/.local/bin/copilot"',
+  'echo "Installed to $HOME/.local/bin/copilot"',
+].join('\n');
+
 // Last-resort version scrape: every descriptor carries its own pattern, and
 // this only runs when that one misses, so a CLI that reworks its --version
 // banner degrades to "installed (version unknown)" instead of "not installed"
@@ -76,10 +127,14 @@ const GENERIC_VERSION_PATTERN = /(\d+\.\d+(?:\.\d+)*)/;
  * install a CLI nothing runs (plan §2.4). Adding it back later is a data change
  * here, not a code change.
  *
- * Copilot is present but `detectOnly`: its CLI is npm-global under a prefix the
- * relay user cannot write (plan §2.5), so it reports version and path and
- * offers no buttons. Without the entry its settings sub-tab would be the only
- * one with no CLI row at all.
+ * Copilot's SDK is not a package of its own: it is the `copilot-sdk` folder in
+ * the version folder the CLI unpacks into the user's cache on its first run.
+ * So an install or an update is done only after that first run and once the
+ * SDK lookup finds the folder (`firstRun`). Its updates write to that cache and
+ * never to the install prefix, so `copilot update` works for every install
+ * method; an install the relay did not make (npm, Homebrew, a system folder)
+ * is reinstalled or removed where it came from (`managedReason`). Login stays
+ * in a terminal (`hints`).
  */
 const CLI_DESCRIPTORS = Object.freeze({
   grok: Object.freeze({
@@ -180,13 +235,74 @@ const CLI_DESCRIPTORS = Object.freeze({
     label: 'GitHub Copilot CLI',
     binary: 'copilot',
     envVar: null,
-    extraBinDirs: Object.freeze(['~/.local/bin', '/usr/local/bin']),
+    // The last one is npm's default global folder on Windows, for a relay
+    // whose PATH predates the npm install.
+    extraBinDirs: Object.freeze(['~/.local/bin', '/usr/local/bin', '~/AppData/Roaming/npm']),
     versionArgs: Object.freeze(['--version']),
     // `GitHub Copilot CLI 1.0.82.`
     versionPattern: /Copilot CLI\s+v?(\d+\.\d+(?:\.\d+)*)/i,
-    detectOnly: true,
-    blockedReason: 'Managed with npm on this host — install and update it from a shell.',
-    commands: Object.freeze({}),
+    // The `--version` right after an install or an update unpacks the CLI's
+    // package first (CLI_LONG_PROBE_TIMEOUT_MS).
+    longProbe: true,
+    firstRun: Object.freeze({ args: Object.freeze(['--version']), requiresCopilotSdk: true }),
+    hints: Object.freeze({
+      notInstalled: 'Install it here, then run copilot once in a terminal on the relay host and log in.',
+      installed: 'To log in, run copilot once in a terminal on the relay host.',
+    }),
+    // Not on Windows, where npm is the relay's own install route.
+    managedReason: Object.freeze({
+      posix: 'Installed with npm, Homebrew or into a system folder: reinstall or remove it there. '
+        + 'Update works anyway: copilot update writes only to your user cache.',
+    }),
+    commands: Object.freeze({
+      install: Object.freeze({
+        posix: Object.freeze({
+          argv: Object.freeze(['bash', '-lc', COPILOT_POSIX_INSTALL_SCRIPT]),
+          display: `curl -fsSL ${COPILOT_INSTALL_SCRIPT_URL} | bash`,
+          detail: 'Runs without a terminal, so it never edits a shell profile. '
+            + 'Nothing is installed unless the script checked the download against the release\'s checksum file; '
+            + 'the relay host needs sha256sum or shasum for that.',
+          targetDir: '~/.local/bin',
+        }),
+        // npm, not winget (untried) or the portable zip (the relay would
+        // unpack and checksum it itself): npm checks every package against
+        // the registry's integrity hash and has no switch the relay sets to
+        // skip it, and the `copilot.cmd` it writes is a batch launcher this
+        // service already runs. `npm.cmd`, because PowerShell's default
+        // execution policy refuses `npm.ps1`. A missing npm is named up
+        // front: `$LASTEXITCODE` stays 0 when the command does not exist,
+        // which would surface as "copilot was not found" instead.
+        win32: Object.freeze({
+          argv: Object.freeze([
+            'powershell', '-NoProfile', '-NonInteractive', '-Command',
+            WIN32_COPILOT_NPM_INSTALL,
+          ]),
+          display: 'npm install -g @github/copilot',
+          detail: 'npm checks the package against the registry\'s integrity hash.',
+          targetDir: '%APPDATA%\\npm',
+          // npm's global folder when it is not the default one: on Windows
+          // the launchers sit in the prefix itself.
+          npmPrefix: Object.freeze({ launcher: 'npm.cmd', args: Object.freeze(['prefix', '-g']) }),
+        }),
+      }),
+      update: Object.freeze({
+        posix: Object.freeze({
+          argv: Object.freeze([BIN_PLACEHOLDER, 'update']),
+          display: 'copilot update',
+          targetDir: '~/.cache/copilot',
+        }),
+        darwin: Object.freeze({
+          argv: Object.freeze([BIN_PLACEHOLDER, 'update']),
+          display: 'copilot update',
+          targetDir: '~/Library/Caches/copilot',
+        }),
+        win32: Object.freeze({
+          argv: Object.freeze([BIN_PLACEHOLDER, 'update']),
+          display: 'copilot update',
+          targetDir: '%LOCALAPPDATA%\\copilot',
+        }),
+      }),
+    }),
   }),
 });
 
@@ -340,8 +456,15 @@ export function createCliInstallService({
   writeBoundBinaries = () => {},
   installTimeoutMs = CLI_INSTALL_TIMEOUT_MS,
   probeTimeoutMs = CLI_PROBE_TIMEOUT_MS,
+  longProbeTimeoutMs = CLI_LONG_PROBE_TIMEOUT_MS,
   statusTtlMs = CLI_STATUS_TTL_MS,
   logFlushMs = CLI_INSTALL_LOG_FLUSH_MS,
+  // The SDK folder a Copilot worker launch would get (copilot-sdk-runtime.mjs);
+  // throws with the launch's own message when there is none. The runtime
+  // hands in the lookup with its configuration (a pinned sdkPath or
+  // sdkVersion) and the launch environment, so the done-check cannot pass
+  // on a version the next launch would refuse.
+  findCopilotSdk = () => resolveCopilotSdkLaunchPath({ env, platform, homeDir: homedirImpl() }),
 } = {}) {
   const listeners = new Set();
   const successHooks = new Set();
@@ -548,9 +671,9 @@ export function createCliInstallService({
 
   // ─── Status probes ─────────────────────────────────────────────────────────
 
-  function runProbeCommand(argv) {
+  function runProbeCommand(argv, { timeoutMs = probeTimeoutMs } = {}) {
     return runProcessToCompletion(() => spawnCliProcess(argv), {
-      timeoutMs: probeTimeoutMs,
+      timeoutMs,
       setTimeoutImpl,
       clearTimeoutImpl,
       killChild: (child) => terminate(child),
@@ -565,18 +688,32 @@ export function createCliInstallService({
     return generic ? generic[1] : null;
   }
 
+  /** A per-platform table's entry: `anyPlatform`, this platform's own, else win32 or posix. */
+  function platformEntry(spec) {
+    if (!spec) return null;
+    return spec.anyPlatform || spec[platform] || (platform === 'win32' ? spec.win32 : spec.posix) || null;
+  }
+
   function commandsFor(descriptor, { installed }) {
     const out = {};
     for (const [action, spec] of Object.entries(descriptor.commands || {})) {
-      const entry = spec.anyPlatform || (platform === 'win32' ? spec.win32 : spec.posix);
+      const entry = platformEntry(spec);
       if (!entry) continue;
       // update/migrate run the installed binary, so they only exist once there
       // is one to run.
       if (action !== 'install' && !installed) continue;
       if (action === 'install' && installed) continue;
-      out[action] = { display: entry.display, targetDir: entry.targetDir };
+      out[action] = {
+        display: entry.display,
+        targetDir: entry.targetDir,
+        ...(entry.detail ? { detail: entry.detail } : {}),
+      };
     }
     return out;
+  }
+
+  function hintFor(descriptor, { installed }) {
+    return (installed ? descriptor.hints?.installed : descriptor.hints?.notInstalled) || null;
   }
 
   function notInstalledStatus(descriptor, { error = null } = {}) {
@@ -598,6 +735,7 @@ export function createCliInstallService({
       blockedReason: descriptor.detectOnly
         ? descriptor.blockedReason
         : (spawnsDisabled ? CLI_SPAWN_DISABLED_ERROR : null),
+      hint: hintFor(descriptor, { installed: false }),
       commands,
       doctor: null,
       bound: boundBinaries[descriptor.id] || null,
@@ -609,7 +747,10 @@ export function createCliInstallService({
   async function runProbe(descriptor) {
     const resolved = resolveCliBinary(descriptor.id);
     if (!resolved) return notInstalledStatus(descriptor);
-    const versionRun = await runProbeCommand([resolved.path, ...(descriptor.versionArgs || [])]);
+    const versionRun = await runProbeCommand(
+      [resolved.path, ...(descriptor.versionArgs || [])],
+      descriptor.longProbe ? { timeoutMs: longProbeTimeoutMs } : {},
+    );
     // A binary that resolves but cannot be run at all (kill switch, exec format
     // error) is still reported as installed with its path — the row says
     // "version unknown" rather than lying about the install.
@@ -641,6 +782,14 @@ export function createCliInstallService({
     }
     const spawnsDisabled = cliSpawnsDisabled();
     const commands = spawnsDisabled ? {} : commandsFor(descriptor, { installed: true });
+    // `claude doctor` names the method itself; everything else is classified
+    // from the realpath the launcher points at.
+    const installMethod = doctor?.method || classifyInstallMethod(resolved);
+    // A copy the relay's installer did not put in the user's home is left to
+    // whatever put it there; it only says so, it blocks no action.
+    const managedReason = installMethod && installMethod !== 'native'
+      ? platformEntry(descriptor.managedReason)
+      : null;
     return {
       id: descriptor.id,
       label: descriptor.label,
@@ -649,16 +798,15 @@ export function createCliInstallService({
       version: version || doctor?.version || null,
       path: resolved.path,
       realPath: resolved.realPath,
-      // `claude doctor` names the method itself; everything else is classified
-      // from the realpath the launcher points at.
-      installMethod: doctor?.method || classifyInstallMethod(resolved),
+      installMethod,
       updateAvailable,
       latestVersion,
       canInstall: false,
       canUpdate: Boolean(commands.update),
       blockedReason: descriptor.detectOnly
         ? descriptor.blockedReason
-        : (spawnsDisabled ? CLI_SPAWN_DISABLED_ERROR : null),
+        : (spawnsDisabled ? CLI_SPAWN_DISABLED_ERROR : managedReason),
+      hint: hintFor(descriptor, { installed: true }),
       commands,
       doctor,
       bound: boundBinaries[descriptor.id] || null,
@@ -911,9 +1059,7 @@ export function createCliInstallService({
    * provider) has no such command — never a partially-built one.
    */
   function resolveActionCommand(descriptor, action, resolvedPath) {
-    const spec = descriptor.commands?.[action];
-    if (!spec) return null;
-    const entry = spec.anyPlatform || (platform === 'win32' ? spec.win32 : spec.posix);
+    const entry = platformEntry(descriptor.commands?.[action]);
     if (!entry) return null;
     const override = normalizeText(env?.COPILOT_WEB_RELAY_CLI_INSTALL_COMMAND);
     if (override) {
@@ -922,7 +1068,12 @@ export function createCliInstallService({
       return { argv: [override, descriptor.id, action], display: entry.display, targetDir: entry.targetDir };
     }
     if (!entry.argv.includes(BIN_PLACEHOLDER)) {
-      return { argv: [...entry.argv], display: entry.display, targetDir: entry.targetDir };
+      return {
+        argv: [...entry.argv],
+        display: entry.display,
+        targetDir: entry.targetDir,
+        npmPrefix: entry.npmPrefix || null,
+      };
     }
     if (!resolvedPath) return null;
     return {
@@ -989,7 +1140,7 @@ export function createCliInstallService({
     installGeneration += 1;
     // Stamped on the session so a late close from a cancelled (or superseded)
     // run cannot publish an outcome over a newer one.
-    const current = { descriptor, action: normalizedAction, child: null, generation: installGeneration };
+    const current = { descriptor, action: normalizedAction, command, child: null, generation: installGeneration };
     session = current;
     install.providerId = descriptor.id;
     install.action = normalizedAction;
@@ -1013,7 +1164,112 @@ export function createCliInstallService({
     return { ok: true, reused: false, install: installSnapshot() };
   }
 
+  /**
+   * The descriptor's first run after its installer exited 0, still inside the
+   * install (Cancel reaches it, a second install is refused) and under the
+   * install timeout, not the probe's: Copilot unpacks its package into the
+   * user's cache here, and only then does the version folder with
+   * `copilot-sdk/` exist. Its output joins the install log.
+   *
+   * Resolves to null when it ran and, where the descriptor asks, the SDK
+   * lookup found a folder; else to the reason the install failed.
+   */
+  async function runFirstRun(current) {
+    const { descriptor, action } = current;
+    const args = [...(descriptor.firstRun.args || [])];
+    const shown = [descriptor.binary, ...args].join(' ');
+    const { resolved, npmPrefix } = await resolveAfterInstall(current);
+    // Cancelled during the npm lookup: the caller sees the newer generation.
+    if (current.generation !== installGeneration) return null;
+    if (!resolved) {
+      return npmPrefix
+        ? `${descriptor.label} ${action} finished but ${descriptor.binary} was not found on PATH or in npm's global folder ${npmPrefix}`
+        : `${descriptor.label} ${action} finished but ${descriptor.binary} was not found on PATH`;
+    }
+    appendInstallLog(current, `\n$ ${shown}\n`);
+    const run = await runProcessToCompletion(() => spawnCliProcess([resolved.path, ...args]), {
+      timeoutMs: installTimeoutMs,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+      killChild: (child) => terminate(child),
+      maxOutputChars: MAX_CAPTURED_OUTPUT_CHARS,
+      onChild: (child) => { current.child = child; },
+      onOutput: (text) => appendInstallLog(current, text),
+    });
+    if (!run.ok) {
+      const reason = run.error
+        || tailOf(stripTerminalEscapes(run.output))
+        || `exited with code ${run.code}`;
+      return `${descriptor.label} ${action} finished, but its first run (${shown}) failed: ${reason}`;
+    }
+    if (!descriptor.firstRun.requiresCopilotSdk) return null;
+    try {
+      appendInstallLog(current, `Copilot SDK found: ${findCopilotSdk()}\n`);
+      return null;
+    } catch (error) {
+      return `${descriptor.label} ${action} finished and ${shown} ran, but a Copilot launch would not find its SDK: ${error?.message || error}`;
+    }
+  }
+
+  /**
+   * A launcher file in a PATH directory, as an absolute path. npm's own
+   * `npm.cmd` finds its JS through `%~dp0`, the folder it was started from,
+   * which is the working directory when cmd.exe is handed the bare name; so
+   * it is always run by its full path.
+   */
+  function findOnPath(fileName) {
+    for (const dir of String(env?.PATH || '').split(pathImpl.delimiter)) {
+      if (!normalizeText(dir)) continue;
+      const candidate = pathImpl.join(normalizeText(dir), fileName);
+      try {
+        if (fsImpl.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+    return '';
+  }
+
+  function isDirectory(dir) {
+    try { return fsImpl.statSync(dir).isDirectory(); } catch { return false; }
+  }
+
+  /**
+   * The installed binary after an installer exited 0. An npm install whose
+   * global folder is not one this service searches (a custom prefix, or a
+   * PATH older than the install) is looked for in `npm prefix -g` too, under
+   * the probe timeout. Its answer is the first line of its standard output
+   * that is an existing folder, so an `npm notice` or a warning is never
+   * taken for it; that folder is hoisted onto PATH, so the binding and every
+   * later resolve agree on it.
+   */
+  async function resolveAfterInstall(current) {
+    const resolved = resolveCliBinary(current.descriptor.id);
+    const lookup = current.command?.npmPrefix;
+    if (resolved || !lookup) return { resolved, npmPrefix: '' };
+    const npm = findOnPath(lookup.launcher);
+    if (!npm) return { resolved: null, npmPrefix: '' };
+    const run = await runProbeCommand([npm, ...lookup.args]);
+    const npmPrefix = run.ok
+      ? stripTerminalEscapes(run.stdout).split('\n').map((line) => line.trim()).find((line) => line && isDirectory(line)) || ''
+      : '';
+    if (!npmPrefix) return { resolved: null, npmPrefix: '' };
+    hoistOntoPath([npmPrefix]);
+    return { resolved: resolveCliBinary(current.descriptor.id), npmPrefix };
+  }
+
   async function finishInstall(current, result) {
+    if (result.ok && current.descriptor.firstRun && current.generation === installGeneration) {
+      // The installer's bin dir first, so the first run is the copy it wrote.
+      hoistOntoPath(current.descriptor.extraBinDirs);
+      const failure = await runFirstRun(current);
+      // A cancel (or dispose) during the first run owns the visible state.
+      if (current.generation !== installGeneration) return;
+      if (failure) {
+        if (session === current) session = null;
+        install.finishedAt = new Date(now()).toISOString();
+        setInstallState(CLI_INSTALL_STATES.ERROR, { error: failure });
+        return;
+      }
+    }
     if (session === current) session = null;
     // A cancel (or a newer install, or dispose) already owns the visible state.
     if (current.generation !== installGeneration) return;

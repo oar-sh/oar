@@ -16,6 +16,7 @@ import {
   createRemoteRelayDispatcher,
   settleRemoteReply,
 } from './remote-relay-dispatcher.mjs';
+import { createRemoteRelayRegistry } from './remote-relay-registry-service.mjs';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -598,6 +599,8 @@ function setup({
   withLocalClient = true,
   // The relay event service (subscribe and its siblings), or null.
   relayEvents = null,
+  // The loop guard's off-list (the registry's isLoopGuardOff / setLoopGuardOff), or null.
+  loopGuard = null,
 } = {}) {
   const unlocks = new Set(unlocked.map((relayId) => `c-1:${relayId}`));
   const approvedLocal = new Set(localApproved);
@@ -615,6 +618,7 @@ function setup({
     latestHumanMessageId: () => humans.latest,
     // The local target's storage, read off the fake of this relay's own API.
     getConversationOrigin: (conversationId) => local.conversations.get(conversationId)?.origin || null,
+    compactedSuccessor: (conversationId) => local.conversations.get(conversationId)?.compactedInto || null,
     listActiveLocalSessions: (conversationId) => [...local.conversations.values()]
       .filter((conv) => conv.origin?.local === true && conv.origin.conversationId === conversationId && conv.activeTurn === true)
       .map((conv) => conv.id),
@@ -676,6 +680,7 @@ function setup({
     randomUUID: () => `m-sent-${++uuidCounter}`,
     ...(resolveConversationId ? { resolveConversationId } : {}),
     relayEvents,
+    loopGuard,
   });
   const run = (action, args = {}, conversationId = 'c-1') => dispatcher.dispatch({ conversationId, action, args });
   return { remote, local, dispatcher, run, logs, events, approvals, sleeps, clock, unlocks, approvedLocal };
@@ -1019,6 +1024,140 @@ test('a message from the user starts the count of agent prompts again, and a Den
   humans.latest = 'm-human-2';
   assert.equal((await send()).status, 200);
   assert.equal(denied.length, 1, 'no card after the user wrote');
+});
+
+// ─── The loop guard as a setting ─────────────────────────────────────────────
+
+/** A real registry over an in-memory settings store: the off-list survives a rebuilt dispatcher. */
+function loopGuardRegistry() {
+  const values = new Map();
+  return createRemoteRelayRegistry({
+    readSetting: (key) => values.get(key) ?? null,
+    writeSetting: (key, value) => values.set(key, value),
+    client: { request: async () => ({}) },
+    logger: { warn() {} },
+  });
+}
+
+/** `count` sends to linux-test conv-1, each a minute apart; the statuses. */
+async function sendMany(fixture, count, { relay = 'linux-test', session = 'conv-1' } = {}) {
+  const statuses = [];
+  for (let index = 0; index < count; index += 1) {
+    fixture.clock.now += 61_000;
+    statuses.push((await fixture.run('send', { relay, session, text: PROMPT, wait_seconds: 0 })).status);
+  }
+  return statuses;
+}
+
+test('the limit comes from the setting: with 10 the card comes at the 11th prompt, and 0 never asks', async () => {
+  const ten = setup({ humans: { latest: 'm-human-1' }, agentSessions: { enabled: false, agentPromptsBeforeAsking: 10 } });
+  withSession(ten.remote);
+  await sendMany(ten, 10);
+  assert.equal(ten.approvals.length, 0);
+  await sendMany(ten, 1);
+  assert.equal(ten.approvals.length, 1, 'agent sessions off: the limit applies to paired relays all the same');
+  assert.equal(ten.approvals[0].agentPrompts, 10);
+
+  const never = setup({ humans: { latest: 'm-human-1' }, agentSessions: { agentPromptsBeforeAsking: 0 } });
+  withSession(never.remote);
+  assert.ok((await sendMany(never, 100)).every((status) => status === 200));
+  assert.equal(never.approvals.length, 0, 'no card after 100 prompts');
+  assert.equal(never.remote.callsTo('POST', '/api/message').length, 100);
+});
+
+test('"Allow for this session" switches the guard off for the conversation, across a restart, until revoked', async () => {
+  const registry = loopGuardRegistry();
+  registry.setAgentSessionsSettings({ agentPromptsBeforeAsking: 10 });
+  const options = (approvals) => ({
+    humans: { latest: 'm-human-1' },
+    agentSessions: registry.getAgentSessionsSettings(),
+    loopGuard: registry,
+    requestApproval: async (request) => {
+      approvals.push(request);
+      return { approved: true, scope: 'session' };
+    },
+  });
+  const approvals = [];
+  const first = setup(options(approvals));
+  withSession(first.remote);
+  await sendMany(first, 11);
+  assert.equal(approvals.length, 1);
+  assert.equal(registry.isLoopGuardOff('c-1'), true);
+  assert.equal(registry.getAgentSessionsSettings().loopGuard.off[0].title, 'report builder');
+  await sendMany(first, 30);
+  assert.equal(approvals.length, 1, 'no further card');
+
+  // The restart: a new dispatcher (its count at 0) over the same settings.
+  const rebuilt = setup(options(approvals));
+  withSession(rebuilt.remote);
+  await sendMany(rebuilt, 25);
+  assert.equal(approvals.length, 1, 'none after the restart either');
+
+  // Revoke: the count ran on meanwhile, so the next prompt raises the card.
+  registry.revokeLoopGuardOff(['c-1']);
+  await sendMany(rebuilt, 1);
+  assert.equal(approvals.length, 2);
+  assert.equal(approvals[1].agentPrompts, 25);
+});
+
+test('a lane\'s report to its starter in a turn on the starter\'s prompt is not counted, on this relay and a paired one', async () => {
+  const starter = (relayId, extra = {}) => ({ kind: 'agent', relayId, conversationId: 'conv-1', hops: 0, ...extra });
+  // On this relay: the lane c-1 was created by conv-1 here.
+  const localOrigin = starter('relay-self-id', { local: true });
+  const local = setupLocal({ humans: { latest: 'm-human-1' }, agentSessions: { ...AGENT_SESSIONS_ON, agentPromptsBeforeAsking: 10 }, caller: { turnRows: [{ kind: '', origin: localOrigin }] } });
+  withLocalSession(local.local);
+  local.local.addConversation({ id: 'c-1', title: 'lane', origin: localOrigin });
+  assert.ok((await sendMany(local, 15, { relay: 'this' })).every((status) => status === 200));
+  assert.equal(local.approvals.length, 0);
+
+  // A paired relay's lead: the lane's stored origin is bound to that relay's key.
+  const pairedOrigin = starter(LINUX.relayId, { verified: true, entryId: LINUX.id, epoch: 0 });
+  const paired = setup({ humans: { latest: 'm-human-1' }, agentSessions: { agentPromptsBeforeAsking: 10 }, caller: { turnRows: [{ kind: '', origin: pairedOrigin }, { kind: '', origin: null }] } });
+  withSession(paired.remote);
+  paired.local.addConversation({ id: 'c-1', title: 'lane', origin: pairedOrigin });
+  assert.ok((await sendMany(paired, 15)).every((status) => status === 200));
+  assert.equal(paired.approvals.length, 0, 'the user\'s own words in the turn too');
+
+  // The starter compacted: its successor is still the starter here.
+  local.local.addConversation({ id: 'conv-2', title: 'sidebar polish (compacted)' });
+  local.local.conversations.get('conv-1').compactedInto = 'conv-2';
+  assert.ok((await sendMany(local, 15, { relay: 'this', session: 'conv-2' })).every((status) => status === 200));
+  assert.equal(local.approvals.length, 0);
+});
+
+test('the same report is counted in a turn woken by a relay event, a schedule message, a continuation or off-turn', async () => {
+  const origin = { kind: 'agent', relayId: 'relay-self-id', conversationId: 'conv-1', hops: 0, local: true };
+  for (const turnRows of [
+    [{ kind: 'relay-event', origin: null }],
+    [{ kind: 'relay-schedule', origin }],
+    [{ kind: '', origin }, { kind: 'relay-event', origin: null }],
+    [{ kind: 'continuation', origin: null }],
+    [],
+    [{ kind: '', origin: null }],
+  ]) {
+    const fixture = setupLocal({ humans: { latest: 'm-human-1' }, agentSessions: { ...AGENT_SESSIONS_ON, agentPromptsBeforeAsking: 10 }, caller: { turnRows } });
+    withLocalSession(fixture.local);
+    fixture.local.addConversation({ id: 'c-1', title: 'lane', origin });
+    assert.ok((await sendMany(fixture, 11, { relay: 'this' })).every((status) => status === 200));
+    assert.equal(fixture.approvals.length, 1, JSON.stringify(turnRows));
+  }
+});
+
+test('the lead\'s sends to its lanes count, and so do sends between sessions neither of which created the other', async () => {
+  // c-1 is the lead (no origin); conv-1 is its lane; the turn acts on the lane's report.
+  const fromLane = { kind: 'agent', relayId: 'relay-self-id', conversationId: 'conv-1', hops: 0, local: true };
+  const lead = setupLocal({ humans: { latest: 'm-human-1' }, agentSessions: { ...AGENT_SESSIONS_ON, agentPromptsBeforeAsking: 10 }, caller: { turnRows: [{ kind: '', origin: fromLane }] } });
+  withLocalSession(lead.local, { origin: { kind: 'agent', relayId: 'relay-self-id', conversationId: 'c-1', hops: 0, local: true } });
+  lead.local.addConversation({ id: 'c-1', title: 'lead' });
+  assert.ok((await sendMany(lead, 11, { relay: 'this' })).every((status) => status === 200));
+  assert.equal(lead.approvals.length, 1);
+
+  // A ↔ B, briefed only: c-1 was started by c-other, not by conv-1.
+  const sideways = setupLocal({ humans: { latest: 'm-human-1' }, agentSessions: { ...AGENT_SESSIONS_ON, agentPromptsBeforeAsking: 10 }, caller: { turnRows: [{ kind: '', origin: fromLane }] } });
+  withLocalSession(sideways.local);
+  sideways.local.addConversation({ id: 'c-1', title: 'B', origin: { kind: 'agent', relayId: 'relay-self-id', conversationId: 'c-other', hops: 0, local: true } });
+  assert.ok((await sendMany(sideways, 11, { relay: 'this' })).every((status) => status === 200));
+  assert.equal(sideways.approvals.length, 1);
 });
 
 test('writes are limited to 10 a minute per conversation, calls to 60', async () => {

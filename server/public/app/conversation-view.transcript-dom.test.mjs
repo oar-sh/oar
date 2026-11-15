@@ -1084,22 +1084,6 @@ test('a broadcast steering snapshot flips the composer to Steer without waiting 
   input.value = '';
 });
 
-test('a conversation binding to its session refreshes the worker status', async () => {
-  // Its worker's snapshot is keyed on the session id the binding just named.
-  const conv = uid('conv-bound');
-  conversations[conv] = { id: conv, title: 'Bound elsewhere', runtimeProviderType: 'github' };
-  const previousFetchHandler = fetchHandler;
-  fetchHandler = async () => null;
-  try {
-    const refreshesBefore = sessionWorkerStatusRefreshes;
-    await fire('conversation_session_bound', { conversationId: conv, sdkSessionId: uid('sess-bound'), runtimeSessionId: uid('rs') });
-    assert.equal(sessionWorkerStatusRefreshes, refreshesBefore + 1);
-  } finally {
-    fetchHandler = previousFetchHandler;
-    delete conversations[conv];
-  }
-});
-
 test('a pushed row the worker lists as cancellable keeps Cancel; the set is re-synced from the status payload without a rebuild', () => {
   resetView();
   const { conv, sdkSessionId } = openWorkerConversation('github', {

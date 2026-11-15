@@ -29,7 +29,6 @@ const PER_CONVERSATION = [
   'chat-menu-preview-shared',
   'chat-menu-archive',
   'chat-menu-group',
-  'chat-menu-inspect-tmux',
   'chat-menu-change-cwd',
   'chat-menu-git-changes',
   'chat-menu-kill-session',

@@ -3,6 +3,7 @@
 import { providerDisplayName } from '../public/app/conversation-provider-indicator.mjs';
 import { DEFAULT_QUESTION_TIMEOUT_MS } from '../../shared/question-timeout.mjs';
 import { REMOTE_RELAY_APPROVAL_VARIANT_LABELS, remoteConversationUrl } from '../../shared/remote-relay-contract.mjs';
+import { questionPushOpensApp } from './user-only-card.mjs';
 
 /**
  * Web Push dispatch: decides whether a push should go out at all (suppressed
@@ -172,6 +173,7 @@ export function renderPushNotification(event, preferences) {
   if (remote) {
     delete data.questionId;
     delete data.choices;
+    delete data.sdkSessionId;
   }
 
   // A distinct tag per event so notifications stack instead of replacing each
@@ -598,20 +600,33 @@ export function createPushDispatchService({
     // Short choices become notification action buttons. Long ones are skipped
     // rather than truncated: the button text is also the answer that gets
     // POSTed back, and a truncated answer would be wrong.
-    const choices = (Array.isArray(question?.choices) ? question.choices : [])
+    // An approval, a Safety check or a tool permission opens the app: no
+    // buttons, and no session to answer with.
+    const opensApp = questionPushOpensApp(question);
+    const choices = (opensApp ? [] : Array.isArray(question?.choices) ? question.choices : [])
       .map((choice) => String(choice || '').trim())
       .filter((choice) => choice && choice.length <= 120)
       .slice(0, 3);
     const id = String(question?.id || '').trim();
     if (id) noteNotice(id, 'pending');
+    // A loop guard card pushes even while a device is active: agents wait on
+    // it, and an open tab on another session does not mean it was seen.
+    let context = question?.context;
+    if (!context || typeof context !== 'object') {
+      try { context = JSON.parse(String(question?.request || ''))?.context; } catch { context = null; }
+    }
     const pushed = dispatch({
       type: 'question',
       conversationId: question?.conversationId || null,
+      bypassActiveSuppression: context?.variant === 'loop_guard',
       providerName: conversationProviderName(question?.conversationId),
       body: question?.prompt || null,
       data: {
         questionId: question?.id || undefined,
         choices: choices.length ? choices : undefined,
+        // A choice button's answer names the card's session, as the card in
+        // the app does: the answer route checks it against the card's own.
+        sdkSessionId: opensApp ? undefined : String(question?.sdkSessionId || '').trim() || undefined,
       },
     });
     if (!id) return pushed;

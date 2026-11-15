@@ -3,8 +3,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { EventEmitter } from 'events';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 import { spawn, spawnSync } from 'child_process';
 import net from 'net';
 
@@ -28,8 +27,9 @@ import {
   resolveStateLayout,
 } from '../server/services/oar-state-layout.mjs';
 import {
-  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, cliAgentToken, describeAgentSdks, describeRelayAddress, DOCTOR_PROBES,
-  listSystemdDropIns, ownerTokenState, parseCliArgs, parseSystemdVersion, primaryLanAddress, renderAgentSdkLines,
+  buildDefaultConfig, buildServicePath, buildSystemdUnit, classifySystemdUnit, cliAgentToken, copilotWrapperIsGenerated, copilotWrapperPath,
+  describeAgentSdks, describeRelayAddress, DOCTOR_PROBE_TIMEOUT_MS, DOCTOR_PROBES,
+  listSystemdDropIns, ownerTokenState, parseCliArgs, parseSystemdVersion, primaryLanAddress, removeGeneratedCopilotWrapper, renderAgentSdkLines,
   renderDoctorReport,
   resolveNpmInvocation, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
 } from '../server/services/oar-cli-helpers.mjs';
@@ -38,7 +38,7 @@ import { createPrompter, PromptAborted, runMenu } from '../server/services/oar-c
 import { createWindowsPortCheck, isWsl, isWslNat, windowsPortWarning } from '../server/services/oar-cli-wsl.mjs';
 import { readEnvValue, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 import { createProcessLister } from '../server/services/process-list-service.mjs';
-import { backupPathFor, createWindowsAutostartService, launcherScriptsMatch } from '../server/services/windows-autostart-service.mjs';
+import { backupPathFor, createWindowsAutostartService } from '../server/services/windows-autostart-service.mjs';
 import {
   BOOT_ELEVATION_SCRIPT_FILENAME, BOOT_TASK_XML_FILENAME,
   bootTaskLabel, createWindowsBootAutostartService, describeHandMade, describeWindowsAutostart, handMadeLines, switchBlockers,
@@ -46,22 +46,6 @@ import {
 
 function resolvePackageRoot(metaUrl = import.meta.url) {
   return path.resolve(path.dirname(fileURLToPath(metaUrl)), '..');
-}
-
-function parsePort(argv = [], fallback = 3333) {
-  const args = Array.isArray(argv) ? argv : [];
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = String(args[index] || '');
-    if (arg === '--port' && args[index + 1]) {
-      const parsed = Number.parseInt(String(args[index + 1]), 10);
-      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
-    }
-    if (arg.startsWith('--port=')) {
-      const parsed = Number.parseInt(arg.slice('--port='.length), 10);
-      if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
-    }
-  }
-  return fallback;
 }
 
 function normalizePort(value) {
@@ -136,11 +120,6 @@ function readJsonFile(filePath) {
   }
 }
 
-function writeJsonFile(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}
-
 function openAppendFileDescriptor(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   return fs.openSync(filePath, 'a');
@@ -152,11 +131,10 @@ function openAppendFileDescriptor(filePath) {
  * was migrated already, never overwrites, and says what it did or why it did
  * nothing. Database and uploads go where the relay `oar` starts will read
  * them, resolved as the relay resolves them. Returns null to go on, or the
- * result to stop with. A refusal stops only `oar setup` (`strict`): `oar
- * copilot` warns and starts the session on the state root as it is.
+ * result to stop with; a refusal stops `oar setup`.
  */
 async function migrateIntoStateRoot({
-  layout, env, packageRoot, migrateFrom = '', logger, isProcessAliveImpl = isProcessAlive, strict = true,
+  layout, env, packageRoot, migrateFrom = '', logger, isProcessAliveImpl = isProcessAlive,
 }) {
   const serverDir = path.join(packageRoot, 'server');
   const relayEnv = { COPILOT_WEB_RELAY_DATA_DIR: resolveRelayStateDirs({ env, layout }).dataDir };
@@ -178,9 +156,7 @@ async function migrateIntoStateRoot({
   }
   const refused = (message, reason) => {
     logger.error?.(`[oar] ${message}`);
-    if (strict) return { code: 1, reason };
-    logger.error?.('[oar] Nothing was migrated; starting on the state root as it is.');
-    return null;
+    return { code: 1, reason };
   };
   switch (migration.status) {
     case 'blocked-live-relay': return refused(migration.error, 'migration-blocked');
@@ -208,115 +184,6 @@ async function migrateIntoStateRoot({
   }
 }
 
-function getCopilotHomeDir(env = process.env) {
-  const override = String(env.COPILOT_CONFIG_HOME || '').trim();
-  if (override) return override;
-  if (process.platform === 'win32') {
-    const profile = String(env.USERPROFILE || '').trim();
-    return path.join(profile || os.homedir(), '.copilot');
-  }
-  return path.join(os.homedir(), '.copilot');
-}
-
-function getCopilotUserExtensionsDir(env = process.env) {
-  return path.join(getCopilotHomeDir(env), 'extensions');
-}
-
-function buildGlobalExtensionWrapperSource(entryPath) {
-  const entryUrl = pathToFileURL(path.resolve(String(entryPath || ''))).href;
-  const packageRoot = path.resolve(path.dirname(String(entryPath || '')), '..', '..', '..');
-  return [
-    '// Auto-generated by oar to provide a stable user-global extension entrypoint.',
-    '// Do not edit manually; regenerate via `oar --install-extension`.',
-    '',
-    'import path from "path";',
-    '',
-    `const PACKAGE_ROOT = ${JSON.stringify(packageRoot)};`,
-    'const cwd = path.resolve(process.cwd());',
-    'const normalizedPackageRoot = path.resolve(PACKAGE_ROOT);',
-    'const runningInsidePackage = cwd === normalizedPackageRoot || cwd.startsWith(`${normalizedPackageRoot}${path.sep}`);',
-    'const forceGlobalExtension = process.env.COPILOT_WEB_RELAY_FORCE_GLOBAL_EXTENSION === "true";',
-    '',
-    '// Avoid double-loading when the project-local extension is already discoverable from the repo itself.',
-    'if (!runningInsidePackage || forceGlobalExtension) {',
-    `  await import(${JSON.stringify(entryUrl)});`,
-    '}',
-    '',
-  ].join('\n');
-}
-
-function ensureGlobalExtensionWrapper({ packageRoot, env = process.env, logger = console } = {}) {
-  const sourceEntryPath = path.join(packageRoot, '.github', 'extensions', 'web-relay', 'extension.mjs');
-  if (!fs.existsSync(sourceEntryPath)) {
-    throw new Error(`missing extension entrypoint at ${sourceEntryPath}`);
-  }
-  const targetDir = path.join(getCopilotUserExtensionsDir(env), 'web-relay');
-  const targetFilePath = path.join(targetDir, 'extension.mjs');
-  const nextSource = buildGlobalExtensionWrapperSource(sourceEntryPath);
-  fs.mkdirSync(targetDir, { recursive: true });
-  const currentSource = fs.existsSync(targetFilePath) ? String(fs.readFileSync(targetFilePath, 'utf8')) : '';
-  if (currentSource !== nextSource) {
-    fs.writeFileSync(targetFilePath, nextSource, 'utf8');
-    logger.log?.(`[oar] Updated user extension wrapper: ${targetFilePath}`);
-  } else {
-    logger.log?.(`[oar] User extension wrapper already current: ${targetFilePath}`);
-  }
-  return { targetDir, targetFilePath, sourceEntryPath };
-}
-
-// No authToken: the relay keeps its owner token as a hash in its data folder.
-function createDefaultConfig({ port = 3333 } = {}) {
-  const parsedPort = Number.parseInt(String(port || ''), 10);
-  return {
-    port: Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 3333,
-    localhostOnly: true,
-    pollIntervalMs: 3000,
-    conversationSessionMode: 'isolated',
-  };
-}
-
-function resolveConfigPaths({ packageRoot, env = process.env, layout = null } = {}) {
-  const envConfigPath = String(env.COPILOT_WEB_RELAY_CONFIG || '').trim();
-  const repoConfigPath = path.join(packageRoot, 'server', 'config.json');
-  const oarConfigPath = layout && !layout.checkout ? path.join(layout.configDir, 'config.json') : null;
-  const seedPath = (
-    (envConfigPath && fs.existsSync(envConfigPath) && envConfigPath)
-    || (oarConfigPath && fs.existsSync(oarConfigPath) && oarConfigPath)
-    || (fs.existsSync(repoConfigPath) && repoConfigPath)
-    || null
-  );
-  const managedPath = oarConfigPath || path.join(getLegacyManagedConfigDir(env), 'config.json');
-  return { seedPath, configPath: seedPath || managedPath };
-}
-
-function resolveLauncherConfig({ packageRoot, env = process.env, relayPort = 3333, portOverride = null, layout = null } = {}) {
-  const { seedPath, configPath } = resolveConfigPaths({ packageRoot, env, layout });
-  const seedConfig = readJsonFile(seedPath) || {};
-  const runtimeConfig = {
-    ...createDefaultConfig({ port: relayPort }),
-    ...seedConfig,
-  };
-  // An explicit --port wins over the config for this run: the server gets it
-  // on argv, and only a config this command creates saves it.
-  runtimeConfig.port = normalizePort(portOverride) ?? normalizePort(runtimeConfig.port) ?? normalizePort(relayPort) ?? 3333;
-  return {
-    configPath,
-    managed: !seedPath,
-    config: runtimeConfig,
-  };
-}
-
-const GH_MISSING_MESSAGE = '[oar] The Copilot session needs the GitHub CLI (gh), which is not installed or not on PATH: https://cli.github.com — the relay alone needs no gh: oar start';
-
-function ghInstalled({ spawnSyncImpl = spawnSync } = {}) {
-  try {
-    const result = spawnSyncImpl('gh', ['--version'], { stdio: 'ignore', timeout: 15_000, windowsHide: true });
-    return !result?.error && result?.status === 0;
-  } catch {
-    return false;
-  }
-}
-
 export async function detectRunningRelay({
   lockPath,
   statusUrl,
@@ -340,267 +207,6 @@ export async function detectRunningRelay({
   }
 
   return { running: false, source: null, lock };
-}
-
-export async function launchRelay({
-  argv = process.argv.slice(2),
-  cwd = process.cwd(),
-  packageRoot = resolvePackageRoot(),
-  nodeBin = process.execPath,
-  spawnImpl = spawn,
-  spawnSyncImpl = spawnSync,
-  fetchImpl = globalThis.fetch,
-  isProcessAliveImpl = isProcessAlive,
-  lockGraceMs = 5000,
-  readyWaitMs = 20_000,
-  env = process.env,
-  logger = console,
-} = {}) {
-  const args = Array.isArray(argv) ? [...argv] : [];
-  const installExtensionOnly = args.includes('--install-extension');
-  const skipExtensionInstall = args.includes('--no-install-extension');
-  const separatorIdx = args.indexOf('--');
-  const rawLauncherArgs = separatorIdx === -1 ? args : args.slice(0, separatorIdx);
-  const migrateFromIdx = rawLauncherArgs.indexOf('--migrate-from');
-  const migrateFromRoot = migrateFromIdx !== -1 ? String(rawLauncherArgs[migrateFromIdx + 1] || '').trim() : '';
-  const launcherArgs = rawLauncherArgs
-    .filter((arg, idx) => idx !== migrateFromIdx && idx !== migrateFromIdx + 1)
-    .filter((arg) => arg !== '--install-extension' && arg !== '--no-install-extension');
-  const forwardedArgs = separatorIdx === -1 ? [] : args.slice(separatorIdx + 1);
-  if (args.includes('--help') || args.includes('-h')) {
-    logger.log([
-      'Usage: oar copilot [--port <port>] [--migrate-from <old-checkout>] [--install-extension] [--no-install-extension] [-- [gh copilot args...]]',
-      '',
-      'Starts the web relay server if needed, then launches gh copilot in the current shell.',
-      '--install-extension installs/updates a user-global web-relay wrapper extension and exits.',
-      '--no-install-extension skips automatic wrapper setup for this run.',
-      'oar help lists every command.',
-    ].join('\n'));
-    return { code: 0, reason: 'help' };
-  }
-
-  // The session is `gh copilot`: without gh there is nothing to prepare or
-  // start. Installing the wrapper alone needs no gh.
-  if (!installExtensionOnly && !ghInstalled({ spawnSyncImpl })) {
-    logger.error?.(GH_MISSING_MESSAGE);
-    return { code: 1, reason: 'gh-missing' };
-  }
-  if (!skipExtensionInstall || installExtensionOnly) {
-    try {
-      ensureGlobalExtensionWrapper({ packageRoot, env, logger });
-    } catch (error) {
-      logger.error?.(`[oar] Failed to prepare user extension wrapper: ${error?.message || error}`);
-      if (installExtensionOnly) return { code: 1, reason: 'extension-install-failed', error };
-    }
-  }
-  if (installExtensionOnly) {
-    return { code: 0, reason: 'extension-installed' };
-  }
-
-  const cliPort = parsePort(launcherArgs, null);
-  const serverDir = path.join(packageRoot, 'server');
-  const layout = resolveStateLayout({ packageRoot, env });
-
-  if (!layout.checkout) {
-    // Global install: state lives in the OAR root. Migrate pre-OAR state in
-    // (once, or as --migrate-from asks); a live source relay blocks it.
-    const stop = await migrateIntoStateRoot({
-      layout, env, packageRoot, migrateFrom: migrateFromRoot, logger, isProcessAliveImpl, strict: false,
-    });
-    if (stop) return stop;
-  }
-
-  const lockPath = layout.checkout
-    ? path.join(serverDir, 'data', 'relay-server.lock')
-    : path.join(layout.dataDir, 'relay-server.lock');
-  // One port finds, launches and probes the relay: an explicit --port for this
-  // run, else the config's, else 3333. The probe used to take --port (or 3333)
-  // while the server started on the config's port, so any mismatch waited out
-  // the readiness deadline and killed the relay it had just started.
-  const { seedPath } = resolveConfigPaths({ packageRoot, env, layout });
-  const configPort = normalizePort(readJsonFile(seedPath)?.port);
-  const port = cliPort ?? configPort ?? 3333;
-  const statusUrl = `http://localhost:${port}/api/status`;
-  const runtimeConfig = resolveLauncherConfig({
-    packageRoot,
-    env,
-    relayPort: port,
-    portOverride: cliPort,
-    layout,
-  });
-  // The relay on that port says whether it runs: a lock file says nothing
-  // about the port, and can outlive its relay. On a --port other than the
-  // config's the lock is left alone: its relay may run on the config's port.
-  // The data folder the relay below runs on, and the cli agent token derived
-  // from its agent key: what this launcher calls the relay with ('' until the
-  // relay has run once; looked up again while it starts).
-  const launchDataDir = resolveRelayStateDirs({ env, layout }).dataDir
-    || resolveDataDir({ env, configPath: runtimeConfig.configPath, serverDir });
-  const tokenNow = () => cliAgentToken({ dataDir: launchDataDir });
-  const probe = { statusUrl, token: tokenNow(), fetchImpl };
-  const answer = configPort && port !== configPort
-    ? await probeRelayPort(probe)
-    : await probeRelayBehindLock({ ...probe, lockPath, port, isProcessAliveImpl, lockGraceMs, logger });
-  if (answer === 'taken') {
-    logger.error?.(`[oar] Port ${port} is in use by another program, or by a relay with another token.`);
-    logger.error?.('[oar] Stop that program, or pick another port: oar copilot --port <port>');
-    return { code: 1, reason: 'port-taken' };
-  }
-  if (answer === 'bringing-over') {
-    logger.log(takeoverLine(readTakeover(lockPath, isProcessAliveImpl), getLauncherLogDir(env, layout)));
-    return { code: 1, reason: 'bringing-over' };
-  }
-  if (runtimeConfig.managed || !fs.existsSync(runtimeConfig.configPath)) {
-    writeJsonFile(runtimeConfig.configPath, runtimeConfig.config);
-  }
-
-  // Checkouts keep the repo-local server/data default; global installs point
-  // the server at the OAR root so updates cannot wipe the database.
-  const stateDirs = resolveRelayStateDirs({ env, layout });
-  const baseEnv = {
-    ...env,
-    COPILOT_WORKSPACE_ROOT: cwd,
-    COPILOT_WEB_RELAY_ROOT: packageRoot,
-    COPILOT_WEB_RELAY_SERVER_DIR: serverDir,
-    COPILOT_WEB_RELAY_CONFIG: runtimeConfig.configPath,
-    COPILOT_WEB_RELAY_LOG_DIR: getLauncherLogDir(env, layout),
-    ...(stateDirs.dataDir ? { COPILOT_WEB_RELAY_DATA_DIR: stateDirs.dataDir } : {}),
-    GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: String(env.GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS || 'true'),
-  };
-
-  let serverProc = null;
-  let relayStartedByThisCommand = false;
-  if (answer === 'oar') {
-    logger.log(`Copilot relay is already running at ${statusUrl}.`);
-  } else {
-    logger.log(`Starting Copilot relay from ${cwd}...`);
-    // No --token: argv is visible to local processes, and the relay keeps its
-    // own token (a --token still works, with a warning).
-    const serverArgs = [path.join(serverDir, 'server.js'), '--port', String(runtimeConfig.config.port)];
-    const logDir = getLauncherLogDir(baseEnv);
-    const serverLogPath = path.join(logDir, 'server.log');
-    const serverErrPath = path.join(logDir, 'server-err.log');
-    const serverOutFd = openAppendFileDescriptor(serverLogPath);
-    const serverErrFd = openAppendFileDescriptor(serverErrPath);
-    try {
-      serverProc = spawnImpl(nodeBin, serverArgs, {
-        // Global installs run from the OAR state root: on Windows a process
-        // pins its cwd, and `npm i -g` (self-update) must be able to replace
-        // the package directory. Checkouts keep the repo as cwd.
-        cwd: layout.checkout ? packageRoot : layout.root,
-        env: baseEnv,
-        stdio: ['ignore', serverOutFd, serverErrFd],
-        windowsHide: false,
-      });
-      relayStartedByThisCommand = true;
-    } catch (error) {
-      try { fs.closeSync(serverOutFd); } catch {}
-      try { fs.closeSync(serverErrFd); } catch {}
-      logger.error?.(`[oar] Failed to launch relay: ${error?.message || error}`);
-      return { code: 1, reason: 'spawn-failed', error };
-    }
-
-    if (!(serverProc instanceof EventEmitter) && typeof serverProc?.on !== 'function') {
-      return { code: 1, reason: 'spawn-invalid-child' };
-    }
-
-    const readyDeadlineMs = readyWaitMs;
-    const ready = await new Promise((resolve) => {
-      const deadline = Date.now() + readyDeadlineMs;
-      const probe = async () => {
-        if (serverProc && serverProc.exitCode !== null) {
-          resolve(false);
-          return;
-        }
-        try {
-          const res = await fetchImpl(statusUrl, {
-            headers: { Authorization: `Bearer ${tokenNow()}` },
-          });
-          if (res && res.ok) {
-            resolve(true);
-            return;
-          }
-        } catch {
-          // retry
-        }
-        if (Date.now() >= deadline) {
-          resolve(false);
-          return;
-        }
-        setTimeout(probe, 300);
-      };
-      probe();
-    });
-
-    const takeover = ready ? null : readTakeover(lockPath, isProcessAliveImpl);
-    if (takeover) {
-      // Left running: a kill would cut the copy short for nothing.
-      logger.log(takeoverLine(takeover, logDir));
-      try { fs.closeSync(serverOutFd); } catch {}
-      try { fs.closeSync(serverErrFd); } catch {}
-      return { code: 1, reason: 'bringing-over' };
-    }
-    if (!ready) {
-      logger.error?.(`[oar] Relay did not become ready at ${statusUrl}`);
-      try {
-        if (serverProc && typeof serverProc.kill === 'function') serverProc.kill();
-      } catch {}
-      try { fs.closeSync(serverOutFd); } catch {}
-      try { fs.closeSync(serverErrFd); } catch {}
-      return { code: 1, reason: 'server-not-ready' };
-    }
-
-    serverProc.once('exit', () => {
-      try { fs.closeSync(serverOutFd); } catch {}
-      try { fs.closeSync(serverErrFd); } catch {}
-    });
-  }
-
-  const ghArgs = forwardedArgs.length
-    ? ['copilot', '--', ...forwardedArgs]
-    : ['copilot'];
-  logger.log(`Launching Copilot CLI from ${cwd}...`);
-
-  let child;
-  try {
-    child = spawnImpl('gh', ghArgs, {
-      cwd,
-      env: baseEnv,
-      stdio: 'inherit',
-      windowsHide: false,
-    });
-  } catch (error) {
-    logger.error?.(error?.code === 'ENOENT' ? GH_MISSING_MESSAGE : `[oar] Failed to launch Copilot CLI: ${error?.message || error}`);
-    try {
-      if (relayStartedByThisCommand && serverProc && typeof serverProc.kill === 'function') serverProc.kill();
-    } catch {}
-    return { code: 1, reason: 'spawn-failed', error };
-  }
-
-  if (!(child instanceof EventEmitter) && typeof child?.on !== 'function') {
-    try {
-      if (relayStartedByThisCommand && serverProc && typeof serverProc.kill === 'function') serverProc.kill();
-    } catch {}
-    return { code: 1, reason: 'spawn-invalid-child' };
-  }
-
-  const exitCode = await new Promise((resolve) => {
-    child.on('exit', (code, signal) => {
-      resolve(code ?? (signal ? 1 : 0));
-    });
-    child.on('error', (error) => {
-      logger.error?.(error?.code === 'ENOENT' ? GH_MISSING_MESSAGE : `[oar] Copilot CLI process error: ${error?.message || error}`);
-      resolve(1);
-    });
-  });
-
-  if (relayStartedByThisCommand && serverProc && serverProc.exitCode === null) {
-    try {
-      serverProc.kill();
-    } catch {}
-  }
-
-  return { code: exitCode, reason: 'exited' };
 }
 
 function readPackageVersion(packageRoot = resolvePackageRoot()) {
@@ -1099,7 +705,7 @@ async function restartRelay(ctx, paths, { old, viaService, answered = true, now 
     return { ok: true, reason: 'restart-queued' };
   }
   if (before.answer === 'oar' && (old.port !== next.port || old.token !== next.token)) {
-    logger.error('[oar] The relay came back on its earlier port and token: it was started with fixed ones (oar copilot). End that session, then run: oar start');
+    logger.error('[oar] The relay came back on its earlier port and token: it was started with fixed ones (on its command line). Stop it, then run: oar start');
     return { ok: false, reason: 'fixed-settings' };
   }
   logger.error(`[oar] The relay did not come back — see ${viaService ? 'journalctl --user -u oar' : path.join(paths.logDir, 'server-err.log')}`);
@@ -2350,7 +1956,7 @@ async function removeGeneratedEntries(ctx, paths, done) {
       done.push(`removed ${unitPath}`);
     }
   }
-  const wrapper = path.join(getCopilotUserExtensionsDir(ctx.env), 'web-relay', 'extension.mjs');
+  const wrapper = copilotWrapperPath({ env: ctx.env, homeDir: ctx.homeDir });
   const source = readText(wrapper);
   if (source !== null && wrapperIsGenerated(ctx, source)) {
     fs.rmSync(wrapper, { force: true });
@@ -2365,16 +1971,12 @@ async function removeGeneratedEntries(ctx, paths, done) {
 }
 
 /**
- * The Copilot wrapper as this version or an earlier one (before the rename,
- * as copilot-remote) wrote it for this install; the same rule as the
- * autostart launchers: anything else is hand-made.
+ * The Copilot wrapper as earlier versions (and those before the rename, as
+ * copilot-remote) wrote it for this install; the same rule as the autostart
+ * launchers: anything else is hand-made.
  */
 function wrapperIsGenerated(ctx, source) {
-  const current = buildGlobalExtensionWrapperSource(path.join(ctx.packageRoot, '.github', 'extensions', 'web-relay', 'extension.mjs'));
-  const earlier = current
-    .replace('Auto-generated by oar ', 'Auto-generated by copilot-remote ')
-    .replace('`oar --install-extension`', '`copilot-remote --install-extension`');
-  return [current, earlier].some((generated) => launcherScriptsMatch(source, generated));
+  return copilotWrapperIsGenerated(source, ctx.packageRoot);
 }
 
 /**
@@ -2524,7 +2126,7 @@ export async function runDoctor(options = {}) {
 
   const probes = DOCTOR_PROBES.map((probe) => {
     try {
-      const result = ctx.spawnSyncImpl(probe.binary, probe.args, { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      const result = ctx.spawnSyncImpl(probe.binary, probe.args, { encoding: 'utf8', timeout: probe.timeoutMs || DOCTOR_PROBE_TIMEOUT_MS, windowsHide: true });
       const ok = result.status === 0;
       const version = ok ? String(result.stdout || '').trim().split('\n')[0].slice(0, 60) : '';
       return { id: probe.id, ok, version };
@@ -2671,9 +2273,11 @@ export async function runBackup(options = {}) {
  * Update button. Fetching the manifest here is an explicit user action, so it
  * happens regardless of the relay's opt-in auto-check setting.
  */
-async function runUpdate({ argv = [], env = process.env, logger = console, fetchImpl = globalThis.fetch, spawnImpl = spawn } = {}) {
+async function runUpdate({
+  argv = [], env = process.env, logger = console, fetchImpl = globalThis.fetch, spawnImpl = spawn,
+  packageRoot = resolvePackageRoot(), homeDir = os.homedir(),
+} = {}) {
   const { channelForVersion, compareSemverIsh, parseSemverIsh } = await import('../shared/update-semver.mjs');
-  const packageRoot = resolvePackageRoot();
   const runningVersion = readPackageVersion(packageRoot);
 
   if (isGitCheckout(packageRoot)) {
@@ -2749,6 +2353,11 @@ async function runUpdate({ argv = [], env = process.env, logger = console, fetch
       return { code: 1, reason: 'native-build-failed' };
     }
   }
+  // The Copilot CLI wrapper earlier versions wrote loads an extension this
+  // version no longer has, which breaks every start of the Copilot CLI.
+  const wrapper = removeGeneratedCopilotWrapper({ env, homeDir });
+  if (wrapper.status === 'removed') logger.log(`[oar] Removed the Copilot CLI wrapper an earlier version wrote: ${wrapper.path}`);
+  if (wrapper.status === 'failed') logger.error(`[oar] Could not remove the Copilot CLI wrapper an earlier version wrote (${wrapper.path}): ${wrapper.error?.message || wrapper.error}`);
 
   // A running relay picks the new code up on restart; ask for the queue-idle
   // deferred one so no in-flight turn is cut off.
@@ -2828,7 +2437,6 @@ async function runMenuCommand(options = {}) {
       url: run(runUrl),
       setup: run(runSetup),
       doctor: run(runDoctor),
-      copilot: run(launchRelay),
       service: async (status) => {
         const action = { none: 'install', unavailable: 'status', other: 'status' }[status.service] || 'remove';
         if (action === 'remove' && !(await ctx.prompter.yesNo('Remove the service?', { defaultYes: false }))) return null;
@@ -2852,7 +2460,6 @@ const COMMANDS = {
   service: runService,
   autostart: runAutostart,
   uninstall: runUninstall,
-  copilot: launchRelay,
   doctor: runDoctor,
   backup: runBackup,
   update: runUpdate,
@@ -2922,4 +2529,4 @@ if (invokedPath === selfPath || invokedName === 'oar.js' || invokedName === 'oar
   });
 }
 
-export { main, parsePort, readRelayLock, resolvePackageRoot };
+export { main, readRelayLock, resolvePackageRoot };

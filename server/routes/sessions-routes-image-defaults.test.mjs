@@ -8,6 +8,7 @@ import { createMessageRepository } from '../repositories/message-repository.mjs'
 import { createImageConversationRepository } from '../repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { asOwner } from '../services/relay-principal-test-harness.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 // update_session `image`: an OpenAI image session's defaults, stored per
 // conversation (image_sessions.defaults_json) through PATCH
@@ -65,14 +66,12 @@ function setup({ modelState = CATALOG, openAISettings = OPENAI_ON } = {}) {
     resolveConversationWorkspaceState: () => ({}),
     updateConversationConfiguredWorkspaceRoot: () => ({ changed: false }),
     learnConversationWorkspaceRoot: () => ({ learned: false }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     workspaceRootAllowList: [],
     processingTimeoutMs: 0,
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'client-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     ensureRuntimeSessionBinding: () => ({ id: 'runtime-session-1' }),
@@ -84,12 +83,8 @@ function setup({ modelState = CATALOG, openAISettings = OPENAI_ON } = {}) {
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
-    sessionWorkerSupervisor: null,
+    sessionWorkerSupervisor: fakeSessionWorkerSupervisor(),
     sessionWorkerRegistry: null,
   };
   registerSessionsRoutes(app, deps);

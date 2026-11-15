@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Share management, against the shared e2e relay.
@@ -21,19 +25,12 @@ function authHeaders() {
 
 async function seedConversation(request, title) {
   const headers = authHeaders();
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text: `${title}: first question`, relayMode: "agent", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok(), `POST /api/message answered ${queued.status()}`).toBeTruthy();
-  const body = await queued.json();
-  const conversationId = String(body?.conversationId || "").trim();
+  // Made as the web client makes a chat: bound to its session from the start.
+  const started = await startConversation({ text: `${title}: first question` });
+  const conversationId = started.conversationId;
   expect(conversationId).toBeTruthy();
-  const responded = await request.post("/api/response", {
-    headers,
-    data: { messageId: String(body.messageId), conversationId, text: `${title}: first answer`, model: "gpt-5.4-mini", mode: "agent" },
-  });
-  expect(responded.ok()).toBeTruthy();
+  const responded = await completeTurn(started, { text: `${title}: first answer`, model: "gpt-5.4-mini", mode: "agent" });
+  expect(responded.ok).toBeTruthy();
   const renamed = await request.patch(`/api/conversation/${conversationId}`, { headers, data: { title } });
   expect(renamed.ok()).toBeTruthy();
   return conversationId;

@@ -6,13 +6,6 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import {
-  OAR_MCP_SERVER_NAME,
-  OAR_MCP_SERVER_SCRIPT_PATH,
-  OAR_MCP_TOOL_TIMEOUT_MS,
-  buildOarMcpServerLaunch,
-  isOarMcpServerDisabled,
-} from '../mcp/oar-mcp-server.mjs';
 import { WORKER_LOG_FILE_ENV } from '../../shared/worker-runtime/worker-log-file.mjs';
 import {
   HOST_CLAUDE_SESSION_ENV_VARS,
@@ -20,15 +13,13 @@ import {
   withoutHostClaudeSessionVariables,
 } from '../../shared/host-claude-session-env.mjs';
 import { missingWorkingDirectoryError } from '../../shared/worker-runtime/working-directory.mjs';
-import { createProcessIdentityReader, identityOfListedWorker, mayReuseSessionWorkerRow } from './session-worker-process-service.mjs';
+import { createProcessIdentityReader, identityOfListedWorker, judgeListedSessionProcess } from './session-worker-process-service.mjs';
 import {
   describeSpawnEnvironment,
   envPathKey,
   readEnvValue,
   windowsCmdPath,
 } from '../../shared/windows-system-tools.mjs';
-
-export { isOarMcpServerDisabled };
 
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
@@ -184,18 +175,18 @@ export function applyOpenAIProviderEnvironment(env = {}, {
 }
 
 /**
- * The worker kind an environment names, or `copilot` (the extension engine,
- * which is the absence of a kind) for anything unrecognised.
+ * The worker kind an environment names, or '' when it names none or one
+ * that does not exist. There is no kind to fall back to: a launch without
+ * one fails (launchSessionCli).
  *
  * Validated against `NODE_WORKER_DESCRIPTORS` rather than a parallel list of
  * kind names: a new node worker is then one descriptor entry, and there is no
- * second place that can be forgotten and silently route the new kind back to
- * the Copilot CLI. Referenced lazily — this is only ever called at request
- * time, long after the descriptor table is initialised.
+ * second place that can be forgotten. Referenced lazily — this is only ever
+ * called at request time, long after the descriptor table is initialised.
  */
 export function resolveWorkerKind(env = {}) {
   const kind = String(env?.COPILOT_WEB_RELAY_WORKER_KIND || '').trim().toLowerCase();
-  return Object.hasOwn(NODE_WORKER_DESCRIPTORS, kind) ? kind : 'copilot';
+  return Object.hasOwn(NODE_WORKER_DESCRIPTORS, kind) ? kind : '';
 }
 
 // The agent SDK a worker kind runs on (agent-sdk-store.mjs), or null: the
@@ -351,32 +342,32 @@ export function applyClaudeApiProviderEnvironment(env = {}, {
 }
 
 /**
- * The Copilot SDK engine: the same `github`/`openai` providers the extension
- * serves, run as a plain Node worker against the CLI's headless runtime.
+ * Copilot: the `github` and `openai` providers, run as a plain Node worker
+ * against the Copilot CLI's headless runtime.
  *
  * Unlike the other appliers this one configures no credentials of its own. The
- * SDK worker authenticates exactly like the TUI does (the host's `copilot`
- * login), and the one path it needs — `COPILOT_SDK_PATH` — is already resolved
- * once into the base launch environment for every session, extension or SDK.
- * (It needs no CLI executable: the runtime entry point is derived from the SDK
- * bundle's own version directory, so the two can never drift apart.) This
- * applier's whole job is selecting the worker kind and handing over the model.
+ * worker authenticates through the host's `copilot` login, and the one path
+ * it needs is `COPILOT_SDK_PATH`: the `copilot-sdk` folder of an installed
+ * CLI version, which the caller looks up for each launch and hands over as
+ * `sdkPath` (resolveCopilotSdkLaunchPath in copilot-sdk-runtime.mjs). One
+ * already in the environment is kept when none is handed over. (It needs no
+ * CLI executable: the runtime entry point is derived from the SDK bundle's
+ * own version directory, so the two can never drift apart.)
  *
  * BYOK is deliberately NOT re-implemented here: an `openai` session is composed
  * as `applyCopilotSdkProviderEnvironment(applyOpenAIProviderEnvironment(...))`,
- * so one OpenAI configuration drives both engines and the secret-env-file
- * plumbing for `COPILOT_PROVIDER_API_KEY` is untouched. The SDK worker reads
- * that family in-process (`copilot-byok-provider.mjs`) because the runtime
- * ignores it for SDK-created sessions.
+ * and the secret-env-file plumbing for `COPILOT_PROVIDER_API_KEY` is
+ * untouched. The SDK worker reads that family in-process
+ * (`copilot-byok-provider.mjs`) because the runtime ignores it for
+ * SDK-created sessions.
  *
- * `COPILOT_SDK_PATH` is required rather than optional: it is resolved from the
- * installed CLI's own bundle, so its absence means there is no CLI to run and
- * failing here names the problem instead of spawning a worker that dies on its
- * first import.
+ * The path is required rather than optional: failing here names the problem
+ * instead of spawning a worker that dies on its first import.
  */
 export function applyCopilotSdkProviderEnvironment(env = {}, {
   enabled = false,
   model = '',
+  sdkPath = '',
 } = {}) {
   const next = { ...env };
   // Only clear the worker kind this provider owns so clear chains stay
@@ -384,43 +375,40 @@ export function applyCopilotSdkProviderEnvironment(env = {}, {
   if (resolveWorkerKind(next) === 'copilot-sdk') delete next.COPILOT_WEB_RELAY_WORKER_KIND;
   delete next.COPILOT_RELAY_MODEL;
   if (!enabled) return next;
-  if (!normalizeText(next.COPILOT_SDK_PATH)) throw new Error('copilot-sdk-path-not-resolved');
+  const normalizedSdkPath = normalizeText(sdkPath) || normalizeText(next.COPILOT_SDK_PATH);
+  if (!normalizedSdkPath) throw new Error('copilot-sdk-path-not-resolved');
+  next.COPILOT_SDK_PATH = normalizedSdkPath;
   next.COPILOT_WEB_RELAY_WORKER_KIND = 'copilot-sdk';
   const normalizedModel = normalizeText(model);
   if (normalizedModel) next.COPILOT_RELAY_MODEL = normalizedModel;
   return next;
 }
 
+// The switch of test relays (COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN): this relay
+// launches no worker; one may report by itself.
+export const CLI_SPAWN_DISABLED = 'cli-spawn-disabled';
+
+export function isCliSpawnDisabled(env = {}) {
+  return Boolean(String(env?.COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN || '').trim());
+}
+
 /**
- * Why the Copilot SDK engine cannot be selected right now, or null when it can.
- *
- * The engine toggle is a promise the UI makes on the relay's behalf ("new
- * Copilot conversations run headless"), and there are two ways to save it and
- * have precisely nothing happen — both invisible from the settings panel, and
- * both indistinguishable from the feature simply not working:
- *
- *  - `COPILOT_SDK_PATH` never resolved. The worker's very first act is to
- *    import the SDK from it, so every conversation would die on spawn.
- *  - Session-worker routing is off. No worker of any node kind is ever spawned,
- *    so the setting is a no-op while the panel asserts the opposite.
- *
- * Refusing the save with the reason is strictly better than accepting it: the
- * user finds out at the moment they can still act on it.
+ * The launch answer under that switch: deferred, not failed, so the session
+ * gets no restart backoff and no launch note, and its rows stay queued for a
+ * worker that reports with the session's id. One log line per session.
  */
-export function copilotSdkEngineUnavailableReason({ env = {}, routingEnabled = false } = {}) {
-  if (!normalizeText(env?.COPILOT_SDK_PATH)) {
-    // Worth spelling out: the launch environment is built ONCE at boot, so
-    // installing the CLI now and re-saving without a restart fails identically.
-    return 'The Copilot SDK was not found when the relay started (COPILOT_SDK_PATH did not resolve). '
-      + 'Install or upgrade the GitHub Copilot CLI, then restart the relay — the launch environment is '
-      + 'snapshotted at startup, so a CLI installed since then is not visible yet.';
-  }
-  if (routingEnabled !== true) {
-    return 'The SDK engine requires session worker routing, which is disabled on this relay '
-      + '(SESSION_WORKER_ROUTING_ENABLED). With routing off no SDK worker is ever spawned, so the engine '
-      + 'setting would have no effect.';
-  }
-  return null;
+export function createCliSpawnDisabledDeferral({ log = () => {} } = {}) {
+  const logged = new Set();
+  return function deferLaunch(sdkSessionId) {
+    const sessionId = String(sdkSessionId || '').trim();
+    if (sessionId && !logged.has(sessionId)) {
+      logged.add(sessionId);
+      try {
+        log(`worker launcher: not launched session=${sessionId.slice(0, 8)} (COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN), waiting for a worker to report`);
+      } catch {}
+    }
+    return { deferred: CLI_SPAWN_DISABLED };
+  };
 }
 
 export function isClaudeWorkerEnvironment(env = {}) {
@@ -521,12 +509,10 @@ export function resolveCopilotSdkWorkerScriptPath(env = {}) {
   return path.join(process.cwd(), 'server', 'copilot-worker', 'copilot-sdk-session-worker.mjs');
 }
 
-// Workers that run as plain Node processes (no CLI, no pseudo-TTY). The
-// `copilot` kind is intentionally absent: that is the extension engine, whose
-// launch path (the real TUI under a `script` pseudo-TTY) must stay exactly
-// as-is. `copilot-sdk` is the SAME provider on the headless SDK engine, and it
-// belongs here with Claude/Cursor/Grok. `claude-cloud` is a provider of its
-// own: its worker follows a session in Anthropic's cloud and runs no CLI.
+// The workers: every kind runs as a plain Node process (no pseudo-TTY).
+// `copilot-sdk` serves the `github` and `openai` providers. `claude-cloud` is
+// a provider of its own: its worker follows a session in Anthropic's cloud
+// and runs no CLI.
 const NODE_WORKER_DESCRIPTORS = Object.freeze({
   claude: Object.freeze({ resolveScriptPath: resolveClaudeWorkerScriptPath, windowsTitle: 'Claude Worker' }),
   cursor: Object.freeze({ resolveScriptPath: resolveCursorWorkerScriptPath, windowsTitle: 'Cursor Worker' }),
@@ -555,98 +541,18 @@ function resolveNodeWorkerDescriptor(env = {}) {
   };
 }
 
-function buildPosixWorkerLaunchCommand(targetSessionId, env = {}, extraCliArgs = []) {
+function buildPosixWorkerLaunchCommand(targetSessionId, env = {}) {
   const nodeWorker = resolveNodeWorkerDescriptor(env);
-  if (nodeWorker) {
-    const nodeExecutable = resolveWorkerNodeExecutable(env);
-    return `${shellQuote(nodeExecutable)} ${shellQuote(nodeWorker.scriptPath)} --session-id ${shellQuote(targetSessionId)}`;
-  }
-  const cliExecutable = normalizeText(env?.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
-    || normalizeText(env?.COPILOT_CLI_EXECUTABLE)
-    || normalizeText(env?.COPILOT_CLI_PATH)
-    || 'copilot';
-  const extra = (Array.isArray(extraCliArgs) ? extraCliArgs : []).map((arg) => ` ${shellQuote(arg)}`).join('');
-  return `${shellQuote(cliExecutable)} --allow-all --session-id ${shellQuote(targetSessionId)}${extra}`;
+  if (!nodeWorker) throw new Error(unknownWorkerKindError(env));
+  const nodeExecutable = resolveWorkerNodeExecutable(env);
+  return `${shellQuote(nodeExecutable)} ${shellQuote(nodeWorker.scriptPath)} --session-id ${shellQuote(targetSessionId)}`;
 }
 
-// ─── The OAR MCP server for the extension engine ─────────────────────────────
-//
-// The Copilot CLI takes extra MCP servers per run through
-// `--additional-mcp-config <json>`, where `<json>` may be `@<file>` (CLI
-// 1.0.83 `--help`: "JSON string or file path (prefix with @)"; the file is
-// read as UTF-8 and merged over ~/.copilot/mcp-config.json for that run
-// only). The config goes to a file rather than inline: the argument then
-// crosses cmd.exe/`start` on Windows and `sh -lc` + `script -c` on the tmux
-// path as one plain path, with no JSON to escape through two shells.
-//
-// Server entry shape (the CLI's own `copilot mcp add` writes the same):
-// `{ type: 'local', command, args, env, tools: ['*'], timeout }`. `timeout` is
-// the per-call limit in ms; without it the CLI cuts a tool call off at 180 s,
-// shorter than one relay_tool wait.
-
-export function resolveOarMcpServerScriptPath(env = {}, { pathImpl = path } = {}) {
-  const repoRoot = normalizeText(env?.COPILOT_WEB_RELAY_ROOT);
-  if (repoRoot) return pathImpl.join(repoRoot, 'server', 'mcp', 'oar-mcp-server.mjs');
-  const serverDir = normalizeText(env?.COPILOT_WEB_RELAY_SERVER_DIR);
-  if (serverDir) return pathImpl.join(serverDir, 'mcp', 'oar-mcp-server.mjs');
-  return OAR_MCP_SERVER_SCRIPT_PATH;
-}
-
-/** The `--additional-mcp-config` document for one extension-engine session. */
-export function buildCopilotOarMcpConfig(targetSessionId, env = {}, {
-  nodePath = normalizeText(env?.COPILOT_WEB_RELAY_NODE) || process.execPath,
-  pathImpl = path,
-} = {}) {
-  const launch = buildOarMcpServerLaunch({
-    nodePath,
-    conversationId: targetSessionId,
-    env,
-    scriptPath: resolveOarMcpServerScriptPath(env, { pathImpl }),
-  });
-  return {
-    mcpServers: {
-      [OAR_MCP_SERVER_NAME]: {
-        type: 'local',
-        command: launch.command,
-        args: launch.args,
-        env: launch.env,
-        tools: ['*'],
-        timeout: OAR_MCP_TOOL_TIMEOUT_MS,
-      },
-    },
-  };
-}
-
-/**
- * Writes the session's MCP config next to its worker log and returns the file
- * path, or null — best-effort like the log itself: a session that cannot get
- * the file still starts, just without the OAR tools. No secrets go in: the
- * server reads the token from the relay config the file points at.
- */
-export function prepareOarMcpConfigFile(targetSessionId, launchEnv = {}, {
-  fsImpl = fs,
-  pathImpl = path,
-  nodePath = undefined,
-} = {}) {
-  if (isOarMcpServerDisabled(launchEnv)) return null;
-  try {
-    const config = buildCopilotOarMcpConfig(targetSessionId, launchEnv, {
-      pathImpl,
-      ...(nodePath ? { nodePath } : {}),
-    });
-    const baseDir = resolveWorkerLogDir(launchEnv, { pathImpl });
-    fsImpl.mkdirSync(baseDir, { recursive: true });
-    const filePath = pathImpl.join(baseDir, `worker-${safeWorkerFileId(targetSessionId)}.mcp.json`);
-    fsImpl.writeFileSync(filePath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    return filePath;
-  } catch {
-    return null;
-  }
-}
-
-function oarMcpCliArgs(configFilePath) {
-  const filePath = normalizeText(configFilePath);
-  return filePath ? ['--additional-mcp-config', `@${filePath}`] : [];
+// What a launch fails with when its environment names no worker kind, or one
+// that does not exist.
+function unknownWorkerKindError(env = {}) {
+  const stated = normalizeText(env?.COPILOT_WEB_RELAY_WORKER_KIND);
+  return `worker-kind-unknown: ${stated ? `"${stated}"` : 'none named'} (COPILOT_WEB_RELAY_WORKER_KIND)`;
 }
 
 export function normalizeTmuxSessionName(targetSessionId) {
@@ -877,7 +783,6 @@ export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
 // its own command exports none (launchSessionCli takes them out).
 export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
   'COPILOT_ALLOW_ALL',
-  'GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS',
   'COPILOT_WEB_RELAY_ROOT',
   'COPILOT_WEB_RELAY_SERVER_DIR',
   'COPILOT_WEB_RELAY_CONFIG',
@@ -886,22 +791,18 @@ export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
   // The Cursor worker keeps its agent stores in the relay's data dir
   // (applyCursorProviderEnvironment).
   'COPILOT_WEB_RELAY_DATA_DIR',
-  'COPILOT_WEB_RELAY_CLI_EXECUTABLE',
-  'COPILOT_WEB_RELAY_EXTENSION_BOOTSTRAP_PATH',
   'COPILOT_SDK_PATH',
-  'EXTENSION_PATH',
   'COPILOT_PROVIDER_TYPE',
   'COPILOT_PROVIDER_BASE_URL',
   'COPILOT_PROVIDER_WIRE_API',
   'COPILOT_MODEL',
   'COPILOT_WEB_RELAY_WORKER_KIND',
   // The SDK worker's own model and BYOK context overrides. `COPILOT_MODEL`
-  // above is the extension engine's model variable and is read by the CLI's
-  // startup layer; the SDK worker takes its default model from
-  // `COPILOT_RELAY_MODEL`, matching every other Node worker's
-  // `*_RELAY_MODEL`. Without it here the model would silently drop to the
-  // runtime default on the tmux path while working on the detached path,
-  // which inherits the whole environment.
+  // above belongs to the BYOK family the OpenAI applier sets; the SDK worker
+  // takes its default model from `COPILOT_RELAY_MODEL`, matching every other
+  // Node worker's `*_RELAY_MODEL`. Without it here the model would silently
+  // drop to the runtime default on the tmux path while working on the
+  // detached path, which inherits the whole environment.
   'COPILOT_RELAY_MODEL',
   'COPILOT_PROVIDER_MAX_PROMPT_TOKENS',
   'COPILOT_PROVIDER_MAX_OUTPUT_TOKENS',
@@ -944,10 +845,8 @@ export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
   'GROK_RELAY_MODEL',
   'GROK_CLI_COMMAND',
   'GROK_ALWAYS_APPROVE',
-  // The OAR MCP server kill switch (the Grok worker reads it too), and the
-  // extension engine's "it is attached" marker.
+  // The OAR MCP server kill switch (the Grok worker reads it).
   'OAR_MCP_SERVER',
-  'OAR_MCP_SERVER_ATTACHED',
   // The agent SDK folder a worker runs on for its whole life (agent-sdk-loader.mjs).
   'OAR_AGENT_SDK_DIR_CLAUDE',
   'OAR_AGENT_SDK_DIR_CURSOR',
@@ -959,9 +858,6 @@ export const TMUX_WORKER_EXPORTED_ENV_VARS = Object.freeze([
 export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   secretEnvFilePath = '',
   workerLogPath = '',
-  // Extension engine only: appended to the CLI command, each shell-quoted
-  // (and quoted again with it for `script -c`).
-  extraCliArgs = [],
 } = {}) {
   const launchEnv = {
     ...env,
@@ -1018,21 +914,13 @@ export function buildTmuxWorkerShellCommand(targetSessionId, env = {}, {
   const secretPrefix = normalizedSecretEnvFilePath
     ? `. ${shellQuote(normalizedSecretEnvFilePath)} || exit $?; rm -f ${shellQuote(normalizedSecretEnvFilePath)}; rmdir ${shellQuote(path.dirname(normalizedSecretEnvFilePath))}; `
     : '';
-  const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv, extraCliArgs);
-  if (resolveNodeWorkerDescriptor(launchEnv)) {
-    // Node workers (Claude, Cursor, Grok) are plain processes; no pseudo-TTY
-    // needed. Their output is teed to the worker log so a crash leaves a
-    // trail (the Copilot CLI keeps its own logs and draws a TUI, so it is
-    // deliberately not teed).
-    const teeSuffix = String(workerLogPath || '').trim()
-      ? ` >> ${shellQuote(workerLogPath)} 2>&1`
-      : '';
-    return `${prefix}${secretPrefix}exec ${workerCommand}${teeSuffix}`;
-  }
-  // Use script to create a pseudo-TTY without GH_FORCE_TTY so the CLI routes
-  // ask_user requests through the SDK's onUserInputRequest handler instead of
-  // drawing terminal prompts.
-  return `${prefix}${secretPrefix}exec script -q -c ${shellQuote(workerCommand)} /dev/null`;
+  const workerCommand = buildPosixWorkerLaunchCommand(targetSessionId, launchEnv);
+  // A worker is a plain process; no pseudo-TTY needed. Its output is teed to
+  // the worker log so a crash leaves a trail.
+  const teeSuffix = String(workerLogPath || '').trim()
+    ? ` >> ${shellQuote(workerLogPath)} 2>&1`
+    : '';
+  return `${prefix}${secretPrefix}exec ${workerCommand}${teeSuffix}`;
 }
 
 function sleep(ms) {
@@ -1096,7 +984,6 @@ function buildWorkerLaunchEnv({ processCwd, workspaceRoot, env = process.env } =
   const launchEnv = {
     ...env,
     COPILOT_ALLOW_ALL: 'true',
-    GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS: 'true',
     ...(launchWorkspaceRoot ? {
       COPILOT_WORKSPACE_ROOT: launchWorkspaceRoot,
       INIT_CWD: launchWorkspaceRoot,
@@ -1130,9 +1017,6 @@ export async function launchSessionCli({
   windowsStartGraceMs = 3_000,
   allowProcessReuse = true,
   createSecretEnvFileImpl = createWorkerSecretEnvFile,
-  // Extension engine: writes the session's OAR MCP config, returns its path
-  // (or null to launch without it).
-  prepareOarMcpConfigImpl = prepareOarMcpConfigFile,
   // Windows console launch: resolves (and rotates) the worker log the worker
   // then writes itself; returns its path or null.
   prepareWorkerLogFileImpl = prepareWorkerLogFile,
@@ -1182,11 +1066,15 @@ export async function launchSessionCli({
     });
 
   // Kill switch for test/e2e servers: a relay started with this env var must
-  // never spawn real session workers (Copilot CLI clients or Claude workers).
+  // never spawn real session workers.
   if (String(env?.COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN || '').trim()) {
     throw new Error('cli-spawn-disabled');
   }
 
+  // A process of the session that is no session worker (a Copilot CLI an
+  // earlier version started) is never reused, and neither is the tmux pane
+  // it may run in. Stopping it is the caller's (stopLeftoverSessionProcess).
+  let listedProcessIsNoWorker = false;
   if (allowProcessReuse) {
     // Fresh: a cached list can be from before a stop and name the process it
     // ended, or a pid handed to another process since.
@@ -1199,7 +1087,11 @@ export async function launchSessionCli({
     const liveIdentity = liveProcessPid
       ? await identityOfListedWorker(liveProcess, { platform, identityOf })
       : null;
-    if (liveProcessPid && mayReuseSessionWorkerRow({ row: liveProcess, current: liveIdentity, sdkSessionId: target, isAlive: isPidAlive })) {
+    const listed = liveProcessPid
+      ? judgeListedSessionProcess({ row: liveProcess, current: liveIdentity, sdkSessionId: target, isAlive: isPidAlive })
+      : 'none';
+    listedProcessIsNoWorker = listed === 'leftover';
+    if (listed === 'worker') {
       return {
         pid: liveProcessPid,
         reused: true,
@@ -1230,24 +1122,22 @@ export async function launchSessionCli({
   // Set per launch below, never inherited: a relay started from inside a
   // worker session would otherwise hand its workers that session's log.
   delete launchSessionEnv[WORKER_LOG_FILE_ENV];
-  // The extension engine gets the OAR MCP server (relay_tool + preview) the
-  // node workers carry in-process; every launch path appends the same args.
-  const extensionCliArgs = resolveNodeWorkerDescriptor(launchSessionEnv)
-    ? []
-    : oarMcpCliArgs(prepareOarMcpConfigImpl(target, launchSessionEnv));
-  // Tells the in-CLI web-relay extension that `preview` is a real tool in this
-  // session, so its prompt context need not teach the HTTP fallback.
-  if (extensionCliArgs.length) launchSessionEnv.OAR_MCP_SERVER_ATTACHED = '1';
 
+  // Every worker is a Node script named by its kind. An environment that
+  // names no kind, or one that does not exist, starts nothing.
+  const nodeWorker = resolveNodeWorkerDescriptor(launchSessionEnv);
+  if (!nodeWorker) {
+    const failure = unknownWorkerKindError(launchSessionEnv);
+    explain(`cannot start: ${failure}`);
+    throw new Error(failure);
+  }
   // A Node that is not there fails loudly here instead of quietly later (on
   // Windows, `start` shows its error in a dialog no one may be able to see).
-  if (resolveNodeWorkerDescriptor(launchSessionEnv)) {
-    const nodeExecutable = resolveWorkerNodeExecutable(launchSessionEnv);
-    if (!locateExecutableImpl(nodeExecutable, { env: launchSessionEnv, platform })) {
-      const overridden = Boolean(normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE));
-      explain(`cannot start: Node "${nodeExecutable}"${overridden ? ' (COPILOT_WEB_RELAY_NODE)' : ''} was not found; ${spawnEnvironmentText()}`);
-      throw new Error(`worker-node-not-found: ${nodeExecutable}${overridden ? ' (set by COPILOT_WEB_RELAY_NODE)' : ''}`);
-    }
+  const nodeWorkerExecutable = resolveWorkerNodeExecutable(launchSessionEnv);
+  if (!locateExecutableImpl(nodeWorkerExecutable, { env: launchSessionEnv, platform })) {
+    const overridden = Boolean(normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_NODE));
+    explain(`cannot start: Node "${nodeWorkerExecutable}"${overridden ? ' (COPILOT_WEB_RELAY_NODE)' : ''} was not found; ${spawnEnvironmentText()}`);
+    throw new Error(`worker-node-not-found: ${nodeWorkerExecutable}${overridden ? ' (set by COPILOT_WEB_RELAY_NODE)' : ''}`);
   }
 
   if (isTmuxAvailable({ platform, execFileSyncImpl })) {
@@ -1263,7 +1153,7 @@ export async function launchSessionCli({
     for (const key of WORKER_SECRET_ENV_VARS) delete tmuxEnv[key];
     for (const key of TMUX_WORKER_EXPORTED_ENV_VARS) delete tmuxEnv[key];
     delete tmuxEnv.PWD;
-    if (allowProcessReuse) {
+    if (allowProcessReuse && !listedProcessIsNoWorker) {
       const existingPanePid = getTmuxPanePid(sessionName, { execFileSyncImpl });
       if (existingPanePid && isPidAlive(existingPanePid)) {
         return {
@@ -1276,9 +1166,7 @@ export async function launchSessionCli({
     }
     killTmuxSession(sessionName, { execFileSyncImpl });
     const secretEnvFile = createSecretEnvFileImpl(launchSessionEnv);
-    const tmuxWorkerLogPath = resolveNodeWorkerDescriptor(launchSessionEnv)
-      ? prepareWorkerLogFile(target, launchSessionEnv)
-      : null;
+    const tmuxWorkerLogPath = prepareWorkerLogFile(target, launchSessionEnv);
     try {
       const tmuxArgs = [
         'new-session',
@@ -1292,7 +1180,6 @@ export async function launchSessionCli({
         buildTmuxWorkerShellCommand(target, launchSessionEnv, {
           secretEnvFilePath: secretEnvFile?.filePath,
           workerLogPath: tmuxWorkerLogPath || '',
-          extraCliArgs: extensionCliArgs,
         }),
       ];
       // A tmux server this call starts is in the worker's own scope.
@@ -1330,12 +1217,6 @@ export async function launchSessionCli({
     throw new Error('worker-spawn-unhealthy:tmux-pane-missing');
   }
 
-  const nodeWorker = resolveNodeWorkerDescriptor(launchSessionEnv);
-  const nodeWorkerExecutable = resolveWorkerNodeExecutable(launchSessionEnv);
-  const posixCliExecutable = normalizeText(launchSessionEnv.COPILOT_WEB_RELAY_CLI_EXECUTABLE)
-    || normalizeText(launchSessionEnv.COPILOT_CLI_EXECUTABLE)
-    || normalizeText(launchSessionEnv.COPILOT_CLI_PATH)
-    || 'copilot';
   // win32: Node quotes every argument that holds a space or a tab, so
   // `start "<title>" "C:\Program Files\nodejs\node.exe" ...` reaches cmd.exe
   // with the title and the path each in one piece; `/s` strips nothing here
@@ -1343,50 +1224,33 @@ export async function launchSessionCli({
   // always holds a space, so `start` never mistakes the program for it.
   const spawnCommand = platform === 'win32'
     ? windowsCmdPath({ env: launchSessionEnv })
-    : (nodeWorker ? nodeWorkerExecutable : posixCliExecutable);
-  const startedProgram = nodeWorker ? nodeWorkerExecutable : (platform === 'win32' ? 'gh' : posixCliExecutable);
+    : nodeWorkerExecutable;
+  const startedProgram = nodeWorkerExecutable;
   const spawnArgs = platform === 'win32'
-    ? (nodeWorker
-      ? [
-        '/d',
-        '/s',
-        '/c',
-        'start',
-        `${nodeWorker.windowsTitle} ${target.slice(0, 8)}`,
-        nodeWorkerExecutable,
-        nodeWorker.scriptPath,
-        '--session-id',
-        target,
-      ]
-      : [
-        '/d',
-        '/s',
-        '/c',
-        'start',
-        `Copilot Worker ${target.slice(0, 8)}`,
-        'gh',
-        'copilot',
-        '--',
-        '--allow-all',
-        '--session-id',
-        target,
-        ...extensionCliArgs,
-      ])
-    : (nodeWorker
-      ? [nodeWorker.scriptPath, '--session-id', target]
-      : ['--allow-all', '--session-id', target, ...extensionCliArgs]);
-  // POSIX node workers tee stdout/stderr into the worker log (a crash must
+    ? [
+      '/d',
+      '/s',
+      '/c',
+      'start',
+      `${nodeWorker.windowsTitle} ${target.slice(0, 8)}`,
+      nodeWorkerExecutable,
+      nodeWorker.scriptPath,
+      '--session-id',
+      target,
+    ]
+    : [nodeWorker.scriptPath, '--session-id', target];
+  // POSIX workers tee stdout/stderr into the worker log (a crash must
   // leave a trail). On win32 the `start` intermediary opens its own console,
   // so fd inheritance cannot reach the worker, and a shell redirect would
   // leave its window empty: the worker is told the file and copies its own
   // output into it (shared/worker-runtime/worker-log-file.mjs). Only the path
   // travels; nothing of the environment or command line is written to the log.
   let detachedStdio = 'ignore';
-  if (platform === 'win32' && nodeWorker) {
+  if (platform === 'win32') {
     const workerLogPath = prepareWorkerLogFileImpl(target, launchSessionEnv);
     if (workerLogPath) launchSessionEnv[WORKER_LOG_FILE_ENV] = workerLogPath;
   }
-  if (platform !== 'win32' && nodeWorker) {
+  if (platform !== 'win32') {
     const workerLogPath = prepareWorkerLogFile(target, launchSessionEnv);
     if (workerLogPath) {
       try {

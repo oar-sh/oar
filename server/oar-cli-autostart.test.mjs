@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 
 import { UNINSTALL_HELPER_SOURCE, main, runAutostart, runSetup, runUninstall } from '../bin/oar.js';
 import { TAKEOVER_PROGRESS_FILE } from './services/earlier-database-service.mjs';
+import { generatedCopilotWrapperSources } from './services/oar-cli-helpers.mjs';
 import { scratchEnv } from './services/scratch-env-test-harness.mjs';
 
 // A config of this version: no token in it (the relay keeps its hash).
@@ -471,13 +472,11 @@ test('uninstall leaves a hand-made task and the launcher it runs; a launcher no 
   assert.equal(fs.existsSync(stray.launcher), false);
 });
 
-// The Copilot wrapper as `oar --install-extension` of this install writes it.
+// The Copilot wrapper as `oar --install-extension` of earlier versions wrote it for this install.
 async function installWrapper(install) {
-  const entry = path.join(install.packageRoot, '.github', 'extensions', 'web-relay', 'extension.mjs');
-  fs.mkdirSync(path.dirname(entry), { recursive: true });
-  fs.writeFileSync(entry, '');
-  assert.equal((await main({ ...install.options(), argv: ['--install-extension'] })).code, 0);
   const wrapper = path.join(install.env.COPILOT_CONFIG_HOME, 'extensions', 'web-relay', 'extension.mjs');
+  fs.mkdirSync(path.dirname(wrapper), { recursive: true });
+  fs.writeFileSync(wrapper, generatedCopilotWrapperSources(install.packageRoot)[0]);
   return { wrapper, source: fs.readFileSync(wrapper, 'utf8') };
 }
 

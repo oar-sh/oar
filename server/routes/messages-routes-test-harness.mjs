@@ -41,7 +41,6 @@ export function makeRouteDeps(overrides = {}) {
     }),
     getOpenAIProviderSettings: () => ({ configured: false, enabled: false, model: '', models: [] }),
     getCursorProviderSettings: () => ({ enabled: false, model: '', models: [] }),
-    featureFlags: {},
     ...overrides,
   };
 }
@@ -270,7 +269,6 @@ export function makeImageOperationDeps({
   let attempt = latestAttempt;
   const deps = makeRouteDeps({
     ts: () => '00:00:00.000',
-    featureFlags: { IMAGE_CONVERSATION_CONTINUITY_ENABLED: true },
     isTrulyLocalRequest: () => true,
     openAIImageRetryDelayMs: 0,
     MAX_UPLOAD_ATTACHMENTS: 6,

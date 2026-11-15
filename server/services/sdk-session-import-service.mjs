@@ -129,8 +129,8 @@ export function createSdkSessionImportService({
     // origin = 'imported' is only ever written by a completed import, so it is
     // the one proof the binding belongs to the importer (and it survives a
     // later failed refresh attempt). Anything else — no ledger row, no origin —
-    // means the relay created the binding (conversation bootstrap,
-    // session-sync) and owns the history.
+    // means the relay created the binding (conversation bootstrap, or the
+    // session sync of an earlier version) and owns the history.
     return ledger?.origin !== 'imported';
   }
 

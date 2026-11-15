@@ -2,8 +2,9 @@
 
 import { createAskUserRoutingService } from '../services/ask-user-routing-service.mjs';
 import { admitRemoteRelayRequest, readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
-import { REMOTE_RELAY_ERROR_CODES, isRemoteRelayApprovalQuestion } from '../../shared/remote-relay-contract.mjs';
-import { isPersonOnlyCard, isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { REMOTE_RELAY_ERROR_CODES } from '../../shared/remote-relay-contract.mjs';
+import { isRelayAskId, relayQuestionKind } from '../../shared/relay-asks.mjs';
+import { isRemoteRelayApprovalRow, isUserOnlyRow } from '../services/user-only-card.mjs';
 import { agentConversationOf, isAgent, isPerson, notPerson } from '../services/relay-principal.mjs';
 import { AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 import { askForPairedRelay, sendRelayAskError } from './relay-ask-routes.mjs';
@@ -46,25 +47,6 @@ function parseRowJson(value) {
   } catch {
     return null;
   }
-}
-
-/**
- * A stored question row that is this relay's Allow / Deny card for one of its
- * own agent's calls to another relay (remote-relay-caller-context.mjs). The
- * context lives in the row's request envelope.
- */
-function isRemoteRelayApprovalRow(row) {
-  const envelope = parseRowJson(row?.request);
-  return envelope ? isRemoteRelayApprovalQuestion(envelope) : false;
-}
-
-/**
- * A card no agent may list, answer or dismiss (shared/relay-asks.mjs
- * isPersonOnlyCard): a relay's approval of its own agent's call, a Safety
- * check, a Claude Cloud permission, any card marked person-only.
- */
-function isUserOnlyRow(row) {
-  return isRemoteRelayApprovalRow(row) || isPersonOnlyCard(row);
 }
 
 /**
@@ -136,7 +118,6 @@ export function registerAskUserRoutes(app, deps) {
     io,
     db,
     stmts,
-    runtimeState,
     uuidv4,
     ts,
     questionExpiresAt,
@@ -163,10 +144,7 @@ export function registerAskUserRoutes(app, deps) {
     sameConversation = (left, right) => !!left && left === right,
   } = deps;
 
-  const continuationRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_CONTINUATION_ROUTING_ENABLED === true;
-  const workerRoutingEnabled = runtimeState?.featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
   const askUserRoutingService = createAskUserRoutingService(db, {
-    continuationRoutingEnabled,
     sessionWorkerRegistry,
   });
 
@@ -308,9 +286,7 @@ export function registerAskUserRoutes(app, deps) {
     const now = new Date().toISOString();
     const questionId = uuidv4();
     const requestedSessionId = normalizeId(req.body.sdk_session_id);
-    const queueOwnerSessionId = workerRoutingEnabled || continuationRoutingEnabled
-      ? normalizeId(q.owner_sdk_session_id)
-      : null;
+    const queueOwnerSessionId = normalizeId(q.owner_sdk_session_id);
     const sdkSessionId = requestedSessionId || queueOwnerSessionId || null;
     const ownerWorkerId = sdkSessionId
       ? normalizeId(sessionWorkerRegistry?.getWorker?.(sdkSessionId)?.workerId)
@@ -327,9 +303,7 @@ export function registerAskUserRoutes(app, deps) {
       || extractRequestedSchema(requestedSchema)
       || extractRequestedSchema(parsedQuestionRequest);
     const requestSchemaJson = resolvedSchema ? JSON.stringify(resolvedSchema) : null;
-    const continuation = continuationRoutingEnabled
-      ? extractContinuationOwnership(parsedQuestionRequest)
-      : { continuationId: null, continuationQuestionId: null };
+    const continuation = extractContinuationOwnership(parsedQuestionRequest);
     // questionExpiresAt normalizes: absent/junk falls back to the 8h default,
     // explicit finite values (including 0) are honored.
     const expiresAt = questionExpiresAt(now, req.body.timeout_ms);

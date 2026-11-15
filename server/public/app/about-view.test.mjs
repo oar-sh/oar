@@ -25,9 +25,9 @@ function aboutPayload(overrides = {}) {
     startedAt: '2026-03-02T11:00:00.000Z',
     uptimeSeconds: 3_700,
     providers: [
-      { id: 'github', label: 'GitHub Copilot', engine: 'extension', cliVersion: '1.0.82', sdkVersion: null, state: 'online', runningWorkers: 0 },
-      { id: 'claude', label: 'Claude Code', engine: null, cliVersion: '2.1.251', sdkVersion: '0.3.292', state: 'idle', runningWorkers: 0 },
-      { id: 'cursor', label: 'Cursor', engine: null, cliVersion: null, sdkVersion: '1.0.36', state: 'online', runningWorkers: 2 },
+      { id: 'github', label: 'GitHub Copilot', cliVersion: '1.0.82', sdkVersion: null, state: 'online', runningWorkers: 0 },
+      { id: 'claude', label: 'Claude Code', cliVersion: '2.1.251', sdkVersion: '0.3.292', state: 'idle', runningWorkers: 0 },
+      { id: 'cursor', label: 'Cursor', cliVersion: null, sdkVersion: '1.0.36', state: 'online', runningWorkers: 2 },
     ],
     stats: {
       conversations: 1234,

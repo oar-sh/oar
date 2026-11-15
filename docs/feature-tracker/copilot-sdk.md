@@ -1,77 +1,51 @@
 # Copilot SDK (`@github/copilot-sdk`)
 
-Updated: 2026-08-16 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
+Updated: 2026-11-14 · Part of the [SDK Feature Tracker](README.md) — legend, changelog, and
 provider-agnostic relay rows live there.
 
-Three integration paths consume this SDK. This file tracks the first two — the third, the headless
-per-conversation worker behind the **SDK engine** (the default engine since 0.9.2 on a relay that
-can run it, `getCopilotEngine()`), has its own file ([copilot-sdk-worker.md](copilot-sdk-worker.md)):
+Two integration paths consume this SDK. This file tracks the first; the second, the headless
+per-conversation worker that runs every Copilot, OpenAI (BYOK) and OpenAI Image conversation, has
+its own file ([copilot-sdk-worker.md](copilot-sdk-worker.md)). The Copilot CLI extension
+(`joinSession` from `@github/copilot-sdk/extension`, the Extension engine) was removed on
+2026-11-14, with its rows here, and so was the hand-started standalone relay client
+(`server/relay.mjs`), which created sessions and ran turns on this path; the rows for turns,
+questions, permissions and model switches are in [copilot-sdk-worker.md](copilot-sdk-worker.md).
 
-- **Extension mode** — `.github/extensions/web-relay/extension.mjs` is the only static import site
-  in scope (`joinSession` from `@github/copilot-sdk/extension`).
-- **Standalone / server mode** — `server/copilot-sdk-runtime.mjs` → `createInstalledCopilotClient`
+- **Relay side** — `server/copilot-sdk-runtime.mjs` → `createInstalledCopilotClient`
   loads the locally installed SDK (`buildInstalledCopilotClientOptions`: stdio connection,
-  `mode: 'empty'`, `useLoggedInUser: true`); `server/relay.mjs` additionally supports a
-  `connection.kind === 'uri'` (TCP) foreground mode.
+  `mode: 'empty'`, `useLoggedInUser: true`) for the history import, the session delete and the
+  model discovery.
 
 ## Session + lifecycle
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| `joinSession()` (extension mode) | Implemented | Extension joins the foreground CLI session through `joinSessionWithRetry` (`.github/extensions/web-relay/extension.mjs`, `runtime/session-join-retry.mjs` — 409-conflict retry loop). |
-| `CopilotClient.createSession()` (standalone mode) | Implemented | Standalone relay creates SDK sessions in `getOrCreateSession()` (`server/relay.mjs`). |
 | `CopilotClient.resumeSession()` | Implemented | Reopens persisted SDK sessions during history import, with `suppressResumeEvent: true` and `availableTools: []` so the import can't execute tools (`server/services/sdk-session-import-service.mjs`). |
 | `CopilotClient.listSessions()` | Implemented | Enumerates locally persisted SDK sessions for the startup import (`server/services/sdk-session-import-service.mjs`). |
-| `getSessionMetadata()` / `getLastSessionId()` | Not implemented | Not used in relay or extension paths. |
-| `CopilotClient.deleteSession()` | Implemented | Conversation delete calls it through the SDK session importer's runtime client (`sdk-session-import-service.mjs` → `deleteSession`), after the conversation's session worker is stopped (`DELETE /api/conversation/:id`, `sessions-routes.mjs`). A conversation deleted before its first turn has no session folder yet and is not sent. Neither is one the relay only imported and never ran (`isImportedOnly`): it is hidden and tombstoned, its CLI session kept and no process stopped. A folder the runtime answers "Session file not found" for is removed directly. When the runtime cannot do it otherwise, the session goes on the SDK delete queue, which the extension engine (`.github/extensions/web-relay/polling/polling-loop.mjs`) still works off. |
-| `session.disconnect()` | Implemented (import path) | Imported resumed sessions are torn down with `await resumed.disconnect()` — the actual 1.0.13 cleanup API; the old optional `stop?.()`/`dispose?.()` calls matched nothing (`server/services/sdk-session-import-service.mjs`). The joined extension session still gets no explicit disconnect (host-owned). |
-| `session.abort()` | Implemented | The Stop control aborts the active turn (`.github/extensions/web-relay/polling/polling-loop.mjs`). See "Targeted subagent abort" below for the subagent-scoped variant. |
-| `session.log()` | Implemented | Ephemeral CLI banners via `session.log(text, { ephemeral: true })` throughout `extension.mjs` and `polling/polling-loop.mjs`. |
+| `getSessionMetadata()` / `getLastSessionId()` | Not implemented | Not used in relay paths. |
+| `CopilotClient.deleteSession()` | Implemented | Conversation delete calls it through the SDK session importer's runtime client (`sdk-session-import-service.mjs` → `deleteSession`), after the conversation's session worker is stopped (`DELETE /api/conversation/:id`, `sessions-routes.mjs`). A conversation deleted before its first turn has no session folder yet and is not sent. Neither is one the relay only imported and never ran (`isImportedOnly`): it is hidden and tombstoned, its CLI session kept and no process stopped. A folder the runtime answers "Session file not found" for is removed directly. A delete the runtime fails otherwise is logged and not retried, and the conversation is deleted all the same: that CLI session's state stays on disk. Until 2026-11-14 such a session went on the SDK delete queue for the extension; the table (`sdk_delete_requests`) stays in the database and is no longer read. |
+| `session.disconnect()` | Implemented (import path) | Imported resumed sessions are torn down with `await resumed.disconnect()` — the actual 1.0.13 cleanup API; the old optional `stop?.()`/`dispose?.()` calls matched nothing (`server/services/sdk-session-import-service.mjs`). |
 | Conversation history refresh / rebuild from SDK events | Implemented | Relay can clear and rebuild retrievable history from SDK events, falling back to transcript data when needed (`server/services/session-history-refresh-service.mjs`, `server/services/session-transcript-service.mjs`). Of the refresh service's exports, only `evaluateRefreshIdleState` and `replaceRetrievableHistory` have production callers; `mapSdkEventsToMessages` / `persistRebuiltHistory` / `clearRetrievableHistory` are test-only. |
 
 ## Turn execution + streaming
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| `session.send()` / `session.sendAndWait()` | Implemented | Core turn flow uses send+sendAndWait wrappers (`.github/extensions/web-relay/runtime/session-io.mjs`, `polling/polling-loop.mjs` via the injected `sendAndWaitWithHardTimeout`). |
-| Message attachments (file/blob/etc.) | Implemented | `buildSdkAttachments()` maps hydrated uploads to SDK attachments — inline `blob` for images, `file` (path + displayName) otherwise; delivery failure retries the turn without attachments (`.github/extensions/web-relay/polling/polling-loop.mjs`). |
-| Per-turn reasoning effort | Implemented | Relay forwards `reasoningEffort` when provided and not `"none"` (`.github/extensions/web-relay/polling/polling-loop.mjs`). |
-| Streaming event mode (`streaming: true`) | Implemented | Enabled on join; the extension subscribes `session.on(...)` to `assistant.message`, `assistant.message_delta`, `assistant.reasoning`, `assistant.reasoning_delta` and republishes them as relay stream frames (`.github/extensions/web-relay/extension.mjs`, `skills/reasoning-stream.mjs` → `createReasoningStreamHandlers`). |
 | Live assistant text preview | Implemented | Main-thread stream frames are markdown-rendered into the pending bubble while the turn runs and repaint after a reload (`server/public/app/conversation-view.js`, `server/public/app/stream-state.mjs` → `deriveInFlightStreamTextByThread`). |
-| Subagent run lifecycle / nested activity | Implemented | `createSubagentLifecycleHandlers` listens to `execution.subagent.start` / `.end` and records runs, activity, thoughts, and per-run stream text; nested bubbles render with stop controls (`.github/extensions/web-relay/skills/subagent-lifecycle.mjs`, `server/repositories/question-repository.mjs` → `listSubagentRunsByResponse`, `server/public/app/conversation-view.js` → `renderSubagentRunsMarkup`). |
-| Subagent attribution (`agentId`) | Implemented | The SDK `agentId` is propagated as `subagentRunId` on question activity, tool results, and `report_intent` thoughts, so subagent work renders in its own bubble (`.github/extensions/web-relay/skills/question-routing-hooks.mjs` → `extractSubagentRunIdFromRequest`). |
-| Targeted subagent abort | Partial | Per-run cancel probes named methods first — `session.abortSubagentRun`, `abortSubagent`, `abortAgent` — then arity-gated `session.abort({subagentRunId})` / `({agentId})` / `(runId)` shapes; runtimes without a matching primitive report "unsupported" rather than stopping the whole turn (`.github/extensions/web-relay/polling/polling-loop.mjs`). |
 | `session.getEvents()` | Partial | Called only by the history import on a resumed session, guarded for runtimes that do not expose it (`server/services/sdk-session-import-service.mjs`). The refresh service consumes already-parsed messages; it never calls `getEvents()` itself. |
 
 ## User input + elicitation
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| `onUserInputRequest` (ask_user text/choices) | Implemented | Registered as a top-level join option (not inside `hooks`) so the SDK calls it, and bridged to relay question cards (`.github/extensions/web-relay/extension.mjs`, `skills/question-routing-hooks.mjs`; the standalone path registers it in session config in `server/relay.mjs`). |
 | `onElicitationRequest` (structured forms) | Implemented | Multi-field structured forms handled; the wire field `requestedSchema` is normalized to `requestSchema`, fields parsed by `server/public/app/question-schema-view.mjs`, and answers validated by `shared/question-schema.mjs` → `validateStructuredAnswer` (consumed in `server/routes/ask-user-routes.mjs`). |
-| Plain-text question fallback | Not implemented | Every relay question card originates from an explicit request — `onUserInputRequest`, `onElicitationRequest`, or Claude's `AskUserQuestion`. `/api/relay-question` is POSTed from exactly one place (`skills/question-bridge.mjs` → `forwardRelayQuestion`), reachable only from those callbacks; the prompt sanitizers instead instruct the model never to ask in plain text. |
 | Session UI helpers (`session.ui.confirm/select/input/elicitation`) | Not implemented | Relay uses the callback bridge instead of the direct session UI API. |
-| `onExitPlanModeRequest` | Not implemented | No top-level registration. Plan boards are derived from `plan_ready` detection in the tool path (`skills/question-routing-hooks.mjs` → `buildPlanBoardPayloadFromRequest`) plus a plan-mode text fallback: final text with ≥2 bullet/numbered lines becomes a `plan_ready` board tagged `source: "plan-mode-fallback"` (`polling/polling-loop.mjs` → `allowPlanModeFallback`, `buildPlanReadyBoardPayload`). This mirrors the Claude worker's heuristic. |
-| `onAutoModeSwitchRequest` | Not implemented | No top-level registration; `"auto"` model selection is instead handled by forcing a session boundary (`model-api/model-switching.mjs` → `requiresSessionBoundary`). |
-
-## Hooks + permissions
-
-| SDK feature | Status | Notes / evidence |
-| ----------- | ------ | ---------------- |
-| `hooks.onPreToolUse` | Implemented | Used for activity routing, subagent lifecycle publishing, and the ask_user pre-bridge (`.github/extensions/web-relay/extension.mjs`, `skills/question-routing-hooks.mjs`, `skills/subagent-lifecycle.mjs`). |
-| `hooks.onSessionStart` / `hooks.onSessionEnd` | Implemented | Relay activation, startup workspace-root sync, and graceful shutdown (`.github/extensions/web-relay/extension.mjs`). |
-| `hooks.onPostToolUse` | Implemented | Registered in extension join options and used to publish subagent lifecycle updates and tool-result activity (`.github/extensions/web-relay/extension.mjs`, `skills/subagent-lifecycle.mjs`). |
-| `onPreMcpToolCall` / `onUserPromptSubmitted` / `onErrorOccurred` | Not implemented | Not registered in join options. |
-| `onPermissionRequest` | Partial | Standalone relay sets `approveAll` (`server/relay.mjs` → `getOrCreateSession`). The extension path registers no permission handler, but is effectively allow-all anyway: `onPreToolUse` unconditionally returns `permissionDecision: "allow"` (`skills/question-routing-hooks.mjs` → `allowToolUse`). |
 
 ## Models + model APIs
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| Model switch per turn | Implemented | Extension path via the `session.rpc.model.switchTo({ modelId, contextTier })` RPC (`model-api/model-switching.mjs`); the standalone relay calls its own `setModelForMessage` in `processNext` since 2026-08-16 — the helper existed but had no caller, so cached sessions silently kept their creation model. |
-| Runtime model discovery | Implemented | Extension calls the `models.list` RPC over `session.connection.sendRequest` and publishes a snapshot to `POST /api/models/snapshot`, including on the error path (`.github/extensions/web-relay/model-api/model-switching.mjs`). |
-| `session.setModel()` helper | Not implemented | The implementation uses `session.rpc.model.switchTo(...)` rather than `session.setModel(...)`. |
-| `client.listModels()` | Partial | Available and used by the standalone relay path only (`server/relay.mjs`); the extension path prefers the `models.list` RPC. |
+| `client.listModels()` | Implemented | The relay's Copilot model discovery asks the installed runtime on a client of its own and feeds the model catalog (`server/services/copilot-model-discovery-service.mjs`). |
 
 ## Advanced session configuration
 
@@ -92,8 +66,8 @@ can run it, `getCopilotEngine()`), has its own file ([copilot-sdk-worker.md](cop
 
 | SDK feature | Status | Notes / evidence |
 | ----------- | ------ | ---------------- |
-| Runtime connection modes | Implemented | Standalone supports hidden stdio and foreground TCP connection handling (`server/relay.mjs`; options assembled by `server/copilot-sdk-runtime.mjs` → `buildInstalledCopilotClientOptions`). |
-| SDK auto-detection / version pin | Implemented | Highest available `copilot-sdk/index.js` + `app.js` under the platform pkg root (descending semver sort), overridable with `sdkPath`/`cliPath`/`sdkVersion`/`COPILOT_PKG_DIR` (`server/copilot-sdk-runtime.mjs` → `resolveInstalledCopilotPaths`). |
+| Runtime connection modes | Partial | The relay side connects over hidden stdio only (`server/copilot-sdk-runtime.mjs` → `buildInstalledCopilotClientOptions`); the foreground TCP mode went with `server/relay.mjs`. |
+| SDK auto-detection / version pin | Implemented | Highest available version folder with `copilot-sdk/index.js` and `app.js` across the Copilot CLI's package folders (`getCopilotBaseDirs`: `COPILOT_PKG_DIR` first, then the cache folders per platform, `~/.copilot/pkg` and the older locations), overridable with `sdkPath`/`cliPath`/`sdkVersion` (`server/copilot-sdk-runtime.mjs` → `resolveInstalledCopilotPaths`). A worker launch asks again each time and a `COPILOT_SDK_PATH` in the environment wins (`resolveCopilotSdkLaunchPath`); nothing found fails the launch with the folders searched. |
 | Telemetry config / trace-context provider | Not implemented | No relay wiring for `telemetry` / `onGetTraceContext` options. |
 | Session filesystem provider (`sessionFs`) | Not implemented | No custom session FS provider registered. |
 | Session lifecycle subscriptions (`client.onLifecycle`) | Not implemented | Not used in relay runtime. |

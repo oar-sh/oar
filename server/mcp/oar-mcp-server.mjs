@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // OAR's own stdio MCP server. It gives the agents OAR launches without an
-// in-process tool surface — Grok (ACP `mcpServers`) and the Copilot CLI
-// extension engine (`--additional-mcp-config`) — the relay's real tools:
+// in-process tool surface — Grok (ACP `mcpServers`) — the relay's real tools:
 // `relay_tool` and `preview`, bound to the one conversation it was started
 // for, so the relay's mention gate and approval apply exactly as they do for
 // the Claude, Cursor and Copilot SDK workers.
@@ -94,7 +93,7 @@ function toText(value) {
 /**
  * The operator's kill switch: `OAR_MCP_SERVER=0|false|off|no` keeps this
  * server out of every session OAR launches (Grok falls back to its preview
- * instruction block, the extension engine starts without the extra config).
+ * instruction block).
  */
 export function isOarMcpServerDisabled(env = {}) {
   return /^(0|false|off|no)$/i.test(String(env?.OAR_MCP_SERVER || '').trim());

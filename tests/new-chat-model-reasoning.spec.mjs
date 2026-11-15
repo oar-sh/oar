@@ -12,10 +12,11 @@ import { composerControl, selectComposerOption } from "./composer-settings-helpe
 // provider resolution, preference persistence and the composer restore path are
 // all covered end to end.
 //
-// The isolated server runs with COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1, so a
-// valid bootstrap still 409s at the worker-spawn step *after* the conversation
-// and its preferences are committed. That is exactly the recovery path the
-// client is expected to handle, so it is asserted rather than stubbed away.
+// The isolated server runs with COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1: it
+// defers the worker launch and answers a valid bootstrap 200. A relay whose
+// launch fails answers 409 *after* the conversation and its preferences are
+// committed; the client must open that conversation all the same, so one test
+// hands the page that answer in place of the relay's.
 
 const CURSOR_SETTINGS = {
   cursor_api_key: "e2e-cursor-key",
@@ -37,7 +38,7 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   const headers = { Authorization: `Bearer ${token}` };
   let db = null;
   let bootstrapResponse = null;
-  let convertWorkerFailureToSuccess = false;
+  let failWorkerLaunch = false;
 
   test.beforeAll(() => {
     db = new Database(relayDbPath());
@@ -59,7 +60,7 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
 
   test.beforeEach(async ({ page }) => {
     bootstrapResponse = null;
-    convertWorkerFailureToSuccess = false;
+    failWorkerLaunch = false;
     await page.route("**/api/conversation/bootstrap", async (route) => {
       const response = await route.fetch();
       const text = await response.text();
@@ -68,21 +69,13 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
       } catch {
         bootstrapResponse = null;
       }
-      // The isolated server cannot spawn workers, so every valid bootstrap 409s
-      // after committing the conversation. Converting that into the payload a
-      // real relay returns is the only way to exercise the success branch of
-      // createNewConversation; tests that want the recovery branch leave the
-      // conversion off.
-      if (
-        convertWorkerFailureToSuccess
-        && response.status() === 409
-        && bootstrapResponse?.conversationCreated
-      ) {
-        return route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ ...bootstrapResponse, ok: true }),
-        });
+      // The isolated server defers the worker launch, so a valid bootstrap
+      // succeeds. The recovery branch of createNewConversation needs the
+      // answer of a relay whose launch failed: the conversation committed,
+      // 409 and `conversationCreated` behind it.
+      if (failWorkerLaunch && response.status() === 200 && bootstrapResponse?.conversationId) {
+        bootstrapResponse = { ...bootstrapResponse, ok: false, error: "spawn-failed", conversationCreated: true };
+        return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify(bootstrapResponse) });
       }
       return route.fulfill({ response, body: text });
     });
@@ -129,7 +122,6 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   }
 
   test("the composer shows the model and effort the modal asked for", async ({ page, request }) => {
-    convertWorkerFailureToSuccess = true;
     // Start from a Copilot chat so the composer's model options are scoped to a
     // different provider than the one the new chat uses: the clamp has to run
     // against the rebuilt Cursor options, not the ones left over here.
@@ -158,13 +150,10 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   });
 
   test("a conversation whose worker cannot start is still opened", async ({ page }) => {
-    // No conversion here: the raw 409 is what a failed worker prestart looks
-    // like, and the conversation is already committed behind it. The prestart
-    // only exists under session-worker routing (RELAY_E2E_ROUTING=1) — without
-    // routing, bootstrap succeeds outright and there is no failure to recover
-    // from, so the scenario cannot be exercised.
+    // The 409 of a failed worker launch, with the conversation already
+    // committed behind it.
+    failWorkerLaunch = true;
     const conversationId = await startCursorGrokConversation(page);
-    test.skip(bootstrapResponse?.ok === true, "worker prestart requires session-worker routing");
     expect(bootstrapResponse?.ok).toBe(false);
     expect(bootstrapResponse?.conversationCreated).toBe(true);
 
@@ -175,7 +164,6 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   });
 
   test("the selection survives a reload", async ({ page }) => {
-    convertWorkerFailureToSuccess = true;
     await startCursorGrokConversation(page);
     await expect(page.locator("#model-select")).toHaveValue("grok-4.5");
 
@@ -187,7 +175,6 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   });
 
   test("a new chat keeps the relay mode the composer is in", async ({ page, request }) => {
-    convertWorkerFailureToSuccess = true;
     const firstConversationId = await startConversation(page, { provider: "github", model: "auto" });
     await selectComposerOption(page, "#mode-select", "plan");
     // The composer polls the conversation, so a GET that started before the
@@ -209,7 +196,6 @@ test.describe("New Chat model and reasoning survive into the composer", () => {
   });
 
   test("an abandoned new chat does not change the open conversation", async ({ page }) => {
-    convertWorkerFailureToSuccess = true;
     await startConversation(page, { provider: "cursor", model: "grok-4.5", reasoning: "medium" });
     await expect(page.locator("#reasoning-effort-select")).toHaveValue("medium");
 
@@ -344,15 +330,11 @@ test.describe("New Chat starts a Claude API chat, and its composer switches bill
 
   test.beforeEach(async ({ page }) => {
     bootstrapResponse = null;
-    // As above: the isolated server cannot spawn workers, so the committed
-    // conversation's 409 is turned into the answer a real relay gives.
+    // The relay's answer to the bootstrap, as the page gets it.
     await page.route("**/api/conversation/bootstrap", async (route) => {
       const response = await route.fetch();
       const text = await response.text();
       try { bootstrapResponse = JSON.parse(text); } catch { bootstrapResponse = null; }
-      if (response.status() === 409 && bootstrapResponse?.conversationCreated) {
-        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...bootstrapResponse, ok: true }) });
-      }
       return route.fulfill({ response, body: text });
     });
     await page.addInitScript(() => {

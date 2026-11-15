@@ -228,3 +228,20 @@ test('the short chip text: the count, "all", "all +N", or "restart"', () => {
   const paired = [{ id: 'sub_m', watcher: 'conv-w', relay: 'rr_fixture', relayName: 'lab-relay', remoteId: 'sub_x', scope: 'sessions', sessions: [{ id: 'conv-9', title: '<b>' }], events: ['turn_end'] }];
   assert.match(renderWatchingChipHtml(watchingSummary(paired, 'conv-w')), /title="Event subscriptions of this conversation \(also on lab-relay\)"/);
 });
+
+test('a late reply row says whose it is, with the title escaped; mixed rows keep the generic summary', () => {
+  const late = (title, detail = {}) => ({ ...event('late_reply', { messageId: 'msg-fixture', status: 'done', reply: 'Done <b>now</b>', ...detail }, { id: 'conv-fixture-lane', title }) });
+  const one = shared.buildRelayEventMessageText([late('Lane <14>')]);
+  assert.deepEqual(parseRelayEventMessageText(one), shared.parseRelayEventMessageText(one));
+  assert.equal(relayEventSummaryText(parseRelayEventMessageText(one)), 'late reply from Lane <14>');
+  const html = renderRelayEventRowHtml({ role: 'user', kind: RELAY_EVENT_MESSAGE_KIND, text: one });
+  assert.match(html, /<span class="relay-event-text">late reply from Lane &lt;14&gt;<\/span>/);
+  assert.match(html, /<li class="relay-event-line">&gt; Done &lt;b&gt;now&lt;\/b&gt;<\/li>/);
+  assert.doesNotMatch(html, / open>/, 'folded: the same text is open in the replier\'s transcript');
+  const two = shared.buildRelayEventMessageText([late('Lane A'), late('Lane B'), late('Lane A', { ack: true, reply: 'ok' })]);
+  assert.equal(relayEventSummaryText(parseRelayEventMessageText(two)), '2 late replies from Lane A, Lane B');
+  const mixed = shared.buildRelayEventMessageText([late('Lane A'), event('turn_end', { preview: 'ok' })]);
+  assert.equal(relayEventSummaryText(parseRelayEventMessageText(mixed)), '2 events · reply, late reply');
+  const undelivered = shared.buildRelayEventMessageText([event('reply_undelivered', { watcherId: 'conv-fixture-lead', watcherTitle: 'Lead' })]);
+  assert.equal(relayEventSummaryText(parseRelayEventMessageText(undelivered)), '1 event · reply undelivered');
+});

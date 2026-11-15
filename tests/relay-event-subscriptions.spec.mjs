@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, relayPresence, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * Relay event subscriptions end to end, without a model: a watching
@@ -14,11 +18,12 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *
  * A relay of the spec's own (the agent-sessions setting is switched on
  * here). No worker runs: a "turn" is a message the spec took off the queue
- * (GET /api/pending), which is what the approval card and a question sit on.
- * The spec reports in the way a worker does while it holds them: a relay that
- * hears from no worker hands a running turn back to the queue 45 s after it
- * was taken, and a busy suite can spend that long before the question below
- * is asked, which then found no turn ("No active relay turn").
+ * as the session's worker (helpers/fake-worker.mjs), which is what the
+ * approval card and a question sit on. The spec reports in the way a worker
+ * does while it holds them: a relay that hears from no worker hands a running
+ * turn back to the queue 45 s after it was taken, and a busy suite can spend
+ * that long before the question below is asked, which then found no turn
+ * ("No active relay turn").
  */
 
 const APPROVAL_TIMEOUT = 20_000;
@@ -58,6 +63,7 @@ test.describe.serial("relay event subscriptions", () => {
   test.describe.configure({ timeout: 120_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const api = createApi(() => relay);
   const tool = (conversationId, action, args = {}) => api("/api/remote-relays/tool", {
     method: "POST",
@@ -73,21 +79,9 @@ test.describe.serial("relay event subscriptions", () => {
   // processing. Called while nothing else is queued, so the dequeue can only
   // return this message.
   async function conversationWithRunningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, messageId, ownerSessionId } = queued.payload;
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: conversationId, conversation_id: conversationId },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    const headers = ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {};
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.id || "") === messageId) return { conversationId, messageId };
-      await sleep(250);
-    }
-    throw new Error("The message was never handed out");
+    const { conversationId, messageId, worker } = await startConversation({ text }, onRelay);
+    await worker.take(messageId);
+    return { conversationId, messageId };
   }
 
   async function openApp(page, conversationId) {
@@ -100,9 +94,7 @@ test.describe.serial("relay event subscriptions", () => {
 
   test.beforeAll(async () => {
     relay = await startRelayServer({ token: randomUUID() });
-    heartbeat = setInterval(() => {
-      api("/api/heartbeat", { method: "POST", body: {} }).catch(() => {});
-    }, 2_000);
+    heartbeat = relayPresence(onRelay);
     expect((await api("/api/settings/pwa-app-name", { method: "POST", body: { appName: "bench-relay" } })).status).toBe(200);
     expect((await api("/api/settings/agent-sessions", { method: "POST", body: { enabled: true } })).status).toBe(200);
     watched = await conversationWithRunningTurn(watchedTitle);
@@ -110,7 +102,7 @@ test.describe.serial("relay event subscriptions", () => {
   });
 
   test.afterAll(async () => {
-    clearInterval(heartbeat);
+    heartbeat?.stop();
     heartbeat = null;
     if (relay) await relay.stop();
     relay = null;
@@ -156,6 +148,7 @@ test.describe.serial("relay event subscriptions", () => {
     const asked = await api("/api/relay-question", {
       method: "POST",
       body: {
+        ...attemptOf(watched.messageId),
         queueId: watched.messageId,
         messageId: watched.messageId,
         conversationId: watched.conversationId,

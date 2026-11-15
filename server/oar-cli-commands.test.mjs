@@ -7,16 +7,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
 import {
-  exitWhenIdle, launchRelay, main, runBackup, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUninstall, runUrl,
+  exitWhenIdle, main, runBackup, runDoctor, runRestart, runService, runSetup, runStart, runStatus, runStop, runUninstall, runUrl,
 } from '../bin/oar.js';
+import { CLI_LONG_PROBE_TIMEOUT_MS } from './services/cli-process-runner.mjs';
 import { PromptAborted } from './services/oar-cli-menu.mjs';
+import { generatedCopilotWrapperSources } from './services/oar-cli-helpers.mjs';
+import { needsSourceBuild } from './services/native-addon-build-service.mjs';
 import { OWNER_HASH_SETTING_KEY, createOwnerSecretStore } from './services/owner-secret-store.mjs';
 import { processIdentity } from './services/relay-singleton-guard.mjs';
 import { agentKeyBytes, hashOwnerToken, mintAgentTokenWithKey, verifyAgentTokenWithKey } from '../shared/relay-credentials.mjs';
@@ -266,7 +268,7 @@ const EXISTING = { port: 4100, localhostOnly: true, pollIntervalMs: 3000 };
 function recordingCommands() {
   const calls = [];
   const commands = {};
-  for (const name of ['menu', 'start', 'stop', 'restart', 'status', 'url', 'setup', 'service', 'copilot', 'doctor', 'update']) {
+  for (const name of ['menu', 'start', 'stop', 'restart', 'status', 'url', 'setup', 'service', 'doctor', 'update']) {
     commands[name] = async ({ argv }) => { calls.push([name, argv]); return { code: 0, reason: name }; };
   }
   return { calls, commands };
@@ -281,8 +283,6 @@ test('main runs the command the arguments name, wherever it stands', async () =>
     ['setup', '--defaults', '--start'],
     ['--stop'],
     ['service', 'remove'],
-    ['--no-install-extension', '--', '--allow-all'],
-    ['copilot'],
     [],
   ]) {
     assert.equal((await main({ argv, commands, logger })).code, 0);
@@ -293,10 +293,19 @@ test('main runs the command the arguments name, wherever it stands', async () =>
     ['setup', ['--defaults', '--start']],
     ['stop', []],
     ['service', ['remove']],
-    ['copilot', ['--no-install-extension', '--', '--allow-all']],
-    ['copilot', []],
     ['menu', []],
   ]);
+});
+
+test('oar copilot and a bare "--" part say the command was removed, exit 2 and run nothing', async () => {
+  for (const argv of [['copilot'], ['--', '--allow-all'], ['--no-install-extension', '--', '--allow-all'], ['--install-extension']]) {
+    const { calls, commands } = recordingCommands();
+    const lines = [];
+    const result = await main({ argv, commands, logger: { log() {}, error: (line) => lines.push(line) } });
+    assert.deepEqual(result, { code: 2, reason: 'usage' });
+    assert.deepEqual(calls, []);
+    assert.match(lines[0], /^\[oar\] oar copilot was removed: .*oar start$/);
+  }
 });
 
 test('an unknown command or option prints the usage, exits 2 and runs nothing', async () => {
@@ -783,39 +792,42 @@ test('setup --migrate-from the same checkout again says it is already migrated a
   assert.doesNotMatch(install.output(), /aside|oar stop/);
 });
 
-test('oar copilot --migrate-from that is refused warns and still starts the session', async (t) => {
-  const install = makeInstall(t, { config: EXISTING });
-  stateRootDb(install, { conversations: 1 });
-  const checkout = oldCheckout(install);
-  // The install's relay already answers; the session is a gh process that exits 0.
-  const relay = fakeRelay(install, { port: 4100, token: 'old-token' });
-  const started = [];
-  const { packageRoot, env, logger, cwd, isProcessAliveImpl } = install.options();
-  const result = await launchRelay({
-    argv: ['--no-install-extension', '--migrate-from', checkout],
-    packageRoot,
-    env,
-    logger,
-    cwd,
-    fetchImpl: relay.fetch,
-    isProcessAliveImpl,
-    lockGraceMs: 10,
-    spawnSyncImpl: () => ({ status: 0 }),
-    spawnImpl: (command) => {
-      started.push(command);
-      const proc = new EventEmitter();
-      proc.exitCode = null;
-      proc.kill = () => {};
-      setImmediate(() => { proc.exitCode = 0; proc.emit('exit', 0, null); });
-      return proc;
-    },
-  });
-  assert.equal(result.code, 0);
-  assert.deepEqual(started, ['gh']);
-  assert.match(install.output(), /already has a database with conversations/);
-  const db = new Database(path.join(install.stateRoot, 'data', 'copilot.db'), { readonly: true });
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations').get().n, 1, 'the state root is untouched');
-  db.close();
+// ─── update ──────────────────────────────────────────────────────────────────
+
+test('oar update removes the Copilot CLI wrapper an earlier version wrote, and leaves a hand-made one', { skip: needsSourceBuild() && 'builds the SQLite binding here' }, async (t) => {
+  for (const handMade of [false, true]) {
+    const install = makeInstall(t, { config: EXISTING });
+    const copilotHome = path.join(install.root, 'copilot');
+    const wrapper = path.join(copilotHome, 'extensions', 'web-relay', 'extension.mjs');
+    const source = `${generatedCopilotWrapperSources(install.packageRoot)[0]}${handMade ? 'console.log("mine");\n' : ''}`;
+    fs.mkdirSync(path.dirname(wrapper), { recursive: true });
+    fs.writeFileSync(wrapper, source);
+    const npm = [];
+    const options = install.options({
+      env: { ...install.options().env, COPILOT_CONFIG_HOME: copilotHome },
+      // npm installs the new version; no relay answers afterwards.
+      spawnImpl: (command, args) => {
+        npm.push(args.join(' '));
+        const child = {
+          on(event, listener) {
+            if (event === 'close') setImmediate(() => listener(0));
+            return child;
+          },
+        };
+        return child;
+      },
+    });
+    const result = await main({ ...options, argv: ['update', '--to', '9.9.10'] });
+    assert.deepEqual(result, { code: 0, reason: 'updated' });
+    assert.ok(npm.some((args) => args.includes('@oar-sh/oar@9.9.10')), 'npm installs the new version');
+    if (handMade) {
+      assert.equal(fs.readFileSync(wrapper, 'utf8'), source, 'byte-identical');
+      assert.doesNotMatch(install.output(), /Copilot CLI wrapper/);
+    } else {
+      assert.equal(fs.existsSync(wrapper), false);
+      assert.match(install.output(), /Removed the Copilot CLI wrapper an earlier version wrote: .*web-relay[\\/]extension\.mjs/);
+    }
+  }
 });
 
 // ─── WSL ─────────────────────────────────────────────────────────────────────
@@ -1927,6 +1939,18 @@ test('start while the relay backs up its database says so, not that it did not c
   install.lines.length = 0;
   await runStart(install.options({ isProcessAliveImpl: (pid) => pid === 5151 }));
   assert.match(install.output(), /is comparing its two database files \(.+copilot\.db, 2 MB\)/);
+});
+
+test('doctor gives copilot --version the long timeout and the other CLIs 5 s', async (t) => {
+  // The first copilot run after an install or an update unpacks its package.
+  const install = makeInstall(t, { config: EXISTING, relayRan: false });
+  const timeouts = {};
+  const spawnSyncImpl = (binary, args, options) => {
+    if (args?.[0] === '--version') timeouts[binary] = options?.timeout;
+    return { status: 1 };
+  };
+  await runDoctor(install.options({ spawnSyncImpl }));
+  assert.deepEqual(timeouts, { copilot: CLI_LONG_PROBE_TIMEOUT_MS, claude: 5000, grok: 5000 });
 });
 
 test('doctor lists the backups: folder, settings, this relay\'s, the last result, and other files here, not rotated', async (t) => {

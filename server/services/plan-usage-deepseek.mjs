@@ -17,6 +17,7 @@
  */
 
 import {
+  CHART_WINDOW_DAYS,
   SOURCE_CACHE,
   SOURCE_LIVE,
   SOURCE_WORKER,
@@ -228,9 +229,6 @@ function balanceProblem(balance) {
 }
 
 const DAY_MS = 86_400_000;
-const CHART_DAYS = 30;
-// How many models get a colour of their own on the charts; the rest share one.
-const CHART_MODEL_SERIES = 4;
 // A Sunday noon: off-peak. Peak prices are exactly double for every part of a
 // price, so the split of a cost into cache hit, cache miss and output is the
 // same at any time; the off-peak prices give the proportions.
@@ -257,7 +255,8 @@ function dayLabel(day) {
 /**
  * The charts' model order, fixed so a model keeps its colour between reads:
  * the models DeepSeek is known for first, in their order, then the others
- * alphabetically. Beyond `CHART_MODEL_SERIES` models they fold into "Other".
+ * alphabetically. Every model is a series of its own; the page colours the
+ * first eight and draws the rest grey.
  */
 function chartModelSeries(models) {
   const known = DEFAULT_DEEPSEEK_MODELS.map((model) => model.toLowerCase());
@@ -268,10 +267,8 @@ function chartModelSeries(models) {
       if (ka !== -1 || kb !== -1) return (ka === -1 ? known.length : ka) - (kb === -1 ? known.length : kb);
       return a < b ? -1 : a > b ? 1 : 0;
     });
-  const own = keys.length > CHART_MODEL_SERIES ? keys.slice(0, CHART_MODEL_SERIES - 1) : keys;
-  const seriesKeyOf = (model) => (own.includes(String(model).toLowerCase()) ? String(model).toLowerCase() : 'other');
-  const series = own.map((key) => ({ key, label: deepseekModelLabel(key) }));
-  if (own.length < keys.length) series.push({ key: 'other', label: 'Other models' });
+  const seriesKeyOf = (model) => String(model).toLowerCase();
+  const series = keys.map((key) => ({ key, label: deepseekModelLabel(key) }));
   return { series, seriesKeyOf };
 }
 
@@ -434,16 +431,18 @@ function budgetMeter({ budget, days, today, currency, actualDays = [] }) {
 }
 
 /**
- * The last 30 days' spend per day, stacked by model. A day without turns is
- * an empty column, so the chart always spans the 30 days.
+ * The last `windowDays` days' spend per day (7, 30 or 90; the card's picker
+ * shows one), stacked by model. A day without turns is an empty column, so
+ * the chart always spans its days. The series come from the models of the
+ * longest window (`seriesModels`), so a model keeps its colour in every one.
  */
-function dailyChart({ days, firstDay, today, unit, costKey, toolsCostKey, actual = false }) {
+function dailyChart({ days, firstDay, today, unit, costKey, toolsCostKey, actual = false, windowDays, seriesModels }) {
   const end = Date.parse(`${today}T00:00:00.000Z`);
-  const start = end - (CHART_DAYS - 1) * DAY_MS;
+  const start = end - (windowDays - 1) * DAY_MS;
   const startDay = utcDay(start);
   const rows = days.filter((row) => row.day >= startDay && row.day <= today);
   if (!rows.some((row) => spendOf(row, costKey, toolsCostKey) > 0)) return null;
-  const { series, seriesKeyOf } = chartModelSeries(rows.map((row) => row.model));
+  const { series, seriesKeyOf } = chartModelSeries(seriesModels);
   const items = [];
   for (let time = start; time <= end; time += DAY_MS) {
     const key = utcDay(time);
@@ -459,12 +458,13 @@ function dailyChart({ days, firstDay, today, unit, costKey, toolsCostKey, actual
   // may reach further back.
   const shortHistory = firstDay && firstDay > startDay;
   return buildChart({
-    id: 'deepseek-daily-spend',
-    label: `Daily spend, last ${CHART_DAYS} days`,
+    id: `deepseek-daily-spend-${windowDays}d`,
+    label: `Daily spend, last ${windowDays} days`,
     kind: 'columns',
     unit,
     series,
     items,
+    windowDays,
     note: actual
       ? `Actual from the DeepSeek export on the days it covers, by its days; estimated on the others, by UTC day, from the turns of this relay${shortHistory ? ` (kept by day since ${dayLabel(firstDay)})` : ''}.`
       : (shortHistory
@@ -474,7 +474,8 @@ function dailyChart({ days, firstDay, today, unit, costKey, toolsCostKey, actual
 }
 
 /**
- * Where the money went per model: the cost split into cache hits, cache
+ * Where the money went per model, all time (no window: the picker leaves it
+ * as it is): the cost split into cache hits, cache
  * misses and output (and the searches and fetches once there are any), from
  * the token counts at DeepSeek's prices. The summary says what the cache
  * saved: the hit tokens at the miss price, less what they cost.
@@ -512,7 +513,7 @@ function sharesChart({ models, currency, unit, costKey, toolsCostKey }) {
     series: SHARE_SERIES.filter((entry) => entry.key !== 'tools' || anyTools),
     items,
     summary: saved > 0 ? `Cache saved about ${formatDeepSeekMoney(saved, currency, { estimate: true })}` : null,
-    note: 'Cache saved: the cache hits at the cache-miss price, less what they cost.',
+    note: 'All time. Cache saved: the cache hits at the cache-miss price, less what they cost.',
   });
 }
 
@@ -824,8 +825,12 @@ export function buildDeepSeekPlanCard({
     .filter(Boolean);
   const budgetCurrency = priceCurrency(monthlyBudgetCurrency) || currency;
   meters.push(budgetMeter({ budget: monthlyBudget, days: dayRows, today, currency: budgetCurrency, actualDays: actual && budgetCurrency === currency ? actual.days : [] }));
+  const longestStart = utcDay(Date.parse(`${today}T00:00:00.000Z`) - (CHART_WINDOW_DAYS[CHART_WINDOW_DAYS.length - 1] - 1) * DAY_MS);
+  const seriesModels = dayRows.filter((row) => row.day >= longestStart && row.day <= today).map((row) => row.model);
   const charts = [
-    dailyChart({ days: dayRows, firstDay: toTrimmedString(days?.firstDay), today, unit, costKey, toolsCostKey, actual: !!actual }),
+    ...CHART_WINDOW_DAYS.map((windowDays) => dailyChart({
+      days: dayRows, firstDay: toTrimmedString(days?.firstDay), today, unit, costKey, toolsCostKey, actual: !!actual, windowDays, seriesModels,
+    })),
     sharesChart({ models: spend.models, currency, unit, costKey, toolsCostKey }),
   ];
   const details = [];

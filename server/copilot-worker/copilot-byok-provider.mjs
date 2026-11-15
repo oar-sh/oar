@@ -1,7 +1,7 @@
 // BYOK (bring-your-own-key) provider config for the SDK worker.
 //
-// Why this exists at all: on the EXTENSION path the `COPILOT_PROVIDER_*`
-// environment variables are read by the `copilot` CLI's own startup layer,
+// Why this exists at all: when the `copilot` CLI itself starts, the
+// `COPILOT_PROVIDER_*` environment variables are read by its own startup layer,
 // which turns them into the process-wide custom provider. Sessions this worker
 // creates through the SDK never go through that layer — a live probe confirmed
 // the runtime IGNORES those variables for SDK-created sessions — so the same
@@ -11,7 +11,7 @@
 // The variable names are deliberately NOT re-invented here: they are exactly
 // the ones `applyOpenAIProviderEnvironment()`
 // (server/services/session-worker-launch-service.mjs) writes today, so one
-// relay-side OpenAI configuration drives both engines and the existing
+// relay-side OpenAI configuration drives the worker and the existing
 // secret-env-file plumbing (`WORKER_SECRET_ENV_VARS` already carries
 // `COPILOT_PROVIDER_API_KEY`) keeps working untouched.
 //
@@ -74,7 +74,7 @@ export function resolveOpenAiModelTokenLimits(model) {
  * Build `SessionConfig.provider` from the worker's environment, or null when
  * this session is not a BYOK session.
  *
- * The signal is the same one the extension path uses: the launch service only
+ * The signal: the launch service only
  * writes `COPILOT_PROVIDER_TYPE` for a session whose relay provider is
  * `openai`, and deletes the whole family otherwise. An API key is required
  * because a provider config without credentials would silently fail every

@@ -16,6 +16,7 @@ import {
   createClaudeCloudSettingsService,
 } from '../services/claude-cloud-settings-service.mjs';
 import { createClaudeCloudSessionService } from '../services/claude-cloud-session-service.mjs';
+import { fakeSessionWorkerSupervisor } from '../feature-flags-test-harness.mjs';
 
 // The Claude Cloud provider through the session routes: bootstrap (the only
 // way such a conversation is created), the `cloud` field of the conversation
@@ -144,7 +145,6 @@ function setup({
     resolveConversationWorkspaceState: () => null,
     updateConversationConfiguredWorkspaceRoot: () => ({ ok: true }),
     learnConversationWorkspaceRoot: () => ({ ok: true }),
-    setPendingSessionCwd: () => null,
     consumePendingSessionCwd: () => null,
     getPendingSessionCwd: () => null,
     workspaceRootAllowList: [],
@@ -152,7 +152,6 @@ function setup({
     localhostOnly: false,
     listenHost: '127.0.0.1',
     ensureSessionId: () => 'client-1',
-    touchCli: () => {},
     markCliOffline: () => {},
     fetchUsageSummary: () => {},
     ensureRuntimeSessionBinding,
@@ -164,12 +163,9 @@ function setup({
     DEFAULT_CONVERSATION_SESSION_MODE: 'conversation-bound',
     DEFAULT_MODEL: 'gpt-5.4-mini',
     remotePath: () => null,
-    computeRetryDelayMs: () => 0,
-    relayRestartOrchestrator: null,
-    relayBridgeOwnerService: null,
-    featureFlags: {},
     resolveSessionStateRoot: () => null,
     sessionWorkerRegistry: createSessionWorkerRegistry(),
+    sessionWorkerSupervisor: fakeSessionWorkerSupervisor(),
     sdkSessionImportService: null,
     statusEventService: { recordSharedAccess: () => ({ event: null }) },
     isSha256: () => false,

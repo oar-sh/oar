@@ -4,6 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 import { relayToken, relayBaseUrl, relayDataDir, relayDbPath } from "./e2e-env.mjs";
 import { clickHeaderAction, expectHeaderActionUnavailable } from "./header-actions-helpers.mjs";
+import { attemptOf, completeTurn, fakeWorkerFor, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 function relayOrigin() {
   return new URL(relayBaseUrl()).origin;
@@ -13,44 +17,26 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function readSdkDeleteRequest(sdkSessionId) {
-  const db = new DatabaseSync(relayDbPath(), { readOnly: true });
-  try {
-    return db.prepare(
-      `SELECT sdk_session_id, conversation_id, status, retry_count, requested_at
-       FROM sdk_delete_requests
-       WHERE sdk_session_id = ?`
-    ).get(sdkSessionId);
-  } finally {
-    db.close();
-  }
-}
-
 // The test relay's Copilot session folder for `sdkSessionId`: its session-state
 // root is COPILOT_SESSION_STATE_DIR (tests/relay-server-harness.mjs).
 function copilotSessionFolder(sdkSessionId) {
   return path.join(path.dirname(relayDataDir()), "session-state", sdkSessionId);
 }
 
-// A conversation bound to `sdkSessionId` with one queued, never-started
-// message; the relay is paused so nothing starts it before the delete.
-async function seedConversationForSdkSession(request, headers, { sdkSessionId, text }) {
-  const queued = await request.post("/api/message", {
-    headers,
-    data: { text, relayMode: "autopilot", model: "gpt-5.4-mini" },
-  });
-  expect(queued.ok()).toBeTruthy();
-  const queuedBody = await queued.json();
-  const conversationId = String(queuedBody?.conversationId || "");
-  expect(conversationId).toBeTruthy();
-  expect(String(queuedBody?.messageId || "")).toBeTruthy();
+function withDb(work) {
+  const db = new DatabaseSync(relayDbPath());
+  try {
+    return work(db);
+  } finally {
+    db.close();
+  }
+}
 
-  const synced = await request.post("/api/session-sync", {
-    headers,
-    data: { sdk_session_id: sdkSessionId, conversation_id: conversationId },
-  });
-  expect(synced.ok()).toBeTruthy();
-  return conversationId;
+// A chat made as the web client makes one, bound to its session (its own
+// id), with `data` (the body of POST /api/message) as its first message:
+// the answer of POST /api/message and the session's fake worker.
+function startChat({ text, relayMode, model, ...message }) {
+  return startConversation({ text, relayMode, model, message });
 }
 
 function makeInlineSvgDataUrl(width, height, fill = "#4ade80") {
@@ -95,31 +81,11 @@ function fileLinkOf(link) {
   });
 }
 
-async function dequeueSpecificMessage(request, headers, messageId, maxAttempts = 30, ownerSessionId = "") {
-  // When session-worker routing is enabled the queue row is born owned and the
-  // anonymous legacy-relay poll never sees it; claiming it as its owner (the
-  // x-relay-session-id bridge identity) exercises the owned-dequeue path the
-  // production workers use. POST /api/message returns the assigned owner id.
-  const dequeueHeaders = String(ownerSessionId || "").trim()
-    ? { ...headers, "x-relay-session-id": String(ownerSessionId).trim() }
-    : headers;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const pendingBody = await dequeued.json();
-    const msg = pendingBody?.message || null;
-    if (!msg) {
-      await sleep(250);
-      continue;
-    }
-    if (String(msg.id || "") === String(messageId || "")) return pendingBody;
-    await request.post("/api/requeue", {
-      headers,
-      data: { messageId: String(msg.id || "") },
-    }).catch(() => {});
-    await sleep(120);
-  }
-  throw new Error(`Timed out waiting to dequeue target message ${String(messageId || "").slice(0, 8)}`);
+// Takes a queued message off the queue as its session's worker (`queued` is
+// the answer of POST /api/message); answers in the shape of the relay's own
+// dequeue answer.
+async function dequeueSpecificMessage(queued, messageId) {
+  return { message: await fakeWorkerFor(queued).take(messageId) };
 }
 
 test("renders and answers relay question card in the web UI", async ({ page, request }) => {
@@ -133,28 +99,24 @@ test("renders and answers relay question card in the web UI", async ({ page, req
   let questionId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: seedText,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-        reasoningEffort: "high",
-      },
+    const queuedBody = await startChat({
+      text: seedText,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
+      reasoningEffort: "high",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    const pendingBody = await dequeueSpecificMessage(queuedBody, messageId);
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     const created = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -202,16 +164,12 @@ test("renders and answers relay question card in the web UI", async ({ page, req
     expect(String(stateBody?.question?.answer || "")).toBe("Option A");
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          reasoningEffort: "high",
-          mode: "autopilot",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        reasoningEffort: "high",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -228,19 +186,15 @@ test("an Allow / Deny card shows its header and no reply box, and the relay refu
   let questionId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Playwright approval seed ${stamp}`, relayMode: "ask", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
+    const queuedBody = await startChat({ text: `Playwright approval seed ${stamp}`, relayMode: "ask", model: "gpt-5.4-mini" });
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
-    await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    await dequeueSpecificMessage(queuedBody, messageId);
 
     const created = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -294,16 +248,12 @@ test("an Allow / Deny card shows its header and no reply box, and the relay refu
     expect(String(answeredBody?.question?.answer || "")).toBe("Allow");
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          reasoningEffort: "high",
-          mode: "autopilot",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        reasoningEffort: "high",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -320,15 +270,10 @@ test("renders a multi-select question card with checkmarks and answers with ever
   let questionId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Playwright multi seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
+    const queuedBody = await startChat({ text: `Playwright multi seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" });
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    const pendingBody = await dequeueSpecificMessage(queuedBody, messageId);
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     // What the Claude worker's ask-user bridge posts for `multiSelect: true`
@@ -336,6 +281,7 @@ test("renders a multi-select question card with checkmarks and answers with ever
     const created = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -374,10 +320,7 @@ test("renders a multi-select question card with checkmarks and answers with ever
     expect(String(stateBody?.question?.answer || "")).toBe("Option A, Option C");
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" },
-      }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }
@@ -393,15 +336,10 @@ test("a Copilot choice card offers Select several: one-click by default, checkma
   let questionId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Playwright toggle seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
+    const queuedBody = await startChat({ text: `Playwright toggle seed ${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini", reasoningEffort: "high" });
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    const pendingBody = await dequeueSpecificMessage(queuedBody, messageId);
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     // What the Copilot worker's bridge posts for a question neither the model
@@ -409,6 +347,7 @@ test("a Copilot choice card offers Select several: one-click by default, checkma
     const created = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -449,10 +388,7 @@ test("a Copilot choice card offers Select several: one-click by default, checkma
     expect(String(stateBody?.question?.answer || "")).toBe("staging, preview");
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" },
-      }).catch(() => {});
+      await respondAsWorker(messageId, { conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", reasoningEffort: "high", mode: "autopilot" }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }
@@ -583,107 +519,31 @@ test("does not retarget workspace root from chat cd commands", async ({ request 
     expect(String(afterBody?.workspaceRootPath || "")).toBe(beforeRootPath);
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "ask",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "ask",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
   }
 });
 
-// The relay deletes a conversation at once and removes its Copilot CLI session
-// through its own runtime. The isolated harness has no Copilot runtime to reach
-// (HOME and LOCALAPPDATA are redirected), which exercises the fallback: the CLI
-// session goes on the SDK delete queue for a CLI-side consumer.
-test("bridges web delete requests to SDK session delete queue", async ({ request }) => {
+// A conversation deleted before its first turn has no CLI session on disk (its
+// session is its own id), so there is nothing to hand to the runtime.
+test("deletes a Copilot conversation that never ran a turn, with no CLI session to delete", async ({ request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
-  const sdkSessionId = `playwright-sdk-delete-${stamp}`;
-  const sessionFolder = copilotSessionFolder(sdkSessionId);
   let conversationId = "";
   let relayPaused = false;
 
   try {
-    conversationId = await seedConversationForSdkSession(request, headers, {
-      sdkSessionId,
-      text: `sdk-delete-bridge-seed-${stamp}`,
-    });
-    // The session has run before, so there is a CLI session on disk to delete.
-    fs.mkdirSync(sessionFolder, { recursive: true });
-    fs.writeFileSync(path.join(sessionFolder, "events.jsonl"), "{}\n");
-
-    const paused = await request.post("/api/relay/pause", { headers });
-    expect(paused.ok()).toBeTruthy();
-    relayPaused = true;
-    await sleep(2500);
-
-    const deleted = await request.delete(`/api/conversation/${conversationId}`, { headers });
-    expect(deleted.ok()).toBeTruthy();
-    const deletedBody = await deleted.json();
-    expect(Boolean(deletedBody?.ok)).toBeTruthy();
-    expect(deletedBody?.cliSessionDeleted).toBe(false);
-    // Left for the queue's consumer, which deletes it through the CLI.
-    expect(fs.existsSync(sessionFolder)).toBe(true);
-
-    // Gone at once — the queued (never-started) message went with it.
-    const missingConversation = await request.get(`/api/conversation/${conversationId}`, { headers });
-    expect(missingConversation.status()).toBe(404);
-
-    const pendingRow = readSdkDeleteRequest(sdkSessionId);
-    expect(String(pendingRow?.sdk_session_id || "")).toBe(sdkSessionId);
-    expect(String(pendingRow?.conversation_id || "")).toBe(conversationId);
-
-    const completed = await request.post("/api/sdk-session-delete/result", {
-      headers,
-      data: {
-        sdk_session_id: sdkSessionId,
-        ok: true,
-      },
-    });
-    expect(completed.ok()).toBeTruthy();
-    expect(readSdkDeleteRequest(sdkSessionId)).toBeUndefined();
-  } finally {
-    if (relayPaused) {
-      await request.post("/api/relay/resume", { headers }).catch(() => {});
-    }
-    if (conversationId) {
-      await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
-    }
-    await request.post("/api/sdk-session-delete/result", {
-      headers,
-      data: {
-        sdk_session_id: sdkSessionId,
-        ok: true,
-      },
-    }).catch(() => {});
-    fs.rmSync(sessionFolder, { recursive: true, force: true });
-  }
-});
-
-// A conversation deleted before its first turn has no CLI session on disk, so
-// there is nothing to hand to the runtime and nothing to queue.
-test("deletes a Copilot conversation that never ran a turn without queueing a CLI session delete", async ({ request }) => {
-  const token = relayToken();
-  const headers = { Authorization: `Bearer ${token}` };
-  const stamp = Date.now();
-  const sdkSessionId = `playwright-sdk-untouched-${stamp}`;
-  let conversationId = "";
-  let relayPaused = false;
-
-  try {
-    conversationId = await seedConversationForSdkSession(request, headers, {
-      sdkSessionId,
-      text: `sdk-delete-untouched-seed-${stamp}`,
-    });
-    expect(fs.existsSync(copilotSessionFolder(sdkSessionId))).toBe(false);
+    // One queued, never-started message; the relay is paused so nothing
+    // starts it before the delete.
+    ({ conversationId } = await startChat({ text: `sdk-delete-untouched-seed-${stamp}`, relayMode: "autopilot", model: "gpt-5.4-mini" }));
+    expect(fs.existsSync(copilotSessionFolder(conversationId))).toBe(false);
 
     const paused = await request.post("/api/relay/pause", { headers });
     expect(paused.ok()).toBeTruthy();
@@ -695,7 +555,6 @@ test("deletes a Copilot conversation that never ran a turn without queueing a CL
     expect(Boolean(deletedBody?.ok)).toBeTruthy();
     expect(deletedBody?.cliSessionDeleted).toBeNull();
     expect((await request.get(`/api/conversation/${conversationId}`, { headers })).status()).toBe(404);
-    expect(readSdkDeleteRequest(sdkSessionId)).toBeUndefined();
     conversationId = "";
   } finally {
     if (relayPaused) {
@@ -704,10 +563,6 @@ test("deletes a Copilot conversation that never ran a turn without queueing a CL
     if (conversationId) {
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
-    await request.post("/api/sdk-session-delete/result", {
-      headers,
-      data: { sdk_session_id: sdkSessionId, ok: true },
-    }).catch(() => {});
   }
 });
 
@@ -720,15 +575,10 @@ test("refuses to delete a conversation while its turn is running, and deletes it
   let answered = false;
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `delete-while-running-${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
+    const queuedBody = await startChat({ text: `delete-while-running-${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" });
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
-    const pendingBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    const pendingBody = await dequeueSpecificMessage(queuedBody, messageId);
     expect(String(pendingBody?.message?.id || "")).toBe(messageId);
 
     const refused = await request.delete(`/api/conversation/${conversationId}`, { headers });
@@ -745,11 +595,8 @@ test("refuses to delete a conversation while its turn is running, and deletes it
     await page.locator(`[onclick*="deleteConv(event,'${conversationId}')"]`).click();
     await expect(page.getByText("This conversation is still working on a reply")).toBeVisible();
 
-    const response = await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" },
-    });
-    expect(response.ok()).toBeTruthy();
+    const response = await respondAsWorker(messageId, { conversationId, text: "done", model: "gpt-5.4-mini", mode: "agent" });
+    expect(response.ok).toBeTruthy();
     answered = true;
 
     const deleted = await request.delete(`/api/conversation/${conversationId}`, { headers });
@@ -759,10 +606,7 @@ test("refuses to delete a conversation while its turn is running, and deletes it
   } finally {
     if (conversationId) {
       if (!answered && messageId) {
-        await request.post("/api/response", {
-          headers,
-          data: { messageId, conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" },
-        }).catch(() => {});
+        await respondAsWorker(messageId, { conversationId, text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
       }
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -774,34 +618,30 @@ test("linkifies workspace file mentions in assistant messages and question cards
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const seedText = `File-link test seed ${stamp}`;
-  const absoluteWindowsPath = `${process.cwd()}\\server\\relay.mjs`;
+  const absoluteWindowsPath = `${process.cwd()}\\server\\server.js`;
   const prompt = `Can you open README.md and ${absoluteWindowsPath}?`;
   const responseText = `Please read README.md, then inspect ${absoluteWindowsPath}.`;
   let conversationId = "";
   let messageId = "";
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: seedText,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: seedText,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const dequeuedBody = await dequeueSpecificMessage(request, headers, messageId, 30, String(queuedBody?.ownerSessionId || ""));
+    const dequeuedBody = await dequeueSpecificMessage(queuedBody, messageId);
     expect(String(dequeuedBody?.message?.id || "")).toBe(messageId);
 
     const createdQuestion = await request.post("/api/relay-question", {
       headers,
       data: {
+        ...attemptOf(messageId),
         queueId: messageId,
         messageId,
         conversationId,
@@ -814,17 +654,12 @@ test("linkifies workspace file mentions in assistant messages and question cards
     });
     expect(createdQuestion.ok()).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: responseText,
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
-    });
-    expect(responded.ok()).toBeTruthy();
+    const responded = await completeTurn({ conversationId, messageId }, {
+      text: responseText,
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
+    }, { stay: true });
+    expect(responded.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
@@ -840,25 +675,21 @@ test("linkifies workspace file mentions in assistant messages and question cards
     await expect.poll(() => fileLinkOf(assistantReadmeLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/README\.md$/), signed: true, params: [] });
     await expect(assistantReadmeLink).toHaveAttribute("target", "_blank");
 
-    const assistantWindowsPathLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "relay.mjs" }).first();
+    const assistantWindowsPathLink = page.locator(".msg.assistant .msg-bubble a", { hasText: "server.js" }).first();
     await expect(assistantWindowsPathLink).toBeVisible();
-    await expect.poll(() => fileLinkOf(assistantWindowsPathLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/server\/relay\.mjs$/), signed: true, params: [] });
-    expect((await fileLinkOf(assistantWindowsPathLink)).path).not.toMatch(/\/api\/files\/git\/copilot\/server\/relay\.mjs$/);
+    await expect.poll(() => fileLinkOf(assistantWindowsPathLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/server\/server\.js$/), signed: true, params: [] });
+    expect((await fileLinkOf(assistantWindowsPathLink)).path).not.toMatch(/\/api\/files\/git\/copilot\/server\/server\.js$/);
 
     const questionReadmeLink = page.locator(".relay-question-body a", { hasText: "README.md" }).first();
     await expect(questionReadmeLink).toBeVisible();
     await expect.poll(() => fileLinkOf(questionReadmeLink)).toEqual({ path: expect.stringMatching(/\/api\/files\/README\.md$/), signed: true, params: [] });
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "autopilot",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -1001,32 +832,24 @@ test("keeps the active conversation visible when startup refreshes resolve late"
   let conversationsFetchCount = 0;
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: seedText,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: seedText,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: responseText,
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
+    await fakeWorkerFor(queuedBody).take(messageId);
+    const responded = await respondAsWorker(messageId, {
+      conversationId,
+      text: responseText,
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     });
-    expect(responded.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
 
     await page.route("**/api/conversations", async (route) => {
       conversationsFetchCount += 1;
@@ -1060,46 +883,31 @@ test("does not reuse the previous reply text in a new thinking bubble", async ({
   const secondSeed = `Thinking reset follow-up ${stamp}`;
   const previousReplyText = `previous-reply-marker-${stamp}`;
   let conversationId = "";
+  let worker = null;
 
   try {
     // Synthesize the first completed turn through the relay API; the isolated
     // e2e server never spawns a CLI, so nothing else would answer the prompt.
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: firstSeed,
-        relayMode: "agent",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: firstSeed,
+      relayMode: "agent",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "").trim();
     const messageId = String(queuedBody?.messageId || "").trim();
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: previousReplyText,
-        model: "gpt-5.4-mini",
-        mode: "agent",
-      },
+    // Taken and answered by the session's worker. The conversation is bound
+    // from its start: follow-up turns are only accepted on a bound one.
+    worker = fakeWorkerFor(queuedBody);
+    await worker.take(messageId);
+    const responded = await worker.respond(messageId, {
+      text: previousReplyText,
+      model: "gpt-5.4-mini",
+      mode: "agent",
     });
-    expect(responded.ok()).toBeTruthy();
-
-    // Follow-up turns are only accepted on session-bound conversations.
-    const synced = await request.post("/api/session-sync", {
-      headers,
-      data: {
-        sdk_session_id: `pw-sid-think-${stamp}`,
-        conversation_id: conversationId,
-      },
-    });
-    expect(synced.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
@@ -1116,24 +924,18 @@ test("does not reuse the previous reply text in a new thinking bubble", async ({
     await page.click("#send-btn");
 
     // The thinking bubble renders when the queued turn moves to "processing";
-    // with CLI spawn disabled nothing dequeues it, so pull it ourselves. Under
-    // session-worker routing the follow-up is owned by the bound session, so
-    // claim it with that identity; anonymously otherwise.
-    const boundSessionHeaders = { ...headers, "x-relay-session-id": `pw-sid-think-${stamp}` };
-    await expect.poll(async () => {
-      for (const pollHeaders of [boundSessionHeaders, headers]) {
-        const pending = await request.get("/api/pending", { headers: pollHeaders });
-        if (!pending.ok()) continue;
-        const body = await pending.json();
-        if (body?.message?.id) return true;
-      }
-      return false;
-    }, { timeout: 15000 }).toBeTruthy();
+    // with CLI spawn disabled nothing dequeues it, so the session's worker
+    // played here takes it.
+    await expect.poll(async () => Boolean((await worker.poll()).payload?.message?.id), { timeout: 15000 }).toBeTruthy();
 
     await expect(page.locator("#thinking-indicator")).toBeVisible();
     await expect(page.locator("#thinking-indicator .thinking-bubble")).not.toContainText(previousReplyText);
 
   } finally {
+    // The follow-up turn the worker took ends here.
+    for (const held of worker?.holding || []) {
+      await worker.respond(held, { text: "playwright cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
+    }
     if (conversationId) {
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -1162,32 +964,24 @@ test("shows Copilot usage from the usage modal", async ({ page, request }) => {
 
   try {
     // The conversation actions menu button is hidden until a conversation is open.
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: `usage-modal-seed-${stamp}`,
-        relayMode: "agent",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: `usage-modal-seed-${stamp}`,
+      relayMode: "agent",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "").trim();
     const messageId = String(queuedBody?.messageId || "").trim();
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: "usage modal reply",
-        model: "gpt-5.4-mini",
-        mode: "agent",
-      },
+    await fakeWorkerFor(queuedBody).take(messageId);
+    const responded = await respondAsWorker(messageId, {
+      conversationId,
+      text: "usage modal reply",
+      model: "gpt-5.4-mini",
+      mode: "agent",
     });
-    expect(responded.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
@@ -1333,15 +1127,11 @@ test("shows a compact CWD picker menu for long known CWD lists", async ({ page, 
     // page closes does not fail the test on a disposed response.
     await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "ask",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "ask",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -1383,32 +1173,24 @@ test("shows current context from the context button", async ({ page, request }) 
 
   try {
     // The context button only fetches when a conversation is active.
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: `context-modal-seed-${stamp}`,
-        relayMode: "agent",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: `context-modal-seed-${stamp}`,
+      relayMode: "agent",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "").trim();
     const messageId = String(queuedBody?.messageId || "").trim();
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: "context modal reply",
-        model: "gpt-5.4-mini",
-        mode: "agent",
-      },
+    await fakeWorkerFor(queuedBody).take(messageId);
+    const responded = await respondAsWorker(messageId, {
+      conversationId,
+      text: "context modal reply",
+      model: "gpt-5.4-mini",
+      mode: "agent",
     });
-    expect(responded.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
@@ -1444,16 +1226,11 @@ test("updates the input context bar after assistant turns", async ({ page, reque
   let contextRequests = 0;
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: `context-bar-seed-${stamp}`,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const queuedBody = await startChat({
+      text: `context-bar-seed-${stamp}`,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
     conversationId = String(queuedBody?.conversationId || "");
     messageId = String(queuedBody?.messageId || "");
     expect(conversationId).toBeTruthy();
@@ -1508,17 +1285,12 @@ test("updates the input context bar after assistant turns", async ({ page, reque
     expect(topBarStyle.backgroundImage).toContain("gradient");
     expect(topBarStyle.boxShadow).not.toBe("none");
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: "context bar update check",
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
-    });
-    expect(responded.ok()).toBeTruthy();
+    const responded = await completeTurn({ conversationId, messageId }, {
+      text: "context bar update check",
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
+    }, { stay: true });
+    expect(responded.ok).toBeTruthy();
 
     await page.waitForFunction(() => {
       const ratio = Number(document.getElementById("input-area")?.dataset.contextUsageRatio || "0");
@@ -1703,31 +1475,30 @@ test("mobile chat title exposes and copies the sdk session id", async ({ page, r
   const headers = { Authorization: `Bearer ${token}` };
   const stamp = Date.now();
   const seedText = `session-title-copy-${stamp}`;
-  const sdkSessionId = `session-title-sdk-${stamp}`;
   let conversationId = "";
   let messageId = "";
+  let answered = false;
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: {
-        text: seedText,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const body = await queued.json();
+    const body = await startChat({ text: seedText, relayMode: "autopilot", model: "gpt-5.4-mini" });
     conversationId = String(body?.conversationId || "");
     messageId = String(body?.messageId || "");
-    const synced = await request.post("/api/session-sync", {
-      headers,
-      data: {
-        sdk_session_id: sdkSessionId,
-        conversation_id: conversationId,
-      },
+    const responded = await completeTurn({ conversationId, messageId }, {
+      text: "title copy reply",
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     });
-    expect(synced.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
+    answered = true;
+    // A conversation bound by an earlier version keeps a session id of its
+    // own, other than the conversation id: the title must name that one, not
+    // fall back to the conversation's.
+    const sdkSessionId = `sdk-title-copy-${stamp}`;
+    withDb((db) => {
+      db.prepare(`UPDATE conversations SET sdk_session_id = ? WHERE id = ?`).run(sdkSessionId, conversationId);
+      db.prepare(`UPDATE runtime_sessions SET sdk_session_id = ? WHERE conversation_id = ?`).run(sdkSessionId, conversationId);
+    });
+    expect(sdkSessionId).not.toBe(conversationId);
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.addInitScript(() => {
@@ -1756,16 +1527,12 @@ test("mobile chat title exposes and copies the sdk session id", async ({ page, r
     await title.evaluate((el) => el.click());
     await expect.poll(async () => page.evaluate(() => window.__copiedSessionId || "")).toBe(sdkSessionId);
   } finally {
-    if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "autopilot",
-        },
+    if (messageId && conversationId && !answered) {
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -1818,15 +1585,11 @@ test("mobile conversation switch does not refocus composer", async ({ page, requ
   } finally {
     const finalize = async (conversationId, messageId) => {
       if (!conversationId || !messageId) return;
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "autopilot",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     };
@@ -1879,15 +1642,11 @@ test("chat title color matches active conversation list color", async ({ page, r
     expect(colors.chat).toBe(colors.list);
   } finally {
     if (messageId && conversationId) {
-      await request.post("/api/response", {
-        headers,
-        data: {
-          messageId,
-          conversationId,
-          text: "playwright cleanup",
-          model: "gpt-5.4-mini",
-          mode: "autopilot",
-        },
+      await respondAsWorker(messageId, {
+        conversationId,
+        text: "playwright cleanup",
+        model: "gpt-5.4-mini",
+        mode: "autopilot",
       }).catch(() => {});
       await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
     }
@@ -2075,30 +1834,20 @@ test("keeps non-image @file references as text-only pending turns", async ({ req
   const headers = { Authorization: `Bearer ${token}` };
 
   async function finalizePending(conversationId, messageId) {
-    await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: "playwright cleanup",
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
+    await completeTurn({ conversationId, messageId }, {
+      text: "playwright cleanup",
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     }).catch(() => {});
     await request.delete(`/api/conversation/${conversationId}`, { headers }).catch(() => {});
   }
 
-  const textRef = await request.post("/api/message", {
-    headers,
-    data: {
-      text: "Please inspect `@file:README.md`",
-      relayMode: "autopilot",
-      model: "gpt-5.4-mini",
-    },
+  const textBody = await startChat({
+    text: "Please inspect `@file:README.md`",
+    relayMode: "autopilot",
+    model: "gpt-5.4-mini",
   });
-  expect(textRef.ok()).toBeTruthy();
-  const textBody = await textRef.json();
-  const textPendingBody = await dequeueSpecificMessage(request, headers, String(textBody?.messageId || ""), 30, String(textBody?.ownerSessionId || ""));
+  const textPendingBody = await dequeueSpecificMessage(textBody, String(textBody?.messageId || ""));
   expect(String(textPendingBody?.message?.id || "")).toBe(String(textBody?.messageId || ""));
   expect(Array.isArray(textPendingBody?.message?.attachments) ? textPendingBody.message.attachments.length : 0).toBe(0);
   await finalizePending(String(textBody?.conversationId || ""), String(textBody?.messageId || ""));
@@ -2113,32 +1862,24 @@ test("restores the current message scroll position after a browser reload", asyn
   let messageId = "";
 
   try {
-    const created = await request.post("/api/message", {
-      headers,
-      data: {
-        text: seedText,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const createdBody = await startChat({
+      text: seedText,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(created.ok()).toBeTruthy();
-    const createdBody = await created.json();
     conversationId = String(createdBody?.conversationId || "").trim();
     messageId = String(createdBody?.messageId || "").trim();
     expect(conversationId).toBeTruthy();
     expect(messageId).toBeTruthy();
 
-    const responded = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId,
-        conversationId,
-        text: responseText,
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
+    await fakeWorkerFor(createdBody).take(messageId);
+    const responded = await respondAsWorker(messageId, {
+      conversationId,
+      text: responseText,
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     });
-    expect(responded.ok()).toBeTruthy();
+    expect(responded.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");
@@ -2195,55 +1936,39 @@ test("restores message scroll when switching back to a conversation", async ({ p
   let secondMessageId = "";
 
   try {
-    const first = await request.post("/api/message", {
-      headers,
-      data: {
-        text: firstSeed,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const firstBody = await startChat({
+      text: firstSeed,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(first.ok()).toBeTruthy();
-    const firstBody = await first.json();
     firstConversationId = String(firstBody?.conversationId || "").trim();
     firstMessageId = String(firstBody?.messageId || "").trim();
 
-    const firstReply = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId: firstMessageId,
-        conversationId: firstConversationId,
-        text: firstResponse,
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
+    await fakeWorkerFor(firstBody).take(firstMessageId);
+    const firstReply = await respondAsWorker(firstMessageId, {
+      conversationId: firstConversationId,
+      text: firstResponse,
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     });
-    expect(firstReply.ok()).toBeTruthy();
+    expect(firstReply.ok).toBeTruthy();
 
-    const second = await request.post("/api/message", {
-      headers,
-      data: {
-        text: secondSeed,
-        relayMode: "autopilot",
-        model: "gpt-5.4-mini",
-      },
+    const secondBody = await startChat({
+      text: secondSeed,
+      relayMode: "autopilot",
+      model: "gpt-5.4-mini",
     });
-    expect(second.ok()).toBeTruthy();
-    const secondBody = await second.json();
     secondConversationId = String(secondBody?.conversationId || "").trim();
     secondMessageId = String(secondBody?.messageId || "").trim();
 
-    const secondReply = await request.post("/api/response", {
-      headers,
-      data: {
-        messageId: secondMessageId,
-        conversationId: secondConversationId,
-        text: secondResponse,
-        model: "gpt-5.4-mini",
-        mode: "autopilot",
-      },
+    await fakeWorkerFor(secondBody).take(secondMessageId);
+    const secondReply = await respondAsWorker(secondMessageId, {
+      conversationId: secondConversationId,
+      text: secondResponse,
+      model: "gpt-5.4-mini",
+      mode: "autopilot",
     });
-    expect(secondReply.ok()).toBeTruthy();
+    expect(secondReply.ok).toBeTruthy();
 
     await page.goto(`/?token=${encodeURIComponent(token)}`);
     await page.waitForLoadState("networkidle");

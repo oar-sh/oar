@@ -34,11 +34,11 @@ const launchEnvSource = sliceBetween(
 test('a claude-cloud session gets its own launch branch, ahead of the Copilot fall-through', () => {
   const cloudBranch = launchEnvSource.indexOf(`if (providerType === 'claude-cloud') {`);
   const claudeBranch = launchEnvSource.indexOf(`if (providerType === 'claude') {`);
-  const copilotFallThrough = launchEnvSource.indexOf(`const copilotSdkEngine = getCopilotEngine() === 'sdk';`);
+  const copilotFallThrough = launchEnvSource.indexOf('const sdkPath = resolveCopilotSdkLaunchPath({ config, env: sessionWorkerLaunchEnv });');
   assert.notEqual(cloudBranch, -1);
   assert.notEqual(claudeBranch, -1);
   assert.notEqual(copilotFallThrough, -1);
-  assert.ok(cloudBranch < copilotFallThrough, 'the cloud branch returns before the Copilot CLI path');
+  assert.ok(cloudBranch < copilotFallThrough, 'the cloud branch returns before the Copilot path');
   const branch = launchEnvSource.slice(cloudBranch, claudeBranch > cloudBranch ? claudeBranch : copilotFallThrough);
   assert.match(branch, /return applyClaudeCloudProviderEnvironment\(cleared, \{\s*enabled: true,\s*model: cloudModel,\s*\}\);/);
   // The Claude branch is still the Claude provider's own.
@@ -70,7 +70,7 @@ test('the clear chain the runtime runs removes a stale cloud kind before binding
       CLAUDE_CLOUD_RELAY_MODEL: 'claude-sonnet-5-5',
     }))),
   )));
-  assert.equal(resolveWorkerKind(cleared), 'copilot');
+  assert.equal(resolveWorkerKind(cleared), '');
   assert.deepEqual(cleared, {});
 });
 

@@ -9,6 +9,10 @@ import { runDirectOpenAIImageTurn, shouldUseDirectOpenAIImageApi } from "../shar
 import { closeComposerSettings, composerControl, selectComposerOption } from "./composer-settings-helpers.mjs";
 import { FAKE_IMAGE_USAGE, FAKE_OPENAI_KEY, startFakeOpenAIImages } from "./fake-openai-images.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { createFakeWorker, settleFakeWorkers } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * What OpenAI image turns cost, end to end: a low daily cap in Settings →
@@ -24,8 +28,8 @@ import { sleep, startRelayServer } from "./relay-server-harness.mjs";
  *
  * The relay is this file's own (one relay and one fake, the steps in order;
  * its state root goes with it, so the cap and the override touch no other
- * spec). It runs no worker: the spec takes each image turn off the queue as a
- * session worker does (GET /api/pending) and runs it with the workers' own
+ * spec). It runs no worker: the spec takes each image turn off the queue as
+ * the chat's session worker (helpers/fake-worker.mjs) and runs it with the workers' own
  * image path (shared/worker-runtime/direct-openai-image.mjs). No turn reaches
  * a model.
  */
@@ -123,6 +127,7 @@ test.describe("OpenAI image spend: the daily cap, Allow for today, Check Usage a
 
   let fake = null;
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   // The image chat the steps share.
   let conversationId = "";
   // The relay mode the composer sends with (the API send uses the same).
@@ -144,24 +149,28 @@ test.describe("OpenAI image spend: the daily cap, Allow for today, Check Usage a
     return answer.payload;
   };
 
-  // What a session worker uses to talk to its relay.
-  const workerApi = () => createApiClient({ serverUrl: relay.baseUrl, token: relay.token });
+  // The image chat's session worker, played by the spec.
+  const chatWorker = () => createFakeWorker({ ...onRelay, sessionId: conversationId, conversationId });
 
-  /** The chat's next queued image row, taken and run as a session worker runs it. */
+  /** The chat's next queued image row, taken and run as its session worker runs it. */
   async function takeImageTurn({ timeoutMs = TURN_TIMEOUT_MS } = {}) {
-    const worker = workerApi();
+    const worker = chatWorker();
+    // What a session worker uses to talk to its relay.
+    const api = createApiClient({ serverUrl: relay.baseUrl, token: relay.token, getHeaders: () => worker.headers });
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const { message } = await worker("GET", "/api/pending");
+      const message = (await worker.poll()).payload?.message || null;
       if (message) {
-        if (String(message.conversationId) !== conversationId) {
-          throw new Error(`Another conversation's row was handed out: ${String(message.conversationId).slice(0, 8)}`);
-        }
         if (!shouldUseDirectOpenAIImageApi(message)) {
           throw new Error(`Not an image turn: provider ${message.providerType}, model ${message.providerModel || message.model}`);
         }
-        const result = await runDirectOpenAIImageTurn({ api: worker, message, requestOptions: { longCall: true } });
-        return { message, result };
+        try {
+          const result = await runDirectOpenAIImageTurn({ api, message, requestOptions: { longCall: true } });
+          return { message, result };
+        } finally {
+          // The image path settled the row itself.
+          worker.release(message.id);
+        }
       }
       await sleep(150);
     }
@@ -316,16 +325,11 @@ test.describe("OpenAI image spend: the daily cap, Allow for today, Check Usage a
 
   test("one image turn books its cost from the reported usage and reaches the cap", async ({ page }) => {
     let bootstrapResponse = null;
-    // A relay that cannot start a worker answers a valid bootstrap 409 after
-    // it committed the conversation; the success payload a real relay sends
-    // is restored for the client (as in image-session.spec.mjs).
+    // The relay's answer to the bootstrap, as the page gets it.
     await page.route("**/api/conversation/bootstrap", async (route) => {
       const response = await route.fetch();
       const text = await response.text();
       try { bootstrapResponse = JSON.parse(text); } catch { bootstrapResponse = null; }
-      if (response.status() === 409 && bootstrapResponse?.conversationCreated) {
-        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...bootstrapResponse, ok: true }) });
-      }
       return route.fulfill({ response, body: text });
     });
     await loadApp(page);
@@ -424,8 +428,8 @@ test.describe("OpenAI image spend: the daily cap, Allow for today, Check Usage a
     await expect(page.locator(SEL.spendBanner)).toBeVisible();
     await expect(page.locator(SEL.spendBanner)).toHaveAttribute("data-kind", "reached");
     // Nothing was queued, nothing went to OpenAI.
-    const pending = await workerApi()("GET", "/api/pending");
-    expect(pending?.message ?? null).toBeNull();
+    const pending = await chatWorker().poll();
+    expect(pending.payload?.message ?? null).toBeNull();
     expect(fake.imageRequests()).toHaveLength(1);
     await expectReplies(page, 1);
 

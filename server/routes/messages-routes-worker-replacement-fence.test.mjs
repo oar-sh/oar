@@ -45,26 +45,16 @@ function boot({ wrapStmts = null } = {}) {
     db,
     stmts,
     io: { emit() {}, volatile: { emit() {} } },
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
     queueCounts: () => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 }),
     parseAttachments: () => [],
     hydrateAttachment: (value) => value,
     ensureRuntimeSessionBinding: (conversationId) => stmts.getRuntimeSessionByConversation.get(conversationId) || null,
     configuredConversationSessionMode: 'isolated',
     DEFAULT_RELAY_MODE: 'agent',
-    // The pid rides the request as the workers send it.
-    relayBridgeOwnerService: {
-      normalizeIdentity: ({ sessionId, pid } = {}) => {
-        const sid = String(sessionId || '').trim();
-        const n = Number(pid);
-        return sid ? { sessionId: sid, pid: Number.isInteger(n) && n > 0 ? n : null } : null;
-      },
-      observe: () => ({ accepted: true }),
-    },
     sessionWorkerRegistry: registry,
     sessionWorkerSupervisor: supervisor,
     workerReplacementFence: fence,
-    runtimeState: { featureFlags: {}, relayPaused: false },
+    runtimeState: { relayPaused: false },
     ts: () => NOW,
     uuidv4: () => 'uuid-1',
     addMsIso: (ms) => new Date(Date.now() + Math.max(0, Number(ms) || 0)).toISOString(),

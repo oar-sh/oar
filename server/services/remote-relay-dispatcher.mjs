@@ -21,6 +21,7 @@ import {
   isRemoteRelayApprovalQuestion,
   isRemoteRelayPromptAction,
   isRemoteRelayWriteAction,
+  normalizeRemoteRelayAgentPromptsBeforeAsking,
   normalizeRemoteRelayOrigin,
   remoteConversationUrl,
   remoteRelayActionPermission,
@@ -55,6 +56,7 @@ import { AUTH_ANSWER_PERSON_REQUIRED_MESSAGE, AUTH_ERROR_CODES } from '../../sha
 import { PLAN_ONLY_ERROR_CODE, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES, RELAY_EVENT_RELAY_LEVEL_TYPES } from '../../shared/relay-events.mjs';
+import { RELAY_EVENT_SELF_RELAY_ID } from './relay-event-service.mjs';
 import { checkRequestedProviderModel, isAutoModelId, providerModelLabel, unknownProviderModelText } from './provider-model-selection.mjs';
 import { cleanTaskOutput, parseRunnerSummary, stallMinutes, stripSgr } from '../../shared/task-output-text.mjs';
 import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
@@ -126,6 +128,10 @@ const PROGRESS_TEXT_MAX = 600;
 // How long a session that worked in the background must stay quiet (no task,
 // no turn in flight or queued) before its last follow-up counts as the end.
 const FOLLOW_UP_SETTLE_MS = 10_000;
+// settleRead: the session looked idle once; read again at once to confirm.
+const READ_AGAIN = Symbol('read again');
+// What a wait hands the agent as the end of its prompt: no late reply after it.
+const FINAL_WAIT_STATUSES = new Set(['done', 'failed', 'stopped', 'cancelled']);
 const PROGRESS_ACTIVITY_COUNT = 5;
 const ACTIVITY_LINE_MAX = 300;
 const ACTIVITY_LINES_PER_MESSAGE = 20;
@@ -818,13 +824,16 @@ export function createRemoteRelayDispatcher({
   // that the relay lacks them.
   relayAsks = null,
   relayAskLink = null,
+  // The loop guard's off-list (the registry): `isLoopGuardOff(id)` and
+  // `setLoopGuardOff(id, { title })`. Without it the guard is on for all.
+  loopGuard = null,
 } = {}) {
   const inflightByConversation = new Map();
   const callTimesByConversation = new Map();
   const writeTimesByConversation = new Map();
-  // The loop guard: prompts sent to other relays' agents per conversation,
-  // counted from the user's latest own message. Kept in memory: a restart
-  // ends a loop of agents by itself.
+  // The loop guard: prompts sent to other agents per conversation, counted
+  // from the user's latest own message. Kept in memory: a restart ends a
+  // loop of agents by itself. The limit and the off-list are settings.
   const agentPromptsByConversation = new Map();
   // create_session calls on the local target that passed the cap and have not
   // queued their prompt yet: they count toward it, so parallel calls cannot
@@ -896,7 +905,7 @@ export function createRemoteRelayDispatcher({
    * it lets the firing go again after the user wrote in that conversation,
    * or allowed its agent's next prompt on the card.
    */
-  function admitScheduledFiring({ createdBy } = {}) {
+  function admitScheduledFiring({ scheduleId = null, createdBy } = {}) {
     const requested = toText(createdBy);
     if (!requested) return false;
     let creator = requested;
@@ -904,12 +913,66 @@ export function createRemoteRelayDispatcher({
       creator = toText(resolveConversationId(requested)) || requested;
     } catch {}
     const kept = agentPrompts(creator);
-    if (kept.count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) return false;
+    if (pastPromptLimit(creator)) {
+      raiseHeldFiringCard(creator, scheduleId, kept.count);
+      return false;
+    }
     kept.count += 1;
+    try {
+      relayAsks?.withdrawLoopGuardCards?.(creator);
+    } catch {}
     return true;
   }
 
-  /** `{ enabled, maxWaitSeconds }`; off and the default wait when unreadable. */
+  /** Whether the loop guard wants the user first: 0 and the off-list never do. */
+  function pastPromptLimit(conversationId) {
+    const limit = agentSessions().agentPromptsBeforeAsking;
+    try {
+      if (!limit || loopGuard?.isLoopGuardOff?.(conversationId)) return false;
+    } catch {}
+    return agentPrompts(conversationId).count >= limit;
+  }
+
+  const LOOP_GUARD_CARD_OPTIONS = Object.freeze({ once: 'Allow once', session: 'Allow for this session', leave: 'Leave held' });
+
+  /**
+   * A held firing has no turn to ask on: one card that does not block, in the
+   * conversation that set it, however many of its schedules are held. It is
+   * the relay's own (no asker), so only the person answers it. Raised on a
+   * schedule's first hold only: the minute checks after it (Leave held, a
+   * restart) raise none.
+   */
+  function raiseHeldFiringCard(conversationId, scheduleId, count) {
+    try {
+      if (!relayAsks?.isAvailable?.() || relayAsks.pendingLoopGuardCard?.(conversationId)) return;
+      const schedule = scheduleId ? relaySchedules?.get?.(scheduleId) : null;
+      if (!schedule || schedule.heldForApproval) return;
+      const title = clipLine(schedule?.title || schedule?.text || scheduleId, 80);
+      const session = clipLine(schedule?.session?.title || schedule?.session?.id || 'another session', 80);
+      relayAsks.createLoopGuardCard?.({
+        conversationId,
+        scheduleId,
+        question: `Schedule '${title}' into '${session}' is held by the loop guard (${count} prompts since your last message).`,
+        options: Object.values(LOOP_GUARD_CARD_OPTIONS),
+      });
+    } catch (error) {
+      logger?.warn?.(`[remote-relays] loop guard card for conv=${conversationId.slice(0, 8)} failed: ${toText(error?.message || error).slice(0, 200)}`);
+    }
+  }
+
+  /** The person answered a held-firing card (relay-ask-service onSystemAnswer). */
+  function loopGuardCardAnswered(ask) {
+    const conversationId = toText(ask?.conversationId);
+    if (!conversationId || ask?.status !== 'answered') return;
+    const choice = toText(ask.choice);
+    if (choice === LOOP_GUARD_CARD_OPTIONS.session) {
+      loopGuard?.setLoopGuardOff?.(conversationId, { title: toText(ask.session?.title) });
+    } else if (choice === LOOP_GUARD_CARD_OPTIONS.once) {
+      agentPrompts(conversationId).count = 0;
+    }
+  }
+
+  /** `{ enabled, maxWaitSeconds, agentPromptsBeforeAsking }`; off and the defaults when unreadable. */
   function agentSessions() {
     let settings = null;
     try {
@@ -921,6 +984,7 @@ export function createRemoteRelayDispatcher({
       maxWaitSeconds: Number.isFinite(maxWaitSeconds) && maxWaitSeconds > 0
         ? maxWaitSeconds
         : REMOTE_RELAY_LIMITS.waitMaxSeconds,
+      agentPromptsBeforeAsking: normalizeRemoteRelayAgentPromptsBeforeAsking(settings?.agentPromptsBeforeAsking),
     };
   }
 
@@ -1121,133 +1185,179 @@ export function createRemoteRelayDispatcher({
 
   async function pollForReply(ctx, { session, messageId, waitSeconds, seen }) {
     const deadline = now() + Math.max(0, waitSeconds) * 1000;
-    const base = { session, message_id: messageId };
-    let idleSeen = false;
     let firstRead = true;
     for (;;) {
       // The confirming read before "cancelled" looks as far as the remote
       // allows per page, for a reply that sits unusually far behind its
       // message. It and the first read (a late wait) follow a full page with
       // the pages after it; the polls in between watch the first page only.
-      const limit = idleSeen ? HISTORY_PAGE_MAX : WAIT_PAGE_LIMIT;
+      const limit = seen.idle ? HISTORY_PAGE_MAX : WAIT_PAGE_LIMIT;
       const page = await call(ctx, 'GET', sessionPath(session), {
         query: { afterMessageId: messageId, limit },
       });
-      const inFlight = isPlainObject(page?.inFlight) ? page.inFlight : null;
-      seen.inFlight = inFlight;
-      const after = await rowsAfterMessage(ctx, session, page, limit, firstRead || idleSeen ? AFTER_SCAN_PAGES : 1);
+      seen.inFlight = isPlainObject(page?.inFlight) ? page.inFlight : null;
+      const after = await rowsAfterMessage(ctx, session, page, limit, firstRead || seen.idle ? AFTER_SCAN_PAGES : 1);
       firstRead = false;
-      const conversationId = toText(page?.id) || session;
-      const settled = settleRemoteReply(after.rows, messageId);
-      if (settled && !settled.foldedWithoutReply) {
-        if (settled.status !== 'done' || !settled.reply?.messageId) return { ...base, ...settled };
-        const follow = remoteFollowUpState(after.rows, settled.reply.messageId, page, { sawBackgroundWork: seen.background === true, sentMessageId: messageId });
-        if (follow.backgroundSeen) seen.background = true;
-        const latestReply = follow.latest ? replyOf(follow.latest, { followUp: true }) : settled.reply;
-        if (!follow.working) {
-          if (!follow.backgroundSeen) return { ...base, ...settled };
-          // After background work, a quiet moment is not the end yet: the
-          // worker publishes a new task set up to 2 s late, and a finished
-          // task opens its follow-up turn a moment after. Done only once the
-          // session stays quiet for the whole settle window.
-          if (!seen.quietSince) seen.quietSince = now();
-          if (now() - seen.quietSince >= FOLLOW_UP_SETTLE_MS) {
-            return {
-              ...base,
-              status: 'done',
-              reply: latestReply,
-              ...(follow.latest ? { firstReply: settled.reply } : {}),
-              note: follow.latest
-                ? `The remote agent finished work it had continued in the background; this is its last follow-up reply (${follow.followUpCount} in all, read_session shows every one).`
-                : 'The remote agent\'s background work ended without a follow-up reply; the reply above is its only one.',
-            };
-          }
-        } else {
-          seen.quietSince = null;
-        }
-        if (inFlight) {
-          const pendingQuestions = await loadPendingQuestions(ctx, toText(page?.id) || session);
-          if (pendingQuestions.length) {
-            return {
-              ...base,
-              status: 'waiting_for_answer',
-              reply: latestReply,
-              pendingQuestions,
-              progress: progressSnapshot(inFlight),
-              note: 'The remote agent answered, kept working in the background and now waits for an answer. Ask the user (unless they told you to decide), then call answer_question and wait again.',
-            };
-          }
-        }
-        const remainingForFollowUp = deadline - now();
-        if (remainingForFollowUp <= 0 || ctx.signal?.aborted) {
+      const outcome = await settleRead(ctx, { session, messageId, page, after, seen, deadline });
+      if (outcome === READ_AGAIN) continue;
+      if (outcome) return outcome;
+      await sleep(Math.min(pollIntervalMs, deadline - now()));
+    }
+  }
+
+  /**
+   * One read's outcome for `messageId` (`after`: the rows after it), or null
+   * to read again after a pause, READ_AGAIN to confirm an idle session at
+   * once. `seen` carries what earlier reads saw; past `deadline` an outcome
+   * that is not final yet comes back as it stands. `questions: false` skips
+   * the read of pending questions (running stays running).
+   */
+  async function settleRead(ctx, { session, messageId, page, after, seen, deadline, questions = true }) {
+    const base = { session, message_id: messageId };
+    const inFlight = isPlainObject(page?.inFlight) ? page.inFlight : null;
+    const conversationId = toText(page?.id) || session;
+    const settled = settleRemoteReply(after.rows, messageId);
+    if (settled && !settled.foldedWithoutReply) {
+      if (settled.status !== 'done' || !settled.reply?.messageId) return { ...base, ...settled };
+      const follow = remoteFollowUpState(after.rows, settled.reply.messageId, page, { sawBackgroundWork: seen.background === true, sentMessageId: messageId });
+      if (follow.backgroundSeen) seen.background = true;
+      const latestReply = follow.latest ? replyOf(follow.latest, { followUp: true }) : settled.reply;
+      if (!follow.working) {
+        if (!follow.backgroundSeen) return { ...base, ...settled };
+        // After background work, a quiet moment is not the end yet: the
+        // worker publishes a new task set up to 2 s late, and a finished
+        // task opens its follow-up turn a moment after. Done only once the
+        // session stays quiet for the whole settle window.
+        if (!seen.quietSince) seen.quietSince = now();
+        if (now() - seen.quietSince >= FOLLOW_UP_SETTLE_MS) {
           return {
             ...base,
-            status: 'running',
+            status: 'done',
             reply: latestReply,
             ...(follow.latest ? { firstReply: settled.reply } : {}),
-            background: { tasks: follow.taskCount, running: follow.tasks },
-            progress: progressSnapshot(inFlight) || { status: 'background', text: '', activities: [] },
-            note: 'The remote agent answered but keeps working in the background; the reply above is its latest so far. Call wait with this session and message_id for the follow-up.',
+            note: follow.latest
+              ? `The remote agent finished work it had continued in the background; this is its last follow-up reply (${follow.followUpCount} in all, read_session shows every one).`
+              : 'The remote agent\'s background work ended without a follow-up reply; the reply above is its only one.',
           };
         }
-        await sleep(Math.min(pollIntervalMs, remainingForFollowUp));
-        continue;
+      } else {
+        seen.quietSince = null;
       }
-
-      if (inFlight) {
-        idleSeen = false;
+      if (inFlight && questions) {
         const pendingQuestions = await loadPendingQuestions(ctx, conversationId);
         if (pendingQuestions.length) {
           return {
             ...base,
             status: 'waiting_for_answer',
+            reply: latestReply,
             pendingQuestions,
-            progress: progressSnapshot(inFlight, messageId),
-            note: 'The remote agent is waiting for an answer. Ask the user (unless they told you to decide), then call answer_question and wait again.',
+            progress: progressSnapshot(inFlight),
+            note: 'The remote agent answered, kept working in the background and now waits for an answer. Ask the user (unless they told you to decide), then call answer_question and wait again.',
           };
         }
-      } else if (await remoteConversationIdle(ctx, page)) {
-        if (settled?.foldedWithoutReply) {
-          return {
-            ...base,
-            status: 'done',
-            note: 'The message was steered into a turn that has finished, but its reply was not found after the message; use read_session to see it.',
-          };
-        }
-        // A reply and the end of its turn are committed together, but the two
-        // reads above are not one snapshot: look once more before calling the
-        // message cancelled.
-        if (idleSeen && after.truncated) {
-          return {
-            ...base,
-            status: 'done',
-            note: `Nothing is queued or running in the remote session, but no reply to this message was found in the ${after.rows.length} messages after it; use read_session to look further back.`,
-          };
-        }
-        if (idleSeen) {
-          return {
-            ...base,
-            status: 'cancelled',
-            note: 'Nothing is queued or running in the remote session and the message got no reply (it was cancelled or removed there).',
-          };
-        }
-        idleSeen = true;
-        continue;
-      } else {
-        idleSeen = false;
       }
-
-      const remaining = deadline - now();
-      if (remaining <= 0 || ctx.signal?.aborted) {
+      const remainingForFollowUp = deadline - now();
+      if (remainingForFollowUp <= 0 || ctx.signal?.aborted) {
         return {
           ...base,
-          status: inFlight ? 'running' : 'queued',
-          progress: progressSnapshot(inFlight, messageId) || { status: 'queued', text: '', activities: [] },
-          note: 'Not finished yet. Call wait with this session and message_id to keep waiting.',
+          status: 'running',
+          reply: latestReply,
+          ...(follow.latest ? { firstReply: settled.reply } : {}),
+          background: { tasks: follow.taskCount, running: follow.tasks },
+          progress: progressSnapshot(inFlight) || { status: 'background', text: '', activities: [] },
+          note: 'The remote agent answered but keeps working in the background; the reply above is its latest so far. Call wait with this session and message_id for the follow-up.',
         };
       }
-      await sleep(Math.min(pollIntervalMs, remaining));
+      return null;
     }
+
+    if (inFlight) {
+      seen.idle = false;
+      const pendingQuestions = questions ? await loadPendingQuestions(ctx, conversationId) : [];
+      if (pendingQuestions.length) {
+        return {
+          ...base,
+          status: 'waiting_for_answer',
+          pendingQuestions,
+          progress: progressSnapshot(inFlight, messageId),
+          note: 'The remote agent is waiting for an answer. Ask the user (unless they told you to decide), then call answer_question and wait again.',
+        };
+      }
+    } else if (await remoteConversationIdle(ctx, page)) {
+      if (settled?.foldedWithoutReply) {
+        return {
+          ...base,
+          status: 'done',
+          note: 'The message was steered into a turn that has finished, but its reply was not found after the message; use read_session to see it.',
+        };
+      }
+      // A reply and the end of its turn are committed together, but the two
+      // reads above are not one snapshot: look once more before calling the
+      // message cancelled.
+      if (seen.idle && after.truncated) {
+        return {
+          ...base,
+          status: 'done',
+          note: `Nothing is queued or running in the remote session, but no reply to this message was found in the ${after.rows.length} messages after it; use read_session to look further back.`,
+        };
+      }
+      if (seen.idle) {
+        return {
+          ...base,
+          status: 'cancelled',
+          note: 'Nothing is queued or running in the remote session and the message got no reply (it was cancelled or removed there).',
+        };
+      }
+      seen.idle = true;
+      return READ_AGAIN;
+    }
+    seen.idle = false;
+
+    const remaining = deadline - now();
+    if (remaining <= 0 || ctx.signal?.aborted) {
+      return {
+        ...base,
+        status: inFlight ? 'running' : 'queued',
+        progress: progressSnapshot(inFlight, messageId) || { status: 'queued', text: '', activities: [] },
+        note: 'Not finished yet. Call wait with this session and message_id to keep waiting.',
+      };
+    }
+    return null;
+  }
+
+  /**
+   * The late-reply sweeper's read (relay-late-reply-service.mjs): what a wait
+   * would return now for each of a conversation's open prompts to one
+   * session (`rows`, oldest first, `[{ messageId, seen }]`; `seen` goes from
+   * pass to pass), from one read after the oldest. Through no gate: each
+   * prompt passed them when it was sent. `{ outcomes, archived, title,
+   * relayName }` (a prompt past what was read has no outcome yet), `{ gone:
+   * 'relay' | 'session' }`, or a throw when the relay cannot be read.
+   */
+  async function readOwnReplies({ watcherConversationId, relayId, sessionId, rows = [] } = {}) {
+    const local = toText(relayId) === RELAY_EVENT_SELF_RELAY_ID;
+    if (local && !agentSessions().enabled) throw new Error('agent sessions are off on this relay');
+    const relay = local ? await localTarget() : registry.get?.(toText(relayId));
+    if (!relay || relay.inboundOnly) return { gone: 'relay' };
+    const ctx = { relay, caller: {}, hops: 0, conversationId: watcherConversationId, ...(local ? { callerAuth: { conversationId: watcherConversationId } } : {}) };
+    const oldest = toText(rows[0]?.messageId);
+    let page;
+    try {
+      page = await call(ctx, 'GET', sessionPath(sessionId), { query: { afterMessageId: oldest, limit: HISTORY_PAGE_MAX } });
+    } catch (error) {
+      if (toText(error?.code) === REMOTE_RELAY_ERROR_CODES.notFound) return { gone: 'session' };
+      throw error;
+    }
+    const after = await rowsAfterMessage(ctx, sessionId, page, HISTORY_PAGE_MAX, AFTER_SCAN_PAGES);
+    const outcomes = {};
+    for (const [index, { messageId, seen }] of rows.entries()) {
+      const from = index === 0 ? 0 : after.rows.findIndex((row) => toText(row?.id) === messageId) + 1;
+      if (index > 0 && from === 0) continue;
+      const own = { ...after, rows: after.rows.slice(from) };
+      const outcome = await settleRead(ctx, { session: toText(page?.id) || sessionId, messageId, page, after: own, seen, deadline: 0, questions: false });
+      outcomes[messageId] = outcome === READ_AGAIN ? { session: sessionId, message_id: messageId, status: 'queued' } : outcome;
+    }
+    return { outcomes, archived: page?.archived === true, title: toText(page?.title) || null, relayName: toText(relay.name) || null };
   }
 
   // ─── Remote catalogue (relay_info, create_session) ─────────────────────────
@@ -2436,21 +2546,29 @@ export function createRemoteRelayDispatcher({
     } catch {}
   }
 
-  /** waitForReply, with that turn's turn_end held while it runs and dropped once the reply came. */
+  /**
+   * waitForReply, with that turn's turn_end held while it runs. A final
+   * outcome the agent gets (its tool call was not abandoned) is returned:
+   * no late reply follows, and with the reply no turn_end either.
+   */
   async function waitForOwnReply(ctx, { session, messageId, waitSeconds }) {
     let token = null;
     try {
       token = relayEvents?.beginOwnWait?.({ watcherConversationId: ctx.conversationId, messageId, waitMs: waitSeconds * 1000 }) || null;
     } catch {}
     let outcome = null;
+    let ended = null;
     try {
       outcome = await waitForReply(ctx, { session, messageId, waitSeconds });
-      return outcome;
     } finally {
+      const returned = !ctx.signal?.aborted && FINAL_WAIT_STATUSES.has(outcome?.status);
       try {
-        relayEvents?.endOwnWait?.(token, { received: outcome?.status === 'done' && !!outcome?.reply });
+        ended = relayEvents?.endOwnWait?.(token, { received: returned && outcome.status === 'done' && !!outcome.reply, returned });
       } catch {}
     }
+    const late = toText(ended?.lateReplyAt).slice(11, 16);
+    if (!late) return outcome;
+    return { ...outcome, note: [outcome.note, `Also delivered to your conversation as a late reply at ${late}Z.`].map(toText).filter(Boolean).join(' ') };
   }
 
   async function send(ctx, args) {
@@ -4077,23 +4195,52 @@ export function createRemoteRelayDispatcher({
     return null;
   }
 
+  /** A conversation of this relay, followed along its compactions (at most 20). */
+  function latestLocal(id) {
+    let current = toText(id);
+    try {
+      current = toText(resolveConversationId(current)) || current;
+      for (let step = 0; step < 20; step += 1) {
+        const next = toText(repository?.compactedSuccessor?.(current));
+        if (!next || next === current) break;
+        current = next;
+      }
+    } catch {}
+    return current;
+  }
+
+  /** Does `origin` name `session` on `relay` (bound to that relay, for a paired one)? */
+  function originNames(origin, relay, session) {
+    if (!isPlainObject(origin) || !toText(origin.conversationId) || !toText(session)) return false;
+    if (relay.local === true) return origin.local === true && latestLocal(origin.conversationId) === latestLocal(session);
+    return origin.local !== true && !!toText(relay.relayId)
+      && originWeightedFor(origin, relay)
+      && toText(origin.relayId) === toText(relay.relayId)
+      && toText(origin.conversationId) === toText(session);
+  }
+
   /**
    * Is `session` on `relay` the session whose agent created this conversation
    * (its origin, which an agent of this relay never sets for a paired one)?
+   * A starter on this relay is followed along its compactions.
    */
-  function sendsToCreator(conversationId, relay, session) {
-    if (relay.local === true || !toText(relay.relayId) || !toText(session)) return false;
-    let origin = null;
+  function sendsToStarter(conversationId, relay, session) {
     try {
-      origin = repository.getConversationOrigin?.(conversationId) || null;
+      return originNames(repository.getConversationOrigin?.(conversationId) || null, relay, session);
     } catch {
       return false;
     }
-    return !!origin && origin.local !== true
-      && originWeightedFor(origin, relay)
-      && toText(origin.relayId) === toText(relay.relayId)
-      && !!toText(origin.conversationId)
-      && toText(origin.conversationId) === toText(session);
+  }
+
+  /**
+   * Does the current turn act on the starter's work alone: the user's own
+   * words and the starter's prompts, at least one of these? A relay event, a
+   * scheduled prompt, a continuation or an off-turn call does not.
+   */
+  function turnActsOnStarter(caller, relay, starter) {
+    const rows = Array.isArray(caller.turnRows) ? caller.turnRows : [];
+    if (rows.some((row) => toText(row?.kind) || (row?.origin && !originNames(row.origin, relay, starter)))) return false;
+    return rows.some((row) => !!row?.origin);
   }
 
   async function runRelayAction({ conversationId, action, args, req, signal, waitNote }) {
@@ -4151,6 +4298,10 @@ export function createRemoteRelayDispatcher({
 
     const caller = { conversationId, ...((await getCallerContext(conversationId, req)) || {}) };
     caller.mode = toText(caller.mode).toLowerCase();
+    const toStarter = action === 'send' && sendsToStarter(conversationId, relay, args.session);
+    // A report to the starter while the turn acts on its work: the loop guard
+    // neither counts nor asks. The starter's own sends to it do count.
+    const reportsToStarter = toStarter && turnActsOnStarter(caller, relay, args.session);
     // A call on this relay itself crosses no relay: it carries the hops of the
     // prompt it acts on unchanged.
     const hops = nonNegativeInt(caller.hops) + (local ? 0 : 1);
@@ -4169,7 +4320,7 @@ export function createRemoteRelayDispatcher({
     // that created it, whatever else its turn acts on (a prompt of a session
     // on this relay, say): its reports go back the way its work came.
     if (write && access !== 'user' && !answering && hops > REMOTE_RELAY_LIMITS.hopLimit
-      && !(action === 'send' && sendsToCreator(conversationId, relay, args.session))) {
+      && !toStarter) {
       return finish(failure(403, REMOTE_RELAY_ERROR_CODES.hopLimit,
         `This turn acts on a prompt from another relay's agent (hop ${hops - 1}); passing it on to relay "${relay.name}" would pass the limit of ${REMOTE_RELAY_LIMITS.hopLimit} hops. The user can allow it by mentioning @${relay.name} in this conversation.`,
         { relay: relay.name }));
@@ -4289,7 +4440,7 @@ export function createRemoteRelayDispatcher({
     try {
       // A schedule for another session prompts it later: the loop guard counts
       // it now, like a send (and each of its firings once more, admitScheduledFiring).
-      const prompting = isRemoteRelayPromptAction(action) || (action === 'schedule' && !ownSchedule);
+      const prompting = !reportsToStarter && (isRemoteRelayPromptAction(action) || (action === 'schedule' && !ownSchedule));
       let asked = false;
       if (localCreate) {
         const decision = await ensureLocalSessionApproval({ conversationId, caller, relay, action, args, signal, group });
@@ -4313,7 +4464,7 @@ export function createRemoteRelayDispatcher({
         }
         if (decision.asked) asked = true;
       }
-      if (!asked && prompting && agentPrompts(conversationId).count >= REMOTE_RELAY_LIMITS.agentPromptsBeforeAsking) {
+      if (!asked && prompting && pastPromptLimit(conversationId)) {
         // Agents that prompt each other can go on without the user for good:
         // from time to time the user is asked, in any relay mode.
         const decision = await requestApproval({
@@ -4333,6 +4484,15 @@ export function createRemoteRelayDispatcher({
           const error = toText(decision?.error)
             || `The agent has sent ${agentPrompts(conversationId).count} prompts to ${local ? 'other agents' : 'other relays\' agents'} since the user last wrote, and the user did not allow more for now.`;
           return finish(failure(403, code, error, { relay: relay.name }));
+        }
+        // "Allow for this session": the guard is off for this conversation
+        // until the user revokes it in the settings.
+        if (decision?.scope === 'session') {
+          try {
+            loopGuard?.setLoopGuardOff?.(conversationId, { title: caller.title });
+          } catch (error) {
+            logger?.warn?.(`[remote-relays] loop guard off for conv=${conversationId.slice(0, 8)} not stored: ${toText(error?.message || error).slice(0, 200)}`);
+          }
         }
         agentPrompts(conversationId).count = 0;
         asked = true;
@@ -4484,5 +4644,8 @@ export function createRemoteRelayDispatcher({
     }
   }
 
-  return { dispatch, inflight, admitScheduledFiring };
+  // The event service's late-reply sweeper reads with the reads a wait uses.
+  relayEvents?.setLateReplyReader?.(readOwnReplies);
+
+  return { dispatch, inflight, admitScheduledFiring, loopGuardCardAnswered };
 }

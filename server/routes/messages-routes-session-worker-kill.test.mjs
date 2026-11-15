@@ -89,7 +89,6 @@ function makeDeps({
     normalizeRelayMode: (value) => String(value || '').trim().toLowerCase() || null,
     DEFAULT_RELAY_MODE: 'agent',
     MAX_UPLOAD_BYTES: 1024 * 1024,
-    featureFlags: { SESSION_WORKER_ROUTING_ENABLED: true },
     sessionWorkerRegistry: {
       getWorker: () => ({ sdkSessionId: SESSION_ID, conversationId: 'conv-1', pid: null, status: 'ready' }),
       removeWorker: () => { calls.push('removeWorker'); },

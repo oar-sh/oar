@@ -18,6 +18,14 @@
 /** Refusal used by every spawn path when the relay runs with CLI spawns off. */
 export const CLI_SPAWN_DISABLED_ERROR = 'cli spawns disabled';
 
+/**
+ * `--version` probe budget for the Copilot CLI, in the relay's CLI status and
+ * in `oar doctor`. Its first run after an install or an update unpacks the
+ * CLI's package before it answers (0.9 s to 12 s measured), so the 5 s every
+ * other CLI gets would report a fresh install as "not found".
+ */
+export const CLI_LONG_PROBE_TIMEOUT_MS = 30_000;
+
 /** Retained-output ceiling shared by every capture path (auth, install). */
 export const MAX_CAPTURED_OUTPUT_CHARS = 16_000;
 const MAX_ERROR_TAIL_CHARS = 600;
@@ -143,7 +151,9 @@ export function killTree(child, signal, {
  * built — PTY or not, which stdio, which environment — and so a refused spawn
  * (the CLI kill switch) surfaces as a result rather than a throw. `onChild`
  * hands the live handle back for cancellation, and `onOutput` sees each raw
- * chunk for callers that stream a log while it runs.
+ * chunk for callers that stream a log while it runs. `output` interleaves
+ * both streams; `stdout` is the standard output alone, for a caller that
+ * parses an answer a warning on stderr must not reach.
  */
 export function runToCompletion(spawnChild, {
   timeoutMs,
@@ -159,16 +169,21 @@ export function runToCompletion(spawnChild, {
     try {
       child = spawnChild();
     } catch (error) {
-      resolve({ ok: false, code: null, output: '', error: error?.message || String(error) });
+      resolve({ ok: false, code: null, output: '', stdout: '', error: error?.message || String(error) });
       return;
     }
     try { onChild?.(child); } catch {}
     let output = '';
+    let stdout = '';
     let settled = false;
     const append = (chunk) => {
       const text = chunk.toString();
       output = `${output}${text}`.slice(-maxOutputChars);
       try { onOutput?.(text); } catch {}
+      return text;
+    };
+    const appendStdout = (chunk) => {
+      stdout = `${stdout}${append(chunk)}`.slice(-maxOutputChars);
     };
     const finish = (result) => {
       if (settled) return;
@@ -178,17 +193,17 @@ export function runToCompletion(spawnChild, {
     };
     const timer = setTimeoutImpl(() => {
       killChild(child, 'SIGTERM');
-      finish({ ok: false, code: null, output, error: `timed out after ${timeoutMs}ms` });
+      finish({ ok: false, code: null, output, stdout, error: `timed out after ${timeoutMs}ms` });
     }, timeoutMs);
     timer?.unref?.();
-    child.stdout?.on?.('data', append);
+    child.stdout?.on?.('data', appendStdout);
     child.stderr?.on?.('data', append);
     child.stdin?.end?.();
     child.on('error', (error) => finish({
-      ok: false, code: null, output, error: error?.message || String(error),
+      ok: false, code: null, output, stdout, error: error?.message || String(error),
     }));
     child.on('close', (code) => finish({
-      ok: code === 0, code, output, error: null,
+      ok: code === 0, code, output, stdout, error: null,
     }));
   });
 }

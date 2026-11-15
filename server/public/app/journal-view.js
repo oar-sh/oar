@@ -2725,9 +2725,6 @@ async function createNewConversation(selectedModel, selectedReasoningEffort = ''
       selectedProvider,
       selectedSize,
     });
-    if (result?.warning) {
-      showTransientRelayNotice(String(result.warning), 6000);
-    }
     if (result?.workspaceRootWarning) {
       showTransientRelayNotice(String(result.workspaceRootWarning), 7000);
     }

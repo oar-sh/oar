@@ -11,11 +11,6 @@ import { registerMediaRoutes } from './media-routes.mjs';
 import { validateEntryName } from '../services/explorer-entry-name.mjs';
 import { countEntries, createDirectory, removeEntry, renameEntry } from '../services/explorer-mutations.mjs';
 import {
-  shouldParkForRestart,
-  parkPendingQueueForRestart,
-  releaseParkedQueueForReadyState,
-} from '../services/relay-queue-gate-service.mjs';
-import {
   persistConversationModelPreference as persistConversationModelPreferenceTx,
   readPlanOnly,
 } from '../services/conversation-preferences-service.mjs';
@@ -134,7 +129,6 @@ import { normalizeClaudeBilling } from '../services/claude-billing-switch-servic
 import { normalizeTurnTokenUsageReport } from '../../shared/turn-token-usage.mjs';
 import { createClaudeApiStopNoteLedger } from '../services/plan-usage-claude-api.mjs';
 import { normalizeClaudeApiUsageReport } from '../services/claude-api-usage-service.mjs';
-import { planBoundaryHoldSql } from '../repositories/message-repository.mjs';
 import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { notPerson, principalLabel, principalOf } from '../services/relay-principal.mjs';
 import { AUTH_ERROR_CODES, AUTH_FILE_CAPABILITY_MESSAGE, AUTH_RELAY_TOOL_REQUIRED_MESSAGE, FILE_PROTECTED_MESSAGE } from '../../shared/relay-route-policy.mjs';
@@ -159,10 +153,6 @@ const DUPLICATE_USER_MESSAGE_WINDOW_MS = 10 * 60 * 1000;
 const OPAQUE_RESPONSE_TEXT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OPAQUE_RESPONSE_RECOVERY_WAIT_MS = 600_000;
 const OPAQUE_RESPONSE_RECOVERY_POLL_MS = 250;
-const STRANDED_SESSION_PRIME_COOLDOWN_MS = 10_000;
-// An idle worker beats every 30 s (shared/worker-runtime/worker-keepalive.mjs):
-// its last beat may be that old and still prove it alive.
-export const STRANDED_SESSION_HEARTBEAT_FRESH_MS = 45_000;
 // Hold finalization after a relay question is answered so the SDK has time to fire the next
 // onUserInputRequest (multi-step ask_user). Without this, the transcript is used prematurely and
 // the queue row is marked done while additional questions are still pending.
@@ -384,10 +374,6 @@ function isTransientQueueError(error) {
   return message.includes('database is locked') || message.includes('database busy');
 }
 
-function isSessionWorkerRoutingEnabled(featureFlags = null) {
-  return featureFlags?.SESSION_WORKER_ROUTING_ENABLED === true;
-}
-
 function normalizeTelemetryText(value, fallback = 'none') {
   const text = String(value || '').trim();
   return text || fallback;
@@ -457,117 +443,6 @@ function normalizeTerminalErrorCode(value) {
 function normalizeTerminalErrorText(value) {
   const text = String(value || '').trim();
   return text || null;
-}
-
-function looksTerminalSessionLoadError(value) {
-  const text = String(value || '').toLowerCase();
-  if (!text) return false;
-  return text.includes('could not be loaded')
-    || text.includes('corrupted or incompatible')
-    || text.includes('session file is corrupted')
-    || text.includes('session not found');
-}
-
-export function resolveBlockedWorkerTerminalFailure({
-  blockedReason = null,
-  requesterSessionId = null,
-  lifecycle = null,
-  worker = null,
-} = {}) {
-  const reason = String(blockedReason || '').trim().toLowerCase();
-  if (!reason) return null;
-  const sessionId = normalizeSessionWorkerId(requesterSessionId || worker?.sdkSessionId);
-  const lastError = normalizeTerminalErrorText(
-    lifecycle?.lastError
-    || worker?.lastError
-    || lifecycle?.degradedReason
-    || null,
-  );
-  const base = {
-    kind: 'terminal-worker-bootstrap',
-    failedAt: new Date().toISOString(),
-    blockedReason: reason,
-    requesterSessionId: sessionId,
-    retryCount: Math.max(0, Number(lifecycle?.retryCount || worker?.retryCount || 0)),
-    detail: lastError || null,
-  };
-  if (reason === 'missing-session-id') {
-    return {
-      ...base,
-      code: 'worker-missing-session-id',
-      stableCode: 'relay.worker-missing-session-id',
-      message: 'The relay could not route this turn because the target session id is missing.',
-      guidance: 'Retry from a valid conversation. If this repeats, refresh the relay UI and try again.',
-    };
-  }
-  if (reason === 'restart-exhausted') {
-    return {
-      ...base,
-      code: 'worker-restart-exhausted',
-      stableCode: 'relay.worker-restart-exhausted',
-      message: 'The relay exhausted worker restart attempts for this session.',
-      guidance: 'Avoid this session for now and create a fresh one. Delete the broken session if you no longer need it.',
-    };
-  }
-  if (reason === 'spawn-failed' && looksTerminalSessionLoadError(lastError)) {
-    return {
-      ...base,
-      code: 'worker-session-load-failed',
-      stableCode: 'relay.worker-session-load-failed',
-      message: 'The session could not be loaded by the worker runtime.',
-      guidance: 'This session is likely corrupted or incompatible. Use a fresh session and delete this one if not needed.',
-    };
-  }
-  return null;
-}
-
-export function resolvePrimedWorkerTerminalFailure({
-  sessionId = null,
-  primeResult = null,
-} = {}) {
-  const normalizedSessionId = normalizeSessionWorkerId(sessionId || primeResult?.worker?.sdkSessionId);
-  if (!primeResult || typeof primeResult !== 'object') return null;
-
-  if (primeResult.ok === false) {
-    return resolveBlockedWorkerTerminalFailure({
-      blockedReason: primeResult.error,
-      requesterSessionId: normalizedSessionId,
-      lifecycle: primeResult.lifecycle || null,
-      worker: primeResult.worker || null,
-    });
-  }
-
-  const lifecycle = primeResult.lifecycle && typeof primeResult.lifecycle === 'object'
-    ? primeResult.lifecycle
-    : null;
-  const degradedReason = String(lifecycle?.degradedReason || '').trim().toLowerCase();
-  if (String(lifecycle?.uiState || '').trim().toLowerCase() !== 'yellow') return null;
-
-  if (degradedReason === 'stale-pid') {
-    return {
-      kind: 'terminal-worker-bootstrap',
-      code: 'worker-stale-pid',
-      stableCode: 'relay.worker-stale-pid',
-      message: 'The worker process for this session is no longer alive.',
-      guidance: 'Retry once. If this repeats, avoid this session and use a fresh one.',
-      detail: normalizeTerminalErrorText(lifecycle?.lastError || degradedReason),
-      failedAt: new Date().toISOString(),
-      blockedReason: degradedReason,
-      requesterSessionId: normalizedSessionId,
-      retryCount: Math.max(0, Number(lifecycle?.retryCount || 0)),
-    };
-  }
-
-  if (degradedReason === 'restart-exhausted' || degradedReason === 'spawn-failed') {
-    return resolveBlockedWorkerTerminalFailure({
-      blockedReason: degradedReason,
-      requesterSessionId: normalizedSessionId,
-      lifecycle,
-      worker: primeResult.worker || null,
-    });
-  }
-
-  return null;
 }
 
 function extractTerminalId(text, patterns = []) {
@@ -787,50 +662,13 @@ export function resolveTerminalFailurePayload(payload = {}, { fallbackText = nul
   };
 }
 
-export function extractRestartTerminalOutcome(orchestratorState = null) {
-  const state = orchestratorState && typeof orchestratorState === 'object' ? orchestratorState : null;
-  if (!state) return null;
-  const code = String(state.terminalOutcomeCode || state.terminalOutcome || '').trim();
-  if (!code) return null;
-  return {
-    phase: String(state.terminalOutcomePhase || '').trim() || null,
-    code,
-    message: String(state.terminalOutcomeMessage || '').trim() || null,
-    attempts: Math.max(0, Number(state.terminalOutcomeAttempts || 0)),
-    at: String(state.terminalOutcomeAt || '').trim() || null,
-  };
-}
-
-export function buildFallbackRestartCompatibilityPayload({
-  failureClass = null,
-  requesterSessionId = null,
-  relayRestartOrchestrator = null,
-  inFlightProcessingCount = 0,
-} = {}) {
-  const currentState = relayRestartOrchestrator?.getState?.() || null;
-  return {
-    enabled: false,
-    considered: false,
-    requested: false,
-    skipped: 'removed-single-runtime-fallback',
-    failureClass: String(failureClass || '').trim().toLowerCase() || null,
-    targetSessionId: normalizeSessionWorkerId(requesterSessionId),
-    inFlightProcessingCount: Math.max(0, Number(inFlightProcessingCount || 0)),
-    terminalOutcome: extractRestartTerminalOutcome(currentState),
-    orchestratorState: currentState,
-    restartRequest: null,
-  };
-}
-
 export function resolveInitialQueueOwnerSessionId({
-  routingEnabled = false,
   requesterSessionId = null,
   runtimeSession = null,
   conversationSdkSessionId = null,
   conversationId = null,
   isNewConversation = false,
 } = {}) {
-  if (!routingEnabled) return null;
   const runtimeSdkSessionId = normalizeSessionWorkerId(runtimeSession?.sdk_session_id);
   const boundConversationSessionId = normalizeSessionWorkerId(conversationSdkSessionId);
   const normalizedConversationId = normalizeSessionWorkerId(conversationId);
@@ -876,60 +714,19 @@ export function validateSubagentRunBinding({
   return { ok: true, conversationId: queueConversationId };
 }
 
-export function shouldAutoPrimeStrandedSession({
-  strandedRow = null,
-  requesterSessionId = null,
-} = {}) {
-  const ownerSessionId = normalizeSessionWorkerId(strandedRow?.owner_sdk_session_id);
-  const requesterSid = normalizeSessionWorkerId(requesterSessionId);
-  if (!ownerSessionId || !requesterSid) return false;
-  if (ownerSessionId === requesterSid) return false;
-  const rawRetryCount = Number(strandedRow?.retry_count);
-  if (!Number.isFinite(rawRetryCount)) return false;
-  const retryCount = Math.max(0, Math.trunc(rawRetryCount));
-  if (retryCount > 0) return false;
-  return true;
-}
-
-export function shouldTakeOverStrandedPendingMessage({
-  strandedRow = null,
-  requesterSessionId = null,
-  primeResult = null,
-  strandedLifecycle = null,
-  nowMs = Date.now(),
-  heartbeatFreshWindowMs = STRANDED_SESSION_HEARTBEAT_FRESH_MS,
-} = {}) {
-  if (!shouldAutoPrimeStrandedSession({ strandedRow, requesterSessionId })) return false;
-  const lifecycle = (primeResult && typeof primeResult.lifecycle === 'object')
-    ? primeResult.lifecycle
-    : (strandedLifecycle && typeof strandedLifecycle === 'object' ? strandedLifecycle : null);
-  if (!lifecycle) return false;
-  const awaitingHeartbeat = lifecycle.awaitingHeartbeat === true;
-  const degradedReason = String(lifecycle.degradedReason || '').trim().toLowerCase();
-  const heartbeatAtMs = Date.parse(String(lifecycle.lastHeartbeatAt || '').trim());
-  const heartbeatWindowMs = Math.max(1_000, Number(heartbeatFreshWindowMs) || STRANDED_SESSION_HEARTBEAT_FRESH_MS);
-  const heartbeatFresh = Number.isFinite(heartbeatAtMs) && (nowMs - heartbeatAtMs) < heartbeatWindowMs;
-  if (heartbeatFresh) return false;
-  if (awaitingHeartbeat) return true;
-  return degradedReason === 'startup-heartbeat-timeout' || degradedReason === 'stale-pid';
-}
-
 // Which provider actually executed a turn, derived from the authenticated
 // responder identity: a session worker names its sdk session via the bridge
 // header, and that session's runtime row names the provider. The response
 // payload has no say — a misrouted responder must not be able to mask itself.
 //
-// Identity-less responders are the interesting case. Two of them exist:
-//   - server/relay.mjs, launched by hand with plain env (nothing sets
-//     COPILOT_PROVIDER_TYPE for it), so it authenticates on the Copilot
-//     plan no matter what the conversation is bound to. A turn it answers for
-//     a non-github conversation really did run on the wrong plan.
-//   - this server finalizing an image operation it executed itself: it calls
-//     the provider's own API with the conversation's BYOK key and then
-//     self-posts to /api/response with no bridge headers. That one genuinely
-//     ran on the bound provider.
-// OpenAI BYOK chat turns are not identity-less: they run on a Copilot CLI
-// launched with COPILOT_PROVIDER_TYPE=openai whose web-relay extension does
+// Identity-less responders are the interesting case. One of them is
+// expected: this server finalizing an image operation it executed itself. It
+// calls the provider's own API with the conversation's BYOK key and then
+// self-posts to /api/response with no bridge headers, and that turn genuinely
+// ran on the bound provider. Any other responder without an identity is
+// taken for the Copilot plan.
+// OpenAI BYOK chat turns are not identity-less: they run on a Copilot SDK worker
+// launched with COPILOT_PROVIDER_TYPE=openai, which does
 // send X-Relay-Session-Id, so they resolve through the runtime row above.
 export function resolveExecutedProviderForResponse({
   stmts,
@@ -1001,10 +798,8 @@ export function dequeuePendingMessage({
   db,
   stmts,
   nowIso,
-  routingEnabled = false,
   requesterSessionId = null,
   ownerLeaseMs = SESSION_WORKER_OWNER_LEASE_MS,
-  affinityOnly = false,
   // The kind the requesting worker says it is ("claude", "claude-api", ...),
   // null when unknown. A Claude chat's row is claimed only by a worker of
   // the row's billing (claudeBillingFence); a refused claim calls
@@ -1018,61 +813,34 @@ export function dequeuePendingMessage({
 } = {}) {
   const currentIso = String(nowIso || '').trim() || new Date().toISOString();
   const requesterSid = normalizeSessionWorkerId(requesterSessionId);
-  const leaseExpiresAt = requesterSid ? addMsToIso(currentIso, ownerLeaseMs) : null;
+  // Only a worker that names its session claims, and only that session's
+  // rows: there is no claim for a requester without one.
+  if (!requesterSid) return null;
+  const leaseExpiresAt = addMsToIso(currentIso, ownerLeaseMs);
   let fenced = null;
   const dequeue = db.transaction(() => {
-    let next = null;
-    if (routingEnabled && requesterSid && stmts.findPendingForWorker) {
-      next = stmts.findPendingForWorker.get(currentIso, requesterSid, requesterSid);
-      // In routed worker mode, never fall back to the global queue. If this
-      // worker has no matching owned/unowned work, another worker session must
-      // pick up the turn instead of letting the wrong session steal it.
-      if (!next) return null;
-    } else if (!routingEnabled && requesterSid && stmts.findPendingForSessionAffinity) {
-      next = stmts.findPendingForSessionAffinity.get(currentIso, requesterSid);
-    }
-    if (next && requesterSid) {
-      fenced = claudeBillingFence({ stmts, row: next, workerKind, claudeApiClaimCheck });
-      if (fenced) return null;
-    }
-    if (!next && affinityOnly) return null;
-    if (!next) {
-      // Requesters that reach the global fallback carry no worker identity
-      // (the legacy Copilot relay CLI, or a bridge client whose affinity scan
-      // came up empty). Conversations bound to a session-worker provider are
-      // off limits here: their turns must only ever run on their own worker.
-      next = stmts.findPendingForLegacyRelay
-        ? stmts.findPendingForLegacyRelay.get(currentIso)
-        : stmts.findPending.get(currentIso);
-    }
+    const next = stmts.findPendingForWorker.get(currentIso, requesterSid);
     if (!next) return null;
+    fenced = claudeBillingFence({ stmts, row: next, workerKind, claudeApiClaimCheck });
+    if (fenced) return null;
     // Across plan mode, a row waits for the live turn instead of steering in.
-    // The claim statements leave such rows out (planBoundaryHoldSql); this is
+    // The claim statement leaves such rows out (planBoundaryHoldSql); this is
     // the fail-closed backstop for one that does not.
     if (crossesPlanBoundaryOfLiveTurn({ stmts, row: next })) return null;
     // One processing attempt = one attempt_id. Minted here for every claim —
     // even for callers that never echo it back — so finalization, requeue, and
     // question writes can be fenced to the attempt that actually owns the row.
     const attemptId = randomUUID();
-    if (routingEnabled && requesterSid && stmts.setProcessingWithWorkerLease) {
-      stmts.setProcessingWithWorkerLease.run(currentIso, attemptId, requesterSid, currentIso, leaseExpiresAt, currentIso, next.id);
-      return {
-        ...next,
-        status: 'processing',
-        processing_at: currentIso,
-        attempt_id: attemptId,
-        owner_sdk_session_id: String(next.owner_sdk_session_id || '').trim() || requesterSid,
-        owner_assigned_at: String(next.owner_assigned_at || '').trim() || currentIso,
-        owner_lease_expires_at: leaseExpiresAt,
-        owner_last_claimed_at: currentIso,
-      };
-    }
-    stmts.setProcessing.run(currentIso, attemptId, next.id);
+    stmts.setProcessingWithWorkerLease.run(currentIso, attemptId, requesterSid, currentIso, leaseExpiresAt, currentIso, next.id);
     return {
       ...next,
       status: 'processing',
       processing_at: currentIso,
       attempt_id: attemptId,
+      owner_sdk_session_id: String(next.owner_sdk_session_id || '').trim() || requesterSid,
+      owner_assigned_at: String(next.owner_assigned_at || '').trim() || currentIso,
+      owner_lease_expires_at: leaseExpiresAt,
+      owner_last_claimed_at: currentIso,
     };
   });
   const claimed = dequeue();
@@ -1243,15 +1011,11 @@ export async function dequeuePendingMessageForWorkerLoop({
   db,
   stmts,
   nowIso,
-  routingEnabled = false,
   requesterSessionId = null,
   ownerLeaseMs = SESSION_WORKER_OWNER_LEASE_MS,
-  affinityOnly = false,
   sessionWorkerSupervisor = null,
   transientRetryLimit = SESSION_WORKER_TRANSIENT_DEQUEUE_RETRIES,
   transientRetryBackoffMs = SESSION_WORKER_TRANSIENT_DEQUEUE_BACKOFF_MS,
-  relayRestartOrchestrator = null,
-  inFlightProcessingCount = 0,
   telemetry = null,
   workerKind = null,
   onBillingFence = null,
@@ -1264,7 +1028,7 @@ export async function dequeuePendingMessageForWorkerLoop({
   isReplacementFenced = null,
 } = {}) {
   const requesterSid = normalizeSessionWorkerId(requesterSessionId);
-  const routingWithWorker = routingEnabled && requesterSid;
+  const routingWithWorker = Boolean(requesterSid);
   let billingFenced = null;
   const retryLimit = Math.max(0, Number(transientRetryLimit) || 0);
   const backoffBaseMs = Math.max(1, Number(transientRetryBackoffMs) || 1);
@@ -1274,12 +1038,6 @@ export async function dequeuePendingMessageForWorkerLoop({
     const killBlocked = supervisor?.isKillBlocked?.(requesterSid) === true;
     if (killBlocked) {
       const lifecycle = supervisor?.getLifecycleState?.(requesterSid) || null;
-      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
-        failureClass: 'session-killed',
-        requesterSessionId: requesterSid,
-        relayRestartOrchestrator,
-        inFlightProcessingCount,
-      });
       emitWorkerLoopTelemetry(telemetry, {
         event: 'worker.ensure.blocked',
         sessionId: requesterSid,
@@ -1298,18 +1056,11 @@ export async function dequeuePendingMessageForWorkerLoop({
         blockedReason: 'session-killed',
         worker: supervisor?.getWorkerState?.(requesterSid) || null,
         lifecycle,
-        fallbackRestart,
         attempts: 0,
       };
     }
     const ensureResult = await supervisor.ensureWorker(requesterSid);
     if (!ensureResult?.ok) {
-      const fallbackRestart = buildFallbackRestartCompatibilityPayload({
-        failureClass: ensureResult?.error || null,
-        requesterSessionId: requesterSid,
-        relayRestartOrchestrator,
-        inFlightProcessingCount,
-      });
       emitWorkerLoopTelemetry(telemetry, {
         event: 'worker.ensure.blocked',
         sessionId: requesterSid,
@@ -1328,7 +1079,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         blockedReason: String(ensureResult?.error || 'worker-unavailable').trim() || 'worker-unavailable',
         worker: ensureResult?.worker || null,
         lifecycle: ensureResult?.lifecycle || null,
-        fallbackRestart,
         attempts: 0,
       };
     }
@@ -1344,7 +1094,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         blockedReason: 'worker-replacement',
         worker: supervisor?.getWorkerState?.(requesterSid) || null,
         lifecycle: supervisor?.getLifecycleState?.(requesterSid) || null,
-        fallbackRestart: null,
         attempts: attempt,
       };
     }
@@ -1354,10 +1103,8 @@ export async function dequeuePendingMessageForWorkerLoop({
         db,
         stmts,
         nowIso: currentIso,
-        routingEnabled,
         requesterSessionId: requesterSid,
         ownerLeaseMs,
-        affinityOnly,
         workerKind,
         claudeApiClaimCheck,
         onBillingFence: (fence) => {
@@ -2462,7 +2209,6 @@ export function registerMessagesRoutes(app, deps) {
     sendWorkerControl,
     ensureSessionId,
     touchCli,
-    recoverProcessingOlderThan,
     addMsIso,
     computeRetryDelayMs,
     resolveRequestedModel,
@@ -2493,8 +2239,6 @@ export function registerMessagesRoutes(app, deps) {
     // query for older wiring/tests that do not supply it.
     resolveLiveTurnQueueRow = (conversationId) => stmts.getLatestProcessingQueueByConversation.get(conversationId) || null,
     emitToClientsExceptSessionId,
-    relayBridgeOwnerService,
-    relayRestartOrchestrator,
     requestRelayShutdown,
     cancelRelayShutdown = null,
     // Truly local = loopback peer, no tunnel marker, no forwarding header
@@ -2506,7 +2250,6 @@ export function registerMessagesRoutes(app, deps) {
     // How long the partial previews of an image request that ended wait for
     // the turn's end (services/openai-image-preview-turns.mjs).
     openAIImagePreviewLeftoverMs,
-    featureFlags,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
     sessionWorkerProcessInspector,
@@ -2537,6 +2280,8 @@ export function registerMessagesRoutes(app, deps) {
     // row does (the swap, or fail closed).
     claudeApiClaimCheck = null,
     onClaudeBillingFence = null,
+    // Whether every worker of this relay says its kind; a function.
+    workersStateTheirKind = null,
     // The Claude API monthly cap's one seam (`{ reached, error? }`; a throw
     // counts as reached): an agent's send to a chat on the key is refused
     // while it is reached. Absent in older wiring and most tests: no cap.
@@ -2703,13 +2448,21 @@ export function registerMessagesRoutes(app, deps) {
     LIMIT 1
   `);
 
+  // The identity a worker sends with each request: null when it names
+  // neither a pid nor a session.
   function readBridgeIdentity(req) {
-    return relayBridgeOwnerService?.normalizeIdentity?.({
-      pid: req.headers['x-relay-process-pid'],
-      parentPid: req.headers['x-relay-parent-pid'],
-      sessionId: req.headers['x-relay-session-id'],
-      conversationId: req.headers['x-relay-conversation-id'],
-    }) || null;
+    const positiveInt = (value) => {
+      const num = Number.parseInt(String(value || ''), 10);
+      return Number.isInteger(num) && num > 0 ? num : null;
+    };
+    const text = (value) => String(value || '').trim() || null;
+    const identity = {
+      pid: positiveInt(req.headers['x-relay-process-pid']),
+      parentPid: positiveInt(req.headers['x-relay-parent-pid']),
+      sessionId: text(req.headers['x-relay-session-id']),
+      conversationId: text(req.headers['x-relay-conversation-id']),
+    };
+    return identity.pid || identity.sessionId ? identity : null;
   }
 
   function resolveConversationWorkspaceScope(req) {
@@ -2972,9 +2725,7 @@ export function registerMessagesRoutes(app, deps) {
       }
     } catch {}
     cancelPendingRelayQuestionsForMessage(messageId);
-    const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
-      ? normalizeSessionWorkerId(queueRow?.owner_sdk_session_id)
-      : null;
+    const ownerSessionId = normalizeSessionWorkerId(queueRow?.owner_sdk_session_id);
     if (ownerSessionId) {
       if (markWorkerError) {
         sessionWorkerSupervisor?.markError?.(ownerSessionId, `queue-failed:${failureRecord?.code || failureRecord?.error || 'unknown'}`);
@@ -3108,47 +2859,6 @@ export function registerMessagesRoutes(app, deps) {
     return cancelledRows.length;
   }
 
-  const strandedPrimeCooldownBySession = new Map();
-
-  const findPendingOwnedByOtherSession = db.prepare(`
-    SELECT q.id, q.conversation_id, q.runtime_session_id, q.owner_sdk_session_id, q.retry_count
-    FROM queue q
-    WHERE q.status = 'pending'
-      AND q.owner_sdk_session_id IS NOT NULL
-      AND q.owner_sdk_session_id != ''
-      AND q.owner_sdk_session_id != ?
-      AND q.runtime_session_id IS NOT NULL
-      AND EXISTS (
-        SELECT 1
-        FROM runtime_sessions rs
-        WHERE rs.id = q.runtime_session_id
-          AND rs.sdk_session_id = ?
-      )
-      AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-      AND ${planBoundaryHoldSql('q')}
-    ORDER BY q.timestamp ASC, q.rowid ASC
-    LIMIT 1
-  `);
-  const transferPendingOwnerToSession = db.prepare(`
-    UPDATE queue
-    SET owner_sdk_session_id = ?,
-        owner_assigned_at = ?,
-        owner_lease_expires_at = NULL,
-        owner_last_claimed_at = NULL
-    WHERE id = ?
-      AND status = 'pending'
-      AND owner_sdk_session_id = ?
-  `);
-  const findActiveOwnedBySession = db.prepare(`
-    SELECT *
-    FROM queue
-    WHERE owner_sdk_session_id = ?
-      AND status IN ('processing', 'pending', 'parked')
-    ORDER BY
-      CASE status WHEN 'processing' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END ASC,
-      timestamp ASC
-    LIMIT 1
-  `);
   const findProcessingOwnedBySession = db.prepare(`
     SELECT *
     FROM queue
@@ -5453,7 +5163,6 @@ export function registerMessagesRoutes(app, deps) {
     const sessionId = clientId || ensureSessionId(req, res);
     const requesterIdentity = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requesterIdentity?.sessionId);
-    const sessionWorkerRoutingEnabled = isSessionWorkerRoutingEnabled(featureFlags);
     let conversationSdkSessionId = null;
     // The conversation's saved choices, for a send that leaves one out: a
     // send to an existing conversation that names no mode runs in the mode
@@ -5487,13 +5196,6 @@ export function registerMessagesRoutes(app, deps) {
           nodeId: String(rawImageTarget.nodeId || '').trim() || null,
         }
       : null;
-    const imageContinuityEnabled = featureFlags?.IMAGE_CONVERSATION_CONTINUITY_ENABLED === true;
-    if (imageTarget && !imageContinuityEnabled) {
-      return res.status(409).json({
-        error: 'Conversational image editing is not enabled',
-        code: 'IMAGE_CONTINUITY_DISABLED',
-      });
-    }
     // Images named by path on this relay and the turn's own image options
     // (relay_tool send and create_session). Both go to an OpenAI image
     // session only; the paths are read before anything is stored, and one
@@ -6513,7 +6215,6 @@ export function registerMessagesRoutes(app, deps) {
       },
     );
     const ownerSessionId = resolveInitialQueueOwnerSessionId({
-      routingEnabled: sessionWorkerRoutingEnabled,
       requesterSessionId,
       runtimeSession,
       conversationSdkSessionId,
@@ -6693,7 +6394,7 @@ export function registerMessagesRoutes(app, deps) {
         null,
       );
       if (imageOptions) stmts.setQueueImageOptions?.run?.(JSON.stringify(imageOptions), msgId);
-      if (imageContinuityEnabled && openAIImageModel) {
+      if (openAIImageModel) {
         if (!imageOperationService?.createEnqueuedOperation) {
           throw new Error('Image operation service is unavailable');
         }
@@ -6764,49 +6465,47 @@ export function registerMessagesRoutes(app, deps) {
       });
       const pendingDepth = Number(queueCounts?.().pendingCount || 0);
       sessionWorkerSupervisor?.markIdle?.(ownerSessionId, pendingDepth);
-      if (sessionWorkerRoutingEnabled) {
-        emitSessionWorkerTelemetry('queue.message.queued', {
-          sessionId: ownerSessionId,
-          workerId: existingWorker?.workerId || null,
-          conversationId: convId,
-          messageId: msgId,
-          continuationId: null,
-          state: existingWorker?.status || 'new',
-          retry: 0,
-          pid: existingWorker?.pid || null,
-        });
-        if (typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
-          sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
-          void sessionWorkerSupervisor.ensureWorker(ownerSessionId).then((result) => {
-            if (!result?.ok) {
-              emitSessionWorkerTelemetry('worker.prime.failed', {
-                sessionId: ownerSessionId,
-                workerId: result?.worker?.workerId || null,
-                conversationId: convId,
-                messageId: msgId,
-                continuationId: null,
-                state: result?.worker?.status || 'error',
-                retry: result?.lifecycle?.retryCount || 0,
-                pid: result?.worker?.pid || null,
-                level: 'warn',
-                extra: { blockedReason: String(result?.error || 'worker-prime-failed') },
-              });
-            }
-          }).catch((error) => {
+      emitSessionWorkerTelemetry('queue.message.queued', {
+        sessionId: ownerSessionId,
+        workerId: existingWorker?.workerId || null,
+        conversationId: convId,
+        messageId: msgId,
+        continuationId: null,
+        state: existingWorker?.status || 'new',
+        retry: 0,
+        pid: existingWorker?.pid || null,
+      });
+      if (typeof sessionWorkerSupervisor?.ensureWorker === 'function') {
+        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
+        void sessionWorkerSupervisor.ensureWorker(ownerSessionId).then((result) => {
+          if (!result?.ok) {
             emitSessionWorkerTelemetry('worker.prime.failed', {
               sessionId: ownerSessionId,
-              workerId: null,
+              workerId: result?.worker?.workerId || null,
               conversationId: convId,
               messageId: msgId,
               continuationId: null,
-              state: 'error',
-              retry: 0,
-              pid: null,
+              state: result?.worker?.status || 'error',
+              retry: result?.lifecycle?.retryCount || 0,
+              pid: result?.worker?.pid || null,
               level: 'warn',
-              extra: { error: String(error?.message || error || 'worker-prime-failed') },
+              extra: { blockedReason: String(result?.error || 'worker-prime-failed') },
             });
+          }
+        }).catch((error) => {
+          emitSessionWorkerTelemetry('worker.prime.failed', {
+            sessionId: ownerSessionId,
+            workerId: null,
+            conversationId: convId,
+            messageId: msgId,
+            continuationId: null,
+            state: 'error',
+            retry: 0,
+            pid: null,
+            level: 'warn',
+            extra: { error: String(error?.message || error || 'worker-prime-failed') },
           });
-        }
+        });
       }
     }
     if (shouldApplySeed) {
@@ -7142,7 +6841,6 @@ export function registerMessagesRoutes(app, deps) {
         });
       }
     }
-    relayBridgeOwnerService?.observe?.(requester);
     const { pendingCount } = queueCounts();
     res.json({
       ok: true,
@@ -7660,24 +7358,6 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true });
   });
 
-  // POST /api/relay-session-link — the Copilot relay reports which SDK session
-  // it created to execute a conversation's turns. The startup import sweep
-  // consults these links so relay execution vehicles are never surfaced as
-  // stand-alone conversations ("shadow" duplicates in the conversation list).
-  app.post('/api/relay-session-link', auth, (req, res) => {
-    touchCli();
-    const conversationId = String(req.body?.conversationId || '').trim();
-    const sdkSessionId = String(req.body?.sdkSessionId || '').trim();
-    if (!conversationId || !sdkSessionId) {
-      return res.status(400).json({ error: 'Missing conversationId or sdkSessionId' });
-    }
-    if (typeof stmts.upsertRelaySessionLink?.run !== 'function') {
-      return res.status(500).json({ error: 'Relay session link storage is unavailable' });
-    }
-    stmts.upsertRelaySessionLink.run(sdkSessionId, conversationId, new Date().toISOString());
-    res.json({ ok: true });
-  });
-
   // POST /api/cursor-context-usage — Cursor worker reports the session's
   // context-window breakdown after a turn. Cursor sessions have no Copilot
   // events.jsonl to tail, so this is what feeds the composer indicator and the
@@ -7756,11 +7436,14 @@ export function registerMessagesRoutes(app, deps) {
     res.json({ ok: true });
   });
 
-  // GET /api/pending — CLI fetches next pending message
-  // The kind a poller of GET /api/pending is fenced as: the one its worker
-  // stated, else none, as on the socket. A worker of unknown kind gets the
-  // rows of a chat that never switched, and none of a chat that has
-  // (kind-unknown): such a chat waits for a worker that says its kind.
+  // GET /api/pending — a session's next row, for a process that plays the
+  // session's worker over HTTP (the e2e fake worker); the workers take their
+  // work over the worker socket. The poller names its session and gets that
+  // session's rows only, through the claim the socket delivery uses.
+  // The kind a poller is fenced as: the one its worker stated, else none, as
+  // on the socket. A worker of unknown kind gets the rows of a chat that
+  // never switched, and none of a chat that has (kind-unknown): such a chat
+  // waits for a worker that says its kind.
   function httpPendingWorkerKind(requesterSessionId) {
     const stated = requesterSessionId ? sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.kind : null;
     return normalizeWorkerKind(stated) || null;
@@ -7770,61 +7453,32 @@ export function registerMessagesRoutes(app, deps) {
     touchCli();
     const requester = readBridgeIdentity(req);
     const requesterSessionId = normalizeSessionWorkerId(requester?.sessionId);
-    const sessionWorkerRoutingEnabled = isSessionWorkerRoutingEnabled(featureFlags);
-    const ownerObservation = relayBridgeOwnerService?.observe?.(requester) || null;
-    const now = new Date().toISOString();
-    let affinityOnlyDequeue = !sessionWorkerRoutingEnabled && Boolean(requesterSessionId);
-    let enforceOwnerMismatch = requester && ownerObservation?.accepted === false && !sessionWorkerRoutingEnabled;
-    if (enforceOwnerMismatch && requesterSessionId && stmts.countQueueWorkForSessionAffinity) {
-      const scopedWork = stmts.countQueueWorkForSessionAffinity.get(now, requesterSessionId);
-      if (Number(scopedWork?.cnt || 0) > 0) {
-        enforceOwnerMismatch = false;
-        affinityOnlyDequeue = true;
-      }
+    if (!requesterSessionId) {
+      return res.status(400).json({ error: 'Missing x-relay-session-id: a poller names the session it works for' });
     }
-    if (enforceOwnerMismatch) {
-      return res.json({
-        message: null,
-        ownerMismatch: true,
-        activeBridgeOwner: relayBridgeOwnerService?.getOwner?.() || null,
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-      });
+    // On a relay that launches its workers, every one of them says its kind
+    // before it asks for work. A process that polls for a session and never
+    // said one (a Copilot CLI an earlier version started) is handed nothing
+    // and is not registered: the turn waits for the session's worker.
+    if (workersStateTheirKind?.() === true && !httpPendingWorkerKind(requesterSessionId)) {
+      return res.json({ message: null, reason: 'worker-kind-unstated' });
     }
-    if (sessionWorkerRoutingEnabled && requesterSessionId) {
-      const requesterKillBlocked = sessionWorkerSupervisor?.isKillBlocked?.(requesterSessionId) === true;
-      if (requesterKillBlocked) {
-        return res.json({
-          message: null,
-          routing: {
-            enabled: true,
-            requesterSessionId,
-            blockedReason: 'session-killed',
-            lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
-            fallbackRestart: null,
-          },
-          restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        });
-      }
-      // The process asking is being replaced (the worker recycle): no work,
-      // as for a killed session, so no turn starts on the pid being stopped.
-      // Unlike the killed marker, the fence outlives the marker's grace and
-      // every clearRestartSchedule; the new worker has another pid and takes
-      // what waited meanwhile.
-      if (workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true) {
-        return res.json({
-          message: null,
-          routing: {
-            enabled: true,
-            requesterSessionId,
-            blockedReason: 'worker-replacement',
-            lifecycle: sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null,
-            fallbackRestart: null,
-          },
-          restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        });
-      }
-      sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
+    const blocked = (blockedReason, lifecycle = null) => res.json({
+      message: null,
+      routing: { enabled: true, requesterSessionId, blockedReason, lifecycle },
+    });
+    if (sessionWorkerSupervisor?.isKillBlocked?.(requesterSessionId) === true) {
+      return blocked('session-killed', sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null);
     }
+    // The process asking is being replaced (the worker recycle): no work,
+    // as for a killed session, so no turn starts on the pid being stopped.
+    // Unlike the killed marker, the fence outlives the marker's grace and
+    // every clearRestartSchedule; the new worker has another pid and takes
+    // what waited meanwhile.
+    if (workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true) {
+      return blocked('worker-replacement', sessionWorkerSupervisor?.getLifecycleState?.(requesterSessionId) || null);
+    }
+    sessionWorkerSupervisor?.noteSessionHeartbeat?.(requesterSessionId);
     if (runtimeState.relayPaused) return res.json({ message: null, paused: true });
     // A queued shutdown or restart waits for the processing turns only: a
     // pending row handed out now would start a turn that postpones it again.
@@ -7856,45 +7510,24 @@ export function registerMessagesRoutes(app, deps) {
       });
     }
     const counts = queueCounts();
-    if (sessionWorkerRoutingEnabled && requesterSessionId) {
-      const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
-      if (!existingRequesterWorker) {
-        sessionWorkerRegistry?.upsertWorker?.({
-          sdkSessionId: requesterSessionId,
-          workerId: `worker-${requesterSessionId.slice(0, 8)}`,
-          conversationId: requester?.conversationId || null,
-          status: 'ready',
-          pid: requester?.pid || null,
-          queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
-        });
-      } else if (requester?.pid && existingRequesterWorker.pid !== requester.pid) {
-        sessionWorkerRegistry?.upsertWorker?.({
-          ...existingRequesterWorker,
-          sdkSessionId: requesterSessionId,
-          conversationId: requester?.conversationId || existingRequesterWorker.conversationId || null,
-          pid: requester.pid,
-          status: existingRequesterWorker.status || 'ready',
-          queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
-        });
-      }
-    }
-    const restartProbe = relayRestartOrchestrator?.onDequeueProbe({
-      processingCount: counts.processingCount,
-      cliOnline: runtimeState.cliOnline,
-    }) || null;
-    const shouldUseRestartQueueGate = !sessionWorkerRoutingEnabled;
-    const parkedCount = shouldUseRestartQueueGate ? parkPendingQueueForRestart({ stmts, state: restartProbe?.state }) : 0;
-    const releasedRows = shouldUseRestartQueueGate ? releaseParkedQueueForReadyState({ db, stmts, state: restartProbe?.state }) : [];
-    for (const row of releasedRows) {
-      io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'pending' });
-    }
-    if (shouldUseRestartQueueGate && restartProbe?.blockDequeue) {
-      return res.json({
-        message: null,
-        restartOrchestrator: restartProbe.state || relayRestartOrchestrator?.getState?.() || null,
-        control: restartProbe.control || null,
-        parkedCount,
-        releasedCount: releasedRows.length,
+    const existingRequesterWorker = sessionWorkerRegistry?.getWorker?.(requesterSessionId) || null;
+    if (!existingRequesterWorker) {
+      sessionWorkerRegistry?.upsertWorker?.({
+        sdkSessionId: requesterSessionId,
+        workerId: `worker-${requesterSessionId.slice(0, 8)}`,
+        conversationId: requester?.conversationId || null,
+        status: 'ready',
+        pid: requester?.pid || null,
+        queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
+      });
+    } else if (requester?.pid && existingRequesterWorker.pid !== requester.pid) {
+      sessionWorkerRegistry?.upsertWorker?.({
+        ...existingRequesterWorker,
+        sdkSessionId: requesterSessionId,
+        conversationId: requester?.conversationId || existingRequesterWorker.conversationId || null,
+        pid: requester.pid,
+        status: existingRequesterWorker.status || 'ready',
+        queueDepth: Math.max(0, Number(counts.pendingCount || 0)),
       });
     }
 
@@ -7903,14 +7536,10 @@ export function registerMessagesRoutes(app, deps) {
       dequeueResult = await dequeuePendingMessageForWorkerLoop({
         db,
         stmts,
-        nowIso: now,
-        routingEnabled: sessionWorkerRoutingEnabled,
+        nowIso: new Date().toISOString(),
         requesterSessionId,
         ownerLeaseMs: SESSION_WORKER_OWNER_LEASE_MS,
-        affinityOnly: affinityOnlyDequeue,
         sessionWorkerSupervisor,
-        relayRestartOrchestrator,
-        inFlightProcessingCount: Number(counts.processingCount || 0),
         // No Claude worker polls here; one that does is fenced as on the
         // socket: by the kind it stated, the key's claim check, and a fenced
         // row asks for the swap or fails closed as there.
@@ -7920,7 +7549,6 @@ export function registerMessagesRoutes(app, deps) {
         // The fence check above, asked again before every claim.
         isReplacementFenced: () => workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true,
         telemetry: (payload = {}) => {
-          if (!sessionWorkerRoutingEnabled) return;
           emitSessionWorkerTelemetry(payload.event, {
             sessionId: payload.sessionId || requesterSessionId,
             workerId: payload.workerId || null,
@@ -7937,62 +7565,25 @@ export function registerMessagesRoutes(app, deps) {
         },
       });
     } catch (error) {
-      console.warn(`[${ts()}] DEQUEUE   failed requester=${String(requesterSessionId || 'none').slice(0, 8)} err=${String(error?.message || error || 'unknown dequeue failure')}`);
-      if (sessionWorkerRoutingEnabled) {
-        emitSessionWorkerTelemetry('queue.dequeue.failure', {
-          sessionId: requesterSessionId,
-          workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
-          conversationId: null,
-          messageId: null,
-          continuationId: null,
-          state: 'error',
-          retry: 0,
-          pid: requester?.pid || null,
-          queue: counts,
-          level: 'warn',
-          extra: { error: String(error?.message || error || 'unknown dequeue failure') },
-        });
-      }
-      return res.status(500).json({
-        error: 'Failed to dequeue pending message',
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        parkedCount,
-        releasedCount: releasedRows.length,
+      console.warn(`[${ts()}] DEQUEUE   failed requester=${requesterSessionId.slice(0, 8)} err=${String(error?.message || error || 'unknown dequeue failure')}`);
+      emitSessionWorkerTelemetry('queue.dequeue.failure', {
+        sessionId: requesterSessionId,
+        workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
+        conversationId: null,
+        messageId: null,
+        continuationId: null,
+        state: 'error',
+        retry: 0,
+        pid: requester?.pid || null,
+        queue: counts,
+        level: 'warn',
+        extra: { error: String(error?.message || error || 'unknown dequeue failure') },
       });
+      return res.status(500).json({ error: 'Failed to dequeue pending message' });
     }
-    let msg = dequeueResult?.message || null;
-    let dequeueBlockedReason = String(dequeueResult?.blockedReason || '').trim() || null;
-    let fallbackRestart = dequeueResult?.fallbackRestart || null;
-    let primedSessionId = null;
-    if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && dequeueBlockedReason) {
-      const blockedTerminalFailure = resolveBlockedWorkerTerminalFailure({
-        blockedReason: dequeueBlockedReason,
-        requesterSessionId,
-        lifecycle: dequeueResult?.lifecycle || null,
-        worker: dequeueResult?.worker || null,
-      });
-      if (blockedTerminalFailure) {
-        const blockedRow = findActiveOwnedBySession.get(requesterSessionId);
-        if (blockedRow) {
-          const failureText = buildTerminalFailureTextForChat({
-            code: blockedTerminalFailure.code,
-            stableCode: blockedTerminalFailure.stableCode,
-            message: blockedTerminalFailure.message,
-            detail: blockedTerminalFailure.detail,
-            guidance: blockedTerminalFailure.guidance,
-            requestId: blockedRow?.id || null,
-          });
-          failQueueMessage({
-            queueRow: blockedRow,
-            messageId: blockedRow.id,
-            conversationId: blockedRow.conversation_id,
-            relayMode: normalizeRelayMode(blockedRow.relay_mode) || DEFAULT_RELAY_MODE,
-            model: blockedRow.model || null,
-            responseText: failureText,
-            failureRecord: blockedTerminalFailure,
-          });
-        }
-      }
+    const msg = dequeueResult?.message || null;
+    const dequeueBlockedReason = String(dequeueResult?.blockedReason || '').trim() || null;
+    if (!msg && dequeueBlockedReason) {
       emitSessionWorkerTelemetry('queue.dequeue.blocked', {
         sessionId: requesterSessionId,
         workerId: dequeueResult?.worker?.workerId || null,
@@ -8003,269 +7594,69 @@ export function registerMessagesRoutes(app, deps) {
         retry: dequeueResult?.lifecycle?.retryCount || 0,
         pid: requester?.pid || dequeueResult?.worker?.pid || null,
         queue: counts,
-        extra: {
-          blockedReason: dequeueBlockedReason,
-          fallbackRestartRequested: fallbackRestart?.requested === true,
-        },
+        extra: { blockedReason: dequeueBlockedReason },
       });
-      return res.json({
-        message: null,
-        routing: {
-          enabled: true,
-          requesterSessionId,
-          blockedReason: dequeueBlockedReason,
-          lifecycle: dequeueResult?.lifecycle || null,
-          fallbackRestart,
-          terminalOutcome: fallbackRestart?.terminalOutcome || null,
-        },
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        parkedCount,
-        releasedCount: releasedRows.length,
-      });
+      return blocked(dequeueBlockedReason, dequeueResult?.lifecycle || null);
     }
-    if (!msg && sessionWorkerRoutingEnabled && requesterSessionId && !dequeueBlockedReason) {
-      const strandedOwner = findPendingOwnedByOtherSession.get(requesterSessionId, requesterSessionId, now);
-      const strandedSessionId = normalizeSessionWorkerId(strandedOwner?.owner_sdk_session_id);
-      const strandedRuntimeSession = strandedOwner?.runtime_session_id
-        ? stmts.getRuntimeSessionById.get(strandedOwner.runtime_session_id)
-        : null;
-      const strandedExpectedOwnerSessionId = normalizeSessionWorkerId(strandedRuntimeSession?.sdk_session_id);
-      const requesterMatchesRuntimeBinding = !!requesterSessionId
-        && !!strandedExpectedOwnerSessionId
-        && requesterSessionId === strandedExpectedOwnerSessionId;
-      const strandedWorker = strandedSessionId
-        ? (sessionWorkerRegistry?.getWorker?.(strandedSessionId) || sessionWorkerSupervisor?.getWorkerState?.(strandedSessionId) || null)
-        : null;
-      const strandedLifecycle = strandedSessionId
-        ? (sessionWorkerSupervisor?.getLifecycleState?.(strandedSessionId) || null)
-        : null;
-      const strandedStatus = String(strandedWorker?.status || '').trim().toLowerCase();
-      const lastPrimeAtMs = strandedSessionId ? Number(strandedPrimeCooldownBySession.get(strandedSessionId) || 0) : 0;
-      const nowMs = Date.now();
-      const cooldownActive = lastPrimeAtMs > 0 && (nowMs - lastPrimeAtMs) < STRANDED_SESSION_PRIME_COOLDOWN_MS;
-      const heartbeatMs = Date.parse(String(strandedLifecycle?.lastHeartbeatAt || '').trim());
-      const heartbeatFresh = Number.isFinite(heartbeatMs) && (nowMs - heartbeatMs) < STRANDED_SESSION_HEARTBEAT_FRESH_MS;
-      const shouldSkipPrime = cooldownActive
-        || strandedStatus === 'processing'
-        || strandedStatus === 'starting'
-        || (strandedStatus === 'ready' && heartbeatFresh);
-      if (
-        requesterMatchesRuntimeBinding
-        && !!strandedExpectedOwnerSessionId
-        && 
-        shouldAutoPrimeStrandedSession({
-          strandedRow: strandedOwner,
-          requesterSessionId,
-        })
-        && !shouldSkipPrime
-        && typeof sessionWorkerSupervisor?.ensureWorker === 'function'
-        && sessionWorkerSupervisor?.isKillBlocked?.(strandedSessionId) !== true
-      ) {
-        strandedPrimeCooldownBySession.set(strandedSessionId, nowMs);
-        try {
-          const primeResult = await sessionWorkerSupervisor.ensureWorker(strandedSessionId);
-          const shouldTakeOver = shouldTakeOverStrandedPendingMessage({
-            strandedRow: strandedOwner,
-            requesterSessionId,
-            primeResult,
-            strandedLifecycle,
-            nowMs,
-            heartbeatFreshWindowMs: STRANDED_SESSION_HEARTBEAT_FRESH_MS,
-          });
-          const primedTerminalFailure = resolvePrimedWorkerTerminalFailure({
-            sessionId: strandedSessionId,
-            primeResult,
-          });
-          if (primedTerminalFailure && strandedOwner?.id && strandedOwner?.conversation_id) {
-            const strandedRow = stmts.findQById.get(strandedOwner.id);
-            if (strandedRow && ['processing', 'pending', 'parked'].includes(String(strandedRow.status || '').trim().toLowerCase())) {
-              const failureText = buildTerminalFailureTextForChat({
-                code: primedTerminalFailure.code,
-                stableCode: primedTerminalFailure.stableCode,
-                message: primedTerminalFailure.message,
-                detail: primedTerminalFailure.detail,
-                guidance: primedTerminalFailure.guidance,
-                requestId: strandedRow.id,
-              });
-              failQueueMessage({
-                queueRow: strandedRow,
-                messageId: strandedRow.id,
-                conversationId: strandedRow.conversation_id,
-                relayMode: normalizeRelayMode(strandedRow.relay_mode) || DEFAULT_RELAY_MODE,
-                model: strandedRow.model || null,
-                responseText: failureText,
-                failureRecord: primedTerminalFailure,
-              });
-            }
-          }
-          if (
-            shouldTakeOver
-            && strandedOwner?.id
-            && typeof transferPendingOwnerToSession?.run === 'function'
-          ) {
-            const transferResult = transferPendingOwnerToSession.run(
-              requesterSessionId,
-              now,
-              strandedOwner.id,
-              strandedSessionId,
-            );
-            if (Number(transferResult?.changes || 0) > 0) {
-              emitSessionWorkerTelemetry('worker.prime.takeover', {
-                sessionId: requesterSessionId,
-                workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
-                conversationId: strandedOwner?.conversation_id || null,
-                messageId: strandedOwner?.id || null,
-                continuationId: null,
-                state: 'ready',
-                retry: Number(strandedOwner?.retry_count || 0),
-                pid: requester?.pid || null,
-                queue: counts,
-                extra: {
-                  previousOwnerSessionId: strandedSessionId,
-                  degradedReason: String(primeResult?.lifecycle?.degradedReason || strandedLifecycle?.degradedReason || ''),
-                },
-              });
-              const recoveryDequeue = await dequeuePendingMessageForWorkerLoop({
-                db,
-                stmts,
-                nowIso: new Date().toISOString(),
-                routingEnabled: sessionWorkerRoutingEnabled,
-                requesterSessionId,
-                ownerLeaseMs: SESSION_WORKER_OWNER_LEASE_MS,
-                affinityOnly: affinityOnlyDequeue,
-                sessionWorkerSupervisor,
-                relayRestartOrchestrator,
-                inFlightProcessingCount: Number(queueCounts()?.processingCount || 0),
-                workerKind: httpPendingWorkerKind(requesterSessionId),
-                claudeApiClaimCheck,
-                onBillingFence: onClaudeBillingFence,
-                isReplacementFenced: () => workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true,
-              });
-              if (recoveryDequeue?.message) {
-                msg = recoveryDequeue.message;
-                dequeueBlockedReason = String(recoveryDequeue?.blockedReason || '').trim() || null;
-                fallbackRestart = recoveryDequeue?.fallbackRestart || null;
-              }
-            }
-          }
-          primedSessionId = strandedSessionId;
-          emitSessionWorkerTelemetry('worker.prime.requested', {
-            sessionId: strandedSessionId,
-            workerId: primeResult?.worker?.workerId || null,
-            conversationId: strandedOwner?.conversation_id || null,
-            messageId: strandedOwner?.id || null,
-            continuationId: null,
-            state: primeResult?.worker?.status || (primeResult?.ok ? 'ready' : 'error'),
-            retry: primeResult?.lifecycle?.retryCount || 0,
-            pid: primeResult?.worker?.pid || null,
-            queue: counts,
-            level: primeResult?.ok ? 'log' : 'warn',
-            extra: primeResult?.ok ? null : { blockedReason: String(primeResult?.error || 'worker-prime-failed') },
-          });
-        } catch (error) {
-          emitSessionWorkerTelemetry('worker.prime.failed', {
-            sessionId: strandedSessionId,
-            workerId: null,
-            conversationId: strandedOwner?.conversation_id || null,
-            messageId: strandedOwner?.id || null,
-            continuationId: null,
-            state: 'error',
-            retry: 0,
-            pid: null,
-            queue: counts,
-            level: 'warn',
-            extra: { error: String(error?.message || error || 'worker-prime-failed') },
-          });
-        }
-      }
+    if (!msg) {
+      const pendingDepth = Number(queueCounts?.().pendingCount || 0);
+      sessionWorkerSupervisor?.markIdle?.(requesterSessionId, pendingDepth);
+      emitSessionWorkerTelemetry('queue.dequeue.idle', {
+        sessionId: requesterSessionId,
+        workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
+        conversationId: null,
+        messageId: null,
+        continuationId: null,
+        state: 'ready',
+        retry: 0,
+        pid: requester?.pid || null,
+        queue: counts,
+      });
+      return res.json({ message: null, routing: { enabled: true, requesterSessionId } });
     }
-    if (msg) {
-      const out = buildDequeuedRelayMessage({
-        msg,
-        stmts,
-        parseAttachments,
-        hydrateAttachment,
-        ensureRuntimeSessionBinding,
-        configuredConversationSessionMode,
-        normalizeRelayMode,
-        defaultRelayMode: DEFAULT_RELAY_MODE,
-        defaultModel: DEFAULT_MODEL,
-        getCursorProviderSettings,
-        getClaudeCloudProviderSettings,
-      });
-      
-      if (out.attachments.length) {
-        const withPathCount = out.attachments.filter((att) => String(att?.path || '').trim()).length;
-        const names = out.attachments.map((att) => String(att?.name || '').trim() || 'attachment').slice(0, 3).join(', ');
-        console.log(`[${ts()}] ATTACH    ${out.id.slice(0,8)} files=${out.attachments.length} paths=${withPathCount} names=${JSON.stringify(names)}`);
-      }
-
-      if (sessionWorkerRoutingEnabled && out.ownerSessionId) {
-        const existingWorker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
-        sessionWorkerRegistry?.upsertWorker?.({
-          ...(existingWorker || {}),
-          sdkSessionId: out.ownerSessionId,
-          conversationId: out.conversationId,
-          runtimeSessionId: out.runtimeSessionId,
-          status: 'processing',
-        });
-        const processingDepth = Number(counts.processingCount || 0);
-        sessionWorkerSupervisor?.markProcessing?.(out.ownerSessionId, processingDepth);
-      }
-      if (sessionWorkerRoutingEnabled) {
-        emitSessionWorkerTelemetry('queue.message.dequeued', {
-          sessionId: out.ownerSessionId || requesterSessionId,
-          workerId: sessionWorkerRegistry?.getWorker?.(out.ownerSessionId || requesterSessionId)?.workerId || null,
-          conversationId: out.conversationId,
-          messageId: out.id,
-          continuationId: null,
-          state: 'processing',
-          retry: Number(msg.retry_count || 0),
-          pid: requester?.pid || null,
-          queue: counts,
-        });
-      }
-      console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model}${out.reasoningEffort ? ` effort=${out.reasoningEffort}` : ''} mode=${out.relayMode} text="${out.text.slice(0,60)}"${out.attachments.length ? ` attachments=${out.attachments.length}` : ''}`);
-      io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
-      res.json({
-        message: out,
-        routing: sessionWorkerRoutingEnabled ? {
-          enabled: true,
-          requesterSessionId,
-        } : { enabled: false },
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        parkedCount,
-        releasedCount: releasedRows.length,
-      });
-    } else {
-      if (sessionWorkerRoutingEnabled && requesterSessionId) {
-        const pendingDepth = Number(queueCounts?.().pendingCount || 0);
-        sessionWorkerSupervisor?.markIdle?.(requesterSessionId, pendingDepth);
-        emitSessionWorkerTelemetry('queue.dequeue.idle', {
-          sessionId: requesterSessionId,
-          workerId: sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.workerId || null,
-          conversationId: null,
-          messageId: null,
-          continuationId: null,
-          state: 'ready',
-          retry: 0,
-          pid: requester?.pid || null,
-          queue: counts,
-        });
-      }
-      res.json({
-        message: null,
-        routing: sessionWorkerRoutingEnabled ? {
-          enabled: true,
-          requesterSessionId,
-          primedSessionId,
-          terminalOutcome: null,
-        } : { enabled: false },
-        restartOrchestrator: relayRestartOrchestrator?.getState?.() || null,
-        parkedCount,
-        releasedCount: releasedRows.length,
-      });
+    const out = buildDequeuedRelayMessage({
+      msg,
+      stmts,
+      parseAttachments,
+      hydrateAttachment,
+      ensureRuntimeSessionBinding,
+      configuredConversationSessionMode,
+      normalizeRelayMode,
+      defaultRelayMode: DEFAULT_RELAY_MODE,
+      defaultModel: DEFAULT_MODEL,
+      getCursorProviderSettings,
+      getClaudeCloudProviderSettings,
+    });
+    if (out.attachments.length) {
+      const withPathCount = out.attachments.filter((att) => String(att?.path || '').trim()).length;
+      const names = out.attachments.map((att) => String(att?.name || '').trim() || 'attachment').slice(0, 3).join(', ');
+      console.log(`[${ts()}] ATTACH    ${out.id.slice(0,8)} files=${out.attachments.length} paths=${withPathCount} names=${JSON.stringify(names)}`);
     }
+    if (out.ownerSessionId) {
+      const existingWorker = sessionWorkerRegistry?.getWorker?.(out.ownerSessionId) || null;
+      sessionWorkerRegistry?.upsertWorker?.({
+        ...(existingWorker || {}),
+        sdkSessionId: out.ownerSessionId,
+        conversationId: out.conversationId,
+        runtimeSessionId: out.runtimeSessionId,
+        status: 'processing',
+      });
+      sessionWorkerSupervisor?.markProcessing?.(out.ownerSessionId, Number(counts.processingCount || 0));
+    }
+    emitSessionWorkerTelemetry('queue.message.dequeued', {
+      sessionId: out.ownerSessionId || requesterSessionId,
+      workerId: sessionWorkerRegistry?.getWorker?.(out.ownerSessionId || requesterSessionId)?.workerId || null,
+      conversationId: out.conversationId,
+      messageId: out.id,
+      continuationId: null,
+      state: 'processing',
+      retry: Number(msg.retry_count || 0),
+      pid: requester?.pid || null,
+      queue: counts,
+    });
+    console.log(`[${ts()}] DEQUEUED  ${out.id.slice(0,8)} conv=${out.conversationId.slice(0,8)} rs=${String(out.runtimeSessionId || 'none').slice(0,8)} owner=${String(out.ownerSessionId || 'none').slice(0,8)} model=${out.model}${out.reasoningEffort ? ` effort=${out.reasoningEffort}` : ''} mode=${out.relayMode} text="${out.text.slice(0,60)}"${out.attachments.length ? ` attachments=${out.attachments.length}` : ''}`);
+    io.emit('message_status', { messageId: out.id, conversationId: out.conversationId, status: 'processing' });
+    res.json({ message: out, routing: { enabled: true, requesterSessionId } });
   });
 
   app.post('/api/relay/pause', auth, (req, res) => {
@@ -8292,19 +7683,6 @@ export function registerMessagesRoutes(app, deps) {
     io.emit('relay_pause_state', { paused: false });
     console.log(`[${ts()}] RELAY     resumed`);
     res.json({ ok: true, paused: false });
-  });
-
-  app.post('/api/relay/recover-processing', auth, (req, res) => {
-    const rawMaxAge = Number(req.body?.maxAgeMs);
-    const maxAgeMs = Number.isFinite(rawMaxAge)
-      ? Math.max(5_000, Math.min(300_000, rawMaxAge))
-      : 15_000;
-    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    const requeueAt = addMsIso(5_000);
-    const rows = recoverProcessingOlderThan(cutoff, requeueAt);
-    if (!rows.length) return res.json({ ok: true, recovered: 0, maxAgeMs });
-    console.log(`[${ts()}] RELAY     recovered processing=${rows.length} maxAgeMs=${maxAgeMs}`);
-    return res.json({ ok: true, recovered: rows.length, maxAgeMs });
   });
 
   // Emptying the queue, restarting the relay and withdrawing a restart are
@@ -8917,9 +8295,6 @@ export function registerMessagesRoutes(app, deps) {
     if (!isTrulyLocalRequest(req)) {
       return res.status(403).json({ error: 'Image operation execution is reachable from this machine only' });
     }
-    if (featureFlags?.IMAGE_CONVERSATION_CONTINUITY_ENABLED !== true) {
-      return res.status(404).json({ error: 'Image continuity is not enabled' });
-    }
     const operationId = String(req.params.operationId || '').trim();
     const operation = operationId ? stmts.getOperation?.get(operationId) : null;
     if (!operation) return res.status(404).json({ error: 'Image operation not found' });
@@ -9184,10 +8559,12 @@ export function registerMessagesRoutes(app, deps) {
   });
 
   // The relay's own workers call this on this machine for an image turn
-  // without an operation (image continuity off). Like the execute route it
-  // is local only: through the tunnel, or with a paired relay's token, it
-  // would spend the owner's money outside the queue. One request per queue
-  // message: a second call for the same message is refused.
+  // without an image operation (a row queued elsewhere than POST
+  // /api/message: schedules, subscriptions, restart resume, the usage-limit
+  // pause, relay-board rows). Like the execute route it is local only:
+  // through the tunnel, or with a paired relay's token, it would spend the
+  // owner's money outside the queue. One request per queue message: a
+  // second call for the same message is refused.
   app.post('/api/openai/images/generate', auth, async (req, res) => {
     touchCli();
     if (!isTrulyLocalRequest(req)) {
@@ -9215,9 +8592,10 @@ export function registerMessagesRoutes(app, deps) {
     const dispatched = noteDispatchedImageMessage(requestBody.messageId);
     // One run of the message: the claim's attempt id (a restart claims the
     // row anew), so its tries never merge into an earlier run's rows.
-    // Known gap: this path (image continuity off) keeps no attempt row, so a
-    // try a relay restart cuts off is booked nowhere; the operation path's
-    // recovery books such a try as an estimate. docs/providers.md says so.
+    // Known gap: this path (a row without an image operation) keeps no
+    // attempt row, so a try a relay restart cuts off is booked nowhere; the
+    // operation path's recovery books such a try as an estimate.
+    // docs/providers.md says so.
     let claimId = '';
     try {
       claimId = String(stmts.findQById?.get?.(requestBody.messageId)?.attempt_id || '').trim();
@@ -9336,8 +8714,8 @@ export function registerMessagesRoutes(app, deps) {
     // settle the row while that attempt is still the row's current one. A
     // mismatch means the row was requeued (and possibly re-dequeued) after
     // this writer started — its work is superseded, not mergeable. Writers
-    // that send no attemptId (the extension engine, mid-rollout workers) keep
-    // the legacy conditional semantics.
+    // that send no attemptId (workers of an earlier version, the server's
+    // own image finalization) keep the legacy conditional semantics.
     const claimedAttemptId = String(req.body.attemptId || '').trim() || null;
     if (claimedAttemptId && q && String(q.attempt_id || '') !== claimedAttemptId) {
       staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: q.attempt_id, route: 'response', status: q.status });
@@ -9743,7 +9121,7 @@ export function registerMessagesRoutes(app, deps) {
         );
       }
     }
-    if (isSessionWorkerRoutingEnabled(featureFlags) && q?.owner_sdk_session_id) {
+    if (q?.owner_sdk_session_id) {
       const ownerSessionId = normalizeSessionWorkerId(q.owner_sdk_session_id);
       if (ownerSessionId) {
         const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
@@ -10450,8 +9828,8 @@ export function registerMessagesRoutes(app, deps) {
   // the row's current attempt differs — the row was requeued or re-dequeued
   // after this writer started, and its output belongs to a superseded turn.
   // Same-attempt writes pass regardless of row status (trailing writes right
-  // after finalization are legitimate), and writers without an attemptId keep
-  // legacy behavior until the extension engine is retired.
+  // after finalization are legitimate), and writers without an attemptId
+  // (older workers) keep legacy behavior.
   function rejectStaleAttemptWrite({ req, res, queueRow, route }) {
     const claimed = String(req.body?.attemptId || '').trim();
     if (!claimed || !queueRow) return false;
@@ -10984,11 +10362,22 @@ export function registerMessagesRoutes(app, deps) {
       staleAttemptLog.note({ messageId, attemptId: claimedAttemptId, currentAttemptId: q.attempt_id, route: 'requeue', status: q.status });
       return res.status(409).json({ error: 'stale_attempt', currentStatus: String(q.status || 'unknown') });
     }
-    const ownerSessionId = isSessionWorkerRoutingEnabled(featureFlags)
-      ? normalizeSessionWorkerId(q?.owner_sdk_session_id)
-      : null;
+    const ownerSessionId = normalizeSessionWorkerId(q?.owner_sdk_session_id);
     const currentStatus = String(q?.status || '').trim().toLowerCase();
     const canTerminalFail = q && ['processing', 'pending', 'parked'].includes(currentStatus);
+    // A branch that ends the worker's turn without a response tells the
+    // registry the worker is idle, as /api/response does: a delivery left the
+    // entry 'processing', and nothing else would clear it before the next one.
+    const markOwnerIdle = () => {
+      if (!ownerSessionId) return;
+      const existingWorker = sessionWorkerRegistry?.getWorker?.(ownerSessionId) || null;
+      sessionWorkerRegistry?.upsertWorker?.({
+        ...(existingWorker || {}),
+        sdkSessionId: ownerSessionId,
+        status: 'ready',
+      });
+      sessionWorkerSupervisor?.markIdle?.(ownerSessionId, Number(queueCounts?.().pendingCount || 0));
+    };
     if (terminalFailure && canTerminalFail) {
       const failureText = buildTerminalFailureTextForChat(terminalFailure);
       const failed = failQueueMessage({
@@ -11032,6 +10421,7 @@ export function registerMessagesRoutes(app, deps) {
       // A continuation has no user prompt to replay; a worker that gives up on
       // one just tears it down.
       stmts.dropStaleContinuation?.run?.(messageId);
+      markOwnerIdle();
       io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'failed' });
       console.log(`[${ts()}] CONTINUATION DROPPED ${messageId?.slice(0,8)} reason=requeue`);
       return res.json({ ok: true, dropped: 'continuation' });
@@ -11076,20 +10466,6 @@ export function registerMessagesRoutes(app, deps) {
         return res.json({ ok: true, terminal: true, code: `relay.${normalizeTerminalErrorCode(imageStop.failure.code)}` });
       }
     }
-    if (q && q.status === 'processing' && String(req.body?.code || '').trim() === 'relay.provider-mismatch') {
-      // A routing refusal, not a delivery failure: the legacy relay handed
-      // back a turn that belongs to a session worker. No retry increment and
-      // no backoff — the owner worker must be able to claim it immediately
-      // instead of paying a 60s ladder for the relay's mistake.
-      db.prepare(`
-        UPDATE queue
-        SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
-        WHERE id = ? AND status = 'processing'${claimedAttemptId ? ` AND attempt_id = ?` : ''}
-      `).run(...(claimedAttemptId ? [messageId, claimedAttemptId] : [messageId]));
-      io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
-      console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=provider-mismatch retry=${Number(q.retry_count || 0)}`);
-      return res.json({ ok: true, mismatch: true });
-    }
     const handBackClass = String(req.body?.class || '').trim();
     if (q && q.status === 'processing' && (handBackClass === 'steering-held' || handBackClass === 'kind-mismatch')) {
       // The worker refused to push the message because its live turn is
@@ -11099,7 +10475,9 @@ export function registerMessagesRoutes(app, deps) {
       // when the hold ends, so the message steers into the resumed turn.
       // `kind-mismatch`: a Claude chat's row reached a worker of the other
       // billing; back to pending (re-stamped to the chat's billing by the
-      // queue trigger) for the worker the billing swap brings up.
+      // queue trigger) for the worker the billing swap brings up. That worker
+      // runs no turn now and is marked idle; a steering-held worker's live
+      // turn goes on.
       const result = db.prepare(`
         UPDATE queue
         SET status = 'pending', processing_at = NULL, attempt_id = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL
@@ -11108,6 +10486,7 @@ export function registerMessagesRoutes(app, deps) {
       if (result.changes > 0) {
         settleRelayAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-requeued' });
         settleRelaySubagentAbortControlsForQueueMessage(messageId, { ok: false, error: 'queue-requeued' });
+        if (handBackClass === 'kind-mismatch') markOwnerIdle();
         io.emit('message_status', { messageId, conversationId: q.conversation_id, status: 'pending' });
         console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} class=${handBackClass} retry=${Number(q.retry_count || 0)}`);
       }
@@ -11136,48 +10515,35 @@ export function registerMessagesRoutes(app, deps) {
         });
         console.log(`[${ts()}] FAILED    ${messageId?.slice(0,8)} retry=${retryCount} reason=timeout`);
       } else {
-        const restartState = relayRestartOrchestrator?.getState?.() || null;
-        const parkForRestart = shouldParkForRestart(restartState);
         const transientRequeue = isTransientRequeue({
           queueRow: q,
           relayActivityCount: stmts.listActivityByQueueMessage?.all?.(messageId)?.length || 0,
           relayStreamCount: stmts.listStreamEventsByQueueMessage?.all?.(messageId)?.length || 0,
         });
-        const nextAttemptAt = parkForRestart
-          ? null
-          : addMsIso(computeRetryDelayMs(retryCount, { transient: transientRequeue }));
+        const nextAttemptAt = addMsIso(computeRetryDelayMs(retryCount, { transient: transientRequeue }));
         const result = db.prepare(`
           UPDATE queue
           SET
-            status = ?,
+            status = 'pending',
             processing_at = NULL,
             attempt_id = NULL,
             retry_count = ?,
             next_attempt_at = ?,
-            owner_lease_expires_at = NULL,
-            parked_at = ?,
-            parked_target_session_id = ?,
-            parked_transaction_id = ?,
-            parked_reason = ?
+            owner_lease_expires_at = NULL
           WHERE id = ? AND status = 'processing'${claimedAttemptId ? ` AND attempt_id = ?` : ''}
         `).run(
-          parkForRestart ? 'parked' : 'pending',
           retryCount,
           nextAttemptAt,
-          parkForRestart ? new Date().toISOString() : null,
-          parkForRestart ? (restartState?.targetSessionId || null) : null,
-          parkForRestart ? (restartState?.transactionId || null) : null,
-          parkForRestart ? (restartState?.lastError || 'session-rebind-pending') : null,
           ...(claimedAttemptId ? [messageId, claimedAttemptId] : [messageId]),
         );
         if (result.changes > 0) {
           settleRelayAbortControlsForQueueMessage(messageId, {
             ok: false,
-            error: parkForRestart ? 'queue-parked' : 'queue-requeued',
+            error: 'queue-requeued',
           });
           settleRelaySubagentAbortControlsForQueueMessage(messageId, {
             ok: false,
-            error: parkForRestart ? 'queue-parked' : 'queue-requeued',
+            error: 'queue-requeued',
           });
           if (ownerSessionId) {
             sessionWorkerSupervisor?.markError?.(ownerSessionId, `requeue-retry:${retryCount}`);
@@ -11187,14 +10553,14 @@ export function registerMessagesRoutes(app, deps) {
               conversationId: q?.conversation_id || null,
               messageId,
               continuationId: null,
-              state: parkForRestart ? 'parked' : 'pending',
+              state: 'pending',
               retry: retryCount,
               pid: null,
-              extra: parkForRestart ? { parkedForRestart: true } : null,
+              extra: null,
             });
           }
-          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} class=${transientRequeue ? 'transient' : 'failure'} status=${parkForRestart ? 'parked' : 'pending'}${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
-          io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: parkForRestart ? 'parked' : 'pending' });
+          console.log(`[${ts()}] REQUEUED  ${messageId?.slice(0,8)} retry=${retryCount} class=${transientRequeue ? 'transient' : 'failure'} status=pending${nextAttemptAt ? ` next=${nextAttemptAt}` : ''}`);
+          io.emit('message_status', { messageId, conversationId: q?.conversation_id, status: 'pending' });
         }
       }
     }

@@ -5,9 +5,9 @@ import { relayRuntimeNodeFlags, relayRuntimeNodeFlagsOrNone } from './relay-heap
 import { detectRelayHosting } from './services/relay-restart-picture.mjs';
 
 // Role selection travels on argv, never in the environment. The runtime's env is
-// inherited by tmux worker sessions and by the Copilot CLI it launches, and the
-// CLI extension spawns the next server from that same env — so an env-based role
-// flag silently decided the role of unrelated future servers.
+// inherited by tmux worker sessions and by the workers it launches, and the
+// removed Copilot CLI extension spawned the next server from that same env — so an
+// env-based role flag silently decided the role of unrelated future servers.
 export const RELAY_RUNTIME_FLAG = '--relay-runtime';
 export const RELAY_SUPERVISED_FLAG = '--supervised';
 

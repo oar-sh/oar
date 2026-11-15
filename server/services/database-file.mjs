@@ -52,7 +52,8 @@ export const STARTUP_SETTING_KEYS = Object.freeze([
   'model_refresh_last',
 ]);
 // And the tables such a start fills that hold no one's work: the model
-// catalog and its refresh state, the restart orchestrator's one row, the
+// catalog and its refresh state, the one row an earlier version's restart
+// orchestrator wrote (nothing reads or writes it now), the
 // media index's extractor version (migration 0039; its items and queue
 // follow messages and stay empty without them). (The shadow tables of the
 // message search are left out too: they follow messages.) Any other table

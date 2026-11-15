@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The live bubble of a running turn nests one bubble per subagent. Each is
 // folded to its header until the user opens it, so the turn stays scrollable
@@ -8,23 +12,6 @@ import { relayToken } from "./e2e-env.mjs";
 //
 // Everything is injected through the routes a session worker publishes on
 // (the queued turn never runs: CLI spawn is disabled on the test server).
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
 
 test.describe("live subagent bubbles", () => {
   test.use({ viewport: { width: 412, height: 915 } });
@@ -38,18 +25,14 @@ test.describe("live subagent bubbles", () => {
     let conversationId = "";
     let messageId = "";
 
-    const publish = (route, data) => request.post(route, { headers, data: { messageId, conversationId, ...data } });
+    const publish = (route, data) => request.post(route, { headers, data: { ...attemptOf(messageId), messageId, conversationId, ...data } });
 
     try {
-      const queued = await request.post("/api/message", {
-        headers,
-        data: { text: `Fold the finished subagents ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-      });
-      expect(queued.ok()).toBeTruthy();
-      const queuedBody = await queued.json();
-      conversationId = String(queuedBody?.conversationId || "");
-      messageId = String(queuedBody?.messageId || "");
-      await dequeue(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+      // Made as the web client makes a chat: bound to its session from the start.
+      const started = await startConversation({ text: `Fold the finished subagents ${stamp}` });
+      conversationId = String(started.conversationId || "");
+      messageId = String(started.messageId || "");
+      await started.worker.take(messageId);
 
       for (const [subagentRunId, displayName] of [[finishedRun, "Check the imports"], [runningRun, "Check the tests"]]) {
         expect((await publish("/api/subagent-run", { subagentRunId, displayName, status: "running" })).ok()).toBeTruthy();
@@ -114,10 +97,7 @@ test.describe("live subagent bubbles", () => {
       await expect(running.locator(".subagent-bubble-summary")).toContainText("3 steps");
     } finally {
       if (messageId && conversationId) {
-        await request.post("/api/response", {
-          headers,
-          data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
-        }).catch(() => {});
+        await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
         await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});
       }
     }

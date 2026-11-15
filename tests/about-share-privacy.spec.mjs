@@ -3,6 +3,10 @@ import path from "node:path";
 import { expect, test } from "@playwright/test";
 
 import { startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // The database file's full path and the backup folder are the owner's: About
 // OAR shows them (GET /api/about), a share viewer never learns them. One relay
@@ -51,18 +55,8 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function dequeue(messageId, ownerSessionId) {
-  const headers = ownerSessionId ? { ...ownerHeaders(), "x-relay-session-id": ownerSessionId } : ownerHeaders();
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const response = await fetch(`${relay.baseUrl}/api/pending`, { headers });
-    expect(response.ok).toBe(true);
-    const message = (await response.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await ownerJson("POST", "/api/requeue", { messageId: String(message.id) }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
+// The relay of this spec, for the worker the spec plays.
+const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
 
 // One turn with every kind of content a shared view loads: an uploaded
 // image on the user message, a tool line, a sub-agent run with its record,
@@ -77,20 +71,17 @@ async function seedConversation() {
   expect(uploaded.status).toBe(200);
   const attachment = (await uploaded.json()).attachment;
 
-  const queued = await ownerJson("POST", "/api/message", {
+  // Made as the web client makes a chat: bound to its session from the start.
+  const { conversationId, messageId, worker } = await startConversation({
     text: `Where do the seed trays go ${stamp}`,
-    relayMode: "agent",
-    model: "gpt-5.4-mini",
-    attachments: [{ sha256: attachment.sha256, name: "tray.png", type: "image/png" }],
-  });
-  const conversationId = String(queued.conversationId || "");
-  const messageId = String(queued.messageId || "");
+    message: { attachments: [{ sha256: attachment.sha256, name: "tray.png", type: "image/png" }] },
+  }, onRelay);
   expect(conversationId).toBeTruthy();
-  await dequeue(messageId, String(queued.ownerSessionId || ""));
-  await ownerJson("POST", "/api/session-sync", { sdk_session_id: `pw-sid-share-privacy-${stamp}`, conversation_id: conversationId });
-  await ownerJson("POST", "/api/activity", { messageId, conversationId, mode: "agent", text: "Read the tray notes" });
+  await worker.take(messageId);
+  await ownerJson("POST", "/api/activity", { ...attemptOf(messageId), messageId, conversationId, mode: "agent", text: "Read the tray notes" });
   const runId = `toolu_share_privacy_${stamp}`;
   await ownerJson("POST", "/api/subagent-run", {
+    ...attemptOf(messageId),
     messageId, conversationId, subagentRunId: runId, displayName: "Count the trays", status: "running", subagentType: "Explore", timelineOwner: "worker",
   });
   await ownerJson("POST", "/api/subagent-timeline", {
@@ -102,14 +93,13 @@ async function seedConversation() {
     ],
     header: { status: "completed" },
   });
-  await ownerJson("POST", "/api/response", {
-    messageId,
-    conversationId,
+  const answered = await worker.respond(messageId, {
     text: `The trays go on the top shelf ${stamp}.`,
     model: "gpt-5.4-mini",
     mode: "agent",
     generatedImages: [{ name: "tray-sketch", mimeType: "image/png", data: PNG_BASE64 }],
   });
+  expect(answered.ok, `POST /api/response answered ${answered.status}`).toBe(true);
   return { conversationId, runId, replyText: `The trays go on the top shelf ${stamp}.` };
 }
 

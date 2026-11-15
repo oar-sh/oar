@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { relayToken } from "./e2e-env.mjs";
 import { clickHeaderAction } from "./header-actions-helpers.mjs";
+import { attemptOf, respondAsWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 // A compaction shows as a break line above the turn while it runs
 // ("Compacting context…", with the live bubble saying so too), and the same
@@ -18,19 +22,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function dequeue(request, headers, messageId, ownerSessionId) {
-  const dequeueHeaders = ownerSessionId ? { ...headers, "x-relay-session-id": ownerSessionId } : headers;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const dequeued = await request.get("/api/pending", { headers: dequeueHeaders });
-    expect(dequeued.ok()).toBeTruthy();
-    const message = (await dequeued.json())?.message || null;
-    if (message && String(message.id) === messageId) return;
-    if (message) await request.post("/api/requeue", { headers, data: { messageId: String(message.id) } }).catch(() => {});
-    await sleep(200);
-  }
-  throw new Error("the queued message was never handed out");
-}
-
 test("a running compaction is one line that turns into the final one; the window slider saves on close", async ({ page, request }) => {
   const token = relayToken();
   const headers = { Authorization: `Bearer ${token}` };
@@ -39,18 +30,14 @@ test("a running compaction is one line that turns into the final one; the window
   let messageId = "";
   let finished = false;
 
-  const publish = (data) => request.post("/api/activity", { headers, data: { messageId, conversationId, mode: "agent", ...data } });
+  const publish = (data) => request.post("/api/activity", { headers, data: { ...attemptOf(messageId), messageId, conversationId, mode: "agent", ...data } });
 
   try {
-    const queued = await request.post("/api/message", {
-      headers,
-      data: { text: `Compact the context ${stamp}`, relayMode: "agent", model: "gpt-5.4-mini" },
-    });
-    expect(queued.ok()).toBeTruthy();
-    const queuedBody = await queued.json();
-    conversationId = String(queuedBody?.conversationId || "");
-    messageId = String(queuedBody?.messageId || "");
-    await dequeue(request, headers, messageId, String(queuedBody?.ownerSessionId || ""));
+    // Made as the web client makes a chat: bound to its session from the start.
+    const started = await startConversation({ text: `Compact the context ${stamp}` });
+    conversationId = String(started.conversationId || "");
+    messageId = String(started.messageId || "");
+    await started.worker.take(messageId);
     expect((await publish({ text: "Tool (view): notes.md" })).ok()).toBeTruthy();
 
     await page.addInitScript((id) => { window.localStorage.setItem("copilot_last_conv", id); }, conversationId);
@@ -89,10 +76,7 @@ test("a running compaction is one line that turns into the final one; the window
 
     // The reply carries the line from here on (the end of a turn reloads the
     // transcript, so the node itself is rebuilt).
-    expect((await request.post("/api/response", {
-      headers,
-      data: { messageId, conversationId, text: `Compacted ${stamp}`, model: "gpt-5.4-mini", mode: "agent" },
-    })).ok()).toBeTruthy();
+    expect((await respondAsWorker(messageId, { conversationId, text: `Compacted ${stamp}`, model: "gpt-5.4-mini", mode: "agent" })).ok).toBeTruthy();
     finished = true;
     await expect(bubble).toHaveCount(0);
     await expect(page.locator(".msg.assistant", { hasText: `Compacted ${stamp}` })).toBeVisible();
@@ -196,10 +180,7 @@ test("a running compaction is one line that turns into the final one; the window
   } finally {
     if (messageId && conversationId) {
       if (!finished) {
-        await request.post("/api/response", {
-          headers,
-          data: { messageId, conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" },
-        }).catch(() => {});
+        await respondAsWorker(messageId, { conversationId, text: "cleanup", model: "gpt-5.4-mini", mode: "agent" }).catch(() => {});
       }
       await request.post(`/api/conversation/${conversationId}/archive`, { headers }).catch(() => {});
     }

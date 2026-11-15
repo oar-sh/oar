@@ -7,6 +7,10 @@ import { expect, test } from "@playwright/test";
 
 import { clickHeaderAction, openChatActionsMenu, waitForHeaderFit } from "./header-actions-helpers.mjs";
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, createFakeWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The session header on a phone comes in two rows: ☰, the title and the
@@ -43,6 +47,7 @@ test.describe.serial("the session header on a phone", () => {
   test.describe.configure({ timeout: 180_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const suffix = Date.now();
   let lead = "";
   let child = "";
@@ -62,25 +67,15 @@ test.describe.serial("the session header on a phone", () => {
     body: { conversationId, action, args },
   });
 
-  async function take(conversationId, headers = {}) {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.conversationId || dequeued.payload?.message?.conversation_id || "") === conversationId) return;
-      await sleep(250);
-    }
-    throw new Error(`No message of ${conversationId.slice(0, 8)} was handed out`);
+  // The conversation's worker takes its next message off the queue.
+  async function take(conversationId) {
+    await createFakeWorker({ ...onRelay, sessionId: conversationId, conversationId }).take();
   }
 
   async function runningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, ownerSessionId, messageId } = queued.payload;
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: conversationId, conversation_id: conversationId },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    await take(conversationId, ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {});
+    // Made as the web client makes a chat: bound to its session (its own id) from the start.
+    const { conversationId, messageId } = await startConversation({ text }, onRelay);
+    await take(conversationId);
     return { conversationId, messageId };
   }
 
@@ -345,7 +340,7 @@ test.describe.serial("the session header on a phone", () => {
     const turn = await runningTurn(`Beetle trap tally ${suffix} along the east hedge, second count of the season`);
     const asked = await api("/api/relay-question", {
       method: "POST",
-      body: { queueId: turn.messageId, prompt: "Which plot is counted first?", choices: ["North plot", "South plot"], timeout_ms: 600_000 },
+      body: { ...attemptOf(turn.messageId), queueId: turn.messageId, prompt: "Which plot is counted first?", choices: ["North plot", "South plot"], timeout_ms: 600_000 },
     });
     expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
     questionOpen = true;

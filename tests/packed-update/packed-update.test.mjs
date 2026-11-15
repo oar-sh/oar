@@ -984,7 +984,6 @@ describe("packed npm updates (0.9.19, 0.9.23) -> this branch", () => {
     const stub = writeStubWorker(state, pkg);
     const relayEnv = {
       // Workers launched by the relay, with the stand-in for Claude's.
-      COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
       COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: stub.script,
       // The SDKs from the cache the setup filled, and once online for a
       // version a stale cached packument does not know (sdkInstallEnv).
@@ -1084,7 +1083,6 @@ describe("packed npm updates (0.9.19, 0.9.23) -> this branch", () => {
     const firstTurn = addPendingTurn(dbFile, fixture);
     const stub = writeLiveStubWorker(state, pkg);
     const relayEnv = {
-      COPILOT_REMOTE_SESSION_WORKER_ROUTING_ENABLED: "1",
       COPILOT_WEB_RELAY_CLAUDE_WORKER_PATH: stub.script,
       npm_config_prefer_offline: "true",
       ...sdkInstallEnv(state, pkg),

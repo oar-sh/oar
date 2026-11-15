@@ -26,7 +26,7 @@ import {
 } from './session-worker-launch-service.mjs';
 
 const TEST_KEY = 'sk-ant-api03-test-0000';
-const OTHER_KINDS = Object.freeze(['', 'claude', 'claude-cloud', 'cursor', 'grok', 'copilot-sdk', 'deepseek']);
+const OTHER_KINDS = Object.freeze(['claude', 'claude-cloud', 'cursor', 'grok', 'copilot-sdk', 'deepseek']);
 
 function claudeApiEnv(extra = {}) {
   return applyClaudeApiProviderEnvironment({ PATH: '/bin', ...extra }, {
@@ -65,7 +65,7 @@ test('the clear chain takes every Claude API variable out, in any order, and lea
       applyClaudeProviderEnvironment(applyOpenAIProviderEnvironment(stale)),
     ))),
   )));
-  assert.equal(resolveWorkerKind(cleared), 'copilot');
+  assert.equal(resolveWorkerKind(cleared), '');
   for (const key of ['OAR_CLAUDE_API_KEY', 'CLAUDE_API_RELAY_MODEL']) assert.equal(key in cleared, false, key);
   const claude = applyClaudeApiProviderEnvironment(applyClaudeProviderEnvironment({}, { enabled: true, model: 'claude-opus-5' }));
   assert.equal(claude.COPILOT_WEB_RELAY_WORKER_KIND, 'claude');
@@ -93,9 +93,9 @@ test('the Claude API key is a secret of the Claude API worker and of no other', 
   }
   for (const kind of OTHER_KINDS) {
     const env = { COPILOT_WEB_RELAY_WORKER_KIND: kind, OAR_CLAUDE_API_KEY: TEST_KEY };
-    assert.equal(workerSecretEnvVarsFor(env).includes('OAR_CLAUDE_API_KEY'), false, kind || 'copilot');
+    assert.equal(workerSecretEnvVarsFor(env).includes('OAR_CLAUDE_API_KEY'), false, kind);
     // A key exported in the relay's own environment does not travel either.
-    assert.equal('OAR_CLAUDE_API_KEY' in withoutForeignWorkerSecrets(env), false, kind || 'copilot');
+    assert.equal('OAR_CLAUDE_API_KEY' in withoutForeignWorkerSecrets(env), false, kind);
   }
   const scrubbed = withoutForeignWorkerSecrets(claudeApiEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'test-token-value', ANTHROPIC_API_KEY: 'test-host-key' }));
   assert.equal(scrubbed.OAR_CLAUDE_API_KEY, TEST_KEY);
@@ -119,7 +119,7 @@ test('the secret file of a Claude API launch carries the key, owner-only, and no
   for (const kind of OTHER_KINDS) {
     writes.length = 0;
     createWorkerSecretEnvFile({ COPILOT_WEB_RELAY_WORKER_KIND: kind, OAR_CLAUDE_API_KEY: TEST_KEY }, { fsImpl, tempRoot: '/tmp' });
-    assert.equal(writes.some((write) => String(write[1]).includes(TEST_KEY)), false, kind || 'copilot');
+    assert.equal(writes.some((write) => String(write[1]).includes(TEST_KEY)), false, kind);
   }
 });
 
@@ -148,10 +148,10 @@ test('every other kind\'s tmux command leaves the key out and unsets a host valu
     try {
       command = buildTmuxWorkerShellCommand('session-1', env, { secretEnvFilePath: '/tmp/copilot-relay-worker-test/provider.env' });
     } catch (error) {
-      assert.fail(`${kind || 'copilot'}: ${error.message}`);
+      assert.fail(`${kind}: ${error.message}`);
     }
-    assert.equal(command.includes(TEST_KEY), false, kind || 'copilot');
-    assert.match(command, /^unset [^;]*\bOAR_CLAUDE_API_KEY\b/, kind || 'copilot');
+    assert.equal(command.includes(TEST_KEY), false, kind);
+    assert.match(command, /^unset [^;]*\bOAR_CLAUDE_API_KEY\b/, kind);
   }
 });
 

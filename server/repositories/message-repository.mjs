@@ -3,7 +3,6 @@
 import { createShareVisibilityStatements } from './share-visibility-statements.mjs';
 import { createMessagePinStatements } from './message-pin-statements.mjs';
 import { createConversationHistoryPageStatements } from '../services/conversation-history-page.mjs';
-import { sessionWorkerProviderSqlList } from '../../shared/provider-routing.mjs';
 
 /**
  * The claim's plan-boundary hold, part of every findPending*
@@ -31,6 +30,28 @@ export function planBoundaryHoldSql(alias) {
       AND (LOWER(TRIM(COALESCE(live.relay_mode, ''))) = 'plan') != (LOWER(TRIM(COALESCE(held.relay_mode, ''))) = 'plan')
   )`;
 }
+
+/**
+ * The session a queue row is bound to: its owner, else its runtime session's,
+ * else its conversation's session. NULL for a row of a chat that was never
+ * bound. Needs the aliases q (queue), rs (the row's runtime session) and c
+ * (its conversation).
+ */
+export const QUEUE_ROW_BOUND_SESSION_SQL = `COALESCE(
+              NULLIF(q.owner_sdk_session_id, ''),
+              NULLIF(rs.sdk_session_id, ''),
+              NULLIF(c.sdk_session_id, '')
+            )`;
+
+/**
+ * The session a queue row belongs to: the bound one, else the session named
+ * like its conversation (the id a worker of a chat that was never bound runs
+ * under). Never NULL, so every pending row has one session whose worker may
+ * claim it and for which the waker launches one. The claim
+ * (findPendingForWorker) and the waker (listPendingWorkerOwnerSessionIds) both
+ * read it, so they never disagree. Same aliases.
+ */
+export const QUEUE_ROW_SESSION_SQL = `COALESCE(${QUEUE_ROW_BOUND_SESSION_SQL}, q.conversation_id)`;
 
 export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
@@ -204,8 +225,8 @@ export function createMessageRepository(db) {
         // Quiet teardown for a continuation whose worker died: there is no
         // user to answer, so it fails without the terminal-failure ceremony.
         dropStaleContinuation: db.prepare(`UPDATE queue SET status = 'failed', processing_at = NULL, next_attempt_at = NULL, owner_lease_expires_at = NULL WHERE id = ? AND status = 'processing' AND kind = 'continuation'`),
-        // Claim ordering (all findPending* variants and the owner-transfer
-        // scan): strict send order, rowid breaking same-millisecond ties.
+        // Claim ordering (findPendingForWorker): strict send order, rowid
+        // breaking same-millisecond ties.
         // Neither retry_count nor next_attempt_at may rank rows: dead-worker
         // recovery and /api/requeue bump retry_count, so ranking by it ran a
         // recovered OLDER message after newer ones in the same conversation,
@@ -214,43 +235,6 @@ export function createMessageRepository(db) {
         // steer-recovered row waited 5 minutes while newer messages jumped
         // it). Head-of-line protection is the WHERE clause's next_attempt_at
         // backoff plus MAX_REQUEUE_RETRIES, which fails a row for good.
-        findPending:    db.prepare(`SELECT q.* FROM queue q WHERE q.status = 'pending' AND COALESCE(q.kind, '') != 'continuation' AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?) AND ${planBoundaryHoldSql('q')} ORDER BY q.timestamp ASC, q.rowid ASC LIMIT 1`),
-        // Global fallback for requesters without a session identity (the legacy
-        // Copilot relay CLI). Conversations bound to a session-worker provider
-        // (claude/cursor/grok) are excluded outright: handing one of their turns
-        // to the relay executes it on the Copilot plan under whatever model the
-        // id happens to resolve to there, invisibly to the user.
-        //
-        // Owned rows are excluded too. An owner means a session worker is
-        // responsible for the turn, and the relay polls every 2s while a worker
-        // takes ~a minute to become ready — so without this the relay wins that
-        // race and fails a turn it cannot run (an OpenAI image model is not a
-        // Copilot model), costing a retry and a backoff. Owners are only
-        // assigned when session-worker routing is enabled
-        // (resolveInitialQueueOwnerSessionId returns null otherwise), so
-        // routing-disabled installs still hand the relay every row.
-        findPendingForLegacyRelay: db.prepare(`
-          SELECT q.*
-          FROM queue q
-          LEFT JOIN runtime_sessions rs
-            ON rs.id = q.runtime_session_id
-          LEFT JOIN runtime_sessions rsc
-            ON rsc.conversation_id = q.conversation_id
-          WHERE q.status = 'pending'
-            AND COALESCE(q.kind, '') != 'continuation'
-            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-            AND NULLIF(q.owner_sdk_session_id, '') IS NULL
-            AND LOWER(COALESCE(
-              NULLIF(rs.provider_type, ''),
-              NULLIF(rsc.provider_type, ''),
-              'github'
-            )) NOT IN (${sessionWorkerProviderSqlList()})
-            AND ${planBoundaryHoldSql('q')}
-          ORDER BY
-            q.timestamp ASC,
-            q.rowid ASC
-          LIMIT 1
-        `),
         findPendingForWorker: db.prepare(`
           SELECT q.*
           FROM queue q
@@ -261,85 +245,20 @@ export function createMessageRepository(db) {
           WHERE q.status = 'pending'
             AND COALESCE(q.kind, '') != 'continuation'
             AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-            AND (
-              (
-                COALESCE(
-                  NULLIF(q.owner_sdk_session_id, ''),
-                  NULLIF(rs.sdk_session_id, ''),
-                  NULLIF(c.sdk_session_id, '')
-                ) IS NULL
-                -- Defense in depth: session-worker-provider turns are always
-                -- born owned, so an unowned one is a routing anomaly — it must
-                -- never be claimable by an arbitrary worker of a different
-                -- provider (isolation would otherwise rest on owner assignment
-                -- alone).
-                AND LOWER(COALESCE(NULLIF(rs.provider_type, ''), 'github'))
-                  NOT IN (${sessionWorkerProviderSqlList()})
-              )
-              OR COALESCE(
-                NULLIF(q.owner_sdk_session_id, ''),
-                NULLIF(rs.sdk_session_id, ''),
-                NULLIF(c.sdk_session_id, '')
-              ) = ?
-            )
-            AND ${planBoundaryHoldSql('q')}
-          ORDER BY
-            CASE
-              WHEN COALESCE(
-                NULLIF(q.owner_sdk_session_id, ''),
-                NULLIF(rs.sdk_session_id, ''),
-                NULLIF(c.sdk_session_id, '')
-              ) = ? THEN 0
-              ELSE 1
-            END ASC,
-            q.timestamp ASC,
-            q.rowid ASC
-          LIMIT 1
-        `),
-        findPendingForSessionAffinity: db.prepare(`
-          SELECT q.*
-          FROM queue q
-          LEFT JOIN runtime_sessions rs
-            ON rs.id = q.runtime_session_id
-          LEFT JOIN conversations c
-            ON c.id = q.conversation_id
-          WHERE q.status = 'pending'
-            AND COALESCE(q.kind, '') != 'continuation'
-            AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?)
-            AND COALESCE(
-              NULLIF(q.owner_sdk_session_id, ''),
-              NULLIF(rs.sdk_session_id, ''),
-              NULLIF(c.sdk_session_id, '')
-            ) = ?
+            -- Only the requesting session's own rows: a row is never handed to
+            -- the worker of another session, whatever its provider.
+            AND ${QUEUE_ROW_SESSION_SQL} = ?
             AND ${planBoundaryHoldSql('q')}
           ORDER BY
             q.timestamp ASC,
             q.rowid ASC
           LIMIT 1
         `),
-        countQueueWorkForSessionAffinity: db.prepare(`
-          SELECT COUNT(*) AS cnt
-          FROM queue q
-          LEFT JOIN runtime_sessions rs
-            ON rs.id = q.runtime_session_id
-          LEFT JOIN conversations c
-            ON c.id = q.conversation_id
-          WHERE (
-            (q.status = 'pending' AND (q.next_attempt_at IS NULL OR q.next_attempt_at <= ?))
-            OR q.status = 'processing'
-          )
-            AND COALESCE(
-              NULLIF(q.owner_sdk_session_id, ''),
-              NULLIF(rs.sdk_session_id, ''),
-              NULLIF(c.sdk_session_id, '')
-            ) = ?
-        `),
+        // The sessions with pending rows, for the waker to launch. A row of a
+        // conversation that is gone (no row, or deleted and about to be
+        // removed with its queue) launches nothing.
         listPendingWorkerOwnerSessionIds: db.prepare(`
-          SELECT COALESCE(
-            NULLIF(q.owner_sdk_session_id, ''),
-            NULLIF(rs.sdk_session_id, ''),
-            NULLIF(c.sdk_session_id, '')
-          ) AS sdk_session_id
+          SELECT ${QUEUE_ROW_SESSION_SQL} AS sdk_session_id
           FROM queue q
           LEFT JOIN runtime_sessions rs
             ON rs.id = q.runtime_session_id
@@ -347,18 +266,70 @@ export function createMessageRepository(db) {
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
             ${notHeldForUsageLimit('q.')}
-            AND COALESCE(
-              NULLIF(q.owner_sdk_session_id, ''),
-              NULLIF(rs.sdk_session_id, ''),
-              NULLIF(c.sdk_session_id, '')
-            ) IS NOT NULL
-          GROUP BY COALESCE(
-            NULLIF(q.owner_sdk_session_id, ''),
-            NULLIF(rs.sdk_session_id, ''),
-            NULLIF(c.sdk_session_id, '')
-          )
+            AND c.id IS NOT NULL
+            AND c.status != 'deleted'
+          GROUP BY ${QUEUE_ROW_SESSION_SQL}
           ORDER BY MIN(q.timestamp) ASC
           LIMIT ?
+        `),
+        // Pending rows no worker will take because their conversation is gone:
+        // no row any more (the queue has no foreign key to it), or deleted
+        // before the cutoff and not removed with its queue, as when the relay
+        // stopped between the two steps of a delete. A delete normally
+        // removes them itself, so the cutoff leaves it the time to.
+        listPendingRowsOfGoneConversations: db.prepare(`
+          SELECT q.id, q.conversation_id
+          FROM queue q
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND (c.id IS NULL OR (c.status = 'deleted' AND c.updated_at < ?))
+          ORDER BY q.timestamp ASC, q.rowid ASC
+        `),
+        // Pending rows of a live conversation that are bound to no session:
+        // before the conversation id became the last owner fallback, no worker
+        // was launched for them. How many there are and the oldest's send time.
+        summarizeUnboundPendingRows: db.prepare(`
+          SELECT COUNT(*) AS count, MIN(q.timestamp) AS oldest_at
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND c.status != 'deleted'
+            AND ${QUEUE_ROW_BOUND_SESSION_SQL} IS NULL
+        `),
+        // The same rows, sent before the cutoff.
+        listUnboundPendingRowsBefore: db.prepare(`
+          SELECT q.id, q.conversation_id, q.model, q.relay_mode, q.timestamp
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND c.status != 'deleted'
+            AND ${QUEUE_ROW_BOUND_SESSION_SQL} IS NULL
+            AND q.timestamp < ?
+          ORDER BY q.timestamp ASC, q.rowid ASC
+        `),
+        // A session's pending rows on the Claude API key (a row's stamp, else
+        // the billing bound with the second parameter): failed closed instead
+        // of a launch while Claude API cannot run a turn
+        // (server-runtime.mjs, failClaudeApiRowsWithoutLaunch). The rows of the
+        // session as the claim reads them, ownerless ones included.
+        listPendingClaudeApiRowsForSession: db.prepare(`
+          SELECT q.id
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND ${QUEUE_ROW_SESSION_SQL} = ?
+            AND COALESCE(q.kind, '') != 'continuation'
+            AND LOWER(COALESCE(${queueHasProvider ? 'q.provider' : 'NULL'}, ?)) = 'claude-api'
         `),
         countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') ${notHeldForUsageLimit()} GROUP BY status`),
         // Stale recovery has nothing to look at while no row is processing.
@@ -379,7 +350,6 @@ export function createMessageRepository(db) {
           GROUP BY q.conversation_id
         `),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),
-        setProcessing:  db.prepare(`UPDATE queue SET status = 'processing', processing_at = ?, attempt_id = ? WHERE id = ?`),
         setProcessingWithWorkerLease: db.prepare(`
           UPDATE queue
           SET
@@ -563,45 +533,12 @@ export function createMessageRepository(db) {
         // above is ambiguous — callers that need "the live turn" resolve it
         // from this list by which row is actually producing output.
         listProcessingQueueByConversation: db.prepare(`SELECT id, relay_mode, timestamp, processing_at FROM queue WHERE conversation_id = ? AND status = 'processing' ORDER BY COALESCE(processing_at, timestamp) ASC`),
-        parkPendingQueueForRestart: db.prepare(`
-          UPDATE queue
-          SET
-            status = 'parked',
-            next_attempt_at = NULL,
-            parked_at = COALESCE(parked_at, @parkedAt),
-            parked_target_session_id = @targetSessionId,
-            parked_transaction_id = @transactionId,
-            parked_reason = @reason
-          WHERE status = 'pending'
-        `),
-        listParkedQueueForRelease: db.prepare(`
-          SELECT id, conversation_id
+        // Read-only: how many rows are parked and when the oldest was parked.
+        summarizeParkedQueue: db.prepare(`
+          SELECT COUNT(*) AS count, MIN(COALESCE(parked_at, timestamp)) AS oldest_parked_at
           FROM queue
           WHERE status = 'parked'
-            AND (
-              parked_transaction_id IS NULL
-              OR parked_transaction_id = ?
-              OR parked_target_session_id = ?
-            )
-          ORDER BY COALESCE(parked_at, timestamp) ASC, timestamp ASC
         `),
-        listAllParkedQueueForRelease: db.prepare(`
-          SELECT id, conversation_id
-          FROM queue
-          WHERE status = 'parked'
-          ORDER BY COALESCE(parked_at, timestamp) ASC, timestamp ASC
-        `),
-        releaseParkedQueueByIds: db.prepare(`
-          UPDATE queue
-          SET
-            status = 'pending',
-            parked_at = NULL,
-            parked_target_session_id = NULL,
-            parked_transaction_id = NULL,
-            parked_reason = NULL
-          WHERE id = ? AND status = 'parked'
-        `),
-
 
         // uploads
         getUploadFile: db.prepare(`SELECT * FROM uploaded_files WHERE sha256 = ?`),

@@ -3,14 +3,17 @@ import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
 import { sleep, startRelayServer } from "./relay-server-harness.mjs";
+import { attemptOf, createFakeWorker, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+
+// No turn a fake worker still holds outlives this file.
+test.afterAll(() => settleFakeWorkers());
 
 /**
  * The 28px floor for tap targets, at 100 % on a phone (390), a phone on its
  * side (844×390) and a desktop (1280): the sidebar head's buttons, every
  * field, select, checkbox and radio label, slider and button in Settings
  * (General, each provider tab, Relays, a Previews row, Sharing,
- * Notifications, Features;
- * buttons 28 wide too), DeepSeek's "Advanced", Relays' "Add", a Sharing
+ * Notifications; buttons 28 wide too), DeepSeek's "Advanced", Relays' "Add", a Sharing
  * row's title and buttons, the ︙ menu's "Empty queue", the repo browser's
  * toolbar, Focus, crumbs and tree root, the group picker's rows and its
  * name field, the × and ↻ of search, git changes and the sub-agent viewer,
@@ -42,6 +45,7 @@ test.describe.serial("tap targets keep the 28px floor", () => {
   test.describe.configure({ timeout: 180_000 });
 
   let relay = null;
+  const onRelay = { baseUrl: () => relay.baseUrl, token: () => relay.token };
   const suffix = Date.now();
   let lead = "";
   let child = "";
@@ -57,25 +61,15 @@ test.describe.serial("tap targets keep the 28px floor", () => {
     return { status: response.status, payload };
   }
 
-  async function take(conversationId, headers = {}) {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const dequeued = await api("/api/pending", { headers });
-      if (String(dequeued.payload?.message?.conversationId || dequeued.payload?.message?.conversation_id || "") === conversationId) return;
-      await sleep(250);
-    }
-    throw new Error(`No message of ${conversationId.slice(0, 8)} was handed out`);
+  // The conversation's worker takes its next message off the queue.
+  async function take(conversationId) {
+    await createFakeWorker({ ...onRelay, sessionId: conversationId, conversationId }).take();
   }
 
+  // Made as the web client makes a chat: bound to its session from the start.
   async function runningTurn(text) {
-    const queued = await api("/api/message", { method: "POST", body: { text, relayMode: "agent", model: "gpt-5.4-mini" } });
-    expect(queued.status, JSON.stringify(queued.payload)).toBe(200);
-    const { conversationId, ownerSessionId, messageId } = queued.payload;
-    const synced = await api("/api/session-sync", {
-      method: "POST",
-      body: { sdk_session_id: conversationId, conversation_id: conversationId },
-    });
-    expect(synced.status, JSON.stringify(synced.payload)).toBe(200);
-    await take(conversationId, ownerSessionId ? { "x-relay-session-id": String(ownerSessionId) } : {});
+    const { conversationId, ownerSessionId, messageId } = await startConversation({ text }, onRelay);
+    await take(ownerSessionId || conversationId);
     return { conversationId, messageId };
   }
 
@@ -123,7 +117,7 @@ test.describe.serial("tap targets keep the 28px floor", () => {
     asking = turn.conversationId;
     const asked = await api("/api/relay-question", {
       method: "POST",
-      body: { queueId: turn.messageId, prompt: "Which bank is surveyed first?", choices: ["East bank", "West bank"], timeout_ms: 600_000 },
+      body: { ...attemptOf(turn.messageId), queueId: turn.messageId, prompt: "Which bank is surveyed first?", choices: ["East bank", "West bank"], timeout_ms: 600_000 },
     });
     expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
     // The child watches the lead and has a schedule: the header's chips and
@@ -133,7 +127,7 @@ test.describe.serial("tap targets keep the 28px floor", () => {
     // A card in the lead: the head row's pill gets its "waiting" part.
     const leadAsked = await api("/api/relay-question", {
       method: "POST",
-      body: { queueId: leadTurn.messageId, prompt: "Survey the weir as well?", choices: ["Yes", "No"], timeout_ms: 600_000 },
+      body: { ...attemptOf(leadTurn.messageId), queueId: leadTurn.messageId, prompt: "Survey the weir as well?", choices: ["Yes", "No"], timeout_ms: 600_000 },
     });
     expect(leadAsked.status, JSON.stringify(leadAsked.payload)).toBe(200);
     // A shared conversation: Settings → Sharing has a row with its buttons.
@@ -327,12 +321,9 @@ test.describe.serial("tap targets keep the 28px floor", () => {
         await expectTargets(page, ".share-row-title", { label: "Sharing row title" });
         await expectSettingsPanel(page, "#settings-panel-shares");
 
-        for (const tab of ["notifications", "features"]) {
-          await page.evaluate((name) => window.openSettingsModal(name), tab);
-          await expect(page.locator(`#settings-panel-${tab}`)).toBeVisible();
-          if (tab === "features") await settled(page, "#features-flag-list input");
-          await expectSettingsPanel(page, `#settings-panel-${tab}`);
-        }
+        await page.evaluate(() => window.openSettingsModal("notifications"));
+        await expect(page.locator("#settings-panel-notifications")).toBeVisible();
+        await expectSettingsPanel(page, "#settings-panel-notifications");
         await page.evaluate(() => window.closeSettingsModal());
 
         // ︙ → Empty queue.

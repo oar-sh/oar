@@ -115,8 +115,8 @@ function normalizeSteeringAutoCompactWindow(raw) {
 // re-upsert on every heartbeat.
 //
 // `supported` is the worker's opt-in to mid-turn steering and the client
-// composer's only steering gate: a worker that never sets it — the extension
-// path, or a Claude worker old enough to send the 4-field snapshot — keeps
+// composer's only steering gate: a worker that never sets it — such as a
+// Claude worker old enough to send the 4-field snapshot — keeps
 // "Queue". `cancellableIds` lists the pushed rows the worker can still pull
 // back out of its runtime (un-steer).
 export function normalizeWorkerSteeringSnapshot(raw) {
