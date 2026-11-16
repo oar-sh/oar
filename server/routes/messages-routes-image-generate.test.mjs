@@ -8,7 +8,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildOpenAIImageRequestFields, registerMessagesRoutes } from './messages-routes.mjs';
+import { registerMessagesRoutes } from './messages-routes.mjs';
+import { buildOpenAIImageRequestFields } from './messages-image-routes.mjs';
 import { createLocalRequestCheck } from '../services/request-boundary.mjs';
 import {
   FAKE_OPENAI_BASE_URL,

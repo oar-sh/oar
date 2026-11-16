@@ -5,6 +5,60 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.29] — 2026-11-16
+
+Highlights: archiving a conversation cancels what was still queued for
+it, so a scheduled prompt, an event or a follow-up no longer starts the
+archived chat again. OAR sends push notifications with its own Web Push
+sender instead of the `web-push` package, 13 fewer packages in an
+install; the keys and the devices you already set up keep working.
+Cancelling a queued or steered message closes the question cards its
+turns asked.
+
+### Changed
+
+- **Archiving a conversation cancels its queued messages.** A scheduled
+  prompt, an event or a follow-up queued before the archive no longer
+  starts the archived chat again a few seconds later; a follow-up held at
+  the usage limit goes with them, and one note in the chat says what was
+  cancelled. A running turn still refuses the archive.
+- **Push notifications without the `web-push` package.** The relay
+  encrypts and signs Web Push itself (`node:crypto` and `fetch`), and a
+  push service's redirect is treated as a failed send, not followed. The
+  key pair stays the one in the relay database, so devices that get
+  notifications today keep getting them, and nothing needs setting up.
+- **Server routes split into smaller modules.** No change in behaviour.
+
+### Removed
+
+- **The `web-push` dependency,** and with it 13 packages from an install.
+
+### Fixed
+
+- **Cancelling a queued or steered message closes the question cards its
+  turns asked.** A card that an earlier attempt of the message left open
+  is shown as cancelled at once on every device, not left waiting for an
+  answer until a reload.
+
+### Upgrade notes
+
+- **No migration** runs, and there is nothing to do. `web-push` leaves
+  the dependencies; the VAPID keys and the push subscriptions stay in the
+  relay database and are used as before. In a git checkout, `npm ci`
+  after the pull removes the package (the relay no longer loads it, so
+  nothing breaks before that).
+- **Archived conversations:** from this version an archive takes the
+  chat's queued messages with it. Unarchiving does not bring them back;
+  send them again.
+
+### Downgrade notes
+
+Going back to 0.9.28 is safe: `oar update --to 0.9.28` or `npm install -g
+@oar-sh/oar@0.9.28` (in a git checkout: `git checkout v0.9.28`, `npm ci`,
+then a relay restart). The schema and the keys are the same, and 0.9.28
+brings the `web-push` package back with it; push notifications keep
+reaching the same devices.
+
 ## [0.9.28] — 2026-11-15
 
 Highlights: Copilot runs on the SDK worker only, and **Settings →

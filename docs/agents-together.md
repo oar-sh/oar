@@ -547,7 +547,8 @@ A conversation that has schedules, or set them, shows **⏰ N scheduled** in its
 lists them with a **Cancel** button each. A session a schedule fires into has an **ⓘ** in its
 sidebar row whose menu reads *Scheduled · next …* (or *N schedules · next …*). An agent lists its
 schedules with `list_schedules` and ends one with `unschedule`.
-Archiving a session ends the schedules that fire into it and the ones it set; compacting it moves
+Archiving a session ends the schedules that fire into it and the ones it set, and cancels a firing
+that was already queued there; compacting it moves
 them to the new conversation. A conversation holds at most 20. Schedules live on the relay that runs the session; a paired relay keeps its own.
 
 ## Questions that don't block

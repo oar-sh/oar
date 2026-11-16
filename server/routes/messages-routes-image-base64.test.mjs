@@ -10,13 +10,9 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  isBase64Text,
-  normalizeGeneratedImageResponses,
-  normalizeOpenAIImageApiGeneratedImages,
-  resolveOpenAIImageEditAttachment,
-  splitBase64DataUrl,
-} from './messages-routes.mjs';
+import { isBase64Text, splitBase64DataUrl } from './messages-helpers.mjs';
+import { normalizeGeneratedImageResponses } from './messages-routes.mjs';
+import { normalizeOpenAIImageApiGeneratedImages, resolveOpenAIImageEditAttachment } from './messages-image-routes.mjs';
 
 // Past the 4,194,304-character boundary; decodes to 3,375,000 zero bytes.
 const BIG_BASE64 = 'A'.repeat(4_500_000);
@@ -68,12 +64,13 @@ test('with V8 regexp optimisation off, the state of a relay with uptime, the big
   // A file URL, not a path: the ESM loader takes a Windows path such as
   // d:\... for a URL with the scheme "d:" and refuses it.
   const moduleUrl = new URL('./messages-routes.mjs', import.meta.url).href;
+  const imageModuleUrl = new URL('./messages-image-routes.mjs', import.meta.url).href;
   const script = `
+    import { normalizeGeneratedImageResponses } from ${JSON.stringify(moduleUrl)};
     import {
       normalizeOpenAIImageApiGeneratedImages,
-      normalizeGeneratedImageResponses,
       resolveOpenAIImageEditAttachment,
-    } from ${JSON.stringify(moduleUrl)};
+    } from ${JSON.stringify(imageModuleUrl)};
     const big = 'A'.repeat(4_500_000);
     // The old check, for contrast: it threw here on V8 13.6.
     let oldCheck = 'passed';

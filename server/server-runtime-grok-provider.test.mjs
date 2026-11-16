@@ -13,7 +13,11 @@ const runtimeSource = fs.readFileSync(path.join(__dirname, 'server-runtime.mjs')
 const launchSource = fs.readFileSync(path.join(__dirname, 'services', 'session-worker-launch-service.mjs'), 'utf8');
 const dbSchemaSource = fs.readFileSync(path.join(__dirname, 'db-schema.mjs'), 'utf8');
 const sessionsSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
-const messagesSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-routes.mjs'), 'utf8');
+const settingsSource = fs.readFileSync(path.join(__dirname, 'routes', 'settings-routes.mjs'), 'utf8');
+const bootstrapSource = fs.readFileSync(path.join(__dirname, 'routes', 'conversation-bootstrap-routes.mjs'), 'utf8');
+const intakeSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-intake-routes.mjs'), 'utf8');
+const workerReportSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-worker-report-routes.mjs'), 'utf8');
+const workerClaimSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-worker-claim-routes.mjs'), 'utf8');
 
 test('launch service recognizes grok worker kind and script path', () => {
   // The kind list used to be spelled out inside resolveWorkerKind; it is now
@@ -39,19 +43,19 @@ test('server-runtime exposes grok settings and launch binding', () => {
 
 test('sessions-routes bootstrap and settings accept grok', () => {
   assert.match(sessionsSource, /buildModelCatalogWithGrokProvider/);
-  assert.match(sessionsSource, /parseGrokSettingsUpdateRequest/);
-  assert.match(sessionsSource, /\/api\/settings\/grok/);
-  assert.match(sessionsSource, /useGrokProvider/);
-  assert.match(sessionsSource, /GROK_NOT_CONFIGURED/);
-  assert.match(sessionsSource, /normalized === 'grok'/);
+  assert.match(settingsSource, /parseGrokSettingsUpdateRequest/);
+  assert.match(settingsSource, /\/api\/settings\/grok/);
+  assert.match(bootstrapSource, /useGrokProvider/);
+  assert.match(bootstrapSource, /GROK_NOT_CONFIGURED/);
+  assert.match(bootstrapSource, /normalized === 'grok'/);
   assert.match(sessionsSource, /grokModels:/);
 });
 
 test('messages-routes dequeue and native session route support grok', () => {
-  assert.match(messagesSource, /grokNativeSessionId/);
-  assert.match(messagesSource, /\/api\/grok-native-session/);
-  assert.match(messagesSource, /runtimeUsesGrok/);
-  assert.match(messagesSource, /updateRuntimeSessionGrokNativeSessionId/);
+  assert.match(workerClaimSource, /grokNativeSessionId/);
+  assert.match(workerReportSource, /\/api\/grok-native-session/);
+  assert.match(intakeSource, /runtimeUsesGrok/);
+  assert.match(workerReportSource, /updateRuntimeSessionGrokNativeSessionId/);
 });
 
 test('grok worker package entrypoints exist', () => {

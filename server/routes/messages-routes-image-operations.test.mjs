@@ -147,6 +147,38 @@ test('every asset of the operation goes to the edit, the first as the base', asy
   assert.deepEqual(calls.openai[0].init.body.getAll('image[]').map((file) => file.name), ['base.png', 'second.png', 'third.png']);
 });
 
+test('an operation on a generated image edits that image', async (t) => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'oar-image-parent-'));
+  t.after(() => fs.rmSync(stateRoot, { recursive: true, force: true }));
+  const imageDir = path.join(stateRoot, 'sess-demo', 'generated-images', 'conv-1', 'msg-parent');
+  fs.mkdirSync(imageDir, { recursive: true });
+  fs.writeFileSync(path.join(imageDir, 'img-01.png'), Buffer.from(ONE_PIXEL_PNG_BASE64, 'base64'));
+  const parentAttachments = JSON.stringify([{
+    name: 'parent.png',
+    type: 'image/png',
+    generatedImage: { imageId: 'img-01', sessionId: 'sess-demo', relativePath: 'conv-1/msg-parent/img-01.png' },
+  }]);
+  const calls = stubImageFetch(t, { openai: [okReply()] });
+  const { deps } = imageOperationDeps();
+  const operation = deps.stmts.getOperation.get('img_op_demo');
+  deps.stmts.getOperation = { get: (id) => (id === operation.id ? { ...operation, parent_node_id: 'node-parent' } : null) };
+  deps.stmts.getNode = { get: (id) => (id === 'node-parent' ? { assistant_message_id: 'msg-parent', attachment_image_id: 'img-01' } : null) };
+  deps.db.prepare = (sql) => ({
+    run() {},
+    get: (id) => (/FROM messages/.test(sql) && id === 'msg-parent' ? { attachments: parentAttachments } : null),
+    all: () => [],
+  });
+  deps.parseAttachments = (raw) => JSON.parse(raw || '[]');
+  deps.resolveSessionStateRoot = () => stateRoot;
+
+  const { status, body } = await executeOperation(deps);
+
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(body.outcome, 'completed');
+  assert.equal(calls.openai[0].path, '/images/edits');
+  assert.deepEqual(calls.openai[0].init.body.getAll('image[]').map((file) => file.name), ['parent.png']);
+});
+
 test('the images go to /api/response, the route answers with OpenAI\'s usage', async (t) => {
   const usage = { input_tokens: 40, output_tokens: 1056, total_tokens: 1096 };
   const calls = stubImageFetch(t, { openai: [okReply({ usage })] });

@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { classifyOpenAIImageFetchError, registerMessagesRoutes, resolveTerminalFailurePayload } from './messages-routes.mjs';
+import { registerMessagesRoutes, resolveTerminalFailurePayload } from './messages-routes.mjs';
+import { classifyOpenAIImageFetchError } from './messages-image-routes.mjs';
 import {
   FAKE_OPENAI_BASE_URL,
   captureRoutes,

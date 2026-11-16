@@ -413,7 +413,7 @@ test('archiving a cloud conversation archives its cloud session, best effort', a
   await call(harness.app, 'POST /api/conversation/:id/unarchive', { params: { id: conversationId } });
   harness.claudeCloudSessionService.recordWorkerReport({ conversationId, cloudSessionId: SESSION_ID });
   const res = await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
-  assert.deepEqual(res.body, { ok: true, workerStopped: false }, 'the cloud failing changes nothing for the user');
+  assert.deepEqual(res.body, { ok: true, workerStopped: false, cancelledMessageIds: [] }, 'the cloud failing changes nothing for the user');
   assert.equal(harness.stmts.getConvAnyStatus.get(conversationId).archived, 1);
   await settle();
   await settle();
@@ -467,7 +467,7 @@ test('archive and unarchive move a conversation between the live list and the ar
 
   const archived = await call(harness.app, 'POST /api/conversation/:id/archive', { params: { id: conversationId } });
   assert.equal(archived.statusCode, 200);
-  assert.deepEqual(archived.body, { ok: true, workerStopped: false });
+  assert.deepEqual(archived.body, { ok: true, workerStopped: false, cancelledMessageIds: [] });
   assert.deepEqual(harness.emitted.filter(([event]) => event === 'conversation_archived').map(([, payload]) => payload), [
     { conversationId, archived: true },
   ]);

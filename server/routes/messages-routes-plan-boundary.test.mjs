@@ -147,9 +147,19 @@ test('every claim query carries the hold', () => {
     .filter(([name, stmt]) => /^findPending/.test(name) && stmt?.source && /FROM queue\b/.test(stmt.source) && /status = 'pending'/.test(stmt.source));
   assert.deepEqual(claims.map(([name]) => name).sort(), ['findPendingForWorker']);
   for (const [name, stmt] of claims) assert.ok(stmt.source.includes(PLAN_BOUNDARY_HOLD_MARK), name);
-  // The route file prepares no claim of its own.
-  const routes = fs.readFileSync(new URL('./messages-routes.mjs', import.meta.url), 'utf8');
-  assert.equal(routes.includes('planBoundaryHoldSql('), false);
+  // The route files prepare no claim of their own.
+  for (const file of [
+    './messages-routes.mjs',
+    './messages-helpers.mjs',
+    './messages-queue-failure.mjs',
+    './messages-worker-report-routes.mjs',
+    './messages-worker-claim-routes.mjs',
+    './messages-worker-output-routes.mjs',
+    './messages-intake-routes.mjs',
+  ]) {
+    const routes = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.equal(routes.includes('planBoundaryHoldSql('), false, file);
+  }
 });
 
 test('fail closed: a claim statement without the hold still never hands out a held row', () => {

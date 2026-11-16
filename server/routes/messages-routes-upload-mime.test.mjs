@@ -8,6 +8,7 @@ import { resolveUploadMimeType } from '../services/mime-sniffer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(__dirname, 'messages-routes.mjs'), 'utf8');
+const intakeSource = fs.readFileSync(path.join(__dirname, 'messages-intake-routes.mjs'), 'utf8');
 
 const MZ_EXECUTABLE = Buffer.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00]);
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
@@ -49,16 +50,16 @@ test('the response reports whether the type was corrected', () => {
 });
 
 test('sending a message clears the draft attachment cache and its references', () => {
-  assert.match(source, /updateConvDraftAttachments\.run\(null, now, sessionId \|\| null, convId\)/,
+  assert.match(intakeSource, /updateConvDraftAttachments\.run\(null, now, sessionId \|\| null, convId\)/,
     'the draft attachment column must be cleared on send');
-  assert.match(source, /stmts\.deleteDraftUploadRefs\?\.run\?\.\(convId\)/,
+  assert.match(intakeSource, /stmts\.deleteDraftUploadRefs\?\.run\?\.\(convId\)/,
     'draft upload references must be released once the message owns the blobs');
 });
 
 test('the draft cleared broadcast reports empty attachments', () => {
   // The send's own clear (draftText ''), not the billing refusal's, which
   // keeps the draft's attachments as they are.
-  const emitBlock = [...source.matchAll(/io\.emit\('conversation_draft_updated', \{[\s\S]*?\}\);/g)]
+  const emitBlock = [...intakeSource.matchAll(/io\.emit\('conversation_draft_updated', \{[\s\S]*?\}\);/g)]
     .map((match) => match[0])
     .find((block) => /draftText: ''/.test(block));
   assert.ok(emitBlock);

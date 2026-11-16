@@ -131,9 +131,10 @@ test('the draft reference sentinel is stable', () => {
 // actually deleted, never by the hashes the caller asked about.
 
 const routeSource = fs.readFileSync(path.join(__dirname, 'sessions-routes.mjs'), 'utf8');
+const settingsRouteSource = fs.readFileSync(path.join(__dirname, 'conversation-settings-routes.mjs'), 'utf8');
 
 test('only draft references this conversation actually held are reclaimed', () => {
-  const helper = /function releaseDraftUploadReferences\([\s\S]*?\n  \}/.exec(routeSource);
+  const helper = /function releaseDraftUploadReferences\([\s\S]*?\n  \}/.exec(settingsRouteSource);
   assert.ok(helper, 'the release helper must exist');
   const body = helper[0];
 
@@ -149,4 +150,5 @@ test('there is no route that deletes a draft attachment by raw hash', () => {
   // Such a route let any caller destroy a freshly uploaded, not-yet-referenced
   // blob belonging to another conversation.
   assert.doesNotMatch(routeSource, /app\.delete\('\/api\/conversation\/:id\/draft-attachment/);
+  assert.doesNotMatch(settingsRouteSource, /app\.delete\('\/api\/conversation\/:id\/draft-attachment/);
 });

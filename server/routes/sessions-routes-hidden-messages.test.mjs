@@ -294,7 +294,7 @@ test('the shared payload says nothing about the hidden list', async () => {
 });
 
 test('the unhide-all route sits behind auth', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   assert.match(source, /app\.post\('\/api\/conversation\/:id\/share-visibility\/unhide-all', auth/);
 });

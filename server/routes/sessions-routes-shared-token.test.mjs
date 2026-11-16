@@ -131,7 +131,7 @@ test('shared conversation view paginates through the shared token endpoint, not 
 });
 
 test('authenticated message share visibility route is registered', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   assert.match(source, /app\.patch\('\/api\/conversation\/:id\/message\/:messageId\/share-visibility', auth/);
   assert.match(source, /typeof req\.body\?\.hiddenFromShares !== 'boolean'/);
@@ -141,7 +141,7 @@ test('authenticated message share visibility route is registered', () => {
 });
 
 test('shared upload route is registered at top level (not nested inside presence route)', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   const presenceStart = source.indexOf("app.post('/api/shared/:token/presence'");
   const uploadStart = source.indexOf("app.get('/api/shared/:token/upload/:sha256/content'");
@@ -153,7 +153,7 @@ test('shared upload route is registered at top level (not nested inside presence
 });
 
 test('shared presence route applies rate limit responses', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   // The limiter itself now lives in services/rate-limit-service.mjs; the route
   // keeps the same window/limit and the same 429 + Retry-After response.
@@ -163,7 +163,7 @@ test('shared presence route applies rate limit responses', () => {
 });
 
 test('shared access status event is created only after a successful shared payload is built', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   const sharedRouteStart = source.indexOf("app.get('/api/shared/:token'");
   const sharedRouteEnd = source.indexOf("\n  });", sharedRouteStart);
@@ -176,15 +176,16 @@ test('shared access status event is created only after a successful shared paylo
 test('shared attachment routes stream through the range-aware file server', () => {
   // The helper owns stream errors, ranges (a shared video can seek) and the
   // safe content headers; a share route no longer pipes a bare read stream.
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
-  const source = fs.readFileSync(filePath, 'utf8');
+  const source = ['./sessions-routes.mjs', './share-routes.mjs']
+    .map((file) => fs.readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8'))
+    .join('\n');
   assert.doesNotMatch(source, /fs\.createReadStream\(filePath\)/);
   assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: file\.mime_type \}, \{[\s\S]*?cacheControl: SHARED_CONTENT_CACHE_CONTROL/);
   assert.match(source, /serveFileWithRangeSupport\(req, res, filePath, \{ contentType: attachment\.type \}, \{[\s\S]*?cacheControl: SHARED_CONTENT_CACHE_CONTROL/);
 });
 
 test('an authenticated share revoke route exists and invalidates active shares (M2)', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./share-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   assert.match(source, /app\.delete\('\/api\/conversation\/:id\/share', auth/);
   assert.match(source, /shares\(\)\.stopSharing\(conversationId, now\)/);
@@ -192,8 +193,9 @@ test('an authenticated share revoke route exists and invalidates active shares (
 });
 
 test('shared attachment content is served with neutralized type + nosniff + sandbox CSP (H3)', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
-  const source = fs.readFileSync(filePath, 'utf8');
+  const source = ['./sessions-routes.mjs', './share-routes.mjs']
+    .map((file) => fs.readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8'))
+    .join('\n');
   // The shared (unauthenticated) upload + generated-image routes hand the
   // stored MIME to the file server, which applies the safe-served-content
   // headers instead of echoing the type inline.

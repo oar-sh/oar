@@ -425,6 +425,28 @@ test('cancel-queued-turn answers already-processing when the id is not cancellab
   assert.equal(fx.controls.length, 1, 'no control for a row the relay cancels itself');
 });
 
+test('cancel-queued-turn on a pending row announces its cancelled question cards (foreign keys on)', async () => {
+  const fx = boot();
+  const msgId = await enqueueMessage(fx, 'queued again after a requeue');
+  // A card left by an earlier attempt of the row, still pending.
+  insertPendingCard(fx, { id: 'card-requeued', queueId: msgId, attemptId: 'attempt-earlier' });
+  fx.emitted.length = 0;
+
+  const { status, body } = await fx.post('/api/conversation/:conversationId/cancel-queued-turn', { messageId: msgId }, { params: { conversationId: CONV } });
+  assert.equal(status, 200);
+  assert.equal(body.acknowledgement, 'cancelled');
+  assert.equal(fx.rowOf(msgId), undefined);
+  assert.equal(fx.stmts.getQuestion.get('card-requeued'), undefined, 'the card goes with the row (cascade)');
+  const cardUpdates = fx.emitted.filter((entry) => entry.event === 'relay_question_updated');
+  assert.deepEqual(cardUpdates.map((entry) => entry.payload), [
+    { question: { id: 'card-requeued', conversationId: CONV, status: 'cancelled' } },
+  ]);
+  assert.deepEqual(
+    fx.emitted.filter((entry) => entry.event === 'message_status').map((entry) => entry.payload),
+    [{ messageId: msgId, conversationId: CONV, status: 'cancelled' }],
+  );
+});
+
 // ---------------------------------------------------------------------------
 // POST /api/queue-cancelled
 // ---------------------------------------------------------------------------
@@ -462,6 +484,22 @@ test('/api/queue-cancelled settles the row like a pending cancel: deleted, cards
   const repeat = await fx.post('/api/queue-cancelled', { conversationId: CONV, messageId: msgId, attemptId: delivered.attemptId }, fx.asWorker());
   assert.equal(repeat.status, 404);
   assert.equal(repeat.body.error, 'not-found');
+});
+
+test('/api/queue-cancelled with foreign keys on announces the cancelled cards before the cascade takes them', async () => {
+  const fx = boot();
+  const msgId = await enqueueMessage(fx);
+  const delivered = dequeueOwnedBy(fx);
+  insertPendingCard(fx, { id: 'card-pushed', queueId: msgId, attemptId: delivered.attemptId });
+  fx.emitted.length = 0;
+
+  const { status } = await fx.post('/api/queue-cancelled', { conversationId: CONV, messageId: msgId, attemptId: delivered.attemptId }, fx.asWorker());
+  assert.equal(status, 200);
+  assert.equal(fx.stmts.getQuestion.get('card-pushed'), undefined, 'the card goes with the row (cascade)');
+  const cardUpdates = fx.emitted.filter((entry) => entry.event === 'relay_question_updated');
+  assert.deepEqual(cardUpdates.map((entry) => entry.payload), [
+    { question: { id: 'card-pushed', conversationId: CONV, status: 'cancelled' } },
+  ]);
 });
 
 test('/api/queue-cancelled with foreign keys off still cancels the pending cards explicitly and broadcasts them', async () => {

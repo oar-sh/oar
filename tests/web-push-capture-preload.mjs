@@ -5,13 +5,11 @@
 // and dispatches as it always does; only the network call is replaced.
 
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 
 const captureFile = String(process.env.RELAY_E2E_PUSH_CAPTURE || '').trim();
 if (captureFile) {
-  const require = createRequire(new URL('../package.json', import.meta.url));
-  // The CommonJS module object the server's `import webpush from 'web-push'` gets too.
-  const webpush = require('web-push');
+  // The same module URL the server imports, so the same object it calls.
+  const { default: webpush } = await import('../server/services/web-push-sender.mjs');
   webpush.sendNotification = async (subscription, payload) => {
     fs.appendFileSync(captureFile, `${JSON.stringify({ endpoint: subscription?.endpoint || '', payload: JSON.parse(String(payload || 'null')) })}\n`);
     return { statusCode: 201, body: '', headers: {} };

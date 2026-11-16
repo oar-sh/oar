@@ -139,8 +139,16 @@ test('the recycle stops and launches under the relay-wide launch mutex the sessi
   assert.match(service, /runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, fn\),/);
   const routesSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
   assert.match(routesSource, /import \{ sessionLaunchMutex \} from '\.\.\/services\/session-launch-mutex-service\.mjs';/);
-  assert.doesNotMatch(routesSource, /const sessionLaunchMutex = /, 'no route-local mutex the recycle could not take');
-  assert.doesNotMatch(routesSource, /createKeyedMutex/);
+  // The launch routes live in the sessions routes and the conversation modules
+  // it registers.
+  const launchRoutesSource = [
+    'sessions-routes.mjs',
+    'conversation-settings-routes.mjs',
+    'conversation-lifecycle-routes.mjs',
+    'conversation-bootstrap-routes.mjs',
+  ].map((file) => fs.readFileSync(path.join(__dirname, 'routes', file), 'utf8')).join('\n');
+  assert.doesNotMatch(launchRoutesSource, /const sessionLaunchMutex = /, 'no route-local mutex the recycle could not take');
+  assert.doesNotMatch(launchRoutesSource, /createKeyedMutex/);
 });
 
 test('the recycle knows the agent-SDK kinds from the launch gate\'s own map', () => {

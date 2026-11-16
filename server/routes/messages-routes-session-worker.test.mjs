@@ -7,13 +7,15 @@ import path from 'node:path';
 import {
   dequeuePendingMessageForWorkerLoop,
   isTransientRequeue,
-  normalizeOpenAIImageApiGeneratedImages,
-  normalizeOpenAIImageGenerateRequestBody,
-  resolveOpenAIImageEditAttachment,
   resolveOpenAIReasoningEffort,
   shouldRequireNewOpenAIConversation,
   validateSubagentRunBinding,
 } from './messages-routes.mjs';
+import {
+  normalizeOpenAIImageApiGeneratedImages,
+  normalizeOpenAIImageGenerateRequestBody,
+  resolveOpenAIImageEditAttachment,
+} from './messages-image-routes.mjs';
 
 test('OpenAI reasoning uses model capabilities instead of always forcing none', () => {
   assert.deepEqual(resolveOpenAIReasoningEffort(''), {

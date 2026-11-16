@@ -212,7 +212,7 @@ test('the Check Usage pieces: today against the cap with the 80 % mark, the shar
 
 test('the presets event and the cap\'s top are the relay\'s', async () => {
   const { readFile } = await import('node:fs/promises');
-  const routes = await readFile(new URL('../../routes/sessions-routes.mjs', import.meta.url), 'utf8');
+  const routes = await readFile(new URL('../../routes/settings-routes.mjs', import.meta.url), 'utf8');
   assert.match(routes, new RegExp(`io\\.emit\\('${spend.OPENAI_IMAGE_PRESETS_EVENT}'`));
   assert.match(routes, /export const OPENAI_IMAGE_DAILY_CAP_MAX_USD = 10_000;/);
   assert.equal(spend.OPENAI_IMAGE_DAILY_CAP_MAX_USD, 10_000);

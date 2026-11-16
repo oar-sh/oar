@@ -102,7 +102,7 @@ import { agentSdkFromCheckout } from './services/agent-sdk-paths.mjs';
 import { agentSdkDirEnvName, AgentSdkMissingError, loadAgentSdk, resolveAgentSdkSource, setAgentSdkStore } from './agent-sdk-loader.mjs';
 import { createGrokAuthService } from './services/grok-auth-service.mjs';
 import { sweepUnreferencedUploads, UNREFERENCED_UPLOADS_QUERY } from './services/upload-sweep.mjs';
-import webpush from 'web-push';
+import webpush from './services/web-push-sender.mjs';
 import { createPushDispatchService, ensurePushVapidKeys } from './services/push-dispatch-service.mjs';
 import { createHostSuspendService } from './services/host-suspend-service.mjs';
 import { USAGE_LIMIT_ACCOUNT_SOCKET_EVENT, createUsageLimitPauseService } from './services/usage-limit-pause-service.mjs';

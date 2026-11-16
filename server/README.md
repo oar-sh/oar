@@ -144,6 +144,14 @@ where supported (with standalone fallback), and hides install/fullscreen header 
 When opened in a regular browser tab, the in-app **Install** button remains available
 in the chat header (shown as `⬇` on small screens).
 
+Push notifications are Web Push (RFC 8030) sent by the relay itself:
+`services/web-push-sender.mjs` builds the VAPID header (RFC 8292) and the aes128gcm encryption
+(RFC 8291) on `node:crypto` and `fetch`, without the `web-push` package, and does not follow a
+redirect from a push service. The key pair is made once and kept in the relay database
+(`push_vapid_public_key`, `push_vapid_private_key` in app settings, in the format the package
+used), so subscriptions made by earlier versions keep working. `pushVapidSubject` in
+`config.json` is the contact URI sent with each request.
+
 You can rename the installed app label from **⚙️ Settings → Relays → Relay name** (paired relays know this relay by the same name).
 The name is stored on the relay (app settings) and served in the web app manifest
 to every browser and origin (LAN and tunnel agree), so future installs pick it up
@@ -730,6 +738,18 @@ handed out while the provider is off):
 `archiveSessionInBackground` for a cloud conversation: the cloud session is archived at Anthropic,
 best effort and not waited for, so neither action ever depends on Anthropic. Nothing is deleted
 there.
+
+`POST /api/conversation/:id/archive` (any provider) also cancels the conversation's queued
+messages, in the transaction that archives it, after the worker stop: a pending or parked row goes
+as `POST /api/conversation/:id/cancel-queued-turn` cancels it (the row is deleted, message status `cancelled`, the question
+cards its earlier attempts asked are cancelled and announced with `relay_question_updated` after
+the commit), and a follow-up held at the usage limit goes through the pause service's cancel. One
+`[System Message]` note in the transcript names what was cancelled; it is no queue row. The answer
+carries `cancelledMessageIds`. A running turn still refuses the archive.
+
+Cancelling one queued or steered message (`cancel-queued-turn`, and `POST /api/queue-cancelled`,
+where the worker reports a pushed message it took back) cancels the pending question cards an attempt of that row asked (`attempt_id` set) before the row
+is deleted, and announces them after the commit, so every client shows them as cancelled at once.
 
 ## Claude API provider
 
