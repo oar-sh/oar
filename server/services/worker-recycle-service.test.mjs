@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createWorkerRecycleService, isWorkerOnOtherBuild, RECYCLE_HOLDS, workerRecycleStuckNoteText } from './worker-recycle-service.mjs';
 import { sweepArchivedWorkers } from './worker-recycle-service.mjs';
-import { createWorkerReplacementFence } from './worker-replacement.mjs';
+import { createWorkerReplacement, createWorkerReplacementFence } from './worker-replacement.mjs';
 import { createKeyedMutex } from './keyed-mutex-service.mjs';
 import { createProcessIdentityReader } from './session-worker-process-service.mjs';
 
@@ -211,6 +211,66 @@ test('an archived session\'s stale worker is stopped kill-blocked and never rela
   await app.service.sweep();
   assert.equal(app.calls.length, 1);
   assert.equal(app.service.status().recycled, 0);
+});
+
+test('Copilot switched off: a stale Copilot worker is stopped and no Copilot worker is started again', async () => {
+  // The runtime's replacement (createWorkerReplacement), its launch refused
+  // for a Copilot chat while Copilot is off, under the recycle.
+  let copilotOn = false;
+  const ensured = [];
+  const supervisorCalls = [];
+  const registry = new Map([['sid-copilot-1', worker('sid-copilot-1', { pid: 88, kind: 'copilot-sdk' })]]);
+  const replacement = createWorkerReplacement({
+    registry: { getWorker: (sid) => registry.get(sid) || null, removeWorker: (sid) => registry.delete(sid) },
+    supervisor: {
+      markKilled: (sid) => supervisorCalls.push(['markKilled', sid]),
+      cancelPendingStart: async () => {},
+      clearRestartSchedule: (sid, options) => supervisorCalls.push(['clearRestartSchedule', sid, options]),
+      resetHealth: () => {},
+      ensureWorker: async (sid) => {
+        ensured.push(sid);
+        registry.set(sid, worker(sid, { pid: 901, buildId: RELAY, kind: 'copilot-sdk' }));
+        return { ok: true };
+      },
+    },
+    stopSessionWorkerProcesses: async () => ({ ok: true, pids: [88] }),
+    isProcessAlive: () => false,
+    readProcessIdentity: async () => null,
+    logger: { warn() {} },
+    refuseLaunch: () => (copilotOn ? null : 'COPILOT_SWITCHED_OFF'),
+  });
+  const fence = replacement.fence;
+  const logs = [];
+  const warns = [];
+  const stuck = [];
+  const service = createWorkerRecycleService({
+    relayBuildId: RELAY,
+    listWorkers: () => Array.from(registry.values()),
+    getWorker: (sid) => registry.get(sid) || null,
+    hasHeartbeated: () => true,
+    stopWorker: replacement.stopWorker,
+    launchWorker: replacement.launchWorker,
+    fence,
+    minStartGapMs: 0,
+    onStuck: (entry) => stuck.push(entry),
+    logger: { log: (line) => logs.push(line), warn: (line) => warns.push(line) },
+  });
+  await service.sweep();
+  assert.deepEqual(ensured, [], 'no Copilot worker started');
+  assert.equal(registry.has('sid-copilot-1'), false, 'the stale worker is gone');
+  assert.deepEqual(logs, [
+    `[worker-recycle] recycling sid-copi kind=copilot-sdk from=${OLD} to=${RELAY}`,
+    '[worker-recycle] stopped sid-copi pid 88, not relaunched: COPILOT_SWITCHED_OFF',
+  ]);
+  assert.deepEqual(warns, []);
+  assert.equal(fence.isHeld('sid-copilot-1', 88), false, 'the fence is down');
+  assert.deepEqual(supervisorCalls.at(-1), ['clearRestartSchedule', 'sid-copilot-1', { resetKilledMarker: true }], 'not left kill-blocked');
+  assert.equal(service.status().recycled, 0);
+  // Later sweeps start nothing either, and no failure streak builds up.
+  await service.sweep();
+  await service.sweep();
+  assert.deepEqual(ensured, []);
+  assert.deepEqual(stuck, []);
 });
 
 test('an archived session waits for its hold like any other', async () => {

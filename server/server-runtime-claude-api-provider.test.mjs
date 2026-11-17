@@ -139,10 +139,8 @@ test('the billing swap stops the old worker with launches blocked, then launches
   assert.match(swap, /hasRunningTurn: \(sid\) => \(stmts\.listProcessingRowsForOwner\?\.all\?\.\(sid\) \|\| \[\]\)\.length > 0,/);
 });
 
-test('a compacted Claude chat keeps its billing; the key removal counts live workers on the key', () => {
-  const compact = sliceBetween('function createCompactedConversation(sourceConversationId) {', '\nfunction relayActivityForResponse');
-  assert.match(compact, /const sourceBilling = normalizeClaudeBilling\(sourceRuntime\?\.provider_type\);/);
-  assert.match(compact, /providerType: sourceBilling,/);
+// A compacted Claude chat keeps its billing: services/conversation-compaction-service.test.mjs.
+test('the key removal counts live workers on the key', () => {
   const settings = sliceBetween('const claudeApiSettingsService = createClaudeApiSettingsService({', '\n});');
   assert.match(settings, /countLiveKeyWorkers: \(\) => \(sessionWorkerRegistry\?\.listWorkers\?\.\(\) \|\| \[\]\)\.filter\(\(worker\) => worker\?\.kind === 'claude-api'\)\.length,/);
   const sockets = sliceBetween('const sessionWorkerWebSocketService = createSessionWorkerWebSocketService({', '\n});');

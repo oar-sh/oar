@@ -4780,29 +4780,27 @@ export function focusConversationMessageById(messageId, { behavior = 'smooth', b
   return true;
 }
 
-export function compactCurrentConversation() {
+// A refusal (the chat's provider is off or not set up) shows the relay's own
+// text. Once the relay made the new conversation, `onCompacted` runs and it
+// opens, unless another chat was opened meanwhile: that one is left alone.
+export async function compactCurrentConversation({ onCompacted = null } = {}) {
   if (!currentConvId || compactInFlight) return;
   const id = currentConvId;
-  const conv = conversations[id];
-  if (!conv || conv.archived) return;
+  if (!conversations[id] || conversations[id].archived) return;
   if (!confirm('Compact this conversation into a new one with carry-over summary?')) return;
 
   setCompactInFlight(true);
   try {
-    const doCompact = async () => {
-      const r = await compactConversationApi(id);
-      if (!r?.compactedConversationId) throw new Error('Compaction failed');
-      await window.refreshConversations?.();
-      await window.openConversation?.(r.compactedConversationId);
-    };
-    void doCompact().catch((e) => {
-      alert(e.message || 'Failed to compact conversation');
-    }).finally(() => {
-      setCompactInFlight(false);
-    });
+    const r = await compactConversationApi(id);
+    if (!r?.compactedConversationId) throw new Error('Compaction failed');
+    if (currentConvId === id) onCompacted?.(); // before the refresh, while the relay's event may open the new chat
+    await window.refreshConversations?.();
+    if (currentConvId !== id) return;
+    await window.openConversation?.(r.compactedConversationId);
   } catch (e) {
-    setCompactInFlight(false);
     alert(e.message || 'Failed to compact conversation');
+  } finally {
+    setCompactInFlight(false);
   }
 }
 
@@ -4862,11 +4860,10 @@ export async function sendMessage() {
   }
 
   if (text.toLowerCase() === '/compact' && selectedAttachments.length === 0) {
-    input.value = '';
-    autoResize(input);
     releaseComposerFocusAfterSend(input);
-    void flushConversationDraft(currentConvId);
-    compactCurrentConversation();
+    // The command leaves the composer once the relay compacted; a refused (or
+    // not confirmed) one stays. Opening the new chat saves the draft empty.
+    void compactCurrentConversation({ onCompacted: () => { input.value = ''; autoResize(input); } });
     scrollAfterOwnSend(send);
     return;
   }

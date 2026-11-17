@@ -38,6 +38,7 @@ import {
   resolveConversationTitle,
   selectConversationHistoryPage,
 } from './sessions-helpers.mjs';
+import { isCopilotProviderType } from '../services/copilot-settings-service.mjs';
 
 /**
  * A folder's attribution override update: `{ path, attributionMode }` with
@@ -173,6 +174,8 @@ export function buildMessageSearchMatchQuery(rawQuery = '') {
 }
 
 const DEFAULT_CONVERSATION_LIST_LIMIT = 40;
+// refresh-history's refusal for a Copilot chat while Copilot is switched off.
+export const COPILOT_OFF_REFRESH_TEXT = 'Copilot is switched off on this relay, so this chat\'s history was not reloaded from Copilot. Switch it on in Settings → Providers → Copilot.';
 const MAX_CONVERSATION_LIST_LIMIT = 100;
 
 export function normalizeConversationListLimit(value, fallback = DEFAULT_CONVERSATION_LIST_LIMIT) {
@@ -252,6 +255,7 @@ export function registerConversationReadRoutes(app, deps, shared) {
     getTaskStallMinutes,
     usageLimitPauseService,
     claudeBillingSwitchService,
+    isCopilotEnabled = () => true,
   } = shared;
   const { groupSummaryPayload } = createConversationGroupHelpers({ io, conversationGroups });
   let listRunningRunConversations = null;
@@ -735,6 +739,12 @@ export function registerConversationReadRoutes(app, deps, shared) {
     const existingConversation = resolveConversationByIdOrSdkSessionId(requestedId);
     if (!existingConversation) return res.status(404).json({ error: 'Conversation not found' });
     const conversationId = String(existingConversation.id).trim();
+    // A Copilot chat's history comes from Copilot's own runtime, which is not
+    // started while Copilot is switched off.
+    const boundProvider = stmts.getRuntimeSessionByConversation.get(conversationId)?.provider_type;
+    if (isCopilotProviderType(boundProvider) && !isCopilotEnabled()) {
+      return res.status(409).json({ error: COPILOT_OFF_REFRESH_TEXT, code: 'COPILOT_SWITCHED_OFF' });
+    }
 
     const idleState = sessionHistoryRefreshService.evaluateRefreshIdleState(conversationId);
     if (!idleState?.idle) {

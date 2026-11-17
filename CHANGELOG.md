@@ -5,6 +5,64 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.31] — 2026-11-17
+
+Highlights: `/compact` keeps the chat on its own provider, model and
+effort, and refuses with the reason, changing nothing, while that provider
+is off or not set up. With Copilot switched off, nothing starts Copilot any
+more: not a message sent just before the switch, not a worker replaced
+after an update, not deleting a chat or reloading its history.
+
+### Fixed
+
+- **Compacting a chat keeps its provider.** The compacted chat stays on the
+  chat's provider, model and effort; before, a chat on any provider but
+  Claude moved to Copilot, also while Copilot was switched off, and lost its
+  model. A Claude Cloud chat starts a new cloud session on the same
+  repository and branch, and the summary names the branches the old session
+  pushed.
+- **Compacting is refused while the chat's provider is off or not set up.**
+  `/compact` then says why and what to do, nothing is created or archived,
+  and the command stays in the composer.
+  This includes Claude chats, which compacted before while Claude was
+  switched off, and Claude API chats at the monthly cap.
+- **No Copilot worker starts while Copilot is switched off.** A message
+  sent just before the switch went off no longer starts one, and a Copilot
+  worker the relay replaces after an update is stopped and not started
+  again.
+- **Deleting a Copilot chat while Copilot is switched off no longer starts
+  Copilot.** The chat is deleted and its session stays in the Copilot CLI's
+  folder; reloading such a chat's history from Copilot is refused with the
+  reason.
+- **If a database update for the Copilot switch fails at startup, Copilot now
+  stays off until the next restart retries it**, instead of being decided
+  silently, and a switch that cannot be saved no longer stops the relay's
+  start or breaks the pages that read it.
+- **`/compact` no longer leaves "/compact" behind as the old chat's draft**
+  when the new chat opens before the compact's own answer arrives.
+
+### Upgrade notes
+
+- No migration and no setting changes: 0.9.31 runs on a 0.9.30 database as
+  it is, and the Copilot switch keeps its value.
+- No dependency changes: `npm ci` after a pull in a git checkout installs
+  nothing new.
+
+### Downgrade notes
+
+Going back to 0.9.30 is safe: `oar update --to 0.9.30` or `npm install -g
+@oar-sh/oar@0.9.30` (in a git checkout: `git checkout v0.9.30`, `npm ci`,
+then a relay restart). 0.9.31 adds no migration and writes nothing 0.9.30
+does not read; compacted chats stay on the provider they were created on.
+One case differs: when the Copilot switch is still unset because its
+database update (migration 0043) failed under 0.9.31, 0.9.30 runs that
+update again at its start and, when it works, keeps Copilot on for a relay
+in use, as 0.9.31's next start would. When it fails again, 0.9.30 does not
+keep Copilot off: the first read decides the switch from the Copilot CLI
+(on when it is installed and has run once, off otherwise) and stores that
+answer; if that answer cannot be stored either, 0.9.30 stops right after
+it starts, because its first read of the switch throws. Going up to 0.9.31 again, the switch keeps the value it had.
+
 ## [0.9.30] — 2026-11-17
 
 Highlights: GitHub Copilot is optional. Settings → Providers → Copilot has

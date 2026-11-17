@@ -74,7 +74,10 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // 697: New Chat's provider list (server/public/app/new-chat-providers.mjs).
 // 698 since 2026-11-17: the word-by-word prefix matcher both prompt
 // sanitizers share (server/public/app/whitespace-flexible-match.mjs).
-const MAX_ENTRIES = 698;
+// 699: compacting a conversation, now a module of its own
+// (server/services/conversation-compaction-service.mjs). 700: the PWA
+// shell version, moved out of the runtime (server/services/pwa-shell-version.mjs).
+const MAX_ENTRIES = 700;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and

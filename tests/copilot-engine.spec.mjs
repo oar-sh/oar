@@ -4,14 +4,17 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "@playwright/test";
 
 import { relayBaseUrl, relayDbPath, relayToken } from "./e2e-env.mjs";
+import { startRelayServer } from "./relay-server-harness.mjs";
 import { buildCopilotPlanCard } from "../server/services/plan-usage-copilot.mjs";
 
 /**
  * What is left of the Copilot settings, and the SDK worker's usage snapshot.
  *
- *  1. Settings → Providers → Copilot has no engine choice: the SDK worker is
- *     the only engine. GET /api/settings/copilot stays for paired relays on an
- *     older version, and it needs the relay token.
+ *  1. Settings → Providers → Copilot has the "Enable GitHub Copilot" switch
+ *     and no engine choice: the SDK worker is the only engine. GET
+ *     /api/settings/copilot answers the engine (for paired relays on an older
+ *     version) and the switch, and it needs the relay token. A relay with
+ *     Copilot switched off shows the switch off and starts no Copilot chat.
  *  2. The usage snapshot, end to end: the worker's POST → the relay's
  *     normalise/store → the card builder → the rendered detail section. The one
  *     seam is /api/usage itself: the Copilot card needs a GitHub quota snapshot
@@ -28,28 +31,76 @@ function authHeaders(token = relayToken()) {
   return { Authorization: `Bearer ${token}` };
 }
 
+async function openCopilotPanel(page, baseUrl, token) {
+  await page.goto(`${baseUrl}/?token=${encodeURIComponent(token)}`);
+  await page.waitForLoadState("networkidle");
+  // networkidle can fire before the app modules finish binding their globals.
+  await page.waitForFunction(() => typeof window.openSettingsModal === "function");
+  await page.evaluate(() => window.openSettingsModal("providers", "copilot"));
+  await expect(page.locator("#settings-modal")).toHaveClass(/visible/);
+  const panel = page.locator("#settings-provider-panel-copilot");
+  await expect(panel).toBeVisible();
+  return panel;
+}
+
 test.describe("Copilot settings", () => {
-  test("the Copilot panel offers no engine choice, and the GET answers the SDK engine", async ({ page, request }) => {
-    await page.goto(`/?token=${encodeURIComponent(relayToken())}`);
-    await page.waitForLoadState("networkidle");
-    // networkidle can fire before the app modules finish binding their globals.
-    await page.waitForFunction(() => typeof window.openSettingsModal === "function");
-    await page.evaluate(() => window.openSettingsModal("providers", "copilot"));
-    await expect(page.locator("#settings-modal")).toHaveClass(/visible/);
-    const panel = page.locator("#settings-provider-panel-copilot");
-    await expect(panel).toBeVisible();
+  test("the Copilot panel has its switch and no engine choice, and the GET answers the engine and the switch", async ({ page, request }) => {
+    const panel = await openCopilotPanel(page, relayBaseUrl(), relayToken());
     await expect(panel.locator("#cli-copilot-section")).toBeVisible();
+    // On, as on a relay in use, with the line under the switch.
+    await expect(panel.locator("#copilot-enabled-toggle")).toBeChecked();
+    await expect(panel.locator("#copilot-settings-status")).toHaveText(/^Copilot is on: its models are in New Chat\./);
     await expect(panel.locator("select")).toHaveCount(0);
-    await expect(page.locator("#copilot-engine-select, #copilot-save-btn, #copilot-settings-status")).toHaveCount(0);
+    await expect(page.locator("#copilot-engine-select, #copilot-save-btn")).toHaveCount(0);
 
     const response = await request.get("/api/settings/copilot", { headers: authHeaders() });
     expect(response.status()).toBe(200);
-    expect((await response.json()).engine).toBe("sdk");
+    const settings = await response.json();
+    expect(settings).toMatchObject({ engine: "sdk", engines: ["sdk"], enabled: true });
+    expect(typeof settings.cliFound).toBe("boolean");
   });
 
   test("the GET requires the relay token", async ({ request }) => {
     const anonymous = await request.get("/api/settings/copilot");
     expect(anonymous.status()).toBe(401);
+  });
+});
+
+// A relay of its own with Copilot switched off: the switch's off state.
+test.describe("Copilot switched off", () => {
+  let relay = null;
+
+  test.beforeAll(async () => {
+    relay = await startRelayServer({ token: randomUUID(), copilot: false });
+  });
+
+  test.afterAll(async () => {
+    await relay?.stop();
+  });
+
+  test("the panel shows the switch off, the GET says off, and no Copilot chat is started", async ({ page }) => {
+    const panel = await openCopilotPanel(page, relay.baseUrl, relay.token);
+    await expect(panel.locator("#copilot-enabled-toggle")).not.toBeChecked();
+    await expect(panel.locator("#copilot-settings-status")).toHaveText(/^Copilot is off: its models are not in New Chat/);
+
+    const call = async (route, init = {}) => {
+      const response = await fetch(`${relay.baseUrl}${route}`, {
+        ...init,
+        headers: { ...authHeaders(relay.token), "Content-Type": "application/json" },
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    };
+    const settings = await call("/api/settings/copilot");
+    expect(settings.status).toBe(200);
+    expect(settings.body).toMatchObject({ engine: "sdk", enabled: false });
+
+    const refused = await call("/api/message", {
+      method: "POST",
+      body: JSON.stringify({ text: "copilot-off-first-message", relayMode: "agent", model: "gpt-5.4-mini", provider: "github" }),
+    });
+    expect(refused.status, JSON.stringify(refused.body)).toBe(400);
+    expect(refused.body.code).toBe("COPILOT_NOT_ENABLED");
+    expect(refused.body.conversationId).toBeUndefined();
   });
 });
 

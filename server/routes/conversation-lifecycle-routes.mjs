@@ -17,6 +17,8 @@ import { mapSubagentRunHeader } from '../services/subagent-timeline-service.mjs'
 import { QUEUE_WAKE_FUNCTION } from '../services/queue-wake-hook.mjs';
 import { QUEUE_ROW_SESSION_SQL, notHeldForUsageLimit } from '../repositories/message-repository.mjs';
 import { createWorkerSessionLiveness } from '../services/worker-session-liveness.mjs';
+import { compactRefusalBody } from '../services/conversation-compaction-service.mjs';
+import { isCopilotProviderType } from '../services/copilot-settings-service.mjs';
 
 /**
  * Registers the routes; returns `{ archiveConversationNow }`, the archive of
@@ -65,6 +67,7 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     isPidAlive,
     stopIdleWorkspaceRootSession,
     resolveConversationTitle,
+    isCopilotEnabled = () => true,
   } = shared;
 
   const CLI_SESSION_DELETE_TIMEOUT_MS = 10_000;
@@ -265,13 +268,19 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
   /**
    * The Copilot session, through the runtime's own deleteSession(). Nothing
    * retries one that fails: its state stays in the session-state folder.
+   * `copilotOff`: a Copilot chat while Copilot is switched off, for which the
+   * runtime is not started; its state stays there too.
    */
-  async function deleteCopilotCliSession({ sdkSessionId }) {
+  async function deleteCopilotCliSession({ sdkSessionId, copilotOff = false }) {
     const stateRoot = String(resolveSessionStateRoot?.() || '').trim();
     const sessionDir = stateRoot && SESSION_FOLDER_ID_PATTERN.test(sdkSessionId) ? path.join(stateRoot, sdkSessionId) : '';
     // A conversation deleted before its first turn has no session on disk yet
     // (the runtime would answer "Session file not found").
     if (sessionDir && !fs.existsSync(sessionDir)) return { deleted: null };
+    if (copilotOff) {
+      console.warn(`[delete] Copilot session ${shortId(sdkSessionId)} was kept: Copilot is switched off on this relay`);
+      return { deleted: false };
+    }
     if (typeof sdkSessionImportService?.deleteSession !== 'function') return { deleted: null };
     try {
       await withDeadline(
@@ -301,7 +310,7 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
       if (provider === 'deepseek') return deleteDeepSeekCliSession({ conversation, runtimeSession });
       if (!sdkSessionId) return { deleted: null };
       if (!provider || provider === 'github' || provider === 'openai') {
-        return await deleteCopilotCliSession({ sdkSessionId });
+        return await deleteCopilotCliSession({ sdkSessionId, copilotOff: isCopilotProviderType(provider) && !isCopilotEnabled() });
       }
       return { deleted: null };
     } catch (error) {
@@ -316,6 +325,8 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     const sourceConversationId = req.params.id;
     const compacted = createCompactedConversation(sourceConversationId);
     if (!compacted) return res.status(404).json({ error: 'Conversation not found' });
+    // Its provider cannot take a new chat now: nothing was created or archived.
+    if (compacted.ok === false) return res.status(compacted.status).json(compactRefusalBody(compacted, sourceConversationId));
     io.emit('conversation_compacted', compacted);
     res.json({
       ok: true,

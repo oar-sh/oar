@@ -27,9 +27,12 @@ const CEILINGS = new Map([
   // The Copilot switch: -33 net from 9440. The empty-chat provider rebind
   // went (-129); the switch's CLI detector, the boot, ledger and usage gates,
   // the binding backstop, the claim fence and the launch checks came in.
-  ['server/server-runtime.mjs', 9407],
+  // -62 compacting a conversation moved to conversation-compaction-service.mjs.
+  // -54: the PWA shell version moved to pwa-shell-version.mjs (-57); the
+  // Copilot switch's checks at the worker launch and the worker replacement (+3).
+  ['server/server-runtime.mjs', 9291],
   ['server/public/app/bootstrap.js', 6490],
-  ['server/public/app/conversation-view.js', 5275],
+  ['server/public/app/conversation-view.js', 5272],
   ['server/copilot-worker/copilot-sdk-session-process.mjs', 5204],
   // +6 for the local-relay branch of mapRemoteError.
   ['server/services/remote-relay-dispatcher.mjs', 4641],

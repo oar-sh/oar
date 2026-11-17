@@ -113,10 +113,20 @@ test.describe.serial("the Inbox", () => {
     // The start screen lies over everything until it has faded out: judged
     // under it, the drawer would be toggled shut.
     await expect(page.locator("#startup-loading")).toHaveCount(0);
-    if (!(await reachable())) await page.locator("#sidebar-toggle").click();
-    await expect.poll(reachable).toBe(true);
-    await button.click();
-    await expect(page.locator(".inbox-view")).toBeVisible();
+    // The app may still open the last conversation after the start, and
+    // opening one shuts the drawer (and leaves the Inbox): each try opens
+    // what is shut again, until the Inbox stays open.
+    const inbox = page.locator(".inbox-view");
+    await expect(async () => {
+      if (!(await inbox.isVisible())) {
+        if (!(await reachable())) {
+          await page.locator("#sidebar-toggle").click();
+          await expect.poll(reachable, { timeout: 3_000 }).toBe(true);
+        }
+        await button.click({ timeout: 3_000 });
+      }
+      await expect(inbox).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 30_000 });
   }
 
   test.beforeAll(async () => {

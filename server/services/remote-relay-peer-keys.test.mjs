@@ -225,6 +225,14 @@ function currentKeyHash(relay, entry) {
     .sort((x, y) => y.seq - x.seq)[0]?.hash || null;
 }
 
+/** Each relay holds the other's key, signs in with it (its token dropped), and the issuer has confirmed it. */
+function keyedBothWays(a, b) {
+  return [[a, b], [b, a]].every(([holder, issuer]) => {
+    const held = holder.entryFor(issuer);
+    return held?.peerToken && held.tokenMode === 'peer' && currentKeyHash(issuer, issuer.entryFor(holder)) === hashPeerKey(held.peerToken);
+  });
+}
+
 async function pairedRelays() {
   const a = await startRelay('relay-alpha');
   const b = await startRelay('relay-beta');
@@ -364,6 +372,9 @@ test('a key claiming another relay: 403 ORIGIN_MISMATCH, counted, one log line, 
 test('the owner token claiming a keyed relay: 403 PEER_KEY_REQUIRED, counted on it, and no key is issued', async (t) => {
   const { a, b } = await pairedRelays();
   t.after(async () => { await a.close(); await b.close(); });
+  // Keyed only once the keys are confirmed: on a loaded host that comes
+  // after the pairing's short settle.
+  await until(() => keyedBothWays(a, b), 'keys both ways, each confirmed, the tokens dropped');
   const entry = b.entryFor(a);
   const seqBefore = entry.peerKeySeq;
   const refused = await b.call('/api/message', { method: 'POST', headers: { 'x-oar-remote-origin': a.registry.instanceId() }, body: { text: 'x' } });
@@ -1575,10 +1586,7 @@ test('new ↔ new from an old pairing: keys both ways within one health interval
 
   // One health pass on each side (both upgraded), no step of the owner's.
   await Promise.all([a.registry.checkAll(), b.registry.checkAll()]);
-  await until(() => [[a, b], [b, a]].every(([holder, issuer]) => {
-    const held = holder.entryFor(issuer);
-    return held?.peerToken && held.tokenMode === 'peer' && currentKeyHash(issuer, issuer.entryFor(holder)) === hashPeerKey(held.peerToken);
-  }), 'keys both ways, each confirmed, the tokens dropped');
+  await until(() => keyedBothWays(a, b), 'keys both ways, each confirmed, the tokens dropped');
   for (const [holder, issuer] of [[a, b], [b, a]]) {
     const held = holder.entryFor(issuer);
     assert.equal(held.token, undefined, `${holder.name} dropped ${issuer.name}'s token`);

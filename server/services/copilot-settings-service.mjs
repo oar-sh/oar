@@ -13,8 +13,23 @@
 // Copilot CLI found → on, else off, written so detection never flips it
 // again. A read without a detector (route deps the runtime did not give one)
 // says on and writes nothing.
+//
+// Two states belong to the process, not the database. Migration 0043 failed
+// at this start (db-schema.mjs notes it): while the key is unset, every read
+// says off and writes nothing, so the next start retries the migration;
+// switching Copilot on in Settings writes the key, which reads answer from
+// then on. A detected value that cannot be written: the read answers it
+// anyway, warns once, and a later read tries the write again.
 
 export const COPILOT_ENABLED_SETTING_KEY = 'copilot_enabled';
+
+let switchMigrationFailed = false;
+let unsavedSwitchWarned = false;
+
+/** Migration 0043 failed at this start (db-schema.mjs). */
+export function noteCopilotSwitchMigrationFailed() {
+  switchMigrationFailed = true;
+}
 
 /** A stored value → true / false, or null when unset or unreadable. */
 export function parseCopilotEnabledSetting(value) {
@@ -29,12 +44,16 @@ export function parseCopilotEnabledSetting(value) {
  * unset); `writeSetting(key, value, stamp)` stores the detected value;
  * `detectCli()` → whether the Copilot CLI is installed. Unset and no
  * detector: on, nothing written. A detector that throws counts as not found.
+ * Unset after a failed migration (`migrationFailed`): off, nothing detected
+ * or written. Never throws.
  */
 export function readCopilotEnabled({
   readSetting = () => '',
   writeSetting = null,
   detectCli = null,
   now = () => new Date(),
+  migrationFailed = switchMigrationFailed,
+  warn = (line) => console.warn(line),
 } = {}) {
   let stored = null;
   try {
@@ -43,6 +62,7 @@ export function readCopilotEnabled({
     stored = null;
   }
   if (stored !== null) return stored;
+  if (migrationFailed) return false;
   if (typeof detectCli !== 'function') return true;
   let found = false;
   try {
@@ -51,7 +71,16 @@ export function readCopilotEnabled({
     found = false;
   }
   if (typeof writeSetting === 'function') {
-    writeSetting(COPILOT_ENABLED_SETTING_KEY, found ? 'true' : 'false', now().toISOString());
+    try {
+      writeSetting(COPILOT_ENABLED_SETTING_KEY, found ? 'true' : 'false', now().toISOString());
+    } catch (error) {
+      if (!unsavedSwitchWarned) {
+        unsavedSwitchWarned = true;
+        try {
+          warn(`[copilot] the Copilot switch could not be saved (${error?.message || error}): Copilot is ${found ? 'on' : 'off'} for now, as detected, and the next start decides it again`);
+        } catch {}
+      }
+    }
   }
   return found;
 }

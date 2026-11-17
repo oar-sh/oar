@@ -29,7 +29,8 @@ import { applyCdnNoStoreHeaders, sendOwnFile } from './services/file-serving.mjs
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
 import { PLAN_BOARD_APPROVE_ONLY, planBoardShownActions } from '../shared/plan-board-actions.mjs';
-import { carryPlanOnlyToCompacted, readPlanOnly } from './services/conversation-preferences-service.mjs';
+import { readPlanOnly } from './services/conversation-preferences-service.mjs';
+import { createConversationCompactionService } from './services/conversation-compaction-service.mjs';
 import { sanitizeRelayQuestionContext as sanitizeRelayQuestionContextWith } from './services/relay-question-context.mjs';
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
@@ -320,6 +321,7 @@ import {
 } from '../shared/model-id.mjs';
 import { createModelVariantCatalogService } from './services/model-variant-catalog-service.mjs';
 import { applyPwaManifestTheme, normalizePwaTheme } from './services/pwa-manifest-theme.mjs';
+import { computePwaShellVersion } from './services/pwa-shell-version.mjs';
 import { mapSubagentRunHeader } from './services/subagent-timeline-service.mjs';
 import { describeExecError, describeSpawnEnvironment, normalizeTempEnv, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 
@@ -3476,6 +3478,8 @@ async function spawnSessionWorkerCli(targetSessionId, { allowProcessReuse = true
   // A test relay launches nothing: deferred for good, so the turn stays
   // queued for a worker that reports by itself.
   if (isCliSpawnDisabled(sessionWorkerLaunchEnv)) return deferLaunchWhileCliSpawnDisabled(normalizedTargetSessionId);
+  // Copilot switched off since a send or a prime checked: no Copilot worker, whoever asked; its rows fail with the switch's note.
+  if (failCopilotRowsWithoutLaunch(normalizedTargetSessionId)) return { deferred: 'COPILOT_SWITCHED_OFF' };
   const resolvedWorkspaceRoot = resolveLaunchWorkspaceRootForSession(normalizedTargetSessionId);
   const workerLaunchEnv = buildSessionWorkerLaunchEnvWithAgentToken(normalizedTargetSessionId);
   // Synchronous: nothing between the gate and the launch can start a
@@ -5291,89 +5295,26 @@ function sweepUnreferencedUploadBlobs() {
   });
 }
 
-function normalizeMessageLine(text, maxLength = 240) {
-  const compact = String(text || '').replace(/\s+/g, ' ').trim();
-  if (!compact) return '';
-  if (compact.length <= maxLength) return compact;
-  return `${compact.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
-
-function buildCompactSummary(conversation, recentMessagesDesc) {
-  const title = normalizeMessageLine(conversation?.title || 'Untitled', 80) || 'Untitled';
-  const sourceLines = Array.isArray(recentMessagesDesc) ? [...recentMessagesDesc].reverse() : [];
-  const lines = [
-    `Conversation title: ${title}`,
-    'Carry-over summary (latest turns first in source, normalized below):',
-  ];
-
-  for (const row of sourceLines.slice(0, 16)) {
-    const role = row?.role === 'assistant' ? 'Assistant' : 'User';
-    const line = normalizeMessageLine(row?.text || '', 260);
-    if (!line) continue;
-    lines.push(`- ${role}: ${line}`);
-  }
-
-  if (lines.length <= 2) {
-    lines.push('- No prior text messages were available.');
-  }
-
-  return lines.join('\n').slice(0, 3500);
-}
-
-function createCompactedConversation(sourceConversationId) {
-  // Compaction stays scoped to sourceConversationId; it never consults a
-  // global/latest session file that could belong to another conversation.
-  const source = stmts.getConv.get(sourceConversationId);
-  if (!source) return null;
-
-  const now = new Date().toISOString();
-  const targetConversationId = uuidv4();
-  const recent = stmts.getRecentMessagesDesc.all(sourceConversationId, 24);
-  const summarySeed = buildCompactSummary(source, recent);
-  const nextTitleBase = normalizeMessageLine(source.title || 'Conversation', 64) || 'Conversation';
-  const nextTitle = `${nextTitleBase} (compacted)`.slice(0, 80);
-
-  let targetRuntimeSession = null;
-  const tx = db.transaction(() => {
-    stmts.insertConv.run(targetConversationId, nextTitle, now, now);
-    stmts.updateConvSeed.run(summarySeed, 1, sourceConversationId, now, targetConversationId);
-    stmts.markConvCompacted.run(targetConversationId, now, sourceConversationId);
-    // The new conversation stays in the old one's session group, and heads
-    // it if the old one did; the archived source stays a member.
-    conversationGroups.carryToCompacted(sourceConversationId, targetConversationId, now);
-    // A plan-only conversation's lock goes along, with its saved mode.
-    carryPlanOnlyToCompacted({ db, stmts, source, targetConversationId, updatedAt: now });
-    // A Claude chat keeps its billing (the subscription or the API key, a
-    // pending swap's included): the new chat's first worker launches on it,
-    // and it is never guessed again from a Claude model id. Other providers
-    // bind as before.
-    const sourceRuntime = stmts.getRuntimeSessionByConversation.get(sourceConversationId) || null;
-    const sourceBilling = normalizeClaudeBilling(sourceRuntime?.provider_type);
-    targetRuntimeSession = ensureRuntimeSessionBinding(targetConversationId, null, now, null, sourceBilling
-      ? {
-          providerType: sourceBilling,
-          providerModel: String(sourceRuntime?.provider_model || sourceRuntime?.model || '').trim() || null,
-        }
-      : {});
-  });
-  tx();
-  // Its schedules go on in the new conversation, both the ones that fire
-  // into it and the ones it set: the archived source would end them.
-  try { relayScheduleService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
-  // And so do its questions that don't block, asked in it or by it.
-  try { relayAskService.carryToCompacted(sourceConversationId, targetConversationId); } catch {}
-  // And an "Allow for this session" on the loop guard.
-  try { remoteRelayRegistry.carryLoopGuardOff(sourceConversationId, targetConversationId, { title: nextTitle }); } catch {}
-
-  return {
-    sourceConversationId,
-    targetConversationId,
-    runtimeSessionId: targetRuntimeSession?.id || null,
-    summarySeed,
-    createdAt: now,
-    targetTitle: nextTitle,
-  };
-}
+// Compacting a conversation into a new one on the same provider
+// (conversation-compaction-service.mjs).
+const conversationCompactionService = createConversationCompactionService({
+  db,
+  stmts,
+  conversationGroups,
+  ensureRuntimeSessionBinding,
+  isCopilotEnabled,
+  getOpenAIProviderSettings,
+  getClaudeProviderSettings,
+  getClaudeApiProviderSettings,
+  getClaudeApiCapState: () => getClaudeApiCapState(),
+  getClaudeCloudProviderSettings,
+  getCursorProviderSettings,
+  getGrokProviderSettings,
+  getDeepSeekProviderSettings,
+  getRelayScheduleService: () => relayScheduleService,
+  getRelayAskService: () => relayAskService,
+  getRemoteRelayRegistry: () => remoteRelayRegistry,
+});
 
 // Per thread (the main agent, each sub-agent), the newest rows; structured
 // rows are always kept (activity-replay-state.mjs). A finished turn: the main
@@ -6083,64 +6024,6 @@ function fetchUsageSummary(cb) {
   });
 }
 
-function shouldIncludeInPwaVersion(relativePath) {
-  if (!relativePath) return false;
-  const normalized = String(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
-  if (!normalized || normalized.startsWith('.')) return false;
-  if (normalized === 'index.html' || normalized === 'sw.js' || normalized === 'manifest.webmanifest') return true;
-  if (/^app-icon(?:-light)?(?:-maskable)?(?:-\d+)?\.(?:png|svg)$/i.test(normalized)) return true;
-  if (/^favicon\.ico$/i.test(normalized)) return true;
-  if (normalized.startsWith('app/')) {
-    const ext = path.extname(normalized).toLowerCase();
-    return ext === '.js' || ext === '.mjs' || ext === '.css' || ext === '.html';
-  }
-  return false;
-}
-
-function formatPwaVersionTimestamp(valueMs) {
-  const date = new Date(valueMs);
-  if (!Number.isFinite(date.getTime())) return '0';
-  const yyyy = String(date.getUTCFullYear());
-  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(date.getUTCDate()).padStart(2, '0');
-  const hh = String(date.getUTCHours()).padStart(2, '0');
-  const min = String(date.getUTCMinutes()).padStart(2, '0');
-  const ss = String(date.getUTCSeconds()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}-${hh}-${min}-${ss}Z`;
-}
-
-function computePwaShellVersion() {
-  let maxMtimeMs = 0;
-  const stack = [PUBLIC_DIR];
-  while (stack.length) {
-    const dirPath = stack.pop();
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dirPath, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const absolutePath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(absolutePath);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      const relativePath = path.relative(PUBLIC_DIR, absolutePath);
-      if (!shouldIncludeInPwaVersion(relativePath)) continue;
-      try {
-        const stats = fs.statSync(absolutePath);
-        if (Number.isFinite(stats.mtimeMs) && stats.mtimeMs > maxMtimeMs) {
-          maxMtimeMs = stats.mtimeMs;
-        }
-      } catch {}
-    }
-  }
-  const sourceMs = Number.isFinite(maxMtimeMs) && maxMtimeMs > 0 ? maxMtimeMs : Date.now();
-  return formatPwaVersionTimestamp(sourceMs);
-}
-
 function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
   const appConfig = {
     basePath: remotePath,
@@ -6150,7 +6033,7 @@ function renderIndexHtmlWithPwaVersion(appConfigOverrides = {}) {
     relayName: (() => { try { return getPwaAppName(); } catch { return ''; } })(),
     ...(appConfigOverrides && typeof appConfigOverrides === 'object' ? appConfigOverrides : {}),
   };
-  const version = computePwaShellVersion();
+  const version = computePwaShellVersion(PUBLIC_DIR);
   const source = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
   return injectAppConfig(source, APP_CONFIG_PLACEHOLDER, appConfig)
     .replace(PWA_VERSION_PLACEHOLDER, `const __PWA_VERSION = '${version}';`);
@@ -6986,6 +6869,7 @@ function createRuntimeWorkerReplacement(tag) {
     logger: console,
     logPrefix: () => `${runtimeLogPrefix()}${tag} `,
     fence: workerReplacementFence,
+    refuseLaunch: (sid) => (failCopilotRowsWithoutLaunch(sid) ? 'COPILOT_SWITCHED_OFF' : null),
   });
 }
 // A stop that fails backs off (the swap service retries it) and clears the
@@ -8098,7 +7982,7 @@ const sharedRouteDeps = {
   collectReferenceAttachmentsFromText,
   mergeMessageAttachments,
   attachmentSummary,
-  createCompactedConversation,
+  createCompactedConversation: conversationCompactionService.createCompactedConversation,
   workspaceRootPayload,
   queueCounts,
   getModelCatalogState,

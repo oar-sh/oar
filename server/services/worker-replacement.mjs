@@ -134,6 +134,9 @@ export function createWorkerReplacement({
   // runtime's replacements and its delivery paths share one; this module
   // only hands it back.
   fence = createWorkerReplacementFence(),
+  // sid → why the session gets no worker now (a Copilot chat while Copilot
+  // is switched off: 'COPILOT_SWITCHED_OFF'), or null. Asked by launchWorker.
+  refuseLaunch = () => null,
 } = {}) {
   if (typeof stopSessionWorkerProcesses !== 'function') {
     throw new Error('createWorkerReplacement requires stopSessionWorkerProcesses');
@@ -240,9 +243,21 @@ export function createWorkerReplacement({
     return before?.startTime ? { ok: true, identity: { pid: before.pid, startTime: before.startTime } } : { ok: true };
   }
 
-  /** Launch the session's worker, never reusing a live process: `{ ok, error }`. */
+  /**
+   * Launch the session's worker, never reusing a live process: `{ ok, error }`.
+   * A launch refuseLaunch refuses starts nothing and is no failure:
+   * `{ ok: true, refused }`. The killed marker goes either way, so a later
+   * launch (Copilot switched on again) is not blocked by the stop's.
+   */
   async function launchWorker(sid) {
     supervisor?.clearRestartSchedule?.(sid, { resetKilledMarker: true });
+    let refused = null;
+    try {
+      refused = refuseLaunch(sid) || null;
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error || 'launch-check-failed') };
+    }
+    if (refused) return { ok: true, error: null, refused: String(refused) };
     const launched = await supervisor?.ensureWorker?.(sid, { allowProcessReuse: false });
     return { ok: launched?.ok === true, error: launched?.error || null };
   }

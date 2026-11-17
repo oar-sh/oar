@@ -30,8 +30,9 @@ function withRelayLogReporter(args) {
 // screen, New Chat and the composer all change. The specs here assume today's
 // ready relay, so the shared one is marked "Copilot ready" once after boot: a
 // snapshot post from a non-authoritative source naming a curated model changes
-// the catalog's `source` (the readiness signal) and nothing else. The
-// fresh-install specs boot their own relay and never see this.
+// the catalog's `source` (the readiness signal) and nothing else. Copilot's
+// switch is on already: startRelayServer sets it as a relay in use has it.
+// The fresh-install specs boot their own relay and never see this.
 async function markRelayCopilotReady(relay) {
   const response = await fetch(`${relay.baseUrl}/api/models/snapshot`, {
     method: "POST",

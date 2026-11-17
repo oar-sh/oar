@@ -22,6 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveDatabaseFile } from "../server/services/database-file.mjs";
 import { redactSecretsInText } from "../server/services/worker-secret-redaction.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -433,10 +434,19 @@ export async function startRelayServer({
   // A file the relay's output is appended to as it comes, redacted
   // (redactRelayLog): what a failed spec's report shows (relay-log-reporter.mjs).
   logFile = "",
+  // The Copilot switch (Settings → Providers → Copilot) of a new state root.
+  // On by default, as a relay in use has it: migration 0043 stores
+  // `copilot_enabled` 'true' for every database in use, and the specs were
+  // written against such a relay. Left alone, a new database decides it from
+  // the CLI detection, and a test relay finds no Copilot CLI: off. `false`
+  // starts the relay with Copilot off on purpose. A data folder that holds a
+  // database already (a restart, a spec's own seed) keeps what it holds.
+  copilot = true,
 } = {}) {
   const resolvedPort = port || await reserveFreePort();
   const baseUrl = `http://127.0.0.1:${resolvedPort}`;
   const paths = state || createStateRoot();
+  const newDatabase = resolveDatabaseFile(paths.dataDir).created;
   if (persistWorkerConfig) {
     const configPath = path.join(paths.stateRoot, "config.json");
     let existing = {};
@@ -525,8 +535,32 @@ export async function startRelayServer({
   }
 
   if (!keepSecurityNotices) await dismissUpgradeNotice(baseUrl, token);
+  if (newDatabase) {
+    try {
+      await setCopilotSwitch(baseUrl, token, copilot !== false);
+    } catch (error) {
+      await stopProcess(proc);
+      removeStateRoot(paths.stateRoot);
+      throw error;
+    }
+  }
 
   return handle;
+}
+
+// Through the switch's own route, as Settings sets it: the relay stores the
+// value a relay in use holds. Switching on starts a model discovery, which
+// finds no Copilot CLI here and runs nothing.
+async function setCopilotSwitch(baseUrl, token, enabled) {
+  const response = await fetch(`${baseUrl}/api/settings/copilot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ enabled }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body?.enabled !== enabled) {
+    throw new Error(`[relay-server-harness] Switching Copilot ${enabled ? "on" : "off"}: HTTP ${response.status}`);
+  }
 }
 
 // The notices a harness relay raises: the token came from the command line

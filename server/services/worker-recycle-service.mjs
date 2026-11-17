@@ -16,7 +16,9 @@
  *   kill-blocked, as the archive route does: an archived session keeps no
  *   worker;
  * - else stops the worker and every process of the session and launches a
- *   new one (worker-replacement.mjs, the Change CWD mechanism).
+ *   new one (worker-replacement.mjs, the Change CWD mechanism), unless the
+ *   launch is refused (a Copilot chat while Copilot is switched off): then
+ *   nothing replaces the stopped worker.
  *
  * Releasable is not enough: a worker between two turns of a conversation in
  * use is releasable too, and recycling it would cost the user a cold CLI on
@@ -493,6 +495,13 @@ export function createWorkerRecycleService({
     }
     if (!launched?.ok) {
       noteFailure(sid, state, 'launch', launched?.error || 'unknown');
+      return;
+    }
+    if (launched.refused) {
+      // The session gets no worker now (a Copilot chat while Copilot is
+      // switched off): the stale one is stopped, and nothing replaces it.
+      endPendingLaunch(sid, state);
+      log(`stopped ${sid8(sid)} pid ${oldPid}, not relaunched: ${launched.refused}`);
       return;
     }
     let launchedEntry = null;

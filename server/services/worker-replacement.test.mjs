@@ -6,7 +6,7 @@ import { createSessionWorkerRegistry } from './session-worker-registry-service.m
 import { createSessionWorkerSupervisor } from './session-worker-supervisor-service.mjs';
 import { createProcessIdentityReader } from './session-worker-process-service.mjs';
 
-function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { ok: true }, alive = () => false, identity = async () => null } = {}) {
+function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { ok: true }, alive = () => false, identity = async () => null, refuseLaunch = undefined } = {}) {
   const calls = [];
   const warnings = [];
   const identityReads = [];
@@ -44,6 +44,7 @@ function setup({ stopResult = { ok: true }, stopThrows = null, ensureResult = { 
     killTmuxSession,
     logger: { log() {}, warn: (line) => warnings.push(line) },
     logPrefix: () => '[relay] TEST ',
+    refuseLaunch,
   });
   return { replacement, calls, warnings, identityReads, worker, inspector, isProcessAlive, killTmuxSession, stopArgs: () => stopArgs };
 }
@@ -224,6 +225,22 @@ test('a launch clears the killed marker and starts a fresh worker, never reusing
   ]);
   const failed = setup({ ensureResult: { ok: false, error: 'kill-blocked' } });
   assert.deepEqual(await failed.replacement.launchWorker('sid-1-abcdef'), { ok: false, error: 'kill-blocked' });
+});
+
+test('a launch refused for the session (Copilot switched off) starts nothing, is no failure, and still lifts the killed marker', async () => {
+  const asked = [];
+  const app = setup({ refuseLaunch: (sid) => { asked.push(sid); return 'COPILOT_SWITCHED_OFF'; } });
+  assert.deepEqual(await app.replacement.launchWorker('sid-1-abcdef'), { ok: true, error: null, refused: 'COPILOT_SWITCHED_OFF' });
+  assert.deepEqual(asked, ['sid-1-abcdef']);
+  assert.deepEqual(app.calls, [['clearRestartSchedule', 'sid-1-abcdef', { resetKilledMarker: true }]], 'no ensureWorker');
+  // Not refused: the launch runs as before.
+  const allowed = setup({ refuseLaunch: () => null });
+  assert.deepEqual(await allowed.replacement.launchWorker('sid-1-abcdef'), { ok: true, error: null });
+  assert.deepEqual(names(allowed.calls), ['clearRestartSchedule', 'ensureWorker']);
+  // A check that throws is a failed launch, never a start.
+  const broken = setup({ refuseLaunch: () => { throw new Error('switch unreadable'); } });
+  assert.deepEqual(await broken.replacement.launchWorker('sid-1-abcdef'), { ok: false, error: 'switch unreadable' });
+  assert.equal(names(broken.calls).includes('ensureWorker'), false);
 });
 
 // The replacement fence: while a worker process is replaced, no work is

@@ -12,6 +12,7 @@ Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, co
 const {
   apiFetchOrThrow,
   cancelRelayRestart,
+  compactConversation,
   loadWindowsAutostartSetting,
   readableServerError,
   relaunchSessionWorkerWithWorkspaceRoot,
@@ -140,4 +141,14 @@ test('a replayed send that already landed, and other failures, are no refusal', 
     assert.equal(await sendMessage({ text: 'hi' }, { onRefused }), null);
   });
   assert.deepEqual(refusals, []);
+});
+
+test('a compact the relay refuses throws its reason; a compact it makes is returned', async () => {
+  const reason = 'Claude API has no key on this relay, so this chat was not compacted. Nothing was changed. Add it in Settings → Providers → Claude API.';
+  await withFetch(answer(409, { ok: false, code: 'CLAUDE_API_NOT_CONFIGURED', error: reason, provider: 'claude-api', compacted: false }), async () => {
+    await assert.rejects(compactConversation('conv-1'), (error) => error.status === 409 && error.message === reason);
+  });
+  await withFetch(answer(200, { ok: true, compactedConversationId: 'conv-2' }), async () => {
+    assert.deepEqual(await compactConversation('conv-1'), { ok: true, compactedConversationId: 'conv-2' });
+  });
 });

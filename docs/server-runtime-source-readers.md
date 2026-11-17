@@ -20,7 +20,7 @@ start marker a helper asserts. "other" is an assertion on the text that is neith
 a count, a value read out of it). Sections are the runtime's own `// ─── … ───` markers, each
 running to the next one, so they are coarse ("Web Push" also holds the worker launch code).
 
-Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor), 85 other.
+Readers: 32 files, 530 assertions: 404 presence, 34 absence (6 without an anchor), 92 other.
 
 ## Absence assertions without a positive anchor
 
@@ -43,15 +43,15 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | Prepared Statements | 3 | 3 | 0 | 2 |
 | Claude Cloud (provider 'claude-cloud') | 5 | 13 | 0 | 1 |
 | Provider CLI install / binary binding | 3 | 1 | 0 | 3 |
-| Web Push | 13 | 47 | 5 | 15 |
-| Queued relay restart / shutdown | 10 | 19 | 0 | 2 |
-| Deferred host suspend | 4 | 18 | 0 | 1 |
+| Web Push | 15 | 49 | 6 | 20 |
+| Queued relay restart / shutdown | 12 | 22 | 0 | 2 |
+| Deferred host suspend | 4 | 17 | 0 | 1 |
 | Relay events | 1 | 1 | 0 | 0 |
-| Questions that don't block | 7 | 6 | 0 | 6 |
-| Express + Socket.io Setup | 9 | 32 | 1 | 2 |
-| Dead-worker detection | 10 | 108 | 4 | 6 |
+| Questions that don't block | 7 | 7 | 0 | 6 |
+| Express + Socket.io Setup | 8 | 31 | 1 | 2 |
+| Dead-worker detection | 11 | 111 | 3 | 6 |
 | CLI Status Tracking | 4 | 5 | 0 | 0 |
-| Remote Relays | 19 | 46 | 1 | 5 |
+| Remote Relays | 18 | 42 | 1 | 5 |
 | Auth Middleware | 2 | 4 | 0 | 0 |
 | Helpers | 5 | 10 | 0 | 0 |
 | CLI Routes | 2 | 2 | 0 | 4 |
@@ -60,7 +60,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | Cloudflare Tunnel | 1 | 1 | 0 | 0 |
 | Preview Lane | 5 | 7 | 0 | 1 |
 | Start | 3 | 5 | 0 | 2 |
-| (whole file) | 15 | 6 | 21 | 21 |
+| (whole file) | 16 | 6 | 21 | 23 |
 
 ## Every assertion, by file
 
@@ -146,7 +146,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 24 | presence | serviceSource (slice) | `readSetting: readAppSettingValue,` | Config |  |
 | 25 | presence | serviceSource (slice) | `listProviderCandidates: \(\) => stmts\.listRuntimeSessionProviderCand…` | Claude Cloud (provider 'claude-cloud') |  |
 | 26 | presence | serviceSource (slice) | `getClaudeProviderSettings: \(\) => getClaudeProviderSettings\(\),` | Claude Cloud (provider 'claude-cloud') |  |
-| 28 | presence | depsSource (slice) | `\n  getClaudeApiProviderSettings,\n` | Remote Relays |  |
+| 28 | presence | depsSource (slice) | `\n  getClaudeApiProviderSettings,\n` | Queued relay restart / shutdown |  |
 | 30 | presence | depsSource (slice) | `\n  claudeApiSettingsService: withAgentSdkUpdate\(claudeApiSettingsSe…` | Remote Relays |  |
 | 40 | presence | launchSource (slice) | `const cleared = applyClaudeApiProviderEnvironment\(` | Web Push |  |
 | 43 | presence | branch (slice) |  | Web Push |  |
@@ -188,7 +188,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 109 | presence | runtimeSource (file) | `\n  checkClaudeApiCap: \(reason\) => claudeApiCapWatch\.check\(reason…` | Remote Relays |  |
 | 111 | presence | runtimeSource (file) | `const claudeApiStopLedger = createClaudeApiStopNoteLedger\(\);` | Deferred host suspend |  |
 | 112 | presence | watch (slice) | `if \(!reached\) claudeApiStopLedger\.clearAll\(\);` | Deferred host suspend |  |
-| 114 | presence | switchService (slice) | `getClaudeApiCapState: \(\) => getClaudeApiCapState\(\),` | Deferred host suspend |  |
+| 114 | presence | switchService (slice) | `getClaudeApiCapState: \(\) => getClaudeApiCapState\(\),` | Queued relay restart / shutdown |  |
 | 116 | presence | fence (slice) | `fence\?\.reason === 'claude-api-unavailable'` | Dead-worker detection |  |
 | 117 | presence | fence (slice) | `failRecoveredRowTerminally\(row, 'claude-api-unavailable'` | Dead-worker detection |  |
 | 118 | presence | fence (slice) | `claudeApiRemedyText\(\{ code, switchedOff: fence\.refusal\?\.switched…` | Dead-worker detection |  |
@@ -203,16 +203,14 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 136 | presence | factory (slice) | `killTmuxSession,` | (imports and paths) |  |
 | 137 | presence | factory (slice) | `logPrefix: \(\) => '\$\{runtimeLogPrefix\(\)\}\$\{tag\} ',` | Dead-worker detection |  |
 | 139 | presence | swap (slice) | `hasRunningTurn: \(sid\) => \(stmts\.listProcessingRowsForOwner\?\.all…` | Dead-worker detection |  |
-| 144 | presence | compact (slice) | `const sourceBilling = normalizeClaudeBilling\(sourceRuntime\?\.provid…` | Queued relay restart / shutdown |  |
-| 145 | presence | compact (slice) | `providerType: sourceBilling,` | Queued relay restart / shutdown |  |
-| 147 | presence | settings (slice) | `countLiveKeyWorkers: \(\) => \(sessionWorkerRegistry\?\.listWorkers\?…` | Claude Cloud (provider 'claude-cloud') |  |
-| 149 | presence | sockets (slice) | `onWorkerKind: \(sessionId, kind\) => \{` | Dead-worker detection |  |
-| 157 | presence | wiring (slice) | `failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid…` | Dead-worker detection |  |
-| 163 | presence | skip (slice) | `normalizeClaudeBilling\(runtime\?\.provider_type\) !== 'claude-api'` | Dead-worker detection |  |
-| 165 | presence | skip (slice) | `try \{\n    refusal = claudeApiClaimCheck\(\);\n  \} catch \(error\) …` | Dead-worker detection |  |
-| 166 | presence | skip (slice) | `code: 'CLAUDE_API_NOT_CONFIGURED',` | Dead-worker detection |  |
-| 167 | presence | skip (slice) | `handleClaudeBillingFence\(\{ reason: 'claude-api-unavailable', messag…` | Dead-worker detection |  |
-| 170 | presence | sliceBetween (slice) | `\n  failClaudeApiRowsWithoutLaunch,\n` | Remote Relays |  |
+| 145 | presence | settings (slice) | `countLiveKeyWorkers: \(\) => \(sessionWorkerRegistry\?\.listWorkers\?…` | Claude Cloud (provider 'claude-cloud') |  |
+| 147 | presence | sockets (slice) | `onWorkerKind: \(sessionId, kind\) => \{` | Dead-worker detection |  |
+| 155 | presence | wiring (slice) | `failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid…` | Dead-worker detection |  |
+| 161 | presence | skip (slice) | `normalizeClaudeBilling\(runtime\?\.provider_type\) !== 'claude-api'` | Dead-worker detection |  |
+| 163 | presence | skip (slice) | `try \{\n    refusal = claudeApiClaimCheck\(\);\n  \} catch \(error\) …` | Dead-worker detection |  |
+| 164 | presence | skip (slice) | `code: 'CLAUDE_API_NOT_CONFIGURED',` | Dead-worker detection |  |
+| 165 | presence | skip (slice) | `handleClaudeBillingFence\(\{ reason: 'claude-api-unavailable', messag…` | Dead-worker detection |  |
+| 168 | presence | sliceBetween (slice) | `\n  failClaudeApiRowsWithoutLaunch,\n` | Remote Relays |  |
 
 ### server/server-runtime-claude-cloud-provider.test.mjs
 
@@ -242,7 +240,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 123 | absence | depsSource (slice) | `claudeCloudClient\|claudeCloudCredentials` | Remote Relays | slice |
 | 124 | presence | depsSource (slice) | `claudeCloudLoginStatus: \{ describe: \(\) => claudeCloudCredentials\.…` | Remote Relays |  |
 | 125 | presence | source (file) | `\nregisterClaudeCloudRoutes\(app, sharedRouteDeps\);\n` | Remote Relays |  |
-| 130 | presence | dequeueSource (slice) | `getClaudeCloudProviderSettings,` | Express + Socket.io Setup |  |
+| 130 | presence | dequeueSource (slice) | `getClaudeCloudProviderSettings,` | Queued relay restart / shutdown |  |
 
 ### server/server-runtime-copilot-cli-install.test.mjs
 
@@ -251,6 +249,23 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 19 | other | from (slice) |  | Provider CLI install / binary binding |  |
 | 21 | presence | construction (slice) | `\n {2}findCopilotSdk: \(\) => resolveCopilotSdkLaunchPath\(\{ config,…` | Provider CLI install / binary binding |  |
 | 23 | presence | runtimeSource (file) | `\n {2}const sdkPath = resolveCopilotSdkLaunchPath\(\{ config, env: se…` | Web Push |  |
+
+### server/server-runtime-copilot-off-launch.test.mjs
+
+| Line | Kind | Reads | Pattern | Section | Anchor |
+| ---: | --- | --- | --- | --- | --- |
+| 28 | other | check (slice) | `the launch checks the switch` | Web Push |  |
+| 30 | other | check (slice) | `if (listed === 'worker') {` | Web Push |  |
+| 31 | other | check (slice) | `return deferLaunchWhileCliSpawnDisabled(normalizedTargetSessionId);` | Web Push |  |
+| 33 | other | check (slice) | `agentSdkLaunchGate.check(` | Web Push |  |
+| 34 | other | check (slice) | `await launchSessionCli({` | Web Push |  |
+| 38 | other | source (file) |  | (whole file) |  |
+| 39 | presence | sliceFunction (slice) | `spawnSessionWorkerCli` | Web Push |  |
+| 41 | other | callers (slice) |  | (whole file) |  |
+| 42 | presence | source (file) | `spawnWorker: async \(sdkSessionId, options = \{\}\) => spawnSessionWo…` | Web Push |  |
+| 47 | presence | replacement (slice) | `refuseLaunch: \(sid\) => \(failCopilotRowsWithoutLaunch\(sid\) \? 'CO…` | Dead-worker detection |  |
+| 49 | presence | source (file) | `const billingSwapWorkerReplacement = createRuntimeWorkerReplacement\(…` | Dead-worker detection |  |
+| 50 | presence | source (file) | `const recycleWorkerReplacement = createRuntimeWorkerReplacement\('WOR…` | Dead-worker detection |  |
 
 ### server/server-runtime-copilot-switch.test.mjs
 
@@ -272,7 +287,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 48 | other | source (file) |  | (whole file) |  |
 | 54 | presence | source (file) |  | (whole file) |  |
 | 56 | other | records (slice) |  | (imports and paths) |  |
-| 60 | presence | table (slice) | `\n  isCopilotEnabled,\n` | Remote Relays |  |
+| 60 | presence | table (slice) | `\n  isCopilotEnabled,\n` | Queued relay restart / shutdown |  |
 | 62 | presence | sliceFunction (slice) | `^function fetchCopilotBillingUsage\(\) \{\n  \/\/ [^\n]*\n  if \(!isC…` | Questions that don't block |  |
 | 63 | presence | sliceFunction (slice) | `^function fetchUsageSummary\(cb\) \{\n  if \(!isCopilotEnabled\(\)\) …` | Questions that don't block |  |
 | 68 | presence | details (slice) | `const sessionIdLabel = '\$\{providerSessionLabel\(runtimeSession\?\.p…` | Queued relay restart / shutdown |  |
@@ -290,7 +305,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 91 | presence | launch (slice) | `for \(const row of stmts\.listPendingRowsForSession\.all\(sdkSessionI…` | Dead-worker detection |  |
 | 92 | presence | source (file) | `failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid…` | Dead-worker detection |  |
 | 100 | other | launch (slice) | `if (!isCopilotProviderType(runtime?.provider_type)) return false;` | Dead-worker detection |  |
-| 101 | absence | launch (slice) | `workerKind\|copilot-sdk` | Dead-worker detection | slice |
+| 101 | absence | launch (slice) | `workerKind\|copilot-sdk` | Web Push | slice |
 | 107 | presence | routeDeps (slice) | `\n  failClaudeApiRowsWithoutLaunch,\n  failCopilotRowsWithoutLaunch,\n` | Remote Relays |  |
 
 ### server/server-runtime-cursor-provider.test.mjs
@@ -368,7 +383,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | ---: | --- | --- | --- | --- | --- |
 | 23 | presence | runtimeSource (file) | `const deepseekSettingsService = createDeepSeekSettingsService\(\{` | Claude Cloud (provider 'claude-cloud') |  |
 | 24 | presence | runtimeSource (file) | `listProviderCandidates: \(\) => stmts\.listRuntimeSessionProviderCand…` | Claude Cloud (provider 'claude-cloud') |  |
-| 26 | presence | depsSource (slice) | `\n  getDeepSeekProviderSettings,\n` | Remote Relays |  |
+| 26 | presence | depsSource (slice) | `\n  getDeepSeekProviderSettings,\n` | Queued relay restart / shutdown |  |
 | 28 | presence | depsSource (slice) | `\n  deepseekSettingsService: withAgentSdkUpdate\(deepseekSettingsServ…` | Remote Relays |  |
 | 37 | presence | launchSource (slice) | `const cleared = [^;]*applyDeepSeekProviderEnvironment\(` | Web Push |  |
 | 40 | presence | deepseekBranch (slice) |  | Web Push |  |
@@ -390,7 +405,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 
 | Line | Kind | Reads | Pattern | Section | Anchor |
 | ---: | --- | --- | --- | --- | --- |
-| 137 | presence | tx (slice) | `const tx = db.transaction(() => {` | Queued relay restart / shutdown |  |
+| 137 | presence | tx (slice) | `const tx = db.transaction(() => {` | Questions that don't block |  |
 | 138 | other | tx (slice) | `if (result.changes === 0) return false;` | Questions that don't block |  |
 | 139 | presence | tx (slice) | `settleFailedRowControlsAndCards(` | Questions that don't block |  |
 | 140 | other | fail (slice) | `if (!tx()) return;` | Questions that don't block |  |
@@ -414,7 +429,7 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 | 35 | presence | runtimeSource (file) | `function setGrokProviderSettings\(` | Config |  |
 | 36 | presence | runtimeSource (file) | `async function refreshGrokProviderModels\(` | Config |  |
 | 37 | presence | runtimeSource (file) | `providerType === 'grok'` | Web Push |  |
-| 38 | presence | runtimeSource (file) | `getGrokProviderSettings,` | Remote Relays |  |
+| 38 | presence | runtimeSource (file) | `getGrokProviderSettings,` | Queued relay restart / shutdown |  |
 | 43 | absence | runtimeSource (file) | `managedProvider = \[\|reconcileUnstartedConversationProviders` | (whole file) | same test (line 34) |
 
 ### server/server-runtime-host-suspend.test.mjs
@@ -758,12 +773,14 @@ Readers: 31 files, 520 assertions: 401 presence, 34 absence (6 without an anchor
 - server/server-runtime-conversation-create.test.mjs
 - server/server-runtime.model-catalog.test.mjs
 - server/services/claude-session-root-service.test.mjs
+- server/services/conversation-compaction-service.test.mjs
 - server/services/oar-cli-helpers.test.mjs
 - server/services/remote-inbox-push.three-relays.test.mjs
 - server/services/session-worker-supervisor-service.launch-race.test.mjs
 - server/services/session-worker-websocket-service.test.mjs
 - server/services/stale-turn-recovery.test.mjs
 - server/source-size-guard.test.mjs
+- tests/helpers/copilot-switch-db-fault.mjs
 - tests/helpers/runtime-boot.mjs
 - tests/helpers/runtime-probe-hooks.mjs
 - tests/helpers/runtime-probe-launcher.mjs

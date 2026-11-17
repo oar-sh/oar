@@ -47,6 +47,7 @@ import {
 } from '../../shared/deepseek-models.mjs';
 import { normalizeClaudeBilling } from '../services/claude-billing-switch-service.mjs';
 import { copilotEnabledFromStmts, copilotOffCreateRefusal } from '../services/copilot-settings-service.mjs';
+import { compactRefusalBody } from '../services/conversation-compaction-service.mjs';
 import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { notPerson } from '../services/relay-principal.mjs';
 import { AUTH_ERROR_CODES, AUTH_RELAY_TOOL_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
@@ -465,6 +466,8 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
       if (!conversationId) return res.status(400).json({ error: 'Compact command requires an existing conversation' });
       const compacted = createCompactedConversation(conversationId);
       if (!compacted) return res.status(404).json({ error: 'Conversation not found' });
+      // Its provider cannot take a new chat now: nothing was created or archived.
+      if (compacted.ok === false) return res.status(compacted.status).json({ ...compactRefusalBody(compacted, conversationId), command: 'compact' });
       io.emit('conversation_compacted', compacted);
       return res.json({
         ok: true,

@@ -1876,10 +1876,12 @@ export async function updateConversationDraft(id, draft = {}) {
   }
 }
 
+// Throws with the relay's reason, e.g. a compact refused because the chat's
+// provider is switched off (apiFetchOrThrow).
 export async function compactConversation(id) {
   const convId = String(id || '').trim();
   if (!convId) return null;
-  return apiFetch(`/api/conversation/${convId}/compact`, { method: 'POST' });
+  return apiFetchOrThrow(`/api/conversation/${convId}/compact`, { method: 'POST' });
 }
 
 export async function killSessionWorker(sdkSessionId, body = {}) {

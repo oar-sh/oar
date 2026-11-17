@@ -1119,6 +1119,7 @@ export function registerSessionsRoutes(app, deps) {
     getTaskStallMinutes,
     usageLimitPauseService,
     claudeBillingSwitchService,
+    isCopilotEnabled,
   });
 
   registerShareRoutes(app, deps, {
@@ -1182,6 +1183,7 @@ export function registerSessionsRoutes(app, deps) {
     isPidAlive,
     stopIdleWorkspaceRootSession,
     resolveConversationTitle,
+    isCopilotEnabled,
   });
 
   registerConversationBootstrapRoutes(app, deps, {

@@ -107,6 +107,8 @@ function setup(state = {}) {
       markDeletedSdkSession: { run: (id) => events.push(`tombstone:${id}`) },
       getMessages: { all: () => [] },
       getRuntimeSessionByConversation: { get: () => state.runtimeSession || null },
+      // The Copilot switch as stored; unset reads as on.
+      getAppSetting: { get: (key) => (key === 'copilot_enabled' && state.copilotEnabled !== undefined ? { value: String(state.copilotEnabled) } : undefined) },
     },
     runtimeState: {},
     config: {},
@@ -744,6 +746,66 @@ test('a Copilot session the runtime cannot delete is left in place, and the conv
       assert.equal(fs.existsSync(sessionDir), true, `left in place: ${failure}`);
     });
   }
+});
+
+test('Copilot switched off: deleting a Copilot chat never starts Copilot\'s runtime; its session stays on disk', async () => {
+  for (const providerType of ['github', '']) {
+    await withTmpDir(async (stateRoot) => {
+      const sessionDir = path.join(stateRoot, 'sdk-1');
+      fs.mkdirSync(sessionDir);
+      let runtimeStarts = 0;
+      const { del, events } = setup({
+        sessionStateRoot: stateRoot,
+        copilotEnabled: false,
+        runtimeSession: { provider_type: providerType },
+        importer: () => {
+          const db = new Database(':memory:');
+          applySchema(db);
+          return createSdkSessionImportService({
+            db,
+            stmts: createSessionRepository(db),
+            createClient: async () => {
+              runtimeStarts += 1;
+              return { client: { async deleteSession() {} }, async dispose() {} };
+            },
+            logger: { info() {} },
+          });
+        },
+      });
+      const warned = [];
+      const originalWarn = console.warn;
+      console.warn = (line) => warned.push(String(line));
+      let response;
+      try {
+        response = await del();
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.equal(response.statusCode, 200, providerType);
+      assert.equal(response.body.cliSessionDeleted, false, providerType);
+      assert.equal(runtimeStarts, 0, `no Copilot runtime started (provider '${providerType}')`);
+      assert.equal(fs.existsSync(sessionDir), true, 'the session stays where it is');
+      assert.ok(events.includes('sql:DELETE FROM conversations'), 'the conversation is still deleted');
+      assert.ok(warned.some((line) => /Copilot session sdk-1.* was kept: Copilot is switched off/.test(line)), warned.join('\n'));
+    });
+  }
+});
+
+test('Copilot switched off: an OpenAI chat\'s session is still deleted through the runtime', async () => {
+  await withTmpDir(async (stateRoot) => {
+    fs.mkdirSync(path.join(stateRoot, 'sdk-1'));
+    const deleted = [];
+    const { del } = setup({
+      sessionStateRoot: stateRoot,
+      copilotEnabled: false,
+      runtimeSession: { provider_type: 'openai' },
+      sdkSessionImportService: { deleteSession: async (sid) => { deleted.push(sid); } },
+    });
+    const response = await del();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.cliSessionDeleted, true);
+    assert.deepEqual(deleted, ['sdk-1']);
+  });
 });
 
 test('a session id that is not a plain folder name is never joined into a path', async () => {

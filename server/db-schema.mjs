@@ -49,6 +49,7 @@ import { migrateImageSessionDefaults } from './migrations/0040-image-session-def
 import { migrateBrowserSessions } from './migrations/0041-browser-sessions.mjs';
 import { migrateLateReplies } from './migrations/0042-late-replies.mjs';
 import { migrateCopilotEnabled } from './migrations/0043-copilot-enabled.mjs';
+import { noteCopilotSwitchMigrationFailed } from './services/copilot-settings-service.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1136,13 +1137,15 @@ try {
   console.warn(`[relay-events] migration 0042 failed; retrying on next boot: ${error?.message || error}`);
 }
 
-// The Copilot switch stays on for a relay that was in use. Without it the
-// switch is unset and the first read decides it, so a failure is logged and
-// retried next boot.
+// The Copilot switch stays on for a relay that was in use. A failure is
+// logged and retried next boot; until then an unset switch reads as off and
+// nothing decides it (copilot-settings-service.mjs), so the retry still finds
+// it unset.
 try {
   migrateCopilotEnabled(db);
 } catch (error) {
-  console.warn(`[copilot] migration 0043 failed; retrying on next boot: ${error?.message || error}`);
+  noteCopilotSwitchMigrationFailed();
+  console.warn(`[copilot] migration 0043 failed; retrying on next boot. Until then Copilot stays switched off unless it is switched on in Settings → Providers → Copilot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);
