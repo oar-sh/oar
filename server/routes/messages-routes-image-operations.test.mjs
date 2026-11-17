@@ -9,7 +9,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveTerminalFailurePayload } from './messages-routes.mjs';
+import { resolveTerminalFailurePayload } from './messages-helpers.mjs';
 import {
   executeImageOperation as executeOperation,
   makeImageOperationDeps as imageOperationDeps,

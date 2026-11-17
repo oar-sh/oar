@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto';
 
 import { resumeRelayMode } from '../../shared/plan-only.mjs';
 import { readPlanOnly } from './conversation-preferences-service.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 import {
   USAGE_LIMIT_CODE,
   USAGE_LIMIT_KIND,
@@ -344,12 +345,16 @@ export function createUsageLimitPauseService({
       ];
       // The insert takes an image operation id where the queue has the column.
       if (stmts.insertQ.source?.includes('image_operation_id')) queueArgs.push(null);
-      stmts.insertQ.run(...queueArgs);
+      // It carries on a turn the chat was running: an archived chat comes back.
+      const { unarchived } = queueIntoConversation(db, stmts, queueArgs);
       setPause.run(heldUntil, pauseJson, messageId);
-      created = { messageId, model: modelVariant, relayMode, timestamp: at, text: resumePrompt };
+      created = { messageId, model: modelVariant, relayMode, timestamp: at, text: resumePrompt, unarchived };
       return messageId;
     });
     const messageId = write();
+    if (created?.unarchived) {
+      try { emit(...unarchivedConversationEvent(plan.conversationId)); } catch {}
+    }
     if (created) {
       try {
         emit('user_message', {

@@ -4,6 +4,7 @@ import { persistConversationPreferences, readPlanOnly } from '../services/conver
 import { fallbackReasoningEffort } from '../services/conversation-model-fallback.mjs';
 import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { notPerson } from '../services/relay-principal.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 import { AUTH_ERROR_CODES, AUTH_PERSON_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 import {
   PLAN_BOARD_APPROVE_ONLY,
@@ -128,6 +129,7 @@ export function registerRelayBoardRoutes(app, deps) {
     pushDispatchService,
     relayEventService,
     remoteRelayInbound = null,
+    claudeCloudSessionService = null,
   } = deps;
 
   /**
@@ -296,17 +298,9 @@ export function registerRelayBoardRoutes(app, deps) {
     const now = new Date().toISOString();
     const shouldDismiss = chosen === 'exit_only';
     const approveOnly = chosen === PLAN_BOARD_APPROVE_ONLY;
-    // Only a pending card is settled: a second press (here or in the Inbox)
-    // finds it settled already and queues nothing.
-    const settledRow = shouldDismiss
-      ? stmts.dismissBoard.run(chosen, now, now, boardId)
-      : stmts.markBoardAction.run(chosen, now, now, boardId);
-    if (Number(settledRow?.changes) !== 1) {
-      const current = stmts.getBoard.get(boardId);
-      return res.status(409).json({ error: `Board already ${current?.status || 'settled'}`, board: formatRelayBoardRow(current) });
-    }
 
-    let queuedMessageId = null;
+    // The follow-up turn, built before anything is written.
+    let followup = null;
     if (!shouldDismiss) {
       // approve_only says exactly its line; the others may carry their own.
       const followupPrompt = normalizeBoardText(approveOnly ? planBoardFollowupText(chosen) : (selected.prompt || planBoardFollowupText(chosen)), '');
@@ -329,27 +323,13 @@ export function registerRelayBoardRoutes(app, deps) {
         const resolvedReasoningEffort = (modelResolution?.ok
           ? String(modelResolution.reasoningEffort || '').trim() || null
           : null) || conversationEffortFor(convId, resolvedBaseModel);
-        queuedMessageId = uuidv4();
-        stmts.insertMsg.run(
-          queuedMessageId,
-          convId,
-          'user',
-          followupPrompt,
-          resolvedVariantModel,
-          relayMode,
-          null,
-          now,
-          resolvedVariantModel || null,
-          null,
-          String(resolvedVariantModel || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
-        );
-        stmts.updateConvTime.run(now, convId);
+        const followupId = uuidv4();
         // One value per placeholder of the queue insert: the context tier
         // (none: the follow-up runs on the conversation's own) and, where the
         // queue has the column, the image operation. Two short, the insert
-        // threw and the action answered 500 with the board already marked.
+        // threw and the action answered 500.
         const queueArgs = [
-          queuedMessageId,
+          followupId,
           convId,
           runtimeSession?.id || null,
           0,
@@ -367,23 +347,73 @@ export function registerRelayBoardRoutes(app, deps) {
           null,
         ];
         if (stmts.queueHasImageOperationId) queueArgs.push(null);
-        stmts.insertQ.run(...queueArgs);
-        io.emit('user_message', {
-          conversationId: convId,
-          messageId: queuedMessageId,
-          senderClientId: clientId || null,
-          message: {
-            role: 'user',
-            text: followupPrompt,
-            model: resolvedVariantModel,
-            modelOrigin: String(resolvedVariantModel || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
-            mode: relayMode,
-            attachments: [],
-            timestamp: now,
-          },
-        });
-        if (!approveOnly) followChosenMode(convId, relayMode, now);
+        followup = { id: followupId, convId, prompt: followupPrompt, relayMode, model: resolvedVariantModel, queueArgs };
       }
+    }
+
+    // The card is settled in the transaction that writes its follow-up: a
+    // write that throws leaves the card pending, to be pressed again. Only a
+    // pending card is settled: a second press (here or in the Inbox) finds it
+    // settled already and queues nothing. The message and its row are written
+    // together; a press into an archived chat brings the chat back with them.
+    const written = db.transaction(() => {
+      const settledRow = shouldDismiss
+        ? stmts.dismissBoard.run(chosen, now, now, boardId)
+        : stmts.markBoardAction.run(chosen, now, now, boardId);
+      if (Number(settledRow?.changes) !== 1) return { settled: false };
+      if (!followup) return { settled: true, unarchived: false };
+      stmts.insertMsg.run(
+        followup.id,
+        followup.convId,
+        'user',
+        followup.prompt,
+        followup.model,
+        followup.relayMode,
+        null,
+        now,
+        followup.model || null,
+        null,
+        String(followup.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
+      );
+      stmts.updateConvTime.run(now, followup.convId);
+      return { settled: true, ...queueIntoConversation(db, stmts, followup.queueArgs) };
+    })();
+    if (!written.settled) {
+      const current = stmts.getBoard.get(boardId);
+      return res.status(409).json({ error: `Board already ${current?.status || 'settled'}`, board: formatRelayBoardRow(current) });
+    }
+
+    let queuedMessageId = null;
+    if (followup) {
+      const { convId, relayMode } = followup;
+      queuedMessageId = followup.id;
+      if (written.unarchived) {
+        io.emit(...unarchivedConversationEvent(convId));
+        // As the unarchive route does: the cloud session comes back too.
+        try {
+          claudeCloudSessionService?.unarchiveSessionInBackground?.({
+            conversationId: convId,
+            runtimeSession: stmts.getRuntimeSessionByConversation?.get?.(convId) || null,
+          });
+        } catch (error) {
+          console.warn(`[archive] Cloud session unarchive not started for ${convId}: ${error?.message || error}`);
+        }
+      }
+      io.emit('user_message', {
+        conversationId: convId,
+        messageId: queuedMessageId,
+        senderClientId: clientId || null,
+        message: {
+          role: 'user',
+          text: followup.prompt,
+          model: followup.model,
+          modelOrigin: String(followup.model || '').trim().toLowerCase() === 'auto' ? 'auto' : 'manual',
+          mode: relayMode,
+          attachments: [],
+          timestamp: now,
+        },
+      });
+      if (!approveOnly) followChosenMode(convId, relayMode, now);
     }
 
     const updated = formatRelayBoardRow(stmts.getBoard.get(boardId));

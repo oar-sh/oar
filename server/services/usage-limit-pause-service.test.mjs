@@ -145,3 +145,29 @@ test('a chat that is not plan-only goes on in the mode the turn ran in', () => {
   app.service.schedulePause(plan, { queueRow: app.queueRow() });
   assert.equal(app.followUps()[0].relay_mode, 'autopilot');
 });
+
+// Archive refuses while a turn runs and cancels a held follow-up, so this
+// does not happen; should a refusal still pause a chat that is archived, its
+// follow-up brings the chat back, said once, instead of waiting unseen.
+test('a follow-up queued into an archived chat unarchives it and says so once', () => {
+  const app = setupChat();
+  app.db.prepare(`UPDATE conversations SET archived = 1 WHERE id = 'conv-1'`).run();
+  const plan = app.service.planPause({ terminalError: refusal, conversationId: 'conv-1', providerType: 'claude', chatProviderType: 'claude', queueRow: app.queueRow() });
+  const scheduled = app.service.schedulePause(plan, { queueRow: app.queueRow() });
+  assert.equal(scheduled.created, true);
+  assert.equal(app.db.prepare(`SELECT archived FROM conversations WHERE id = 'conv-1'`).get().archived, 0);
+  const events = app.emitted.map((entry) => entry.event);
+  assert.deepEqual(app.emitted.filter((entry) => entry.event === 'conversation_archived').map((entry) => entry.payload), [{ conversationId: 'conv-1', archived: false }]);
+  assert.ok(events.indexOf('conversation_archived') < events.indexOf('user_message'), events.join(','));
+  // Held until the reset, then claimed.
+  const [followUp] = app.followUps();
+  const stmts = createMessageRepository(app.db);
+  assert.equal(stmts.findPendingForWorker.get('2026-10-02T12:00:00.000Z', 'sid-1')?.id, followUp.id);
+});
+
+test('a follow-up into a live chat announces no unarchive', () => {
+  const app = setupChat();
+  const plan = app.service.planPause({ terminalError: refusal, conversationId: 'conv-1', providerType: 'claude', chatProviderType: 'claude', queueRow: app.queueRow() });
+  app.service.schedulePause(plan, { queueRow: app.queueRow() });
+  assert.deepEqual(app.emitted.filter((entry) => entry.event === 'conversation_archived'), []);
+});

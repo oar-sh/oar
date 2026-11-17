@@ -197,7 +197,8 @@ export function claudeApiCapStateFrom({ capUsd = null, spend = null } = {}) {
     spentUsd,
     incomplete,
     // One stretch at the cap: this local month and this cap. A note said once
-    // per chat per episode (messages-routes.mjs, continuations on the key).
+    // per chat per episode (messages-worker-output-routes.mjs, continuations
+    // on the key).
     episode: `${String(spend?.bounds?.month || '')}:${cap}`,
     // `reason` without the place, for a message that names it in its remedy.
     ...(reached

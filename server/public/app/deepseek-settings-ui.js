@@ -143,7 +143,7 @@ export function applyDeepSeekSettingsState(settings = {}, { resetInputs = false 
       ? 'DeepSeek is enabled. Select DeepSeek in New Chat to use it.'
       : (state.configured
           ? 'API key saved but currently disabled. Enable it to allow DeepSeek selection in New Chat.'
-          : 'Not configured. New conversations use GitHub Copilot.');
+          : 'Not configured.');
     status.dataset.state = state.enabled ? 'active' : (state.configured ? 'saved' : 'unconfigured');
   }
   window.syncAutoModelAvailability?.();
@@ -252,7 +252,7 @@ export async function removeDeepSeekSettings() {
   if (!state.configured) return;
   if (!confirm('Remove the saved DeepSeek API key?')) return;
   await runUpdate({ remove: true }, {
-    successText: 'DeepSeek API key removed. New conversations use GitHub Copilot.',
+    successText: 'DeepSeek API key removed.',
     failureText: 'Failed to remove DeepSeek settings.',
     resetInputs: true,
   });

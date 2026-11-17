@@ -12,7 +12,7 @@ import {
 } from './relay-error-ctas.mjs';
 
 // The chat text these read is produced by buildTerminalFailureTextForChat()
-// (messages-routes.mjs); the samples below keep its exact shape.
+// (messages-helpers.mjs); the samples below keep its exact shape.
 const CLI_MISSING = 'Grok CLI was not found on PATH. Install it from Settings → Providers → Grok. '
   + 'Error code: relay.grok-cli-missing. Send the message again to retry. If this keeps failing, include the error code when you report it.';
 const AUTH_FAILED = 'Grok authentication failed. Sign in from Settings → Providers → Grok. '
@@ -164,7 +164,7 @@ test('Start on subscription keeps the effort the user chose when the Claude list
 });
 
 test('the stop note of a self-started turn on the key keeps its buttons with 5 + 5 long task labels', async () => {
-  const { buildClaudeApiStopNoteText } = await import('../../routes/messages-routes.mjs');
+  const { buildClaudeApiStopNoteText } = await import('../../routes/messages-worker-output-routes.mjs');
   const tasks = (kind) => Array.from({ length: 5 }, (_, i) => ({ label: `npm run watch -- --flag-${kind}${i} ${'x'.repeat(80)}` }));
   for (const [code, error, actions] of [
     ['CLAUDE_API_CAP_REACHED', "This month's Claude API spend ($123.45 of $100.00) has reached its cap. This turn did not run.", ['open-claude-api-cap', 'switch-claude-billing-to-subscription']],

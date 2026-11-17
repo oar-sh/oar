@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 
-import { splatPath } from './messages-routes.mjs';
+import { splatPath } from './file-routes.mjs';
 import { captureRoutes, makeRouteDeps } from './messages-routes-test-harness.mjs';
 
 const ROUTES = ['/api/files/{*splat}', '/api/files-preview/{*splat}'];

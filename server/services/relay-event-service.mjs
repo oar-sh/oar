@@ -131,6 +131,7 @@ import {
   isPersonOnlyQuestion,
 } from '../../shared/relay-asks.mjs';
 import { createLateReplyService } from './relay-late-reply-service.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 
 export const RELAY_EVENT_SUBSCRIPTIONS_SOCKET_EVENT = 'relay_event_subscriptions';
 export const RELAY_EVENT_SELF_RELAY_ID = 'self';
@@ -1502,9 +1503,11 @@ export function createRelayEventService({
         null,
       ];
       if (stmts.queueHasImageOperationId || stmts.insertQ?.source?.includes?.('image_operation_id')) queueArgs.push(null);
-      stmts.insertQ.run(...queueArgs);
+      // The watcher is live (checked above); were it archived, the row
+      // would bring it back rather than wait unseen.
+      const { unarchived } = queueIntoConversation(db, stmts, queueArgs);
       for (const row of rows) sql.markDelivered.run(at, messageId, row.id);
-      result = { messageId, merged: false, digest, count: rows.length, text, model: modelVariant, relayMode, owner, timestamp: at };
+      result = { messageId, merged: false, digest, count: rows.length, text, model: modelVariant, relayMode, owner, timestamp: at, unarchived };
     });
     write();
     if (!result) return null;
@@ -1519,6 +1522,9 @@ export function createRelayEventService({
         });
       } catch {}
     } else {
+      if (result.unarchived) {
+        try { emit(...unarchivedConversationEvent(watcher)); } catch {}
+      }
       try {
         emit('user_message', {
           conversationId: watcher,

@@ -161,7 +161,7 @@ test('server-runtime caps relay activity rows through the shared helpers, newest
   // passes its query param, nobody else does.
   assert.match(source, /function relayActivityForQueueMessage\(queueMessageId, activityCap = undefined\)/);
   assert.match(source, /function inFlightStateForConversation\(conversationId, \{ activityCap = undefined \} = \{\}\)[\s\S]*?activities: relayActivityForQueueMessage\(row\.id, activityCap\)/);
-  const routes = fs.readFileSync(fileURLToPath(new URL('../../routes/sessions-routes.mjs', import.meta.url)), 'utf8');
+  const routes = fs.readFileSync(fileURLToPath(new URL('../../routes/conversation-read-routes.mjs', import.meta.url)), 'utf8');
   assert.match(routes, /inFlightStateForConversation\(resolvedConversationId, \{ activityCap: req\.query\.activityCap \}\)/);
 });
 

@@ -8,8 +8,9 @@ import { normalizeWorkspaceRootKey } from './workspace-root-path-policy.mjs';
 // tested without an HTTP server.
 // ---------------------------------------------------------------------------
 
-// Mirrors DUPLICATE_USER_MESSAGE_WINDOW_MS in routes/messages-routes.mjs: a
-// repeated request inside this window is treated as the same user intent.
+// Like the send path's duplicate check (DUPLICATE_USER_MESSAGE_WINDOW_MS in
+// routes/messages-intake-routes.mjs, a longer window): a repeated request
+// inside this window is treated as the same user intent.
 export const RELAUNCH_COALESCE_WINDOW_MS = 5_000;
 
 /**

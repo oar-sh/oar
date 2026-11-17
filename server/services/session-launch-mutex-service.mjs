@@ -2,8 +2,9 @@
  * The per-session launch mutex, one for the whole relay process, keyed by
  * sdkSessionId.
  *
- * What runs under it: the Change CWD relaunch, the launch route and the
- * delete and archive routes (sessions-routes.mjs), the worker recycle's
+ * What runs under it: the Change CWD relaunch (conversation-settings-routes.mjs),
+ * the launch route (host-routes.mjs) and the delete and archive routes
+ * (conversation-lifecycle-routes.mjs), the worker recycle's
  * recycle, archived stop and launch retry (worker-recycle-service.mjs), and
  * the archived sweep at relay start (sweepArchivedWorkers there). What does
  * not: the Claude billing swap, which keeps the old worker away from the

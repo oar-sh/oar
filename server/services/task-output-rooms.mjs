@@ -11,11 +11,22 @@
 // fetches the tail again; a file that shrank is sent as an empty chunk with
 // `reset: true`. Nobody watching costs nothing: the room's poller stops when
 // it empties.
+//
+// A second instance serves another file per conversation (the worker log):
+// its own room prefix, event names and `socket.data` key, so a page may
+// watch a task and that file at once, and a `resolveSource` in place of
+// `resolveTask`. With `itemKey: null` a room is one per conversation and the
+// payloads carry no item id.
 
 import { TASK_OUTPUT_LIMITS } from '../../shared/task-output-text.mjs';
 import { inspectOutputFile, readRange, taskOutputSource } from './task-output-service.mjs';
 
 const ROOM_PREFIX = 'task-output:';
+export const TASK_OUTPUT_EVENTS = Object.freeze({
+  watch: 'task_output_watch',
+  unwatch: 'task_output_unwatch',
+  chunk: 'task_output_chunk',
+});
 // Chunks one tick may send for a fast writer (4 × 64 KB a second).
 const MAX_CHUNKS_PER_TICK = 4;
 // A watcher whose offset is this far behind the room is caught up by itself;
@@ -41,10 +52,31 @@ function idOf(value) {
  * task in the conversation's live or ended set, or null: the same access
  * check as the output route. Sockets reaching `registerSocket` are already
  * authenticated.
+ *
+ * Or `resolveSource(conversationId, itemId)`, which returns `{ path, ended }`
+ * (`path` '' with a `code` when there is nothing to read), null when the
+ * conversation or item is gone; a throw counts as unavailable.
  */
 export function createTaskOutputRooms({
   io,
   resolveTask,
+  resolveSource = null,
+  roomPrefix = ROOM_PREFIX,
+  events = TASK_OUTPUT_EVENTS,
+  dataKey = 'taskOutputRoom',
+  // The payload field naming the item within the conversation; null for one
+  // file per conversation.
+  itemKey = 'taskId',
+  logLabel = 'task-output',
+  // Line-safe sends (the worker log): > 0 sends complete lines only, an open
+  // line once the file has been quiet this long, and that line again from
+  // its start, scrubbed whole, once it is complete (`rewrite: true`); a long
+  // line is cut between words. 0: the task console's sends.
+  idleFlushMs = 0,
+  // The source's path is looked up again on every watch and tick; a new one
+  // (another SDK session's log) restarts the room there with a reset.
+  followPath = false,
+  now = Date.now,
   intervalMs = 1000,
   chunkBytes = TASK_OUTPUT_LIMITS.chunkBytes,
   roomSize = (room) => io?.sockets?.adapter?.rooms?.get?.(room)?.size || 0,
@@ -54,9 +86,27 @@ export function createTaskOutputRooms({
   clearIntervalImpl = clearInterval,
   logger = console,
 } = {}) {
-  if (typeof resolveTask !== 'function') throw new Error('createTaskOutputRooms requires resolveTask');
-  // room → { conversationId, taskId, path, offset, timer, busy }
+  if (typeof resolveTask !== 'function' && typeof resolveSource !== 'function') {
+    throw new Error('createTaskOutputRooms requires resolveTask');
+  }
+  const resolve = typeof resolveSource === 'function' ? resolveSource : (conversationId, taskId) => {
+    const found = resolveTask(conversationId, taskId);
+    if (!found) return found;
+    const { kind, path } = taskOutputSource(found.task);
+    // A snapshot is fetched again by the console, `none` has nothing.
+    return { path, ended: !!found.ended, code: path ? undefined : (kind === 'snapshot' ? 'snapshot' : 'no-output') };
+  };
+  // room → { conversationId, itemId, path, offset, timer, busy }
   const watched = new Map();
+
+  function roomOf(conversationId, itemId) {
+    return itemKey ? `${roomPrefix}${conversationId}:${itemId}` : `${roomPrefix}${conversationId}`;
+  }
+
+  // The ids every chunk of a room carries.
+  function idsOf(entry) {
+    return itemKey ? { conversationId: entry.conversationId, [itemKey]: entry.itemId } : { conversationId: entry.conversationId };
+  }
 
   function stopRoom(room) {
     const entry = watched.get(room);
@@ -66,15 +116,15 @@ export function createTaskOutputRooms({
   }
 
   function leave(socket) {
-    const current = socket.data?.taskOutputRoom;
+    const current = socket.data?.[dataKey];
     if (current) socket.leave(current);
-    if (socket.data) socket.data.taskOutputRoom = null;
+    if (socket.data) socket.data[dataKey] = null;
     if (current && roomSize(current) === 0) stopRoom(current);
   }
 
-  function lookup(conversationId, taskId) {
+  function lookup(conversationId, itemId) {
     try {
-      return resolveTask(conversationId, taskId);
+      return resolve(conversationId, itemId);
     } catch {
       return undefined;
     }
@@ -107,9 +157,8 @@ export function createTaskOutputRooms({
         longLineBytes: chunkBytes,
       });
       if (!chunk.ok || chunk.endOffset <= offset) break;
-      target.emit('task_output_chunk', {
-        conversationId: entry.conversationId,
-        taskId: entry.taskId,
+      target.emit(events.chunk, {
+        ...idsOf(entry),
         offset: chunk.offset,
         endOffset: chunk.endOffset,
         text: chunk.text,
@@ -122,6 +171,86 @@ export function createTaskOutputRooms({
     return offset;
   }
 
+  // Line-safe sends from where the room's unconfirmed bytes start (the open
+  // line already sent, else the room's offset) to `end`: complete lines
+  // (the first chunk marked `rewrite` when it repeats a sent open line), then,
+  // when `flushOpen` and nothing more completes, the open line.
+  async function sendLineSafe(target, entry, end, ended, flushOpen) {
+    const resending = entry.openLineStart !== null;
+    let offset = resending ? entry.openLineStart : entry.offset;
+    let rewrite = resending;
+    let stalled = false;
+    for (let sent = 0; sent < MAX_CHUNKS_PER_TICK && offset < end; sent += 1) {
+      const chunk = await readChunk(entry.path, {
+        start: offset,
+        maxBytes: Math.min(chunkBytes, end - offset),
+        holdOpenLine: true,
+        longLineBytes: chunkBytes,
+        softCut: true,
+      });
+      if (!chunk.ok) return;
+      if (chunk.endOffset <= offset) {
+        stalled = true;
+        break;
+      }
+      target.emit(events.chunk, {
+        ...idsOf(entry),
+        offset: chunk.offset,
+        endOffset: chunk.endOffset,
+        text: chunk.text,
+        size: chunk.size,
+        mtime: chunk.mtime,
+        ended,
+        ...(rewrite ? { rewrite: true } : {}),
+      });
+      rewrite = false;
+      offset = chunk.endOffset;
+      entry.openLineStart = null;
+      entry.offset = offset;
+    }
+    if (!flushOpen || !(stalled || offset >= end)) return;
+    // The open line, from its start; only when bytes past what was sent wait.
+    const from = entry.openLineStart !== null ? entry.openLineStart : entry.offset;
+    if (end <= entry.offset) return;
+    const piece = await readChunk(entry.path, { start: from, maxBytes: Math.min(chunkBytes, end - from), holdOpenLine: false });
+    if (!piece.ok || piece.endOffset <= entry.offset) return;
+    target.emit(events.chunk, {
+      ...idsOf(entry),
+      offset: piece.offset,
+      endOffset: piece.endOffset,
+      text: piece.text,
+      size: piece.size,
+      mtime: piece.mtime,
+      ended,
+      partial: true,
+      ...(entry.openLineStart !== null ? { rewrite: true } : {}),
+    });
+    entry.openLineStart = from;
+    entry.offset = piece.endOffset;
+  }
+
+  // The room's source moved to `path`: it starts over there, and the pages
+  // read the tail again.
+  async function switchPath(target, entry, path, ended) {
+    entry.path = path;
+    entry.openLineStart = null;
+    const info = await inspect(path);
+    const size = info.ok ? info.size : 0;
+    entry.offset = await safeOffset(path, size);
+    entry.lastSize = size;
+    entry.lastGrowthAt = now();
+    target.emit(events.chunk, {
+      ...idsOf(entry),
+      offset: entry.offset,
+      endOffset: entry.offset,
+      text: '',
+      size,
+      mtime: info.ok ? info.mtimeMs : null,
+      ended,
+      reset: true,
+    });
+  }
+
   async function poll(room) {
     const entry = watched.get(room);
     if (!entry || entry.busy) return;
@@ -131,25 +260,30 @@ export function createTaskOutputRooms({
     }
     entry.busy = true;
     try {
-      const found = lookup(entry.conversationId, entry.taskId);
+      const found = lookup(entry.conversationId, entry.itemId);
       // The task left both sets (an hour after its end): nothing more comes.
       if (found === null) {
         stopRoom(room);
         return;
       }
       const ended = !!found?.ended;
+      const target = io.to(room);
+      if (followPath && found?.path && found.path !== entry.path) {
+        await switchPath(target, entry, String(found.path), ended);
+        return;
+      }
       const info = await inspect(entry.path);
       // Not there (yet, or any more): keep waiting.
       if (!info.ok) return;
-      const target = io.to(room);
       // Unchanged since the last tick: the writer is idle, an open line goes out.
       const idle = info.size === entry.lastSize;
+      if (!idle) entry.lastGrowthAt = now();
       entry.lastSize = info.size;
       if (info.size < entry.offset) {
+        entry.openLineStart = null;
         entry.offset = await safeOffset(entry.path, info.size);
-        target.emit('task_output_chunk', {
-          conversationId: entry.conversationId,
-          taskId: entry.taskId,
+        target.emit(events.chunk, {
+          ...idsOf(entry),
           offset: entry.offset,
           endOffset: entry.offset,
           text: '',
@@ -160,11 +294,16 @@ export function createTaskOutputRooms({
         });
         return;
       }
-      if (info.size > entry.offset) {
+      if (idleFlushMs > 0) {
+        if (info.size > entry.offset || entry.openLineStart !== null) {
+          await sendLineSafe(target, entry, info.size, ended, ended || now() - entry.lastGrowthAt >= idleFlushMs);
+        }
+      } else if (info.size > entry.offset) {
         entry.offset = await sendRange(target, entry, entry.offset, info.size, ended, { flush: idle || ended });
       }
     } catch (error) {
-      logger?.warn?.(`[task-output] live read failed for task ${String(entry.taskId).slice(0, 12)}: ${error?.message || error}`);
+      const what = itemKey ? `task ${String(entry.itemId).slice(0, 12)}` : `conversation ${String(entry.conversationId).slice(0, 12)}`;
+      logger?.warn?.(`[${logLabel}] live read failed for ${what}: ${error?.message || error}`);
     } finally {
       const still = watched.get(room);
       if (still) still.busy = false;
@@ -173,25 +312,24 @@ export function createTaskOutputRooms({
 
   async function watch(socket, payload) {
     const conversationId = idOf(payload?.conversationId);
-    const taskId = idOf(payload?.taskId);
-    if (!conversationId || !taskId) return { ok: false, code: 'missing-id' };
-    const found = lookup(conversationId, taskId);
+    const itemId = itemKey ? idOf(payload?.[itemKey]) : '';
+    if (!conversationId || (itemKey && !itemId)) return { ok: false, code: 'missing-id' };
+    const found = lookup(conversationId, itemId);
     if (found === undefined) return { ok: false, code: 'unavailable' };
     if (!found) return { ok: false, code: 'not-found' };
-    const { kind, path } = taskOutputSource(found.task);
-    // A snapshot is fetched again by the console, `none` has nothing.
-    if (!path) return { ok: false, code: kind === 'snapshot' ? 'snapshot' : 'no-output' };
+    const path = String(found.path || '');
+    if (!path) return { ok: false, code: found.code || 'no-output' };
     let info = await inspect(path);
     // A file not there yet (a spool is named before its first byte) is
     // waited for: the room starts at offset 0.
     if (!info.ok && info.code === 'missing') info = { ok: true, size: 0, mtimeMs: null };
     if (!info.ok) return { ok: false, code: info.code || 'unreadable' };
 
-    const room = taskOutputRoom(conversationId, taskId);
-    if (socket.data?.taskOutputRoom !== room) {
+    const room = roomOf(conversationId, itemId);
+    if (socket.data?.[dataKey] !== room) {
       leave(socket);
       socket.join(room);
-      if (socket.data) socket.data.taskOutputRoom = room;
+      if (socket.data) socket.data[dataKey] = room;
     } else if (!socket.rooms?.has?.(room)) {
       // A recovered socket keeps its data; its rooms may or may not be back.
       socket.join(room);
@@ -208,26 +346,31 @@ export function createTaskOutputRooms({
     if (!entry) {
       entry = {
         conversationId,
-        taskId,
+        itemId,
         path,
         offset: startOffset,
         lastSize: info.size,
+        lastGrowthAt: now(),
+        // Line-safe sends: where the open line sent last begins, if one was.
+        openLineStart: null,
         timer: null,
         busy: false,
       };
       watched.set(room, entry);
       entry.timer = setIntervalImpl(() => { poll(room).catch(() => {}); }, intervalMs);
       entry.timer?.unref?.();
+    } else if (followPath && entry.path !== path && !entry.busy) {
+      await switchPath(io.to(room), entry, path, !!found.ended);
     } else if (wanted !== null && wanted < entry.offset && entry.offset - wanted <= CATCH_UP_BYTES) {
       // A second page joins behind the room: it gets the gap on its own.
       await sendRange(socket, entry, wanted, entry.offset, !!found.ended);
     }
-    return { ok: true, taskId, offset: entry.offset, size: info.size };
+    return { ok: true, ...(itemKey ? { [itemKey]: itemId } : {}), offset: entry.offset, size: info.size };
   }
 
   function registerSocket(socket) {
     if (!socket || typeof socket.on !== 'function') return;
-    socket.on('task_output_watch', (payload, ack) => {
+    socket.on(events.watch, (payload, ack) => {
       watch(socket, payload)
         .then((result) => {
           // A refused watch leaves no stale room behind: the page shows another task now.
@@ -239,7 +382,7 @@ export function createTaskOutputRooms({
           safeAck(ack, { ok: false, code: 'unavailable' });
         });
     });
-    socket.on('task_output_unwatch', (_payload, ack) => {
+    socket.on(events.unwatch, (_payload, ack) => {
       leave(socket);
       safeAck(ack, { ok: true });
     });

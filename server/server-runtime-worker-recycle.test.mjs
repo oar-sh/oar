@@ -137,12 +137,15 @@ test('the recycle stops and launches under the relay-wide launch mutex the sessi
   assert.match(runtimeSource, /import \{ sessionLaunchMutex \} from '\.\/services\/session-launch-mutex-service\.mjs';/);
   const service = sliceBetween('const workerRecycleService = createWorkerRecycleService({', '\n});');
   assert.match(service, /runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, fn\),/);
-  const routesSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
+  const routesSource = fs.readFileSync(path.join(__dirname, 'routes', 'host-routes.mjs'), 'utf8');
   assert.match(routesSource, /import \{ sessionLaunchMutex \} from '\.\.\/services\/session-launch-mutex-service\.mjs';/);
   // The launch routes live in the sessions routes and the conversation modules
   // it registers.
   const launchRoutesSource = [
     'sessions-routes.mjs',
+    'model-routes.mjs',
+    'host-routes.mjs',
+    'conversation-read-routes.mjs',
     'conversation-settings-routes.mjs',
     'conversation-lifecycle-routes.mjs',
     'conversation-bootstrap-routes.mjs',

@@ -11,7 +11,7 @@ import { createQuestionRepository } from '../repositories/question-repository.mj
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { RELAY_EVENT_MESSAGE_KIND } from '../../shared/relay-events.mjs';
 import { RELAY_SCHEDULE_MESSAGE_KIND } from '../../shared/relay-schedules.mjs';
-import { buildDequeuedRelayMessage } from './messages-routes.mjs';
+import { buildDequeuedRelayMessage } from './messages-worker-claim-routes.mjs';
 import { captureRoutes, invokeRoute, makeRouteDeps } from './messages-routes-test-harness.mjs';
 
 const NOW = '2026-03-02T10:00:00.000Z';

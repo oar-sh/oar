@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Fixed-window rate limiter
 //
-// Extracted verbatim from the shared-presence limiter in routes/sessions-routes.mjs
+// Extracted verbatim from the shared-presence limiter (now in routes/share-routes.mjs)
 // so the same behaviour can guard other endpoints. Buckets expire on a TTL and
 // the oldest are evicted once maxBuckets is exceeded, so a hostile caller cannot
 // grow the map without bound.

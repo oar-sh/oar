@@ -24,6 +24,7 @@ import {
 } from '../services/openai-image-spend-service.mjs';
 import { IMAGE_HEADER_BYTES, readImageHeader } from '../../shared/image-header.mjs';
 import { createLocalRequestCheck } from '../services/request-boundary.mjs';
+import { createOpenAIImagePreviewTurns } from '../services/openai-image-preview-turns.mjs';
 import {
   asSentence,
   delay,
@@ -558,11 +559,13 @@ export function registerGeneratedImageContentRoute(app, deps) {
 
 }
 
-// Registers the image routes; returns imageTurnRequeueStop for /api/requeue.
-// `imageSpend` and `imagePreviews` are the message routes' own instances.
-export function registerMessagesImageRoutes(app, deps, { imageSpend, imagePreviews }) {
+// Registers the image routes; returns imageTurnRequeueStop for /api/requeue
+// and imagePreviews, the one instance the output routes and /api/requeue
+// share. `imageSpend` is the message routes' own instance.
+export function registerMessagesImageRoutes(app, deps, { imageSpend }) {
   const {
     auth,
+    io,
     db,
     stmts,
     config,
@@ -584,7 +587,20 @@ export function registerMessagesImageRoutes(app, deps, { imageSpend, imagePrevie
     // The pause before the one retry of an OpenAI image request.
     openAIImageRetryDelayMs = OPENAI_IMAGE_RETRY_DELAY_MS,
     resolveSessionStateRoot,
+    // How long the partial previews of an image request that ended wait for
+    // the turn's end (services/openai-image-preview-turns.mjs).
+    openAIImagePreviewLeftoverMs,
   } = deps;
+
+  // The partial previews of the running image turns: files beside the
+  // turn's final images, events to the owner's clients (every socket is the
+  // owner's: share views read over HTTP and have none).
+  const imagePreviews = createOpenAIImagePreviewTurns({
+    resolveSessionStateRoot,
+    sessionIdFor: (conversationId) => String(stmts.getConvAnyStatus?.get?.(conversationId)?.sdk_session_id || '').trim() || conversationId,
+    emit: (event, payload) => io?.emit?.(event, payload),
+    ...(openAIImagePreviewLeftoverMs !== undefined ? { leftoverMs: openAIImagePreviewLeftoverMs } : {}),
+  });
 
   // Image operations whose OpenAI request runs in this process, and the
   // direct image requests (no operation) this process sent, by queue
@@ -1399,5 +1415,5 @@ export function registerMessagesImageRoutes(app, deps, { imageSpend, imagePrevie
     });
   });
 
-  return { imageTurnRequeueStop };
+  return { imageTurnRequeueStop, imagePreviews };
 }

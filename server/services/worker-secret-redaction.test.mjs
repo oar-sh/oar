@@ -586,3 +586,102 @@ test('task output: a snapshot a worker posts loses the saved key; a task\'s file
   const cleaned = cleanTaskOutput(`$ env | grep KEY\nANTHROPIC_AUTH_TOKEN=${DEEPSEEK_SHAPED_KEY}\nplain ${DEEPSEEK_SHAPED_KEY}\n`);
   assert.equal(cleaned.includes(DEEPSEEK_SHAPED_KEY), false);
 });
+
+// Fake codes of each kind a worker's text can carry: what a terminal shows
+// of it is the text without them.
+const SPLIT_CODES = Object.freeze({
+  sgr: '\u001b[31m',
+  'colon sgr': '\u001b[38:5:196m',
+  'erase csi': '\u001b[K',
+  'cursor csi': '\u001b[2C',
+  'osc bel': '\u001b]8;;https://example.invalid/\u0007',
+  'osc st': '\u001b]0;title\u001b\\',
+  charset: '\u001b(B',
+  'save cursor': '\u001b7',
+});
+
+test('a key an escape code cuts at any place is replaced, and the code stays', () => {
+  for (const [name, code] of Object.entries(SPLIT_CODES)) {
+    for (let at = 1; at < SAVED_KEY.length; at += 1) {
+      const text = `key ${SAVED_KEY.slice(0, at)}${code}${SAVED_KEY.slice(at)} done`;
+      assert.equal(redactSecretsInText(text, [SAVED_KEY]), `key [redacted]${code} done`, `${name} at ${at}`);
+    }
+  }
+});
+
+test('a cut first or last part of a key goes also when codes cut it, follow it or come before it', () => {
+  for (const [name, code] of Object.entries(SPLIT_CODES)) {
+    for (let length = MIN_REDACTED_KEY_PREFIX_LENGTH; length < SAVED_KEY.length; length += 1) {
+      const head = SAVED_KEY.slice(0, length);
+      assert.equal(redactSecretsInText(`key ${head}${code}`, [SAVED_KEY]), `key [redacted]${code}`, `${name}, end, ${length}`);
+      assert.equal(redactSecretsInText(`echo ${head}${code}… (now)`, [SAVED_KEY]), `echo [redacted]${code}… (now)`, `${name}, ellipsis, ${length}`);
+      const tail = SAVED_KEY.slice(-length);
+      assert.equal(redactSecretsInText(`${code}${tail} rest`, [SAVED_KEY]), `${code}[redacted] rest`, `${name}, start, ${length}`);
+      for (let at = 1; at < length; at += 1) {
+        assert.equal(redactSecretsInText(`key ${head.slice(0, at)}${code}${head.slice(at)}`, [SAVED_KEY]), `key [redacted]${code}`, `${name}, end, ${length} cut at ${at}`);
+        assert.equal(redactSecretsInText(`…${tail.slice(0, at)}${code}${tail.slice(at)} rest`, [SAVED_KEY]), `…[redacted]${code} rest`, `${name}, start, ${length} cut at ${at}`);
+      }
+    }
+  }
+});
+
+test('look-alike text with codes stays as it was', () => {
+  const lookAlikes = [
+    `key ${SAVED_KEY.slice(0, 3)}\u001b[31m${SAVED_KEY.slice(3, MIN_REDACTED_KEY_PREFIX_LENGTH - 1)}\u001b[0m`,
+    `${SAVED_KEY.slice(0, 6)}\u001b[1m${SAVED_KEY.slice(6, 12)}\u001b[0m is how it starts`,
+    `key: ${SAVED_KEY.slice(0, 10)}\u001b[31mZ\u001b[0m`,
+    `\u001b[2mthe ${SAVED_KEY.slice(-12)} rest`,
+    '\u001b[1mbold\u001b[0m and \u001b]8;;https://example.invalid/\u0007link\u001b]8;;\u0007',
+    'DeepSeek keys start with \u001b[1msk-\u001b[0m',
+  ];
+  for (const text of lookAlikes) assert.equal(redactSecretsInText(text, [SAVED_KEY]), text);
+});
+
+test('with codes, touching parts become one marker and a key inside a code still goes', () => {
+  const other = 'relay-test-key-other-11112222';
+  assert.equal(redactSecretsInText(`${SAVED_KEY}\u001b[0m${other.slice(0, 4)}\u001b[1m${other.slice(4)} x`, [SAVED_KEY, other]),
+    '[redacted]\u001b[0m\u001b[1m x');
+  assert.equal(redactSecretsInText(`see \u001b]8;;https://example.invalid/?k=${SAVED_KEY}\u0007link\u001b]8;;\u0007`, [SAVED_KEY]),
+    'see \u001b]8;;https://example.invalid/?k=[redacted]\u0007link\u001b]8;;\u0007');
+  assert.equal(redactSecretsInText(`x\u001b${SAVED_KEY} y`, [SAVED_KEY]), 'x[redacted] y');
+});
+
+test('a key cut by codes leaves a worker post, in values and property names', () => {
+  const cut = `${SAVED_KEY.slice(0, 9)}\u001b[33m${SAVED_KEY.slice(9)}\u001b[39m`;
+  assert.deepEqual(redactSecretsDeep({ output: `$ env\n${cut}\n`, [cut]: 1 }, [SAVED_KEY]),
+    { output: '$ env\n[redacted]\u001b[33m\u001b[39m\n', '[redacted]\u001b[33m\u001b[39m': 1 });
+  const middleware = createWorkerPostRedaction({ readSetting });
+  const req = { method: 'POST', path: '/api/stream', headers: WORKER_HEADERS, body: { text: `so far ${SAVED_KEY.slice(0, 10)}\u001b[2m` } };
+  middleware(req, {}, () => {});
+  assert.deepEqual(req.body, { text: 'so far [redacted]\u001b[2m' });
+});
+
+test('a key inside a string control is hidden there, also beside a cut key, and every code stays whole', () => {
+  // Joined at run time: the hygiene scan refuses key shapes.
+  const key = ['sk', 'FAKE0123456789abcdef0123456789ab'].join('-');
+  const other = ['sk', 'FAKE9876543210fedcba9876543210yz'].join('-');
+  const probes = [
+    [`key ${key.slice(0, 10)}\u001b]8;;https://x.test/?k=${key}\u0007${key.slice(10)} end`,
+      'key [redacted]\u001b]8;;https://x.test/?k=[redacted]\u0007 end'],
+    [`key ${key.slice(0, 10)}\u001b]8;;https://x.test/?k=${key}\u001b\\${key.slice(10)} end`,
+      'key [redacted]\u001b]8;;https://x.test/?k=[redacted]\u001b\\ end'],
+    [`${key}\u001b]0;${key}\u0007${key}`, '[redacted]\u001b]0;[redacted]\u0007'],
+    // A key in a hyperlink's address does not join the key before it: the
+    // code stays whole, as do the parts of another key on both sides of it.
+    [`${other}\u001b]8;;https://x.test/?k=${other}&x=${key.slice(0, 12)}\u0007${key.slice(12)} done`,
+      `[redacted]\u001b]8;;https://x.test/?k=[redacted]&x=${key.slice(0, 12)}\u0007${key.slice(12)} done`],
+    [`${other}\u001b]8;;https://x.test/?k=${other}&x=${key.slice(0, 12)}\u001b\\${key.slice(12)} done`,
+      `[redacted]\u001b]8;;https://x.test/?k=[redacted]&x=${key.slice(0, 12)}\u001b\\${key.slice(12)} done`],
+  ];
+  for (const [text, expected] of probes) assert.equal(redactSecretsInText(text, [key, other]), expected);
+  for (const [name, code] of Object.entries(SPLIT_CODES)) {
+    for (let at = 1; at < key.length; at += 1) {
+      const cut = `${key.slice(0, at)}${code}${key.slice(at)}`;
+      const link = `\u001b]8;;https://x.test/?k=${key}\u0007link\u001b]8;;\u0007`;
+      const hidden = '\u001b]8;;https://x.test/?k=[redacted]\u0007link\u001b]8;;\u0007';
+      assert.equal(redactSecretsInText(`${cut} ${link} end`, [key]), `[redacted]${code} ${hidden} end`, `${name} at ${at}, apart`);
+      assert.equal(redactSecretsInText(`${cut}${link} end`, [key]), `[redacted]${code}${hidden} end`, `${name} at ${at}, beside`);
+    }
+  }
+  assert.equal(redactSecretsInText(`\u001b]8;;https://x.test/?k=${key}\u0007link`, [key]), '\u001b]8;;https://x.test/?k=[redacted]\u0007link');
+});

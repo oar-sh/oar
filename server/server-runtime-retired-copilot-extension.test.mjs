@@ -32,7 +32,8 @@ test('the generated wrapper is removed once at start, as a top-level statement',
 
 test('the runtime reads and writes no engine setting: the engine is the SDK worker', () => {
   assert.doesNotMatch(runtimeSource, /copilot_engine|getCopilotEngine|setCopilotProviderSettings|relayCliLauncherService/);
-  assert.match(runtimeSource, /function getCopilotProviderSettings\(\) \{\n  return \{ engine: 'sdk', engines: \['sdk'\] \};\n\}/);
+  // The one engine, plus the switch and the CLI detection (the Copilot switch).
+  assert.match(runtimeSource, /function getCopilotProviderSettings\(\) \{\n  return \{ engine: 'sdk', engines: \['sdk'\], enabled: isCopilotEnabled\(\), cliFound: detectCopilotCli\(\) \};\n\}/);
 });
 
 test('the SDK is looked up on every Copilot launch, after every other provider has returned', () => {

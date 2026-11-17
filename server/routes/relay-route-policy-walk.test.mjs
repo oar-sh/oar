@@ -23,6 +23,7 @@ import { registerAskUserRoutes } from './ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './relay-board-routes.mjs';
 import { registerCacheRoutes } from './cache-routes.mjs';
 import { registerGitRoutes } from './git-routes.mjs';
+import { registerWorkerLogRoutes } from './worker-log-routes.mjs';
 import { registerClaudeCloudRoutes } from './claude-cloud-routes.mjs';
 import { registerPushRoutes } from './push-routes.mjs';
 import { registerRemoteRelayRoutes } from './remote-relay-routes.mjs';
@@ -49,6 +50,7 @@ const REGISTRARS = [
   registerRelayBoardRoutes,
   registerCacheRoutes,
   registerGitRoutes,
+  registerWorkerLogRoutes,
   registerClaudeCloudRoutes,
   registerPushRoutes,
   registerRemoteRelayRoutes,

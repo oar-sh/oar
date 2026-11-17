@@ -631,8 +631,10 @@ export function renderDoctorReport({
   for (const note of databaseNotes) lines.push(`                  ${note}`);
   if (backups) lines.push(...renderBackupLines(backups, now));
   lines.push('  provider CLIs :');
+  // Every provider is optional: a CLI that is not there is said so, not as a
+  // fault (the exit code never depended on it).
   for (const probe of probes) {
-    lines.push(`    ${probe.id.padEnd(14)}: ${probe.ok ? probe.version || 'installed' : 'not found'}`);
+    lines.push(`    ${probe.id.padEnd(14)}: ${probe.ok ? probe.version || 'installed' : 'not installed (optional)'}`);
   }
   lines.push(...renderAgentSdkLines(agentSdks));
   for (const warning of warnings) lines.push(`  warning       : ${warning}`);

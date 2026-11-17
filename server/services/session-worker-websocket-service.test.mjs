@@ -904,6 +904,151 @@ test('a retry far away is re-read every minute, and fires on time', async (t) =>
   service.stop();
 });
 
+// `clock.lag = 1` once the timer is armed puts the service's clock 1 ms
+// behind the timers: the due timer fires at retryAt − 1, as a real one can.
+// The query reads "future" rows only (nextPendingAttemptAt's
+// `next_attempt_at > ?`).
+function earlyDueSetup(t, { nextDueAtMs, onDue, requestWork, queueCounts }) {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+  const clock = { lag: 0 };
+  const nowMs = () => Date.now() - clock.lag;
+  const httpServer = new EventEmitter();
+  const service = createSessionWorkerWebSocketService({
+    WebSocketServerImpl: FakeWebSocketServer,
+    httpServer,
+    authToken: 'secret-token',
+    queueCounts: queueCounts || (() => ({ pendingCount: 1, processingCount: 0, parkedCount: 0 })),
+    ...(requestWork ? { requestWork } : {}),
+    nextDueAtMs: () => nextDueAtMs(nowMs()),
+    onDue: (reason) => onDue(reason, { service, clock, nowMs }),
+    pollIntervalMs: 10_000,
+    nowMs,
+  });
+  return { service, clock, nowMs, httpServer };
+}
+
+test('a due timer that fires a millisecond early still delivers the retry when the clock passes its time before the re-arm', async (t) => {
+  const retryAt = 1_000_000 + 2_000;
+  const claims = [];
+  const delivered = () => claims.some((claim) => claim.granted);
+  let ctx = null;
+  ctx = earlyDueSetup(t, {
+    queueCounts: () => ({ pendingCount: delivered() ? 0 : 1, processingCount: 0, parkedCount: 0 }),
+    // The claim's own rule: a row in backoff only from its retry time on.
+    requestWork: async ({ reason }) => {
+      const at = ctx.nowMs();
+      const granted = at >= retryAt && !delivered();
+      claims.push({ reason, at, granted });
+      // The clock passes the retry time between the refused claim and the
+      // timer's re-arm.
+      if (!granted && reason === 'retry-due') ctx.clock.lag = 0;
+      return granted ? { message: { id: 'q-retry' } } : null;
+    },
+    nextDueAtMs: (now) => (!delivered() && retryAt > now ? retryAt : null),
+    onDue: (reason, { service }) => { void service.notifyQueueChanged(reason); },
+  });
+  const { service, clock, httpServer } = ctx;
+  service.start();
+  clock.lag = 1;
+  const socket = connectWorker(httpServer, 'sdk-early');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  t.mock.timers.tick(2_000);
+  await flushMicrotasks();
+  assert.deepEqual(claims.filter((claim) => claim.reason === 'retry-due'), [
+    { reason: 'retry-due', at: retryAt - 1, granted: false },
+  ], 'the early wake is refused');
+  t.mock.timers.tick(50);
+  await flushMicrotasks();
+  const deliveries = socket.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'queue.deliver');
+  assert.equal(deliveries.length, 1, 'delivered by the due timer, not at the next poll');
+  assert.equal(deliveries[0].reason, 'retry-due');
+  assert.equal(deliveries[0].pending.message.id, 'q-retry');
+  assert.deepEqual(claims.at(-1), { reason: 'retry-due', at: retryAt + 50, granted: true });
+  service.stop();
+});
+
+test('the owed time of an early due timer outlives re-arms that read no future row', async (t) => {
+  const retryAt = 1_000_000 + 2_000;
+  const dues = [];
+  const { service, clock, nowMs } = earlyDueSetup(t, {
+    nextDueAtMs: (now) => (retryAt > now ? retryAt : null),
+    onDue: (reason, { service: svc, clock, nowMs: now }) => {
+      dues.push(now());
+      clock.lag = 0;
+      // A wake whose own re-arm (after its await) reads at retryAt: nothing.
+      void svc.notifyQueueChanged(reason);
+    },
+  });
+  service.start();
+  clock.lag = 1;
+  t.mock.timers.tick(2_000);
+  assert.deepEqual(dues, [retryAt - 1]);
+  await flushMicrotasks();
+  // Another re-arm in the same instant (a queue write, a poll): still nothing
+  // in the future.
+  assert.equal(nowMs(), retryAt);
+  await service.notifyQueueChanged('insert');
+  t.mock.timers.tick(49);
+  assert.deepEqual(dues, [retryAt - 1]);
+  t.mock.timers.tick(1);
+  assert.deepEqual(dues, [retryAt - 1, retryAt + 50], 'the owed timer fires once more');
+  t.mock.timers.tick(5_000);
+  assert.equal(dues.length, 2, 'and is not owed again');
+  service.stop();
+});
+
+test('an early due timer is re-armed for its own time when the due query throws', async (t) => {
+  const retryAt = 1_000_000 + 2_000;
+  const dues = [];
+  const { service, clock } = earlyDueSetup(t, {
+    nextDueAtMs: (now) => {
+      if (now >= retryAt) throw new Error('the due query broke');
+      return retryAt;
+    },
+    onDue: (_reason, { clock, nowMs }) => {
+      dues.push(nowMs());
+      clock.lag = 0;
+    },
+  });
+  service.start();
+  clock.lag = 1;
+  t.mock.timers.tick(2_000);
+  assert.deepEqual(dues, [retryAt - 1]);
+  t.mock.timers.tick(50);
+  assert.deepEqual(dues, [retryAt - 1, retryAt + 50]);
+  t.mock.timers.tick(5_000);
+  assert.equal(dues.length, 2);
+  service.stop();
+});
+
+test('a due timer that fires on time is owed nothing, even when its claim is refused', async (t) => {
+  const retryAt = 1_000_000 + 2_000;
+  const claims = [];
+  let ctx = null;
+  ctx = earlyDueSetup(t, {
+    // A worker busy elsewhere: every claim is refused.
+    requestWork: async ({ reason }) => { claims.push({ reason, at: ctx.nowMs() }); return null; },
+    nextDueAtMs: (now) => (retryAt > now ? retryAt : null),
+    onDue: (reason, { service }) => { void service.notifyQueueChanged(reason); },
+  });
+  const { service, httpServer } = ctx;
+  service.start();
+  const socket = connectWorker(httpServer, 'sdk-busy');
+  socket.emit('message', JSON.stringify({ type: 'worker.ready', reason: 'ws-open' }));
+  await flushMicrotasks();
+  t.mock.timers.tick(2_000);
+  await flushMicrotasks();
+  for (let i = 0; i < 50; i += 1) {
+    t.mock.timers.tick(100);
+    await flushMicrotasks();
+  }
+  assert.deepEqual(claims.filter((claim) => claim.reason === 'retry-due'), [{ reason: 'retry-due', at: retryAt }],
+    'one due wake over 5 s, no re-arm chain');
+  assert.deepEqual(claims.map((claim) => claim.reason), ['ws-open', 'retry-due']);
+  service.stop();
+});
+
 test('stop clears the due timer and nothing re-arms it', async (t) => {
   const due = 1_000_000 + 5_000;
   const { service, dues } = dueSetup(t, { dueAtMs: () => due });

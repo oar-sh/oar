@@ -324,7 +324,7 @@ function resetComposer(text = '') {
 
 function resetSessionIndicators() {
   const chatTitle = getById('chat-title');
-  delete chatTitle.dataset.copilotSessionId;
+  delete chatTitle.dataset.sdkSessionId;
   chatTitle.title = '';
   repoBrowserState.sessionRootPath = '';
   repoBrowserState.sessionRootName = 'Session';
@@ -942,7 +942,7 @@ test('send validation resolving after a switch leaves the session pill and repo 
   validation.resolve(validationPayload('sess-stale', '/stale-root', 'A'));
   await sendPromise;
 
-  assert.equal(getById('chat-title').dataset.copilotSessionId, undefined, 'the stale session id is not applied to the pill');
+  assert.equal(getById('chat-title').dataset.sdkSessionId, undefined, 'the stale session id is not applied to the pill');
   assert.equal(repoBrowserState.sessionRootPath, '', 'the repo browser keeps the current conversation\'s root');
 });
 
@@ -962,7 +962,7 @@ test('send validation happy path: unswitched flow applies the session pill and r
 
   await view.sendMessage();
 
-  assert.equal(getById('chat-title').dataset.copilotSessionId, 'sess-live', 'the session pill reflects the validated conversation');
+  assert.equal(getById('chat-title').dataset.sdkSessionId, 'sess-live', 'the session pill reflects the validated conversation');
   assert.equal(repoBrowserState.sessionRootPath, '/live-root', 'the repo browser root reflects the validated conversation');
 });
 

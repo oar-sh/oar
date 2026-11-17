@@ -56,17 +56,7 @@ test('a DeepSeek delivery carries DeepSeek attribution, the Claude command limit
   assert.match(attributionSource, /modelLabel: deepseekModelLabel\(modelId\)/);
 });
 
-test('provider reconciliation and runtime binding know deepseek', () => {
-  const reconcileSource = sliceBetween(
-    'async function reconcileUnstartedConversationProviders(',
-    '\nasync function rebindUnstartedOpenAIConversationModel(',
-  );
-  assert.match(reconcileSource, /deepseek: DEFAULT_DEEPSEEK_MODEL,/);
-  assert.match(
-    reconcileSource,
-    /currentProvider === 'deepseek'\s*\?\s*getDeepSeekProviderSettings\(\)\.configured === true/,
-    'rollback must only restore a deepseek binding while the key is still configured',
-  );
+test('runtime binding knows deepseek', () => {
   const bindingSource = sliceBetween('function ensureRuntimeSessionBinding(', '\nfunction bootstrapRuntimeSessionBindings(');
   assert.match(bindingSource, /normalizedRequestedProviderType === 'deepseek'\s*\?\s*'deepseek'/);
   assert.match(bindingSource, /resolvedProviderType === 'deepseek'\s*(?:\)|\|\|)/);

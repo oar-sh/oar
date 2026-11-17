@@ -225,7 +225,7 @@ for (const profile of [
       await expectEmptyState(page, "setup");
       await expect(emptyState(page).locator("h3")).toHaveText("Set up a provider");
       await expect(emptyState(page).locator("p")).toContainText("Settings → Providers");
-      await expect(emptyState(page).locator("p")).toContainText("Copilot CLI on the relay host");
+      await expect(emptyState(page).locator("p")).toContainText("Copilot, Claude, Cursor, OpenAI, Grok or DeepSeek");
       await expect(page.locator("#empty-state-open-settings")).toBeVisible();
       await expect(page.locator("#empty-state-new-chat")).toBeVisible();
       await expect(page.locator("#empty-state-show-conversations")).toHaveCount(0);
@@ -268,7 +268,7 @@ for (const profile of [
       await expect(note).toContainText("Settings → Providers");
       await expect(openSettings).toBeVisible();
       await expect(openSettings).toHaveClass(/summary-btn-accent/);
-      await expect(confirm).toHaveText("Start a Copilot chat anyway");
+      await expect(confirm).toHaveText("Start chat anyway");
       await expect(confirm).toBeEnabled();
       await expect(page.locator("#new-conversation-provider-row")).toBeHidden();
 

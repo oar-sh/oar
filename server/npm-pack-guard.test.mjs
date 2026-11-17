@@ -63,8 +63,18 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // peer keys that follow it add their own. 760 since 2026-11-12: 0.9.27
 // features (auth, peer keys, security UI) took it to 694 entries. 690
 // since 2026-11-14: the Copilot CLI extension left the package (695 entries
-// before, 664 after).
-const MAX_ENTRIES = 690;
+// before, 664 after). 691 since 2026-11-16: the queue insert that unarchives
+// (server/repositories/queue-insert.mjs) took it to 691. 692 since
+// 2026-11-16: the Windows stop of the relay's whole process tree
+// (server/services/windows-relay-process-tree.mjs). 693 since 2026-11-16:
+// the worker liveness probe the dead-worker detection and the archive share
+// (server/services/worker-session-liveness.mjs). 695 since 2026-11-16: the
+// Copilot switch (server/services/copilot-settings-service.mjs and migration
+// 0043). 696: its Settings switch (server/public/app/copilot-settings-ui.js).
+// 697: New Chat's provider list (server/public/app/new-chat-providers.mjs).
+// 698 since 2026-11-17: the word-by-word prefix matcher both prompt
+// sanitizers share (server/public/app/whitespace-flexible-match.mjs).
+const MAX_ENTRIES = 698;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and

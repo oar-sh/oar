@@ -8,9 +8,11 @@ import {
   buildConversationShareToken,
   normalizeSharedViewerId,
   filterMessagesVisibleToSharedView,
+} from './share-routes.mjs';
+import {
   buildConversationMessages,
   selectConversationHistoryPage,
-} from './sessions-routes.mjs';
+} from './sessions-helpers.mjs';
 
 test('normalizeShareToken accepts valid hex tokens', () => {
   const value = normalizeShareToken('A'.repeat(32));
@@ -176,7 +178,7 @@ test('shared access status event is created only after a successful shared paylo
 test('shared attachment routes stream through the range-aware file server', () => {
   // The helper owns stream errors, ranges (a shared video can seek) and the
   // safe content headers; a share route no longer pipes a bare read stream.
-  const source = ['./sessions-routes.mjs', './share-routes.mjs']
+  const source = ['./sessions-routes.mjs', './share-routes.mjs', './model-routes.mjs', './host-routes.mjs', './conversation-read-routes.mjs']
     .map((file) => fs.readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8'))
     .join('\n');
   assert.doesNotMatch(source, /fs\.createReadStream\(filePath\)/);
@@ -193,7 +195,7 @@ test('an authenticated share revoke route exists and invalidates active shares (
 });
 
 test('shared attachment content is served with neutralized type + nosniff + sandbox CSP (H3)', () => {
-  const source = ['./sessions-routes.mjs', './share-routes.mjs']
+  const source = ['./sessions-routes.mjs', './share-routes.mjs', './model-routes.mjs', './host-routes.mjs', './conversation-read-routes.mjs']
     .map((file) => fs.readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8'))
     .join('\n');
   // The shared (unauthenticated) upload + generated-image routes hand the

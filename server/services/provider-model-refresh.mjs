@@ -220,6 +220,8 @@ export function buildProviderRefreshTable({
   deepseekSettingsService = null,
   claudeApiSettingsService = null,
   copilotModelDiscoveryService = null,
+  // The Copilot switch (copilot-settings-service.mjs); absent, Copilot is on.
+  isCopilotEnabled = () => true,
   // Claude and Grok run on the host's CLI and its login: set up when the CLI
   // is installed or the login is there, as the relay knows it without
   // spawning anything. Absent (most tests): enabled is enough.
@@ -257,13 +259,20 @@ export function buildProviderRefreshTable({
   const deepseekSettings = () => deepseekSettingsService?.getSettings?.() || null;
   const claudeApiSettings = () => claudeApiSettingsService?.getSettings?.() || null;
   const hasCopilotDiscovery = typeof copilotModelDiscoveryService?.refresh === 'function';
+  const copilotOn = () => {
+    try {
+      return isCopilotEnabled() !== false;
+    } catch {
+      return true;
+    }
+  };
   return {
     // Copilot discovery gates itself on an installed CLI (skipped when there
-    // is none), so the Refresh button always asks it.
+    // is none), so the Refresh button asks it whenever Copilot is switched on.
     github: {
-      isEnabled: () => hasCopilotDiscovery,
+      isEnabled: () => hasCopilotDiscovery && copilotOn(),
       isSetUp: () => {
-        if (!hasCopilotDiscovery) return false;
+        if (!hasCopilotDiscovery || !copilotOn()) return false;
         try {
           return typeof copilotModelDiscoveryService.isCliResolvable === 'function'
             ? copilotModelDiscoveryService.isCliResolvable() === true

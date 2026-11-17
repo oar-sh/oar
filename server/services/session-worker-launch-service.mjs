@@ -742,7 +742,7 @@ export function createWorkerSecretEnvFile(env = {}, {
  * block a worker spawn. Naive rotation: >10 MB rolls to `<file>.1`, checked
  * at each launch on every platform.
  */
-function resolveWorkerLogDir(launchEnv = {}, { pathImpl = path } = {}) {
+export function resolveWorkerLogDir(launchEnv = {}, { pathImpl = path } = {}) {
   const explicitDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_LOG_DIR);
   const serverDir = normalizeText(launchEnv?.COPILOT_WEB_RELAY_SERVER_DIR);
   // `new URL(...).pathname` yields '/C:/git/...' on Windows, which pathImpl.join
@@ -753,7 +753,19 @@ function resolveWorkerLogDir(launchEnv = {}, { pathImpl = path } = {}) {
 }
 
 function safeWorkerFileId(targetSessionId) {
-  return String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'worker';
+  return String(targetSessionId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+}
+
+/**
+ * The log file of the worker for `targetSessionId` under `launchEnv`, with no
+ * side effect (no folder made, no rotation): what prepareWorkerLogFile opens
+ * and the worker log view reads. null for an id that cleans to nothing: those
+ * share `worker-worker.log`, which belongs to no one conversation.
+ */
+export function workerLogPathFor(targetSessionId, launchEnv = {}, { pathImpl = path } = {}) {
+  const safeId = safeWorkerFileId(targetSessionId);
+  if (!safeId) return null;
+  return pathImpl.join(resolveWorkerLogDir(launchEnv, { pathImpl }), `worker-${safeId}.log`);
 }
 
 export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
@@ -763,8 +775,7 @@ export function prepareWorkerLogFile(targetSessionId, launchEnv = {}, {
   try {
     const baseDir = resolveWorkerLogDir(launchEnv, { pathImpl });
     fsImpl.mkdirSync(baseDir, { recursive: true });
-    const safeId = safeWorkerFileId(targetSessionId);
-    const logPath = pathImpl.join(baseDir, `worker-${safeId}.log`);
+    const logPath = workerLogPathFor(targetSessionId, launchEnv, { pathImpl }) || pathImpl.join(baseDir, 'worker-worker.log');
     try {
       const stats = fsImpl.statSync(logPath);
       if (stats.size > 10 * 1024 * 1024) fsImpl.renameSync(logPath, `${logPath}.1`);

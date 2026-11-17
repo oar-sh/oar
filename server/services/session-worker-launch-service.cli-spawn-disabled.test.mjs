@@ -14,7 +14,7 @@ import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
-import { dequeuePendingMessageForWorkerLoop } from '../routes/messages-routes.mjs';
+import { dequeuePendingMessageForWorkerLoop } from '../routes/messages-worker-claim-routes.mjs';
 import { createPendingWorkerPrimer } from './queue-waker.mjs';
 import { createSessionWorkerRegistry } from './session-worker-registry-service.mjs';
 import { createSessionWorkerSupervisor } from './session-worker-supervisor-service.mjs';

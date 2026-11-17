@@ -1,6 +1,7 @@
 'use strict';
 
 import { originWeightedFor } from './remote-relay-inbound.mjs';
+import { createReadWorkerLog, plainTail, refuseWorkerLogElsewhere } from './remote-relay-worker-log.mjs';
 import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
@@ -58,7 +59,7 @@ import { ANSWERED_ELSEWHERE_KIND } from '../../shared/steer-settle-markers.mjs';
 import { RELAY_EVENT_DEFAULT_TYPES, RELAY_EVENT_RELAY_LEVEL_TYPES } from '../../shared/relay-events.mjs';
 import { RELAY_EVENT_SELF_RELAY_ID } from './relay-event-service.mjs';
 import { checkRequestedProviderModel, isAutoModelId, providerModelLabel, unknownProviderModelText } from './provider-model-selection.mjs';
-import { cleanTaskOutput, parseRunnerSummary, stallMinutes, stripSgr } from '../../shared/task-output-text.mjs';
+import { parseRunnerSummary, stallMinutes } from '../../shared/task-output-text.mjs';
 import { TASK_OUTPUT_NONE_MESSAGES } from '../public/app/task-console-render.mjs';
 import {
   RELAY_EVENT_REMOTE_PULL_PATH,
@@ -1397,13 +1398,13 @@ export function createRemoteRelayDispatcher({
     const models = catalog.models || {};
     return REMOTE_RELAY_PROVIDERS.map((provider) => {
       if (provider === 'github') {
-        const githubModels = catalogGithubModels(catalog);
-        const defaultModel = toText(catalog.status.defaultModel) || toText(models.defaultModel) || toText(models.currentModel) || null;
+        const configured = catalog.copilot?.enabled !== false; // Copilot's switch; an older relay sends none: on
+        const defaultModel = (configured && (toText(catalog.status.defaultModel) || toText(models.defaultModel) || toText(models.currentModel))) || null;
         return {
           provider,
-          configured: true,
+          configured,
           defaultModel,
-          models: uniqueTexts([...(defaultModel ? [defaultModel] : []), ...githubModels]),
+          models: configured ? uniqueTexts([...(defaultModel ? [defaultModel] : []), ...catalogGithubModels(catalog)]) : [],
           ...(toText(catalog.copilot?.engine) ? { engine: toText(catalog.copilot.engine) } : {}),
         };
       }
@@ -2180,26 +2181,7 @@ export function createRemoteRelayDispatcher({
     const model = Array.isArray(answer?.lines) ? answer.lines : [];
     const task = isPlainObject(answer?.task) ? answer.task : {};
     const ended = answer?.ended === true;
-    // Plain text, a repeat folded as ×N; cleaned again, whatever the other
-    // side did.
-    const rendered = model.map((line) => {
-      const text = stripSgr(cleanTaskOutput(String(line?.text ?? '')));
-      const count = Number(line?.count) > 1 ? Number(line.count) : 1;
-      return count > 1 ? `${text}  [×${count}]` : text;
-    });
-    let tail = rendered.slice(-args.lines);
-    let cut = tail.length < rendered.length;
-    let bytes = 0;
-    let keepFrom = tail.length;
-    for (let index = tail.length - 1; index >= 0; index -= 1) {
-      bytes += Buffer.byteLength(tail[index], 'utf8') + 1;
-      if (bytes > REMOTE_RELAY_LIMITS.taskOutputBytesMax) break;
-      keepFrom = index;
-    }
-    if (keepFrom > 0) {
-      tail = tail.slice(keepFrom);
-      cut = true;
-    }
+    const { tail, cut } = plainTail(model, args.lines);
     const health = isPlainObject(answer?.health) ? answer.health : null;
     const lastOutputAt = Number(health?.lastOutputAt) || Number(answer?.mtime) || null;
     const minutes = !ended && lastOutputAt ? stallMinutes(lastOutputAt, now()) : null;
@@ -2735,10 +2717,10 @@ export function createRemoteRelayDispatcher({
     const provider = createProvider(ctx.caller, args);
     const cloud = provider === CLOUD_PROVIDER;
     const entry = providers.find((candidate) => candidate.provider === provider);
-    if (!entry?.configured) {
+    if (!entry?.configured) { // github is not set up only where Copilot is switched off; nothing else is picked
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.providerUnavailable,
-        `Relay "${ctx.relay.name}" has no ${provider} provider set up. Providers there: ${configured.join(', ') || 'none'}. Pass provider to pick one.`,
-        { providers: configured, ...(cloud && catalog.settings[CLOUD_PROVIDER] ? { remoteCode: CLOUD_DISABLED_CODE } : {}) });
+        `${provider === 'github' ? `Copilot is switched off on relay "${ctx.relay.name}", so no session was created.` : `Relay "${ctx.relay.name}" has no ${provider} provider set up.`} Providers there: ${configured.join(', ') || 'none'}. Pass provider to pick one.`,
+        { providers: configured, ...(cloud && catalog.settings[CLOUD_PROVIDER] ? { remoteCode: CLOUD_DISABLED_CODE } : {}), ...(provider === 'github' ? { remoteCode: 'COPILOT_NOT_ENABLED' } : {}) });
     }
 
     let model = args.model || '';
@@ -3952,6 +3934,7 @@ export function createRemoteRelayDispatcher({
     list_sessions: listSessions,
     read_session: readSession,
     read_task_output: readTaskOutput,
+    read_worker_log: createReadWorkerLog({ call, sessionPath, now, refuse: (status, code, message) => new DispatchFailure(status, code, message) }),
     wait: waitAction,
     send,
     create_session: createSession,
@@ -3986,6 +3969,12 @@ export function createRemoteRelayDispatcher({
         { ...extra, remoteCode: C.peerKeyRequired });
     }
     if (code === C.unauthorized || status === 401) {
+      // This relay calling itself: no pairing to redo, a fault on this side
+      // (no agent token for the calling session, or its own API refused it).
+      if (relay?.local === true) {
+        logger?.warn?.(`${LOG_PREFIX} ${action} on this relay: its own API refused the call: ${message.slice(0, 200)}`);
+        return failure(500, REMOTE_RELAY_INTERNAL_ERROR_CODE, `${message}. Nothing was done. This is a fault on this relay, not a pairing; see its server log.`, extra);
+      }
       return failure(502, C.unauthorized, `${message}. Ask the person to ${remoteRelayReAddAdvice(relay.name)}.`, extra);
     }
     if (code === C.inboundDisabled || toText(remoteBody?.code) === C.inboundDisabled) {
@@ -4545,13 +4534,12 @@ export function createRemoteRelayDispatcher({
   }
 
   /**
-   * Whether a call is an ask action about the caller's own conversation on
-   * this relay: an ask or list_questions without another session, or a
-   * withdraw here. Such a call touches nothing but the conversation's own
-   * questions, so it needs neither the agent sessions setting nor a mention.
+   * Whether a call is about the caller's own conversation on this relay (an ask or list_questions
+   * without another session, a withdraw, a read_worker_log): it touches nothing but that
+   * conversation's questions or log, so it needs neither the agent sessions setting nor a mention.
    */
   async function isOwnAskCall(conversationId, action, args) {
-    if (!REMOTE_RELAY_ASK_ACTIONS.includes(action)) return false;
+    if (!REMOTE_RELAY_ASK_ACTIONS.includes(action) && action !== 'read_worker_log') return false;
     const query = toText(args?.relay).replace(/^@/, '').toLowerCase();
     if (query !== REMOTE_RELAY_LOCAL_ALIAS) {
       const resolved = await registry.resolve(args.relay);
@@ -4559,10 +4547,10 @@ export function createRemoteRelayDispatcher({
       const selfName = toText(await registry.selfName?.()).toLowerCase();
       if (!selfName || selfName !== query) return false;
     }
-    return action === 'withdraw' || !toText(args.session) || isOwnConversation({ conversationId }, args.session);
+    return action === 'withdraw' || action === 'read_worker_log' || !toText(args.session) || isOwnConversation({ conversationId }, args.session);
   }
 
-  /** An ask action on the caller's own conversation (isOwnAskCall): the rate limit, then the action. */
+  /** A call on the caller's own conversation (isOwnAskCall): the rate limit, then the action; read_worker_log with the caller's own token, which its route's row check judges. */
   async function runOwnAskAction({ conversationId, action, args, req, signal }) {
     const relay = await localTarget();
     const retryAfterSeconds = consumeRateLimit(conversationId, false);
@@ -4573,10 +4561,11 @@ export function createRemoteRelayDispatcher({
     }
     const caller = { conversationId, ...((await getCallerContext(conversationId, req)) || {}) };
     try {
-      const { summary, ...rest } = await ACTIONS[action]({ relay, caller, hops: nonNegativeInt(caller.hops), conversationId, signal }, args);
+      const { summary, ...rest } = await ACTIONS[action]({ relay, caller, hops: nonNegativeInt(caller.hops), conversationId, signal, ...(action === 'read_worker_log' ? { callerAuth: { principal: principalOf(req), conversationId } } : {}) }, args);
       return { status: 200, body: { ok: true, relay: relay.name, summary, ...rest } };
     } catch (error) {
       if (error instanceof DispatchFailure) return failure(error.status, error.code, error.message, { relay: relay.name, ...error.extra });
+      if (isRemoteRelayError(error)) return mapRemoteError(error, relay, { action, args });
       throw error;
     }
   }
@@ -4628,6 +4617,7 @@ export function createRemoteRelayDispatcher({
       if (await isOwnAskCall(callerConversationId, validation.action, validation.args)) {
         return await runOwnAskAction({ conversationId: callerConversationId, action: validation.action, args: validation.args, req, signal });
       }
+      if (validation.action === 'read_worker_log') return refuseWorkerLogElsewhere(validation.args);
       return await runRelayAction({
         conversationId: callerConversationId,
         action: validation.action,

@@ -679,3 +679,40 @@ test('a task that ended while the relay was away ends with one event', () => {
   assert.equal(messages[0].text.match(/task_finished/g).length, 1);
   assert.match(messages[0].text, /task_finished "npm run soak" \(shell, exit 0\)/);
 });
+
+test('an event for a watcher archived without notice is dropped at the flush, and the watcher stays archived', () => {
+  const { service, db, clock, emitted, wakes } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, scope: 'all' });
+  service.noteTurnEnd({ conversationId: BUILDER, replyText: 'Rendered the orbit camera.' });
+  db.prepare(`UPDATE conversations SET archived = 1 WHERE id = ?`).run(WATCHER);
+  clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
+  assert.deepEqual(eventMessages(db), []);
+  assert.equal(db.prepare(`SELECT archived FROM conversations WHERE id = ?`).get(WATCHER).archived, 1);
+  assert.deepEqual(emitted.filter((entry) => entry.event === 'conversation_archived'), []);
+  assert.deepEqual(wakes, []);
+});
+
+// The live check goes stale: the watcher is archived inside the flush's
+// write, after flush checked it. The row brings it back, said once, instead
+// of waiting unseen in an archived chat.
+test('an event row written into a watcher archived after its check unarchives it and says so once', () => {
+  const { service, db, stmts, clock, emitted } = setup();
+  service.subscribe({ watcherConversationId: WATCHER, scope: 'all' });
+  service.noteTurnEnd({ conversationId: BUILDER, replyText: 'Rendered the orbit camera.' });
+  const updateConvTime = stmts.updateConvTime;
+  stmts.updateConvTime = {
+    run: (at, id) => {
+      const result = updateConvTime.run(at, id);
+      db.prepare(`UPDATE conversations SET archived = 1 WHERE id = ?`).run(id);
+      return result;
+    },
+  };
+  clock.advance(RELAY_EVENT_LIMITS.coalesceMs);
+  const [message] = eventMessages(db);
+  assert.equal(message.status, 'pending');
+  assert.equal(db.prepare(`SELECT archived FROM conversations WHERE id = ?`).get(WATCHER).archived, 0);
+  const events = emitted.map((entry) => entry.event);
+  assert.deepEqual(emitted.filter((entry) => entry.event === 'conversation_archived').map((entry) => entry.payload), [{ conversationId: WATCHER, archived: false }]);
+  assert.ok(events.indexOf('conversation_archived') < events.indexOf('user_message'), events.join(','));
+  assert.equal(stmts.findPendingForWorker.get(new Date(clock.now()).toISOString(), `sdk-${WATCHER}`)?.id, message.id);
+});

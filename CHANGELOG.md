@@ -5,6 +5,128 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.30] — 2026-11-17
+
+Highlights: GitHub Copilot is optional. Settings → Providers → Copilot has
+an **Enable GitHub Copilot** switch like the other providers', a relay in
+use keeps Copilot on, and a new relay starts with it on only when the
+Copilot CLI is installed and has run once. Switching a provider off, or
+removing its key, no longer moves a chat to another provider. A chat's
+**︙** menu shows its worker's log, scrubbed of credentials, and an agent
+can read its own. Archiving no longer starts an archived chat again, and a
+reply you stopped is no longer run again after its session dies.
+
+### Added
+
+- **A switch for GitHub Copilot** (Settings → Providers → Copilot → Enable
+  GitHub Copilot), like the other providers'. Off, Copilot leaves New Chat,
+  the model lists, Select Models, Check Usage and the provider lists of
+  paired relays on 0.9.30 (one still on 0.9.29 lists Copilot as set up, but
+  a session it starts there is refused and nothing is created). A Copilot
+  chat keeps its history but takes no message until it is switched on
+  again: a send from the composer or an agent is refused, and a message
+  queued another way (a schedule, a relay event, a plan card, a resumed
+  turn) fails with a Copilot settings button. No Copilot worker starts
+  while it is off, at start, on an unarchive or on a manual launch
+  (`COPILOT_SWITCHED_OFF`), and the relay imports no Copilot sessions and
+  reads no Copilot models or usage. Existing relays keep Copilot on; a new
+  one starts with it on only when the Copilot CLI is installed and has run
+  once (its version folder unpacked; `COPILOT_SDK_PATH` does not count),
+  and otherwise you switch it on in Settings. New Chat lists the providers
+  that are on and preselects the one you last started a chat on, and the
+  OpenAI tab says when it needs the Copilot CLI, with Install.
+- **📜 Worker log in the chat menu.** Any chat with a worker shows what its
+  worker process wrote to its log: the last 2,000 lines, new lines live
+  while it is open, and Load earlier back to 5 MB, in a view like a task's
+  console. The header names the session, the file's path on the host, its
+  size and last write, and the file a relaunch rolled it over to.
+  Credentials are scrubbed on the relay first, there is no download, and
+  only you and the conversation's own agent can read it; the agent reads
+  its own with relay_tool's `read_worker_log`.
+- **Task and log output scrub more credential shapes:** OAR's own tokens
+  and file capabilities, Cookie and Set-Cookie headers, xAI keys, JWTs,
+  `refresh_token` and `id_token`, an OAuth `code=` in a query string or form
+  body, and `access_token` in JSON or `key: value` form.
+
+### Changed
+
+- **A message that reaches an archived chat without your composer brings
+  the chat back to the list and runs:** an agent's message, a usage-limit
+  follow-up or a plan card's action. In the web page the composer still
+  asks you to unarchive the chat first.
+- **An empty chat keeps its provider when that provider is switched off or
+  loses its key.** Until now a chat that had not sent a message yet moved to
+  Copilot when Claude, Claude API or Grok was switched off, or the OpenAI,
+  Cursor or DeepSeek key was removed, and switching Grok on moved empty
+  Copilot chats to Grok. Now nothing moves: the chat's first message behaves
+  as in a started chat of that provider.
+
+### Fixed
+
+- **A reply you had stopped is no longer run again when its session dies
+  or goes silent.**
+- **A failed turn's question card no longer stays open in the Inbox, and
+  answering it no longer fails silently.**
+- **Archiving a chat whose session had died in the middle of a reply now
+  ends that reply as failed, instead of starting the session again in the
+  archived chat.**
+- Archiving a chat now closes all its open question cards, also those of a
+  queued message that no attempt asked yet.
+- A plan card whose follow-up could not be queued now stays open so it can
+  be pressed again, and a Stop sent to a reply the relay failed after a
+  stall no longer stays pending.
+- A chat unarchived in another tab now comes back to the chat list at once,
+  without a reload.
+- On Windows, `oar restart --now`, and a restart of a relay that does not
+  answer, now stop all of the relay's processes (supervisor, runtime and
+  session workers) before it starts again, and `oar stop` ends them all once
+  the relay is down (at once with `--now`). A plain `oar restart` of a relay
+  that answers still restarts only its runtime.
+- An agent's relay tool call on its own relay that this relay refuses for want
+  of an agent token now answers with this relay's own error and points to its
+  server log, instead of advising to re-add the relay from its pairing link.
+- Task and log output, worker logs and worker output now hide a credential
+  even when a terminal code splits it (a colour code, another control
+  sequence or an OSC); the relay's console log, which already dropped colour
+  codes, now handles the other codes too.
+- The chat title's tooltip and the toast after copying its session ID now
+  name the chat's own provider instead of always "Copilot".
+
+### Upgrade notes
+
+- **Migration 0043** runs at the first start and writes
+  `copilot_enabled = 'true'` on a relay that is in use (one with a
+  conversation, or a setting a bare start does not write), so Copilot stays
+  on and nothing changes. A fresh install decides once at its first start:
+  Copilot on when the Copilot CLI is installed and has run once, off
+  otherwise; installing the CLI later does not switch it on, so switch it on
+  in Settings → Providers → Copilot. The migration changes no schema and
+  never overwrites a value already there.
+- **Empty chats stay where they are.** A chat with no message yet keeps its
+  provider when that provider is switched off or its key removed; its first
+  message then behaves as in a started chat of that provider. Start a new chat
+  on a provider that is on instead.
+- No dependency changes: `npm ci` after a pull in a git checkout installs
+  nothing new.
+
+### Downgrade notes
+
+Going back to 0.9.29 is safe: `oar update --to 0.9.29` or `npm install -g
+@oar-sh/oar@0.9.29` (in a git checkout: `git checkout v0.9.29`, `npm ci`,
+then a relay restart). 0.9.29 starts and runs on the database as it is: it
+never reads `copilot_enabled`, so Copilot is on there whatever the switch
+said, as it always was in 0.9.29, and Copilot chats take messages again.
+0.9.29 moves chats that have not sent a message yet when a provider's
+settings are saved, never at start: every save on the Grok tab moves empty
+Copilot chats to Grok while Grok is on, and empty Grok chats to Copilot
+while it is off; switching Claude or Claude API off, and removing the
+OpenAI, Cursor, DeepSeek or Claude API key move that provider's empty
+chats to Copilot. So an empty chat left on Grok while it was off under
+0.9.30 moves at the next save on the Grok tab, not only at a new
+switch-off; on the other providers it moves only at a new switch-off or a
+key removal. Going up to 0.9.30 again, the switch keeps the value
+it had.
+
 ## [0.9.29] — 2026-11-16
 
 Highlights: archiving a conversation cancels what was still queued for

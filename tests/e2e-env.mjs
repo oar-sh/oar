@@ -30,6 +30,11 @@ export function relayDataDir() {
   return requireEnv("RELAY_TEST_DATA_DIR");
 }
 
+// Where the test server's workers write their logs (worker-<sdk id>.log).
+export function relayLogDir() {
+  return requireEnv("RELAY_TEST_LOG_DIR");
+}
+
 // Fake credentials file the Claude auth stub CLI treats as "logged in".
 // Lives under the test server's isolated CLAUDE_CONFIG_DIR, never the host's.
 export function relayClaudeCredFile() {

@@ -328,7 +328,7 @@ test('the shared payload says nothing about pins', async () => {
 });
 
 test('the pin route sits behind auth', () => {
-  const filePath = fileURLToPath(new URL('./sessions-routes.mjs', import.meta.url));
+  const filePath = fileURLToPath(new URL('./conversation-read-routes.mjs', import.meta.url));
   const source = fs.readFileSync(filePath, 'utf8');
   assert.match(source, /app\.patch\('\/api\/conversation\/:id\/message\/:messageId\/pin', auth/);
 });

@@ -270,8 +270,8 @@ test('a loopback request is an agent\'s request, and its origin keeps local: tru
 
 test('a request derived from a loopback request (the billing re-dispatch) keeps local', () => {
   const original = loopbackRequest({ origin: LOCAL_ORIGIN });
-  // messages-routes.mjs: the billing switch sends the message again through
-  // Object.create(req) with a new body.
+  // messages-intake-routes.mjs: the billing switch sends the message again
+  // through Object.create(req) with a new body.
   const sendRequest = Object.create(original);
   sendRequest.body = { origin: LOCAL_ORIGIN, conversationId: 'conv-billing-1' };
   assert.equal(isRemoteRelayLoopbackRequest(sendRequest), true);

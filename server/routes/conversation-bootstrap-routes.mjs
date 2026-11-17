@@ -4,6 +4,7 @@
 // model, mode, workspace root and group, registered by registerSessionsRoutes.
 import { randomUUID } from 'crypto';
 import { persistConversationPreferences } from '../services/conversation-preferences-service.mjs';
+import { copilotOffCreateRefusal, isCopilotCatalogModel } from '../services/copilot-settings-service.mjs';
 import {
   checkRequestedProviderModel,
   isAutoModelId,
@@ -49,6 +50,12 @@ import {
   buildConversationCloudPayload,
   validateCloudSourceRequest,
 } from '../services/claude-cloud-session-service.mjs';
+import {
+  bootstrapGroupRefusal,
+  copilotImageModelRefusal,
+  createConversationGroupHelpers,
+  normalizeRelayModePreference,
+} from './sessions-helpers.mjs';
 
 export function resolveBootstrapModelSelection({
   requestedModel = '',
@@ -75,7 +82,8 @@ function normalizeRequestedProviderType(value = '') {
   if (normalized === 'deepseek') return 'deepseek';
   // Its own provider, never read as `claude`.
   if (normalized === 'claude-api') return 'claude-api';
-  if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  // `copilot` is the tab's and the CLI's name for the provider `github`.
+  if (normalized === 'github' || normalized === 'github-copilot' || normalized === 'copilot') return 'github';
   return '';
 }
 
@@ -95,6 +103,8 @@ export function registerConversationBootstrapRoutes(app, deps, shared) {
     DEFAULT_MODEL,
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
+    // The Copilot catalogue's resolution of a requested id (the first send's).
+    resolveRequestedModel = null,
   } = deps;
   const {
     getOpenAIProviderSettings,
@@ -111,13 +121,9 @@ export function registerConversationBootstrapRoutes(app, deps, shared) {
     getClaudeApiProviderSettings,
     buildModelCatalogWithProviders,
     consumeWorkspaceRootRateLimit,
-    emitGroupChanged,
-    listGroupsForAgents,
-    bootstrapGroupRefusal,
-    conversationGroupField,
-    copilotImageModelRefusal,
-    normalizeRelayModePreference,
+    isCopilotEnabled = () => true,
   } = shared;
+  const { emitGroupChanged, listGroupsForAgents, conversationGroupField } = createConversationGroupHelpers({ io, conversationGroups });
 
   app.post('/api/conversation/bootstrap', auth, async (req, res) => {
     // An agent of this relay starts sessions through relay_tool only: the
@@ -409,6 +415,17 @@ export function registerConversationBootstrapRoutes(app, deps, shared) {
     }
     const useCopilotProvider = !useClaudeCloudProvider && !useOpenAIProvider && !useClaudeProvider && !useCursorProvider
       && !useGrokProvider && !useDeepSeekProvider && !useClaudeApiProvider;
+    // Copilot switched off: a chat that would be Copilot's is refused, never
+    // given to another provider.
+    if (useCopilotProvider && !isCopilotEnabled()) {
+      // A Copilot model names Copilot, resolved as the first send resolves it
+      // (resolveRequestedModel: a listed id, or one with its effort,
+      // "gpt-5.4-mini-high").
+      const named = requestedProviderType === 'github'
+        || isCopilotCatalogModel(requestedBootstrapModel, getModelCatalogState())
+        || (!!requestedBootstrapModel && resolveRequestedModel?.(requestedBootstrapModel)?.ok === true);
+      return res.status(400).json(copilotOffCreateRefusal({ named }));
+    }
     // A Copilot chat on an image id would reach the Copilot runtime, which
     // cannot serve it: refused before anything is written.
     const copilotImageRefusal = useCopilotProvider ? copilotImageModelRefusal(requestedBootstrapModel || catalogSelectedModel) : null;

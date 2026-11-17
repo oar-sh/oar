@@ -284,7 +284,7 @@ function chartModelSeries(models) {
  * setting replaces it only when the balance before the rise was read after
  * the setting too (`reference.roseFromAt`: the setting already covered that
  * balance, the money came later). Saving a starting balance reads the
- * balance right then (sessions-routes.mjs), so every later top-up has such a
+ * balance right then (settings-routes.mjs), so every later top-up has such a
  * read before it. Only a rise whose earlier read is not known (a reference
  * from before that was noted) falls back to the balance: it replaces the
  * starting balance when the balance after it is above it.

@@ -4,7 +4,7 @@ A Node.js web server that lets you chat with your local coding agents from any d
 
 Three runtimes can serve a conversation, selected when the conversation is created:
 
-- **GitHub Copilot** (default) — the Copilot SDK worker in `server/copilot-worker/` (worker kind `copilot-sdk`, one Node process per conversation), on the SDK that comes with the installed GitHub Copilot CLI (see [SDK auto-detection behavior](#sdk-auto-detection-behavior)).
+- **GitHub Copilot** — the Copilot SDK worker in `server/copilot-worker/` (worker kind `copilot-sdk`, one Node process per conversation), on the SDK that comes with the installed GitHub Copilot CLI (see [SDK auto-detection behavior](#sdk-auto-detection-behavior)).
 - **OpenAI (BYOK)** — the same Copilot SDK worker in BYOK mode against an OpenAI-compatible endpoint, plus a direct Images API path for image conversations.
 - **Claude (Agent SDK)** — a dedicated Node worker in `server/claude-worker/` that speaks the same relay contracts.
 
@@ -335,9 +335,8 @@ In the composer, `[1m]` variants are folded into their base model: the base ID i
 entry, and the variant is selected through the Context window field (`long_context` composes the
 `[1m]` ID on send and in the persisted per-conversation model preference).
 
-Disabling Claude rebinds conversations that have not yet sent a message back to the default provider,
-mirroring the OpenAI key-removal reconciliation. Conversations that have already started keep their
-provider, and other providers' bindings are never touched.
+Disabling Claude moves no conversation: one that has not yet sent a message keeps its provider, as
+every chat does when a provider is switched off or loses its key.
 
 ### Per-turn behavior
 
@@ -456,6 +455,30 @@ truth, and the relay asks:
   `public/app/task-console-render.mjs`). Rows go with their hour, the 20-per-key limit, a set that
   drops them or the conversation's delete. Without the table (a failed migration) the store works in
   memory as before.
+- **The worker log.** `GET /api/conversation/:conversationId/worker-log` (`routes/worker-log-routes.mjs`)
+  reads the conversation's worker log, `<log dir>/worker-<sdk session id>.log`, with its path derived
+  as the launch derives it (`workerLogPathFor` in `services/session-worker-launch-service.mjs`, from
+  the workers' launch environment; no table stores it; a conversation whose worker has not reported
+  a session yet is launched under its own id, which then names the file). Without `before` it answers the last `lines`
+  lines (default 2,000, at most 5,000) within 256 KB, with `before` the lines ending there, as the
+  task output route does (`services/worker-log-service.mjs` over `services/task-output-service.mjs`):
+  `{ ok, kind: 'file', conversationId, provider, sdkSessionId, dir, path, previous, text, lines,
+  startOffset, endOffset, size, mtime, hasMoreBefore }`, `previous` naming the `.1` a relaunch rolled
+  over, or `{ ok, kind: 'none', conversationId, provider, sdkSessionId, dir, path, previous, message }`
+  when there is no session or no file yet (`path` empty and `previous` `[]` without a session); a file
+  it cannot read is `409` with `code`. Every window
+  is cleaned and scrubbed on the relay (`scrubTaskOutput`, OAR's own credentials included); there is
+  no download route. The scrubber is pattern-based: a secret of a shape it does not know passes. An
+  unterminated last line is held while it is under 5 s old, in the tail and in the room, which sends
+  it once the log is quiet that long and again whole (`rewrite: true`) once it is complete; a line
+  over 64 KB goes out cut between words. The route is a row in the route policy: the person, and an agent token only for
+  its own conversation (403 `AUTH_CONVERSATION_MISMATCH` for another's, `AUTH_PERSON_REQUIRED` for the
+  cli token and for a request another relay sent); a paired relay's key is refused
+  (`REMOTE_RELAY_PEER_SCOPE`). The view's live tail is a second instance of the task console's rooms:
+  `worker_log_watch { conversationId }` (acked with the room's offset), `worker_log_unwatch`, and
+  `worker_log_chunk { conversationId, offset, endOffset, text, size, mtime, reset?, partial?, rewrite? }` to the room
+  `worker-log:<conversationId>`, polled every second while it has members. Sockets are the person's
+  alone.
 - **Run rows left `running`.** A background sub-agent's row whose end was never written would count
   as running work for a day. For a Claude worker that has reported its task set in this runtime, a
   `running` background row that the set does not list and that nothing has updated for 15 minutes
@@ -476,7 +499,8 @@ workflow-progress surface — the worker reads it off disk:
   byte caps and a filename pattern, and the digest is clamped (≤100 agents, ≤50 phases, ≤5 log lines,
   per-field length caps). A run is joined to its task by the record's `taskId`, with a start-time
   mtime window as the mid-run fallback.
-- The relay never trusts the worker's JSON: `sanitizeWorkflowProgress` (`routes/messages-routes.mjs`)
+- The relay never trusts the worker's JSON: `sanitizeWorkflowProgress`
+  (`routes/messages-worker-output-routes.mjs`)
   re-applies every clamp before storing or broadcasting, and drops a digest with no phases and no
   agents.
 
@@ -662,8 +686,8 @@ environment stored, `resolveEnvironmentId` takes the account's first active one 
 default first (`buildClaudeCloudModelList`). Every change is broadcast as the socket event
 `claude_cloud_settings_updated` with the GET body.
 
-Switching the provider off does not rebind anything: there is no reconciliation as for the other
-providers, and an existing cloud conversation still launches its worker.
+Switching the provider off does not rebind anything, as for every provider, and an existing
+cloud conversation still launches its worker.
 
 ### Creating a conversation
 
@@ -741,11 +765,14 @@ there.
 
 `POST /api/conversation/:id/archive` (any provider) also cancels the conversation's queued
 messages, in the transaction that archives it, after the worker stop: a pending or parked row goes
-as `POST /api/conversation/:id/cancel-queued-turn` cancels it (the row is deleted, message status `cancelled`, the question
-cards its earlier attempts asked are cancelled and announced with `relay_question_updated` after
-the commit), and a follow-up held at the usage limit goes through the pause service's cancel. One
-`[System Message]` note in the transcript names what was cancelled; it is no queue row. The answer
-carries `cancelledMessageIds`. A running turn still refuses the archive.
+as `POST /api/conversation/:id/cancel-queued-turn` cancels it (the row is deleted, message status
+`cancelled`, its pending question cards are cancelled and announced with `relay_question_updated`
+after the commit), except that the archive also cancels the cards with no attempt, which
+`cancel-queued-turn` leaves alone. A follow-up held at the usage limit goes through the pause
+service's cancel. One `[System Message]` note in the transcript names what was cancelled; it is no
+queue row. The answer carries `cancelledMessageIds` and `failedMessageIds` (the turns it ended);
+the group archive (`POST /api/conversation-groups/:id/archive`) carries `failedMessageIds` keyed
+by each archived member's id. A running turn still refuses the archive.
 
 Cancelling one queued or steered message (`cancel-queued-turn`, and `POST /api/queue-cancelled`,
 where the worker reports a pushed message it took back) cancels the pending question cards an attempt of that row asked (`attempt_id` set) before the row
@@ -1382,7 +1409,13 @@ when the worker posts it, shown to at most 500) and, for a task with an output f
 (`minutesSinceOutput`, `quiet`, `quietAfterMinutes`, test-run `counts`);
 `read_task_output {session, task_id, lines?}` (read permission; default 200 lines, at most 500 or
 32 KB) reads the end of that output through `GET /api/conversation/:id/background-task/:taskId/output`,
-scrubbed of credentials.
+scrubbed of credentials. `read_worker_log {relay: "this", lines?}` (read permission; the same limits)
+reads the end of the caller's own conversation's worker log through
+`GET /api/conversation/:id/worker-log`, called in-process with the agent's own token, so the route's
+own-conversation check applies (`services/remote-relay-worker-log.mjs`). It takes no `session` (naming
+one is refused), and any other relay is refused with `unsupported` before its lock or permission is
+looked at: a worker log is read only by its own conversation. Like an ask about the own conversation,
+it works without the agent sessions setting, and reads only the caller's own log on this relay.
 
 ### Browser
 
@@ -1787,7 +1820,7 @@ Copilot CLI and run it once (copilot --version); no relay restart is needed. Loo
 ### Stopping a worker
 
 `stopSessionWorkerProcesses` serves **☠️ Kill session** (`POST /api/session-worker/:sdkSessionId/kill`),
-the CWD relaunch, a provider rebind and the replacement of a worker without a socket. It reads the
+the CWD relaunch, an unstarted OpenAI chat's model change and the replacement of a worker without a socket. It reads the
 session's processes from a fresh process list and checks that they are gone: on Linux and macOS
 SIGTERM to each and `tmux kill-session`, up to 3 s, then SIGKILL to the survivors and up to 2 s
 more; on Windows `Stop-Process -Force` on the process tree, leaf first; processes still alive after 3 s
@@ -2004,17 +2037,18 @@ Queue metrics include `parkedCount`: turns an earlier version parked behind its 
 | GET | `/api/usage` | Unified plan usage: one card per configured provider (`providers[]` with `meters`, `details`, `links`) built from the live Copilot quota, the Claude worker's latest stored snapshot, and the derived Cursor cycle totals. A provider that cannot be read yields an unavailable card rather than failing the response, so the modal always renders. While Claude Cloud is on, the Claude card's windows are read live from the account, and a Claude Cloud card is added (credit meters, the relay's cloud spend, and the cost of the conversation named by `?conversationId=` when it is a cloud one); a card may carry `notes[]` (a line of text with an optional https link), and a meter `severity` and `resetKind: 'expiry'`. While DeepSeek is on, a DeepSeek card is added: the account balance (`GET {baseUrl}/user/balance` with the saved key, kept for a minute; `is_available: false` becomes a warning, a failed read a `partial` card with the reason and the last balance read) and the relay's estimated spend per model and in total, in the balance's currency (USD without one), as notes and detail rows. Its `meters[]` are a balance bar per currency with money (`deepseek-balance-<currency>`, unit `cny` or `usd`, measured against the balance after its last rise, which `deepseek_balance_reference` keeps) and, with a budget set, `deepseek-monthly-budget` (this calendar month's spend from `deepseek_usage_days`, `resetAt` the next 1st at 00:00 UTC). Its `charts[]` (`{ id, label, kind: 'columns' | 'bars' | 'share', unit, series[], items[{ key, label, values }], note, summary, windowDays? }`) are `deepseek-daily-spend-7d`, `-30d` and `-90d` (UTC days stacked by model, each with `windowDays` 7, 30 or 90 for the page's window picker) and `deepseek-spend-shares` (all time, no `windowDays`; per model: cache hit, miss, output and, once any, searches and fetches; `summary` what the cache saved); every other card gets its own charts from the token booking the same way (`<provider>-daily-spend|daily-tokens[-<billing>]-<n>d`, kind `columns`, and `<provider>-spend-shares|token-shares[-<billing>]-<n>d`, kind `share`: one item `last-<n>d` whose values are keyed by the daily chart's `model:<name>` series, every model of the 90 days, largest first; relay-local days); `?providers=deepseek` reads it live. While a Claude API key is saved or the provider is on, a Claude API card is added: today's and this month's estimated spend and tokens per model in relay-local days, and the monthly cap (see [Usage and the monthly cap](#usage-and-the-monthly-cap)). Legacy top-level Copilot quota fields are spread alongside `providers` for cached clients; `?legacy=1` returns the Copilot-only snapshot on its own |
 | GET | `/api/settings/cursor-allowance` | Read the manual Cursor plan allowances (`cursorModelsUsd`, `otherModelsUsd`, `resetDay`) |
 | POST | `/api/settings/cursor-allowance` | Set the Cursor pool allowances and billing reset day; `null` clears an allowance, and `resetAccounting: true` re-baselines the derived spend tracking |
-| GET | `/api/settings/copilot` | Always `{ engine: 'sdk', engines: ['sdk'] }`: Copilot has one engine, the SDK worker, and nothing to set. Kept for paired relays on older versions that read it; there is no POST |
+| GET | `/api/settings/copilot` | `{ engine: 'sdk', engines: ['sdk'], enabled, cliFound }`: Copilot's one engine (the SDK worker), its switch (app_settings `copilot_enabled`, services/copilot-settings-service.mjs; migration 0043 keeps it on for a relay in use, a new database decides it once from the CLI detection) and whether the Copilot CLI is installed. Paired relays read it: an older one only the engine fields, and a missing `enabled` means on |
+| POST | `/api/settings/copilot` | `{ enabled }` (a boolean, else `400`) → `{ ok: true, …the GET body, warning }`. Switching on runs a Copilot model discovery (`warning` carries its failure). While off, Copilot's models leave the catalogue, its usage card and reads go, new Copilot chats are refused (`COPILOT_NOT_ENABLED`, or `PROVIDER_REQUIRED` when nothing was named), a send to a Copilot chat through `POST /api/message` (the composer, an agent's `send`) is `409` `COPILOT_SWITCHED_OFF`, and a Copilot row queued any other way (a schedule, a relay event, a plan card, a restart resume, a usage-limit follow-up) or already queued fails at the claim with the switch's note (`relay.copilot-switched-off`). Emits `copilot_settings_updated` and `models_updated` |
 | GET | `/api/settings/claude` | Read Claude provider settings (`enabled`, `model`, `models`, `availableModels`, `attributionMode`, `backgroundCommandLimitMinutes` with the slider bounds `backgroundCommandLimitMinMinutes`, `backgroundCommandLimitMaxMinutes`, `backgroundCommandLimitStepMinutes`, `backgroundCommandLimitDefaultMinutes`) |
-| POST | `/api/settings/claude` | Enable/disable Claude, set the default model, the enabled model subset, the attribution mode or `backgroundCommandLimitMinutes` (clamped to 30…480 and snapped to 30-minute steps; not a number is `400`; read by Claude sessions spawned afterwards); triggers discovery and unstarted-conversation reconciliation |
+| POST | `/api/settings/claude` | Enable/disable Claude, set the default model, the enabled model subset, the attribution mode or `backgroundCommandLimitMinutes` (clamped to 30…480 and snapped to 30-minute steps; not a number is `400`; read by Claude sessions spawned afterwards); triggers discovery; no conversation is moved |
 | GET | `/api/settings/claude-cloud` | Read Claude Cloud settings: `{ enabled, defaultModel, environmentId, environments: [{ id, name }] \| null, environmentsError, account: { loggedIn, email, orgName, subscriptionType } \| null, token: { source, hasToken, expiresAt }, models }`. `token` says where the login is read from (`env`, `file`, `none`) and when it runs out, never the token. `environments` is `null` while the provider is off or the host has no login: nothing is asked of Anthropic then |
 | POST | `/api/settings/claude-cloud` | `{ enabled?, defaultModel?, environmentId? }` → `{ ok: true, …the GET body }`. Enabling without a Claude login on the host is `400` with `code: 'claude_cloud_login_missing'`; an empty `environmentId` clears the stored one. Emits `claude_cloud_settings_updated` |
 | GET | `/api/settings/cursor` | Read Cursor provider settings — same shape as Claude's: `models` is the enabled subset, `availableModels` the full discovered list, plus per-model `efforts` |
 | POST | `/api/settings/cursor` | Set/remove the Cursor API key, default model, or enabled model subset; key changes reset discovered models and effort tiers |
 | GET | `/api/settings/deepseek` | Read DeepSeek settings: `{ configured, enabled, model, models, availableModels, discovered, baseUrl, defaultBaseUrl, attribution, monthlyBudget, monthlyBudgetCurrency, efforts, providerType }`. `monthlyBudgetCurrency` is `USD` or `CNY`, or `null` for a budget saved before the currency was stored (read in the balance's currency). `models` is the enabled subset (the default model always in it), `availableModels` what `GET {baseUrl}/models` listed (or the built-in `deepseek-flash`, `deepseek-v4-pro`). The key is never in it: `configured` says whether one is stored |
-| POST | `/api/settings/deepseek` | `{ apiKey?, enabled?, model?, enabledModels?, baseUrl?, attribution?, monthlyBudget?, monthlyBudgetCurrency?, remove? }` → `{ ok: true, …the GET body, reconciliation, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live DeepSeek workers. `baseUrl` must be `https:` (`http:` only on a loopback host), without credentials, query or fragment; `attribution` is `oar` or `off`; `monthlyBudget` is an amount of zero or more (rounded to cents; `null`, empty or zero clears it and its currency, which removes the usage card's budget bar); `monthlyBudgetCurrency` is `USD` or `CNY` (`null` or empty: the balance's currency), stored with the budget and shown on the bar; else `400`. Removing the key is `409` (`deepseek-key-removal-blocked`) while a DeepSeek conversation has a message or a queued one, and moves unstarted DeepSeek conversations back to Copilot. Emits `deepseek_settings_updated` and `models_updated` |
+| POST | `/api/settings/deepseek` | `{ apiKey?, enabled?, model?, enabledModels?, baseUrl?, attribution?, monthlyBudget?, monthlyBudgetCurrency?, remove? }` → `{ ok: true, …the GET body, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live DeepSeek workers. `baseUrl` must be `https:` (`http:` only on a loopback host), without credentials, query or fragment; `attribution` is `oar` or `off`; `monthlyBudget` is an amount of zero or more (rounded to cents; `null`, empty or zero clears it and its currency, which removes the usage card's budget bar); `monthlyBudgetCurrency` is `USD` or `CNY` (`null` or empty: the balance's currency), stored with the budget and shown on the bar; else `400`. Removing the key is `409` (`deepseek-key-removal-blocked`) while a DeepSeek conversation has a message or a queued one; an unstarted DeepSeek conversation keeps its provider. Emits `deepseek_settings_updated` and `models_updated` |
 | GET | `/api/settings/claude-api` | Read Claude API settings (Claude chats on a Claude Console API key): `{ configured, enabled, model, models, availableModels, enabledModels, discovered, effortsByModel, contextWindowsByModel, modelDetails, monthlyCapUsd, providerType, label }`. `availableModels` is what `GET https://api.anthropic.com/v1/models` listed for the key (with a `[1m]` id beside a model with a 1M window or one the Claude tab lists so), or the Claude tab's list before the first discovery; `models` is the enabled subset (the default model always in it). The default model is the Claude tab's when offered, else the first Sonnet. The efforts are the Claude provider's, narrowed by what Anthropic reports per model. The key is never in it: `configured` says whether one is stored |
-| POST | `/api/settings/claude-api` | `{ apiKey?, enabled?, model?, enabledModels?, monthlyCapUsd?, remove? }` → `{ ok: true, …the GET body, reconciliation, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live Claude API workers. Claude OAuth access and refresh tokens (`sk-ant-oat`, `sk-ant-ort`), Admin keys (`sk-ant-admin`), claude.ai and Claude Code session tokens (`sk-ant-sid`, `sk-ant-si-`, `sk-ant-cc-`, `sk-ant-ccsr-`) and any key that does not start with `sk-ant-` (another vendor's; `claude-api-key-not-console-key`) are refused by prefix (`400`, `claude-api-key-<kind>`), never quoted back. Any other `sk-ant-` key is saved, and the discovery that follows is Anthropic's verdict on it: a key Anthropic refuses stays saved, and the answer carries the refusal in `warning` and in `discoveryError` (`{ error, code }`, null when discovery did not run or went through), which the tab shows as its status. A model list asked for with a key that was changed or removed before the answer came is dropped, and `warning` says so. `monthlyCapUsd` is empty/null for no cap, else a positive amount with at most two decimals up to 1,000,000. Removing the key is `409` (`claude-api-key-removal-blocked`) while a Claude API conversation has a message or a queued one; removing it or switching the provider off moves unstarted Claude API conversations back to Copilot. Emits `claude_api_settings_updated` and `models_updated` |
+| POST | `/api/settings/claude-api` | `{ apiKey?, enabled?, model?, enabledModels?, monthlyCapUsd?, remove? }` → `{ ok: true, …the GET body, warning }`. A key switches the provider on and runs model discovery; a changed key stops the live Claude API workers. Claude OAuth access and refresh tokens (`sk-ant-oat`, `sk-ant-ort`), Admin keys (`sk-ant-admin`), claude.ai and Claude Code session tokens (`sk-ant-sid`, `sk-ant-si-`, `sk-ant-cc-`, `sk-ant-ccsr-`) and any key that does not start with `sk-ant-` (another vendor's; `claude-api-key-not-console-key`) are refused by prefix (`400`, `claude-api-key-<kind>`), never quoted back. Any other `sk-ant-` key is saved, and the discovery that follows is Anthropic's verdict on it: a key Anthropic refuses stays saved, and the answer carries the refusal in `warning` and in `discoveryError` (`{ error, code }`, null when discovery did not run or went through), which the tab shows as its status. A model list asked for with a key that was changed or removed before the answer came is dropped, and `warning` says so. `monthlyCapUsd` is empty/null for no cap, else a positive amount with at most two decimals up to 1,000,000. Removing the key is `409` (`claude-api-key-removal-blocked`) while a Claude API conversation has a message or a queued one; removing it or switching the provider off moves no conversation (an unstarted one keeps its provider and its first send is refused). Emits `claude_api_settings_updated` and `models_updated` |
 | GET | `/api/settings/turn-ceiling` | Read the max turn duration plus slider bounds (`minMinutes`, `maxMinutes`, `stepMinutes`, `defaultMinutes`) |
 | POST | `/api/settings/turn-ceiling` | Set the max turn duration in minutes (`0` = no limit) |
 | GET | `/api/settings/relay-restart-max-wait` | How long a queued relay restart waits before it asks: `{ maxWaitMinutes, choices: [5, 10, 15, 30, 60, 120, 240, 0], defaultMinutes: 30, overrideMs }`; `0` = no limit; `overrideMs` is `OAR_RELAY_RESTART_MAX_WAIT_MS` when set |
@@ -2132,7 +2166,7 @@ recovery paths, which report each outcome (`noteRestartTurnOutcome`):
 
 | Path | `cut` (cannot run again) | `requeued` | `failed` |
 | --- | --- | --- | --- |
-| stale sweep (`recoverProcessingOlderThan`) | stale continuation dropped; consumed row failed | requeued | over the retry budget |
+| stale sweep (`recoverProcessingOlderThan`) | stale continuation dropped; consumed row failed | requeued | over the retry budget; a row of an archived chat |
 | dead worker (`recoverDeadWorkerProcessingRows`) | continuation dropped; consumed row failed | requeued | over the retry budget |
 | owner heartbeat idle (`recoverOwnedProcessingRowsForSession`) | continuation dropped; consumed row failed; a started turn failed as `turn-replay-blocked` | requeued | |
 

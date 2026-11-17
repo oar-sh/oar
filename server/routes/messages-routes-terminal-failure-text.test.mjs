@@ -5,7 +5,7 @@ import {
   buildTerminalFailureTextForChat,
   parseTerminalFailureText,
   resolveTerminalFailurePayload,
-} from './messages-routes.mjs';
+} from './messages-helpers.mjs';
 import { classifyClaudeResultFailure } from '../claude-worker/claude-turn-failure.mjs';
 
 const DEFAULT_GUIDANCE = 'Send the message again to retry. If this keeps failing, include the error code when you report it.';

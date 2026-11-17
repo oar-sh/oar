@@ -91,6 +91,8 @@ async function main() {
         PLAYWRIGHT_BASE_URL: relay.baseUrl,
         RELAY_TEST_TOKEN: token,
         RELAY_TEST_DATA_DIR: relay.dataDir,
+        // The folder the server's workers log to (COPILOT_WEB_RELAY_LOG_DIR).
+        RELAY_TEST_LOG_DIR: path.join(relay.stateRoot, "logs"),
         RELAY_TEST_CLAUDE_CRED_FILE: relay.claudeCredFile,
         // The CLI-install specs boot their own relay (an install rewrites config
         // and rebinds env), so only the Grok-account paths are published here.

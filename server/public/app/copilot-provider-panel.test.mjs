@@ -50,11 +50,13 @@ test('the Copilot panel is reachable by deep link and hides the others', () => {
   assert.equal(el('settings-provider-panel-copilot').hidden, true);
 });
 
-test('the Copilot panel holds the CLI status row and no engine choice', () => {
+test('the Copilot panel holds its switch and the CLI status row, and no engine choice', () => {
   const panel = el('settings-provider-panel-copilot');
+  assert.ok(panel.querySelector('#copilot-enabled-toggle'));
+  assert.ok(panel.querySelector('#copilot-settings-status'));
   assert.ok(panel.querySelector('#cli-copilot-section'));
   assert.equal(panel.querySelectorAll('select').length, 0);
-  for (const id of ['copilot-engine-select', 'copilot-save-btn', 'copilot-settings-status']) {
+  for (const id of ['copilot-engine-select', 'copilot-save-btn']) {
     assert.equal(el(id), null, id);
   }
   assert.doesNotMatch(panel.textContent, /engine/i);

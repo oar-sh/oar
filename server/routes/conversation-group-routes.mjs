@@ -3,7 +3,7 @@
 // Session groups, made and changed by hand in the sidebar: a new group from
 // one or more conversations, a name, a conversation moved in or out (or
 // dragged to a place inside a group), and a group dissolved. Archiving a group lives with the archive route
-// (sessions-routes.mjs) and stopping one with the turn controls
+// (conversation-lifecycle-routes.mjs) and stopping one with the turn controls
 // (messages-routes.mjs), next to the code they reuse.
 //
 // The owner's action only: every route is behind `auth`, and a request that
@@ -12,7 +12,7 @@
 // existing one for a session it creates (the bootstrap route), and moves one
 // session into a group, out of it, or into a new group of a name it gives
 // (update_session, PATCH /api/conversation/:id/settings in
-// sessions-routes.mjs). Renaming and dissolving groups, and moving several
+// conversation-settings-routes.mjs). Renaming and dissolving groups, and moving several
 // rows at once, stay here, the owner's.
 //
 // The one read, GET /api/conversation-groups, is the list relay_info and
@@ -24,7 +24,7 @@ import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { notPerson } from '../services/relay-principal.mjs';
 import { AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
 import { GROUP_NAME_MAX } from '../repositories/conversation-group-repository.mjs';
-import { resolveConversationTitle } from './sessions-routes.mjs';
+import { resolveConversationTitle } from './sessions-helpers.mjs';
 
 const resolveConversationTitleText = (title) => resolveConversationTitle({ title, titleSource: 'auto' });
 

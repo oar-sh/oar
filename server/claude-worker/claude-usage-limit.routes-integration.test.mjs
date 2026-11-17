@@ -19,10 +19,8 @@ import {
   taskNotificationMessage,
   settled,
 } from './claude-session-test-harness.mjs';
-import {
-  buildDequeuedRelayMessage,
-  dequeuePendingMessage,
-} from '../routes/messages-routes.mjs';
+import { buildDequeuedRelayMessage } from '../routes/messages-worker-claim-routes.mjs';
+import { dequeuePendingMessage } from '../routes/messages-worker-claim-routes.mjs';
 import {
   makeRouteDeps as baseRouteDeps,
   captureRoutes,

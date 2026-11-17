@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseTerminalFailureText, resolveTerminalFailurePayload } from './messages-routes.mjs';
+import { parseTerminalFailureText, resolveTerminalFailurePayload } from './messages-helpers.mjs';
 
 const NOTE = 'No tool output was returned for a required function call. Error code: relay.missing-tool-output. '
   + 'IDs: functionCallId=call_abc123. Retry the message. Details: no tool output found for function call call_abc123';

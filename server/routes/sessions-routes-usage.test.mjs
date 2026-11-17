@@ -54,9 +54,10 @@ async function getUsage(app, query = {}) {
   return res;
 }
 
-function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage, deepseekEnabled = false, deepseekBalanceService, deepseekUsageImportService, withTokens = false } = {}) {
+function setup({ cloudEnabled = true, claudeAccountUsageService, cloudRows = [], fetchUsageSummary, fetchCopilotBillingUsage, grokEnabled = false, fetchGrokBillingUsage, deepseekEnabled = false, deepseekBalanceService, deepseekUsageImportService, withTokens = false, copilotEnabled = null } = {}) {
   const db = new Database(':memory:');
   applySchema(db);
+  if (copilotEnabled !== null) db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES ('copilot_enabled', ?, ?)`).run(copilotEnabled, NOW);
   // Only the runtime session rows matter here, so they go in without their conversations.
   db.pragma('foreign_keys = OFF');
   const insert = db.prepare(`
@@ -421,4 +422,39 @@ test('without the token booking no tab gets Tokens sections', async () => {
   const { app } = setup();
   const res = await getUsage(app);
   assert.equal(res.body.providers.some((card) => (card.details || []).some((section) => section.id.includes('-token-usage'))), false);
+});
+
+// ---------------------------------------------------------------------------
+// The Copilot switch
+
+test('Copilot off and only Claude on: no Copilot card, and neither its quota nor its billing is read', async () => {
+  let quotaReads = 0;
+  let billingReads = 0;
+  const { app } = setup({
+    cloudEnabled: false,
+    copilotEnabled: 'false',
+    fetchUsageSummary: (callback) => { quotaReads += 1; callback(null, COPILOT_SUMMARY); },
+    fetchCopilotBillingUsage: async () => { billingReads += 1; return { items: [] }; },
+  });
+  const res = await getUsage(app);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.providers.map((card) => card.provider), ['claude', 'cursor']);
+  assert.equal(res.body.plan, undefined, 'no legacy Copilot fields');
+  assert.equal(quotaReads, 0);
+  assert.equal(billingReads, 0);
+});
+
+test('Copilot off: the legacy answer is refused without a read', async () => {
+  let quotaReads = 0;
+  const { app } = setup({ copilotEnabled: 'false', fetchUsageSummary: (callback) => { quotaReads += 1; callback(null, COPILOT_SUMMARY); } });
+  const res = await getUsage(app, { legacy: '1' });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'COPILOT_NOT_ENABLED');
+  assert.equal(quotaReads, 0);
+});
+
+test('Copilot on: its card is there as before', async () => {
+  const { app } = setup({ cloudEnabled: false, copilotEnabled: 'true' });
+  const res = await getUsage(app);
+  assert.deepEqual(res.body.providers.map((card) => card.provider), ['github', 'claude', 'cursor']);
 });

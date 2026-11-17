@@ -188,7 +188,9 @@ function shapeWindow(buffer, windowStart, size, mtimeMs) {
 }
 
 // The last `lines` lines of the bytes before `end`, within `maxBytes`.
-async function readLinesEndingAt(filePath, end, { lines, maxBytes, trimEnd, fsImpl }) {
+// `holdOpenLine`: an unterminated last line stays out (its writer may be
+// mid-value), unless it is the window's only line.
+async function readLinesEndingAt(filePath, end, { lines, maxBytes, trimEnd, holdOpenLine = false, fsImpl }) {
   const windowStart = Math.max(0, end - maxBytes);
   const read = await readBytes(filePath, windowStart, end, { fsImpl });
   if (!read.ok) return read;
@@ -205,6 +207,10 @@ async function readLinesEndingAt(filePath, end, { lines, maxBytes, trimEnd, fsIm
   buffer = buffer.subarray(fromLines);
   const firstByte = read.start + start + fromLines;
   if (trimEnd) buffer = buffer.subarray(0, safeChunkLength(buffer));
+  if (holdOpenLine && buffer.length && buffer[buffer.length - 1] !== NEWLINE) {
+    const lastBreak = buffer.lastIndexOf(NEWLINE);
+    if (lastBreak !== -1) buffer = buffer.subarray(0, lastBreak + 1);
+  }
   return shapeWindow(buffer, firstByte, read.size, read.mtimeMs);
 }
 
@@ -217,13 +223,22 @@ async function readLinesEndingAt(filePath, end, { lines, maxBytes, trimEnd, fsIm
  * escape the writer has not finished; `endOffset` is where the live chunks
  * continue. `{ ok: false, code }` when the file cannot be read.
  */
-export async function readTail(filePath, { lines, maxBytes, fsImpl = fs } = {}) {
+export async function readTail(filePath, {
+  lines,
+  maxBytes,
+  // An unterminated last line written less than this long ago stays out
+  // (0: never held).
+  holdOpenLineMs = 0,
+  now = Date.now,
+  fsImpl = fs,
+} = {}) {
   const info = await inspectOutputFile(filePath, { fsImpl });
   if (!info.ok) return info;
   return readLinesEndingAt(normalizeTaskOutputPath(filePath), info.size, {
     lines: clampInt(lines, { min: 1, max: TASK_OUTPUT_LIMITS.tailLinesMax, fallback: TASK_OUTPUT_LIMITS.tailLinesDefault }),
     maxBytes: clampInt(maxBytes, { min: 1, max: TASK_OUTPUT_LIMITS.requestBytesMax, fallback: TASK_OUTPUT_LIMITS.requestBytesMax }),
     trimEnd: true,
+    holdOpenLine: holdOpenLineMs > 0 && now() - info.mtimeMs < holdOpenLineMs,
     fsImpl,
   });
 }
@@ -241,6 +256,39 @@ export async function readBefore(filePath, { before, lines, maxBytes, fsImpl = f
   });
 }
 
+// Between words: spaces, tabs, and the separators of fields (`,` `;`).
+const WORD_BREAK_BYTES = new Set([0x20, 0x09, 0x2c, 0x3b]);
+const QUOTE_BYTES = new Set([0x22, 0x27]); // " '
+// Words kept together before the cut: a value with its key or scheme word
+// (`Authorization: Bearer <value>`, `,"password": "<value>"`).
+const SOFT_CUT_CONTEXT_WORDS = 3;
+
+/**
+ * Where to cut the first `length` bytes of a long line so a credential is not
+ * scrubbed in two halves: before the last few words (the one that crosses
+ * the limit and the two before it, so a value starts the next piece with its
+ * key), words split at whitespace, `,` and `;`; else after the last quote;
+ * else at `length`. Never in the first half.
+ */
+export function softLineCut(buffer, length) {
+  const floor = Math.floor(length / 2);
+  let cut = -1;
+  let words = 0;
+  for (let index = length - 1; index > floor; index -= 1) {
+    if (!WORD_BREAK_BYTES.has(buffer[index])) continue;
+    // One cut point per run of breaks, at its start.
+    while (index - 1 > floor && WORD_BREAK_BYTES.has(buffer[index - 1])) index -= 1;
+    cut = index;
+    words += 1;
+    if (words >= SOFT_CUT_CONTEXT_WORDS) break;
+  }
+  if (cut > 0) return cut;
+  for (let index = length - 1; index > floor; index -= 1) {
+    if (QUOTE_BYTES.has(buffer[index])) return index + 1;
+  }
+  return length;
+}
+
 /**
  * The bytes from `start` on, at most `maxBytes` (64 KB), for a live chunk:
  * `{ ok, offset, endOffset, text, size, mtime }` with `text` cleaned and the
@@ -255,6 +303,9 @@ export async function readRange(filePath, {
   // only when it is `longLineBytes` long, or with a later call without this.
   holdOpenLine = false,
   longLineBytes = TASK_OUTPUT_LIMITS.chunkBytes,
+  // A long open line goes out cut between words (softLineCut), not at the
+  // exact byte.
+  softCut = false,
   fsImpl = fs,
 } = {}) {
   const path = normalizeTaskOutputPath(filePath);
@@ -274,6 +325,7 @@ export async function readRange(filePath, {
     }
     if (cut > 0) length = cut;
     else if (length < longLineBytes) length = 0;
+    else if (softCut) length = softLineCut(read.buffer, length);
   }
   return {
     ok: true,

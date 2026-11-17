@@ -31,6 +31,7 @@ const PER_CONVERSATION = [
   'chat-menu-group',
   'chat-menu-change-cwd',
   'chat-menu-git-changes',
+  'chat-menu-worker-log',
   'chat-menu-kill-session',
 ];
 
@@ -96,6 +97,15 @@ test('a cloud conversation hides Change CWD and shows Open on claude.ai only wit
   assert.equal(withLink.entries['chat-menu-change-cwd'].hidden, true);
   // The other per-conversation entries are unaffected by the provider.
   assert.equal(withLink.entries['chat-menu-git-changes'].hidden, false);
+});
+
+test('Worker log: shown with any conversation (Claude Cloud and no session yet included), hidden without one and in the shared view', () => {
+  const unbound = { conversationId: 'conv_fixture_new', conversation: { id: 'conv_fixture_new', sdkSessionId: null }, sdkSessionId: '' };
+  for (const input of [localConversation, { ...localConversation, isCloud: true }, unbound]) {
+    assert.deepEqual(resolveChatActionsMenuState(input).entries['chat-menu-worker-log'], { hidden: false, disabled: false });
+  }
+  assert.equal(resolveChatActionsMenuState({ conversationId: null }).entries['chat-menu-worker-log'].hidden, true);
+  assert.equal(resolveChatActionsMenuState({ sharedMode: true, ...localConversation }).entries['chat-menu-worker-log'].hidden, true);
 });
 
 test('a switch from a cloud conversation to none leaves Change CWD hidden', () => {

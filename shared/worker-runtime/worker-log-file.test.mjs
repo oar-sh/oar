@@ -205,3 +205,119 @@ test('no secret, or one too short, installs nothing; uninstall puts the streams 
   installed.uninstall();
   assert.equal(processImpl.stdout.write, originalWrite);
 });
+
+// Fake, as every value here: what a terminal shows of an output is its text
+// without codes.
+// Joined at run time: the hygiene scan refuses key shapes.
+const SPLIT_SECRET = ['sk', 'fake-split-0123456789abcdef'].join('-');
+const SPLIT_CODES = Object.freeze({
+  sgr: '\u001b[31m',
+  'colon sgr': '\u001b[38:5:196m',
+  'erase csi': '\u001b[K',
+  'cursor csi': '\u001b[2C',
+  'osc bel': '\u001b]8;;https://example.invalid/\u0007',
+  'osc st': '\u001b]0;title\u001b\\',
+  charset: '\u001b(B',
+  'save cursor': '\u001b7',
+});
+
+function redactingStdout(secrets = [SPLIT_SECRET]) {
+  const processImpl = fakeProcess();
+  installWorkerLogRedaction({ secrets, processImpl });
+  return {
+    write(chunk) {
+      processImpl.stdout.write(chunk);
+      return processImpl.console.at(-1)[1];
+    },
+  };
+}
+
+test('the log redaction hides a secret an escape code cuts at any place, and keeps the code', () => {
+  const stdout = redactingStdout();
+  for (const [name, code] of Object.entries(SPLIT_CODES)) {
+    for (let at = 1; at < SPLIT_SECRET.length; at += 1) {
+      const line = `key ${SPLIT_SECRET.slice(0, at)}${code}${SPLIT_SECRET.slice(at)} done\n`;
+      const expected = `key [redacted]${code} done\n`;
+      assert.equal(stdout.write(line), expected, `${name} at ${at}`);
+      assert.equal(String(stdout.write(Buffer.from(line, 'utf8'))), expected, `${name} at ${at}, bytes`);
+    }
+  }
+});
+
+test('the log redaction keeps the codes around a cut secret in place and its colour after it', () => {
+  const stdout = redactingStdout();
+  const cut = `\u001b[1m${SPLIT_SECRET.slice(0, 5)}\u001b[31m${SPLIT_SECRET.slice(5, 9)}\u001b[K${SPLIT_SECRET.slice(9)}\u001b[0m!`;
+  assert.equal(stdout.write(`a ${cut}\n`), 'a \u001b[1m[redacted]\u001b[31m\u001b[K\u001b[0m!\n');
+  // Two secrets side by side stay two markers, as without codes.
+  assert.equal(stdout.write(`${SPLIT_SECRET}${SPLIT_SECRET}\n`), '[redacted][redacted]\n');
+  assert.equal(stdout.write(`${SPLIT_SECRET}\u001b[0m${SPLIT_SECRET.slice(0, 3)}\u001b[2m${SPLIT_SECRET.slice(3)}\n`),
+    '[redacted]\u001b[0m[redacted]\u001b[2m\n');
+});
+
+test('the log redaction leaves look-alike text with codes as it was', () => {
+  const stdout = redactingStdout();
+  const lookAlikes = [
+    `${SPLIT_SECRET.slice(0, 12)}\u001b[31mzzz${SPLIT_SECRET.slice(15)}\n`,
+    `${SPLIT_SECRET.slice(0, -1)}\u001b[0m\n`,
+    `\u001b[32m${SPLIT_SECRET.slice(1)}\u001b[0m\n`,
+    `${SPLIT_SECRET.slice(0, 10)} \u001b[31m${SPLIT_SECRET.slice(10)}\n`,
+    '\u001b[1mbold\u001b[0m and \u001b]8;;https://example.invalid/\u0007link\u001b]8;;\u0007\n',
+  ];
+  for (const line of lookAlikes) assert.equal(stdout.write(line), line);
+});
+
+test('a secret inside a code is redacted there, and one a stray ESC runs into goes with the ESC', () => {
+  const stdout = redactingStdout();
+  assert.equal(stdout.write(`\u001b]8;;https://example.invalid/?k=${SPLIT_SECRET}\u0007link\u001b]8;;\u0007\n`),
+    '\u001b]8;;https://example.invalid/?k=[redacted]\u0007link\u001b]8;;\u0007\n');
+  assert.equal(stdout.write(`x\u001b${SPLIT_SECRET}\n`), 'x[redacted]\n');
+});
+
+test('bytes cut inside a character are written as they came, and a secret in them goes by its bytes', () => {
+  const stdout = redactingStdout();
+  const euro = Buffer.from('€', 'utf8');
+  const cut = Buffer.concat([Buffer.from('\u001b[31mprice 5', 'utf8'), euro.subarray(0, 2)]);
+  assert.equal(stdout.write(cut), cut);
+  const withSecret = Buffer.concat([Buffer.from(`\u001b[31m${SPLIT_SECRET} 5`, 'utf8'), euro.subarray(0, 2)]);
+  const written = stdout.write(withSecret);
+  assert.ok(Buffer.isBuffer(written));
+  assert.deepEqual(written, Buffer.concat([Buffer.from('\u001b[31m[redacted] 5', 'utf8'), euro.subarray(0, 2)]));
+  assert.equal(written.includes(Buffer.from('�', 'utf8')), false);
+  const plain = Buffer.concat([Buffer.from(`no secret 5`, 'utf8'), euro.subarray(0, 1)]);
+  assert.equal(stdout.write(plain), plain);
+});
+
+test('the log copy gets a cut secret redacted too', () => {
+  const processImpl = fakeProcess();
+  const fsImpl = recordingFs();
+  const logFile = installWorkerLogFile({ env: { [WORKER_LOG_FILE_ENV]: WIN32_LOG }, processImpl, fsImpl });
+  const redaction = installWorkerLogRedaction({ secrets: [SPLIT_SECRET], processImpl });
+  processImpl.stderr.write(`error: ${SPLIT_SECRET.slice(0, 7)}\u001b[33m${SPLIT_SECRET.slice(7)}\u001b[39m\n`);
+  const fileText = fsImpl.writes.map(([, chunk]) => String(chunk)).join('');
+  assert.equal(fileText, 'error: [redacted]\n');
+  redaction.uninstall();
+  logFile.uninstall();
+});
+
+test('a secret inside a string control is hidden there, also beside a cut one, and every code stays whole', () => {
+  const stdout = redactingStdout();
+  const key = SPLIT_SECRET;
+  const probes = [
+    [`key ${key.slice(0, 10)}\u001b]8;;https://x.test/?k=${key}\u0007${key.slice(10)} end\n`,
+      'key [redacted]\u001b]8;;https://x.test/?k=[redacted]\u0007 end\n'],
+    [`key ${key.slice(0, 10)}\u001b]8;;https://x.test/?k=${key}\u001b\\${key.slice(10)} end\n`,
+      'key [redacted]\u001b]8;;https://x.test/?k=[redacted]\u001b\\ end\n'],
+    [`${key}\u001b]0;${key}\u0007${key}\n`, '[redacted]\u001b]0;[redacted]\u0007[redacted]\n'],
+  ];
+  for (const [line, expected] of probes) {
+    assert.equal(stdout.write(line), expected);
+    assert.equal(String(stdout.write(Buffer.from(line, 'utf8'))), expected);
+  }
+  for (const [name, code] of Object.entries(SPLIT_CODES)) {
+    for (let at = 1; at < key.length; at += 1) {
+      const cut = `${key.slice(0, at)}${code}${key.slice(at)}`;
+      assert.equal(stdout.write(`${cut}\u001b]8;;https://x.test/?k=${key}\u0007link\u001b]8;;\u0007\n`),
+        `[redacted]${code}\u001b]8;;https://x.test/?k=[redacted]\u0007link\u001b]8;;\u0007\n`, `${name} at ${at}`);
+    }
+  }
+});

@@ -392,3 +392,27 @@ test('a schedule set before a billing switch fires on the chat\'s billing of the
   const [message] = scheduledMessages(db, AGENT);
   assert.equal(db.prepare(`SELECT provider FROM queue WHERE id = ?`).get(message.id).provider, 'claude-api');
 });
+
+// The live check goes stale: the session is archived inside the firing's
+// write, after fireIfDue checked it. The row brings it back, said once,
+// instead of waiting unseen in an archived chat.
+test('a firing into a session archived after its check unarchives it and says so once', () => {
+  const { service, db, stmts, clock, emitted } = setup();
+  service.create({ conversationId: WORKER, createdBy: AGENT, text: 'nightly review', everyMinutes: 5 });
+  const updateConvTime = stmts.updateConvTime;
+  stmts.updateConvTime = {
+    run: (at, id) => {
+      const result = updateConvTime.run(at, id);
+      db.prepare(`UPDATE conversations SET archived = 1 WHERE id = ?`).run(id);
+      return result;
+    },
+  };
+  clock.advance(5 * MIN);
+  const [message] = scheduledMessages(db, WORKER);
+  assert.equal(message.status, 'pending');
+  assert.equal(db.prepare(`SELECT archived FROM conversations WHERE id = ?`).get(WORKER).archived, 0);
+  const events = emitted.map((entry) => entry.event);
+  assert.deepEqual(emitted.filter((entry) => entry.event === 'conversation_archived').map((entry) => entry.payload), [{ conversationId: WORKER, archived: false }]);
+  assert.ok(events.indexOf('conversation_archived') < events.indexOf('user_message'), events.join(','));
+  assert.equal(stmts.findPendingForWorker.get(new Date(clock.now()).toISOString(), `sdk-${WORKER}`)?.id, message.id);
+});

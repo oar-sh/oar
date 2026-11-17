@@ -211,6 +211,231 @@ test('chunks say when the task has ended, and a task gone from both sets stops t
   assert.deepEqual(rooms.watchedRooms(), []);
 });
 
+// ─── A second instance: the worker log ───────────────────────────────────────
+
+const WORKER_LOG_EVENTS = { watch: 'worker_log_watch', unwatch: 'worker_log_unwatch', chunk: 'worker_log_chunk' };
+
+function workerLogRooms(io, resolveSource) {
+  const timers = [];
+  const rooms = createTaskOutputRooms({
+    io,
+    resolveSource,
+    roomPrefix: 'worker-log:',
+    events: WORKER_LOG_EVENTS,
+    dataKey: 'workerLogRoom',
+    itemKey: null,
+    roomSize: (room) => io.rooms.get(room)?.size || 0,
+    setIntervalImpl: (fn) => { const timer = { fn, cleared: false }; timers.push(timer); return timer; },
+    clearIntervalImpl: (timer) => { timer.cleared = true; },
+    logger: null,
+  });
+  return { rooms, timers };
+}
+
+test('a worker-log instance: one room per conversation, its own events, no item id', async (t) => {
+  const file = tempFile(t, 'boot\n');
+  const io = fakeIo();
+  const { rooms } = workerLogRooms(io, (conversationId) => (conversationId === 'conv-1' ? { path: file, ended: false } : null));
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  assert.deepEqual(await socket.call('worker_log_watch', { conversationId: 'conv-1', offset: 5 }), { ok: true, offset: 5, size: 5 });
+  assert.equal(socket.data.workerLogRoom, 'worker-log:conv-1');
+  assert.equal(socket.data.taskOutputRoom, undefined);
+  fs.appendFileSync(file, 'turn started\n');
+  await rooms.poll('worker-log:conv-1');
+  assert.equal(io.emitted.length, 1);
+  const { room, event, payload } = io.emitted[0];
+  assert.deepEqual([room, event], ['worker-log:conv-1', 'worker_log_chunk']);
+  assert.deepEqual({ ...payload, mtime: typeof payload.mtime }, { conversationId: 'conv-1', offset: 5, endOffset: 18, text: 'turn started\n', size: 18, mtime: 'number', ended: false });
+  assert.equal('taskId' in payload, false);
+  assert.deepEqual(await socket.call('worker_log_watch', { conversationId: 'conv-2' }), { ok: false, code: 'not-found' });
+  assert.deepEqual(rooms.watchedRooms(), []);
+});
+
+test('a socket in a task room and a worker-log room at once gets both, and leaving one keeps the other', async (t) => {
+  const { file: taskFile, io, rooms: taskRooms } = setup(t);
+  const logFile = tempFile(t, '');
+  const { rooms: logRooms } = workerLogRooms(io, () => ({ path: logFile, ended: false }));
+  const socket = io.socket('s1');
+  taskRooms.registerSocket(socket);
+  logRooms.registerSocket(socket);
+  await socket.call('task_output_watch', { conversationId: 'conv-1', taskId: 't1', offset: 6 });
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  assert.deepEqual([...socket.rooms].sort(), ['task-output:conv-1:t1', 'worker-log:conv-1']);
+  fs.appendFileSync(taskFile, 'task line\n');
+  fs.appendFileSync(logFile, 'log line\n');
+  await taskRooms.poll('task-output:conv-1:t1');
+  await logRooms.poll('worker-log:conv-1');
+  assert.deepEqual(io.emitted.map((entry) => [entry.room, entry.event, entry.payload.text]), [
+    ['task-output:conv-1:t1', 'task_output_chunk', 'task line\n'],
+    ['worker-log:conv-1', 'worker_log_chunk', 'log line\n'],
+  ]);
+  await socket.call('worker_log_unwatch', {});
+  assert.deepEqual([...socket.rooms], ['task-output:conv-1:t1']);
+  assert.deepEqual(taskRooms.watchedRooms(), ['task-output:conv-1:t1']);
+  assert.deepEqual(logRooms.watchedRooms(), []);
+});
+
+test('a worker log rotated at a relaunch (renamed, a new smaller file) is sent as a reset', async (t) => {
+  const file = tempFile(t, 'old run line one\nold run line two\n');
+  const io = fakeIo();
+  const { rooms } = workerLogRooms(io, () => ({ path: file, ended: false }));
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  fs.renameSync(file, `${file}.1`);
+  fs.writeFileSync(file, 'new run\n');
+  await rooms.poll('worker-log:conv-1');
+  assert.deepEqual([io.emitted[0].event, io.emitted[0].payload.reset, io.emitted[0].payload.offset], ['worker_log_chunk', true, 8]);
+});
+
+test('a worker-log source with no path is refused with its code', async () => {
+  const io = fakeIo();
+  const { rooms } = workerLogRooms(io, () => ({ path: '', code: 'no-session' }));
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  assert.deepEqual(await socket.call('worker_log_watch', { conversationId: 'conv-1' }), { ok: false, code: 'no-session' });
+  assert.deepEqual(await socket.call('worker_log_watch', {}), { ok: false, code: 'missing-id' });
+});
+
+// ─── Line-safe sends (the worker log's options) ──────────────────────────────
+
+function lineSafeRooms(io, file, { clock, resolveSource } = {}) {
+  return createTaskOutputRooms({
+    io,
+    resolveSource: resolveSource || (() => ({ path: file, ended: false })),
+    roomPrefix: 'worker-log:',
+    events: WORKER_LOG_EVENTS,
+    dataKey: 'workerLogRoom',
+    itemKey: null,
+    idleFlushMs: 5000,
+    followPath: true,
+    now: () => clock.now,
+    roomSize: (room) => io.rooms.get(room)?.size || 0,
+    setIntervalImpl: () => ({}),
+    clearIntervalImpl: () => {},
+    logger: null,
+  });
+}
+
+const framesOf = (io) => io.emitted.map((entry) => entry.payload);
+
+test('line-safe: an open line waits for 5 s of quiet, and once complete goes out again whole, scrubbed; no frame shows the value', async (t) => {
+  const file = tempFile(t, 'boot\n');
+  const io = fakeIo();
+  const clock = { now: 1_000_000 };
+  const rooms = lineSafeRooms(io, file, { clock });
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  const room = 'worker-log:conv-1';
+  const secret = 'hunter2plainsecret';
+  fs.appendFileSync(file, 'Authorization: Bearer ');
+  await rooms.poll(room);
+  // Two quiet ticks: the task console would flush here; the worker log waits.
+  clock.now += 1000;
+  await rooms.poll(room);
+  clock.now += 1000;
+  await rooms.poll(room);
+  assert.equal(io.emitted.length, 0, 'an open line within 5 s of its last write is held');
+  clock.now += 4000;
+  await rooms.poll(room);
+  assert.deepEqual(framesOf(io).map((frame) => [frame.offset, frame.text, frame.partial, frame.rewrite]), [[5, 'Authorization: Bearer ', true, undefined]]);
+  fs.appendFileSync(file, `${secret}\nnext line\n`);
+  clock.now += 1000;
+  await rooms.poll(room);
+  const last = framesOf(io).at(-1);
+  assert.deepEqual([last.offset, last.rewrite, last.text], [5, true, 'Authorization: Bearer [redacted]\nnext line\n']);
+  assert.equal(last.endOffset, fs.statSync(file).size);
+  assert.ok(!JSON.stringify(io.emitted).includes(secret), 'no frame carries the value');
+  // The next line continues after it, without a rewrite.
+  fs.appendFileSync(file, 'after\n');
+  clock.now += 1000;
+  await rooms.poll(room);
+  assert.deepEqual([framesOf(io).at(-1).text, framesOf(io).at(-1).rewrite], ['after\n', undefined]);
+});
+
+test('line-safe: a value written slowly is held while its writer keeps going', async (t) => {
+  const file = tempFile(t, '');
+  const io = fakeIo();
+  const clock = { now: 1_000_000 };
+  const rooms = lineSafeRooms(io, file, { clock });
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  for (const piece of ['Authorization: ', 'Bearer ', 'hunter2', 'plain', 'secret']) {
+    fs.appendFileSync(file, piece);
+    clock.now += 2000;
+    await rooms.poll('worker-log:conv-1');
+  }
+  assert.equal(io.emitted.length, 0);
+  fs.appendFileSync(file, '\n');
+  clock.now += 1000;
+  await rooms.poll('worker-log:conv-1');
+  assert.deepEqual(framesOf(io).map((frame) => frame.text), ['Authorization: Bearer [redacted]\n']);
+});
+
+test('line-safe: a line longer than 64 KB is cut between words, so a Bearer value is not split', async (t) => {
+  const file = tempFile(t, '');
+  const io = fakeIo();
+  const clock = { now: 1_000_000 };
+  const rooms = lineSafeRooms(io, file, { clock });
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  const secret = 'hunter2plainsecretvalue';
+  const prefix = 'curl -H "x-trace: ok" -H "Authorization: Bearer ';
+  // The value straddles the 64 KB mark.
+  const filler = 'w '.repeat(Math.floor((64 * 1024 - prefix.length - 10) / 2));
+  fs.appendFileSync(file, `${filler}${prefix}${secret}" https://api.example.test/v1 ${'z '.repeat(500)}\n`);
+  assert.ok(filler.length + prefix.length < 64 * 1024 && filler.length + prefix.length + secret.length > 64 * 1024);
+  clock.now += 1000;
+  await rooms.poll('worker-log:conv-1');
+  const frames = framesOf(io);
+  assert.ok(frames.length >= 2, 'the line goes out in more than one piece');
+  assert.ok(frames[0].endOffset < 64 * 1024);
+  assert.ok(!JSON.stringify(io.emitted).includes(secret.slice(0, 8)), 'no frame carries any part of the value');
+  assert.ok(!JSON.stringify(io.emitted).includes(secret.slice(-8)));
+  assert.ok(frames.some((frame) => frame.text.includes('Authorization: Bearer [redacted]')));
+  // Piece by piece, the whole line arrived.
+  assert.equal(frames.at(-1).endOffset, fs.statSync(file).size);
+  for (let index = 1; index < frames.length; index += 1) assert.equal(frames[index].offset, frames[index - 1].endOffset);
+});
+
+test('line-safe: a source whose path changes (a new SDK session) moves the room there with a reset, on a tick and on a watch', async (t) => {
+  const first = tempFile(t, 'old session\n');
+  const second = tempFile(t, 'new session line\n');
+  const io = fakeIo();
+  const clock = { now: 1_000_000 };
+  let current = first;
+  const rooms = lineSafeRooms(io, null, { clock, resolveSource: () => ({ path: current, ended: false }) });
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  current = second;
+  await rooms.poll('worker-log:conv-1');
+  assert.deepEqual([framesOf(io)[0].reset, framesOf(io)[0].offset], [true, 17]);
+  fs.appendFileSync(second, 'more\n');
+  clock.now += 1000;
+  await rooms.poll('worker-log:conv-1');
+  assert.equal(framesOf(io).at(-1).text, 'more\n');
+  // A page that watches after the next change finds the room on the new file.
+  current = first;
+  const ack = await socket.call('worker_log_watch', { conversationId: 'conv-1' });
+  assert.deepEqual([ack.ok, ack.offset, framesOf(io).at(-1).reset], [true, 12, true]);
+});
+
+test('the task console\'s defaults are unchanged: no rewrite or partial marks, an open line flushed after one quiet tick', async (t) => {
+  const { file, io, rooms } = setup(t, { content: 'start\n' });
+  const socket = io.socket('s1');
+  rooms.registerSocket(socket);
+  await socket.call('task_output_watch', { conversationId: 'conv-1', taskId: 't1' });
+  fs.appendFileSync(file, 'prompt? ');
+  await rooms.poll(taskOutputRoom('conv-1', 't1'));
+  await rooms.poll(taskOutputRoom('conv-1', 't1'));
+  assert.deepEqual(io.emitted.map((entry) => Object.keys(entry.payload).sort()), [['conversationId', 'endOffset', 'ended', 'mtime', 'offset', 'size', 'taskId', 'text']]);
+});
+
 test('a file that is not there yet is waited for, and its first bytes come from offset 0', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-rooms-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

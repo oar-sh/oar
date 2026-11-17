@@ -2,8 +2,9 @@
 // already loads: the provider settings payloads and the model catalog. No DOM.
 //
 // OpenAI, Claude, Claude API, Claude Cloud, Cursor, Grok and DeepSeek say so
-// themselves: their settings carry `enabled`. Copilot has no such flag and the relay never asks
-// whether the Copilot CLI is signed in, so the best signal is indirect: has a
+// themselves: their settings carry `enabled`. Copilot's settings carry its
+// switch: off, it is not ready. On, the relay still never asks whether the
+// Copilot CLI is signed in, so the best signal is indirect: has a
 // real Copilot model list ever reached the catalog? A fresh database is seeded
 // with a curated list under the source `bootstrap-seed`; a server discovery,
 // an extension snapshot or a worker snapshot replaces that source. Until one
@@ -66,10 +67,11 @@ const SETTINGS_PROVIDERS = Object.freeze([
 ]);
 
 /** Payloads whose absence means "could not be loaded" rather than "not offered". */
-const REQUIRED_INPUTS = Object.freeze(['openai', 'claude', 'cursor', 'grok', 'catalog']);
+const REQUIRED_INPUTS = Object.freeze(['copilot', 'openai', 'claude', 'cursor', 'grok', 'catalog']);
 
 /**
  * @param {object} input the settings payloads New Chat loads, plus GET /api/models
+ * @param {object|null} [input.copilot] GET /api/settings/copilot; `enabled: false` is off (missing: on)
  * @param {object|null} [input.openai]
  * @param {object|null} [input.claude]
  * @param {object|null} [input.claudeApi] null on a relay without Claude API: not offered, not unknown
@@ -79,7 +81,7 @@ const REQUIRED_INPUTS = Object.freeze(['openai', 'claude', 'cursor', 'grok', 'ca
  * @param {object|null} [input.deepseek] null on a relay without DeepSeek: not offered, not unknown
  * @param {object|null} [input.catalog]
  * @param {object|null} [input.agentSdks] GET /api/agent-sdks/status; absent or null changes nothing
- * @returns {{ known: boolean, anyReady: boolean, ready: string[], copilot: 'ready' | 'unknown', reasons?: Record<string, { blocking: boolean, text: string }> }}
+ * @returns {{ known: boolean, anyReady: boolean, ready: string[], copilot: 'ready' | 'unknown' | 'off', reasons?: Record<string, { blocking: boolean, text: string }> }}
  *   `reasons` only with an agent SDK snapshot: by enabled provider whose SDK is not ready
  */
 export function resolveProviderReadiness(input = {}) {
@@ -99,9 +101,9 @@ export function resolveProviderReadiness(input = {}) {
     if (!reason?.blocking) ready.push(providerId);
   }
   const source = String(payloads.catalog?.source || '').trim();
-  const copilot = payloads.catalog && typeof payloads.catalog === 'object' && source && source !== SEED_CATALOG_SOURCE
-    ? 'ready'
-    : 'unknown';
+  const copilot = payloads.copilot?.enabled === false
+    ? 'off'
+    : (payloads.catalog && typeof payloads.catalog === 'object' && source && source !== SEED_CATALOG_SOURCE ? 'ready' : 'unknown');
   if (copilot === 'ready') ready.push('github');
   const answer = { known, anyReady: ready.length > 0, ready, copilot };
   if (sdks) answer.reasons = reasons;
@@ -122,12 +124,30 @@ export function isSetupRequired(readiness) {
   return !!readiness && readiness.known === true && readiness.anyReady !== true;
 }
 
+/**
+ * Why the composer is locked: 'setup' with no conversation open and no
+ * provider ready; 'new-chat' with no conversation open while Copilot is
+ * switched off (a send there would start a chat on a provider nobody picked:
+ * New Chat names it); 'copilot-off' in a Copilot chat (provider `github`, or
+ * none: a chat from before providers) while Copilot is switched off; null
+ * otherwise. OpenAI chats share Copilot's worker, not its switch.
+ */
+export function composerLockReason({ conversationId = '', providerType = '' } = {}, readiness = current) {
+  if (!String(conversationId || '').trim()) {
+    if (isSetupRequired(readiness)) return 'setup';
+    return readiness?.copilot === 'off' ? 'new-chat' : null;
+  }
+  const type = String(providerType ?? '').trim().toLowerCase();
+  return readiness?.copilot === 'off' && (type === '' || type === 'github') ? 'copilot-off' : null;
+}
+
 // ── The client's live copy ────────────────────────────────────────────────
 // Fed from the initial loads, the socket events that follow a Settings save
 // or a catalog change, and New Chat's own fresh loads. Subscribers redraw the
 // empty screen and the composer when the answer changes.
 
 const inputs = {
+  copilot: undefined,
   openai: undefined,
   claude: undefined,
   claudeApi: undefined,

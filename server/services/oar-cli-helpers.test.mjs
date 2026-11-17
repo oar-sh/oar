@@ -372,7 +372,8 @@ test('doctor report renders both healthy and missing states without leaking the 
   assert.ok(!report.includes('super-secret'), 'token value must never render');
   assert.match(report, /tunnel {8}: managed/);
   assert.match(report, /2\.0 MB/);
-  assert.match(report, /grok {10}: not found/);
+  assert.match(report, /grok {10}: not installed \(optional\)/);
+  assert.ok(!/: not found/.test(report), 'a missing provider CLI is not a fault');
   assert.match(report, /copilot {7}: GitHub Copilot CLI 1\.0\.9/);
 
   const missing = renderDoctorReport({

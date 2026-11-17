@@ -80,6 +80,7 @@ export {
 } from './claude-api-settings-ui.js';
 import { openClaudeCloudSettingsSection } from './claude-cloud-settings-ui.js';
 import { refreshCliInstallSections } from './cli-install-ui.js';
+import { refreshCopilotSettingsState } from './copilot-settings-ui.js';
 import { refreshAgentSdkRows } from './agent-sdk-ui.js';
 import { refreshUpdateSection } from './update-ui.js';
 import { refreshRemoteRelaysSection } from './remote-relays-settings.js';
@@ -674,7 +675,7 @@ export function applyOpenAISettingsState(settings = {}, { resetInputs = false } 
       ? `OpenAI API is enabled. Select OpenAI in New Chat to use model ${openAISettingsState.model}.`
       : (openAISettingsState.configured
           ? 'API key saved but currently disabled. Enable it to allow OpenAI selection in New Chat.'
-          : 'Not configured. New conversations use GitHub Copilot.');
+          : 'Not configured.');
     status.dataset.state = openAISettingsState.enabled
       ? 'active'
       : (openAISettingsState.configured ? 'saved' : 'unconfigured');
@@ -1038,7 +1039,7 @@ export function applyCursorSettingsState(settings = {}, { resetInputs = false } 
       ? 'Cursor is enabled. Select Cursor in New Chat to use it.'
       : (cursorSettingsState.configured
           ? 'API key saved but currently disabled. Enable it to allow Cursor selection in New Chat.'
-          : 'Not configured. New conversations use GitHub Copilot.');
+          : 'Not configured.');
     status.dataset.state = cursorSettingsState.enabled
       ? 'active'
       : (cursorSettingsState.configured ? 'saved' : 'unconfigured');
@@ -1467,7 +1468,7 @@ export async function removeCursorSettings() {
     const result = await updateCursorSettings({ model, remove: true });
     if (!result) throw new Error('Failed to remove Cursor settings.');
     applyCursorSettingsState(result, { resetInputs: true });
-    showTransientRelayNotice('Cursor API key removed. New conversations use GitHub Copilot.');
+    showTransientRelayNotice('Cursor API key removed.');
   } catch (error) {
     // A 409 'cursor-key-removal-blocked' rejection carries the active
     // conversation counts inside the server's error message.
@@ -1574,7 +1575,7 @@ export async function removeOpenAISettings() {
     const result = await updateOpenAISettings({ model, remove: true });
     if (!result) throw new Error('Failed to remove OpenAI settings.');
     applyOpenAISettingsState(result, { resetInputs: true });
-    showTransientRelayNotice('OpenAI API key removed. New conversations use GitHub Copilot.');
+    showTransientRelayNotice('OpenAI API key removed.');
   } catch (error) {
     alert(error?.message || 'Failed to remove OpenAI settings.');
   } finally {
@@ -1899,6 +1900,7 @@ export function openSettingsModal(tab, providerTab) {
   void refreshClaudeAuthSection();
   void openClaudeCloudSettingsSection();
   void refreshGrokAuthSection();
+  void refreshCopilotSettingsState();
   // Forced: the cached rows can be 30s stale, and a CLI installed from a shell
   // in the meantime should show up the moment the panel opens. Sockets keep it
   // current from here on.

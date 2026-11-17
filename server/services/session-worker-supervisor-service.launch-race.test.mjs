@@ -2,9 +2,11 @@
 // is still running (its heartbeat, socket hello or claim sets the pid, and a
 // claim's ensureWorker reuses it) keeps its registry entry, however that
 // launch ends. The registration writes below are the ones those routes make
-// (messages-routes.mjs heartbeat and /api/pending, the runtime's
-// noteSessionWorkerHello); the liveness check is the registry-pid step of
-// the dead-worker sweep (isWorkerSessionProcessAlive in server-runtime.mjs).
+// (the heartbeat in messages-worker-report-routes.mjs and /api/pending in
+// messages-worker-claim-routes.mjs, the runtime's noteSessionWorkerHello);
+// the liveness check is the registry-pid step of the dead-worker sweep
+// (services/worker-session-liveness.mjs, which isWorkerSessionProcessAlive
+// in server-runtime.mjs and the archive run).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

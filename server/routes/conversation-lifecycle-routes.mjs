@@ -12,6 +12,11 @@ import { notPerson } from '../services/relay-principal.mjs';
 import { removeClaudeSessionLeftovers } from '../services/claude-session-leftovers.mjs';
 import { DEEPSEEK_USAGE_CHECKPOINTS_TABLE } from '../migrations/0024-deepseek-usage-totals.mjs';
 import { claudeProjectDirSlug } from '../services/claude-session-root-service.mjs';
+import { buildTerminalFailureTextForChat } from './messages-helpers.mjs';
+import { mapSubagentRunHeader } from '../services/subagent-timeline-service.mjs';
+import { QUEUE_WAKE_FUNCTION } from '../services/queue-wake-hook.mjs';
+import { QUEUE_ROW_SESSION_SQL, notHeldForUsageLimit } from '../repositories/message-repository.mjs';
+import { createWorkerSessionLiveness } from '../services/worker-session-liveness.mjs';
 
 /**
  * Registers the routes; returns `{ archiveConversationNow }`, the archive of
@@ -35,8 +40,10 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     sessionWorkerRegistry,
     sessionWorkerProcessInspector,
     resolveSessionStateRoot,
+    DEFAULT_RELAY_MODE,
   } = deps;
   const {
+    failQueueMessage,
     cleanupGeneratedImagesForConversation,
     claudeCloudSessionService,
     conversationGroups,
@@ -61,6 +68,8 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
   } = shared;
 
   const CLI_SESSION_DELETE_TIMEOUT_MS = 10_000;
+  // The archive's process probe, all sessions together (a test sets it shorter).
+  const processProbeTimeoutMs = Number(deps.archiveProcessProbeTimeoutMs) > 0 ? Number(deps.archiveProcessProbeTimeoutMs) : 5_000;
   const LIVE_WORKER_STATUSES = new Set(['starting', 'ready', 'processing']);
   // A session id that is safe to join into a path under the session-state root.
   const SESSION_FOLDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -71,6 +80,13 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     WHERE conversation_id = ?
       AND status = 'processing'
   `);
+  const listProcessingConversationRows = db.prepare(`
+    SELECT *
+    FROM queue
+    WHERE conversation_id = ?
+      AND status = 'processing'
+    ORDER BY timestamp ASC, rowid ASC
+  `);
   // The rows an archive cancels: those still waiting for a worker.
   const listQueuedConversationRows = db.prepare(`
     SELECT *
@@ -79,6 +95,24 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
       AND status IN ('pending', 'parked')
     ORDER BY timestamp ASC, rowid ASC
   `);
+  // The sessions whose workers take the conversation's pending rows, by the
+  // waker's own rule (listPendingWorkerOwnerSessionIds): a follow-up held at
+  // the usage limit waits for its reset, not for a worker. Prepared on first
+  // use, at the first unarchive.
+  let listPendingConversationSessionIds = null;
+  const LIST_PENDING_CONVERSATION_SESSION_IDS_SQL = `
+    SELECT DISTINCT ${QUEUE_ROW_SESSION_SQL} AS sdk_session_id
+    FROM queue q
+    LEFT JOIN runtime_sessions rs
+      ON rs.id = q.runtime_session_id
+    LEFT JOIN conversations c
+      ON c.id = q.conversation_id
+    WHERE q.conversation_id = ?
+      AND q.status = 'pending'
+      ${notHeldForUsageLimit('q.')}
+  `;
+  // The wake through the queue triggers' own function, prepared on first use.
+  let wakeQueueStatement = null;
   const findOtherLiveConversationForSdkSession = db.prepare(`
     SELECT id
     FROM conversations
@@ -150,11 +184,15 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
    * none. A turn that fails marks a worker that is still running 'error',
    * and it stays so until its next turn, background tasks and all.
    */
-  function describeConversationActivity(conversationId, workerSessionId) {
-    const worker = sessionWorkerRegistry?.getWorker?.(workerSessionId) || null;
-    const workerAlive = !!worker && (worker.pid
+  function isWorkerAlive(worker) {
+    return !!worker && (worker.pid
       ? isPidAlive(worker.pid)
       : LIVE_WORKER_STATUSES.has(String(worker.status || '').trim().toLowerCase()));
+  }
+
+  function describeConversationActivity(conversationId, workerSessionId) {
+    const worker = sessionWorkerRegistry?.getWorker?.(workerSessionId) || null;
+    const workerAlive = isWorkerAlive(worker);
     const processingCount = Number(countProcessingConversationQueueRows.get(conversationId)?.count || 0);
     const taskKeys = [...new Set([conversationId, workerSessionId])];
     let liveTasks = workerAlive ? taskKeys.flatMap((key) => backgroundTaskStore?.get?.(key) || []) : [];
@@ -512,8 +550,10 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
           ? String(findOtherLiveConversationForSdkSession.get(sdkSessionId, id)?.id || '').trim() || null
           : null;
         const importedOnly = !!sdkSessionId && sdkSessionImportService?.isImportedOnly?.(sdkSessionId) === true;
+        // The session the archive stops, if it stops one.
+        const stoppedSessionId = !sharedWithConversationId && !importedOnly ? workerSessionId : null;
         let workerStopped = false;
-        if (!sharedWithConversationId && !importedOnly) {
+        if (stoppedSessionId) {
           const stopped = await stopIdleWorkspaceRootSession({
             sdkSessionId: workerSessionId,
             worker: sessionWorkerRegistry?.getWorker?.(workerSessionId) || null,
@@ -538,8 +578,19 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
           // Nothing may respawn a worker for an archived chat.
           sessionWorkerSupervisor?.markKilled?.(workerSessionId);
         }
-        // From here to the commit nothing awaits: the queue cannot hand a
-        // queued message to a worker between the archive and its cancel.
+        // The turns of sessions the archive did not stop: the process probe
+        // says which have no worker. It awaits, so it runs before the window
+        // below, which checks each turn is still on the attempt it probed.
+        const probedRows = listProcessingConversationRows.all(id)
+          .filter((row) => sessionOfRow(row, workerSessionId) !== stoppedSessionId);
+        const deadSessionIds = await probeDeadSessions([...new Set(probedRows.map((row) => sessionOfRow(row, workerSessionId)))]);
+        const deadAttempts = new Map(probedRows
+          .filter((row) => deadSessionIds.has(sessionOfRow(row, workerSessionId)))
+          .map((row) => [String(row.id), String(row.attempt_id || '')]));
+        // From here to the last failed turn nothing awaits: the queue cannot
+        // hand a queued message to a worker between the archive and its
+        // cancel, nor the dead-worker sweep requeue a turn failed below.
+        const orphanedRows = listOrphanedTurnRows(id, workerSessionId, stoppedSessionId, deadAttempts);
         const archivedAt = new Date().toISOString();
         const cancelled = db.transaction(() => {
           db.prepare(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`).run(archivedAt, id);
@@ -547,6 +598,13 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
         })();
         io.emit('conversation_archived', { conversationId: id, archived: true });
         announceArchiveCancel(id, cancelled);
+        const failedMessageIds = failOrphanedTurnsOnArchive(id, orphanedRows, workerSessionId);
+        // The archive stands: a note that cannot be written ends nothing below.
+        try {
+          noteArchiveOutcome(id, { ...cancelled, failedCount: failedMessageIds.length });
+        } catch (error) {
+          console.warn(`[archive] The archive note of ${shortId(id)} was not written: ${error?.message || error}`);
+        }
         // Its subscriptions end, and so does its place in others'.
         try { relayEventService?.noteConversationGone?.(id); } catch {}
         // So do its schedules.
@@ -564,7 +622,7 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
             console.warn(`[archive] Cloud session archive not started for ${id}: ${error?.message || error}`);
           }
         }
-        return { statusCode: 200, body: { ok: true, workerStopped, cancelledMessageIds: cancelled.messageIds } };
+        return { statusCode: 200, body: { ok: true, workerStopped, cancelledMessageIds: cancelled.messageIds, failedMessageIds } };
       });
   }
 
@@ -575,8 +633,8 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
    * it: the pending questions of its earlier attempts are cancelled and the
    * row is deleted. A follow-up held at the usage limit goes last, as the
    * pause banner's Cancel drops it (its follow-up message, the relay's own
-   * text, goes with it). One note in the transcript says what was cancelled;
-   * it is no queue row. Returns what announceArchiveCancel tells the clients.
+   * text, goes with it). Returns what announceArchiveCancel tells the
+   * clients and what noteArchiveOutcome counts.
    */
   function cancelQueuedRowsOnArchive(conversationId, at) {
     const queuedMessageIds = [];
@@ -586,9 +644,9 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
         if (skip(row)) continue;
         const messageId = String(row.id);
         // Read while they can be: the row's delete takes its questions along
-        // (relay_questions.queue_id cascades). No attempt of the row counts as
-        // current, as in the route.
-        for (const question of stmts.cancelPendingQuestionsForStaleAttempts?.all?.(at, messageId, '') || []) {
+        // (relay_questions.queue_id cascades). Every card of the row goes,
+        // those with no attempt too.
+        for (const question of stmts.cancelPendingQuestionsForRow?.all?.(at, messageId) || []) {
           const updated = stmts.getQuestion?.get?.(question.id) || null;
           if (updated && typeof formatQuestionRow === 'function') questions.push(formatQuestionRow(updated));
         }
@@ -603,32 +661,200 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     // Anything the pause service left (none but its one follow-up is held).
     if (usageLimitPauseService) cancelRows(() => false);
     const messageIds = pausedMessageId ? [...queuedMessageIds, pausedMessageId] : queuedMessageIds;
-    if (!messageIds.length) return { messageIds, queuedMessageIds, questions, note: null };
-    const count = queuedMessageIds.length;
-    const what = [
-      count ? `${count} queued message${count === 1 ? '' : 's'}` : '',
-      pausedMessageId ? 'the usage-limit follow-up' : '',
-    ].filter(Boolean).join(' and ');
-    const note = { id: randomUUID(), text: `[System Message] Archived: cancelled ${what}.`, timestamp: at };
-    stmts.insertMsg.run(note.id, conversationId, 'assistant', note.text, null, null, null, at, null, null, null);
-    return { messageIds, queuedMessageIds, questions, note };
+    return { messageIds, queuedMessageIds, pausedMessageId, questions };
   }
 
-  /** After the archive committed: each cancelled row, its questions, the note. */
-  function announceArchiveCancel(conversationId, { queuedMessageIds, questions, note }) {
+  /** After the archive committed: each cancelled row and its questions. */
+  function announceArchiveCancel(conversationId, { queuedMessageIds, questions }) {
     // The usage-limit pause's cancel announced its row itself.
     for (const messageId of queuedMessageIds) {
       io.emit('message_status', { messageId, conversationId, status: 'cancelled' });
     }
     for (const question of questions) io.emit('relay_question_updated', { question });
-    if (note) {
-      io.emit('assistant_message', {
-        conversationId,
-        sourceMessageId: null,
-        messageId: note.id,
-        message: { role: 'assistant', text: note.text, model: null, mode: null, timestamp: note.timestamp },
-      });
+  }
+
+  /** The session that runs a queue row: its owner, else the conversation's. */
+  function sessionOfRow(row, workerSessionId) {
+    return String(row.owner_sdk_session_id || '').trim() || workerSessionId;
+  }
+
+  // The runtime's own probe (services/worker-session-liveness.mjs), with this
+  // relay's worker sockets when the runtime hands them over.
+  const workerSessionLiveness = createWorkerSessionLiveness({
+    hasLiveWorkerSocket: (sessionId) => deps.hasLiveWorkerSocket?.(sessionId) === true,
+    getWorkerPid: (sessionId) => sessionWorkerRegistry?.getWorker?.(sessionId)?.pid,
+    isPidAlive: (pid) => isPidAlive(pid),
+    findProcessForSession: typeof sessionWorkerProcessInspector?.findProcessForSessionAsync === 'function'
+      ? (sessionId) => sessionWorkerProcessInspector.findProcessForSessionAsync(sessionId)
+      : null,
+  });
+
+  /**
+   * Which of these sessions have no worker left: the turns of sessions the
+   * archive did not stop. A live worker socket, the registry's pid, then the
+   * process list, whose lookups share one read (the inspector shares a
+   * running read), bounded together. A session whose lookup fails or runs
+   * out of time, or with no process list at all, is not shown dead: its turn
+   * is left to the dead-worker sweep, and so are all of them when any lookup
+   * runs out of time.
+   */
+  async function probeDeadSessions(sessionIds) {
+    const dead = new Set();
+    const { states, unanswered } = await workerSessionLiveness.probeAll(sessionIds, {
+      timeoutMs: processProbeTimeoutMs,
+      onLookupError: (sessionId, error) => {
+        console.warn(`[archive] The process list could not be read for ${shortId(sessionId)}: ${error?.message || error}`);
+      },
+    });
+    if (unanswered) {
+      console.warn(`[archive] The process list did not answer within ${processProbeTimeoutMs} ms: the turns of ${unanswered} session${unanswered === 1 ? '' : 's'} are left to the sweep.`);
+      return dead;
     }
+    for (const [sessionId, state] of states) if (state === 'dead') dead.add(sessionId);
+    return dead;
+  }
+
+  /**
+   * The conversation's processing rows that no worker will end. The session
+   * the archive stopped passed the activity check, so no registry entry for
+   * it means no worker (the stop removes it; a turn an idle worker claimed
+   * meanwhile is its last). Any other session's turn, another owner's or a
+   * shared or imported session's, is one the probe showed dead and that is
+   * still on the attempt it probed.
+   */
+  function listOrphanedTurnRows(conversationId, workerSessionId, stoppedSessionId, deadAttempts) {
+    return listProcessingConversationRows.all(conversationId).filter((row) => {
+      const sessionId = sessionOfRow(row, workerSessionId);
+      if (sessionId !== stoppedSessionId) return deadAttempts.get(String(row.id)) === String(row.attempt_id || '');
+      const worker = sessionWorkerRegistry?.getWorker?.(sessionId) || null;
+      return !worker || !isWorkerAlive(worker);
+    });
+  }
+
+  /**
+   * After the archive committed, in the same tick: each turn no worker will
+   * end fails as a dead turn does (failure reply, partial output linked,
+   * sub-agent runs and question cards ended, relay events), with no push and
+   * with the stopped worker left alone. A row whose failure throws is still
+   * marked failed, so nothing requeues it, and said so to the clients. The
+   * background sub-agent runs of each dead session close as the dead-worker
+   * sweep closes them, which no longer visits the session. Returns the
+   * failed rows' ids.
+   */
+  function failOrphanedTurnsOnArchive(conversationId, rows, workerSessionId) {
+    const failedMessageIds = [];
+    for (const row of rows) {
+      const messageId = String(row.id);
+      const failure = {
+        kind: 'terminal',
+        error: 'conversation-archived',
+        code: 'conversation-archived',
+        stableCode: 'relay.conversation-archived',
+        message: 'This chat was archived while this reply was not finished.',
+        guidance: 'Unarchive the chat and send the message again to continue.',
+        failedAt: new Date().toISOString(),
+      };
+      let failed = false;
+      try {
+        failed = !!failQueueMessage({
+          queueRow: row,
+          messageId,
+          conversationId,
+          relayMode: String(row.relay_mode || '').trim() || DEFAULT_RELAY_MODE || 'agent',
+          model: null,
+          responseText: buildTerminalFailureTextForChat(failure),
+          failureRecord: failure,
+          settleWorker: false,
+        });
+      } catch (error) {
+        console.warn(`[archive] Failing the turn ${shortId(messageId)} of ${shortId(conversationId)} threw: ${error?.message || error}`);
+        failed = markOrphanedTurnFailed(conversationId, messageId, failure);
+      }
+      if (!failed) continue;
+      failedMessageIds.push(messageId);
+      // failQueueMessage closes the cards of earlier attempts; no worker is
+      // left to take an answer for the last one, or for one with no attempt.
+      try {
+        for (const question of stmts.cancelPendingQuestionsForRow?.all?.(new Date().toISOString(), messageId) || []) {
+          const updated = stmts.getQuestion?.get?.(question.id) || null;
+          if (updated && typeof formatQuestionRow === 'function') io.emit('relay_question_updated', { question: formatQuestionRow(updated) });
+        }
+      } catch (error) {
+        console.warn(`[archive] The question cards of the turn ${shortId(messageId)} of ${shortId(conversationId)} were not cancelled: ${error?.message || error}`);
+      }
+    }
+    const deadSessionIds = new Set(rows.map((row) => String(row.owner_sdk_session_id || '').trim() || workerSessionId));
+    for (const sessionId of deadSessionIds) {
+      try {
+        closeStrandedBackgroundRuns(stmts.listRunningBackgroundSubagentRunsForSession?.all?.(sessionId, sessionId) || []);
+      } catch (error) {
+        console.warn(`[archive] The background sub-agent runs of ${shortId(sessionId)} were not closed: ${error?.message || error}`);
+      }
+    }
+    return failedMessageIds;
+  }
+
+  /**
+   * The fallback for a turn whose failQueueMessage threw: the row is marked
+   * failed with the archive's record, unless the throw came after its own
+   * commit. Either way a failed row is announced once, so an open page does
+   * not keep showing it running. Returns whether the row is failed.
+   */
+  function markOrphanedTurnFailed(conversationId, messageId, failure) {
+    try {
+      stmts.setFailed.run(JSON.stringify(failure), messageId);
+      if (String(stmts.findQById?.get?.(messageId)?.status || '') !== 'failed') return false;
+      io.emit('message_status', { messageId, conversationId, status: 'failed' });
+      return true;
+    } catch (error) {
+      console.warn(`[archive] The turn ${shortId(messageId)} of ${shortId(conversationId)} was not marked failed: ${error?.message || error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Background sub-agent runs a dead worker can no longer end: marked failed,
+   * each announced with its full header and its own turn, as the dead-worker
+   * sweep does.
+   */
+  function closeStrandedBackgroundRuns(runs) {
+    if (!runs.length) return;
+    const at = new Date().toISOString();
+    for (const run of runs) {
+      stmts.updateSubagentRunStatus?.run?.('failed', at, at, run.id);
+      const closed = stmts.getSubagentRun?.get?.(run.id) || { ...run, status: 'failed', completed_at: at };
+      const header = mapSubagentRunHeader(closed, { stoppable: false });
+      if (header) {
+        io.emit('subagent_status', { ...header, timestamp: at, queueMessageId: header.messageId, reconciled: true });
+      }
+    }
+  }
+
+  /**
+   * One note in the transcript, after the failure replies, says what the
+   * archive ended and cancelled; it is no queue row. None when it did
+   * neither.
+   */
+  function noteArchiveOutcome(conversationId, { queuedMessageIds, pausedMessageId, failedCount }) {
+    const count = queuedMessageIds.length;
+    const cancelledWhat = [
+      count ? `${count} queued message${count === 1 ? '' : 's'}` : '',
+      pausedMessageId ? 'the usage-limit follow-up' : '',
+    ].filter(Boolean).join(' and ');
+    const parts = [
+      failedCount ? `ended ${failedCount} unfinished repl${failedCount === 1 ? 'y' : 'ies'}` : '',
+      cancelledWhat ? `cancelled ${cancelledWhat}` : '',
+    ].filter(Boolean);
+    if (!parts.length) return;
+    const at = new Date().toISOString();
+    const note = { id: randomUUID(), text: `[System Message] Archived: ${parts.join('; ')}.`, timestamp: at };
+    stmts.insertMsg.run(note.id, conversationId, 'assistant', note.text, null, null, null, at, null, null, null);
+    io.emit('assistant_message', {
+      conversationId,
+      sourceMessageId: null,
+      messageId: note.id,
+      message: { role: 'assistant', text: note.text, model: null, mode: null, timestamp: note.timestamp },
+    });
   }
 
   // POST /api/conversation-groups/:id/archive — archive every live member of
@@ -644,12 +870,15 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
     if (!group) return res.status(404).json({ ok: false, error: 'Group not found' });
     const archived = [];
     const skipped = [];
+    // Each archived member's ended turns, as its single archive answers them.
+    const failedMessageIds = {};
     try {
       for (const member of conversationGroups.membersOf(groupId)) {
         if (member.archived) continue;
         const outcome = await archiveConversationNow(member.id);
         if (outcome.statusCode === 200) {
           archived.push(member.id);
+          failedMessageIds[member.id] = outcome.body?.failedMessageIds || [];
         } else {
           skipped.push({
             id: member.id,
@@ -660,15 +889,18 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
       }
     } catch (error) {
       console.warn(`[archive] Group archive failed for ${groupId}: ${error?.message || error}`);
-      return res.status(500).json({ ok: false, error: 'Failed to archive the group', archived, skipped });
+      return res.status(500).json({ ok: false, error: 'Failed to archive the group', archived, skipped, failedMessageIds });
     }
     if (archived.length) emitGroupChanged(groupId, archived);
-    return res.json({ ok: true, archived, skipped });
+    return res.json({ ok: true, archived, skipped, failedMessageIds });
   });
 
   // POST /api/conversation/:id/unarchive — back to the live list. A Claude
   // Cloud chat's cloud session is brought back too, so the next message
-  // reaches it; a stopped worker is launched again by the next delivery.
+  // reaches it. A row left pending in the chat goes at once: the route
+  // launches its session's worker and wakes the queue
+  // (wakeQueueAfterUnarchive); with nothing queued, the next delivery
+  // launches a stopped worker.
   app.post('/api/conversation/:id/unarchive', auth, (req, res) => {
     if (!admitRemoteRelayRequest(req, res, remoteRelayInbound)) return;
     const id = String(req.params.id || '').trim();
@@ -681,6 +913,7 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
       if (Number(existing.archived || 0) !== 1) return res.json({ ok: true, alreadyLive: true });
       db.prepare(`UPDATE conversations SET archived = 0, updated_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
       io.emit('conversation_archived', { conversationId: id, archived: false });
+      wakeQueueAfterUnarchive(id);
       try {
         claudeCloudSessionService?.unarchiveSessionInBackground?.({
           conversationId: id,
@@ -695,6 +928,69 @@ export function registerConversationLifecycleRoutes(app, deps, shared) {
       return res.status(500).json({ error: 'Failed to unarchive conversation' });
     }
   });
+
+  /**
+   * A row left pending in the archived chat may go now, but the unarchive
+   * writes no queue row, so the queue's own triggers do not fire and the row
+   * would wait for the backstop poll. The sessions that own such rows get
+   * their worker as a send's does (the archive's kill marker cleared), and the
+   * queue wakes through the triggers' own function, so a worker that is
+   * already connected is handed the row at once.
+   */
+  function wakeQueueAfterUnarchive(conversationId) {
+    let sessionIds = [];
+    try {
+      if (!listPendingConversationSessionIds) listPendingConversationSessionIds = db.prepare(LIST_PENDING_CONVERSATION_SESSION_IDS_SQL);
+      sessionIds = listPendingConversationSessionIds.all(conversationId)
+        .map((row) => String(row.sdk_session_id || '').trim())
+        .filter(Boolean);
+    } catch (error) {
+      console.warn(`[archive] The queued rows of ${shortId(conversationId)} were not read after the unarchive: ${error?.message || error}`);
+      return;
+    }
+    if (!sessionIds.length) return;
+    for (const sessionId of sessionIds) {
+      if (typeof sessionWorkerSupervisor?.ensureWorker !== 'function') break;
+      // As the primer does: a Claude API chat whose key, switch or cap went
+      // bad while it was archived gets its rows failed with the usual note
+      // instead of a worker (server-runtime.mjs, failClaudeApiRowsWithoutLaunch).
+      // A check that throws costs this session its launch only.
+      try {
+        if (deps.failClaudeApiRowsWithoutLaunch?.(sessionId)) continue;
+      } catch (error) {
+        console.warn(`[archive] No worker for ${shortId(sessionId)} after the unarchive: the Claude API check failed: ${error?.message || error}`);
+        continue;
+      }
+      // The same for a Copilot chat while Copilot is switched off: its rows
+      // fail with the switch's note, and no Copilot worker starts
+      // (server-runtime.mjs, failCopilotRowsWithoutLaunch).
+      try {
+        if (deps.failCopilotRowsWithoutLaunch?.(sessionId)) continue;
+      } catch (error) {
+        console.warn(`[archive] No worker for ${shortId(sessionId)} after the unarchive: the Copilot check failed: ${error?.message || error}`);
+        continue;
+      }
+      try {
+        sessionWorkerSupervisor.clearRestartSchedule?.(sessionId, { resetKilledMarker: true });
+        void Promise.resolve(sessionWorkerSupervisor.ensureWorker(sessionId)).then((result) => {
+          if (!result?.ok) console.warn(`[archive] No worker for ${shortId(sessionId)} after the unarchive: ${result?.error || 'refused'}`);
+        }).catch((error) => {
+          console.warn(`[archive] No worker for ${shortId(sessionId)} after the unarchive: ${error?.message || error}`);
+        });
+      } catch (error) {
+        console.warn(`[archive] No worker for ${shortId(sessionId)} after the unarchive: ${error?.message || error}`);
+      }
+    }
+    // The function is registered before the triggers, and a trigger that fails
+    // to install takes only the triggers down (queue-wake-hook.mjs): the call
+    // then still wakes the queue, beside the 500 ms poll that replaces the
+    // triggers. Where the hook never registered it, the call fails and the
+    // poll alone hands the row out.
+    try {
+      if (!wakeQueueStatement) wakeQueueStatement = db.prepare(`SELECT ${QUEUE_WAKE_FUNCTION}(?)`);
+      wakeQueueStatement.get('unarchive');
+    } catch {}
+  }
 
   return { archiveConversationNow };
 }

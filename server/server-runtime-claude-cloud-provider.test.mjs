@@ -95,15 +95,10 @@ test('runtime session binding honors an explicit claude-cloud provider type', ()
 
 test('unstarted conversations are never rebound to or from the cloud by a provider toggle', () => {
   // A cloud conversation carries a repository: flipping another provider's
-  // switch must leave it alone, and flipping the cloud's must not turn
-  // GitHub conversations into cloud ones.
-  assert.match(source, /managedProvider = \['claude', 'cursor', 'grok', 'deepseek', 'claude-api'\]/);
-  assert.doesNotMatch(source, /managedProvider = \[[^\]]*'claude-cloud'/);
-  const reconcileSource = sliceBetween(
-    'async function reconcileUnstartedConversationProviders(',
-    '\nasync function rebindUnstartedOpenAIConversationModel(',
-  );
-  assert.match(reconcileSource, /if \(currentProvider !== managedProvider && currentProvider !== 'github'\) \{\s*continue;/);
+  // switch must leave it alone. No provider toggle rebinds any chat (the
+  // empty-chat rebind is gone).
+  assert.match(source, /async function rebindUnstartedOpenAIConversationModel\(/, 'the one rebind left changes a model, not a provider');
+  assert.doesNotMatch(source, /reconcileUnstartedConversationProviders|managedProvider = \[/);
 });
 
 test('the cloud services are built once and handed to the routes', () => {

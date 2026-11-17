@@ -7,6 +7,13 @@ import { isRelayShutdownQueued, relayShutdownGateReply } from '../services/relay
 import { buildClaudeCloudDelivery, isClaudeCloudProviderType } from '../services/claude-cloud-session-service.mjs';
 import { normalizeClaudeBilling } from '../services/claude-billing-switch-service.mjs';
 import {
+  copilotClaimRefusal,
+  copilotEnabledFromStmts,
+  copilotSwitchedOffNoteText,
+  isCopilotProviderType,
+} from '../services/copilot-settings-service.mjs';
+import { createFailQueueMessageFromDeps } from './messages-queue-failure.mjs';
+import {
   SESSION_WORKER_OWNER_LEASE_MS,
   addMsToIso,
   buildTerminalFailureTextForChat,
@@ -81,6 +88,12 @@ export function dequeuePendingMessage({
   // (the provider off, no key, the monthly cap): such a row is fenced too,
   // whatever the worker, and the caller fails it closed.
   claudeApiClaimCheck = null,
+  // () → null, or `{ code, error }` while Copilot is switched off: a Copilot
+  // row is then fenced (copilotSwitchFence) and handed to `onCopilotFence`,
+  // which fails it; never to `onBillingFence` and its billing swap. Absent,
+  // Copilot rows are not checked.
+  copilotClaimCheck = null,
+  onCopilotFence = null,
 } = {}) {
   const currentIso = String(nowIso || '').trim() || new Date().toISOString();
   const requesterSid = normalizeSessionWorkerId(requesterSessionId);
@@ -89,11 +102,14 @@ export function dequeuePendingMessage({
   if (!requesterSid) return null;
   const leaseExpiresAt = addMsToIso(currentIso, ownerLeaseMs);
   let fenced = null;
+  let copilotFenced = null;
   const dequeue = db.transaction(() => {
     const next = stmts.findPendingForWorker.get(currentIso, requesterSid);
     if (!next) return null;
     fenced = claudeBillingFence({ stmts, row: next, workerKind, claudeApiClaimCheck });
     if (fenced) return null;
+    copilotFenced = copilotSwitchFence({ stmts, row: next, copilotClaimCheck });
+    if (copilotFenced) return null;
     // Across plan mode, a row waits for the live turn instead of steering in.
     // The claim statement leaves such rows out (planBoundaryHoldSql); this is
     // the fail-closed backstop for one that does not.
@@ -118,7 +134,38 @@ export function dequeuePendingMessage({
   if (fenced && typeof onBillingFence === 'function') {
     try { onBillingFence({ ...fenced, requesterSessionId: requesterSid }); } catch {}
   }
+  if (copilotFenced && typeof onCopilotFence === 'function') {
+    try { onCopilotFence({ ...copilotFenced, requesterSessionId: requesterSid }); } catch {}
+  }
   return claimed;
+}
+
+/**
+ * Whether `row`, a Copilot chat's turn (provider `github` or none), must not
+ * be claimed because Copilot is switched off: null when it may, else
+ * `{ conversationId, messageId, reason: 'copilot-switched-off', refusal }`.
+ * Keyed on the chat's provider, never on the worker kind: OpenAI chats run
+ * in Copilot's worker and are not Copilot's. A check that throws lets the
+ * row run, as with the switch on.
+ */
+export function copilotSwitchFence({ stmts, row, copilotClaimCheck = null } = {}) {
+  if (!row || typeof copilotClaimCheck !== 'function') return null;
+  const runtime = stmts?.getRuntimeSessionByConversation?.get?.(row.conversation_id) || null;
+  if (!isCopilotProviderType(runtime?.provider_type)) return null;
+  let refusal = null;
+  try {
+    refusal = copilotClaimCheck() || null;
+  } catch (error) {
+    console.warn(`[copilot] Copilot claim check failed for ${String(row.id || '').slice(0, 8)}: ${error?.message || error} — the row runs`);
+    refusal = null;
+  }
+  if (!refusal) return null;
+  return {
+    conversationId: String(row.conversation_id || ''),
+    messageId: String(row.id || ''),
+    reason: 'copilot-switched-off',
+    refusal,
+  };
 }
 
 /**
@@ -197,6 +244,8 @@ export async function dequeuePendingMessageForWorkerLoop({
   workerKind = null,
   onBillingFence = null,
   claudeApiClaimCheck = null,
+  copilotClaimCheck = null,
+  onCopilotFence = null,
   // () → true while the replacement fence (services/worker-replacement.mjs)
   // is up for the requesting process. The caller asks it before calling; it
   // is asked again before every claim, since ensureWorker and a transient
@@ -288,6 +337,8 @@ export async function dequeuePendingMessageForWorkerLoop({
           billingFenced = fence;
           if (typeof onBillingFence === 'function') onBillingFence(fence);
         },
+        copilotClaimCheck,
+        onCopilotFence,
       });
       emitWorkerLoopTelemetry(telemetry, {
         event: message ? 'queue.dequeue.success' : 'queue.dequeue.empty',
@@ -301,13 +352,6 @@ export async function dequeuePendingMessageForWorkerLoop({
         pid: routingWithWorker ? (supervisor?.getWorkerState?.(requesterSid)?.pid || null) : null,
         queue: null,
       });
-      if (message) {
-        const dequeuedAtMs = Date.parse(currentIso);
-        const queuedAtMs = Date.parse(String(message?.timestamp || '').trim());
-        const queueWaitMs = Number.isFinite(dequeuedAtMs) && Number.isFinite(queuedAtMs)
-          ? Math.max(0, dequeuedAtMs - queuedAtMs)
-          : null;
-      }
       return {
         message,
         // The next row is of another billing than this worker: it waits for
@@ -511,6 +555,9 @@ export function registerMessagesWorkerClaimRoutes(app, deps, shared) {
     parseAttachments,
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
+    // Decides the Copilot switch once on a new database
+    // (copilot-settings-service.mjs); absent, an unset switch reads as on.
+    detectCopilotCli = null,
   } = deps;
   const {
     getCursorProviderSettings,
@@ -526,6 +573,34 @@ export function registerMessagesWorkerClaimRoutes(app, deps, shared) {
     emitSessionWorkerTelemetry,
     staleAttemptLog,
   } = shared;
+
+  // Copilot switched off: a Copilot row is failed at the claim with its note
+  // (the Copilot settings button), never claimed. Built on first use: the
+  // failure path needs the full route deps.
+  const copilotClaimCheck = () => (copilotEnabledFromStmts(stmts, { detectCli: detectCopilotCli }) ? null : copilotClaimRefusal());
+  let failQueueMessageForCopilot = null;
+  function failCopilotFencedRow(fence) {
+    const row = stmts.findQById?.get?.(fence?.messageId) || null;
+    if (!row || String(row.status || '') !== 'pending') return;
+    failQueueMessageForCopilot ||= createFailQueueMessageFromDeps(deps);
+    const failed = failQueueMessageForCopilot({
+      queueRow: row,
+      messageId: row.id,
+      conversationId: row.conversation_id,
+      relayMode: normalizeRelayMode(row.relay_mode) || DEFAULT_RELAY_MODE,
+      model: row.model || null,
+      responseText: copilotSwitchedOffNoteText(),
+      failureRecord: {
+        kind: 'copilot-switched-off',
+        error: 'copilot-switched-off',
+        code: 'COPILOT_SWITCHED_OFF',
+        stableCode: 'relay.copilot-switched-off',
+        failedAt: new Date().toISOString(),
+      },
+      markWorkerError: false,
+    });
+    if (failed !== null) console.log(`[${ts()}] COPILOT   ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id || '').slice(0, 8)} failed: Copilot is switched off`);
+  }
 
   // POST /api/queue-consumed — the Claude worker marks rows whose prompt the
   // CLI has taken when no response carries the mark (a turn the user stopped,
@@ -724,6 +799,8 @@ export function registerMessagesWorkerClaimRoutes(app, deps, shared) {
         workerKind: httpPendingWorkerKind(requesterSessionId),
         claudeApiClaimCheck,
         onBillingFence: onClaudeBillingFence,
+        copilotClaimCheck,
+        onCopilotFence: failCopilotFencedRow,
         // The fence check above, asked again before every claim.
         isReplacementFenced: () => workerReplacementFence?.isHeld?.(requesterSessionId, requester?.pid) === true,
         telemetry: (payload = {}) => {

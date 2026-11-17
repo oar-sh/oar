@@ -383,8 +383,15 @@ export function scrubSecrets(text, submittedCode = '') {
 // Known credential shapes. Each keeps its prefix so a reader still sees what
 // kind of value was there.
 const KNOWN_TOKEN_RULES = Object.freeze([
+  // OAR's own credentials (shared/relay-credentials.mjs): owner token,
+  // browser session, sign-in code, agent token, peer key, proof key.
+  [/\b(oar[oascpk]1_)[A-Za-z0-9_\-.]+/g, '$1[redacted]'],
+  // An OAR file capability (`fc1.<session>.<expiry>.<mac>`), also URL-encoded.
+  [/\bfc1(?:\.|%2E)[A-Za-z0-9_-]+(?:\.|%2E)[0-9a-z]+(?:\.|%2E)[A-Za-z0-9_-]+/gi, 'fc1.[redacted]'],
   // Anthropic, OpenAI and other `sk-` keys.
   [/\bsk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}/g, 'sk-[redacted]'],
+  // xAI keys.
+  [/\b(xai-)[A-Za-z0-9]{20,}/g, '$1[redacted]'],
   // GitHub tokens (classic and fine-grained).
   [/\b(gh[pousr]_)[A-Za-z0-9]{20,}/g, '$1[redacted]'],
   [/\b(github_pat_)[A-Za-z0-9_]{20,}/g, '$1[redacted]'],
@@ -402,13 +409,27 @@ const KNOWN_TOKEN_RULES = Object.freeze([
   [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, '$1[redacted]@'],
   // A Slack incoming webhook: the path is the credential.
   [/\b(hooks\.slack\.com\/services\/)[A-Za-z0-9_/-]+/g, '$1[redacted]'],
-  // Credentials in a query string: ?key=…, &sig=…, &token=…
-  [/([?&](?:key|api_?key|sig|signature|token|access_token|auth|password|secret)=)(?!\[redacted\])[^&\s#"'`]+/gi, '$1[redacted]'],
+  // Credentials in a query string or form body: ?key=…, &sig=…, &token=…,
+  // an OAuth ?code=… or &refresh_token=…
+  [/([?&](?:key|api_?key|sig|signature|token|access_token|refresh_token|id_token|client_secret|code|auth|password|secret)=)(?!\[redacted\])[^&\s#"'`]+/gi, '$1[redacted]'],
+  // OAuth fields elsewhere: JSON `"access_token": "…"`, `refresh_token: …`,
+  // `client_secret=…` (the `_` before `token` keeps the generic key: value
+  // rule below from seeing them).
+  [/\b((?:access|refresh|id)_token|client_secret)(["']?\s*[:=]\s*["']?)(?!\[redacted\]|(?:true|false|null|none|undefined)\b|\*+|\$)([^\s"',;&}]{4,})/gi, '$1$2[redacted]'],
+  // Set-Cookie as an array (util.inspect `'set-cookie': [ 'sid=…', … ]`,
+  // JSON `"set-cookie":["sid=…"]`), up to its closing bracket, across lines;
+  // one not closed within the text, to the end of its line.
+  [/\b((?:set-)?cookie["']?\s*:\s*)\[(?=[^\]]{0,4096}=)[^\]]{0,4096}\]/gi, '$1[redacted]'],
+  [/\b((?:set-)?cookie["']?\s*:\s*)\[(?=[^\]\r\n]*=)[^\]\r\n]*/gi, '$1[redacted]'],
+  // A Cookie or Set-Cookie header's value (name=value pairs), whole.
+  [/\b((?:set-)?cookie["']?\s*:\s*["']?)(?!\[redacted\])(?=[^\s;=]+=)[^\r\n"']+/gi, '$1[redacted]'],
   // An `Authorization:` header, any case (`AUTHORIZATION: basic …` in a git
   // http.extraheader), any scheme word (`token <hex>`, `Bot …`): the word
   // stays, the value goes. Bearer/Basic outside a header stay case-exact
   // above, so prose ("basic functionality") is left alone.
   [/\b(authorization["']?\s*[:=]\s*["']?(?:token|bot|digest|apikey|bearer|basic)\s+)(?!\[redacted\])[^\s"',;]+/gi, '$1[redacted]'],
+  // A JSON Web Token anywhere else (an OAuth access or id token).
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, 'eyJ[redacted]'],
   // curl -u / --user name:password, also attached (-ualice:pw). Only on a
   // curl line: `docker run -u node:node`, `ps -u alice:staff` are no secret.
   [/\b(curl\b[^\n|;&]*?\s(?:-u|--user)(?:\s+|=)?["']?[^\s:"']+:)(?!\[redacted\]|\$)[^\s"']+/g, '$1[redacted]'],
@@ -439,27 +460,424 @@ const GENERIC_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za
 // A PEM private key block, whole.
 const PEM_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
 
-function scrubPlain(text) {
-  let output = text.replace(PEM_PATTERN, '[redacted private key]');
-  for (const [pattern, replacement] of KNOWN_TOKEN_RULES) output = output.replace(pattern, replacement);
-  output = output
-    .replace(ENV_ASSIGNMENT_PATTERN, (_match, name, quote) => `${name}=${quote}${REDACTED}`)
-    .replace(KEY_VALUE_PATTERN, (_match, key, separator) => `${key}${separator}${REDACTED}`)
-    .replace(GENERIC_TOKEN_PATTERN, REDACTED);
-  return output;
+// `observe`, when given, is called after each rule that matched with its
+// matches, `{ at, text, output }` (`at` in the text that rule saw), and
+// whether the rule is one of a credential shape (KNOWN_TOKEN_RULES).
+function scrubPlain(text, observe = null) {
+  const replace = (input, pattern, replacement, shape = false) => {
+    const replaced = input.replace(pattern, replacement);
+    // A replace with a callback is slow even without a match: only a rule
+    // that changed the text is run again to see its matches.
+    if (!observe || replaced === input) return replaced;
+    const matches = [];
+    const output = input.replace(pattern, (...args) => {
+      const groups = args.length - 3;
+      let value = replacement;
+      if (typeof replacement === 'function') value = replacement(...args);
+      else if (replacement.includes('$')) {
+        value = replacement.replace(/\$([1-9])/g, (dollar, digit) => (Number(digit) <= groups ? args[digit] ?? '' : dollar));
+      }
+      matches.push({ at: args[groups + 1], text: args[0], output: value });
+      return value;
+    });
+    if (matches.length) observe(matches, shape);
+    return output;
+  };
+  let output = replace(text, PEM_PATTERN, '[redacted private key]');
+  for (const [pattern, replacement] of KNOWN_TOKEN_RULES) output = replace(output, pattern, replacement, true);
+  output = replace(output, ENV_ASSIGNMENT_PATTERN, (_match, name, quote) => `${name}=${quote}${REDACTED}`);
+  output = replace(output, KEY_VALUE_PATTERN, (_match, key, separator) => `${key}${separator}${REDACTED}`);
+  return replace(output, GENERIC_TOKEN_PATTERN, REDACTED);
+}
+
+// The scrub of `text` and what became of each of its characters, for
+// scrubTaskOutput: `source[k]` is the index in `text` of the output's
+// character k, -1 for one a replacement put in; `shown[i]` when character i
+// is in the output as itself; `known[i]` when a credential shape's rule
+// kept it beside its `[redacted]` as the credential's public part (`ghp_`,
+// `?token=`) and no later rule took it out as a value of its own; `found`,
+// the replacements whose text holds no `[redacted…]` marker, `{ from, to,
+// output, hidden }`: what they put in for the characters they took out
+// (`hidden`), which lie between `from` and `to`. With no match, `source`, `shown` and `known`
+// are null (and `found` is left empty when `collect` is false). Each rule
+// that matched costs one copy of the text's map.
+function traceScrub(text, collect = true) {
+  let source = null;
+  let known = null;
+  const found = [];
+  const output = scrubPlain(text, (matches, shape) => {
+    if (!source) {
+      source = new Int32Array(text.length);
+      for (let index = 0; index < text.length; index += 1) source[index] = index;
+      known = new Uint8Array(text.length);
+    }
+    let length = source.length;
+    for (const { text: match, output: value } of matches) length += value.length - match.length;
+    const next = new Int32Array(length);
+    let to = 0;
+    let cursor = 0;
+    const keep = (from, end) => {
+      next.set(source.subarray(from, end), to);
+      to += end - from;
+    };
+    const keepKnown = (from, end) => {
+      for (let index = from; index < end; index += 1) {
+        next[to] = source[index];
+        to += 1;
+        if (source[index] >= 0) known[source[index]] = 1;
+      }
+    };
+    for (const { at, text: match, output: value } of matches) {
+      let head = 0;
+      while (head < value.length && head < match.length && value[head] === match[head]) head += 1;
+      let tail = 0;
+      while (tail < value.length - head && tail < match.length - head
+        && value[value.length - 1 - tail] === match[match.length - 1 - tail]) tail += 1;
+      // A part kept as public stays so when a later rule only wraps the
+      // credential it is part of; one that takes it out as a fresh value
+      // makes it secret.
+      const fresh = !match.includes('[redacted');
+      if (fresh) {
+        for (let index = at + head; index < at + match.length - tail; index += 1) {
+          if (source[index] >= 0) known[source[index]] = 0;
+        }
+      }
+      if (collect && fresh) {
+        const hidden = [];
+        for (let index = at + head; index < at + match.length - tail; index += 1) {
+          if (source[index] >= 0) hidden.push(source[index]);
+        }
+        if (hidden.length) {
+          found.push({ from: hidden[0], to: hidden[hidden.length - 1] + 1, output: value.slice(head, value.length - tail), hidden });
+        }
+      }
+      const kept = shape ? keepKnown : keep;
+      keep(cursor, at);
+      kept(at, at + head);
+      next.fill(-1, to, to + value.length - head - tail);
+      to += value.length - head - tail;
+      kept(at + match.length - tail, at + match.length);
+      cursor = at + match.length;
+    }
+    keep(cursor, source.length);
+    source = next;
+  });
+  let shown = null;
+  if (source) {
+    shown = new Uint8Array(text.length);
+    for (const index of source) if (index >= 0) shown[index] = 1;
+  }
+  return { output, source, shown, known, found };
 }
 
 /**
- * Credentials out of a task's output: the known token shapes, secret-named
- * `KEY=value` and `key: value` pairs, Bearer/Basic values, URL passwords,
- * private keys, and long random-looking tokens. SGR codes are left alone
- * (the text between them is scrubbed), so colours survive.
+ * Credentials out of a task's output or a worker's log: the known token
+ * shapes (OAR's own among them), secret-named `KEY=value` and `key: value`
+ * pairs, OAuth fields and JWTs, Bearer/Basic values, cookies, URL passwords,
+ * private keys, and long random-looking tokens. Escape codes (SGR colours,
+ * every other CSI, OSC hyperlinks) are left in place and the text between
+ * them is scrubbed, so colours survive; an OSC's own text is scrubbed too. A
+ * credential a code breaks in two is found in the text without the codes: a
+ * line that would show a character of it becomes that text's scrub, with
+ * the line's codes moved to its end. Linear in the text's length.
  */
 export function scrubTaskOutput(text) {
   const value = String(text ?? '');
   if (!value) return value;
   if (!value.includes('\x1b')) return scrubPlain(value);
-  return value.split(/(\x1b\[[0-9;]*m)/).map((part, index) => (index % 2 === 1 ? part : scrubPlain(part))).join('');
+  const parts = value.split(ESCAPE_SPLIT_PATTERN);
+  const plain = parts.filter((_part, index) => index % 2 === 0).join('');
+  const whole = traceScrub(plain, false);
+  // How many of the first i characters without codes the whole scrub does
+  // not show; a piece in which it shows all needs no trace.
+  let hiddenBefore = null;
+  if (whole.shown) {
+    hiddenBefore = new Int32Array(plain.length + 1);
+    for (let at = 0; at < plain.length; at += 1) hiddenBefore[at + 1] = hiddenBefore[at] + 1 - whole.shown[at];
+  }
+  // Coloured output repeats its pieces (a check mark, a status word).
+  const scrubs = new Map();
+  const traces = new Map();
+  const pieces = [];
+  let offset = 0;
+  for (let index = 0; index < parts.length; index += 2) {
+    const part = parts[index];
+    const traced = hiddenBefore && hiddenBefore[offset + part.length] > hiddenBefore[offset];
+    const cache = traced ? traces : scrubs;
+    if (!cache.has(part)) cache.set(part, traced ? traceScrub(part) : { output: scrubPlain(part) });
+    const { output, shown, found } = cache.get(part);
+    pieces.push({ part, offset, output, shown, found, traced });
+    offset += part.length;
+  }
+  const coloured = parts.map((part, index) => (index % 2 === 1 ? scrubEscape(part) : pieces[index / 2].output)).join('');
+  if (whole.output === plain || whole.output === pieces.map((piece) => piece.output).join('')) return coloured;
+  return withCodesAtLineEnds(parts, pieces, whole, coloured);
+}
+
+// What scrubTaskOutput matches across and puts back: a CSI (colours, cursor
+// moves, erases), an OSC or another string control ended by BEL or ST (a
+// hyperlink), and any other escape (`ESC ( B`, `ESC 7`). None holds a line
+// break, and none can backtrack further than to the next ESC or line break.
+const ESCAPE_SPLIT_PATTERN = /(\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]PX^_][^\x07\x1b\n]*(?:\x07|\x1b\\)|\x1b[ -/]*[0-~])/;
+const STRING_CONTROL_PATTERN = /^\x1b[\]PX^_]/;
+
+// An OSC's (or other string control's) text is scrubbed like output: a
+// hyperlink's address can hold a credential. Other codes stay as they are.
+function scrubEscape(code) {
+  if (code.length <= 2 || !STRING_CONTROL_PATTERN.test(code)) return code;
+  const end = code.endsWith('\x07') ? code.length - 1 : code.length - 2;
+  return `${code.slice(0, 2)}${scrubPlain(code.slice(2, end))}${code.slice(end)}`;
+}
+
+// ESCAPE_SPLIT_PATTERN everywhere, and at one place for a scan from ESC to
+// ESC; both find the same codes.
+const ESCAPE_CODES = new RegExp(ESCAPE_SPLIT_PATTERN.source, 'g');
+const ESCAPE_CODE_AT = new RegExp(ESCAPE_SPLIT_PATTERN.source, 'y');
+
+// The last of the ascending `values` that is at most `target`, -1 for none.
+function lastAtMost(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (values[middle] <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low - 1;
+}
+
+/**
+ * `text` with the ranges of values `findRanges(value)` names (`[start, end)`
+ * pairs in `value`) replaced by `marker`, for a redaction by exact value
+ * (the worker log's, the worker posts'). The ranges are looked for in the
+ * text without the codes scrubTaskOutput matches across, so a code that cuts
+ * a value in two does not hide it, and in the text as it is, so a value
+ * inside a code (a hyperlink's address) or one a stray ESC runs into is found
+ * as before. Ranges that overlap become one; with `mergeTouching`, so do
+ * ranges that touch or have only codes between them. Each becomes `marker`
+ * followed by the codes that lay inside it, in their order, so the text
+ * after it keeps its colour; every other code stays where it is. A range in
+ * a string control's body (a hyperlink's address) is replaced there and the
+ * code stays whole; a code that a range of the text as it is runs into
+ * otherwise is dropped with it. Every code written is whole. What a terminal
+ * shows is then the text without codes with its ranges replaced. Linear in
+ * the text's length, besides the two calls of `findRanges`.
+ */
+export function replaceRangesAcrossEscapes(text, findRanges, { marker = '[redacted]', mergeTouching = false } = {}) {
+  const value = String(text ?? '');
+  const plain = value.replace(ESCAPE_CODES, '');
+  const plainRanges = plain.length < value.length ? findRanges(plain) : [];
+  const rawRanges = findRanges(value);
+  if (!plainRanges.length && !rawRanges.length) return value;
+  // Code k is `value.slice(codeStart[k], codeEnd[k])` and stands before
+  // character `codePlain[k]` of `plain`.
+  const codeStart = [];
+  const codeEnd = [];
+  const codePlain = [];
+  let removed = 0;
+  for (let at = value.indexOf('\x1b'); at !== -1; at = value.indexOf('\x1b', at + 1)) {
+    ESCAPE_CODE_AT.lastIndex = at;
+    if (!ESCAPE_CODE_AT.test(value)) continue;
+    const end = ESCAPE_CODE_AT.lastIndex;
+    codeStart.push(at);
+    codePlain.push(at - removed);
+    codeEnd.push(end);
+    removed += end - at;
+    at = end - 1;
+  }
+  // Where character `index` of `plain` is in `value`.
+  const rawAt = (index) => {
+    const code = lastAtMost(codePlain, index);
+    return code < 0 ? index : index + codeEnd[code] - codePlain[code];
+  };
+  // How many characters of `plain` lie before `value[at]`.
+  const plainBefore = (at) => {
+    const code = lastAtMost(codeStart, at - 1);
+    if (code < 0) return at;
+    return at < codeEnd[code] ? codePlain[code] : at - codeEnd[code] + codePlain[code];
+  };
+  // The body of string control `code` (an OSC's text) as `[from, to)`
+  // between its introducer and its BEL or ST; null for any other code.
+  const bodyOf = (code) => {
+    if (!'\x5dPX^_'.includes(value[codeStart[code] + 1])) return null;
+    const end = codeEnd[code];
+    return [codeStart[code] + 2, value.charCodeAt(end - 1) === 7 ? end - 1 : end - 2];
+  };
+  const spans = [];
+  for (const [start, end] of plainRanges) {
+    if (end > start) spans.push([rawAt(start), rawAt(end - 1) + 1]);
+  }
+  // A range of the text as it is that lies in a string control's body is
+  // replaced there, the code kept whole; one in the text between codes is a
+  // span like the others; one that runs into a code otherwise takes the
+  // codes it touches whole, and they are dropped. No span starts or ends
+  // inside a code.
+  const inBody = new Map();
+  let dropped = null;
+  for (const [start, end] of rawRanges) {
+    if (end <= start) continue;
+    const first = lastAtMost(codeStart, start);
+    const last = lastAtMost(codeStart, end - 1);
+    const startsIn = first >= 0 && start < codeEnd[first];
+    if (!startsIn && first === last) {
+      spans.push([start, end]);
+      continue;
+    }
+    if (startsIn && first === last) {
+      const body = bodyOf(first);
+      if (body && start >= body[0] && end <= body[1]) {
+        if (!inBody.has(first)) inBody.set(first, []);
+        inBody.get(first).push([start, end]);
+        continue;
+      }
+    }
+    dropped ||= new Uint8Array(codeStart.length);
+    for (let code = startsIn ? first : first + 1; code <= last; code += 1) dropped[code] = 1;
+    spans.push([startsIn ? codeStart[first] : start, Math.max(end, codeEnd[last])]);
+  }
+  const joins = (ranges, start) => start < ranges[ranges.length - 1][1]
+    || (mergeTouching && plainBefore(start) === plainBefore(ranges[ranges.length - 1][1]));
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged = [];
+  for (const [start, end] of spans) {
+    if (merged.length && joins(merged, start)) {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], end);
+      continue;
+    }
+    merged.push([start, end]);
+  }
+  // Code `code` as it is written: whole, its body's ranges replaced.
+  const codeText = (code) => {
+    const ranges = inBody.get(code);
+    if (!ranges) return value.slice(codeStart[code], codeEnd[code]);
+    ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+    const parts = [];
+    let at = codeStart[code];
+    let open = null;
+    for (const [start, end] of ranges) {
+      if (open && (start < open[1] || (mergeTouching && start === open[1]))) {
+        open[1] = Math.max(open[1], end);
+        continue;
+      }
+      if (open) {
+        parts.push(value.slice(at, open[0]), marker);
+        at = open[1];
+      }
+      open = [start, end];
+    }
+    parts.push(value.slice(at, open[0]), marker, value.slice(open[1], codeEnd[code]));
+    return parts.join('');
+  };
+  const output = [];
+  const bodyCodes = [...inBody.keys()].sort((a, b) => a - b);
+  let nextBody = 0;
+  let emitted = 0;
+  // `value` up to `end`, a code with a replaced body as codeText has it.
+  const emitTo = (end) => {
+    for (; nextBody < bodyCodes.length && codeStart[bodyCodes[nextBody]] < end; nextBody += 1) {
+      const code = bodyCodes[nextBody];
+      if (codeStart[code] < emitted) continue;
+      output.push(value.slice(emitted, codeStart[code]), codeText(code));
+      emitted = codeEnd[code];
+    }
+    output.push(value.slice(emitted, end));
+    emitted = end;
+  };
+  for (const [start, end] of merged) {
+    emitTo(start);
+    output.push(marker);
+    for (let code = lastAtMost(codeStart, start - 1) + 1; code < codeStart.length && codeStart[code] < end; code += 1) {
+      if (!dropped?.[code]) output.push(codeText(code));
+    }
+    emitted = end;
+  }
+  emitTo(value.length);
+  return output.join('');
+}
+
+// A line whose coloured scrub shows a character that the scrub of the whole
+// text without codes hides (other than a credential's public part, `ghp_`)
+// becomes that scrub's line, with what the coloured pieces' own scrubs hid
+// hidden as well, and the line's codes, in their order, at its end: its
+// text keeps the colour it starts in, and the lines after it start as they
+// did before. Every other line stays coloured. When a scrub joined lines (a
+// private key, a cookie list), the whole text goes that way.
+function withCodesAtLineEnds(parts, pieces, whole, coloured) {
+  const leaks = [false];
+  const codes = [''];
+  // The pieces' replacements that took out a character the whole scrub
+  // shows, at their place in the text without codes.
+  const extra = [];
+  parts.forEach((code, index) => {
+    if (index % 2 === 1) {
+      codes[codes.length - 1] += scrubEscape(code);
+      return;
+    }
+    const { part, offset, output, traced, shown, found } = pieces[index / 2];
+    if (!traced) {
+      // The whole scrub shows all of the piece: the piece shows nothing it
+      // hides, and what the piece's own scrub took out is extra.
+      if (output !== part) extra.push({ from: offset, to: offset + part.length, output });
+      for (let at = part.indexOf('\n'); at !== -1; at = part.indexOf('\n', at + 1)) {
+        leaks.push(false);
+        codes.push('');
+      }
+      return;
+    }
+    for (let at = 0; at < part.length; at += 1) {
+      if (part.charCodeAt(at) === 10) {
+        leaks.push(false);
+        codes.push('');
+      } else if ((!shown || shown[at]) && !whole.shown[offset + at] && !whole.known[offset + at]) {
+        leaks[leaks.length - 1] = true;
+      }
+    }
+    for (const { from, to, output: value, hidden } of found) {
+      if (hidden.some((at) => whole.shown[offset + at])) extra.push({ from: offset + from, to: offset + to, output: value });
+    }
+  });
+  if (!leaks.includes(true)) return coloured;
+  const hidden = withExtraHidden(whole, extra, whole.shown.length);
+  // Before a closing `\r`, which would make the line's visible text empty.
+  const append = (line, lineCodes) => (line.endsWith('\r') ? `${line.slice(0, -1)}${lineCodes}\r` : `${line}${lineCodes}`);
+  const hiddenLines = hidden.split('\n');
+  const colouredLines = coloured.split('\n');
+  if (hiddenLines.length !== leaks.length || colouredLines.length !== leaks.length) return append(hidden, codes.join(''));
+  return colouredLines.map((line, index) => (leaks[index] ? append(hiddenLines[index], codes[index]) : line)).join('\n');
+}
+
+// The whole scrub's output with each extra replacement made over its span
+// (the first of two that overlap wins). A `[redacted…]` the whole scrub put
+// inside such a span goes with it; every other marker stays as it is.
+function withExtraHidden(whole, extra, length) {
+  const owner = new Int32Array(length).fill(-1);
+  const kept = [];
+  for (const span of extra.sort((a, b) => a.from - b.from)) {
+    if (kept.length && span.from < kept[kept.length - 1].to) continue;
+    owner.fill(kept.length, span.from, span.to);
+    kept.push(span);
+  }
+  const { output, source } = whole;
+  const pieces = [];
+  let last = -1;
+  for (let at = 0; at < output.length; at += 1) {
+    const from = source[at];
+    if (from >= 0 && owner[from] >= 0) {
+      if (owner[from] !== last) pieces.push(kept[owner[from]].output);
+      last = owner[from];
+      continue;
+    }
+    if (from >= 0) {
+      last = -1;
+      pieces.push(output[at]);
+      continue;
+    }
+    let end = at;
+    while (end < output.length && source[end] < 0) end += 1;
+    if (last < 0 || end >= output.length || owner[source[end]] !== last) pieces.push(output.slice(at, end));
+    at = end - 1;
+  }
+  return pieces.join('');
 }
 
 /** What leaves the relay: control codes out (SGR kept), then credentials out. */

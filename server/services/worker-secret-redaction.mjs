@@ -30,6 +30,10 @@
 //   remote-relay activity line ends in `…”`). The last part of a key at the
 //   very start of a text goes as well: a task-output snapshot is the output's
 //   last 8 KiB and can begin halfway through a key.
+// - A key that escape codes (a colour, a cursor move, a hyperlink) cut in
+//   two goes as well, and so do its parts above when codes follow or precede
+//   them: the text is searched with its codes and without them, and the
+//   codes stay.
 // - Property names are rewritten like values (`{ "<key>": 1 }` becomes
 //   `{ "[redacted]": 1 }`), so a key cannot ride along as one.
 // - A key shorter than MIN_REDACTED_SECRET_LENGTH is left alone, so a
@@ -45,6 +49,7 @@
 // A provider registers its key by one entry in SAVED_PROVIDER_KEY_SETTINGS.
 
 import { DEEPSEEK_PROVIDER_TYPE } from '../../shared/deepseek-models.mjs';
+import { replaceRangesAcrossEscapes } from '../../shared/task-output-text.mjs';
 import { CLAUDE_API_KEY_SETTING_KEY, CLAUDE_API_PROVIDER_TYPE } from './claude-api-settings-service.mjs';
 import { DEEPSEEK_API_KEY_SETTING_KEY } from './deepseek-settings-service.mjs';
 
@@ -167,9 +172,18 @@ function replaceRanges(text, ranges) {
  * after an ellipsis it may begin with (pushKeySuffixRange). All are found in
  * the text as it came, of every secret, and replaced together, so where they
  * overlap the longest wins: a key that holds another saved key goes whole,
- * also when only a part of it is there.
+ * also when only a part of it is there. A text with escape codes is
+ * searched without them as well (replaceRangesAcrossEscapes), so a code that
+ * cuts a key, or follows a cut first part, does not keep it.
  */
 function redactString(text, secrets) {
+  const find = (value) => findSecretRanges(value, secrets);
+  if (text.includes('\u001b')) return replaceRangesAcrossEscapes(text, find, { marker: REDACTED_SECRET_TEXT, mergeTouching: true });
+  return replaceRanges(text, find(text));
+}
+
+/** The ranges redactString replaces in `text`, unsorted. */
+function findSecretRanges(text, secrets) {
   const ranges = [];
   const start = LEADING_ELLIPSIS.exec(text)[0].length;
   for (const secret of secrets) {
@@ -179,7 +193,7 @@ function redactString(text, secrets) {
     pushKeyPrefixRanges(text, secret, ranges);
     pushKeySuffixRange(text, start, secret, ranges);
   }
-  return replaceRanges(text, ranges);
+  return ranges;
 }
 
 /**

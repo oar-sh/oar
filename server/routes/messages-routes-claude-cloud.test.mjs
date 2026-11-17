@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
-import { buildDequeuedRelayMessage } from './messages-routes.mjs';
+import { buildDequeuedRelayMessage } from './messages-worker-claim-routes.mjs';
 import { makeRouteDeps, invokePost } from './messages-routes-test-harness.mjs';
 import { applySchema } from '../db-schema.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';

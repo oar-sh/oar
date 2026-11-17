@@ -3,7 +3,7 @@
 // One page of a conversation's history, selected in SQL.
 //
 // The history route used to load every message, hydrate every reply and only
-// then cut the page out (selectConversationHistoryPage in sessions-routes.mjs),
+// then cut the page out (selectConversationHistoryPage, now in sessions-helpers.mjs),
 // so each page and each live poll paid for the whole conversation. This module
 // selects the page's rows in SQL with the same cursor rules and the same
 // pageInfo, so only the page is hydrated.

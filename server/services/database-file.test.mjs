@@ -455,6 +455,7 @@ test('the start-up allowlist is the keys and tables a real start writes, and not
     'auth_owner_token_last_use',
     'claude_api_model_state',
     'claude_model_state',
+    'copilot_enabled',
     'copilot_model_state',
     'cursor_model_state',
     'deepseek_model_state',

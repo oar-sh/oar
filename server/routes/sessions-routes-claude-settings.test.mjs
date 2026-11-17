@@ -4,16 +4,20 @@ import assert from 'node:assert/strict';
 import {
   buildModelCatalogWithClaudeProvider,
   buildModelCatalogWithOpenAIProvider,
+} from './sessions-routes.mjs';
+import {
   parseClaudeSettingsUpdateRequest,
-  buildConversationMessages,
   claudeAttributionSettingsFields,
+} from './settings-routes.mjs';
+import { buildConversationMessages } from './sessions-helpers.mjs';
+import {
   parseWorkspaceRootAttributionUpdate,
   buildWorkspaceRootAttributionPayload,
-} from './sessions-routes.mjs';
+} from './conversation-read-routes.mjs';
 import { claudeBackgroundCommandLimitSettingsFields } from '../../shared/claude-background-command-limit.mjs';
 
 test('the provider parsers pass the Select Models switch on', async () => {
-  const { parseCursorSettingsUpdateRequest, parseGrokSettingsUpdateRequest } = await import('./sessions-routes.mjs');
+  const { parseCursorSettingsUpdateRequest, parseGrokSettingsUpdateRequest } = await import('./settings-routes.mjs');
   assert.deepEqual(parseClaudeSettingsUpdateRequest({ autoEnableNew: false }), { ok: true, autoEnableNew: false });
   assert.deepEqual(parseGrokSettingsUpdateRequest({ enabledModels: [], autoEnableNew: true }), { ok: true, enabledModels: [], autoEnableNew: true });
   assert.equal(parseCursorSettingsUpdateRequest({ autoEnableNew: true }).autoEnableNew, true);

@@ -26,6 +26,8 @@ export const PLAN_BOUNDARY_QUEUE_TITLE = 'Queued behind the running turn: plan m
 // hold reasons mapped to a human title. Stopping a turn lives on the message
 // bubbles, never here, so every state below is a Send/Steer/Queue shape.
 export const SETUP_REQUIRED_TEXT = 'Set up a provider to start chatting';
+export const NEW_CHAT_FIRST_TEXT = 'Start a chat with + New Chat: it asks for the provider and the model.';
+export const COPILOT_SWITCHED_OFF_TEXT = 'Copilot is switched off on this relay. Switch it on in Settings → Providers → Copilot to continue this chat.';
 
 const STEERING_HOLD_TITLES = Object.freeze({
   question: 'Will steer in after you answer the question',
@@ -60,10 +62,34 @@ export function deriveComposerControlState({
   // live list; sending would start it again behind the user's back.
   archived = false,
   // No conversation open and no provider known to be ready (a fresh install):
-  // a send here would create a Copilot chat that cannot run. The composer is
-  // locked, with a placeholder that says what to do, until readiness flips.
+  // a send here would create a chat that cannot run. The composer is locked,
+  // with a placeholder that says what to do, until readiness flips. The lock
+  // reason (provider-readiness.mjs composerLockReason) can also be
+  // 'copilot-off': a Copilot chat while Copilot is switched off, whose send
+  // the relay refuses. The button then opens Copilot's settings instead. Or
+  // 'new-chat': no chat open while Copilot is off; the button opens New Chat.
   setupRequired = false,
 } = {}) {
+  if (setupRequired === 'new-chat') {
+    return {
+      action: 'open-new-chat',
+      label: 'New chat',
+      title: NEW_CHAT_FIRST_TEXT,
+      disabled: false,
+      composerDisabled: true,
+      placeholder: NEW_CHAT_FIRST_TEXT,
+    };
+  }
+  if (setupRequired === 'copilot-off') {
+    return {
+      action: 'open-copilot-settings',
+      label: 'Copilot settings',
+      title: COPILOT_SWITCHED_OFF_TEXT,
+      disabled: false,
+      composerDisabled: true,
+      placeholder: COPILOT_SWITCHED_OFF_TEXT,
+    };
+  }
   if (setupRequired) {
     return {
       action: 'send',

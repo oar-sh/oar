@@ -680,7 +680,7 @@ test('tasks no stop reaches are named: not stoppable, or a worker without a sock
 // text before "Error code:") is within FAILURE_NOTE_LEAD_MAX, so the
 // transcript's buttons and the failure-note readers find its code.
 test('the stop note keeps its lead within the failure-note limit: 5 stopped and 5 unreached tasks with long labels', async () => {
-  const { buildClaudeApiStopNoteText } = await import('./messages-routes.mjs');
+  const { buildClaudeApiStopNoteText } = await import('./messages-worker-output-routes.mjs');
   const { FAILURE_NOTE_LEAD_MAX, matchFailureNote, isFailureNoteText } = await import('../../shared/failure-note-text.mjs');
   const { relayErrorCodeFromText } = await import('../public/app/relay-error-ctas.mjs');
   const long = (prefix, index) => ({ label: `${prefix} ${index} ${'watch the deploy log and report each new line '.repeat(2)}`.slice(0, 80) });
@@ -723,10 +723,21 @@ test('the stop note keeps its lead within the failure-note limit: 5 stopped and 
 });
 
 test('the way out a Claude API note names follows the refusal: the cap, switched off, or no key', async () => {
-  const { claudeApiRemedyText } = await import('./messages-routes.mjs');
+  const { claudeApiRemedyText } = await import('./messages-worker-output-routes.mjs');
   assert.equal(claudeApiRemedyText({ code: 'CLAUDE_API_CAP_REACHED' }), 'Switch this chat to the subscription, or raise the monthly cap in Settings → Providers → Claude API');
   assert.equal(claudeApiRemedyText({ code: 'CLAUDE_API_NOT_CONFIGURED', switchedOff: true }), 'Switch this chat to the subscription, or switch Claude API on in Settings → Providers → Claude API');
   assert.equal(claudeApiRemedyText({ code: 'CLAUDE_API_NOT_CONFIGURED' }), 'Switch this chat to the subscription, or set Claude API up in Settings → Providers → Claude API');
+});
+
+test('messages-routes.mjs exports its register function, not the worker modules\' helpers', async () => {
+  const routes = await import('./messages-routes.mjs');
+  assert.equal(typeof routes.registerMessagesRoutes, 'function');
+  for (const name of ['buildDequeuedRelayMessage', 'dequeuePendingMessageForWorkerLoop', 'claudeApiRemedyText']) {
+    assert.equal(name in routes, false, `${name} is imported from its own module`);
+  }
+  const claim = await import('./messages-worker-claim-routes.mjs');
+  assert.equal(typeof claim.buildDequeuedRelayMessage, 'function');
+  assert.equal(typeof claim.dequeuePendingMessageForWorkerLoop, 'function');
 });
 
 test('a plan-only chat: an agent\'s billing switch with a message that names another mode is refused before the switch', async () => {

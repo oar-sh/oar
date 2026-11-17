@@ -11,6 +11,7 @@ import { useStrictStrikethrough } from './markdown-strikethrough.mjs';
 import { parseGroupFoldChoices, pruneGroupFoldChoices } from './conversation-group-state.mjs';
 import { isPhoneLandscapeLayout, shouldCollapseListAfterPick, syncPhoneLandscapeAttribute } from './phone-landscape.mjs';
 import { FONT_SCALE_CHANGE_EVENT } from './font-scaling.js';
+import { providerSessionLabel, resolveConversationProviderType } from './conversation-provider-indicator.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -220,11 +221,27 @@ export function generateId() {
   });
 }
 
+// Views that show one conversation's data and must go when another is
+// opened (or none); called after every change of currentConvId.
+const currentConvListeners = new Set();
+
+/** `listener(id, previousId)` after the open conversation changed; returns the unsubscribe. */
+export function onCurrentConvChange(listener) {
+  if (typeof listener !== 'function') return () => {};
+  currentConvListeners.add(listener);
+  return () => currentConvListeners.delete(listener);
+}
+
 export function setCurrentConv(id) {
+  const previous = currentConvId;
   currentConvId = id;
   if (id) localStorage.setItem('copilot_last_conv', id);
   else localStorage.removeItem('copilot_last_conv');
   updateCompactButton();
+  if (previous === id) return;
+  for (const listener of [...currentConvListeners]) {
+    try { listener(id, previous); } catch {}
+  }
 }
 
 /**
@@ -801,7 +818,8 @@ export function updateSessionPill(conversation, runtimeSession) {
   ).trim();
   if (!sdkSessionId) {
     if (title) {
-      delete title.dataset.copilotSessionId;
+      delete title.dataset.sdkSessionId;
+      delete title.dataset.sdkSessionProvider;
       title.title = '';
     }
     if (usageLine) {
@@ -811,8 +829,11 @@ export function updateSessionPill(conversation, runtimeSession) {
     return;
   }
   if (title) {
-    title.dataset.copilotSessionId = sdkSessionId;
-    title.title = `Copilot session ${sdkSessionId} (click to copy)`;
+    const providerType = resolveConversationProviderType(conversation);
+    title.dataset.sdkSessionId = sdkSessionId;
+    // The copy toast names the same provider.
+    title.dataset.sdkSessionProvider = providerType;
+    title.title = `${providerSessionLabel(providerType)} ${sdkSessionId} (click to copy)`;
   }
 
   const usageSummary = runtimeSession?.sessionUsageSummary

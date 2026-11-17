@@ -17,7 +17,7 @@ test('with no provider ready the screen points to Settings → Providers, whatev
       assert.equal(state.heading, SETUP_HEADING);
       assert.equal(state.text, SETUP_TEXT);
       assert.match(state.text, /Settings → Providers/);
-      assert.match(state.text, /Copilot CLI/);
+      assert.match(state.text, /Copilot, Claude/, 'every provider named, none assumed set up');
       assert.deepEqual(ids(state), ['empty-state-open-settings', 'empty-state-new-chat']);
       assert.deepEqual(primaryIds(state), ['empty-state-open-settings']);
       assert.equal(state.actions[0].action, 'open-settings');

@@ -39,7 +39,7 @@ import { getSessionProof } from './session-proof.mjs';
 import { capFinishedActivityEntries, capLiveActivityEntries, normalizeTurnSeq } from './activity-replay-state.mjs';
 import { liveActivityCap } from './live-activity-cap.mjs';
 import { publishStatusEvent, recordStatusEvent } from './status-store.mjs';
-import { clearOpenConversation, renderConvList, refreshConversations, scheduleLoadedConversationsRefresh, applyConversationGroupEvent, openConversation } from './journal-view.js';
+import { clearOpenConversation, renderConvList, refreshConversations, scheduleLoadedConversationsRefresh, applyConversationGroupEvent, openConversation, isArchivedConversationsView } from './journal-view.js';
 import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
 import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
 import { applyRelaySchedules, loadRelaySchedules } from './relay-schedules-ui.js';
@@ -53,6 +53,7 @@ import {
 import { upsertRelayBoard, loadRelayBoards, renderRelayBoards } from './relay-board-view.js';
 import { setConversationBackgroundTasks, setConversationTaskHealth } from './background-tasks-view.mjs';
 import { handleTaskConsoleReconnect, handleTaskOutputChunk } from './task-console.mjs';
+import { handleWorkerLogChunk, handleWorkerLogReconnect } from './worker-log-view.mjs';
 import { setConversationPins } from './pinned-messages-view.mjs';
 import { noteQuestionAskUpdated, refreshQuestions } from './questions-panel-ui.js';
 import { setConversationHiddenMessages } from './hidden-messages-view.mjs';
@@ -70,6 +71,7 @@ import { applyClaudeCloudSettingsState, refreshClaudeCloudSettingsState } from '
 import { applyClaudeCloudSessionEvent } from './claude-cloud-conversation-ui.js';
 import { updateProviderReadinessInputs } from './provider-readiness.mjs';
 import { applyCliInstallState } from './cli-install-ui.js';
+import { applyCopilotSettingsState, refreshCopilotSettingsState } from './copilot-settings-ui.js';
 import { applyAgentSdkState } from './agent-sdk-ui.js';
 import { renderUpdateSection } from './update-ui.js';
 import { applyHostSuspendState, applyRelayShutdownState } from './host-suspend-ui.js';
@@ -400,10 +402,15 @@ export async function connectSocket(overrideDeps) {
     scheduleLoadedConversationsRefresh();
     refreshSessionWorkerStatus().catch(() => {});
     refreshModelCatalog().catch(() => {});
+    // The Copilot switch, which also feeds provider readiness; a change made
+    // while away is caught here.
+    void refreshCopilotSettingsState();
     // An open sub-agent viewer fetches whatever it missed while away.
     handleSubagentViewerReconnect();
     // An open task console watches again and reads what it missed.
     void handleTaskConsoleReconnect();
+    // So does an open worker log.
+    void handleWorkerLogReconnect();
     // Subscriptions that changed while away.
     void loadRelayEventSubscriptions();
     // Schedules that changed or fired while away.
@@ -485,11 +492,6 @@ export async function connectSocket(overrideDeps) {
   socket.on('openai_settings_updated', (payload) => {
     const state = deps?.applyOpenAISettingsState?.(payload || {});
     updateProviderReadinessInputs({ openai: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   // Today's OpenAI image spend after every booking and every change of the
   // cap or the override (the banner, Settings, Check Usage), and the image
@@ -503,11 +505,6 @@ export async function connectSocket(overrideDeps) {
   socket.on('claude_settings_updated', (payload) => {
     const state = deps?.applyClaudeSettingsState?.(payload || {});
     updateProviderReadinessInputs({ claude: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   // Login/logout transitions on the relay host. Broadcast to every client so a
   // login started on the desktop can be finished on a phone (and vice versa).
@@ -575,43 +572,27 @@ export async function connectSocket(overrideDeps) {
   socket.on('claude_cloud_session', (payload) => {
     if (applyClaudeCloudSessionEvent(payload || null)) deps?.syncChatTitleControls?.();
   });
+  // The Copilot switch changed (Settings → Providers → Copilot).
+  socket.on('copilot_settings_updated', (payload) => {
+    applyCopilotSettingsState(payload || {});
+  });
   socket.on('grok_settings_updated', (payload) => {
     const state = deps?.applyGrokSettingsState?.(payload || {});
     updateProviderReadinessInputs({ grok: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   socket.on('deepseek_settings_updated', (payload) => {
     const state = deps?.applyDeepSeekSettingsState?.(payload || {});
     updateProviderReadinessInputs({ deepseek: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   // The Claude API tab saved (a key, the switch, the cap): the tab, New
   // Chat's readiness and the composer's billing toggle follow.
   socket.on('claude_api_settings_updated', (payload) => {
     const state = deps?.applyClaudeApiSettingsState?.(payload || {});
     updateProviderReadinessInputs({ claudeApi: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   socket.on('cursor_settings_updated', (payload) => {
     const state = deps?.applyCursorSettingsState?.(payload || {});
     updateProviderReadinessInputs({ cursor: state || payload || null });
-    if (Number(payload?.reconciliation?.updatedUnstartedConversations || 0) > 0) {
-      void Promise.resolve()
-        .then(() => deps?.refreshCurrentView?.())
-        .catch(() => {});
-    }
   });
   socket.on('shared_access', (event) => {
     publishStatusEvent(event);
@@ -792,6 +773,10 @@ export async function connectSocket(overrideDeps) {
   // this page's console watches that task.
   socket.on('task_output_chunk', (payload) => {
     handleTaskOutputChunk(payload);
+  });
+  // New bytes of the worker log the view shows, sent only while it watches.
+  socket.on('worker_log_chunk', (payload) => {
+    handleWorkerLogChunk(payload);
   });
   // A message was pinned or unpinned (any client): the conversation's whole
   // pin list, replacing what this page had.
@@ -1108,6 +1093,10 @@ export async function connectSocket(overrideDeps) {
       syncChatTitleControls();
       syncComposerButtonState();
     }
+    // A chat this page has not loaded (archived before it opened) is back:
+    // another tab unarchived it, or an agent's send did. Its row comes with
+    // the loaded pages fetched again, where its new updated_at puts it first.
+    if (!conversation && archived === false && !isArchivedConversationsView()) scheduleLoadedConversationsRefresh();
   });
   socket.on('conversation_deleted', ({ conversationId }) => {
     delete conversations[conversationId];

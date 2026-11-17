@@ -53,6 +53,44 @@ export const QUEUE_ROW_BOUND_SESSION_SQL = `COALESCE(
  */
 export const QUEUE_ROW_SESSION_SQL = `COALESCE(${QUEUE_ROW_BOUND_SESSION_SQL}, q.conversation_id)`;
 
+/**
+ * A queue row whose conversation is not archived. The claim
+ * (findPendingForWorker) and the waker (listPendingWorkerOwnerSessionIds)
+ * both must read it, so they never disagree: a row of an archived
+ * conversation is neither woken nor claimed until the conversation is
+ * unarchived. Nor does such a pending row hold off host suspend
+ * (listActiveQueueCountsByConversation). None is stranded by a send: every queue write into an archived
+ * conversation unarchives it (queue-insert.mjs). A row whose conversation row
+ * is missing passes, as before. Needs the alias c (its conversation).
+ */
+export const QUEUE_ROW_NOT_ARCHIVED_SQL = 'COALESCE(c.archived, 0) = 0';
+
+/**
+ * The clause that leaves out a turn paused at the Claude usage limit
+ * (usage-limit-pause-service) while its hold lasts: a pending follow-up held
+ * until the reset. The waker, the queue counts and the unarchive's wake
+ * (conversation-lifecycle-routes) all read it, so they never disagree. An
+ * empty clause when the queue has no usage_limit_pause column (hasColumn).
+ */
+export function notHeldForUsageLimit(alias = '', hasColumn = true) {
+    return hasColumn
+        ? `AND NOT (${alias}usage_limit_pause IS NOT NULL AND ${alias}status = 'pending' AND ${alias}next_attempt_at IS NOT NULL AND ${alias}next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
+        : '';
+}
+
+/**
+ * What a row's terminal failure ends with it, called inside the failure's
+ * transaction once the row is failed: every pending question card of the
+ * row (any attempt's) is cancelled, and every pending Stop of it settled as
+ * failed, since no worker takes the row again. Needs the question
+ * repository's statements in `stmts`. Returns the cancelled cards' ids, for
+ * the caller to announce after the commit.
+ */
+export function settleFailedRowControlsAndCards(stmts, rowId, at) {
+    stmts.settleAbortControlsForFailedRow.run(at, at, rowId);
+    return stmts.cancelPendingQuestionsForRow.all(at, rowId).map((question) => question.id);
+}
+
 export function createMessageRepository(db) {
     const shareVisibility = createShareVisibilityStatements(db);
     const messagePins = createMessagePinStatements(db);
@@ -65,9 +103,6 @@ export function createMessageRepository(db) {
         .some((column) => column.name === 'usage_limit_pause');
     const queueHasProvider = db.prepare(`PRAGMA table_info(queue)`).all()
         .some((column) => column.name === 'provider');
-    const notHeldForUsageLimit = (alias = '') => (queueHasUsageLimitPause
-        ? `AND NOT (${alias}usage_limit_pause IS NOT NULL AND ${alias}status = 'pending' AND ${alias}next_attempt_at IS NOT NULL AND ${alias}next_attempt_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
-        : '');
     // When a processing row is due for the stale sweep; one rule for the
     // listings and the requeue, so the UPDATE can never take a row the
     // listing did not. Inactivity is measured from the last heartbeat, the
@@ -248,6 +283,7 @@ export function createMessageRepository(db) {
             -- Only the requesting session's own rows: a row is never handed to
             -- the worker of another session, whatever its provider.
             AND ${QUEUE_ROW_SESSION_SQL} = ?
+            AND ${QUEUE_ROW_NOT_ARCHIVED_SQL}
             AND ${planBoundaryHoldSql('q')}
           ORDER BY
             q.timestamp ASC,
@@ -256,7 +292,7 @@ export function createMessageRepository(db) {
         `),
         // The sessions with pending rows, for the waker to launch. A row of a
         // conversation that is gone (no row, or deleted and about to be
-        // removed with its queue) launches nothing.
+        // removed with its queue) or archived launches nothing.
         listPendingWorkerOwnerSessionIds: db.prepare(`
           SELECT ${QUEUE_ROW_SESSION_SQL} AS sdk_session_id
           FROM queue q
@@ -265,9 +301,10 @@ export function createMessageRepository(db) {
           LEFT JOIN conversations c
             ON c.id = q.conversation_id
           WHERE q.status = 'pending'
-            ${notHeldForUsageLimit('q.')}
+            ${notHeldForUsageLimit('q.', queueHasUsageLimitPause)}
             AND c.id IS NOT NULL
             AND c.status != 'deleted'
+            AND ${QUEUE_ROW_NOT_ARCHIVED_SQL}
           GROUP BY ${QUEUE_ROW_SESSION_SQL}
           ORDER BY MIN(q.timestamp) ASC
           LIMIT ?
@@ -314,6 +351,20 @@ export function createMessageRepository(db) {
             AND q.timestamp < ?
           ORDER BY q.timestamp ASC, q.rowid ASC
         `),
+        // A session's waiting rows the worker would claim (not the
+        // continuations it starts itself): failed in one go when its
+        // provider cannot run a turn (the Copilot switch off).
+        listPendingRowsForSession: db.prepare(`
+          SELECT q.id
+          FROM queue q
+          LEFT JOIN runtime_sessions rs
+            ON rs.id = q.runtime_session_id
+          LEFT JOIN conversations c
+            ON c.id = q.conversation_id
+          WHERE q.status = 'pending'
+            AND ${QUEUE_ROW_SESSION_SQL} = ?
+            AND COALESCE(q.kind, '') != 'continuation'
+        `),
         // A session's pending rows on the Claude API key (a row's stamp, else
         // the billing bound with the second parameter): failed closed instead
         // of a launch while Claude API cannot run a turn
@@ -331,7 +382,18 @@ export function createMessageRepository(db) {
             AND COALESCE(q.kind, '') != 'continuation'
             AND LOWER(COALESCE(${queueHasProvider ? 'q.provider' : 'NULL'}, ?)) = 'claude-api'
         `),
-        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') ${notHeldForUsageLimit()} GROUP BY status`),
+        // A pending row of an archived chat is neither claimed nor woken
+        // (QUEUE_ROW_NOT_ARCHIVED_SQL), so it is not queued work; a processing
+        // or parked one still counts.
+        countStatus:    db.prepare(`SELECT status, COUNT(*) as cnt FROM queue WHERE status IN ('pending','processing','parked') ${notHeldForUsageLimit('', queueHasUsageLimitPause)} AND NOT (status = 'pending' AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = queue.conversation_id AND c.archived = 1)) GROUP BY status`),
+        // A failed row's Stops (settleFailedRowControlsAndCards).
+        settleAbortControlsForFailedRow: db.prepare(`
+          UPDATE relay_control_requests
+          SET status = 'failed', error = 'queue-failed', updated_at = ?, completed_at = ?
+          WHERE queue_message_id = ?
+            AND type IN ('abort_turn', 'abort_subagent')
+            AND status IN ('pending', 'processing')
+        `),
         // Stale recovery has nothing to look at while no row is processing.
         hasProcessingRow: db.prepare(`SELECT 1 AS present FROM queue WHERE status = 'processing' LIMIT 1`),
         // The earliest future retry time of a pending row (a backoff, a
@@ -342,11 +404,14 @@ export function createMessageRepository(db) {
           WHERE status = 'pending' AND next_attempt_at IS NOT NULL
             AND next_attempt_at > ? AND next_attempt_at < '9999'
         `),
-        // Deferred host suspend: which conversations still hold live turns.
+        // Deferred host suspend: which conversations still hold live turns. A
+        // pending row of an archived chat is no turn to wait for: nothing
+        // claims it until the chat is unarchived. A processing one still
+        // counts, as a live worker may be running it.
         listActiveQueueCountsByConversation: db.prepare(`
           SELECT q.conversation_id, COUNT(*) AS cnt, MAX(c.title) AS title
           FROM queue q LEFT JOIN conversations c ON c.id = q.conversation_id
-          WHERE q.status IN ('pending','processing','parked')
+          WHERE (q.status IN ('processing','parked') OR (q.status = 'pending' AND ${QUEUE_ROW_NOT_ARCHIVED_SQL}))
           GROUP BY q.conversation_id
         `),
         countRuntimeSessions: db.prepare(`SELECT COUNT(*) AS cnt FROM runtime_sessions WHERE status = 'active'`),

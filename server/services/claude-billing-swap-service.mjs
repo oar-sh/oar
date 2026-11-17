@@ -7,8 +7,8 @@
  * CLI on the host's subscription login, `claude-api` on the saved API key
  * (which reaches only that kind's launch). After a switch, the chat's next
  * row is of the other billing, and the delivery refuses it to the worker it
- * has (claudeBillingFence, messages-routes.mjs). This service then replaces
- * that worker, between turns:
+ * has (claudeBillingFence, messages-worker-claim-routes.mjs). This service
+ * then replaces that worker, between turns:
  *
  * - it waits while the session owns a turn the relay handed out (a
  *   `processing` row: running, delivered and not yet started, a cold spawn

@@ -836,6 +836,8 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     // for another provider live), the time it was really read.
     copilotCapturedAt = null,
     copilotBilling = null,
+    // The Copilot switch: no Copilot card while it is off, as for Grok.
+    copilotConfigured = true,
     claudeConfigured = true,
     // Live account usage (claude-account-usage-service.mjs), or null: it is
     // only ever read while Claude Cloud is switched on.
@@ -883,14 +885,16 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     const copilotWorkerSnapshot = readSnapshot('copilot-sdk');
 
     const providers = [
-      buildCopilotPlanCard({
-        summary: copilotSummary,
-        billing: copilotBilling,
-        workerUsage: copilotWorkerSnapshot?.payload || null,
-        error: copilotError,
-        capturedAt: copilotCapturedAt || generatedAt,
-        stale: copilotStale === true,
-      }),
+      copilotConfigured !== false
+        ? buildCopilotPlanCard({
+          summary: copilotSummary,
+          billing: copilotBilling,
+          workerUsage: copilotWorkerSnapshot?.payload || null,
+          error: copilotError,
+          capturedAt: copilotCapturedAt || generatedAt,
+          stale: copilotStale === true,
+        })
+        : null,
       buildClaudePlanCard({
         usage: claudeSnapshot?.payload || null,
         capturedAt: claudeSnapshot?.capturedAt || null,

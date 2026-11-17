@@ -10,6 +10,7 @@ import {
   isConversationUsingGrokProvider,
   isConversationUsingOpenAIProvider,
   isOpenAIImageModelId,
+  providerSessionLabel,
   questionCardHeadLabel,
   resolveConversationProviderType,
   sessionLockNoteText,
@@ -204,4 +205,12 @@ test('every pill and lock-note key has its colour in light and dark', async () =
   assert.equal(declared.length, 2);
   assert.match(html, /\.conv-provider-indicator\[data-provider="claude-api"\] \{ color: var\(--provider-claude-api\); \}/);
   assert.match(html, /#model-lock-note\[data-provider="claude-api"\] \{ color: var\(--provider-claude-api\); \}/);
+});
+
+test('the session label names the provider, and an unknown one none', () => {
+  assert.equal(providerSessionLabel('claude'), 'Claude session');
+  assert.equal(providerSessionLabel(' GitHub '), 'Copilot session');
+  assert.equal(providerSessionLabel('claude-cloud'), 'Claude Cloud session');
+  assert.equal(providerSessionLabel(''), 'Session');
+  assert.equal(providerSessionLabel('something-new'), 'Session');
 });

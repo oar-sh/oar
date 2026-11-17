@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildModelVariantCatalogPayload, buildReasoningByModelFromVariantRows } from './sessions-routes.mjs';
+import { buildModelVariantCatalogPayload, buildReasoningByModelFromVariantRows } from './model-routes.mjs';
 
 test('buildModelVariantCatalogPayload keeps enabled unavailable variants and warning metadata', () => {
   const payload = buildModelVariantCatalogPayload({

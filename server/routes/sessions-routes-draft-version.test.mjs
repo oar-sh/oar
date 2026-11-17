@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { hasConversationDraftVersionConflict, normalizeOptionalIsoTimestamp } from './sessions-routes.mjs';
+import { hasConversationDraftVersionConflict, normalizeOptionalIsoTimestamp } from './conversation-settings-routes.mjs';
 
 test('normalizeOptionalIsoTimestamp normalizes valid ISO values', () => {
   const normalized = normalizeOptionalIsoTimestamp('2026-06-20T10:11:12.123Z');

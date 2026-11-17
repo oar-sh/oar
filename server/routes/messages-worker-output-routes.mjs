@@ -1008,9 +1008,6 @@ export function registerMessagesWorkerOutputRoutes(app, deps, shared) {
       return res.json({ ok: true, terminal: true, code: terminalFailure.stableCode });
     }
 
-    const holdCutoff = new Date(Date.now() - relayQuestionFinalizationHoldMs).toISOString();
-    const hasPendingQuestion = !!stmts.findPendingQuestionByMessage?.get(messageId);
-    const hasRecentlyAnsweredQuestion = !!stmts.findRecentlyAnsweredQuestionByMessage?.get(messageId, holdCutoff);
     const conversation = stmts.getConvAnyStatus?.get?.(targetConversationId) || null;
     let resolvedText = await resolveRelayResponseText({
       text: trimmedText,
@@ -1255,18 +1252,6 @@ export function registerMessagesWorkerOutputRoutes(app, deps, shared) {
       }
       return res.json({ ok: true, ignored: 'not_pending_or_processing', actualStatus: currentStatus });
     }
-    const queuedAtMs = Date.parse(String(q?.timestamp || '').trim());
-    const processingAtMs = Date.parse(String(q?.processing_at || '').trim());
-    const finalizedAtMs = Date.parse(now);
-    const queueToDoneMs = Number.isFinite(queuedAtMs) && Number.isFinite(finalizedAtMs)
-      ? Math.max(0, finalizedAtMs - queuedAtMs)
-      : null;
-    const processingToDoneMs = Number.isFinite(processingAtMs) && Number.isFinite(finalizedAtMs)
-      ? Math.max(0, finalizedAtMs - processingAtMs)
-      : null;
-    const queueToProcessingMs = Number.isFinite(queuedAtMs) && Number.isFinite(processingAtMs)
-      ? Math.max(0, processingAtMs - queuedAtMs)
-      : null;
     settleRelayAbortControlsForQueueMessage(messageId, {
       ok: true,
       note: 'queue message completed before stop control was applied',
@@ -1328,7 +1313,7 @@ export function registerMessagesWorkerOutputRoutes(app, deps, shared) {
           stale: false,
           capturedAt: now,
         });
-      } catch (firstError) {
+      } catch {
         try {
           await delay(USAGE_FETCH_RETRY_DELAY_MS);
           const summary = await fetchUsageSummaryPromise(fetchUsageSummary);
@@ -1337,7 +1322,7 @@ export function registerMessagesWorkerOutputRoutes(app, deps, shared) {
             stale: false,
             capturedAt: now,
           });
-        } catch (retryError) {
+        } catch {
           usageSnapshot = staleUsageSnapshotFromRow(previousUsageRow, { capturedAt: now });
         }
       }

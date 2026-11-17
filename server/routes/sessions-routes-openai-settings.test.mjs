@@ -1,10 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  buildModelCatalogWithOpenAIProvider,
-  parseOpenAISettingsUpdateRequest,
-} from './sessions-routes.mjs';
+import { buildModelCatalogWithOpenAIProvider } from './sessions-routes.mjs';
+import { parseOpenAISettingsUpdateRequest } from './settings-routes.mjs';
 
 test('parses provider toggles without requiring an API key', () => {
   assert.deepEqual(

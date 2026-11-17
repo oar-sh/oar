@@ -5,8 +5,8 @@ import {
   buildModelCatalogWithClaudeProvider,
   buildModelCatalogWithCursorProvider,
   buildModelCatalogWithOpenAIProvider,
-  parseCursorSettingsUpdateRequest,
 } from './sessions-routes.mjs';
+import { parseCursorSettingsUpdateRequest } from './settings-routes.mjs';
 
 test('parseCursorSettingsUpdateRequest requires at least one recognized field', () => {
   const result = parseCursorSettingsUpdateRequest({});

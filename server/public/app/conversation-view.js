@@ -134,7 +134,7 @@ import { ABSORBED_MSG_CLASS, STEERED_MSG_CLASS, STEER_MARKER_CLASS_BY_KIND, sync
 import { resolveSubagentFold, subagentFoldSummary, toggledSubagentFoldChoice } from './subagent-fold.mjs';
 import { deriveComposerControlState, hasComposerDraft, hasUploadingAttachments } from './composer-control-state.mjs';
 import { resolveNoConversationState } from './no-conversation-state.mjs';
-import { getProviderReadiness, isProviderSetupRequired } from './provider-readiness.mjs';
+import { composerLockReason, getProviderReadiness, isProviderSetupRequired } from './provider-readiness.mjs';
 import { buildLiveMessageFingerprint } from './live-message-dedupe.mjs';
 import { createInfiniteLoader } from './infinite-loader.js';
 import { normalizeDraftTimestampMs, isIncomingDraftTimestampStale } from './conversation-draft-timestamp-utils.mjs';
@@ -309,7 +309,7 @@ export function clearImageEditTarget() {
     window.syncComposerPlaceholder();
   } else {
     const input = document.getElementById('msg-input');
-    if (input) input.placeholder = 'Message Copilot…';
+    if (input) input.placeholder = 'Send a message…';
   }
 }
 
@@ -656,7 +656,7 @@ function syncSendButtonState() {
     steeringHoldReason: steeringHold.reason,
     crossesPlanMode: modesCrossPlan(currentTurn?.mode, document.getElementById('mode-select')?.value),
     archived: conversations[String(currentConvId || '').trim()]?.archived === true,
-    setupRequired: !String(currentConvId || '').trim() && isProviderSetupRequired(),
+    setupRequired: composerLockReason({ conversationId: currentConvId, providerType: conversations[String(currentConvId || '').trim()]?.runtimeProviderType }),
   });
   btn.disabled = state.disabled;
   btn.dataset.action = state.action;
@@ -1101,7 +1101,7 @@ export async function flushConversationDraft(conversationId = currentConvId) {
   const id = String(conversationId || '').trim();
   if (!id) return null;
   const input = document.getElementById('msg-input');
-  const draftText = String((id === String(currentConvId || '').trim() && input) ? input.value : (conversations[id]?.draftText || ''));
+  const draftText = String((id === String(currentConvId || '').trim() && input && !input.disabled) ? input.value : (conversations[id]?.draftText || '')); // a locked composer is never the draft
   if (isDraftOwnedByPendingSend(id)) {
     // Held: the send saves the cached text once it settles.
     upsertConversationDraftState(id, { draftText: draftTextForSync(draftText) });
@@ -1122,7 +1122,7 @@ function reconcileIncomingComposerDraft(id, incoming) {
   if (!input) return;
   const synced = getSyncedDraft(id);
   const composerAttachments = serializeDraftAttachments(selectedAttachments);
-  if (!shouldApplyIncomingDraftToComposer({
+  if (!input.disabled && !shouldApplyIncomingDraftToComposer({ // a locked composer has no edit of its own
     inputText: input.value,
     incomingText: incoming.text,
     syncedText: synced ? synced.text : null,
@@ -3812,9 +3812,9 @@ export function runRelayErrorCta(cta) {
     void startGrokSignIn();
     return;
   }
-  if (cta === 'open-grok-settings') openSettingsModal('providers', 'grok');
+  const settingsTab = { 'open-grok-settings': 'grok', 'open-copilot-settings': 'copilot', 'open-deepseek-settings': 'deepseek' }[cta];
+  if (settingsTab) openSettingsModal('providers', settingsTab);
   if (cta === 'open-claude-settings') openSettingsModal('providers', 'claude');
-  if (cta === 'open-deepseek-settings') openSettingsModal('providers', 'deepseek');
   if (cta === 'open-deepseek-top-up') window.open('https://platform.deepseek.com/top_up', '_blank', 'noopener');
   if (cta === 'open-claude-api-settings') openSettingsModal('providers', 'claude-api');
   if (cta === 'open-claude-api-cap') {
@@ -4839,11 +4839,11 @@ export async function sendMessage() {
     return;
   }
   if (!hasDraft) return;
-  // No conversation open and no provider ready: a send would create a
-  // Copilot chat that cannot run. The composer is locked in this state; this
-  // guard covers a programmatic send, before any upload starts.
-  if (!String(currentConvId || '').trim() && isProviderSetupRequired()) {
-    showTransientRelayNotice('Set up a provider in Settings → Providers before starting a chat.', 6000);
+  // No conversation open and no provider ready, or Copilot off: a send would
+  // start a chat on no provider or one nobody picked. The composer is locked
+  // then; this guard covers a programmatic send, before any upload starts.
+  if (!String(currentConvId || '').trim() && composerLockReason({ conversationId: '' })) {
+    showTransientRelayNotice(isProviderSetupRequired() ? 'Set up a provider in Settings → Providers before starting a chat.' : 'Start a chat with + New Chat: it asks for the provider.', 6000);
     return;
   }
   closeSlashAutocomplete();

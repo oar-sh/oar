@@ -14,6 +14,8 @@
 // installed) and what a child process writes to an inherited console.
 import fs from 'fs';
 
+import { replaceRangesAcrossEscapes } from '../task-output-text.mjs';
+
 export const WORKER_LOG_FILE_ENV = 'COPILOT_WEB_RELAY_WORKER_LOG_FILE';
 
 // Colours are for the console; the Linux file never has them, because there
@@ -100,12 +102,16 @@ const REDACTED_SECRET_TEXT = '[redacted]';
 // As the relay's redaction of worker posts (server/services/worker-secret-redaction.mjs):
 // a shorter value would mangle ordinary text.
 const MIN_REDACTED_SECRET_LENGTH = 8;
+// Fatal, so bytes cut inside a character are never written back as U+FFFD.
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /**
  * Replaces each secret's exact text with `[redacted]` in what the worker
  * writes to stdout/stderr, on every platform: the console, the Linux
  * launcher's redirect into the worker log, and the Windows copy above (install
  * this after installWorkerLogFile so the copy gets the redacted text). A
+ * secret that escape codes (a colour, a cursor move, a hyperlink) cut in two
+ * is caught too, and the codes stay (replaceRangesAcrossEscapes). A
  * secret split across two writes is not caught; the worker logs whole lines.
  * Returns null when there is no secret of at least 8 characters.
  */
@@ -119,10 +125,37 @@ export function installWorkerLogRedaction({
     .sort((a, b) => b.length - a.length);
   if (!values.length) return null;
 
+  const findRanges = (text) => {
+    const ranges = [];
+    for (const value of values) {
+      for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) ranges.push([at, at + value.length]);
+    }
+    return ranges;
+  };
   const redact = (text) => {
+    if (text.includes('\u001b')) return replaceRangesAcrossEscapes(text, findRanges, { marker: REDACTED_SECRET_TEXT });
     let output = text;
     for (const value of values) {
       if (output.includes(value)) output = output.split(value).join(REDACTED_SECRET_TEXT);
+    }
+    return output;
+  };
+  // Bytes that are not whole UTF-8 (a write cut inside a character) are
+  // never decoded: a secret in them goes by its exact bytes.
+  const markerBytes = Buffer.from(REDACTED_SECRET_TEXT, 'utf8');
+  const redactBytes = (bytes) => {
+    let output = bytes;
+    for (const value of values) {
+      if (!output.includes(value)) continue;
+      const length = Buffer.byteLength(value, 'utf8');
+      const parts = [];
+      let from = 0;
+      for (let at = output.indexOf(value); at !== -1; at = output.indexOf(value, at + length)) {
+        parts.push(output.subarray(from, at), markerBytes);
+        from = at + length;
+      }
+      parts.push(output.subarray(from));
+      output = Buffer.concat(parts);
     }
     return output;
   };
@@ -137,9 +170,19 @@ export function installWorkerLogRedaction({
       }
       if (chunk instanceof Uint8Array) {
         const bytes = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-        if (values.some((value) => bytes.includes(value))) {
-          const done = typeof encoding === 'function' ? encoding : callback;
-          return originalWrite.call(this, redact(bytes.toString('utf8')), 'utf8', done);
+        if (bytes.includes(0x1b) || values.some((value) => bytes.includes(value))) {
+          let text = null;
+          try {
+            text = utf8.decode(bytes);
+          } catch {
+            const redacted = redactBytes(bytes);
+            if (redacted !== bytes) return originalWrite.call(this, redacted, encoding, callback);
+          }
+          if (text !== null) {
+            const redacted = redact(text);
+            const done = typeof encoding === 'function' ? encoding : callback;
+            if (redacted !== text) return originalWrite.call(this, redacted, 'utf8', done);
+          }
         }
       }
       return originalWrite.call(this, chunk, encoding, callback);

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
-import { dequeuePendingMessage } from '../routes/messages-routes.mjs';
+import { dequeuePendingMessage } from '../routes/messages-worker-claim-routes.mjs';
 import { createSessionRepository } from './session-repository.mjs';
 import { createMessageRepository, QUEUE_ROW_SESSION_SQL } from './message-repository.mjs';
 import { createQuestionRepository } from './question-repository.mjs';

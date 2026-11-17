@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
 import { expect, test } from "@playwright/test";
-import { relayToken } from "./e2e-env.mjs";
-import { completeTurn, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
+import { relayDataDir, relayToken } from "./e2e-env.mjs";
+import { readRelaySecretsFile, relaySecretsPath } from "../server/services/owner-secret-store.mjs";
+import { mintAgentTokenWithKey } from "../shared/relay-credentials.mjs";
+import { completeTurn, createFakeWorker, fakeWorkerFor, settleFakeWorkers, startConversation } from "./helpers/fake-worker.mjs";
 
 // No turn a fake worker still holds outlives this file.
 test.afterAll(() => settleFakeWorkers());
@@ -119,3 +122,127 @@ for (const profile of [
     });
   });
 }
+
+// A message an agent sends into an archived chat brings the chat back to the
+// list and runs, as one the user sends does. The agent is another session,
+// with the agent token its worker holds (made from the relay's agent key).
+test("an agent's message into an archived chat brings it back to the list and runs", async ({ page, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const target = await seed(`archive-agent-target-${stamp}`);
+  const sender = await seed(`archive-agent-sender-${stamp}`);
+  try {
+    expect((await request.post(`/api/conversation/${target}/archive`, { headers })).status()).toBe(200);
+    await page.goto(`/?token=${encodeURIComponent(token)}`);
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(() => typeof window.openConversation === "function");
+    const row = (id) => page.locator(`#conv-list .conv-item[data-conversation-id="${id}"]`);
+    await expect(row(sender)).toBeVisible();
+    await expect(row(target)).toHaveCount(0);
+
+    const { secrets } = readRelaySecretsFile(relaySecretsPath(relayDataDir()));
+    expect(Boolean(secrets?.agentKey), "the e2e relay has an agent key").toBe(true);
+    const agentToken = mintAgentTokenWithKey(secrets.agentKey, { kind: "session", subject: sender });
+    const sent = await request.post("/api/message", {
+      headers: { Authorization: `Bearer ${agentToken}` },
+      data: { conversationId: target, text: `archive-agent-send-${stamp}`, model: "gpt-5.4-mini", relayMode: "agent" },
+    });
+    expect(sent.status(), await sent.text()).toBe(200);
+    const queued = await sent.json();
+
+    // Stored as live, and back in the open page's live list without a reload,
+    // though the page never loaded the chat.
+    await expect.poll(() => archivedFlag(request, headers, target)).toBe(false);
+    await expect(row(target)).toBeVisible();
+    // And it runs: the chat's worker is handed the message.
+    const worker = fakeWorkerFor(queued);
+    const taken = await worker.take(queued.messageId);
+    expect(taken.id).toBe(queued.messageId);
+    const responded = await worker.respond(queued.messageId, { text: "picked up", model: "gpt-5.4-mini", mode: "agent" });
+    expect(responded.ok).toBeTruthy();
+  } finally {
+    for (const id of [target, sender]) {
+      await request.delete(`/api/conversation/${id}`, { headers }).catch(() => {});
+    }
+  }
+});
+
+// A chat archived before this tab opened, unarchived in another tab: it comes
+// back to this tab's live list without a reload.
+test("a chat unarchived in another tab comes back to this tab's list without a reload", async ({ page, context, request }) => {
+  const token = relayToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const stamp = Date.now();
+  const target = await seed(`archive-tab-target-${stamp}`);
+  const other = await seed(`archive-tab-other-${stamp}`);
+  const second = await context.newPage();
+  try {
+    expect((await request.post(`/api/conversation/${target}/archive`, { headers })).status()).toBe(200);
+    const row = (tab, id) => tab.locator(`#conv-list .conv-item[data-conversation-id="${id}"]`);
+    for (const tab of [page, second]) {
+      await tab.goto(`/?token=${encodeURIComponent(token)}`);
+      await tab.waitForLoadState("networkidle");
+      await tab.waitForFunction(() => typeof window.openConversation === "function");
+      await expect(row(tab, other)).toBeVisible();
+      await expect(row(tab, target)).toHaveCount(0);
+    }
+
+    // The other tab unarchives it from its Archived view.
+    await second.locator("#conv-archived-toggle").click();
+    await expect(row(second, target)).toBeVisible();
+    await row(second, target).hover();
+    await row(second, target).locator(".conv-archive").click();
+    await expect(row(second, target)).toHaveCount(0);
+    await expect.poll(() => archivedFlag(request, headers, target)).toBe(false);
+
+    // This tab never loaded it, and lists it now.
+    await expect(row(page, target)).toBeVisible();
+  } finally {
+    await second.close().catch(() => {});
+    for (const id of [target, other]) {
+      await request.delete(`/api/conversation/${id}`, { headers }).catch(() => {});
+    }
+  }
+});
+
+// A turn whose worker died: the worker that took it names a process of its
+// own, which ends before the archive. The archive ends the turn as failed
+// instead of leaving it for the dead-worker sweep to requeue, and nothing
+// takes it up again after a sweep has run.
+test("archiving a chat whose worker died mid-reply ends the reply as failed", async ({ request }) => {
+  test.setTimeout(120_000);
+  const headers = { Authorization: `Bearer ${relayToken()}` };
+  const started = await startConversation({ text: `archive-dead-worker-${Date.now()}` });
+  const sessionId = String(started.ownerSessionId || "").trim() || started.conversationId;
+  started.worker.stop();
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try {
+    const worker = createFakeWorker({ sessionId, conversationId: started.conversationId, pid: child.pid });
+    await worker.take(started.messageId);
+    worker.stop();
+    child.kill("SIGKILL");
+    await exited;
+
+    const archived = await request.post(`/api/conversation/${started.conversationId}/archive`, { headers });
+    expect(archived.status()).toBe(200);
+    expect((await archived.json()).failedMessageIds).toEqual([started.messageId]);
+    const conversation = await (await request.get(`/api/conversation/${started.conversationId}`, { headers })).json();
+    const replies = conversation.messages.filter((message) => message.role === "assistant").map((message) => message.text);
+    expect(replies.filter((text) => text.includes("Error code: relay.conversation-archived.")).length).toBe(1);
+    expect(replies.at(-1)).toBe("[System Message] Archived: ended 1 unfinished reply.");
+
+    // Past one sweep (every 30 s): the session's worker is handed nothing.
+    await new Promise((resolve) => setTimeout(resolve, 32_000));
+    const live = createFakeWorker({ sessionId, conversationId: started.conversationId });
+    const polled = await live.poll();
+    live.stop();
+    expect(polled.payload?.message?.id || null).toBeNull();
+    const after = await (await request.get(`/api/conversation/${started.conversationId}`, { headers })).json();
+    expect(after.messages.filter((message) => message.role === "assistant").length).toBe(replies.length);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await request.delete(`/api/conversation/${started.conversationId}`, { headers }).catch(() => {});
+  }
+});

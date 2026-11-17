@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
-import { buildDequeuedRelayMessage } from './messages-routes.mjs';
+import { buildDequeuedRelayMessage } from './messages-worker-claim-routes.mjs';
 import { makeRouteDeps, invokePost } from './messages-routes-test-harness.mjs';
 
 const NOW = '2024-01-01T00:00:00.000Z';

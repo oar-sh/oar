@@ -276,3 +276,43 @@ test('a draft across plan mode from the live turn reads Queue, not Steer', () =>
   // On the same side it steers as before.
   assert.equal(deriveComposerControlState({ hasActiveTurn: true, hasDraft: true, steeringSupported: true, crossesPlanMode: false }).action, 'steer');
 });
+test('a Copilot chat while Copilot is off: the composer is locked and the button opens Copilot settings', async () => {
+  const { COPILOT_SWITCHED_OFF_TEXT } = await import('./composer-control-state.mjs');
+  for (const extra of [{}, { hasDraft: true }, { hasActiveTurn: true }, { archived: true }]) {
+    assert.deepEqual(deriveComposerControlState({ setupRequired: 'copilot-off', ...extra }), {
+      action: 'open-copilot-settings',
+      label: 'Copilot settings',
+      title: COPILOT_SWITCHED_OFF_TEXT,
+      disabled: false,
+      composerDisabled: true,
+      placeholder: COPILOT_SWITCHED_OFF_TEXT,
+    });
+  }
+  assert.match(COPILOT_SWITCHED_OFF_TEXT, /^Copilot is switched off on this relay\./);
+  // 'setup' is the fresh-install lock, as `true` was.
+  assert.equal(deriveComposerControlState({ setupRequired: 'setup' }).composerDisabled, true);
+  assert.equal(deriveComposerControlState({ setupRequired: 'setup' }).action, 'send');
+});
+
+test('the send button opens Copilot settings when that is its action, and sends otherwise', async () => {
+  const fs = await import('node:fs');
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /<button id="send-btn" onclick="this\.dataset\.action === 'open-copilot-settings' \? openSettingsModal\('providers', 'copilot'\) : \(this\.dataset\.action === 'open-new-chat' \? newConversation\(\) : sendMessage\(\)\)">Send<\/button>/);
+  const view = fs.readFileSync(new URL('./conversation-view.js', import.meta.url), 'utf8');
+  assert.match(view, /setupRequired: composerLockReason\(\{ conversationId: currentConvId, providerType: conversations\[String\(currentConvId \|\| ''\)\.trim\(\)\]\?\.runtimeProviderType \}\)/);
+});
+
+test('no chat open while Copilot is off: the composer is locked and its button opens New Chat', async () => {
+  const { NEW_CHAT_FIRST_TEXT } = await import('./composer-control-state.mjs');
+  for (const extra of [{}, { hasDraft: true }]) {
+    assert.deepEqual(deriveComposerControlState({ setupRequired: 'new-chat', ...extra }), {
+      action: 'open-new-chat',
+      label: 'New chat',
+      title: NEW_CHAT_FIRST_TEXT,
+      disabled: false,
+      composerDisabled: true,
+      placeholder: NEW_CHAT_FIRST_TEXT,
+    });
+  }
+  assert.doesNotMatch(NEW_CHAT_FIRST_TEXT, /Copilot/, 'neutral');
+});

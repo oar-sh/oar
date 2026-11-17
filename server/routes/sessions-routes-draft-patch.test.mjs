@@ -6,7 +6,8 @@ import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createSessionWorkerRegistry } from '../services/session-worker-registry-service.mjs';
-import { MAX_CONVERSATION_DRAFT_LENGTH, registerSessionsRoutes } from './sessions-routes.mjs';
+import { MAX_CONVERSATION_DRAFT_LENGTH } from './conversation-settings-routes.mjs';
+import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { MAX_DRAFT_TEXT_LENGTH, draftTextForSync } from '../public/app/conversation-draft-sync.mjs';
 
 // Route-level coverage for PATCH /api/conversation/:id/draft's version check.

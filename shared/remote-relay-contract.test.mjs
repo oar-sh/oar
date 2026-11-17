@@ -550,6 +550,8 @@ test('what the input check hands on passes it again unchanged, for every action'
     { action: 'list_sessions', relay: 'this', scope: 'all', limit: 5, query: 'docs', cursor: 'c1' },
     { action: 'read_session', relay: 'this', session: 'conv-a', last: 3, max_chars: 900, include_activity: true, before: 'b1' },
     { action: 'read_task_output', relay: 'this', session: 'conv-a', task_id: 'task-b7', lines: 40 },
+    { action: 'read_worker_log', relay: 'this', lines: 40 },
+    { action: 'read_worker_log' },
     { action: 'wait', relay: 'this', session: 'conv-a', message_id: 'm-1', wait_seconds: 30 },
     { action: 'send', relay: 'this', session: 'conv-a', text: 'hello', mode: 'plan', effort: 'high', if_busy: 'fail', model: 'gpt-5.4-mini' },
     { action: 'create_session', relay: 'this', text: 'start', provider: 'claude', cwd: '/home/dev/project', title: 'docs pass', group: 'Docs' },
@@ -707,6 +709,28 @@ test('read_task_output: session and task_id required, lines defaulted and clampe
   assert.equal(remoteRelayPermissionAllows('read', 'read_task_output'), true);
   assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /read_task_output/);
   assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.lines.maximum, 500);
+});
+
+test('read_worker_log: relay defaults to this, lines defaulted and clamped, no session taken, read permission', () => {
+  assert.ok(REMOTE_RELAY_ACTIONS.includes('read_worker_log'));
+  assert.deepEqual(REMOTE_RELAY_ACTION_ARGUMENTS.read_worker_log, ['lines']);
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'read_worker_log' }), { ok: true, action: 'read_worker_log', args: { relay: 'this', lines: 200 } });
+  assert.equal(validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'this', lines: 9000 }).args.lines, 500);
+  assert.equal(validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'this', lines: 0 }).args.lines, 1);
+  assert.match(validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'this', lines: 'many' }).error, /lines must be a number/);
+  // Always the caller's own conversation: a session is refused, not ignored.
+  const named = validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'this', session: 'conv-b' });
+  assert.equal(named.ok, false);
+  assert.match(named.error, /takes no session/);
+  // A provider that sends every property empty is fine.
+  assert.equal(validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'this', session: null, task_id: '' }).ok, true);
+  // The relay check is the dispatcher's (it knows which relay is this one).
+  assert.equal(validateRemoteRelayToolInput({ action: 'read_worker_log', relay: 'linux-test' }).args.relay, 'linux-test');
+  assert.equal(REMOTE_RELAY_ACTION_PERMISSION.read_worker_log, 'read');
+  assert.equal(remoteRelayPermissionAllows('read', 'read_worker_log'), true);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /read_worker_log reads the end of your own session worker's log on this relay, credentials scrubbed/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.description, /read_worker_log/);
+  assert.ok(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.enum.includes('read_worker_log'));
 });
 
 // ─── create_session group, and arguments an action does not take ─────────────

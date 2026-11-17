@@ -10,12 +10,16 @@ import {
 import { CLAUDE_ATTRIBUTION_MODES, DEFAULT_CLAUDE_ATTRIBUTION_MODE, claudeAttributionModelLabel, claudeAttributionTrailer, normalizeClaudeAttributionMode } from '../../shared/claude-attribution.mjs';
 import { parseDeepSeekSettingsUpdateRequest } from '../services/deepseek-settings-service.mjs';
 import {
+  copilotSettingsPayload,
+  parseCopilotSettingsUpdateRequest,
+  writeCopilotEnabled,
+} from '../services/copilot-settings-service.mjs';
+import {
   CLAUDE_API_PROVIDER_TYPE,
   parseClaudeApiSettingsUpdateRequest,
 } from '../services/claude-api-settings-service.mjs';
 import {
   DEEPSEEK_PROVIDER_TYPE,
-  DEFAULT_DEEPSEEK_MODEL,
 } from '../../shared/deepseek-models.mjs';
 import { readRemoteRelayRequest } from '../services/remote-relay-inbound.mjs';
 import { notPerson } from '../services/relay-principal.mjs';
@@ -79,6 +83,7 @@ import {
 } from '../../shared/pwa-app-name.mjs';
 import { parseRestartResumeUpdate } from '../services/restart-resume-service.mjs';
 import { deepseekStartingBalanceNote } from '../services/plan-usage-deepseek.mjs';
+import { stopIdleWorkspaceRootSession } from './sessions-helpers.mjs';
 
 export function parseDefaultSessionWorkspaceRootUpdateRequest(body = {}) {
   const payload = body && typeof body === 'object' ? body : {};
@@ -305,6 +310,8 @@ export function registerSettingsRoutes(app, deps, shared) {
     setDefaultSessionWorkspaceRootPath,
     setOpenAIProviderSettings = () => ({ ok: false, error: 'OpenAI settings are unavailable' }),
     getCopilotProviderSettings = () => ({ engine: 'sdk', engines: ['sdk'] }),
+    copilotModelDiscoveryService = null,
+    detectCopilotCli = null,
     setClaudeProviderSettings = () => ({ ok: false, error: 'Claude settings are unavailable' }),
     setCursorProviderSettings = () => ({ ok: false, error: 'Cursor settings are unavailable' }),
     setGrokProviderSettings = () => ({ ok: false, error: 'Grok settings are unavailable' }),
@@ -314,12 +321,6 @@ export function registerSettingsRoutes(app, deps, shared) {
     // (plan-usage-claude-api.mjs): a saved setting starts every chat afresh.
     claudeApiStopLedger = null,
     notifyOpenAIImageSpendChanged = () => {},
-    reconcileUnstartedConversationProviders = async () => ({
-      updatedUnstartedConversations: 0,
-      skippedStartedConversations: 0,
-      skippedActiveQueueConversations: 0,
-      failedConversations: [],
-    }),
     setCursorDashboardTokenSettings = () => ({ ok: false, error: 'Cursor dashboard token settings are unavailable' }),
     setCursorPlanAllowanceSettings = () => ({ ok: false, error: 'Cursor allowance settings are unavailable' }),
     setGrokPlanAllowanceSettings = () => ({ ok: false, error: 'Grok allowance settings are unavailable' }),
@@ -345,7 +346,6 @@ export function registerSettingsRoutes(app, deps, shared) {
     getModelCatalogState,
     modelsUpdatedPayload,
     shares,
-    stopIdleWorkspaceRootSession,
     getOpenAIProviderSettings,
     refreshOpenAIProviderModels,
     getClaudeProviderSettings,
@@ -365,6 +365,7 @@ export function registerSettingsRoutes(app, deps, shared) {
     getSharePathPrivacyMode,
     getTaskStallMinutes,
     remoteRelayInbound,
+    isCopilotEnabled = () => true,
   } = shared;
 
   app.get('/api/settings/shares', auth, (req, res) => {
@@ -566,32 +567,13 @@ export function registerSettingsRoutes(app, deps, shared) {
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
       : await refreshOpenAIProviderModels();
-    const reconciliationResult = parsed.remove === true
-      ? await reconcileUnstartedConversationProviders({
-          enabled: false,
-          model: result.model,
-        })
-      : {
-          updatedUnstartedConversations: 0,
-          skippedStartedConversations: 0,
-          skippedActiveQueueConversations: 0,
-          failedConversations: [],
-        };
-    const reconciliation = {
-      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
-        ? reconciliationResult.failedConversations
-        : [],
-    };
+    // A removed key moves no chat: an empty OpenAI chat keeps its provider.
     const currentSettings = getOpenAIProviderSettings();
     const settingsPayload = {
       configured: currentSettings?.configured === true,
       enabled: currentSettings?.enabled === true,
       model: String(currentSettings?.model || result.model || 'gpt-4o').trim() || 'gpt-4o',
       baseUrl: String(currentSettings?.baseUrl || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1',
-      reconciliation,
       ...openAIImageSpendSettingsPayload(),
     };
     io.emit('models_updated', modelsUpdatedPayload(
@@ -599,16 +581,11 @@ export function registerSettingsRoutes(app, deps, shared) {
       currentSettings,
     ));
     io.emit('openai_settings_updated', settingsPayload);
-    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
-      ? reconciliation.failedConversations
-      : [];
     return res.json({
       ok: true,
       ...settingsPayload,
       models: Array.isArray(discovery?.models) ? discovery.models : [],
-      warning: imageSpendError || (reconciliationFailures.length
-        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed'))),
+      warning: imageSpendError || (discovery?.ok ? null : (discovery?.error || 'OpenAI model discovery failed')),
     });
   });
 
@@ -660,10 +637,53 @@ export function registerSettingsRoutes(app, deps, shared) {
     name: String(req.params?.name ?? ''),
   }));
 
-  // Copilot has one engine, the SDK worker, and nothing to set. The GET stays
-  // so that paired relays on an older version that read it keep working.
+  // Copilot has one engine, the SDK worker, and its switch. Paired relays
+  // read this GET (an older one only the engine fields; a newer caller treats
+  // a missing `enabled` as on).
+  function copilotCliFound() {
+    try {
+      if (typeof detectCopilotCli === 'function') return Boolean(detectCopilotCli());
+    } catch {
+      return false;
+    }
+    return getCopilotProviderSettings()?.cliFound === true;
+  }
+  function currentCopilotSettings() {
+    return copilotSettingsPayload({
+      ...getCopilotProviderSettings(),
+      enabled: isCopilotEnabled(),
+      cliFound: copilotCliFound(),
+    });
+  }
+
   app.get('/api/settings/copilot', auth, (_req, res) => {
-    return res.json(getCopilotProviderSettings());
+    return res.json(currentCopilotSettings());
+  });
+
+  // Switching Copilot on runs a model discovery, so its models are there for
+  // New Chat; off, they leave the catalogue (sessions-routes.mjs).
+  app.post('/api/settings/copilot', auth, async (req, res) => {
+    const parsed = parseCopilotSettingsUpdateRequest(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+      return res.status(500).json({ error: 'Copilot settings are unavailable' });
+    }
+    const wasEnabled = isCopilotEnabled();
+    writeCopilotEnabled({
+      writeSetting: (key, value, stamp) => stmts.upsertAppSetting.run(key, value, stamp),
+      enabled: parsed.enabled,
+    });
+    const discovery = parsed.enabled && !wasEnabled && typeof copilotModelDiscoveryService?.refresh === 'function'
+      ? await copilotModelDiscoveryService.refresh('copilot-enabled').catch((error) => ({ ok: false, error: error?.message || String(error) }))
+      : { ok: true };
+    const settingsPayload = currentCopilotSettings();
+    io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
+    io.emit('copilot_settings_updated', settingsPayload);
+    return res.json({
+      ok: true,
+      ...settingsPayload,
+      warning: discovery?.ok ? null : (discovery?.error || 'Copilot model discovery failed'),
+    });
   });
 
   app.get('/api/settings/claude', auth, (_req, res) => {
@@ -695,28 +715,8 @@ export function registerSettingsRoutes(app, deps, shared) {
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
       : await refreshClaudeProviderModels();
-    // Disabling Claude rebinds unstarted Claude conversations back to the
-    // default provider (mirrors the OpenAI key-removal reconciliation).
-    const reconciliationResult = parsed.enabled === false
-      ? await reconcileUnstartedConversationProviders({
-          enabled: false,
-          model: result.model,
-          provider: 'claude',
-        })
-      : {
-          updatedUnstartedConversations: 0,
-          skippedStartedConversations: 0,
-          skippedActiveQueueConversations: 0,
-          failedConversations: [],
-        };
-    const reconciliation = {
-      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
-        ? reconciliationResult.failedConversations
-        : [],
-    };
+    // Switching Claude off moves no chat: an empty Claude chat keeps its
+    // provider.
     const currentSettings = getClaudeProviderSettings();
     const settingsPayload = {
       configured: currentSettings?.configured === true,
@@ -726,20 +726,14 @@ export function registerSettingsRoutes(app, deps, shared) {
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
       ...claudeAttributionSettingsFields(currentSettings),
       ...claudeBackgroundCommandLimitSettingsFields(currentSettings),
-      reconciliation,
     };
     io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('claude_settings_updated', settingsPayload);
-    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
-      ? reconciliation.failedConversations
-      : [];
     return res.json({
       ok: true,
       ...settingsPayload,
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
-      warning: reconciliationFailures.length
-        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'Claude model discovery failed')),
+      warning: discovery?.ok ? null : (discovery?.error || 'Claude model discovery failed'),
     });
   });
 
@@ -772,19 +766,7 @@ export function registerSettingsRoutes(app, deps, shared) {
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
       : await refreshGrokProviderModels();
-    const reconciliationResult = await reconcileUnstartedConversationProviders({
-      enabled: result.enabled === true,
-      model: result.model,
-      provider: 'grok',
-    });
-    const reconciliation = {
-      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
-        ? reconciliationResult.failedConversations
-        : [],
-    };
+    // Switching Grok on or off moves no chat, in either direction.
     const currentSettings = getGrokProviderSettings();
     const settingsPayload = {
       configured: currentSettings?.configured === true,
@@ -792,20 +774,14 @@ export function registerSettingsRoutes(app, deps, shared) {
       model: String(currentSettings?.model || result.model || 'grok-4.5').trim() || 'grok-4.5',
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
-      reconciliation,
     };
     io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('grok_settings_updated', settingsPayload);
-    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
-      ? reconciliation.failedConversations
-      : [];
     return res.json({
       ok: true,
       ...settingsPayload,
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
-      warning: reconciliationFailures.length
-        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'Grok model discovery failed')),
+      warning: discovery?.ok ? null : (discovery?.error || 'Grok model discovery failed'),
     });
   });
 
@@ -899,28 +875,7 @@ export function registerSettingsRoutes(app, deps, shared) {
     const discovery = !shouldDiscover
       ? { ok: true, models: [], error: null }
       : await refreshCursorProviderModels();
-    // Removing the Cursor key rebinds unstarted Cursor conversations back to
-    // the default provider (mirrors the OpenAI key-removal reconciliation).
-    const reconciliationResult = parsed.remove === true
-      ? await reconcileUnstartedConversationProviders({
-          enabled: false,
-          model: result.model,
-          provider: 'cursor',
-        })
-      : {
-          updatedUnstartedConversations: 0,
-          skippedStartedConversations: 0,
-          skippedActiveQueueConversations: 0,
-          failedConversations: [],
-        };
-    const reconciliation = {
-      updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-      skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-      skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-      failedConversations: Array.isArray(reconciliationResult?.failedConversations)
-        ? reconciliationResult.failedConversations
-        : [],
-    };
+    // A removed key moves no chat: an empty Cursor chat keeps its provider.
     const currentSettings = getCursorProviderSettings();
     const settingsPayload = {
       configured: currentSettings?.configured === true,
@@ -928,20 +883,14 @@ export function registerSettingsRoutes(app, deps, shared) {
       model: String(currentSettings?.model || result.model || 'composer-2.5').trim() || 'composer-2.5',
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
       availableModels: Array.isArray(currentSettings?.availableModels) ? currentSettings.availableModels : [],
-      reconciliation,
     };
     io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('cursor_settings_updated', settingsPayload);
-    const reconciliationFailures = Array.isArray(reconciliation?.failedConversations)
-      ? reconciliation.failedConversations
-      : [];
     return res.json({
       ok: true,
       ...settingsPayload,
       models: Array.isArray(currentSettings?.models) ? currentSettings.models : [],
-      warning: reconciliationFailures.length
-        ? `${reconciliationFailures.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed')),
+      warning: discovery?.ok ? null : (discovery?.error || 'Cursor model discovery failed'),
     });
   });
 
@@ -1009,29 +958,14 @@ export function registerSettingsRoutes(app, deps, shared) {
         planUsageService?.recordDeepSeekBalance?.(balance);
       } catch {}
     }
-    // Removing the key moves unstarted DeepSeek conversations back to the
-    // default provider, as for OpenAI and Cursor.
-    const reconciliationResult = parsed.remove === true
-      ? await reconcileUnstartedConversationProviders({ enabled: false, model: DEFAULT_DEEPSEEK_MODEL, provider: DEEPSEEK_PROVIDER_TYPE })
-      : { updatedUnstartedConversations: 0, skippedStartedConversations: 0, skippedActiveQueueConversations: 0, failedConversations: [] };
-    const failedConversations = Array.isArray(reconciliationResult?.failedConversations) ? reconciliationResult.failedConversations : [];
-    const settingsPayload = {
-      ...describeDeepSeekSettings(),
-      reconciliation: {
-        updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-        skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-        skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-        failedConversations,
-      },
-    };
+    // A removed key moves no chat: an empty DeepSeek chat keeps its provider.
+    const settingsPayload = describeDeepSeekSettings();
     io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('deepseek_settings_updated', settingsPayload);
     return res.json({
       ok: true,
       ...settingsPayload,
-      warning: failedConversations.length
-        ? `${failedConversations.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'DeepSeek model discovery failed')),
+      warning: discovery?.ok ? null : (discovery?.error || 'DeepSeek model discovery failed'),
     });
   });
 
@@ -1063,21 +997,9 @@ export function registerSettingsRoutes(app, deps, shared) {
     const discovery = result.discover
       ? await claudeApiSettingsService.refreshModels()
       : { ok: true, models: [], error: null };
-    // Removing the key or switching the provider off moves unstarted Claude
-    // API conversations back to the default provider, as for Claude itself.
-    const reconciliationResult = result.removed === true || result.disabled === true
-      ? await reconcileUnstartedConversationProviders({ enabled: false, model: '', provider: CLAUDE_API_PROVIDER_TYPE })
-      : { updatedUnstartedConversations: 0, skippedStartedConversations: 0, skippedActiveQueueConversations: 0, failedConversations: [] };
-    const failedConversations = Array.isArray(reconciliationResult?.failedConversations) ? reconciliationResult.failedConversations : [];
-    const settingsPayload = {
-      ...claudeApiSettingsService.describe(),
-      reconciliation: {
-        updatedUnstartedConversations: Number(reconciliationResult?.updatedUnstartedConversations || 0),
-        skippedStartedConversations: Number(reconciliationResult?.skippedStartedConversations || 0),
-        skippedActiveQueueConversations: Number(reconciliationResult?.skippedActiveQueueConversations || 0),
-        failedConversations,
-      },
-    };
+    // Removing the key or switching the provider off moves no chat: an empty
+    // Claude API chat keeps its provider, and its first send refuses.
+    const settingsPayload = claudeApiSettingsService.describe();
     io.emit('models_updated', modelsUpdatedPayload(getModelCatalogState()));
     io.emit('claude_api_settings_updated', settingsPayload);
     try { claudeApiStopLedger?.clearAll?.(); } catch {}
@@ -1097,9 +1019,7 @@ export function registerSettingsRoutes(app, deps, shared) {
       ok: true,
       ...settingsPayload,
       discoveryError,
-      warning: failedConversations.length
-        ? `${failedConversations.length} unstarted conversation(s) could not switch provider.`
-        : (discovery?.ok ? null : (discovery?.error || 'Claude API model discovery failed')),
+      warning: discovery?.ok ? null : (discovery?.error || 'Claude API model discovery failed'),
     });
   });
 

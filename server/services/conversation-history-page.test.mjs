@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
 import { createConversationHistoryPageStatements } from './conversation-history-page.mjs';
-import { selectConversationHistoryPage } from '../routes/sessions-routes.mjs';
+import { selectConversationHistoryPage } from '../routes/sessions-helpers.mjs';
 
 const CONV = 'conv-paging-fixture';
 

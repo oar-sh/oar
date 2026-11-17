@@ -1,4 +1,5 @@
 import { stripRemotePromptHeader } from './remote-relay-shared.mjs';
+import { compileWordSequence, matchLeadingWordSequence } from './whitespace-flexible-match.mjs';
 
 const RELAY_TOOL_GUIDANCE_LINES = [
   '# Relay Tool Guidance',
@@ -69,43 +70,47 @@ const LEGACY_MODE_INSTRUCTIONS = {
   ].join(' '),
 };
 
-function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+// The prefixes are matched word by word (any whitespace between words, any
+// case), never through a RegExp built from them: compiling a regex from a long
+// text overflows the stack, and a browser main thread has its own limit.
+// They depend only on the mode, so they are built once per mode and reused:
+// a long conversation sanitises every message on each history load.
+const PROMPT_PREFIX_CACHE = new Map();
 
-function whitespaceFlexiblePattern(value) {
-  return String(value || '')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => escapeRegExp(part))
-    .join('\\s+');
-}
-
-// The patterns depend only on the mode, so they are built once per mode and
-// reused: a long conversation sanitises every message on each history load.
-const PROMPT_PREFIX_PATTERN_CACHE = new Map();
-
-function buildPromptPrefixPatterns(mode) {
+function promptPrefixCacheKey(mode) {
   const requestedMode = String(mode || '').trim().toLowerCase();
-  const cacheKey = requestedMode && MODE_MARKERS[requestedMode] ? requestedMode : '';
-  const cached = PROMPT_PREFIX_PATTERN_CACHE.get(cacheKey);
-  if (cached) return cached;
+  return requestedMode && MODE_MARKERS[requestedMode] ? requestedMode : '';
+}
+
+// The prefixes tried for a mode, in order: the full one with the current and
+// the legacy mode instructions, each with the current and then the previous
+// guidance, then the bare marker. No mode tries every mode's.
+function promptPrefixTexts(cacheKey) {
   const modes = cacheKey ? [cacheKey] : Object.keys(MODE_MARKERS);
-  const patterns = modes.flatMap((key) => {
+  return modes.flatMap((key) => {
     const marker = MODE_MARKERS[key];
-    const currentFullPrefix = `${marker} ${MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
-    const legacyFullPrefix = `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
     return [
-      new RegExp(`^${whitespaceFlexiblePattern(currentFullPrefix)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(legacyFullPrefix)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(marker)}\\s*`, 'i'),
+      `${marker} ${MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`,
+      marker,
     ];
   });
-  PROMPT_PREFIX_PATTERN_CACHE.set(cacheKey, patterns);
-  return patterns;
+}
+
+function buildPromptPrefixes(mode) {
+  const cacheKey = promptPrefixCacheKey(mode);
+  const cached = PROMPT_PREFIX_CACHE.get(cacheKey);
+  if (cached) return cached;
+  const prefixes = promptPrefixTexts(cacheKey).map((text) => compileWordSequence(text));
+  PROMPT_PREFIX_CACHE.set(cacheKey, prefixes);
+  return prefixes;
+}
+
+/** The prefix texts stripRelayPromptContext tries for `mode`, in order. */
+export function relayPromptPrefixTextsForTests(mode = '') {
+  return promptPrefixTexts(promptPrefixCacheKey(mode));
 }
 
 function stripAttachmentPromptArtifacts(text) {
@@ -171,9 +176,10 @@ export function stripRelayPromptContext(text, relayMode = '', options = {}) {
     .replace(MATH_BLOCK_PATTERN, '')
     .trim();
   if (!value) return '';
-  const patterns = buildPromptPrefixPatterns(relayMode);
-  for (const pattern of patterns) {
-    const stripped = value.replace(pattern, '').trim();
+  for (const prefix of buildPromptPrefixes(relayMode)) {
+    const end = matchLeadingWordSequence(value, prefix);
+    if (end < 0) continue;
+    const stripped = value.slice(end).trim();
     if (stripped && stripped !== value) return stripLeadingRelayNotes(stripped, { origin });
   }
   return stripLeadingRelayNotes(value, { origin });

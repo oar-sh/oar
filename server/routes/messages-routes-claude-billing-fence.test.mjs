@@ -4,11 +4,13 @@ import Database from 'better-sqlite3';
 
 import {
   buildDequeuedRelayMessage,
+  dequeuePendingMessageForWorkerLoop,
+} from './messages-worker-claim-routes.mjs';
+import {
   claudeBillingFence,
   dequeuePendingMessage,
-  dequeuePendingMessageForWorkerLoop,
-  resolveExecutedProviderForResponse,
-} from './messages-routes.mjs';
+} from './messages-worker-claim-routes.mjs';
+import { resolveExecutedProviderForResponse } from './messages-worker-output-routes.mjs';
 import { applySchema } from '../db-schema.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';

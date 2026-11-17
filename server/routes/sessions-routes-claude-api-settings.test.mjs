@@ -397,26 +397,22 @@ test('removing the key is refused with 409 while a Claude API conversation has a
   assert.equal(reconcileCalls.length, 0);
 });
 
-test('removing the key or switching off moves unstarted Claude API conversations back', async () => {
+test('removing the key or switching off moves no Claude API conversation: an empty one keeps its provider', async () => {
   const removable = createClaudeApiService({ initial: { claude_api_key: TEST_KEY } });
   const removeHarness = createHarness({ claudeApiSettingsService: removable.service });
   const removed = await post(removeHarness.app, { remove: true });
   assert.equal(removed.statusCode, 200);
   assert.equal(removed.body.configured, false);
-  assert.deepEqual(removeHarness.reconcileCalls, [{ enabled: false, model: '', provider: 'claude-api' }]);
-  assert.equal(removed.body.reconciliation.updatedUnstartedConversations, 2);
+  assert.deepEqual(removeHarness.reconcileCalls, []);
+  assert.equal('reconciliation' in removed.body, false);
 
   const switchable = createClaudeApiService({ initial: { claude_api_key: TEST_KEY } });
   const offHarness = createHarness({ claudeApiSettingsService: switchable.service });
   const off = await post(offHarness.app, { enabled: false });
   assert.equal(off.statusCode, 200);
   assert.equal(off.body.enabled, false);
-  assert.equal(offHarness.reconcileCalls.length, 1);
-  assert.equal(offHarness.reconcileCalls[0].provider, 'claude-api');
-  // Changing the cap alone moves nothing.
-  const capHarness = createHarness({ claudeApiSettingsService: createClaudeApiService({ initial: { claude_api_key: TEST_KEY } }).service });
-  await post(capHarness.app, { monthlyCapUsd: 10 });
-  assert.equal(capHarness.reconcileCalls.length, 0);
+  assert.deepEqual(offHarness.reconcileCalls, []);
+  assert.equal('reconciliation' in off.body, false);
 });
 
 test('bootstrap refuses Claude API without a key or while it is switched off', async () => {

@@ -38,9 +38,12 @@ import { createPrompter, PromptAborted, runMenu } from '../server/services/oar-c
 import { createWindowsPortCheck, isWsl, isWslNat, windowsPortWarning } from '../server/services/oar-cli-wsl.mjs';
 import { readEnvValue, windowsSystemToolPath } from '../shared/windows-system-tools.mjs';
 import { createProcessLister } from '../server/services/process-list-service.mjs';
+import {
+  findRelayProcesses, isSameProcess, relayProcessesLeft, stopRelayProcesses, taskkillLine, waitRelayProcessesGone,
+} from '../server/services/windows-relay-process-tree.mjs';
 import { backupPathFor, createWindowsAutostartService } from '../server/services/windows-autostart-service.mjs';
 import {
-  BOOT_ELEVATION_SCRIPT_FILENAME, BOOT_TASK_XML_FILENAME,
+  BOOT_ELEVATION_SCRIPT_FILENAME, BOOT_TASK_NAME, BOOT_TASK_XML_FILENAME,
   bootTaskLabel, createWindowsBootAutostartService, describeHandMade, describeWindowsAutostart, handMadeLines, switchBlockers,
 } from '../server/services/windows-boot-autostart-service.mjs';
 
@@ -501,6 +504,10 @@ function cliContext(options = {}) {
     pid: process.pid,
     restartWaitMs: 60_000,
     stopWaitMs: 30_000,
+    // How long the Windows sweep waits for the relay's processes to end.
+    treeWaitMs: 30_000,
+    // How long it reads the lock again while a runtime it does not name runs.
+    lockSettleMs: 5_000,
     pollMs: 300,
   };
   const ctx = { ...defaults };
@@ -634,8 +641,9 @@ async function pollUntil(check, { waitMs, pollMs }) {
 /**
  * Asks the relay to stop or restart itself; it does so once no turn is
  * running, or at once with `immediate` (`--now` of a relay without a service).
+ * Null when it refused; `noAnswer` when it did not answer at all.
  */
-async function requestShutdown(ctx, endpoint, restart, { immediate = false } = {}) {
+async function requestShutdown(ctx, endpoint, restart, { immediate = false, noAnswer = null } = {}) {
   try {
     const response = await ctx.fetchImpl(`http://localhost:${endpoint.port}/api/relay/shutdown`, {
       method: 'POST',
@@ -654,7 +662,7 @@ async function requestShutdown(ctx, endpoint, restart, { immediate = false } = {
     if (busy) ctx.logger.log('[oar] Waiting for the relay\'s running turns to finish …');
     return { busy };
   } catch {
-    return null;
+    return noAnswer;
   }
 }
 
@@ -1177,6 +1185,340 @@ async function confirmCutOff(ctx, question, command) {
 const STOP_NOW_QUESTION = 'Stop the relay now? Running turns are cut off.';
 const RESTART_NOW_QUESTION = 'Restart the relay now? Running turns are cut off.';
 
+// ─── Windows: the relay's whole process tree ────────────────────────────────
+
+const WINDOWS_TREE_LINE = '[oar] On Windows this also ends the relay\'s session workers and what they run; a turn still running ends with them.';
+
+/**
+ * This install's relay processes on Windows (windows-relay-process-tree.mjs):
+ * `look(before)` reads the process list and finds them; `list` and `kill`
+ * are what the sweep stops them with. `kill` is taskkill by its full path,
+ * one pid, never /T: /T follows parent pids, which Windows hands out again.
+ */
+function windowsRelayTree(ctx, paths) {
+  const lister = ctx.processListImpl || createProcessLister({ platform: ctx.platform, systemToolPath: (name) => windowsSystemToolPath(name, { env: ctx.env }) });
+  const serverDir = path.join(ctx.packageRoot, 'server');
+  const lockPath = relayLockPath(ctx, paths);
+  const list = () => lister.list();
+  // Runtimes of the folder seen beside the one the lock names: another relay's.
+  const foreign = [];
+  const look = async (before) => {
+    const found = findRelayProcesses(await list(), { serverDir, lockPid: readRelayLock(lockPath)?.pid, before, foreign });
+    if (found.runtime) {
+      for (const proc of found.otherRuntimes) if (!foreign.some((known) => isSameProcess(known, proc))) foreign.push(proc);
+    }
+    return found;
+  };
+  return {
+    list,
+    look,
+    // While what runs cannot be told apart, the lock and the list are read
+    // again, at most `lockSettleMs`: a runtime takes the lock 1-2 s after it
+    // starts.
+    settledLook: async (before) => {
+      const deadline = Date.now() + ctx.lockSettleMs;
+      let found = await look(before);
+      while (found.unclear && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, ctx.pollMs));
+        found = await look(before);
+      }
+      return found;
+    },
+    // `{ ok }`, or `{ ok: false, reason }` with what taskkill said (access denied).
+    kill: (pid) => {
+      try {
+        const result = ctx.spawnSyncImpl(windowsSystemToolPath('taskkill', { env: ctx.env }), ['/PID', String(pid), '/F'], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, windowsHide: true,
+        });
+        if (result?.status === 0) return { ok: true };
+        const said = `${result?.stderr || ''}\n${result?.stdout || ''}`.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        return { ok: false, reason: result?.error?.message || said.join(' ') || `exit code ${result?.status ?? 'none'}` };
+      } catch (error) {
+        return { ok: false, reason: error?.message || String(error) };
+      }
+    },
+    // A list that cannot be read ends the wait: the sweep that follows reads
+    // it again and says so when it still cannot.
+    gone: async (processes) => {
+      try {
+        return !relayProcessesLeft(processes, await list()).length;
+      } catch {
+        return true;
+      }
+    },
+  };
+}
+
+function windowsListUnreadable(ctx, error) {
+  ctx.logger.error(`[oar] The process list could not be read (${error?.message || error}), so the relay's processes cannot be told apart from others. Nothing was changed.`);
+  return { code: 1, reason: 'process-list-unreadable' };
+}
+
+const KIND_TEXT = { supervisor: 'the supervisor', runtime: 'the runtime', worker: 'a session worker', descendant: 'started by the relay' };
+
+// Processes that may be this relay's but cannot be told from another's: none is ended.
+function reportUnclearRelay(ctx, found) {
+  ctx.logger.error('[oar] Can\'t tell this relay\'s processes apart; retry, or end them by hand. Nothing was ended:');
+  for (const proc of found.candidates) ctx.logger.error(`[oar]   ${taskkillLine(proc.processId)}   (${KIND_TEXT[proc.kind]})`);
+}
+
+/**
+ * Stops what is left of this install's relay on Windows, kind by kind
+ * (stopRelayProcesses), and waits until all of it has ended, at most
+ * `treeWaitMs`. A process that starts meanwhile (the boot task starts the
+ * relay again after a failure) is none of what it stops. Nothing is ended
+ * while this relay's processes cannot be told apart (`unclear`), and it is
+ * no success while a server.js of this install that it did not end still
+ * runs. `{ ok, reason, startedAt, restarted }`, `restarted` the server.js
+ * processes of this install that started meanwhile; each process left is
+ * named with the command that ends it.
+ */
+async function sweepWindowsRelay(ctx, tree) {
+  const { logger } = ctx;
+  const startedAt = Date.now();
+  let found;
+  let gone;
+  let after;
+  let failed = [];
+  try {
+    found = await tree.settledLook(startedAt);
+    if (found.unclear) {
+      reportUnclearRelay(ctx, found);
+      return { ok: false, reason: 'unclear', startedAt, restarted: [] };
+    }
+    if (found.workersSkipped) {
+      const others = found.otherRuntimes.map((proc) => proc.processId).join(', ');
+      logger.log(`[oar] Warning: another relay runs from this folder (process ${others}), and its session workers cannot be told from this relay's, so no session worker was stopped.${found.workers.length ? ' End this relay\'s ones yourself:' : ''}`);
+      for (const proc of found.workers) logger.log(`[oar]   ${taskkillLine(proc.processId)}`);
+    }
+    const stopped = await stopRelayProcesses({ targets: found.targets, list: tree.list, kill: tree.kill });
+    failed = stopped.failed;
+    if (failed.length) {
+      logger.error('[oar] taskkill could not end these, so they still run:');
+      for (const proc of failed) logger.error(`[oar]   ${taskkillLine(proc.processId)}   (${KIND_TEXT[proc.kind]}): ${proc.reason}`);
+    }
+    // A pid whose kill failed is not waited for.
+    const waited = found.targets.filter((target) => !failed.some((proc) => proc.processId === target.processId));
+    gone = await waitRelayProcessesGone({ targets: waited, list: tree.list, waitMs: ctx.treeWaitMs, pollMs: ctx.pollMs });
+    if (gone.ok) after = await tree.look();
+  } catch (error) {
+    logger.error(`[oar] The process list could not be read while the relay's processes were stopped (${error?.message || error}); which of them still run is not known.`);
+    return { ok: false, reason: 'processes-left', startedAt, restarted: [] };
+  }
+  if (!gone.ok) {
+    logger.error(`[oar] Not every process of the relay ended within ${Math.round(ctx.treeWaitMs / 1000)} s. End these yourself:`);
+    for (const proc of gone.left) logger.error(`[oar]   ${taskkillLine(proc.processId)}   (${KIND_TEXT[proc.kind]})`);
+    return { ok: false, reason: 'processes-left', startedAt, restarted: [] };
+  }
+  if (failed.length) return { ok: false, reason: 'processes-left', startedAt, restarted: [] };
+  const servers = after.candidates.filter((proc) => proc.kind !== 'worker');
+  const stray = servers.filter((proc) => proc.createdAt < startedAt);
+  if (stray.length) {
+    logger.error('[oar] A server.js of this relay that could not be told to be its own still runs. End it yourself:');
+    for (const proc of stray) logger.error(`[oar]   ${taskkillLine(proc.processId)}   (${KIND_TEXT[proc.kind]})`);
+    return { ok: false, reason: 'processes-left', startedAt, restarted: [] };
+  }
+  return { ok: true, reason: 'stopped', startedAt, restarted: servers.filter((proc) => proc.createdAt >= startedAt) };
+}
+
+/**
+ * A relay that does not answer while processes of it run (`found`): said,
+ * then the confirmation of `--now`; null to go ahead. One that holds its
+ * lock to bring a database over is left alone.
+ */
+async function confirmWindowsSweep(ctx, paths, found, question, command) {
+  const takeover = readTakeover(relayLockPath(ctx, paths), ctx.isProcessAliveImpl);
+  if (takeover) {
+    ctx.logger.log(takeoverLine(takeover, paths.logDir));
+    return { code: 1, reason: 'bringing-over' };
+  }
+  const parts = found.unclear
+    ? [`${found.candidates.length} process${found.candidates.length === 1 ? '' : 'es'} of its folder`]
+    : [
+      found.supervisor && `supervisor ${found.supervisor.processId}`,
+      found.runtime && `runtime ${found.runtime.processId}`,
+      found.workers.length && `${found.workers.length} session worker${found.workers.length === 1 ? '' : 's'}`,
+    ].filter(Boolean);
+  ctx.logger.log(`[oar] The relay does not answer, but processes of it run (${parts.join(', ')}).`);
+  ctx.logger.log(WINDOWS_TREE_LINE);
+  return confirmCutOff(ctx, question, command);
+}
+
+function reportWindowsStop(ctx, sweep) {
+  if (!sweep.ok) return { code: 1, reason: sweep.reason };
+  if (sweep.restarted.length) {
+    // The boot task starts the relay again after a failure.
+    ctx.logger.error('[oar] The relay started again by itself while it was stopped, so it is not stopped. End it yourself:');
+    for (const proc of sweep.restarted) ctx.logger.error(`[oar]   ${taskkillLine(proc.processId)}   (${KIND_TEXT[proc.kind]})`);
+    return { code: 1, reason: 'restarted-by-itself' };
+  }
+  ctx.logger.log('[oar] The relay is stopped, with its session workers.');
+  return { code: 0, reason: 'stopped' };
+}
+
+/**
+ * `oar stop` on Windows. The relay is asked to stop as anywhere else; once
+ * its supervisor has ended within `stopWaitMs` (with `--now` in any case),
+ * the rest of its process tree, the session workers included, is stopped and
+ * waited for (sweepWindowsRelay). A relay still busy then stops by itself
+ * later and leaves its workers. A relay that does not answer while
+ * processes of it run is swept after the confirmation of `--now`.
+ */
+async function stopWindowsRelay(ctx, paths, { now }) {
+  const { logger } = ctx;
+  const command = oarCommand(paths);
+  const tree = windowsRelayTree(ctx, paths);
+  const relay = await findRelay(ctx, paths);
+  if (relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
+  let before;
+  try {
+    before = await tree.look();
+  } catch (error) {
+    return windowsListUnreadable(ctx, error);
+  }
+  if (relay.answer === 'none') {
+    if (!before.targets.length && !before.candidates.length) {
+      logger.log('[oar] The relay is not running.');
+      return { code: 0, reason: 'not-running' };
+    }
+    const refused = await confirmWindowsSweep(ctx, paths, before, STOP_NOW_QUESTION, `${command} stop`);
+    if (refused) return refused;
+    return reportWindowsStop(ctx, await sweepWindowsRelay(ctx, tree));
+  }
+  logger.log(WINDOWS_TREE_LINE);
+  if (now) {
+    const refused = await confirmCutOff(ctx, STOP_NOW_QUESTION, `${command} stop --now`);
+    if (refused) return refused;
+  }
+  if (!(await requestShutdown(ctx, relay.endpoint, false, { immediate: now }))) {
+    logger.error('[oar] The relay did not accept the stop request.');
+    return { code: 1, reason: 'stop-refused' };
+  }
+  const main = [before.supervisor, before.runtime].filter(Boolean);
+  const down = await pollUntil(
+    async () => (await probeRelayPort({ ...relay.endpoint, fetchImpl: ctx.fetchImpl })) === 'none' && await tree.gone(main),
+    { waitMs: ctx.stopWaitMs, pollMs: ctx.pollMs },
+  );
+  if (!down && !now) {
+    logger.log(`[oar] The relay is still busy; it stops by itself when its running turns finish (at once: ${command} stop --now). Its session workers keep running then; ${command} stop ends them once it has stopped.`);
+    return { code: 0, reason: 'stop-queued' };
+  }
+  return reportWindowsStop(ctx, await sweepWindowsRelay(ctx, tree));
+}
+
+// Until this install's relay answers on the config's port, at most `restartWaitMs`.
+async function waitForRestartedRelay(ctx, paths) {
+  const next = endpointOf(paths.config, cliTokenOf(ctx, paths));
+  const up = await pollUntil(
+    async () => (await readRelayStatus({ ...next, fetchImpl: ctx.fetchImpl })).answer === 'oar',
+    { waitMs: ctx.restartWaitMs, pollMs: ctx.pollMs },
+  );
+  if (up) ctx.logger.log('[oar] The relay restarted.');
+  else ctx.logger.error(`[oar] The relay did not come back — see ${path.join(paths.logDir, 'server-err.log')}`);
+  return up;
+}
+
+// A start is done when the relay answers: `{ ok, reason }`.
+async function startedWindowsRelay(ctx, paths) {
+  return (await waitForRestartedRelay(ctx, paths)) ? { ok: true, reason: 'restarted' } : { ok: false, reason: 'server-not-ready' };
+}
+
+/**
+ * Starts the relay again after a sweep that began at `startedAt`: `{ ok,
+ * reason }`. A runtime the lock names that started meanwhile (the boot task
+ * starts the relay again after a failure) is the start: its answer is waited
+ * for, and no second relay starts. While a runtime of the folder runs that
+ * cannot be told apart, nothing starts. Else this install's boot task
+ * (`schtasks /run`), or the background start of `oar start` where there is
+ * none or it is refused.
+ */
+async function startWindowsRelayAgain(ctx, paths, tree, startedAt) {
+  const { logger } = ctx;
+  let found = null;
+  try {
+    found = await tree.settledLook();
+  } catch {}
+  if (found?.unclear) {
+    reportUnclearRelay(ctx, found);
+    return { ok: false, reason: 'unclear' };
+  }
+  if (found?.runtime && found.runtime.createdAt >= startedAt) {
+    logger.log(`[oar] Windows started the relay again by itself (process ${found.runtime.processId}); no second one is started.`);
+    return startedWindowsRelay(ctx, paths);
+  }
+  if (await windowsBootTaskReady(ctx, paths)) {
+    if (runQuiet(windowsSystemToolPath('schtasks', { env: ctx.env }), ['/run', '/tn', BOOT_TASK_NAME], ctx)) {
+      logger.log(`[oar] Started the relay through its ${bootTaskLabel(BOOT_TASK_NAME)}.`);
+      return startedWindowsRelay(ctx, paths);
+    }
+    logger.log(`[oar] The ${bootTaskLabel(BOOT_TASK_NAME)} could not be started (schtasks /run was refused); the relay starts in the background instead.`);
+  }
+  const result = await startRelay(ctx, paths);
+  reportRelayStart(result, logger);
+  return result.ok ? { ok: true, reason: 'restarted' } : { ok: false, reason: 'server-not-ready' };
+}
+
+/**
+ * `oar restart` on Windows. Without `--now` it is the queued restart it
+ * was: the relay starts a new runtime once no turn runs, and its supervisor
+ * and session workers keep running, which it says. With `--now`, and for a
+ * relay that does not answer while processes of it run (after the same
+ * confirmation): the relay is asked to stop, its whole process tree is
+ * ended and waited for (sweepWindowsRelay), and only then is it started
+ * again (startWindowsRelayAgain). Nothing starts while any of it is left.
+ */
+async function restartWindowsRelay(ctx, paths, options) {
+  const { logger } = ctx;
+  const command = oarCommand(paths);
+  const now = ctx.argv.includes('--now');
+  const relay = await findRelay(ctx, paths);
+  if (relay.answer === 'taken') return reportPortTaken(ctx, paths, relay.endpoint.port);
+  if (relay.answer === 'oar' && !now) {
+    logger.log(`[oar] On Windows this restarts the relay's runtime only; its supervisor and session workers keep running. For a full restart: ${command} restart --now`);
+    const outcome = await restartRelay(ctx, paths, { old: relay.endpoint, viaService: false, answered: true, now: false });
+    if (outcome.ok) await showAddress(ctx, paths);
+    return { code: outcome.ok ? 0 : 1, reason: outcome.reason };
+  }
+  const tree = windowsRelayTree(ctx, paths);
+  let before;
+  try {
+    before = await tree.look();
+  } catch (error) {
+    return windowsListUnreadable(ctx, error);
+  }
+  if (relay.answer === 'none') {
+    if (!before.targets.length && !before.candidates.length) return runStart(options);
+    const refused = await confirmWindowsSweep(ctx, paths, before, RESTART_NOW_QUESTION, `${command} restart`);
+    if (refused) return refused;
+  } else {
+    logger.log(WINDOWS_TREE_LINE);
+    const refused = await confirmCutOff(ctx, RESTART_NOW_QUESTION, `${command} restart --now`);
+    if (refused) return refused;
+    // A stop, not a restart: the supervisor ends with the runtime and starts
+    // no new one. One the relay refuses is refused, as for `oar stop`; only
+    // a relay that does not answer it is swept all the same.
+    const asked = await requestShutdown(ctx, relay.endpoint, false, { immediate: true, noAnswer: 'no-answer' });
+    if (!asked) {
+      logger.error('[oar] The relay did not accept the stop request.');
+      return { code: 1, reason: 'stop-refused' };
+    }
+    if (asked !== 'no-answer') {
+      const main = [before.supervisor, before.runtime].filter(Boolean);
+      await pollUntil(() => tree.gone(main), { waitMs: ctx.stopWaitMs, pollMs: ctx.pollMs });
+    }
+  }
+  const sweep = await sweepWindowsRelay(ctx, tree);
+  if (!sweep.ok) {
+    logger.error('[oar] The relay is not started again while processes of it run.');
+    return { code: 1, reason: sweep.reason };
+  }
+  const started = await startWindowsRelayAgain(ctx, paths, tree, sweep.startedAt);
+  if (!started.ok) return { code: 1, reason: started.reason };
+  try { fs.unlinkSync(paths.previousPath); } catch {}
+  await showAddress(ctx, paths);
+  return { code: 0, reason: 'restarted' };
+}
+
 /**
  * `oar stop` — the relay stops itself once no turn is running, under the
  * service too (its unit stays enabled). `--now` under the service, or a
@@ -1192,6 +1534,7 @@ export async function runStop(options = {}) {
   const missing = requireConfig(ctx, paths);
   if (missing) return missing;
   const now = ctx.argv.includes('--now');
+  if (ctx.platform === 'win32') return stopWindowsRelay(ctx, paths, { now });
   const viaService = (await serviceState(ctx, paths)) === 'active';
   if (viaService && now) {
     const refused = await confirmCutOff(ctx, STOP_NOW_QUESTION, `${oarCommand(paths)} stop --now`);
@@ -1236,6 +1579,7 @@ export async function runRestart(options = {}) {
   const paths = installPaths(ctx);
   const missing = requireConfig(ctx, paths);
   if (missing) return missing;
+  if (ctx.platform === 'win32') return restartWindowsRelay(ctx, paths, options);
   const viaService = (await serviceState(ctx, paths)) === 'active';
   const relay = await findRelay(ctx, paths);
   if (!viaService && relay.answer === 'none') return runStart(options);

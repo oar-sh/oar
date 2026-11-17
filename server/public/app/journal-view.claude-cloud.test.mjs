@@ -234,6 +234,10 @@ test('a started cloud chat opens with its cloud field and leaves the last-used m
 });
 
 test('the next open starts from empty cloud fields, and Copilot keeps its effort row', async () => {
+  // The provider a chat was started on is preselected next time; without
+  // one, the first listed.
+  assert.equal(localStorage.getItem('oar_new_chat_provider'), 'claude-cloud');
+  localStorage.removeItem('oar_new_chat_provider');
   await journal.newConversation();
   assert.equal(el('new-conversation-provider-select').value, 'github');
   assert.equal(el('new-conversation-cloud-row').hidden, true);

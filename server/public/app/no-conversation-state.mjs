@@ -3,14 +3,14 @@
 //
 // Three variants: `setup` when the relay has no provider known to be ready
 // (the fresh-install case: point to Settings → Providers, do not pretend
-// Copilot is set up), `first-chat` when a provider is ready and there are no
+// any provider is set up), `first-chat` when a provider is ready and there are no
 // conversations yet, and `pick` when conversations exist but none is open.
 // A readiness answer that is unknown counts as ready, as everywhere else.
 
 import { blockingReadinessReasons, isSetupRequired } from './provider-readiness.mjs';
 
 export const SETUP_HEADING = 'Set up a provider';
-export const SETUP_TEXT = 'Turn on Claude, Cursor, OpenAI, Grok or DeepSeek in Settings → Providers, or sign in to the Copilot CLI on the relay host.';
+export const SETUP_TEXT = 'Turn on a provider in Settings → Providers: Copilot, Claude, Cursor, OpenAI, Grok or DeepSeek.';
 
 const ACTIONS = Object.freeze({
   openSettings: (primary) => ({ id: 'empty-state-open-settings', action: 'open-settings', label: primary ? 'Open Settings' : 'Settings', primary, link: !primary }),

@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { buildModelCatalogWithOpenAIProvider } from './sessions-routes.mjs';
 import {
-  buildModelCatalogWithOpenAIProvider,
   parseOpenAISettingsUpdateRequest,
-  resolveBootstrapModelSelection,
   parseDefaultSessionWorkspaceRootUpdateRequest,
-  normalizePreferredReasoningEffort,
-} from './sessions-routes.mjs';
+} from './settings-routes.mjs';
+import { resolveBootstrapModelSelection } from './conversation-bootstrap-routes.mjs';
+import { normalizePreferredReasoningEffort } from './sessions-helpers.mjs';
 
 test('parseOpenAISettingsUpdateRequest accepts save and remove requests', () => {
   assert.deepEqual(parseOpenAISettingsUpdateRequest({

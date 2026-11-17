@@ -41,6 +41,7 @@
 import { randomUUID } from 'node:crypto';
 import { resumeRelayMode } from '../../shared/plan-only.mjs';
 import { readPlanOnly } from './conversation-preferences-service.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 
 export const RESTART_RESUME_SETTING_KEY = 'restart_resume_notes';
 export const RESTART_RESUME_KIND = 'relay-restart-resume';
@@ -252,14 +253,20 @@ export function createRestartResumeService({
         null,
       ];
       if (stmts.queueHasImageOperationId || stmts.insertQ?.source?.includes?.('image_operation_id')) queueArgs.push(null);
-      stmts.insertQ.run(...queueArgs);
+      // The conversation is live (checked above); were it archived, the row
+      // would bring it back rather than wait unseen.
+      return queueIntoConversation(db, stmts, queueArgs).unarchived;
     });
+    let unarchived = false;
     try {
-      write();
+      unarchived = write();
     } catch (error) {
       noted.delete(conversationId);
       try { logger?.warn?.(`[restart-resume] conv=${conversationId.slice(0, 8)} note not queued: ${error?.message || error}`); } catch {}
       return null;
+    }
+    if (unarchived) {
+      try { emit(...unarchivedConversationEvent(conversationId)); } catch {}
     }
     try {
       emit('user_message', {

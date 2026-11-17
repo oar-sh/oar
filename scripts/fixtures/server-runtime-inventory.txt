@@ -1,0 +1,787 @@
+# server/server-runtime.mjs inventory, from scripts/server-runtime-inventory.mjs.
+#
+# This file is identity, not a log. A commit that only moves code out of
+# server-runtime.mjs leaves it as it is: a moved name keeps a path (a
+# re-export), the register…() calls get the same keys, the routes come in the
+# same order, the timer and listener counts stay. If the comparison
+# (server/server-runtime-boot.test.mjs) fails on a move, the move is wrong,
+# not this file. It changes only in a commit that changes behaviour on purpose
+# (a route, an export, a deps key, a timer or a listener added or removed);
+# that commit says why in its message, and its checker reviews this diff.
+# Regenerate with: node scripts/server-runtime-inventory.mjs --write
+#
+# The one exception, a limit of how this file is read: a register…() call
+# moved out of server-runtime.mjs into a wiring module loses its "register"
+# and "keyset" lines (only calls made by server-runtime.mjs are wrapped), and
+# a constant delay passed through a factory parameter reads "computed" (the
+# delay is read at the call site). Such a move changes this file; its commit
+# names the move and shows that the routes and timers are otherwise unchanged.
+#
+# Lines: "export", "register <call> arg<n> <kind>" and "keyset <id> <key>"
+# (each distinct key list once), "route <METHOD> <path>" in registration
+# order (a USE line names its functions), "timer <when> <kind> <delay> <ref|unref> x<count>" and
+# "listener <when> <emitter> <event> x<count>". <when> is after-start (right
+# after the relay's listen callback) or at-exit (after its own shutdown).
+# A delay is shown where the call site passes a constant (a number or an
+# UPPER_CASE name); a jittered or computed one counts by kind alone
+# ("computed"). Timeouts under 1 s are left out (their lifetime races the
+# moment of the count), and so are the probe's own timers and listeners.
+# Platform: one file for Windows and Linux; the entries that differ are
+# listed in PLATFORM_ONLY in the script and left out on both.
+#
+# The start runs isolated (tests/helpers/scratch-relay-env.mjs), on an empty
+# database, so these start-up paths are skipped or idle and are outside this
+# file's reach (a move inside them needs the checker's reading):
+# - COPILOT_WEB_RELAY_DISABLE_CLI_SPAWN=1: no session worker launch
+#   (session-worker-launch-service), no CLI install or version probe
+#   (cli-install-service), no Claude or Grok sign-in spawn, no agent SDK
+#   install (agent-sdk-store reconcile), no Windows autostart refresh
+#   (windows-autostart-service, windows-boot-autostart-service).
+# - OAR_NO_UPDATE_CHECK=1: no update-check service and no 12 h poller.
+# - OAR_CLAUDE_CLOUD_API_BASE_URL and OAR_ANTHROPIC_API_BASE_URL at a dead
+#   loopback port, OAR_CLAUDE_CLOUD_BRANCH_LOOKUP=off: no Claude API or Cloud
+#   call succeeds (none is made at start on an empty database).
+# - OAR_HOST_SUSPEND_DRY_RUN=1: a host suspend only logs (none at start).
+# - OAR_BOOT_REPORTING_WINDOW_MS=0: the boot reporting window is zero.
+# - An empty CLI bin folder and a stub Copilot SDK path: no provider CLI is
+#   found, so no Copilot model discovery or SDK session import runs a CLI.
+# - The empty database and default config: no conversation, so no worker
+#   priming, turn recovery, dead-worker sweep or restored task acts on a row;
+#   no paired relay (health loop idle); no tunnel; preview lane off; no push
+#   subscription; no provider enabled.
+# - COPILOT_WEB_RELAY_CLAUDE_AUTH_ALLOW_STUB_SPAWN, _CLI_INSTALL_ALLOW_STUB_SPAWN
+#   and _GROK_AUTH_ALLOW_STUB_SPAWN: spawns re-enabled for the test stubs
+#   only, and only when a request asks (none at start).
+# - localhostOnly: the relay listens on 127.0.0.1; the LAN listen (0.0.0.0,
+#   the network address in the banner) is not taken.
+# - COPILOT_SESSION_STATE_DIR is an empty folder: the startup SDK session
+#   import finds nothing to import.
+# - The database start paths run on an empty data folder: settleDatabaseFile
+#   finds no files to settle, adoptEarlierDatabase answers not-applicable (a
+#   checkout), maybeBackupBeforeStart has no database to copy,
+#   mergeStrayMigratedUploads has nothing to merge.
+# - relay-secrets.json does not exist yet, so the first-start bootstrap
+#   writes it; the start with an existing secrets file (and an ignored
+#   --token) is not taken.
+#
+# What this file cannot see, whatever the flags:
+# - the resources still open at exit (sockets and handles: their count races
+#   the shutdown);
+# - setImmediate, timers/promises and AbortSignal.timeout (only setTimeout and
+#   setInterval are counted);
+# - socket.io middleware and event handlers (io.use, io.on, socket.on);
+# - the order among the anonymous "/" middlewares (each reads "anonymous");
+# - and timers set inside node_modules are counted, so a dependency bump can
+#   change a line here without any change in server-runtime.mjs.
+
+export (none)
+register registerMessagesRoutes arg0 app
+register registerMessagesRoutes arg1 object keyset=K1
+register registerAgentSdkRoutes arg0 app
+register registerAgentSdkRoutes arg1 object keyset=K2
+register registerSessionsRoutes arg0 app
+register registerSessionsRoutes arg1 object keyset=K1
+register registerConversationGroupRoutes arg0 app
+register registerConversationGroupRoutes arg1 object keyset=K1
+register registerAskUserRoutes arg0 app
+register registerAskUserRoutes arg1 object keyset=K1
+register registerRelayBoardRoutes arg0 app
+register registerRelayBoardRoutes arg1 object keyset=K1
+register registerCacheRoutes arg0 app
+register registerCacheRoutes arg1 object keyset=K1
+register registerGitRoutes arg0 app
+register registerGitRoutes arg1 object keyset=K1
+register registerWorkerLogRoutes arg0 app
+register registerWorkerLogRoutes arg1 object keyset=K3
+register registerClaudeCloudRoutes arg0 app
+register registerClaudeCloudRoutes arg1 object keyset=K1
+register registerPushRoutes arg0 app
+register registerPushRoutes arg1 object keyset=K4
+register registerRemoteRelayRoutes arg0 app
+register registerRemoteRelayRoutes arg1 object keyset=K5
+register registerRelayEventRoutes arg0 app
+register registerRelayEventRoutes arg1 object keyset=K6
+register registerRelayScheduleRoutes arg0 app
+register registerRelayScheduleRoutes arg1 object keyset=K7
+register registerDeepSeekUsageImportRoutes arg0 app
+register registerDeepSeekUsageImportRoutes arg1 object keyset=K8
+register registerRelayAskRoutes arg0 app
+register registerRelayAskRoutes arg1 object keyset=K9
+register registerRelayRestartRoutes arg0 app
+register registerRelayRestartRoutes arg1 object keyset=K10
+register registerAboutRoutes arg0 app
+register registerAboutRoutes arg1 object keyset=K11
+register registerAuthRoutes arg0 app
+register registerAuthRoutes arg1 object keyset=K12
+register registerPreviewRoutes arg0 app
+register registerPreviewRoutes arg1 object keyset=K13
+keyset K1 DEFAULT_CONVERSATION_SESSION_MODE
+keyset K1 DEFAULT_MODEL
+keyset K1 DEFAULT_QUESTION_TIMEOUT_MS
+keyset K1 DEFAULT_RELAY_MODE
+keyset K1 MAX_IMAGE_DATA_URL_LENGTH
+keyset K1 MAX_REFERENCE_IMAGE_ATTACHMENT_BYTES
+keyset K1 MAX_REPO_TREE_NODES
+keyset K1 MAX_REQUEUE_RETRIES
+keyset K1 MAX_UPLOAD_ATTACHMENTS
+keyset K1 MAX_UPLOAD_BYTES
+keyset K1 MAX_WORKSPACE_PREVIEW_BYTES
+keyset K1 SUPPORTED_CONVERSATION_SESSION_MODES
+keyset K1 SUPPORTED_REASONING_EFFORTS
+keyset K1 SUPPORTED_RELAY_MODES
+keyset K1 addMsIso
+keyset K1 attachmentSummary
+keyset K1 auth
+keyset K1 backgroundTaskStore
+keyset K1 backgroundWorkView
+keyset K1 bootstrapRuntimeSessionBindings
+keyset K1 buildContextResponseText
+keyset K1 buildRelayReadyBannerData
+keyset K1 buildRepositoryTreeSnapshot
+keyset K1 buildUpdateStatePayload
+keyset K1 cancelRelayShutdown
+keyset K1 checkClaudeApiCap
+keyset K1 claudeAccountUsageService
+keyset K1 claudeApiClaimCheck
+keyset K1 claudeApiPlanUsage
+keyset K1 claudeApiSettingsService
+keyset K1 claudeApiStopLedger
+keyset K1 claudeApiUsageService
+keyset K1 claudeAuthService
+keyset K1 claudeBillingSwitchService
+keyset K1 claudeCloudLoginStatus
+keyset K1 claudeCloudRepoService
+keyset K1 claudeCloudSessionService
+keyset K1 claudeCloudSettingsService
+keyset K1 cliInstallService
+keyset K1 closeConversationPreviews
+keyset K1 collectHostActivity
+keyset K1 collectOrphanedUploadsFromConversation
+keyset K1 collectReferenceAttachmentsFromText
+keyset K1 compareRepoDirEntries
+keyset K1 computeRetryDelayMs
+keyset K1 config
+keyset K1 configuredConversationSessionMode
+keyset K1 conversationGroups
+keyset K1 copilotModelDiscoveryService
+keyset K1 createCompactedConversation
+keyset K1 currentWorkspaceRootPath
+keyset K1 db
+keyset K1 deepseekBalanceService
+keyset K1 deepseekClaudeConfigDir
+keyset K1 deepseekSettingsService
+keyset K1 deepseekUsageImportService
+keyset K1 deleteOrphanedUploads
+keyset K1 detectCopilotCli
+keyset K1 driveDisplayName
+keyset K1 driveRootFromAbsolutePath
+keyset K1 emitToClientsExceptSessionId
+keyset K1 ensureRuntimeSessionBinding
+keyset K1 ensureSessionId
+keyset K1 failClaudeApiRowsWithoutLaunch
+keyset K1 failCopilotRowsWithoutLaunch
+keyset K1 fetchBrowsableDrives
+keyset K1 fetchCopilotBillingUsage
+keyset K1 fetchCursorDashboardUsage
+keyset K1 fetchDriveDirectoryEntries
+keyset K1 fetchGrokBillingUsage
+keyset K1 fetchLinuxDirectoryEntries
+keyset K1 fetchUsageSummary
+keyset K1 fetchWorkspaceDirectoryEntries
+keyset K1 fileCapabilities
+keyset K1 formatQuestionRow
+keyset K1 formatRelayBoardRow
+keyset K1 fs
+keyset K1 getBackgroundTaskTimeoutMinutes
+keyset K1 getClaudeApiCapState
+keyset K1 getClaudeApiProviderSettings
+keyset K1 getClaudeCloudProviderSettings
+keyset K1 getClaudeProviderSettings
+keyset K1 getCopilotModelState
+keyset K1 getCopilotProviderSettings
+keyset K1 getCursorDashboardTokenSettings
+keyset K1 getCursorPlanAllowanceSettings
+keyset K1 getCursorProviderSettings
+keyset K1 getDeepSeekProviderSettings
+keyset K1 getGrokPlanAllowanceSettings
+keyset K1 getGrokProviderSettings
+keyset K1 getModelCatalogState
+keyset K1 getOpenAIImageSpendState
+keyset K1 getOpenAIProviderSettings
+keyset K1 getOrCreateConversation
+keyset K1 getPwaAppName
+keyset K1 getRestartResumeEnabled
+keyset K1 getSharePathPrivacyMode
+keyset K1 getSharedWatcherCount
+keyset K1 getSubagentRecordRetentionDays
+keyset K1 getTaskStallMinutes
+keyset K1 getTurnCeilingMinutes
+keyset K1 gitChangesService
+keyset K1 gitRemoteService
+keyset K1 grokAuthService
+keyset K1 hasLiveWorkerSocket
+keyset K1 hostSuspendService
+keyset K1 hydrateAttachment
+keyset K1 imageInputDenyPaths
+keyset K1 imageOperationService
+keyset K1 inFlightStateForConversation
+keyset K1 io
+keyset K1 isClaudeModelRefreshSetUp
+keyset K1 isGrokModelRefreshSetUp
+keyset K1 isLikelyBinaryPreviewBuffer
+keyset K1 isLikelyTextContentType
+keyset K1 isSha256
+keyset K1 isTrulyLocalRequest
+keyset K1 learnConversationWorkspaceRoot
+keyset K1 linkUploadReferences
+keyset K1 listConversationPreviews
+keyset K1 listKnownPreviewTokens
+keyset K1 listModelVariantRows
+keyset K1 listenHost
+keyset K1 localhostOnly
+keyset K1 mapDriveDirectoryEntry
+keyset K1 mapLinuxDirectoryEntry
+keyset K1 markCliOffline
+keyset K1 markCopilotModelsSeen
+keyset K1 markProviderModelsSeen
+keyset K1 markSharedViewerPresence
+keyset K1 maybeApplyWorkspaceRootFromMessage
+keyset K1 mediaTags
+keyset K1 mergeMessageAttachments
+keyset K1 mintAgentToken
+keyset K1 modelRefreshLedger
+keyset K1 modelRefreshScheduler
+keyset K1 modelRefreshSettings
+keyset K1 normalizeAttachments
+keyset K1 normalizeDriveAbsolutePath
+keyset K1 normalizeLinuxAbsolutePath
+keyset K1 normalizeQuestionChoices
+keyset K1 normalizeRelayMode
+keyset K1 normalizeWorkspaceRelativePath
+keyset K1 noteRestartTurnOutcome
+keyset K1 notifyOpenAIImageSpendChanged
+keyset K1 onClaudeBillingFence
+keyset K1 openAIImageSpend
+keyset K1 parseAttachments
+keyset K1 parseBoardActions
+keyset K1 parseBooleanQueryFlag
+keyset K1 parseModelVariantSelection
+keyset K1 parseQuestionRequest
+keyset K1 path
+keyset K1 persistUploadBuffer
+keyset K1 planUsageService
+keyset K1 pokeTaskHealth
+keyset K1 previewCardsForResponse
+keyset K1 previewLanguageForWorkspaceFile
+keyset K1 processingTimeoutMs
+keyset K1 protectedRelayFiles
+keyset K1 pushDispatchService
+keyset K1 questionExpiresAt
+keyset K1 queueCounts
+keyset K1 readContextFromSessionEvents
+keyset K1 readSessionTranscriptMessages
+keyset K1 readSessionUsageSummary
+keyset K1 readWorkspaceFileMeta
+keyset K1 readWorkspaceFilePreviewBuffer
+keyset K1 rebindUnstartedOpenAIConversationModel
+keyset K1 refreshClaudeProviderModels
+keyset K1 refreshCursorProviderModels
+keyset K1 refreshGrokProviderModels
+keyset K1 refreshModelVariantCatalogFromCli
+keyset K1 refreshOpenAIProviderModels
+keyset K1 relayActivityForQueueMessage
+keyset K1 relayActivityForResponse
+keyset K1 relayAskService
+keyset K1 relayEventService
+keyset K1 relayScheduleService
+keyset K1 relayShutdownStatePayload
+keyset K1 relayThoughtsForQueueMessage
+keyset K1 relayThoughtsForResponse
+keyset K1 remotePath
+keyset K1 remoteRelayInbound
+keyset K1 requestRelayShutdown
+keyset K1 resolveClaudeSessionRoot
+keyset K1 resolveConversationRecord
+keyset K1 resolveConversationWorkspaceState
+keyset K1 resolveCursorSessionRoot
+keyset K1 resolveDeepSeekSessionRoot
+keyset K1 resolveLiveTurnQueueRow
+keyset K1 resolveRequestedModel
+keyset K1 resolveRequestedReasoningEffort
+keyset K1 resolveSessionStateRoot
+keyset K1 resolveWorkspaceFilePath
+keyset K1 resolveWorkspaceFileTargetPath
+keyset K1 runningVersion
+keyset K1 runtimeState
+keyset K1 sameConversation
+keyset K1 sanitizeActivityText
+keyset K1 sanitizeRelayQuestionContext
+keyset K1 sanitizeRelayQuestionPrompt
+keyset K1 sanitizeRelayQuestionRequest
+keyset K1 sdkSessionImportService
+keyset K1 sendWorkerControl
+keyset K1 sessionActivityTracker
+keyset K1 sessionHistoryRefreshService
+keyset K1 sessionWorkerProcessInspector
+keyset K1 sessionWorkerRegistry
+keyset K1 sessionWorkerSupervisor
+keyset K1 setBackgroundTaskTimeoutMinutes
+keyset K1 setClaudeProviderSettings
+keyset K1 setCopilotAutoEnableNew
+keyset K1 setCursorDashboardTokenSettings
+keyset K1 setCursorPlanAllowanceSettings
+keyset K1 setCursorProviderSettings
+keyset K1 setDefaultSessionWorkspaceRootPath
+keyset K1 setEnabledModelVariants
+keyset K1 setGrokPlanAllowanceSettings
+keyset K1 setGrokProviderSettings
+keyset K1 setOpenAIProviderSettings
+keyset K1 setPwaAppName
+keyset K1 setRestartResumeEnabled
+keyset K1 setSharePathPrivacyMode
+keyset K1 setSubagentRecordRetentionDays
+keyset K1 setTaskStallMinutes
+keyset K1 setTurnCeilingMinutes
+keyset K1 setWorkspaceRoot
+keyset K1 sharePathKnownRoots
+keyset K1 shareRepository
+keyset K1 shouldSkipRepoEntryName
+keyset K1 statusEventService
+keyset K1 stmts
+keyset K1 subagentRunsForResponse
+keyset K1 taskOutputSnapshots
+keyset K1 toDriveWebPath
+keyset K1 tokenUsageService
+keyset K1 touchCli
+keyset K1 ts
+keyset K1 updateCheckService
+keyset K1 updateConversationConfiguredWorkspaceRoot
+keyset K1 updateInstallService
+keyset K1 updateModelCatalog
+keyset K1 uploadContentUrlForSha
+keyset K1 uploadPathForSha
+keyset K1 uploadReadDirs
+keyset K1 uploadsDir
+keyset K1 usageLimitPauseService
+keyset K1 uuidv4
+keyset K1 windowsAutostartService
+keyset K1 windowsBootAutostartService
+keyset K1 workerReplacementFence
+keyset K1 workersStateTheirKind
+keyset K1 workflowRunsForResponse
+keyset K1 workspaceContentType
+keyset K1 workspaceFileMetaCache
+keyset K1 workspacePreviewKindForMeta
+keyset K1 workspaceRootAllowList
+keyset K1 workspaceRootPayload
+keyset K2 agentSdkStore
+keyset K2 auth
+keyset K2 io
+keyset K3 auth
+keyset K3 getConversation
+keyset K3 getLaunchEnv
+keyset K3 providerOf
+keyset K3 remoteRelayInbound
+keyset K4 auth
+keyset K4 getPushVapidPublicKey
+keyset K4 pushDispatchService
+keyset K5 auth
+keyset K5 dispatcher
+keyset K5 pairing
+keyset K5 peerKeys
+keyset K5 registry
+keyset K5 remoteRelayInbound
+keyset K6 auth
+keyset K6 relayEventService
+keyset K6 remoteRelayInbound
+keyset K7 auth
+keyset K7 relayScheduleService
+keyset K7 remoteRelayInbound
+keyset K8 auth
+keyset K8 deepseekUsageImportService
+keyset K8 getCardCurrency
+keyset K8 remoteRelayInbound
+keyset K9 auth
+keyset K9 db
+keyset K9 formatQuestionRow
+keyset K9 formatRelayBoardRow
+keyset K9 questionNotice
+keyset K9 relayAskLinkService
+keyset K9 relayAskService
+keyset K9 relayNotices
+keyset K9 remoteRelayClient
+keyset K9 remoteRelayInbound
+keyset K9 remoteRelayRegistry
+keyset K9 stmts
+keyset K10 auth
+keyset K10 collectRestartPicture
+keyset K10 getMaxWaitMinutes
+keyset K10 getState
+keyset K10 keepWaiting
+keyset K10 maxWaitOverrideMs
+keyset K10 setMaxWaitMinutes
+keyset K11 aboutService
+keyset K11 auth
+keyset K12 auth
+keyset K12 browserSessions
+keyset K12 isTrulyLocalRequest
+keyset K12 logger
+keyset K12 onSessionsRevoked
+keyset K12 ownerSecretStore
+keyset K12 ownerTokenUse
+keyset K12 publicBaseUrl
+keyset K12 qrMatrix
+keyset K12 readSetting
+keyset K12 relayAuth
+keyset K12 remoteRelayRegistry
+keyset K12 signInCodes
+keyset K12 signInNotices
+keyset K12 writeSetting
+keyset K13 auth
+keyset K13 previewHealthProbe
+keyset K13 previewRegistry
+keyset K13 recordPreviewCard
+keyset K13 resolveConversationScope
+keyset K13 resolvePreviewWorkspaceRoot
+route USE / [requestMiddleware]
+route USE / [jsonParser]
+route USE / [anonymous]
+route USE / [anonymous]
+route USE / [workerPostRedaction]
+route USE / [anonymous]
+route GET /socket.io/socket.io.js
+route GET /manifest.webmanifest
+route GET /sw.js
+route GET /,/index.html
+route GET /shared/:token,/shared/:token/
+route GET /share-preview/:conversationId,/share-preview/:conversationId/
+route USE / [serveStatic]
+route POST /api/session-worker/:sdkSessionId/kill
+route POST /api/conversation/:conversationId/cancel-turn
+route POST /api/conversation-groups/:id/stop
+route POST /api/conversation/:conversationId/subagent/:subagentRunId/cancel
+route POST /api/conversation/:conversationId/cancel-queued-turn
+route GET /api/control/active
+route POST /api/control/:controlId/result
+route POST /api/upload
+route GET /api/upload/:sha256/content
+route GET /api/generated-image/:conversationId/:messageId/:imageId/content
+route GET /api/media
+route GET /api/media/counts
+route GET /api/media/facets
+route GET /api/media/:id/content
+route POST /api/files/capability
+route GET /api/files/{*splat}
+route GET /api/files-preview/{*splat}
+route GET /api/repo/tree
+route GET /api/repo/list
+route GET /api/drives/roots
+route GET /api/drives/list
+route GET /api/session-root/list
+route POST /api/repo/mkdir
+route POST /api/repo/rename
+route POST /api/repo/delete
+route POST /api/drives/mkdir
+route POST /api/drives/rename
+route POST /api/drives/delete
+route GET /api/drives/file
+route GET /api/drives/files-preview
+route POST /api/message
+route POST /api/conversation/:id/billing
+route POST /api/heartbeat
+route POST /api/grok-native-session
+route POST /api/claude-native-session
+route POST /api/claude-context-usage
+route POST /api/grok-plan-usage
+route POST /api/deepseek-plan-usage
+route POST /api/claude-api-usage
+route POST /api/turn-token-usage
+route POST /api/claude-plan-usage
+route POST /api/claude-usage-limit
+route POST /api/copilot-plan-usage
+route POST /api/cursor-plan-usage
+route POST /api/cursor-agent-id
+route POST /api/cursor-context-usage
+route POST /api/grok-context-usage
+route POST /api/queue-consumed
+route POST /api/queue-cancelled
+route GET /api/pending
+route POST /api/relay/pause
+route POST /api/relay/resume
+route POST /api/queue/empty
+route POST /api/relay/shutdown
+route POST /api/relay/shutdown/cancel
+route GET /api/generated-image/:conversationId/:messageId/partials/:fileName
+route GET /api/image-usage
+route POST /api/image-operations/:operationId/execute
+route POST /api/openai/images/generate
+route POST /api/response
+route POST /api/continuation-turn
+route POST /api/background-task-settled
+route POST /api/background-tasks
+route POST /api/background-tasks/:taskId/output-snapshot
+route POST /api/activity
+route POST /api/stream
+route POST /api/thought
+route POST /api/subagent-run
+route POST /api/subagent-timeline
+route POST /api/conversation/:conversationId/background-task/:taskId/stop
+route GET /api/conversation/:conversationId/background-task/:taskId/output
+route GET /api/conversation/:conversationId/subagent/:subagentRunId
+route POST /api/requeue
+route GET /api/agent-sdks/status
+route POST /api/agent-sdks/install
+route POST /api/agent-sdks/install/cancel
+route GET /api/conversations
+route GET /api/sessions
+route GET /api/workspace-root/attribution
+route POST /api/workspace-root/attribution
+route GET /api/context/:conversationId
+route GET /api/context
+route GET /api/search/messages
+route POST /api/conversation/:id/refresh-history
+route GET /api/conversation/:id
+route PATCH /api/conversation/:id/message/:messageId/pin
+route POST /api/conversation/:id/share
+route POST /api/conversation/:id/share/renew
+route DELETE /api/conversation/:id/share
+route GET /api/shares
+route GET /api/conversation/:id/share/opens
+route GET /api/shared/:token
+route GET /api/conversation/:id/share-preview
+route GET /api/shared/:token/subagent/:subagentRunId
+route GET /api/conversation/:id/share-preview/subagent/:subagentRunId
+route POST /api/shared/:token/presence
+route GET /api/shared/:token/upload/:sha256/content
+route GET /api/shared/:token/generated-image/:messageId/:imageId/content
+route PATCH /api/conversation/:id/message/:messageId/share-visibility
+route POST /api/conversation/:id/share-visibility/unhide-all
+route GET /api/status/events
+route PATCH /api/conversation/:id
+route PATCH /api/conversation/:id/preferences
+route PATCH /api/conversation/:id/settings
+route PATCH /api/conversation/:id/draft
+route POST /api/conversation/:id/workspace-root
+route POST /api/conversation/:id/relaunch-with-workspace-root
+route POST /api/conversation/:id/compact
+route DELETE /api/conversation/:id
+route POST /api/conversation/:id/archive
+route POST /api/conversation-groups/:id/archive
+route POST /api/conversation/:id/unarchive
+route POST /api/conversation/bootstrap
+route GET /api/status
+route GET /api/settings/shares
+route POST /api/settings/shares
+route GET /api/settings/shares/stored-viewer-ips
+route DELETE /api/settings/shares/stored-viewer-ips
+route POST /api/settings/default-session-workspace-root
+route GET /api/settings/openai
+route POST /api/settings/openai
+route GET /api/openai-image-presets
+route PUT /api/openai-image-presets
+route DELETE /api/openai-image-presets/:name
+route GET /api/settings/copilot
+route POST /api/settings/copilot
+route GET /api/settings/claude
+route POST /api/settings/claude
+route GET /api/settings/grok
+route POST /api/settings/grok
+route GET /api/settings/cursor
+route POST /api/settings/cursor
+route GET /api/settings/deepseek
+route POST /api/settings/deepseek
+route GET /api/settings/claude-api
+route POST /api/settings/claude-api
+route GET /api/settings/turn-ceiling
+route POST /api/settings/turn-ceiling
+route GET /api/settings/subagent-record-retention
+route POST /api/settings/subagent-record-retention
+route GET /api/settings/share-path-privacy
+route POST /api/settings/share-path-privacy
+route GET /api/settings/background-task-timeout
+route POST /api/settings/background-task-timeout
+route GET /api/settings/task-stall-minutes
+route POST /api/settings/task-stall-minutes
+route GET /api/settings/restart-resume
+route POST /api/settings/restart-resume
+route GET /api/settings/pwa-app-name
+route POST /api/settings/pwa-app-name
+route GET /api/settings/windows-autostart
+route POST /api/settings/windows-autostart
+route GET /api/settings/cursor-allowance
+route POST /api/settings/cursor-allowance
+route GET /api/settings/cursor-dashboard-token
+route POST /api/settings/cursor-dashboard-token
+route GET /api/settings/grok-allowance
+route POST /api/settings/grok-allowance
+route GET /api/claude/auth/status
+route POST /api/claude/auth/login/start
+route POST /api/claude/auth/login/code
+route POST /api/claude/auth/login/cancel
+route POST /api/claude/auth/logout
+route GET /api/cli/status
+route POST /api/cli/install
+route POST /api/cli/install/cancel
+route GET /api/update/state
+route POST /api/update/auto-check
+route POST /api/update/check
+route POST /api/update/dismiss
+route POST /api/update/cancel
+route POST /api/update/apply
+route GET /api/grok/auth/status
+route POST /api/grok/auth/login/start
+route POST /api/grok/auth/login/cancel
+route POST /api/grok/auth/logout
+route POST /api/workspace-root
+route POST /api/session-worker/:sdkSessionId/launch
+route GET /api/host/suspend
+route POST /api/host/suspend
+route POST /api/host/suspend/cancel
+route GET /api/usage-limit
+route POST /api/usage-limit/resume
+route POST /api/usage-limit/cancel
+route GET /api/model-variants
+route POST /api/model-variants/refresh
+route PATCH /api/model-variants
+route POST /api/model-variants/seen
+route GET /api/model-refresh-settings
+route POST /api/model-refresh-settings
+route GET /api/models
+route POST /api/models/snapshot
+route GET /api/usage
+route GET /api/conversation-groups
+route POST /api/conversation-groups
+route PATCH /api/conversation-groups/:id
+route PUT /api/conversation/:id/group
+route DELETE /api/conversation/:id/group
+route DELETE /api/conversation-groups/:id
+route GET /api/relay-questions
+route GET /api/relay-question/:id
+route POST /api/relay-question/:id/dismiss
+route POST /api/relay-question
+route POST /api/relay-question/:id/answer
+route POST /api/relay-question/:id/timeout
+route GET /api/relay-boards
+route GET /api/relay-board/:id
+route POST /api/relay-board
+route POST /api/relay-board/:id/action
+route POST /api/cache/rebuild
+route GET /api/git/remote
+route GET /api/git/status
+route GET /api/git/diff
+route POST /api/git/pull
+route GET /api/conversation/:conversationId/worker-log
+route GET /api/settings/claude-cloud
+route POST /api/settings/claude-cloud
+route POST /api/claude-cloud-session
+route GET /api/claude-cloud-session
+route POST /api/claude-cloud/login-nudge
+route GET /api/claude-cloud/repos
+route GET /api/claude-cloud/branches
+route GET /api/push/vapid-public-key
+route GET /api/push/devices
+route POST /api/push/subscribe
+route PATCH /api/push/devices/:id
+route DELETE /api/push/devices/:id
+route GET /api/relay/identity
+route GET /api/remote-relays
+route GET /api/remote-relays/summary
+route GET /api/remote-relays/inflight
+route POST /api/remote-relays
+route POST /api/remote-relays/peer-key
+route GET /api/remote-relays/peer-key/check
+route POST /api/remote-relays/peer-key/request
+route POST /api/remote-relays/peer-key/inbound
+route POST /api/remote-relays/pair
+route POST /api/remote-relays/tool
+route GET /api/settings/remote-relays
+route POST /api/settings/remote-relays
+route GET /api/settings/agent-sessions
+route POST /api/settings/agent-sessions
+route PATCH /api/remote-relays/:id
+route DELETE /api/remote-relays/:id
+route POST /api/remote-relays/:id/check
+route POST /api/remote-relays/:id/repair
+route POST /api/remote-relays/:id/renew-key
+route POST /api/remote-relays/:id/revoke-key
+route POST /api/remote-relays/:id/confirm-identity
+route POST /api/remote-relays/:id/refusal-notice/dismiss
+route GET /api/relay-events/subscriptions
+route POST /api/relay-events/remote/subscribe
+route POST /api/relay-events/remote/pull
+route DELETE /api/relay-events/subscriptions/:id
+route GET /api/relay-schedules
+route DELETE /api/relay-schedules/:id
+route POST /api/deepseek-usage-import
+route GET /api/relay-asks
+route GET /api/inbox
+route POST /api/inbox/relays/:relayId/asks/:id/answer
+route POST /api/inbox/relays/:relayId/asks/:id/dismiss
+route POST /api/relay-asks/remote/ask
+route POST /api/relay-asks/remote/status
+route POST /api/relay-asks/remote/withdraw
+route POST /api/relay-asks/remote/answer
+route POST /api/relay-asks/remote/dismiss
+route GET /api/relay-asks/remote/inbox
+route GET /api/relay/shutdown
+route POST /api/relay/shutdown/keep-waiting
+route GET /api/settings/relay-restart-max-wait
+route POST /api/settings/relay-restart-max-wait
+route GET /api/about
+route POST /api/auth/session
+route DELETE /api/auth/session
+route GET /api/auth/sessions
+route PATCH /api/auth/sessions/:id
+route DELETE /api/auth/sessions/:id
+route DELETE /api/auth/sessions
+route POST /api/auth/signin-codes
+route POST /api/auth/signin-codes/terminal
+route GET /api/auth/owner-token
+route POST /api/auth/owner-token/rotate
+route GET /api/auth/notices
+route POST /api/auth/notices/dismiss-signins
+route POST /api/auth/notices/:id/dismiss
+route GET /api/previews
+route POST /api/previews
+route DELETE /api/previews/:token
+timer after-start setInterval 10000ms ref x1
+timer after-start setInterval 15000ms ref x1
+timer after-start setInterval 21600000ms unref x1
+timer after-start setInterval 300000ms unref x1
+timer after-start setInterval 30000ms unref x1
+timer after-start setInterval 3000ms ref x1
+timer after-start setInterval 600000ms unref x1
+timer after-start setInterval 60000ms unref x1
+timer after-start setInterval 86400000ms unref x1
+timer after-start setInterval computed unref x7
+timer after-start setTimeout 30000ms unref x1
+timer after-start setTimeout 60000ms unref x1
+timer after-start setTimeout computed unref x7
+listener after-start process SIGINT x1
+listener after-start process SIGTERM x1
+listener after-start process exit x1
+listener after-start process newListener x2
+listener after-start process removeListener x2
+listener after-start process uncaughtExceptionMonitor x1
+listener after-start process warning x1
+listener after-start server close x1
+listener after-start server connection x1
+listener after-start server error x1
+listener after-start server listening x2
+listener after-start server request x1
+listener after-start server upgrade x5
+timer at-exit setInterval 60000ms unref x1
+timer at-exit setInterval computed unref x1
+listener at-exit process SIGINT x1
+listener at-exit process SIGTERM x1
+listener at-exit process exit x1
+listener at-exit process newListener x2
+listener at-exit process removeListener x2
+listener at-exit process uncaughtExceptionMonitor x1
+listener at-exit process warning x1
+listener at-exit server close x2
+listener at-exit server connection x1
+listener at-exit server error x1
+listener at-exit server listening x2
+listener at-exit server request x1
+listener at-exit server upgrade x4

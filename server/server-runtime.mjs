@@ -34,16 +34,19 @@ import { sanitizeRelayQuestionContext as sanitizeRelayQuestionContextWith } from
 import { isRealPathWithinRoot } from './services/workspace-symlink-guard.mjs';
 import { applySchema } from './db-schema.mjs';
 import { createSessionRepository } from './repositories/session-repository.mjs';
-import { createMessageRepository } from './repositories/message-repository.mjs';
+import { createMessageRepository, settleFailedRowControlsAndCards } from './repositories/message-repository.mjs';
 import { createQuestionRepository } from './repositories/question-repository.mjs';
 import { mapRelayActivityRow, mapRelayThoughtRow, sanitizeActivityText } from './repositories/relay-turn-rows.mjs';
 import { createImageConversationRepository } from './repositories/image-conversation-repository.mjs';
 import { registerSessionsRoutes } from './routes/sessions-routes.mjs';
-import { buildDequeuedRelayMessage, claudeApiRemedyText, dequeuePendingMessageForWorkerLoop, registerMessagesRoutes } from './routes/messages-routes.mjs';
+import { registerMessagesRoutes } from './routes/messages-routes.mjs';
+import { buildDequeuedRelayMessage, dequeuePendingMessageForWorkerLoop } from './routes/messages-worker-claim-routes.mjs';
+import { claudeApiRemedyText } from './routes/messages-worker-output-routes.mjs';
 import { registerAskUserRoutes } from './routes/ask-user-routes.mjs';
 import { registerRelayBoardRoutes } from './routes/relay-board-routes.mjs';
 import { registerCacheRoutes } from './routes/cache-routes.mjs';
 import { registerGitRoutes } from './routes/git-routes.mjs';
+import { registerWorkerLogRoutes } from './routes/worker-log-routes.mjs';
 import { registerClaudeCloudRoutes } from './routes/claude-cloud-routes.mjs';
 import { createPreviewScopeResolver, registerPreviewRoutes } from './routes/preview-routes.mjs';
 import { registerRemoteRelayRoutes } from './routes/remote-relay-routes.mjs';
@@ -90,7 +93,7 @@ import { createClaudeApiUsageService } from './services/claude-api-usage-service
 import { createTokenUsageService } from './services/token-usage-service.mjs';
 import { createOpenAIImageSpendService } from './services/openai-image-spend-service.mjs';
 import { createClaudeApiCapWatch, createClaudeApiPlanUsage, createClaudeApiStopNoteLedger } from './services/plan-usage-claude-api.mjs';
-import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, DEFAULT_DEEPSEEK_MODEL, deepseekModelLabel } from '../shared/deepseek-models.mjs';
+import { DEEPSEEK_DEFAULT_AUTO_COMPACT_WINDOW, deepseekModelLabel } from '../shared/deepseek-models.mjs';
 import { createClaudeCloudSessionService } from './services/claude-cloud-session-service.mjs';
 import { createClaudeCloudRepoService, listRecentCloudSourcesFromStatements } from './services/claude-cloud-repo-service.mjs';
 import { createClaudeAccountUsageService } from './services/claude-account-usage-service.mjs';
@@ -156,6 +159,13 @@ import { fetchPersonalBillingUsage } from './services/github-billing-usage.mjs';
 import { createSessionTranscriptService } from './services/session-transcript-service.mjs';
 import { createSdkSessionImportService } from './services/sdk-session-import-service.mjs';
 import { createCopilotModelDiscoveryService } from './services/copilot-model-discovery-service.mjs';
+import {
+  copilotClaimRefusal,
+  copilotEnabledFromStmts,
+  copilotSwitchedOffNoteText,
+  createCopilotCliDetector,
+  isCopilotProviderType,
+} from './services/copilot-settings-service.mjs';
 import { createInstalledCopilotClient, resolveCopilotSdkLaunchPath, resolveInstalledCopilotPaths } from './copilot-sdk-runtime.mjs';
 import { createSessionHistoryRefreshService } from './services/session-history-refresh-service.mjs';
 import { createContextSnapshotService } from './services/context-snapshot-service.mjs';
@@ -212,6 +222,7 @@ import { createWindowsBootAutostartService } from './services/windows-boot-autos
 import { createSessionWorkerWebSocketService } from './services/session-worker-websocket-service.mjs';
 import { createSubagentViewerRooms } from './services/subagent-viewer-rooms.mjs';
 import { createTaskOutputRooms } from './services/task-output-rooms.mjs';
+import { createWorkerLogRooms } from './services/worker-log-service.mjs';
 import { createTaskHealthPoller, createTaskOutputSnapshots } from './services/task-output-service.mjs';
 import {
   resolveDefaultSessionWorkspaceRootState as resolveDefaultSessionWorkspaceRootStateFromService,
@@ -257,6 +268,7 @@ import { reportParkedQueueAtBoot } from './services/relay-queue-gate-service.mjs
 import { failRowsOfGoneConversations, failStaleOwnerlessRowsAtBoot } from './services/ownerless-queue-rows.mjs';
 import { createPendingWorkerPrimer, createQueueWaker } from './services/queue-waker.mjs';
 import { createStaleTurnRecovery } from './services/stale-turn-recovery.mjs';
+import { createWorkerSessionLiveness } from './services/worker-session-liveness.mjs';
 import {
   STALE_SUBAGENT_RUN_BOOT_DELAY_MS,
   STALE_SUBAGENT_RUN_SWEEP_INTERVAL_MS,
@@ -293,6 +305,7 @@ import {
   readTaskStallMinutesSetting,
 } from '../shared/task-output-text.mjs';
 import { normalizeRelayThoughtList } from './public/app/relay-thoughts.mjs';
+import { providerSessionLabel } from './public/app/conversation-provider-indicator.mjs';
 import {
   capFinishedActivityEntries,
   capRelayActivityEntries,
@@ -2240,11 +2253,23 @@ function readAppSettingValue(key) {
   return String(stmts.getAppSetting.get(normalizedKey)?.value || '').trim();
 }
 
+// Whether the Copilot CLI (its SDK and binary) is installed on this host. The
+// one detector every reader of the Copilot switch gets: on a new database the
+// first read decides the switch from it and writes the answer, so detection
+// never flips it later (copilot-settings-service.mjs).
+const detectCopilotCli = createCopilotCliDetector({ resolveInstalledPaths: () => resolveInstalledCopilotPaths({ config }) });
+
+// The Copilot switch (Settings → Providers → Copilot), read at each use.
+function isCopilotEnabled() {
+  return copilotEnabledFromStmts(stmts, { detectCli: detectCopilotCli });
+}
+
 // Copilot (github and openai conversations) runs on the SDK worker and
-// nothing else. The answer keeps its shape for paired relays on a version
-// that still asks which engine this relay runs.
+// nothing else. The engine fields keep their shape for paired relays on a
+// version that still asks which engine this relay runs; `enabled` is the
+// switch, `cliFound` whether the CLI is installed.
 function getCopilotProviderSettings() {
-  return { engine: 'sdk', engines: ['sdk'] };
+  return { engine: 'sdk', engines: ['sdk'], enabled: isCopilotEnabled(), cliFound: detectCopilotCli() };
 }
 
 function getTurnCeilingMinutes() {
@@ -2698,9 +2723,10 @@ const modelVariantCatalog = createModelVariantCatalogService({
   autoModelSentinel: AUTO_MODEL_SENTINEL,
   runCopilotCliCommand,
   modelStateStore: providerModelState,
-  onNewModels: (baseModelIds, on) => modelRefreshLedger.noteNewModels('github', baseModelIds.map((id) => ({ id, on }))),
+  // Copilot's line in the model-refresh ledger only while it is switched on.
+  onNewModels: (baseModelIds, on) => { if (isCopilotEnabled()) modelRefreshLedger.noteNewModels('github', baseModelIds.map((id) => ({ id, on }))); },
   // A worker's snapshot read the runtime's list: a Copilot model refresh.
-  onAuthoritativeSnapshot: () => modelRefreshLedger.record('github', { ok: true }),
+  onAuthoritativeSnapshot: () => { if (isCopilotEnabled()) modelRefreshLedger.record('github', { ok: true }); },
 });
 const {
   SUPPORTED_REASONING_EFFORTS,
@@ -3624,135 +3650,6 @@ async function stopSessionWorkerForProviderRebind(sdkSessionId) {
   return true;
 }
 
-async function reconcileUnstartedConversationProviders({ enabled, model, provider = 'openai' } = {}) {
-  const normalizedProvider = String(provider || 'openai').trim().toLowerCase();
-  const managedProvider = ['claude', 'cursor', 'grok', 'deepseek', 'claude-api'].includes(normalizedProvider) ? normalizedProvider : 'openai';
-  const managedDefaultModel = managedProvider === 'claude-api'
-    ? getClaudeApiProviderSettings().model
-    : {
-        openai: DEFAULT_OPENAI_MODEL,
-        claude: DEFAULT_CLAUDE_MODEL,
-        cursor: DEFAULT_CURSOR_MODEL,
-        grok: DEFAULT_GROK_MODEL,
-        deepseek: DEFAULT_DEEPSEEK_MODEL,
-      }[managedProvider];
-  const providerType = enabled === true ? managedProvider : 'github';
-  const providerModel = enabled === true
-    ? (String(model || '').trim() || managedDefaultModel)
-    : null;
-  const runtimeModel = providerModel || DEFAULT_MODEL;
-  const candidates = stmts.listRuntimeSessionProviderCandidates.all();
-  const result = {
-    updatedUnstartedConversations: 0,
-    skippedStartedConversations: 0,
-    skippedActiveQueueConversations: 0,
-    failedConversations: [],
-  };
-  if (!stmts.runtimeSessionsSupportProviders || !stmts.updateRuntimeSessionProvider) {
-    return result;
-  }
-
-  for (const row of candidates) {
-    const currentProvider = String(row?.provider_type || 'github').trim().toLowerCase() || 'github';
-    const currentProviderModel = String(row?.provider_model || '').trim();
-    // Only manage conversations belonging to the reconciled provider (or the
-    // github default it swaps with); other providers' bindings stay untouched.
-    if (currentProvider !== managedProvider && currentProvider !== 'github') {
-      continue;
-    }
-    if (currentProvider === providerType && (providerType !== managedProvider || currentProviderModel === providerModel)) {
-      continue;
-    }
-    if (Number(row?.message_count || 0) > 0) {
-      result.skippedStartedConversations += 1;
-      continue;
-    }
-    if (Number(row?.active_queue_count || 0) > 0) {
-      result.skippedActiveQueueConversations += 1;
-      continue;
-    }
-
-    const conversationId = String(row?.conversation_id || '').trim();
-    const ownerSessionId = String(
-      row?.sdk_session_id
-      || row?.conversation_sdk_session_id
-      || conversationId,
-    ).trim();
-    let workerWasStopped = false;
-    let providerWasUpdated = false;
-    try {
-      if (ownerSessionId) {
-        workerWasStopped = await stopSessionWorkerForProviderRebind(ownerSessionId);
-      }
-      stmts.updateRuntimeSessionProvider.run(
-        providerType,
-        providerModel,
-        runtimeModel,
-        new Date().toISOString(),
-        row.id,
-      );
-      providerWasUpdated = true;
-      if (workerWasStopped && ownerSessionId) {
-        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
-        const ensured = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
-          allowProcessReuse: false,
-        });
-        if (!ensured?.ok) throw new Error(ensured?.error || 'worker-relaunch-failed');
-      }
-      result.updatedUnstartedConversations += 1;
-    } catch (error) {
-      let rollbackError = null;
-      const canRestorePreviousProvider = currentProvider === 'claude'
-        ? getClaudeProviderSettings().enabled === true
-        : (currentProvider === 'cursor'
-          ? getCursorProviderSettings().configured === true
-          : (currentProvider === 'grok'
-            ? getGrokProviderSettings().enabled === true
-            : (currentProvider === 'deepseek'
-              ? getDeepSeekProviderSettings().configured === true
-              : (currentProvider === 'claude-api'
-                ? getClaudeApiProviderSettings().enabled === true
-                : (currentProvider !== 'openai' || getOpenAIProviderSettings().configured === true)))));
-      if (providerWasUpdated && canRestorePreviousProvider) {
-        stmts.updateRuntimeSessionProvider.run(
-          currentProvider,
-          currentProviderModel || null,
-          String(row?.model || '').trim() || DEFAULT_MODEL,
-          new Date().toISOString(),
-          row.id,
-        );
-      } else if (providerWasUpdated) {
-        // The previous provider is no longer configured, so the DB stays on
-        // the new one with no running worker. That state must be loud, not
-        // buried in the result object: without the event the conversation
-        // just looks bound-and-idle while every turn on it will fail.
-        console.warn(`${runtimeLogPrefix()}PROVIDER REBIND stranded conv=${String(conversationId).slice(0, 8)} newProvider=${managedProvider} — relaunch failed and ${currentProvider || 'previous provider'} is no longer configured`);
-        io.emit('provider_rebind_failed', {
-          conversationId,
-          provider: managedProvider,
-          previousProvider: currentProvider || null,
-          restored: false,
-        });
-      }
-      if (workerWasStopped && ownerSessionId) {
-        sessionWorkerSupervisor?.clearRestartSchedule?.(ownerSessionId, { resetKilledMarker: true });
-        const restored = await sessionWorkerSupervisor?.ensureWorker?.(ownerSessionId, {
-          allowProcessReuse: false,
-        });
-        if (!restored?.ok) rollbackError = String(restored?.error || 'worker-rollback-relaunch-failed');
-      }
-      result.failedConversations.push({
-        conversationId,
-        error: [
-          String(error?.message || error || 'provider-rebind-failed'),
-          rollbackError ? `rollback: ${rollbackError}` : '',
-        ].filter(Boolean).join('; '),
-      });
-    }
-  }
-  return result;
-}
-
 async function rebindUnstartedOpenAIConversationModel({ conversationId, model } = {}) {
   const normalizedConversationId = String(conversationId || '').trim();
   const nextModel = String(model || '').trim();
@@ -4113,19 +4010,22 @@ function buildContextResponseText({ snapshot, runtimeSession, conversationId, ev
     snapshot?.copilot_session_id
     || runtimeSession?.sdk_session_id,
   );
+  // Named for the chat's own provider ("Claude session ID"), "Session ID"
+  // when it is not known, as the title tooltip and the copy toast do.
+  const sessionIdLabel = `${providerSessionLabel(runtimeSession?.provider_type)} ID`;
 
   if (!snapshot) {
     const fallbackSnapshot = {
       ...snapshot,
       model: String(runtimeSession?.model || '').trim() || null,
     };
-    pushDetail('Copilot session ID', canonicalCopilotSessionId);
+    pushDetail(sessionIdLabel, canonicalCopilotSessionId);
     if (hasText(eventsPath)) detailEntries.push({ label: 'Events source', value: contextField(eventsPath), multiline: true });
     if (hasText(error)) detailEntries.push({ label: 'Note', value: contextField(error), multiline: true });
     return buildContextUsageBlock(fallbackSnapshot, runtimeSession, detailEntries);
   }
 
-  pushDetail('Copilot session ID', canonicalCopilotSessionId);
+  pushDetail(sessionIdLabel, canonicalCopilotSessionId);
   if (snapshot?.estimate_kind === 'assistant-output-lower-bound') {
     pushDetail('Estimate', 'Lower bound from assistant completion tokens');
   }
@@ -5936,6 +5836,7 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
   const retryCount = Number(row?.retry_count || 0) + 1;
   const failureText = presetText || `Relay recovery limit reached after ${retryCount} attempts (${reason}). The worker kept dying before completing this turn, so the message was failed to keep the queue moving. Send it again to retry.`;
   const requestedModel = String(row?.model || '').trim() || null;
+  let cancelledQuestionIds = [];
   const tx = db.transaction(() => {
     // setFailed is compare-and-set on status (processing/pending/parked): a
     // row that settled between the sweep's listing and this write must not
@@ -5950,6 +5851,7 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
       failedAt: now,
     }), row.id);
     if (result.changes === 0) return false;
+    cancelledQuestionIds = settleFailedRowControlsAndCards(stmts, row.id, now);
     stmts.setQueueResponseMessageId?.run(responseId, row.id);
     stmts.insertMsg.run(
       responseId,
@@ -5979,10 +5881,19 @@ function failRecoveredRowTerminally(row, reason, { failureRecord = null, failure
     message: { role: 'assistant', text: failureText, model: requestedModel || 'unknown', mode: String(row?.relay_mode || '').trim() || null, timestamp: now },
   });
   io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+  announceCancelledQuestions(cancelledQuestionIds);
   try {
     relayEventService?.noteError({ conversationId: row.conversation_id, kind: 'turn_failed', message: failureText, queueMessageId: row.id });
   } catch {}
-  console.warn(`${runtimeLogPrefix()}${failureRecord ? 'CONSUMED FAILED' : 'RECOVERY LIMIT'} ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+  console.warn(`${runtimeLogPrefix()}${failureRecord ? `FAILED ${failureRecord.code || failureRecord.error || 'terminal'}` : 'RECOVERY LIMIT'} ${String(row.id).slice(0, 8)} conv=${String(row.conversation_id).slice(0, 8)} retries=${retryCount} reason=${reason}`);
+}
+
+// The cards a failed row took along (settleFailedRowControlsAndCards), after the commit.
+function announceCancelledQuestions(questionIds) {
+  for (const id of questionIds) {
+    const question = stmts.getQuestion.get(id);
+    if (question) io.emit('relay_question_updated', { question: formatQuestionRow(question) });
+  }
 }
 
 // A row whose prompt the worker's runtime already consumed (queue.consumed_at)
@@ -6057,12 +5968,19 @@ const COPILOT_BILLING_DENIAL_TTL_MS = 10 * 60_000;
 let copilotBillingDenial = null;
 let copilotBillingLogin = '';
 
+// What the Copilot usage reads answer while Copilot is switched off.
+const COPILOT_NOT_SET_UP_TEXT = 'Copilot is not set up on this relay: it is switched off.';
+
 /**
  * Optional, personal-scope billing detail for the plan-usage card. Never
  * rejects: a token without billing scope simply yields `{ error }` and the card
  * renders its quota meters without the cost breakdown.
  */
 function fetchCopilotBillingUsage() {
+  // Copilot switched off: not set up, and GitHub is not asked.
+  if (!isCopilotEnabled()) {
+    return Promise.resolve({ items: [], timePeriod: null, scope: null, error: COPILOT_NOT_SET_UP_TEXT });
+  }
   if (copilotBillingDenial && copilotBillingDenial.expiresAt > Date.now()) {
     return Promise.resolve({
       items: [],
@@ -6105,6 +6023,10 @@ function fetchCopilotBillingUsage() {
 }
 
 function fetchUsageSummary(cb) {
+  if (!isCopilotEnabled()) {
+    cb(new Error(COPILOT_NOT_SET_UP_TEXT));
+    return;
+  }
   const useToken = (token) => {
     fetch('https://api.github.com/copilot_internal/user', {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
@@ -6338,7 +6260,7 @@ const copilotModelDiscoveryService = createCopilotModelDiscoveryService({
   }),
   resolveInstalledPaths: () => resolveInstalledCopilotPaths({ config }),
   updateModelCatalog,
-  onRefreshed: (result) => modelRefreshLedger.record('github', result),
+  onRefreshed: (result) => { if (isCopilotEnabled()) modelRefreshLedger.record('github', result); },
   logger: console,
 });
 const contextSnapshotService = createContextSnapshotService({
@@ -6716,6 +6638,10 @@ async function requestSessionWorkerSocketDelivery({ sessionId, pid, reason = 'wo
     workerKind: workerKind || sessionWorkerRegistry?.getWorker?.(requesterSessionId)?.kind || null,
     claudeApiClaimCheck,
     onBillingFence: handleClaudeBillingFence,
+    // Copilot switched off: a Copilot row fails here with its note, never
+    // through the billing fence (messages-worker-claim-routes.mjs).
+    copilotClaimCheck,
+    onCopilotFence: handleCopilotFence,
     // The fence check above, asked again before every claim: ensureWorker
     // and a transient error's backoff both wait.
     isReplacementFenced: () => workerReplacementFence.isHeld(requesterSessionId, pid),
@@ -6876,22 +6802,16 @@ async function recoverUndeliveredSessionWorkerMessage({ pending = null, sessionI
 
 const WORKER_DEATH_GRACE_MS = 15_000;
 
+// The probe the archive shares (services/worker-session-liveness.mjs).
+const workerSessionLiveness = createWorkerSessionLiveness({
+  hasLiveWorkerSocket: (sid) => sessionWorkerWebSocketService?.hasLiveWorkerSocket?.(sid) === true,
+  getWorkerPid: (sid) => sessionWorkerRegistry?.getWorker?.(sid)?.pid,
+  isPidAlive: isProcessAlive,
+  findProcessForSession: (sid) => sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sid),
+});
+// A process list that cannot answer ('unknown') is not alive: the turn is recovered.
 async function isWorkerSessionProcessAlive(sessionId, hintPid = null) {
-  // A merely-retained socket is not proof of life: a dead worker's socket
-  // lingers until its close event lands, and counting it stalled recovery.
-  // The socket only counts with a recent heartbeat or a PID that probes
-  // alive; otherwise fall through to the process probes below.
-  if (sessionWorkerWebSocketService?.hasLiveWorkerSocket?.(sessionId)) return true;
-  // The pids first: they cost nothing. The process list last: on win32 it is
-  // a PowerShell run (off the thread, shared and cached by the inspector).
-  const registryPid = Number(sessionWorkerRegistry?.getWorker?.(sessionId)?.pid || 0);
-  if (registryPid > 0 && isProcessAlive(registryPid)) return true;
-  const pid = Number(hintPid || 0);
-  if (pid > 0 && isProcessAlive(pid)) return true;
-  try {
-    if (await sessionWorkerProcessInspector?.findProcessForSessionAsync?.(sessionId)) return true;
-  } catch {}
-  return false;
+  return (await workerSessionLiveness.probe(sessionId, { hintPid })) === 'alive';
 }
 
 // Runs a dead worker can no longer end: marked failed, each with the full
@@ -6928,9 +6848,11 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
   const requeueAt = addMsIso(2_000);
   for (const row of rows) {
     if (String(row.kind || '') === 'continuation') {
-      // No user prompt to replay: a dead worker's continuation is torn down.
-      stmts.dropStaleContinuation?.run?.(row.id);
+      // No user prompt to replay: a dead worker's continuation is torn down,
+      // and its background agent's interview cards and Stops with it.
+      const cardIds = db.transaction(() => (stmts.dropStaleContinuation.run(row.id).changes ? settleFailedRowControlsAndCards(stmts, row.id, new Date().toISOString()) : []))();
       io.emit('message_status', { messageId: row.id, conversationId: row.conversation_id, status: 'failed' });
+      announceCancelledQuestions(cardIds);
       noteRestartTurnOutcome(row, 'cut');
       continue;
     }
@@ -6939,11 +6861,16 @@ function recoverDeadWorkerProcessingRows(sessionId, reason) {
       noteRestartTurnOutcome(row, 'cut');
       continue;
     }
+    // Per row, read after the liveness probe: the owner's rows span chats,
+    // and a requeue in an archived one would wait unclaimed for good.
+    if (staleTurnRecovery.failIfArchived(row, `worker-died-${reason}`)) continue;
     if (Number(row.retry_count || 0) + 1 >= MAX_REQUEUE_RETRIES) {
       failRecoveredRowTerminally(row, `worker-died-${reason}`);
       noteRestartTurnOutcome(row, 'failed');
       continue;
     }
+    // The user's Stop still waits for this turn: no replay.
+    if (staleTurnRecovery.failIfStopRequested(row, `worker-died-${reason}`)) continue;
     // The dead worker's subagent runs can never be terminated by the replay
     // (fresh worker, fresh call ids) — close them out now.
     closeStrandedSubagentRuns(stmts.listRunningSubagentRunsByQueueMessage?.all?.(row.id) || [], row.id);
@@ -7175,7 +7102,7 @@ const workerRecycleService = createWorkerRecycleService({
   launchWorker: recycleWorkerReplacement.launchWorker,
   fence: recycleWorkerReplacement.fence,
   // The stop and the launch under the per-session launch mutex the Change
-  // CWD relaunch and the launch routes take (sessions-routes.mjs).
+  // CWD relaunch and the launch route take (conversation-settings-routes.mjs, host-routes.mjs).
   runExclusive: (sid, fn) => sessionLaunchMutex.runExclusive(sid, fn),
   // The kinds the launch gate gives an agent SDK: once stale, recycled
   // without waiting for their CLI child, and fenced until then.
@@ -7309,7 +7236,7 @@ function failClaudeApiRowsWithoutLaunch(sdkSessionId) {
     || null;
   if (normalizeClaudeBilling(runtime?.provider_type) !== 'claude-api') return false;
   // A check that cannot answer fails this session's rows on the key closed,
-  // as the claim does (messages-routes.mjs, claudeBillingFence).
+  // as the claim does (messages-worker-claim-routes.mjs, claudeBillingFence).
   let refusal = null;
   try {
     refusal = claudeApiClaimCheck();
@@ -7328,8 +7255,48 @@ function failClaudeApiRowsWithoutLaunch(sdkSessionId) {
   return true;
 }
 
+// Copilot switched off: the claim's check (copilotSwitchFence) refuses a
+// Copilot chat's row, and the row fails with the note whose code the
+// transcript turns into a Copilot settings button.
+function copilotClaimCheck() {
+  return isCopilotEnabled() ? null : copilotClaimRefusal();
+}
+
+function handleCopilotFence(fence) {
+  const row = stmts.findQById.get(fence?.messageId);
+  if (!row || String(row.status || '') !== 'pending') return;
+  failRecoveredRowTerminally(row, 'copilot-switched-off', {
+    failureRecord: {
+      kind: 'copilot-switched-off',
+      error: 'copilot-switched-off',
+      code: 'COPILOT_SWITCHED_OFF',
+      stableCode: 'relay.copilot-switched-off',
+      failedAt: new Date().toISOString(),
+    },
+    failureText: copilotSwitchedOffNoteText(),
+  });
+}
+
+// A Copilot chat's worker is not launched while Copilot is switched off: its
+// waiting rows fail here as the claim would fail them, instead of a spawn of
+// the Copilot CLI that could only refuse them. True when it was so. The
+// session's runtime row is found as the launch finds it; none (a chat from
+// before providers) is Copilot's.
+function failCopilotRowsWithoutLaunch(sdkSessionId) {
+  if (isCopilotEnabled()) return false;
+  const runtime = stmts.getRuntimeSessionBySdkSessionId.get(sdkSessionId)
+    || stmts.getRuntimeSessionByConversation.get(sdkSessionId)
+    || null;
+  if (!isCopilotProviderType(runtime?.provider_type)) return false;
+  for (const row of stmts.listPendingRowsForSession.all(sdkSessionId)) {
+    handleCopilotFence({ messageId: row.id });
+  }
+  console.warn(`${runtimeLogPrefix()}WORKER PRIME skipped session=${sdkSessionId.slice(0, 8)} reason=COPILOT_SWITCHED_OFF — no Copilot worker while Copilot is switched off`);
+  return true;
+}
+
 // The delivery refused a Claude chat's row to the worker that asked
-// (messages-routes.mjs, claudeBillingFence).
+// (messages-worker-claim-routes.mjs, claudeBillingFence).
 function handleClaudeBillingFence(fence) {
   if (fence?.reason === 'claude-api-unavailable') {
     const row = stmts.findQById.get(fence.messageId);
@@ -7513,7 +7480,7 @@ const pendingWorkerPrimer = createPendingWorkerPrimer({
     && typeof stmts.listPendingWorkerOwnerSessionIds?.all === 'function',
   listPendingOwnerSessionIds: (limit) => stmts.listPendingWorkerOwnerSessionIds.all(limit),
   isKillBlocked: (sid) => sessionWorkerSupervisor?.isKillBlocked?.(sid) === true,
-  failRowsWithoutLaunch: (sid) => failClaudeApiRowsWithoutLaunch(sid),
+  failRowsWithoutLaunch: (sid) => failClaudeApiRowsWithoutLaunch(sid) || failCopilotRowsWithoutLaunch(sid),
   ensureWorker: (sid) => sessionWorkerSupervisor.ensureWorker(sid),
   // Rows waiting for their worker: the maintenance pass retries until none is.
   onRowsWaiting: () => pendingWorkerPrimeTimer.arm(),
@@ -7953,6 +7920,8 @@ const modelRefreshTable = buildProviderRefreshTable({
   deepseekSettingsService,
   claudeApiSettingsService,
   copilotModelDiscoveryService,
+  // The background check asks Copilot only while it is switched on.
+  isCopilotEnabled,
   isClaudeSetUp: isClaudeModelRefreshSetUp,
   isGrokSetUp: isGrokModelRefreshSetUp,
 });
@@ -8099,6 +8068,7 @@ const sharedRouteDeps = {
   setOpenAIProviderSettings,
   refreshOpenAIProviderModels: trackedModelRefreshers.refreshOpenAIProviderModels,
   getCopilotProviderSettings,
+  detectCopilotCli,
   getClaudeProviderSettings,
   setClaudeProviderSettings: withAgentSdkSetup(setClaudeProviderSettings, 'claude', () => getClaudeProviderSettings()?.enabled === true, 'Claude enabled'),
   refreshClaudeProviderModels: trackedModelRefreshers.refreshClaudeProviderModels,
@@ -8120,7 +8090,6 @@ const sharedRouteDeps = {
   claudeCloudRepoService,
   // The login's state for the workers' nudge route (never the token).
   claudeCloudLoginStatus: { describe: () => claudeCloudCredentials.describe() },
-  reconcileUnstartedConversationProviders,
   rebindUnstartedOpenAIConversationModel,
   getOrCreateConversation,
   ensureRuntimeSessionBinding,
@@ -8199,6 +8168,9 @@ const sharedRouteDeps = {
   sessionWorkerSupervisor,
   sessionWorkerRegistry,
   sessionWorkerProcessInspector,
+  hasLiveWorkerSocket: (sid) => sessionWorkerWebSocketService.hasLiveWorkerSocket(sid) === true,
+  failClaudeApiRowsWithoutLaunch,
+  failCopilotRowsWithoutLaunch,
   // /api/pending refuses work to a process the worker recycle is replacing.
   workerReplacementFence,
   buildContextResponseText,
@@ -8314,6 +8286,13 @@ registerAskUserRoutes(app, sharedRouteDeps);
 registerRelayBoardRoutes(app, sharedRouteDeps);
 registerCacheRoutes(app, sharedRouteDeps);
 registerGitRoutes(app, sharedRouteDeps);
+registerWorkerLogRoutes(app, {
+  auth,
+  getConversation: (conversationId) => stmts.getConvAnyStatus?.get?.(conversationId) || null,
+  providerOf: (conversationId) => stmts.getRuntimeSessionByConversation?.get?.(conversationId)?.provider_type || '',
+  getLaunchEnv: () => sessionWorkerLaunchEnv,
+  remoteRelayInbound,
+});
 registerClaudeCloudRoutes(app, sharedRouteDeps);
 registerPushRoutes(app, {
   auth,
@@ -8384,7 +8363,7 @@ registerAboutRoutes(app, {
     startedAt: RELAY_STARTED_AT,
     packageRoot: PACKAGE_ROOT,
     getProviderSettings: () => ({
-      github: { enabled: true, engine: getCopilotProviderSettings().engine },
+      github: { enabled: isCopilotEnabled(), engine: getCopilotProviderSettings().engine },
       openai: { enabled: getOpenAIProviderSettings()?.enabled === true },
       claude: { enabled: getClaudeProviderSettings()?.enabled === true },
       'claude-cloud': { enabled: getClaudeCloudProviderSettings()?.enabled === true },
@@ -8696,19 +8675,13 @@ registerAuthRoutes(app, {
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+// A new conversation, for the intake's fresh id only. A message into an
+// existing archived one brings it back in the queue write's own transaction
+// (repositories/queue-insert.mjs).
 function getOrCreateConversation(id, firstLine) {
   const now = new Date().toISOString();
   stmts.insertConv.run(id, (firstLine || 'Untitled').slice(0, 80), now, now);
-  const conv = stmts.getConv.get(id);
-  // A message into an archived conversation (an agent's, through a paired
-  // relay, say) brings it back to the live list: its worker starts again
-  // for the delivery, and an archived chat must not work unseen.
-  if (conv && Number(conv.archived || 0) === 1 && typeof stmts.unarchiveConv?.run === 'function') {
-    stmts.unarchiveConv.run(now, id);
-    io.emit('conversation_archived', { conversationId: id, archived: false });
-    return stmts.getConv.get(id);
-  }
-  return conv;
+  return stmts.getConv.get(id);
 }
 
 function ensureRuntimeSessionBinding(
@@ -8777,6 +8750,13 @@ function ensureRuntimeSessionBinding(
   )
     ? (String(providerModel || normalizedModel || '').trim() || null)
     : null;
+  // Copilot switched off: a new chat is never bound to Copilot, named or by
+  // default. The routes refuse such a create first (COPILOT_NOT_ENABLED,
+  // PROVIDER_REQUIRED); this is the backstop. An existing chat without a
+  // binding (no provider: Copilot's) is still bound as Copilot.
+  if (assignConfiguredProvider && resolvedProviderType === 'github' && !isCopilotEnabled()) {
+    throw Object.assign(new Error('Copilot is switched off on this relay, so no Copilot chat was started.'), { code: 'COPILOT_NOT_ENABLED' });
+  }
   try {
     const insertArgs = [
       runtimeSessionId,
@@ -8925,6 +8905,12 @@ const taskOutputRooms = createTaskOutputRooms({
     return backgroundTaskStore.findTask(keys, taskId);
   },
 });
+// A conversation's worker log goes live only to the pages whose view shows it.
+const workerLogRooms = createWorkerLogRooms({
+  io,
+  getConversation: (conversationId) => stmts.getConvAnyStatus?.get?.(conversationId) || null,
+  getLaunchEnv: () => sessionWorkerLaunchEnv,
+});
 // The stall hint and the pass/fail chip of the panel's rows: every 10 s over
 // the live tasks with an output file.
 const taskHealthPoller = createTaskHealthPoller({ store: backgroundTaskStore, io });
@@ -9020,6 +9006,7 @@ io.on('connection', (socket) => {
   activeDeviceTracker.registerSocket(socket);
   subagentViewerRooms.registerSocket(socket);
   taskOutputRooms.registerSocket(socket);
+  workerLogRooms.registerSocket(socket);
 });
 
 // ─── SSH Reverse Tunnel ────────────────────────────────────────────────────────
@@ -9166,6 +9153,7 @@ function clearRuntimeTimers() {
   try { workerRecycleService.stop(); } catch {}
   try { taskHealthPoller.stop(); } catch {}
   try { taskOutputRooms.stop(); } catch {}
+  try { workerLogRooms.stop(); } catch {}
   runtimeTimers.ownerWatchdog = null;
   runtimeTimers.staleRecovery = null;
   runtimeTimers.questionExpiry = null;
@@ -9380,12 +9368,19 @@ httpServer.listen(config.port, listenHost, () => {
   }).catch((error) => {
     console.warn(`${runtimeLogPrefix()}PREVIEW LANE failed to bind :${previewsConfig.port} — ${error?.message || error}`);
   });
-  void sdkSessionImportService.runStartupImport().catch((error) => {
-    console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
-  });
-  // Deferred and unref'd (a few seconds behind the startup import's own CLI
-  // spawn); a relay without an installed Copilot CLI skips it entirely.
-  copilotModelDiscoveryService.scheduleStartupRefresh();
+  // Copilot's boot work (the SDK session import and the model discovery, both
+  // spawning its CLI) only while Copilot is switched on. On a new database
+  // this first read decides the switch from the CLI detection.
+  if (isCopilotEnabled()) {
+    void sdkSessionImportService.runStartupImport().catch((error) => {
+      console.warn(`${runtimeLogPrefix()}SDK session import startup failed: ${error?.message || error}`);
+    });
+    // Deferred and unref'd (a few seconds behind the startup import's own CLI
+    // spawn); a relay without an installed Copilot CLI skips it entirely.
+    copilotModelDiscoveryService.scheduleStartupRefresh();
+  } else {
+    console.log(`${runtimeLogPrefix()}COPILOT switched off: no SDK session import, no model discovery`);
+  }
   // "Check for new models": a first look a minute in (overdue providers),
   // then every quarter of an hour; unref'd.
   modelRefreshScheduler.start();

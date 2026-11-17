@@ -56,6 +56,9 @@ export function createQuestionRepository(db) {
         // Cards left behind by a superseded processing attempt. NULL-attempt
         // rows (created before the fencing deploy) are deliberately left alone.
         cancelPendingQuestionsForStaleAttempts: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending' AND attempt_id IS NOT NULL AND attempt_id != ? RETURNING id`),
+        // Every pending card of a row that ends for good with no worker left
+        // to take an answer (the archive), NULL-attempt cards included.
+        cancelPendingQuestionsForRow: db.prepare(`UPDATE relay_questions SET status = 'cancelled', answered_at = COALESCE(answered_at, ?) WHERE message_id = ? AND status = 'pending' RETURNING id`),
         deleteConvQuestions: db.prepare(`DELETE FROM relay_questions WHERE conversation_id = ?`),
         // RETURNING (run via .all) so the expiry log names exactly the rows
         // that flipped — a separate pre-SELECT could race an answer landing

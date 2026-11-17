@@ -11,8 +11,8 @@ import {
   OPENAI_IMAGE_DAILY_CAP_MAX_USD,
   parseOpenAIImageSpendSettingsRequest,
   parseOpenAISettingsUpdateRequest,
-  registerSessionsRoutes,
-} from './sessions-routes.mjs';
+} from './settings-routes.mjs';
+import { registerSessionsRoutes } from './sessions-routes.mjs';
 import { OPENAI_IMAGE_PRESETS_PATH, OPENAI_IMAGE_SPEND_SETTING_KEYS } from '../../shared/openai-image-spend.mjs';
 import { OPENAI_IMAGE_PRESETS_SETTING_KEY, OPENAI_IMAGE_PRESET_LIMITS } from '../../shared/openai-image-presets.mjs';
 import { asOwner } from '../services/relay-principal-test-harness.mjs';

@@ -321,6 +321,20 @@ test('broken twice after partials: files gone at once, the note says it may have
   assert.equal(fs.existsSync(path.join(relay.conversationDir, relay.messageId)), false);
 });
 
+test('a requeue after the request went out ends the turn and its previews go: /api/requeue finishes the image routes\' previews', async (t) => {
+  const relay = makeRelay(t);
+  stubImageFetch(t, { openai: [twoPartialsAndFinal()] });
+  const { status } = await relay.generate();
+  assert.equal(status, 200);
+  assert.equal(fs.readdirSync(relay.partialsDir).length, 2);
+
+  const requeued = await invokeRoute(relay.routes, 'POST', '/api/requeue', { body: { messageId: relay.messageId } });
+  assert.equal(requeued.status, 200);
+  assert.equal(requeued.body.terminal, true);
+  assert.equal(relay.previewEvents().at(-1).payload.reason, 'failed');
+  assert.equal(fs.existsSync(relay.partialsDir), false);
+});
+
 test('a timeout in the middle of the stream is a timeout, retried once', async (t) => {
   const relay = makeRelay(t, { config: { openaiImageGenerateTimeoutMs: 40 } });
   const calls = stubImageFetch(t, { openai: [{ status: 200, sse: openAIImageSse([{ partial: 0, b64: OTHER_PNG_BASE64 }]), hangAfter: true }] });

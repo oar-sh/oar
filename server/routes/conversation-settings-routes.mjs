@@ -39,6 +39,19 @@ import {
   validateRemoteRelaySessionSettings,
 } from '../../shared/remote-relay-contract.mjs';
 import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
+import {
+  bootstrapGroupRefusal,
+  copilotImageModelRefusal,
+  createConversationGroupHelpers,
+  isPidAlive,
+  launchWorkspaceRootSession,
+  normalizePreferredModel,
+  normalizePreferredReasoningEffort,
+  normalizeRelayModePreference,
+  parseDraftAttachmentsColumn,
+  resolveConversationTitle,
+  stopIdleWorkspaceRootSession,
+} from './sessions-helpers.mjs';
 
 // The web client caps what it saves at the same length (MAX_DRAFT_TEXT_LENGTH
 // in public/app/conversation-draft-sync.mjs); a test pins them together.
@@ -123,6 +136,67 @@ export function diffDraftAttachmentHashes(previous = [], next = []) {
   };
 }
 
+const MAX_CONVERSATION_TITLE_LENGTH = 120;
+
+export function normalizeConversationTitle(value) {
+  const title = String(value || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!title) return '';
+  return title.slice(0, MAX_CONVERSATION_TITLE_LENGTH);
+}
+
+export function persistConversationTitle({
+  db,
+  stmts,
+  io = null,
+  conversationId = '',
+  title = '',
+} = {}) {
+  const id = String(conversationId || '').trim();
+  const nextTitle = normalizeConversationTitle(title);
+  if (!id) {
+    return { ok: false, statusCode: 400, error: 'Missing conversation id' };
+  }
+  if (!nextTitle) {
+    return { ok: false, statusCode: 400, error: 'Missing title' };
+  }
+
+  const existing = stmts?.getConvAnyStatus?.get?.(id) || null;
+  if (existing && String(existing.status || '').trim() === 'deleted') {
+    return { ok: false, statusCode: 404, error: 'Conversation not found' };
+  }
+
+  const updatedAt = existing?.updated_at || new Date().toISOString();
+
+  if (!existing) {
+    if (typeof stmts?.insertConv?.run === 'function') {
+      stmts.insertConv.run(id, nextTitle, updatedAt, updatedAt);
+    } else if (db && typeof db.prepare === 'function') {
+      db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`).run(id, nextTitle, updatedAt, updatedAt);
+    }
+  }
+
+  if (typeof stmts?.updateConvTitle?.run === 'function') {
+    stmts.updateConvTitle.run(nextTitle, id);
+  } else if (db && typeof db.prepare === 'function') {
+    db.prepare(`UPDATE conversations SET title = ?, title_source = 'manual' WHERE id = ?`).run(nextTitle, id);
+  }
+
+  if (typeof stmts?.setConvSdkSessionIdIfMissing?.run === 'function') {
+    stmts.setConvSdkSessionIdIfMissing.run(id, updatedAt, id);
+  } else if (db && typeof db.prepare === 'function') {
+    db.prepare(`UPDATE conversations SET sdk_session_id = ?, updated_at = ? WHERE id = ? AND (sdk_session_id IS NULL OR sdk_session_id = '')`).run(id, updatedAt, id);
+  }
+
+  const payload = {
+    conversationId: id,
+    title: nextTitle,
+    updatedAt,
+    workspaceYamlPath: null,
+  };
+  io?.emit?.('conversation_title_updated', payload);
+  return { ok: true, ...payload, created: !existing };
+}
+
 export function registerConversationSettingsRoutes(app, deps, shared) {
   const {
     auth,
@@ -140,7 +214,6 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
     sessionWorkerSupervisor,
     sessionWorkerRegistry,
     sessionWorkerProcessInspector,
-    resolveSessionStateRoot,
   } = deps;
   const {
     conversationGroups,
@@ -150,22 +223,8 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
     describeSessionActivity,
     resolveConversationByIdOrSdkSessionId,
     consumeWorkspaceRootRateLimit,
-    emitGroupChanged,
-    listGroupsForAgents,
-    bootstrapGroupRefusal,
-    conversationGroupField,
-    copilotImageModelRefusal,
-    isPidAlive,
-    launchWorkspaceRootSession,
-    stopIdleWorkspaceRootSession,
-    normalizeRelayModePreference,
-    normalizePreferredModel,
-    normalizePreferredReasoningEffort,
-    parseDraftAttachmentsColumn,
-    resolveConversationTitle,
-    normalizeConversationTitle,
-    persistConversationTitle,
   } = shared;
+  const { emitGroupChanged, listGroupsForAgents, conversationGroupField } = createConversationGroupHelpers({ io, conversationGroups });
 
   /**
    * Drops draft references to the given blobs and reclaims any that no longer
@@ -207,7 +266,6 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
       io,
       conversationId,
       title: req.body?.title,
-      resolveSessionStateRoot,
     });
     if (!result.ok) {
       return res.status(result.statusCode || 500).json({ error: result.error || 'Failed to update conversation title' });
@@ -792,7 +850,7 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
       written.push('cwd');
     }
     if (plan.title !== undefined) {
-      const titled = persistConversationTitle({ db, stmts, io, conversationId, title: plan.title, resolveSessionStateRoot });
+      const titled = persistConversationTitle({ db, stmts, io, conversationId, title: plan.title });
       if (!titled.ok) return failAfter(titled.statusCode || 500, { error: titled.error || 'Failed to update the title.' });
       written.push('title');
     }
@@ -1121,14 +1179,19 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
       sessionWorkerSupervisor,
       sdkSessionId,
       sessionWorkerRegistry,
-      { allowProcessReuse: false, resetKilledMarker: false, requireStoppedWorker: false },
+      {
+        allowProcessReuse: false,
+        resetKilledMarker: false,
+        requireStoppedWorker: false,
+        failCopilotRowsWithoutLaunch: deps.failCopilotRowsWithoutLaunch,
+      },
     );
     if (!launched?.ok) {
       return {
         statusCode: launched?.statusCode || 409,
         body: {
           ok: false,
-          code: 'relaunch-failed',
+          code: launched?.code || 'relaunch-failed',
           configuredWorkspaceRootPath: state?.configuredWorkspaceRootPath || null,
           workspaceRootApplied: false,
           error: launched?.error || 'Failed to relaunch the CLI',

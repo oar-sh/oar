@@ -118,7 +118,8 @@ test('with no grace, as at relay start, a live conversation keeps its pending ro
   fx.queue('q-archived-f6', 'conv-archived-f6', { at: iso(47 * HOUR) });
   assert.equal(failRowsOfGoneConversations({ ...fx.deps, graceMs: 0 }), 0);
   for (const id of ['q-live-f6', 'q-idle-f6', 'q-archived-f6']) assert.equal(fx.row(id).status, 'pending', id);
-  assert.equal(fx.pendingCount(), 3);
+  // Kept, but not counted as queued work while its chat is archived.
+  assert.equal(fx.pendingCount(), 2);
   assert.deepEqual(fx.events, []);
   assert.deepEqual(fx.lines, []);
 });

@@ -1,4 +1,5 @@
 import { revealSelectedTabs, watchTabStripFades } from './tab-strip-fade.mjs';
+import { getProviderReadiness } from './provider-readiness.mjs';
 
 const SETTINGS_TAB_STORAGE_KEY = 'copilot_settings_tab';
 export const SETTINGS_TAB_SHOWN_EVENT = 'oar:settings-tab-shown';
@@ -8,8 +9,8 @@ const SETTINGS_PROVIDER_TAB_STORAGE_KEY = 'copilot_settings_provider_tab';
 // A remembered tab or a deep link to General still lands there after its
 // Appearance block got a tab of its own.
 export const SETTINGS_TABS = ['general', 'appearance', 'providers', 'relays', 'security', 'previews', 'shares', 'notifications'];
-// Copilot leads: it is the default provider, and `SETTINGS_PROVIDER_TABS[0]`
-// is also the sub-tab a first-time visitor lands on.
+// The provider sub-tabs in strip order. A first-time visitor lands on the
+// first provider that is on (firstEnabledProviderTab), Copilot's while none is.
 const SETTINGS_PROVIDER_TABS = ['copilot', 'openai', 'claude', 'claude-api', 'claude-cloud', 'grok', 'cursor', 'deepseek'];
 
 let settingsTabsBound = false;
@@ -40,9 +41,16 @@ function storedSettingsTab() {
   return normalizeTab(readLocalStorage(SETTINGS_TAB_STORAGE_KEY), SETTINGS_TABS) || SETTINGS_TABS[0];
 }
 
+/** The first provider tab whose provider is on (Copilot by its switch); Copilot's with none. */
+export function firstEnabledProviderTab(readiness = getProviderReadiness()) {
+  const on = new Set((readiness?.ready || []).map((id) => (id === 'github' ? 'copilot' : id)));
+  if (readiness && readiness.copilot !== 'off') on.add('copilot');
+  return SETTINGS_PROVIDER_TABS.find((tab) => on.has(tab)) || SETTINGS_PROVIDER_TABS[0];
+}
+
 function storedProviderTab() {
   return normalizeTab(readLocalStorage(SETTINGS_PROVIDER_TAB_STORAGE_KEY), SETTINGS_PROVIDER_TABS)
-    || SETTINGS_PROVIDER_TABS[0];
+    || firstEnabledProviderTab();
 }
 
 function settingsElements(attribute) {

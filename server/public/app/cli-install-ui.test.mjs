@@ -83,6 +83,7 @@ const {
   confirmCliInstall,
   installLogSummary,
   isCliInstallBusy,
+  openAINeedsCopilotCli,
 } = await import('./cli-install-ui.js');
 const { closeSummaryModal } = await import('./store.js');
 
@@ -378,4 +379,35 @@ test('a payload with only one half of the contract leaves the other alone', () =
   assert.match(el('cli-grok-status').textContent, /^1\.0\.13/);
   assert.equal(installLogSummary({ state: 'nonsense', command: '' }), 'Install · install log');
   assert.equal(cliRowNote(null), '');
+});
+
+// ── The OpenAI tab and the Copilot CLI (D4) ──
+
+test('the OpenAI tab says it needs the Copilot CLI, with Install, only while the CLI is known missing', () => {
+  const copilotRow = (overrides) => providerRow({ id: 'copilot', label: 'GitHub Copilot CLI', binary: 'copilot', commands: { install: { display: 'npm i -g @github/copilot' } }, ...overrides });
+  const section = el('openai-copilot-cli-row');
+  assert.ok(el('settings-provider-panel-openai').contains(section));
+  assert.match(el('openai-copilot-cli-note').textContent, /^Needs the GitHub Copilot CLI/);
+
+  applyCliInstallState(payload({ copilot: copilotRow({ installed: false }) }));
+  assert.equal(section.hidden, false);
+  assert.equal(el('openai-copilot-cli-install-btn').hidden, false);
+
+  applyCliInstallState(payload({ copilot: copilotRow({ installed: true, version: '1.0.9', path: '/usr/local/bin/copilot' }) }));
+  assert.equal(section.hidden, true, 'installed');
+
+  applyCliInstallState(payload({ copilot: copilotRow({ checkedAt: null }) }));
+  assert.equal(section.hidden, true, 'never probed: nothing claimed');
+
+  applyCliInstallState(payload({ copilot: copilotRow({ installed: false, commands: {} }) }));
+  assert.equal(section.hidden, false);
+  assert.equal(el('openai-copilot-cli-install-btn').hidden, true, 'no install command here: no button');
+});
+
+test('openAINeedsCopilotCli: a missing, probed CLI, not while its install runs', () => {
+  assert.equal(openAINeedsCopilotCli({ checkedAt: 'x', installed: false }), true);
+  assert.equal(openAINeedsCopilotCli({ checkedAt: 'x', installed: false }, { installing: true }), false);
+  assert.equal(openAINeedsCopilotCli({ checkedAt: 'x', installed: true }), false);
+  assert.equal(openAINeedsCopilotCli({ checkedAt: null, installed: false }), false);
+  assert.equal(openAINeedsCopilotCli(null), false);
 });

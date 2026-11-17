@@ -687,6 +687,16 @@ export async function grokLogout() {
   return grokAuthRequest('/api/grok/auth/logout');
 }
 
+// The Copilot switch (Settings → Providers → Copilot): `{ engine, engines,
+// enabled, cliFound }`.
+export async function loadCopilotSettings() {
+  return apiFetch('/api/settings/copilot');
+}
+
+export async function updateCopilotSettings({ enabled } = {}) {
+  return settingsRequest('/api/settings/copilot', { enabled: enabled === true }, 'Failed to update Copilot settings');
+}
+
 export async function loadGrokSettings() {
   return apiFetch('/api/settings/grok');
 }

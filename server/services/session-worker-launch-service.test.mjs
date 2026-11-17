@@ -808,6 +808,34 @@ test('prepareWorkerLogFile never throws when the filesystem misbehaves', async (
   assert.equal(logPath, null);
 });
 
+test('workerLogPathFor: the log dir, else the server dir, else beside the module; no folder made', async () => {
+  const { workerLogPathFor, resolveWorkerLogDir } = await import('./session-worker-launch-service.mjs');
+  assert.equal(workerLogPathFor('sid-1', { COPILOT_WEB_RELAY_LOG_DIR: '/var/log/relay', COPILOT_WEB_RELAY_SERVER_DIR: '/srv' }, { pathImpl: path.posix }), '/var/log/relay/worker-sid-1.log');
+  assert.equal(workerLogPathFor('sid-1', { COPILOT_WEB_RELAY_SERVER_DIR: '/srv/server' }, { pathImpl: path.posix }), '/srv/server/logs/worker-sid-1.log');
+  assert.equal(workerLogPathFor('sid-1', {}), path.join(resolveWorkerLogDir({}), 'worker-sid-1.log'));
+  assert.equal(workerLogPathFor('sid-1', { COPILOT_WEB_RELAY_SERVER_DIR: 'C:\\srv\\relay' }, { pathImpl: path.win32 }), 'C:\\srv\\relay\\logs\\worker-sid-1.log');
+});
+
+test('workerLogPathFor cleans the id like the launch, cuts it at 64, and gives null for an id that cleans to nothing', async () => {
+  const { workerLogPathFor } = await import('./session-worker-launch-service.mjs');
+  const env = { COPILOT_WEB_RELAY_LOG_DIR: '/logs' };
+  assert.equal(workerLogPathFor('sid/../evil', env, { pathImpl: path.posix }), '/logs/worker-sidevil.log');
+  assert.equal(workerLogPathFor(`${'a'.repeat(70)}`, env, { pathImpl: path.posix }), `/logs/worker-${'a'.repeat(64)}.log`);
+  for (const empty of ['', null, undefined, '../..', '   ']) {
+    assert.equal(workerLogPathFor(empty, env, { pathImpl: path.posix }), null, String(empty));
+  }
+});
+
+test('prepareWorkerLogFile opens the path workerLogPathFor names; an empty id still gets the shared file', async () => {
+  const { prepareWorkerLogFile, workerLogPathFor } = await import('./session-worker-launch-service.mjs');
+  const fsImpl = { mkdirSync: () => {}, statSync: () => { throw new Error('missing'); }, renameSync: () => {} };
+  const env = { COPILOT_WEB_RELAY_LOG_DIR: '/logs' };
+  for (const id of ['sid-1', 'f0e1d2c3-b4a5-4697-8879-6a5b4c3d2e1f', 'sid/../evil', 'x'.repeat(80)]) {
+    assert.equal(prepareWorkerLogFile(id, env, { fsImpl, pathImpl: path.posix }), workerLogPathFor(id, env, { pathImpl: path.posix }), id);
+  }
+  assert.equal(prepareWorkerLogFile('', env, { fsImpl, pathImpl: path.posix }), '/logs/worker-worker.log');
+});
+
 // ─── the worker log on the windows console launch ────────────────────────────
 
 const WIN32_WORKER_LOG = path.win32.join('C:\relay', 'logs', 'worker-abc-123.log');

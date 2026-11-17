@@ -227,6 +227,8 @@ import {
 } from './context-tier-options.mjs';
 import {
   isOpenAIImageModelId,
+  providerDisplayName,
+  providerSessionLabel,
   sessionLockNoteText,
   sessionLockProviderKey,
 } from './conversation-provider-indicator.mjs';
@@ -244,6 +246,7 @@ import {
 } from './message-search-view.js';
 import { initSubagentViewer } from './subagent-viewer.mjs';
 import { initTaskConsole } from './task-console.mjs';
+import { initWorkerLogView } from './worker-log-view.mjs';
 import { watchPreviewMarks } from './share-preview-marks.mjs';
 import {
   initGitChangesView,
@@ -3181,7 +3184,7 @@ function renderModelVariantCatalogBody() {
   );
   const providerTabButtons = `
     <div class="summary-tab-strip" style="display:flex;flex-wrap:wrap;gap:calc(4px * var(--ui-scale)) calc(5px * var(--ui-scale));align-items:center;">
-      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot">Copilot</button>
+      <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'copilot' ? ' active' : ''}" data-model-provider-tab="copilot" ${hasCopilotTab ? '' : 'disabled'}>Copilot</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'openai' ? ' active' : ''}" data-model-provider-tab="openai" ${hasOpenAITab ? '' : 'disabled'}>OpenAI</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'anthropic' ? ' active' : ''}" data-model-provider-tab="anthropic" ${hasAnthropicTab ? '' : 'disabled'}>Claude SDK</button>
       <button type="button" class="summary-btn model-provider-tab${modelVariantCatalogProviderTab === 'claude-api' ? ' active' : ''}" data-model-provider-tab="claude-api" ${hasClaudeApiTab ? '' : 'disabled'}>Claude API</button>
@@ -4099,26 +4102,20 @@ async function saveAutoCompactWindow(convId, autoCompactWindow, pendingNote = ''
   }
 }
 
+// The context modal's subtitle: the SDK session under its provider's name
+// (plain "Session" when the relay names none), else the conversation.
+function contextSummarySubtitle(providerType, sessionId, convId) {
+  if (sessionId) return `${providerSessionLabel(providerType)} ${sessionId.slice(0, 8)}`;
+  return convId ? `Conversation ${convId.slice(0, 8)}` : 'No conversation selected';
+}
+
 async function loadContextSummaryAndRender(convId) {
   const trimmedConvId = String(convId || '').trim();
   const payload = await loadContextSummary(trimmedConvId);
   if (!payload) throw new Error('Unable to load context');
   const sessionId = String(payload.copilotSessionId || payload.snapshot?.copilot_session_id || '').trim();
   const refreshLookupId = sessionId || trimmedConvId || null;
-  const providerLabel = payload.providerType === 'claude'
-    ? 'Claude'
-    : (payload.providerType === 'claude-api'
-      ? 'Claude API'
-      : (payload.providerType === CLAUDE_CLOUD_PROVIDER
-        ? 'Claude Cloud'
-        : (payload.providerType === 'cursor'
-          ? 'Cursor'
-          : (payload.providerType === 'grok'
-            ? 'Grok'
-            : (payload.providerType === 'deepseek' ? 'DeepSeek' : 'Copilot')))));
-  const subtitle = sessionId
-    ? `${providerLabel} session ${sessionId.slice(0, 8)}`
-    : (trimmedConvId ? `Conversation ${trimmedConvId.slice(0, 8)}` : 'No conversation selected');
+  const subtitle = contextSummarySubtitle(payload.providerType, sessionId, trimmedConvId);
 
   // The session fields come with the payload when the relay knows them
   // (older relays send neither, and the notes fall back to draft vs stored).
@@ -4859,11 +4856,12 @@ function initChatTitleCopy() {
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    const sessionId = String(title.dataset.copilotSessionId || '').trim();
+    const sessionId = String(title.dataset.sdkSessionId || '').trim();
     if (!sessionId) return;
     copyTextToClipboard(sessionId).then((ok) => {
       if (ok) {
-        showTransientRelayNotice(`Copied Copilot session ID: ${sessionId.slice(0, 8)}…`);
+        const provider = providerDisplayName(title.dataset.sdkSessionProvider);
+        showTransientRelayNotice(`Copied ${provider ? `${provider} session` : 'session'} ID: ${sessionId.slice(0, 8)}…`);
       } else {
         showTransientRelayNotice('Could not copy session ID.');
       }
@@ -6081,6 +6079,7 @@ async function initApp() {
   initMessageSearchView({ openConversation });
   initSubagentViewer();
   initTaskConsole();
+  initWorkerLogView({ closeMenu: () => { lockChatActionsMenuShield(350); closeChatActionsMenu(); } });
   initPinnedMessagesView({
     openConversation,
     focusMessage: focusConversationMessageById,

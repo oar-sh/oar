@@ -82,8 +82,10 @@ import {
   loadDeepSeekSettings,
   loadClaudeApiSettings,
   loadOpenAISettings,
+  loadCopilotSettings,
 } from './api-client.js';
 import { isSetupRequired, updateProviderReadinessInputs } from './provider-readiness.mjs';
+import { newChatProviderOptions, preselectedNewChatProvider, readLastNewChatProvider, rememberNewChatProvider } from './new-chat-providers.mjs';
 import { SETUP_TEXT } from './no-conversation-state.mjs';
 import { openSettingsModal } from './settings-modal.js';
 import { START_ON_SUBSCRIPTION_ACTION, newChatClaudeApiRefusalActions } from './relay-error-ctas.mjs';
@@ -1879,7 +1881,7 @@ function updateNewConversationProviderHelp(provider = 'github') {
     help.textContent = "DeepSeek chats run Claude Code on the relay host against DeepSeek's API, billed to your saved DeepSeek key.";
     return;
   }
-  help.textContent = 'Copilot models use your GitHub Copilot runtime.';
+  help.textContent = normalizedProvider === 'github' ? 'Copilot chats run on the GitHub Copilot CLI and its login on the relay host.' : '';
 }
 
 async function populateNewConversationModelSelect(providerType = 'github') {
@@ -2470,7 +2472,7 @@ function populateNewConversationCwdSelect() {
 
 // The New Chat modal with no provider known to be ready: a note above the
 // buttons, Open Settings → Providers as the main button, and the usual Start
-// (same id, same handler) as a secondary "Start a Copilot chat anyway".
+// (same id, same handler) as a secondary "Start chat anyway".
 function applyNewConversationSetupState(setupRequired) {
   const note = document.getElementById('new-conversation-setup-note');
   const openSettings = document.getElementById('new-conversation-open-settings');
@@ -2490,11 +2492,11 @@ function applyNewConversationSetupState(setupRequired) {
       });
     }
   }
-  if (confirm) confirm.textContent = setupRequired ? 'Start a Copilot chat anyway' : 'Start chat';
+  if (confirm) confirm.textContent = setupRequired ? 'Start chat anyway' : 'Start chat';
 }
 
 async function openNewConversationModelModal() {
-  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings, deepseekSettings, claudeApiSettings] = await Promise.all([
+  const [catalog, settings, claudeSettings, cursorSettings, grokSettings, claudeCloudSettings, deepseekSettings, claudeApiSettings, copilotSettings] = await Promise.all([
     loadModelCatalog(),
     loadOpenAISettings(),
     loadClaudeSettings(),
@@ -2506,6 +2508,8 @@ async function openNewConversationModelModal() {
     loadDeepSeekSettings(),
     // And without Claude API.
     loadClaudeApiSettings(),
+    // The Copilot switch: listed like the others while it is on.
+    loadCopilotSettings(),
   ]);
   newConversationCatalogCache = catalog || null;
   newConversationOpenAISettingsCache = settings || null;
@@ -2519,6 +2523,7 @@ async function openNewConversationModelModal() {
   // and the composer. With no provider known to be ready the modal opens in
   // its setup state: Settings is the main button, Start stays as "anyway".
   const readiness = updateProviderReadinessInputs({
+    copilot: copilotSettings || null,
     openai: settings || null,
     claude: claudeSettings || null,
     claudeCloud: claudeCloudSettings || null,
@@ -2534,44 +2539,16 @@ async function openNewConversationModelModal() {
   clearNewConversationClaudeApiRefusal();
   bindNewConversationCloudInputs();
   const providerSelect = document.getElementById('new-conversation-provider-select');
+  const options = newChatProviderOptions({
+    copilot: copilotSettings, openai: settings, claude: claudeSettings, claudeApi: claudeApiSettings,
+    claudeCloud: claudeCloudSettings, cursor: cursorSettings, grok: grokSettings, deepseek: deepseekSettings,
+  });
   if (providerSelect) {
-    const options = [{ value: 'github', label: 'Copilot' }];
-    if (settings?.enabled === true) {
-      options.push({ value: 'openai', label: 'OpenAI (BYOK)' });
-      options.push({ value: 'openai-image', label: 'OpenAI Image (BYOK)' });
-    }
-    if (claudeSettings?.enabled === true) {
-      options.push({ value: 'claude', label: 'Claude SDK' });
-    }
-    if (claudeApiSettings?.enabled === true) {
-      options.push({ value: 'claude-api', label: 'Claude API' });
-    }
-    if (claudeCloudSettings?.enabled === true) {
-      options.push({ value: CLAUDE_CLOUD_PROVIDER, label: 'Claude Cloud' });
-    }
-    if (cursorSettings?.enabled === true) {
-      options.push({ value: 'cursor', label: 'Cursor SDK' });
-    }
-    if (grokSettings?.enabled === true) {
-      options.push({ value: 'grok', label: 'Grok' });
-    }
-    if (deepseekSettings?.enabled === true) {
-      options.push({ value: 'deepseek', label: 'DeepSeek' });
-    }
-    providerSelect.innerHTML = '';
-    for (const option of options) {
-      const entry = document.createElement('option');
-      entry.value = option.value;
-      entry.textContent = option.label;
-      providerSelect.appendChild(entry);
-    }
-    // With Copilot alone the provider row is a single dead option — hide it.
+    providerSelect.replaceChildren(...options.map((option) => Object.assign(document.createElement('option'), { value: option.value, textContent: option.label })));
+    // With one provider on, the row is a single dead option: hidden.
     const providerRow = document.getElementById('new-conversation-provider-row');
     if (providerRow) providerRow.hidden = options.length <= 1;
-    const preferredProvider = 'github';
-    providerSelect.value = options.some((option) => option.value === preferredProvider)
-      ? preferredProvider
-      : options[0].value;
+    providerSelect.value = preselectedNewChatProvider(options, readLastNewChatProvider());
     if (providerSelect.dataset.modelsBound !== '1') {
       providerSelect.dataset.modelsBound = '1';
       providerSelect.addEventListener('change', () => {
@@ -2581,7 +2558,10 @@ async function openNewConversationModelModal() {
     }
   }
 
-  if (!(await populateNewConversationModelSelect(providerSelect?.value || 'github'))) {
+  // No provider on: the modal opens in its setup state, with nothing to start.
+  const confirm = document.getElementById('new-conversation-model-confirm');
+  if (confirm) confirm.hidden = !options.length;
+  if (options.length && !(await populateNewConversationModelSelect(providerSelect?.value || options[0].value))) {
     showTransientRelayNotice('No model is currently available for a new conversation.', 5000);
     return;
   }
@@ -2649,6 +2629,7 @@ async function openBootstrappedConversation({
   // default model and has no effort, so it must not become what the next
   // local chat starts with.
   if (selectedProvider !== CLAUDE_CLOUD_PROVIDER) rememberBootstrappedSelection(payload);
+  rememberNewChatProvider(selectedProvider);
   // The chosen size becomes the new chat's own, read when its composer is built.
   if (selectedProvider === 'openai-image' && selectedSize) rememberImageComposerValues(conversationId, { size: selectedSize });
   await refreshConversations();

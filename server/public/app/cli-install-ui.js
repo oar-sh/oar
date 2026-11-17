@@ -27,6 +27,7 @@ import {
   showTransientRelayNotice,
 } from './store.js';
 import { getCliStatus, startCliInstall, cancelCliInstall } from './api-client.js';
+import { isCopilotEnabled, subscribeCopilotSettings } from './copilot-settings-ui.js';
 
 // The panels that carry a row. Copilot is detect-only (npm-global on this host),
 // so its payload arrives with an empty `commands` and the buttons stay hidden.
@@ -138,11 +139,12 @@ export function cliRowState(row) {
  * The line under the row: why a provider cannot be installed from here, the
  * doctor warnings verbatim (they are the CLI's own words, not a paraphrase),
  * and the server's hint for what comes after an install (Copilot: log in from
- * a terminal).
+ * a terminal). `switchedOff`: the provider is installed but switched off.
  */
-export function cliRowNote(row) {
+export function cliRowNote(row, { switchedOff = false } = {}) {
   if (!row) return '';
   const parts = [];
+  if (switchedOff && row.installed === true) parts.push('Switch Copilot on above to use it.');
   const blocked = String(row.blockedReason || '').trim();
   if (blocked) parts.push(blocked);
   const hint = String(row.hint || '').trim();
@@ -235,7 +237,7 @@ function renderCliInstallRow(providerId) {
   const note = el(providerId, 'note');
   const noteText = mine && install.error && state === 'error'
     ? String(install.error).trim()
-    : cliRowNote(row);
+    : cliRowNote(row, { switchedOff: providerId === 'copilot' && !isCopilotEnabled() });
   if (note) {
     note.textContent = noteText;
     note.dataset.state = (mine && state === 'error') ? 'error' : '';
@@ -263,9 +265,32 @@ function renderCliInstallRow(providerId) {
   }
 }
 
+/**
+ * Whether the OpenAI tab says it needs the Copilot CLI: OpenAI chats run in
+ * the Copilot SDK worker. Only once the status was read and says it is not
+ * installed; while an install of it runs, the Copilot row tells the story.
+ */
+export function openAINeedsCopilotCli(row, { installing = false } = {}) {
+  return !!row && !!row.checkedAt && row.installed !== true && !installing;
+}
+
+function renderOpenAICopilotCliRow() {
+  const section = document.getElementById('openai-copilot-cli-row');
+  if (!section) return;
+  const install = cliState.install || {};
+  const installing = normalizeProviderId(install.providerId) === 'copilot' && install.state === 'running';
+  const row = cliState.providers?.copilot || null;
+  setHidden(section, !openAINeedsCopilotCli(row, { installing }));
+  // An install from here needs what the Copilot row's Install needs.
+  setHidden(document.getElementById('openai-copilot-cli-install-btn'), !row?.commands?.install);
+}
+
 export function renderCliInstallSections() {
   for (const providerId of CLI_PROVIDER_IDS) renderCliInstallRow(providerId);
+  renderOpenAICopilotCliRow();
 }
+// The Copilot row's note follows the switch above it.
+subscribeCopilotSettings(() => renderCliInstallRow('copilot'));
 
 // A broadcast can outrun the HTTP response that triggered it (the first log
 // chunk lands before POST /api/cli/install returns its "running" snapshot).

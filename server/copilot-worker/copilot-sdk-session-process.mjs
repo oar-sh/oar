@@ -412,9 +412,9 @@ export function createCopilotSdkSessionRunner({
   // nothing in flight, the two others while a model request or a tool is.
   // 0 disables (the background-task timeout's 0 = no-limit convention).
   // Emphatically NOT off by default: the worker's 10s heartbeat keeps renewing
-  // the relay's processing lease (messages-routes.mjs), so without a ceiling a
-  // turn whose runtime went quiet holds its queue row open until the relay's
-  // turn ceiling.
+  // the relay's processing lease (messages-worker-report-routes.mjs), so
+  // without a ceiling a turn whose runtime went quiet holds its queue row open
+  // until the relay's turn ceiling.
   turnStallTimeoutMs = undefined,
   turnStallModelTimeoutMs = undefined,
   turnStallToolTimeoutMs = undefined,

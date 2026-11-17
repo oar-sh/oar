@@ -5,8 +5,8 @@ import { tokenLabel } from './context-tier-options.mjs';
  * selection (maintainer's rule: the hint names who answers, whatever runtime serves
  * it — claude-* through Cursor's catalog still reads "Message Claude…").
  * Provider only breaks ties: Auto/empty follows the conversation's bound
- * provider, unknown families on the OpenAI BYOK provider read OpenAI, and
- * everything else falls back to the historical Copilot text.
+ * provider, unknown families on the OpenAI BYOK provider read OpenAI, a
+ * Copilot chat reads Copilot, and anything else names no provider.
  */
 export function composerPlaceholderFor({ modelId = '', providerType = '' } = {}) {
   const provider = String(providerType || '').trim().toLowerCase();
@@ -17,7 +17,8 @@ export function composerPlaceholderFor({ modelId = '', providerType = '' } = {})
     if (provider === 'openai' || provider === 'openai-byok') return 'Message OpenAI…';
     if (provider === 'cursor') return 'Message Cursor…';
     if (provider === 'deepseek') return 'Message DeepSeek…';
-    return 'Message Copilot…';
+    if (provider === 'github') return 'Message Copilot…';
+    return 'Send a message…';
   };
   if (!id || id === 'auto') return providerFallback();
   if (id.startsWith('claude-')) return 'Message Claude…';

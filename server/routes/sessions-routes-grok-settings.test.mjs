@@ -7,8 +7,8 @@ import {
   buildModelCatalogWithCursorProvider,
   buildModelCatalogWithClaudeProvider,
   buildModelCatalogWithOpenAIProvider,
-  parseGrokSettingsUpdateRequest,
 } from './sessions-routes.mjs';
+import { parseGrokSettingsUpdateRequest } from './settings-routes.mjs';
 
 const base = {
   models: ['gpt-5.4-mini', 'auto'],

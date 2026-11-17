@@ -1,6 +1,6 @@
 // Turns a terminal turn failure in the transcript into a button that fixes it.
 //
-// `buildTerminalFailureTextForChat()` (messages-routes.mjs) renders every
+// `buildTerminalFailureTextForChat()` (messages-helpers.mjs) renders every
 // terminal failure as plain chat text ending in `Error code: relay.<code>.`,
 // so the code is the only stable handle a client has. The dead end this exists
 // for: a Grok turn fails with relay.grok-cli-missing and the printed advice is
@@ -60,6 +60,12 @@ const RELAY_ERROR_CTAS = Object.freeze({
   'claude-api-cap-reached': Object.freeze([
     Object.freeze({ action: 'open-claude-api-cap', label: 'Claude API settings' }),
     SWITCH_TO_SUBSCRIPTION_CTA,
+  ]),
+  // A Copilot row failed at the claim while Copilot is switched off
+  // (messages-worker-claim-routes.mjs, copilotSwitchFence): the switch is on
+  // the Copilot tab.
+  'copilot-switched-off': Object.freeze([
+    Object.freeze({ action: 'open-copilot-settings', label: 'Copilot settings' }),
   ]),
   // An image turn the daily OpenAI image cap stopped before its try: the
   // cap field and "Allow for today" are on the OpenAI tab.

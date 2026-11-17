@@ -14,6 +14,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const runtimeSource = fs.readFileSync(path.join(__dirname, 'server-runtime.mjs'), 'utf8');
 const sessionsSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
+const hostRoutesSource = fs.readFileSync(path.join(__dirname, 'routes', 'host-routes.mjs'), 'utf8');
+// The sessions routes with the route modules they register.
+const sessionsModulesSource = ['sessions-routes.mjs', 'model-routes.mjs', 'host-routes.mjs', 'conversation-read-routes.mjs']
+  .map((file) => fs.readFileSync(path.join(__dirname, 'routes', file), 'utf8'))
+  .join('\n');
 const messagesSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-routes.mjs'), 'utf8');
 const socketSource = fs.readFileSync(path.join(__dirname, 'public', 'app', 'socket-handlers.js'), 'utf8');
 const bootstrapSource = fs.readFileSync(path.join(__dirname, 'public', 'app', 'bootstrap.js'), 'utf8');
@@ -75,11 +80,11 @@ test('relay shutdown state is announced on request, drain and cancel', () => {
 });
 
 test('HTTP surface: GET/POST/cancel for host suspend, cancel for relay shutdown, status field', () => {
-  assert.match(sessionsSource, /app\.get\('\/api\/host\/suspend', auth/);
-  assert.match(sessionsSource, /app\.post\('\/api\/host\/suspend', auth/);
-  assert.match(sessionsSource, /app\.post\('\/api\/host\/suspend\/cancel', auth/);
+  assert.match(hostRoutesSource, /app\.get\('\/api\/host\/suspend', auth/);
+  assert.match(hostRoutesSource, /app\.post\('\/api\/host\/suspend', auth/);
+  assert.match(hostRoutesSource, /app\.post\('\/api\/host\/suspend\/cancel', auth/);
   assert.match(sessionsSource, /hostSuspend: runtimeState\.hostSuspend \|\| null,/);
-  assert.doesNotMatch(sessionsSource, /function runHostSuspendToRam/, 'the command moved to services/host-suspend-command.mjs');
+  assert.doesNotMatch(sessionsModulesSource, /function runHostSuspendToRam/, 'the command moved to services/host-suspend-command.mjs');
   assert.match(messagesSource, /app\.post\('\/api\/relay\/shutdown\/cancel', auth/);
 });
 

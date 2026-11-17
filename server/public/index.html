@@ -1616,8 +1616,8 @@
     text-overflow: ellipsis;
   }
   #chat-title-session-usage[hidden] { display: none; }
-  #chat-title[data-copilot-session-id] { cursor: copy; }
-  #chat-title[data-copilot-session-id]:hover {
+  #chat-title[data-sdk-session-id] { cursor: copy; }
+  #chat-title[data-sdk-session-id]:hover {
     text-decoration: underline;
     text-underline-offset: 2px;
   }
@@ -5001,15 +5001,15 @@
     --tc-ansi-14: #3192aa;
     --tc-ansi-15: #8c959f;
   }
-  #task-console-modal {
+  #task-console-modal, #worker-log-modal {
     position: fixed; inset: 0; z-index: 10900; display: none;
     align-items: center; justify-content: center;
     background: rgba(0, 0, 0, 0.68); padding: calc(9px * var(--ui-scale));
   }
-  #task-console-modal.visible { display: flex; }
-  #task-console-title { flex: 1; min-width: 0; margin: 0; font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
+  #task-console-modal.visible, #worker-log-modal.visible { display: flex; }
+  #task-console-title, #worker-log-title { flex: 1; min-width: 0; margin: 0; font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
   .task-console-meta-row { display: flex; flex-wrap: wrap; align-items: center; gap: calc(4px * var(--ui-scale)); color: var(--muted); font-size: var(--fs-meta-sm); }
-  #task-console-meta { overflow-wrap: anywhere; }
+  #task-console-meta, #worker-log-meta, #worker-log-path { overflow-wrap: anywhere; }
   .tc-stall { color: var(--muted); }
   .tc-stall-warn { color: var(--warn); font-weight: 600; }
   #task-console-chip { cursor: pointer; font: inherit; }
@@ -5020,12 +5020,12 @@
   #task-console-stop:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
   /* "Load earlier" within reach while following the end; the one at the top
      of the output stays. */
-  #task-console-earlier-top {
+  #task-console-earlier-top, #worker-log-earlier-top {
     background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer;
     font-size: var(--fs-meta-sm); text-decoration: underline; text-underline-offset: 3px;
   }
-  #task-console-earlier-top:disabled { color: var(--muted); text-decoration: none; cursor: default; }
-  #task-console-earlier-top[hidden] { display: none; }
+  #task-console-earlier-top:disabled, #worker-log-earlier-top:disabled { color: var(--muted); text-decoration: none; cursor: default; }
+  #task-console-earlier-top[hidden], #worker-log-earlier-top[hidden] { display: none; }
   /* Where the output of a command piped into tail stops until it ends. */
   #task-console-hold {
     margin: calc(4px * var(--ui-scale)) 0 0; padding: calc(3px * var(--ui-scale)) calc(6px * var(--ui-scale)); border-left: 3px solid var(--warn); border-radius: calc(4px * var(--ui-scale));
@@ -5037,18 +5037,18 @@
   /* Wider screens: the console ends above the composer's open task row, so
      the row's chip, clock and Stop stay in view (task-console.mjs sets the
      bottom). Phones keep the full-screen console. */
-  #task-console-modal.tc-above-panel .task-console-dialog { height: 100%; }
-  #task-console-scroll {
+  #task-console-modal.tc-above-panel .task-console-dialog, #worker-log-modal.tc-above-panel .worker-log-dialog { height: 100%; }
+  #task-console-scroll, #worker-log-scroll {
     flex: 1; overflow: auto; overscroll-behavior: contain; padding: calc(4px * var(--ui-scale)) calc(8px * var(--ui-scale)) calc(14px * var(--ui-scale));
     background: var(--bg);
   }
-  #task-console-earlier {
+  #task-console-earlier, #worker-log-earlier {
     display: block; margin: 0 auto calc(4px * var(--ui-scale)); border: 1px solid var(--border); background: var(--bg2);
     color: var(--text); border-radius: 999px; padding: calc(3px * var(--ui-scale)) calc(8px * var(--ui-scale)); font-size: var(--fs-meta-sm); cursor: pointer;
   }
-  #task-console-earlier:disabled { opacity: 0.6; cursor: default; }
-  #task-console-earlier[hidden] { display: none; }
-  #task-console-body {
+  #task-console-earlier:disabled, #worker-log-earlier:disabled { opacity: 0.6; cursor: default; }
+  #task-console-earlier[hidden], #worker-log-earlier[hidden] { display: none; }
+  #task-console-body, #worker-log-body {
     margin: 0; font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
     font-size: var(--fs-meta-sm); line-height: 1.45; color: var(--text);
     white-space: pre-wrap; overflow-wrap: anywhere;
@@ -5099,15 +5099,18 @@
   /* Inverse text (SGR 7) with a side left unset: the console's own colours, swapped. */
   .tc-fg-inverse { color: var(--bg); }
   .tc-bg-inverse { background: var(--text); }
-  #task-console-status { color: var(--muted); padding: calc(5px * var(--ui-scale)) 0; font-size: var(--fs-meta-sm); }
-  #task-console-status[hidden] { display: none; }
-  #task-console-jump {
+  #task-console-status, #worker-log-status { color: var(--muted); padding: calc(5px * var(--ui-scale)) 0; font-size: var(--fs-meta-sm); }
+  #task-console-status[hidden], #worker-log-status[hidden] { display: none; }
+  #task-console-jump, #worker-log-jump {
     position: absolute; left: 50%; bottom: calc(14px * var(--ui-scale)); transform: translateX(-50%);
     border: 1px solid var(--accent); background: var(--bg3); color: var(--accent);
     border-radius: 999px; padding: calc(3px * var(--ui-scale)) calc(8px * var(--ui-scale)); font-size: var(--fs-meta-sm); cursor: pointer;
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
   }
-  #task-console-jump[hidden] { display: none; }
+  #task-console-jump[hidden], #worker-log-jump[hidden] { display: none; }
+  /* The worker log view is the task console above, with the log's path
+     and the scrub note in its header. */
+  .wl-note { font-style: italic; }
   /* Rows in the composer panel: the console opener, the health hints, the
      ended rows. */
   .bg-task-desc.task-console-open {
@@ -5141,9 +5144,9 @@
   }
   .bg-task-dismiss:hover { color: var(--text); border-color: var(--text); }
   @media (max-width: 680px) {
-    #task-console-modal { padding: 0; }
-    #task-console-modal .subagent-viewer-dialog { width: 100%; height: 100%; border: 0; border-radius: 0; }
-    #task-console-scroll { padding: calc(4px * var(--ui-scale)) calc(6px * var(--ui-scale)) calc(14px * var(--ui-scale)); }
+    #task-console-modal, #worker-log-modal { padding: 0; }
+    #task-console-modal .subagent-viewer-dialog, #worker-log-modal .subagent-viewer-dialog { width: 100%; height: 100%; border: 0; border-radius: 0; }
+    #task-console-scroll, #worker-log-scroll { padding: calc(4px * var(--ui-scale)) calc(6px * var(--ui-scale)) calc(14px * var(--ui-scale)); }
   }
   /* Preview cards: same row grammar as a background task, with a link-shaped
      primary action. Shared by the composer panel and the settings list. */
@@ -8854,6 +8857,7 @@
             <button id="chat-menu-archive" class="chat-actions-menu-item" type="button" role="menuitem">🗄️ Archive conversation</button>
             <button id="chat-menu-group" class="chat-actions-menu-item" type="button" role="menuitem">🧩 Session group…</button>
             <button id="chat-menu-refresh-history" class="chat-actions-menu-item" type="button" role="menuitem" hidden disabled aria-hidden="true" tabindex="-1" style="display:none">🔄️ Refresh history</button>
+            <button id="chat-menu-worker-log" class="chat-actions-menu-item" type="button" role="menuitem">📜 Worker log</button>
             <button id="chat-menu-select-models" class="chat-actions-menu-item" type="button" role="menuitem">🤗 Select Models<span id="chat-menu-select-models-dot" class="chat-menu-new-dot" aria-hidden="true" hidden></span></button>
             <button id="chat-menu-change-cwd" class="chat-actions-menu-item" type="button" role="menuitem">🗂️ Change CWD</button>
             <button id="chat-menu-git-changes" class="chat-actions-menu-item" type="button" role="menuitem">🌿 Git changes</button>
@@ -8995,8 +8999,8 @@
       <div id="composer-settings-backdrop" class="composer-settings-backdrop" hidden></div>
       <div class="input-row">
         <input id="image-input" type="file" multiple hidden onchange="handleAttachmentInput(this.files); this.value='';">
-        <textarea id="msg-input" placeholder="Message Copilot…" rows="1" aria-autocomplete="list" onkeydown="handleKey(event)" oninput="autoResize(this); updateComposerSlashMenu(this)"></textarea>
-        <button id="send-btn" onclick="sendMessage()">Send</button>
+        <textarea id="msg-input" placeholder="Send a message…" rows="1" aria-autocomplete="list" onkeydown="handleKey(event)" oninput="autoResize(this); updateComposerSlashMenu(this)"></textarea>
+        <button id="send-btn" onclick="this.dataset.action === 'open-copilot-settings' ? openSettingsModal('providers', 'copilot') : (this.dataset.action === 'open-new-chat' ? newConversation() : sendMessage())">Send</button>
         <a id="shared-github-pill" href="https://github.com/oar-sh/oar" target="_blank" rel="noopener" aria-label="Fork OAR on GitHub">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
           <span>Fork on GitHub</span>
@@ -9550,6 +9554,14 @@
           aria-labelledby="settings-provider-tab-copilot"
           data-settings-provider-panel="copilot"
         >
+          <!-- The Copilot switch; copilot-settings-ui.js binds and renders it. -->
+          <div class="settings-row settings-row-column settings-gap">
+            <div class="settings-row settings-row-full settings-row-lead">
+              <label for="copilot-enabled-toggle">Enable GitHub Copilot</label>
+              <input id="copilot-enabled-toggle" type="checkbox" checked>
+            </div>
+            <div id="copilot-settings-status" class="settings-help settings-provider-status settings-gap-xs">Checking…</div>
+          </div>
           <!-- Provider CLI status row; cli-install-ui.js drives the state: Install
                (GitHub's script into ~/.local/bin, npm on Windows), Update
                (copilot update), Cancel/Dismiss. -->
@@ -9581,6 +9593,15 @@
           data-settings-provider-panel="openai"
           hidden
         >
+          <!-- OpenAI chats run in the Copilot SDK worker, so they need the
+               Copilot CLI (not a Copilot login, and not the Copilot switch).
+               cli-install-ui.js shows this while the CLI is missing. -->
+          <div id="openai-copilot-cli-row" class="settings-row settings-gap" hidden>
+            <span id="openai-copilot-cli-note" class="settings-help settings-provider-status" data-state="unconfigured" style="flex: 1 1 auto;">Needs the GitHub Copilot CLI: OpenAI chats run in its worker. No Copilot login is needed.</span>
+            <div class="settings-inline-actions">
+              <button id="openai-copilot-cli-install-btn" type="button" class="summary-btn" onclick="confirmCliInstall('copilot', 'install')">Install</button>
+            </div>
+          </div>
           <div class="settings-row settings-row-column settings-gap">
             <label for="openai-api-key-input">OpenAI API key</label>
             <div class="settings-row settings-row-full settings-row-lead">
@@ -9614,7 +9635,7 @@
               <button id="openai-save-btn" type="button" class="summary-btn" onclick="saveOpenAISettings()">Save OpenAI settings</button>
               <button id="openai-remove-btn" type="button" class="summary-btn" onclick="removeOpenAISettings()">Remove saved key</button>
             </div>
-            <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Provider changes also update conversations that have not sent a message yet. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
+            <div class="settings-help">Leave the key blank to keep the saved key, or enter a new one to replace it. Chats keep their provider when the key is removed or OpenAI is switched off. The Base URL is useful for OpenAI-compatible endpoints or for pointing to the capture proxy (<code>node server/tools/capture-proxy.mjs</code>) to inspect requests.</div>
           </div>
           <!-- Image turns: the daily cap, today's spend and the presets (openai-image-cost-ui.js). -->
           <div id="openai-image-spend-section" class="settings-row settings-row-column settings-gap" data-testid="openai-image-spend-section">
@@ -10557,10 +10578,9 @@
       <div id="new-conversation-cwd-status" class="new-conversation-field-note" style="word-break:break-word;">New chats start in the relay default directory.</div>
       <div id="new-conversation-provider-row">
         <label for="new-conversation-provider-select" class="new-conversation-field-label">Provider</label>
-        <select id="new-conversation-provider-select">
-          <option value="github">Copilot</option>
-        </select>
-        <div id="new-conversation-provider-help" class="new-conversation-field-note">Copilot models use your GitHub Copilot runtime.</div>
+        <!-- The providers that are on, filled when New Chat opens (new-chat-providers.mjs). -->
+        <select id="new-conversation-provider-select"></select>
+        <div id="new-conversation-provider-help" class="new-conversation-field-note"></div>
       </div>
       <!-- Claude Cloud only (journal-view.js): the GitHub repository and branch
            the cloud session clones, filled from the folder picked above. -->
@@ -10685,6 +10705,32 @@
       <div id="task-console-status" hidden></div>
     </div>
     <button id="task-console-jump" type="button" hidden>Jump to end ↓</button>
+  </div>
+</div>
+
+<!-- Worker log: the end of the conversation's worker log, live while it is
+     open (worker-log-view.mjs). Credentials are scrubbed on the relay. -->
+<div id="worker-log-modal" aria-hidden="true">
+  <div class="subagent-viewer-dialog worker-log-dialog" role="dialog" aria-modal="true" aria-labelledby="worker-log-title">
+    <div class="subagent-viewer-header">
+      <div class="subagent-viewer-title-row">
+        <span aria-hidden="true">📜</span>
+        <h2 id="worker-log-title">Worker log</h2>
+        <button class="subagent-viewer-btn worker-log-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="task-console-meta-row">
+        <span id="worker-log-meta"></span>
+        <button id="worker-log-earlier-top" type="button" hidden>Load earlier</button>
+      </div>
+      <div class="task-console-meta-row"><span id="worker-log-path"></span></div>
+      <div class="task-console-meta-row wl-note">Credentials are scrubbed; the file on the host is not.</div>
+    </div>
+    <div id="worker-log-scroll">
+      <button id="worker-log-earlier" type="button" hidden>Load earlier</button>
+      <pre id="worker-log-body"></pre>
+      <div id="worker-log-status" hidden></div>
+    </div>
+    <button id="worker-log-jump" type="button" hidden>Jump to end ↓</button>
   </div>
 </div>
 

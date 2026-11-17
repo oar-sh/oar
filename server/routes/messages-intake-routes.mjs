@@ -46,6 +46,7 @@ import {
   deepseekReasoningEffortFor,
 } from '../../shared/deepseek-models.mjs';
 import { normalizeClaudeBilling } from '../services/claude-billing-switch-service.mjs';
+import { copilotEnabledFromStmts, copilotOffCreateRefusal } from '../services/copilot-settings-service.mjs';
 import { PLAN_ONLY_REFUSAL, planOnlyRefusesMode } from '../../shared/plan-only.mjs';
 import { notPerson } from '../services/relay-principal.mjs';
 import { AUTH_ERROR_CODES, AUTH_RELAY_TOOL_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
@@ -60,6 +61,7 @@ import {
   recordRemoteRelayUnlocks,
   withRemoteRelayMentionHint,
 } from '../services/remote-relay-inbound.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 
 const DUPLICATE_USER_MESSAGE_WINDOW_MS = 10 * 60 * 1000;
 
@@ -101,7 +103,8 @@ export function shouldRequireNewOpenAIConversation({
 function normalizeRequestedProviderType(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'openai' || normalized === 'openai-byok' || normalized === 'openai-image') return 'openai';
-  if (normalized === 'github' || normalized === 'github-copilot') return 'github';
+  // `copilot` is the tab's and the CLI's name for the provider `github`.
+  if (normalized === 'github' || normalized === 'github-copilot' || normalized === 'copilot') return 'github';
   if (normalized === 'cursor') return 'cursor';
   // Without these, an explicit request for a bootstrap-only provider read as
   // "no provider stated" and the guards below could never fire.
@@ -236,7 +239,12 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
     sessionWorkerRegistry,
     sessionWorkerSupervisor,
     resolveSessionStateRoot,
+    claudeCloudSessionService,
+    // Decides the Copilot switch once on a new database
+    // (copilot-settings-service.mjs); absent, an unset switch reads as on.
+    detectCopilotCli = null,
   } = deps;
+  const isCopilotEnabled = () => copilotEnabledFromStmts(stmts, { detectCli: detectCopilotCli });
   const {
     uploadReadDirs,
     imageInputDenyPaths,
@@ -548,6 +556,17 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
     // A switch with the message: the rest of the send resolves the model,
     // effort and limits against the billing it switches to.
     const runtimeProviderType = billingSwitch?.to || boundProviderType;
+    // A Copilot chat (provider `github`, or none: a chat from before
+    // providers) does not take a message while Copilot is switched off. It
+    // is not moved; switched on again, it works, and the message is sent
+    // again by hand. OpenAI chats share Copilot's worker but not its switch.
+    if (!shouldCreateConversation && (runtimeProviderType === 'github' || runtimeProviderType === '') && !isCopilotEnabled()) {
+      return res.status(409).json({
+        error: 'Copilot is switched off on this relay, so this message was not sent. Switch it on in Settings → Providers → Copilot.',
+        code: 'COPILOT_SWITCHED_OFF',
+        conversationId,
+      });
+    }
     // An agent's send to a chat on the key while this month's cap is reached
     // is refused before anything is stored, so the agent hears it at once (a
     // page's send is queued and refused at the claim, with its note there).
@@ -638,6 +657,12 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
         error: `Creating a ${bootstrapOnlyProvider} conversation requires POST /api/conversation/bootstrap`,
         code: 'PROVIDER_REQUIRES_BOOTSTRAP',
       });
+    }
+    // A first send that would create a Copilot chat while Copilot is off is
+    // refused, as on the bootstrap route; nothing is created.
+    if (shouldCreateConversation && !useOpenAIProvider && !isCopilotEnabled()) {
+      const named = requestedProviderType === 'github' || requestedModelAvailableInGitHub;
+      return res.status(400).json(copilotOffCreateRefusal({ named }));
     }
     const requestedConfiguredOpenAIModel = configuredOpenAI?.enabled
       && String(model || '').trim() === String(configuredOpenAI.model || '').trim();
@@ -1497,6 +1522,8 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
     let imageOperation = null;
     // The switch's announcement, made once the send has committed.
     let announceBillingSwitch = null;
+    // A send into an archived chat brings it back with the row.
+    let unarchived = false;
     const persistMessageAndQueue = db.transaction(() => {
       // First, so the row below is stamped with the new billing; a refused
       // switch undoes the whole send.
@@ -1618,7 +1645,7 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
           now,
         );
       }
-      stmts.insertQ.run(
+      ({ unarchived } = queueIntoConversation(db, stmts, [
         msgId,
         convId,
         runtimeSession?.id || null,
@@ -1636,7 +1663,7 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
         null,
         null,
         null,
-      );
+      ]));
       if (imageOptions) stmts.setQueueImageOptions?.run?.(JSON.stringify(imageOptions), msgId);
       if (openAIImageModel) {
         if (!imageOperationService?.createEnqueuedOperation) {
@@ -1682,6 +1709,18 @@ export function registerMessagesIntakeRoutes(app, deps, shared) {
         });
       }
       throw error;
+    }
+    if (unarchived) {
+      io.emit(...unarchivedConversationEvent(convId));
+      // As the unarchive route does: the cloud session comes back too.
+      try {
+        claudeCloudSessionService?.unarchiveSessionInBackground?.({
+          conversationId: convId,
+          runtimeSession: stmts.getRuntimeSessionByConversation?.get?.(convId) || null,
+        });
+      } catch (error) {
+        console.warn(`[archive] Cloud session unarchive not started for ${convId}: ${error?.message || error}`);
+      }
     }
     recordRemoteRelayUnlocks(remoteRelayInbound, {
       conversationId: convId,

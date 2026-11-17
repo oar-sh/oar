@@ -4,22 +4,28 @@
 // tail: bytes written between the read and the join would otherwise be lost
 // until the next gap shows them. The relay's rooms may or may not survive a
 // reconnect, so the console watches again on every connect.
+//
+// Another view of one file per conversation (the worker log) passes its own
+// event names and `itemKey: null`: it watches a conversation, not a task.
 
 const WATCH_TIMEOUT_MS = 3000;
+const TASK_OUTPUT_WATCH_EVENTS = Object.freeze({ watch: 'task_output_watch', unwatch: 'task_output_unwatch' });
 
-export function createTaskConsoleWatch({ getSocket, timeoutMs = WATCH_TIMEOUT_MS } = {}) {
+export function createTaskConsoleWatch({
+  getSocket,
+  timeoutMs = WATCH_TIMEOUT_MS,
+  events = TASK_OUTPUT_WATCH_EVENTS,
+  itemKey = 'taskId',
+} = {}) {
   let watched = null;
 
-  async function watch(conversationId, taskId) {
-    watched = { conversationId: String(conversationId || ''), taskId: String(taskId || '') };
+  async function watch(conversationId, itemId) {
+    watched = { conversationId: String(conversationId || ''), ...(itemKey ? { [itemKey]: String(itemId || '') } : {}) };
     const socket = getSocket?.();
-    if (!socket?.connected || !watched.conversationId || !watched.taskId) return { ok: false, code: 'offline' };
+    if (!socket?.connected || !watched.conversationId || (itemKey && !watched[itemKey])) return { ok: false, code: 'offline' };
     let result;
     try {
-      result = await socket.timeout(timeoutMs).emitWithAck('task_output_watch', {
-        conversationId: watched.conversationId,
-        taskId: watched.taskId,
-      });
+      result = await socket.timeout(timeoutMs).emitWithAck(events.watch, { ...watched });
     } catch {
       return { ok: false, code: 'timeout' };
     }
@@ -30,7 +36,7 @@ export function createTaskConsoleWatch({ getSocket, timeoutMs = WATCH_TIMEOUT_MS
     if (!watched) return;
     watched = null;
     const socket = getSocket?.();
-    if (socket?.connected) socket.emit('task_output_unwatch', {});
+    if (socket?.connected) socket.emit(events.unwatch, {});
   }
 
   return {

@@ -48,6 +48,24 @@ test('unwatch tells the relay once and forgets the task', async () => {
   assert.equal(watch.current(), null);
 });
 
+test('custom event names and no item: the worker log watches a conversation', async () => {
+  const socket = fakeSocket({ answer: () => ({ ok: true, offset: 0, size: 0 }) });
+  const watch = createTaskConsoleWatch({
+    getSocket: () => socket,
+    timeoutMs: 500,
+    events: { watch: 'worker_log_watch', unwatch: 'worker_log_unwatch' },
+    itemKey: null,
+  });
+  assert.deepEqual(await watch.watch('conv-fixture-1'), { ok: true, offset: 0, size: 0 });
+  assert.deepEqual(watch.current(), { conversationId: 'conv-fixture-1' });
+  watch.unwatch();
+  assert.deepEqual(socket.sent.map(({ event, payload }) => [event, payload]), [
+    ['worker_log_watch', { conversationId: 'conv-fixture-1' }],
+    ['worker_log_unwatch', {}],
+  ]);
+  assert.deepEqual(await watch.watch(''), { ok: false, code: 'offline' }, 'no conversation, no watch');
+});
+
 test('offline or unanswered, the watch gives up quietly and keeps the task for the reconnect', async () => {
   const offline = fakeSocket({ connected: false });
   const watch = createTaskConsoleWatch({ getSocket: () => offline });

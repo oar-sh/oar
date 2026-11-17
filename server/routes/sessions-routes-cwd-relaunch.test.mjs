@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { evaluateWorkspaceRootRelaunch } from './sessions-routes.mjs';
+import { evaluateWorkspaceRootRelaunch } from '../services/workspace-root-relaunch-service.mjs';
 
 test('evaluateWorkspaceRootRelaunch restarts an idle worker', () => {
   assert.deepEqual(evaluateWorkspaceRootRelaunch({ workerStatus: 'ready' }), {

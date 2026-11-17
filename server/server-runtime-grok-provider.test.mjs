@@ -13,6 +13,7 @@ const runtimeSource = fs.readFileSync(path.join(__dirname, 'server-runtime.mjs')
 const launchSource = fs.readFileSync(path.join(__dirname, 'services', 'session-worker-launch-service.mjs'), 'utf8');
 const dbSchemaSource = fs.readFileSync(path.join(__dirname, 'db-schema.mjs'), 'utf8');
 const sessionsSource = fs.readFileSync(path.join(__dirname, 'routes', 'sessions-routes.mjs'), 'utf8');
+const modelRoutesSource = fs.readFileSync(path.join(__dirname, 'routes', 'model-routes.mjs'), 'utf8');
 const settingsSource = fs.readFileSync(path.join(__dirname, 'routes', 'settings-routes.mjs'), 'utf8');
 const bootstrapSource = fs.readFileSync(path.join(__dirname, 'routes', 'conversation-bootstrap-routes.mjs'), 'utf8');
 const intakeSource = fs.readFileSync(path.join(__dirname, 'routes', 'messages-intake-routes.mjs'), 'utf8');
@@ -38,7 +39,8 @@ test('server-runtime exposes grok settings and launch binding', () => {
   // The schema/migration block (including the grok_native_session_id column)
   // moved verbatim to db-schema.mjs.
   assert.match(dbSchemaSource, /grok_native_session_id/);
-  assert.match(runtimeSource, /managedProvider = \['claude', 'cursor', 'grok', 'deepseek', 'claude-api'\]/);
+  // Switching Grok on or off moves no chat (the empty-chat rebind is gone).
+  assert.doesNotMatch(runtimeSource, /managedProvider = \[|reconcileUnstartedConversationProviders/);
 });
 
 test('sessions-routes bootstrap and settings accept grok', () => {
@@ -48,7 +50,7 @@ test('sessions-routes bootstrap and settings accept grok', () => {
   assert.match(bootstrapSource, /useGrokProvider/);
   assert.match(bootstrapSource, /GROK_NOT_CONFIGURED/);
   assert.match(bootstrapSource, /normalized === 'grok'/);
-  assert.match(sessionsSource, /grokModels:/);
+  assert.match(modelRoutesSource, /grokModels:/);
 });
 
 test('messages-routes dequeue and native session route support grok', () => {

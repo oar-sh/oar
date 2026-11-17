@@ -48,6 +48,7 @@ import { migrateMediaIndex } from './migrations/0039-media-index.mjs';
 import { migrateImageSessionDefaults } from './migrations/0040-image-session-defaults.mjs';
 import { migrateBrowserSessions } from './migrations/0041-browser-sessions.mjs';
 import { migrateLateReplies } from './migrations/0042-late-replies.mjs';
+import { migrateCopilotEnabled } from './migrations/0043-copilot-enabled.mjs';
 import { migrateImageConversationSchema } from './repositories/image-conversation-repository.mjs';
 
 // Mirrors DEFAULT_RELAY_MODE in server-runtime.mjs; used only by the one-time
@@ -1133,6 +1134,15 @@ try {
   migrateLateReplies(db);
 } catch (error) {
   console.warn(`[relay-events] migration 0042 failed; retrying on next boot: ${error?.message || error}`);
+}
+
+// The Copilot switch stays on for a relay that was in use. Without it the
+// switch is unset and the first read decides it, so a failure is logged and
+// retried next boot.
+try {
+  migrateCopilotEnabled(db);
+} catch (error) {
+  console.warn(`[copilot] migration 0043 failed; retrying on next boot: ${error?.message || error}`);
 }
 
 const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all().map((c) => c.name);

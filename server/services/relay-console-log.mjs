@@ -23,7 +23,14 @@ export const RELAY_CONSOLE_LOG_DISABLE_ENV = 'OAR_NO_CONSOLE_LOG';
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_KEEP = 3;
 const LEVELS = Object.freeze(['log', 'info', 'warn', 'error', 'debug']);
-const ANSI_STYLE_PATTERN = /\u001b\[[0-9;]*m/g;
+// Terminal codes, gone before any matching so none can split a token: every
+// CSI (colours, erases, cursor moves), every OSC (a title, a hyperlink) up to
+// its BEL or ST, line breaks inside it included, or else to the next ESC or
+// the line's end, an escape with intermediate bytes (`ESC ( B`), and ESC with
+// `7`, `8` or a printable character no token holds (`ESC =`). Any other ESC
+// goes alone and the character after it stays: eating a letter or a digit
+// could break a token's prefix. The file is plain text.
+const TERMINAL_CODE_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b\][^\u0007\u001b\n]*|\u001b[ -/]+[0-~]|\u001b[78!-,/:-@[-^`{-~]|\u001b/g;
 // A token in a URL, whatever its value: the page is opened with `?token=`.
 const TOKEN_PARAM_PATTERN = /([?&]token=)[^&\s"'<>]+/gi;
 // A file capability (`fc1.<session>.<expiry>.<mac>`, file-capability.mjs),
@@ -134,7 +141,7 @@ export function installRelayConsoleLog({
   function scrub(text) {
     // Any prefixed relay credential (owner token, session, sign-in code,
     // agent token, peer key) goes by its shape; older values by name.
-    const out = String(text).replace(ANSI_STYLE_PATTERN, '').replace(TOKEN_PARAM_PATTERN, '$1[token]').replace(RELAY_CREDENTIAL_PATTERN, '[token]')
+    const out = String(text).replace(TERMINAL_CODE_PATTERN, '').replace(TOKEN_PARAM_PATTERN, '$1[token]').replace(RELAY_CREDENTIAL_PATTERN, '[token]')
       .replace(FILE_CAPABILITY_PATTERN, '[capability]').replace(CAPABILITY_PARAM_PATTERN, '$1[capability]').replace(MEDIA_TAG_PATTERN, '$1[tag]');
     const secrets = currentSecretPattern();
     return secrets ? out.replace(secrets, '[token]') : out;

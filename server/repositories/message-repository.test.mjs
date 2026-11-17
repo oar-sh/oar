@@ -3,8 +3,9 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createMessageRepository } from './message-repository.mjs';
 import { createMessagePinStatements } from './message-pin-statements.mjs';
-import { dequeuePendingMessage, resolveExecutedProviderForResponse } from '../routes/messages-routes.mjs';
-import { mapUsageSnapshotRow } from '../routes/sessions-routes.mjs';
+import { dequeuePendingMessage } from '../routes/messages-worker-claim-routes.mjs';
+import { resolveExecutedProviderForResponse } from '../routes/messages-worker-output-routes.mjs';
+import { mapUsageSnapshotRow } from '../services/usage-snapshot-helpers.mjs';
 import { applySchema } from '../db-schema.mjs';
 
 function createTestDb() {
@@ -841,6 +842,27 @@ test('hasProcessingRow finds a processing row and nothing else', () => {
   assert.equal(repository.hasProcessingRow.get(), undefined, 'pending, done and parked rows are not processing');
   insert.run('q-processing', 'processing');
   assert.deepEqual({ ...repository.hasProcessingRow.get() }, { present: 1 });
+});
+
+test("countStatus leaves out an archived chat's pending row and keeps its processing one", () => {
+  const db = createTestDb();
+  const repository = createMessageRepository(db);
+  db.prepare(`INSERT INTO conversations (id, title, status, archived, created_at, updated_at) VALUES (?, ?, 'active', ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
+    .run('conv-live', 'Live', 0);
+  db.prepare(`INSERT INTO conversations (id, title, status, archived, created_at, updated_at) VALUES (?, ?, 'active', ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`)
+    .run('conv-archived', 'Archived', 1);
+  const insert = db.prepare(`
+    INSERT INTO queue (id, conversation_id, is_new_conversation, text, status, timestamp, retry_count)
+    VALUES (?, ?, 0, 'hello', ?, '2026-01-01T00:00:00.000Z', 0)
+  `);
+  insert.run('q-live-pending', 'conv-live', 'pending');
+  insert.run('q-archived-pending', 'conv-archived', 'pending');
+  insert.run('q-archived-processing', 'conv-archived', 'processing');
+  insert.run('q-archived-parked', 'conv-archived', 'parked');
+  // A row whose conversation row is missing still counts, as before.
+  insert.run('q-orphan-pending', 'conv-gone', 'pending');
+  const counts = Object.fromEntries(repository.countStatus.all().map((row) => [row.status, row.cnt]));
+  assert.deepEqual(counts, { pending: 2, processing: 1, parked: 1 });
 });
 
 test('nextPendingAttemptAt names the earliest future retry of a pending row, never a hold until resumed', () => {

@@ -36,6 +36,8 @@ const CHECK_DIR_PREFIX = '.database-file-check-';
 // work either. And the owner token's use record (owner-token-use.mjs
 // OWNER_TOKEN_LAST_USE_SETTING_KEY), which every start begins when it
 // finds none, and which counts a script's use of the token, not a chat.
+// And the Copilot switch (copilot-settings-service.mjs), which the first
+// read on a new database writes from the CLI detection.
 export const STARTUP_SETTING_KEYS = Object.freeze([
   'auth_owner_token_hash',
   'auth_owner_token_last_use',
@@ -50,6 +52,7 @@ export const STARTUP_SETTING_KEYS = Object.freeze([
   'deepseek_model_state',
   'claude_api_model_state',
   'model_refresh_last',
+  'copilot_enabled',
 ]);
 // And the tables such a start fills that hold no one's work: the model
 // catalog and its refresh state, the one row an earlier version's restart

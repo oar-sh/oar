@@ -27,17 +27,15 @@ import {
   assistantText,
   settled,
 } from './claude-session-test-harness.mjs';
-import {
-  buildDequeuedRelayMessage,
-  dequeuePendingMessage,
-} from '../routes/messages-routes.mjs';
+import { buildDequeuedRelayMessage } from '../routes/messages-worker-claim-routes.mjs';
+import { dequeuePendingMessage } from '../routes/messages-worker-claim-routes.mjs';
 import {
   makeRouteDeps as baseRouteDeps,
   captureRoutes,
   invokeRoute,
   makeApi,
 } from '../routes/messages-routes-test-harness.mjs';
-import { buildConversationMessages } from '../routes/sessions-routes.mjs';
+import { buildConversationMessages } from '../routes/sessions-helpers.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository } from '../repositories/message-repository.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';

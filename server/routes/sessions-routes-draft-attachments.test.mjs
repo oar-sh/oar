@@ -7,10 +7,10 @@ import { fileURLToPath } from 'node:url';
 import {
   normalizeDraftAttachmentsInput,
   diffDraftAttachmentHashes,
-  parseDraftAttachmentsColumn,
   MAX_CONVERSATION_DRAFT_ATTACHMENTS,
   DRAFT_UPLOAD_MESSAGE_ID,
-} from './sessions-routes.mjs';
+} from './conversation-settings-routes.mjs';
+import { parseDraftAttachmentsColumn } from './sessions-helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -130,7 +130,9 @@ test('the draft reference sentinel is stable', () => {
 // still mid-upload, so releasing must be driven by rows this conversation
 // actually deleted, never by the hashes the caller asked about.
 
-const routeSource = fs.readFileSync(path.join(__dirname, 'sessions-routes.mjs'), 'utf8');
+const routeSource = ['sessions-routes.mjs', 'model-routes.mjs', 'host-routes.mjs', 'conversation-read-routes.mjs']
+  .map((file) => fs.readFileSync(path.join(__dirname, file), 'utf8'))
+  .join('\n');
 const settingsRouteSource = fs.readFileSync(path.join(__dirname, 'conversation-settings-routes.mjs'), 'utf8');
 
 test('only draft references this conversation actually held are reclaimed', () => {

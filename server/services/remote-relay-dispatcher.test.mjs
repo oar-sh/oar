@@ -10,6 +10,7 @@ import {
 } from '../../shared/remote-relay-contract.mjs';
 import { executeRemoteRelayTool } from '../../shared/remote-relay-tool-core.mjs';
 import { formatTokenSplit } from './plan-usage-tokens.mjs';
+import { tagPrincipal } from './relay-principal.mjs';
 import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
 import {
   REMOTE_RELAY_INTERNAL_ERROR_CODE,
@@ -4167,6 +4168,217 @@ test('read_task_output says why there is nothing: no output for the provider, an
   assert.match(noSession.body.error, /Session conv-1 was not found/);
 });
 
+// ─── read_worker_log ─────────────────────────────────────────────────────────
+
+const WORKER_LOG_PATH = '/api/conversation/c-1/worker-log';
+
+// This relay's worker log route; `answer` is its JSON or an Error.
+function withWorkerLogRoute(target, answer) {
+  const original = target.request.bind(target);
+  target.request = async (relay, method, path, options = {}) => {
+    if (method === 'GET' && path.endsWith('/worker-log')) {
+      target.calls.push({ relay: relay.name, method, path, query: options.query, caller: options.caller });
+      if (answer instanceof Error) throw answer;
+      return answer;
+    }
+    return original(relay, method, path, options);
+  };
+}
+
+const WORKER_LOG_ANSWER = Object.freeze({
+  ok: true,
+  kind: 'file',
+  conversationId: 'c-1',
+  provider: 'claude',
+  sdkSessionId: 'sess-c1',
+  dir: '/srv/oar/logs',
+  path: '/srv/oar/logs/worker-sess-c1.log',
+  text: 'ignored by the action',
+  lines: [
+    { text: '[claude 2026-09-20T09:40:00.000Z] \x1b[33mturn started\x1b[39m', count: 1 },
+    { text: '[claude] heartbeat', count: 4 },
+    // A route that forgot to scrub still gets scrubbed here (put together at
+    // run time: the hygiene scan refuses token shapes in the source).
+    { text: `[relay] 401 for ${['oar', 'a1_', 's.Yy0x.', 'Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFi'].join('')}`, count: 1 },
+  ],
+  startOffset: 1000,
+  endOffset: 4096,
+  size: 4096,
+  mtime: Date.parse('2026-09-20T09:55:00.000Z'),
+  hasMoreBefore: true,
+  previous: [{ name: 'worker-sess-c1.log.1', size: 10_485_800 }],
+});
+
+test('read_worker_log reads the own conversation\'s log on this relay: plain, scrubbed lines, size and last write', async () => {
+  const { run, local } = setupLocal();
+  withWorkerLogRoute(local, WORKER_LOG_ANSWER);
+  // relay may be left out: "this".
+  for (const args of [{ relay: 'this' }, {}]) {
+    const result = await run('read_worker_log', args);
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.deepEqual(result.body.tail, [
+      '[claude 2026-09-20T09:40:00.000Z] turn started',
+      '[claude] heartbeat  [×4]',
+      '[relay] 401 for oara1_[redacted]',
+    ]);
+    assert.deepEqual(result.body.log, {
+      provider: 'claude',
+      sdkSessionId: 'sess-c1',
+      path: '/srv/oar/logs/worker-sess-c1.log',
+      size: 4096,
+      lastWriteAt: '2026-09-20T09:55:00.000Z',
+      previous: ['worker-sess-c1.log.1'],
+    });
+    assert.equal(result.body.truncated, true);
+    assert.match(result.body.summary, /^read_worker_log → \S+: 3 lines, 4096 bytes, last write 5 min ago$/);
+    assert.equal(JSON.stringify(result.body).includes('Zm9vYmFyYmF6'), false);
+  }
+  const calls = local.calls.filter((entry) => entry.path === WORKER_LOG_PATH);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].query, { lines: 200 });
+});
+
+test('read_worker_log keeps to 500 lines and 32 KB, newest lines last', async () => {
+  const { run, local } = setupLocal();
+  const lines = Array.from({ length: 600 }, (_, index) => ({ text: `${String(index).padStart(4, '0')} ${'x'.repeat(120)}`, count: 1 }));
+  withWorkerLogRoute(local, { ...WORKER_LOG_ANSWER, lines, hasMoreBefore: false });
+  const result = await run('read_worker_log', { relay: 'this', lines: 5000 });
+  assert.equal(local.calls.find((entry) => entry.path === WORKER_LOG_PATH).query.lines, 500);
+  assert.equal(result.body.truncated, true);
+  assert.ok(Buffer.byteLength(result.body.tail.join('\n')) <= 32 * 1024);
+  assert.match(result.body.tail.at(-1), /^0599 /);
+  const few = await run('read_worker_log', { relay: 'this', lines: 5 });
+  assert.equal(few.body.tail.length, 5);
+});
+
+test('read_worker_log with no log yet says so and names where it will be', async () => {
+  const { run, local } = setupLocal();
+  withWorkerLogRoute(local, {
+    ok: true,
+    kind: 'none',
+    provider: 'claude',
+    sdkSessionId: 'c-1',
+    dir: '/srv/oar/logs',
+    path: '/srv/oar/logs/worker-c-1.log',
+    previous: [],
+    message: 'No worker log yet: the worker has not written to its log file.',
+  });
+  const result = await run('read_worker_log', { relay: 'this' });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.tail, []);
+  assert.equal(result.body.note, 'No worker log yet: the worker has not written to its log file.');
+  assert.deepEqual(result.body.log, { provider: 'claude', sdkSessionId: 'c-1', path: '/srv/oar/logs/worker-c-1.log', folder: '/srv/oar/logs' });
+  assert.match(result.body.summary, /no worker log yet$/);
+});
+
+test('read_worker_log refuses a paired relay and a session argument, and asks nothing of either', async () => {
+  const { run, remote } = setup();
+  withWorkerLogRoute(remote, WORKER_LOG_ANSWER);
+  const paired = await run('read_worker_log', { relay: 'spare-test' });
+  assert.equal(paired.body.code, CODES.unsupported);
+  assert.match(paired.body.error, /read only by its own conversation/);
+  assert.equal(remote.calls.some((entry) => entry.path.endsWith('/worker-log')), false);
+
+  const local = setupLocal();
+  withWorkerLogRoute(local.local, WORKER_LOG_ANSWER);
+  const named = await local.run('read_worker_log', { relay: 'this', session: 'conv-other' });
+  assert.equal(named.body.code, CODES.invalidInput);
+  assert.match(named.body.error, /takes no session/);
+  assert.equal(local.local.calls.some((entry) => entry.path.endsWith('/worker-log')), false);
+});
+
+test('read_worker_log on a locked paired relay is refused as unsupported, before the lock asks for a mention', async () => {
+  const { run, remote } = setup({ unlocked: [] });
+  withWorkerLogRoute(remote, WORKER_LOG_ANSWER);
+  // Nothing is unlocked in this conversation: relay_info on linux-test is "locked".
+  assert.equal((await run('relay_info', { relay: 'linux-test' })).body.code, CODES.locked);
+  for (const relay of ['linux-test', 'spare-test', 'no-such-relay']) {
+    const result = await run('read_worker_log', { relay });
+    assert.equal(result.status, 400, relay);
+    assert.equal(result.body.code, CODES.unsupported, relay);
+    assert.doesNotMatch(result.body.error, /mention|locked/, relay);
+    assert.match(result.body.error, /use relay "this"/, relay);
+  }
+  assert.equal(remote.calls.some((entry) => entry.path.endsWith('/worker-log')), false);
+});
+
+test('read_worker_log needs no agent sessions setting: the own log with the setting off, the caller\'s own token handed to the route', async () => {
+  for (const agentSessions of [null, { enabled: false, maxWaitSeconds: 600 }]) {
+    const { dispatcher, local } = setup({ agentSessions });
+    withWorkerLogRoute(local, WORKER_LOG_ANSWER);
+    const req = tagPrincipal({ headers: {} }, { kind: 'agent', agentKind: 's', conversationId: 'c-1', via: 'bearer' });
+    const result = await dispatcher.dispatch({ conversationId: 'c-1', action: 'read_worker_log', args: { relay: 'this' }, req });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(result.body.tail.length, 3);
+    const routeCall = local.calls.find((entry) => entry.path === WORKER_LOG_PATH);
+    // The route sees the calling agent itself, so its own-conversation check decides.
+    assert.deepEqual([routeCall.caller.principal.kind, routeCall.caller.principal.conversationId, routeCall.caller.conversationId], ['agent', 'c-1', 'c-1']);
+    // Still no session argument, with the setting off as on.
+    const named = await dispatcher.dispatch({ conversationId: 'c-1', action: 'read_worker_log', args: { relay: 'this', session: 'conv-other' }, req });
+    assert.equal(named.body.code, CODES.invalidInput);
+    // The setting still closes everything else on this relay.
+    const other = await dispatcher.dispatch({ conversationId: 'c-1', action: 'list_sessions', args: { relay: 'this' }, req });
+    assert.equal(other.body.code, CODES.localDisabled);
+  }
+  // The person's call goes to the route as the person, unchanged.
+  const { dispatcher, local } = setupLocal();
+  withWorkerLogRoute(local, WORKER_LOG_ANSWER);
+  const ownerReq = tagPrincipal({ headers: {} }, { kind: 'owner', via: 'bearer' });
+  assert.equal((await dispatcher.dispatch({ conversationId: 'c-1', action: 'read_worker_log', args: { relay: 'this' }, req: ownerReq })).status, 200);
+  assert.equal(local.calls.find((entry) => entry.path === WORKER_LOG_PATH).caller.principal.kind, 'owner');
+});
+
+test('read_worker_log passes on the route\'s refusals with their own status and code, never a 500', async () => {
+  // With the setting on and off: both go the own-conversation way.
+  for (const options of [{}, { agentSessions: null }]) {
+    const { run, local, logs } = setupLocal(options);
+    const cases = [
+      // Another conversation's token, or the cli token: the route's row check.
+      [remoteError(`${CODES.httpPrefix}403`, 'Relay answered HTTP 403', 403, { error: 'A worker log is read only by its own conversation\'s agent', code: 'AUTH_CONVERSATION_MISMATCH' }), 403, `${CODES.httpPrefix}403`, 'AUTH_CONVERSATION_MISMATCH'],
+      [remoteError(`${CODES.httpPrefix}403`, 'Relay answered HTTP 403', 403, { error: 'Only the person signed in to this relay can do this', code: 'AUTH_PERSON_REQUIRED' }), 403, `${CODES.httpPrefix}403`, 'AUTH_PERSON_REQUIRED'],
+      // A symlinked log file.
+      [remoteError(`${CODES.httpPrefix}409`, 'Relay answered HTTP 409', 409, { error: 'The worker log is a symbolic link; it is not read.', code: 'symlink' }), 409, `${CODES.httpPrefix}409`, 'symlink'],
+    ];
+    for (const [error, status, code, remoteCode] of cases) {
+      withWorkerLogRoute(local, error);
+      const result = await run('read_worker_log', { relay: 'this' });
+      assert.equal(result.status, status, JSON.stringify(result.body));
+      assert.equal(result.body.code, code);
+      assert.equal(result.body.remoteCode ?? null, remoteCode);
+      assert.equal(result.body.tail, undefined);
+    }
+    assert.equal(logs.some((line) => /read_worker_log failed/.test(String(line))), false, 'no internal-error warn line');
+  }
+});
+
+test('this relay refused by its own API answers with its own code and its server log, not the pairing advice', async () => {
+  const cases = [
+    // No agent token for the calling session (the loopback's own refusal).
+    remoteError(CODES.unauthorized, 'This relay has no agent token for the calling session'),
+    // Its own API refused the token.
+    remoteError(CODES.unauthorized, 'This relay rejected the token (401)', 401),
+  ];
+  for (const error of cases) {
+    const { run, local, logs } = setupLocal();
+    withWorkerLogRoute(local, error);
+    const result = await run('read_worker_log', { relay: 'this' });
+    assert.equal(result.status, 500, JSON.stringify(result.body));
+    assert.equal(result.body.code, REMOTE_RELAY_INTERNAL_ERROR_CODE);
+    assert.equal(result.body.error, `${error.message}. Nothing was done. This is a fault on this relay, not a pairing; see its server log.`);
+    assert.doesNotMatch(result.body.error, /re-add|pairing link/);
+    assert.equal(result.body.tail, undefined);
+    assert.ok(logs.some((line) => line === `[remote-relays] read_worker_log on this relay: its own API refused the call: ${error.message}`), logs.join('\n'));
+  }
+  // A paired relay that refuses the token keeps the advice to re-add it.
+  const { run, remote, logs } = setup();
+  remote.fail('GET', '/api/status', remoteError(CODES.unauthorized, 'Relay "linux-test" rejected the token (401)', 401));
+  const paired = await run('relay_info', { relay: 'linux-test' });
+  assert.deepEqual([paired.status, paired.body.code], [502, CODES.unauthorized]);
+  assert.match(paired.body.error, /Ask the person to re-add relay "linux-test" from its link/);
+  assert.doesNotMatch(paired.body.error, /server log/);
+  assert.equal(logs.some((line) => /its own API refused/.test(line)), false);
+});
+
 test('read_session gives each task its taskId, whether it has output, and its health', async () => {
   const { run, local } = setupLocal();
   withLocalSession(local, {
@@ -5587,4 +5799,34 @@ test('answer_question in ask mode shows the user no approval card: it is refused
   assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
   assert.equal(approvals.length, 0);
   assert.equal(local.questions.get('q-other').status, 'pending');
+});
+
+test('a remote with Copilot switched off lists github as not set up; one that says nothing (older) keeps it on', async () => {
+  const { run, remote } = setup();
+  remote.settings.copilot = { engine: 'sdk', engines: ['sdk'], enabled: false, cliFound: true };
+  const off = await run('relay_info', { relay: 'linux-test' });
+  const byName = Object.fromEntries(off.body.providers.map((entry) => [entry.provider, entry]));
+  assert.deepEqual(byName.github, { provider: 'github', configured: false, defaultModel: null, models: [], engine: 'sdk' });
+  assert.match(off.body.summary, /providers openai, claude/);
+
+  remote.settings.copilot = { engine: 'sdk', engines: ['sdk'], enabled: true, cliFound: true };
+  const on = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(on.body.providers.find((entry) => entry.provider === 'github').configured, true);
+  remote.settings.copilot = { engine: 'sdk', engines: ['sdk'] };
+  const older = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(older.body.providers.find((entry) => entry.provider === 'github').configured, true);
+});
+
+test('create_session on github where Copilot is switched off is refused, with the remote\'s code, and nothing else is picked', async () => {
+  const { run, remote } = setup({ caller: { provider: 'github', model: 'gpt-5.6-luna' } });
+  remote.settings.copilot = { engine: 'sdk', engines: ['sdk'], enabled: false, cliFound: true };
+  for (const args of [CREATE_ARGS, { ...CREATE_ARGS, provider: 'github', model: 'gpt-5.6-luna' }]) {
+    const result = await run('create_session', args);
+    assert.equal(result.status, 400);
+    assert.equal(result.body.code, CODES.providerUnavailable);
+    assert.equal(result.body.remoteCode, 'COPILOT_NOT_ENABLED');
+    assert.deepEqual(result.body.providers, ['openai', 'claude']);
+    assert.match(result.body.error, /Copilot is switched off on relay "linux-test", so no session was created\. Providers there: openai, claude\./);
+  }
+  assert.equal(remote.callsTo('POST', '/api/conversation/bootstrap').length, 0);
 });

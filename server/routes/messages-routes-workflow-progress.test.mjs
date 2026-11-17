@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { registerMessagesRoutes, sanitizeWorkflowProgress } from './messages-routes.mjs';
+import { registerMessagesRoutes } from './messages-routes.mjs';
+import { sanitizeWorkflowProgress } from './messages-worker-output-routes.mjs';
 
 // Pins for the workflow-progress digest ingest (docs/plans/workflow-progress-tree.md,
 // Phase 2): POST /api/background-tasks must pass a structurally sanitized

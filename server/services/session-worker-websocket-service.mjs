@@ -493,9 +493,10 @@ export function createSessionWorkerWebSocketService({
   /**
    * One timer for the earliest future retry time. An armed timer for the same
    * time is kept; any other arm clears the one before. A time further than a
-   * minute away is re-read after a minute.
+   * minute away is re-read after a minute. `owedMs`: the time of a due timer
+   * that fired early, armed for whatever the query says.
    */
-  function armDueTimer() {
+  function armDueTimer(owedMs = null) {
     if (stopped) {
       clearDueTimer();
       return;
@@ -505,8 +506,10 @@ export function createSessionWorkerWebSocketService({
     if (dueTimer && dueTimerForMs !== null && dueTimerForMs <= nowMsSafe()) return;
     let dueAt = null;
     try { dueAt = nextDueAtMs(); } catch { dueAt = null; }
-    const dueMs = Number(dueAt);
-    if (dueAt === null || dueAt === undefined || !Number.isFinite(dueMs)) {
+    let dueMs = Number(dueAt);
+    if (dueAt === null || dueAt === undefined || !Number.isFinite(dueMs)) dueMs = null;
+    if (owedMs !== null && (dueMs === null || owedMs < dueMs)) dueMs = owedMs;
+    if (dueMs === null) {
       clearDueTimer();
       return;
     }
@@ -521,12 +524,17 @@ export function createSessionWorkerWebSocketService({
       dueTimer = null;
       dueTimerForMs = null;
       if (stopped) return;
+      // A timer can fire a millisecond early, and the claim, on the same
+      // clock, refuses a row before its time. If the clock passes that time
+      // before the re-read, the row is no longer "future" and the query
+      // misses it: the re-arm owes the timer's own time.
+      const early = reachesDue && nowMsSafe() < dueMs;
       if (reachesDue) {
         // Whatever came due may go now; a row that was claimed or cancelled
         // meanwhile makes this a wake with nothing to do.
         try { onDue('retry-due'); } catch {}
       }
-      armDueTimer();
+      armDueTimer(early ? dueMs : null);
     }, delayMs);
     if (typeof dueTimer.unref === 'function') dueTimer.unref();
   }

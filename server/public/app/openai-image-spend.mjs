@@ -29,7 +29,7 @@ export const OPENAI_IMAGE_SETTINGS_FIELDS = Object.freeze({
 export const OPENAI_IMAGE_PRESETS_PATH = '/api/openai-image-presets';
 
 // The relay's socket event with `{ presets }` after every preset change
-// (sessions-routes.mjs), and the top of the cap POST /api/settings/openai
+// (settings-routes.mjs), and the top of the cap POST /api/settings/openai
 // takes.
 export const OPENAI_IMAGE_PRESETS_EVENT = 'openai_image_presets_updated';
 export const OPENAI_IMAGE_DAILY_CAP_MAX_USD = 10_000;

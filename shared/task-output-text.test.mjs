@@ -16,16 +16,19 @@ import {
   parseRunnerSummary,
   parseTaskStallMinutesUpdate,
   readTaskStallMinutesSetting,
+  replaceRangesAcrossEscapes,
   scrubSecrets,
   scrubTaskOutput,
   stallMinutes,
   stripControlKeepSgr,
   stripSgr,
 } from './task-output-text.mjs';
+import { RELAY_CREDENTIAL_PATTERN } from './relay-credentials.mjs';
 
 // Credential-shaped values are put together at run time: the hygiene scan
 // refuses token shapes in the source.
 const fake = (...parts) => parts.join('');
+const RELAY_CREDENTIAL_PATTERN_FOR_TEST = new RegExp(`^(?:${RELAY_CREDENTIAL_PATTERN.source})$`);
 const GH_TOKEN = fake('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz0123456789');
 
 const fixture = (name) => readFileSync(new URL(`./fixtures/task-output/${name}`, import.meta.url), 'utf8');
@@ -235,6 +238,272 @@ test('scrubTaskOutput leaves ordinary test output alone', () => {
   for (const line of ordinary) assert.equal(scrubTaskOutput(line), line);
 });
 
+// The shapes a worker's log carries: provider errors that quote a header or
+// an OAuth answer, and OAR's own credentials from the worker's environment.
+test('scrubTaskOutput: cookies, xAI keys, JWTs, OAuth fields and OAR credentials, each with its prefix kept', () => {
+  const jwt = fake('eyJhbGciOiJIUzI1NiJ9', '.', 'eyJzdWIiOiJ3b3JrZXIifQ', '.', 'c2lnbmF0dXJlLXZhbHVl');
+  const b64 = fake('Zm9vYmFyYmF6cXV4', 'MTIzNDU2Nzg5MGFi', 'Y2RlZmdoaWo');
+  const cases = [
+    ['Cookie: sessionid=a1b2c3d4; csrftoken=zz99', 'Cookie: [redacted]'],
+    ['< set-cookie: __Secure-sid=Qm9i; Path=/; HttpOnly', '< set-cookie: [redacted]'],
+    ['{"cookie":"sid=Qm9iQm9i; theme=dark","host":"api.example.test"}', '{"cookie":"[redacted]","host":"api.example.test"}'],
+    [`grok: ${fake('xa', 'i-', 'AbCdEfGhIjKlMnOpQrStUvWx0123')} rejected`, 'grok: xai-[redacted] rejected'],
+    [`id_token ${jwt} expired`, 'id_token eyJ[redacted] expired'],
+    [`Authorization: Bearer ${jwt}`, 'Authorization: Bearer [redacted]'],
+    [`{"access_token":"${fake('ya29', '.a0Af')}x9","refresh_token": "${fake('1//0g', 'Lq')}w8"}`, '{"access_token":"[redacted]","refresh_token": "[redacted]"}'],
+    ['refresh_token: r3fr3sh-v4lue', 'refresh_token: [redacted]'],
+    ['POST /token grant_type=refresh_token&refresh_token=r3fr3sh&client_secret=s3cr3t', 'POST /token grant_type=refresh_token&refresh_token=[redacted]&client_secret=[redacted]'],
+    ['GET /callback?code=4%2F0AQl-abc&state=xyz', 'GET /callback?code=[redacted]&state=xyz'],
+    ['client_secret = s3cr3t-cl13nt', 'client_secret = [redacted]'],
+    [`OAR_AGENT_TOKEN=${fake('oar', 'a1_', 's.', 'Y29udi0x', '.', b64)}`, 'OAR_AGENT_TOKEN=[redacted]'],
+    [`token ${fake('oar', 'a1_', 's.', 'Y29udi0x', '.', b64)} refused`, 'token oara1_[redacted] refused'],
+    [`peer key ${fake('oar', 'p1_', b64)}.`, 'peer key oarp1_[redacted]'],
+    [`Bearer ${fake('oar', 'o1_', b64)}`, 'Bearer oaro1_[redacted]'],
+    [`GET /api/files/a.png?k=${fake('fc', '1.', 'c2Vzcw', '.', 'mf3k2', '.', 'bWFj')}`, 'GET /api/files/a.png?k=fc1.[redacted]'],
+  ];
+  for (const [input, expected] of cases) assert.equal(scrubTaskOutput(input), expected, input);
+  // Every credential shape the relay itself recognises loses its value.
+  for (const prefix of ['oaro1_', 'oars1_', 'oarc1_', 'oara1_', 'oarp1_', 'oark1_']) {
+    const value = fake(prefix, b64);
+    assert.match(value, RELAY_CREDENTIAL_PATTERN_FOR_TEST);
+    assert.equal(scrubTaskOutput(`x ${value} y`), `x ${prefix}[redacted] y`);
+  }
+});
+
+test('scrubTaskOutput: Set-Cookie written as an array, util.inspect and JSON, one line or several', () => {
+  const sid = fake('Qm9iU2Vzc2lvb', 'kNvb2tpZQ');
+  const cases = [
+    [`  'set-cookie': [ 'sid=${sid}; Path=/; HttpOnly', 'theme=dark; Path=/' ],`, "  'set-cookie': [redacted],"],
+    [`{"set-cookie":["sid=${sid}; Path=/","theme=dark"],"x":1}`, '{"set-cookie":[redacted],"x":1}'],
+    [`headers: {\n  'set-cookie': [\n    'sid=${sid}; Path=/; HttpOnly',\n    'theme=dark'\n  ]\n}`, "headers: {\n  'set-cookie': [redacted]\n}"],
+    // An array the text cuts off: its line goes.
+    [`"set-cookie":["sid=${sid}; Path=/", "th`, '"set-cookie":[redacted]'],
+  ];
+  for (const [input, expected] of cases) {
+    const output = scrubTaskOutput(input);
+    assert.equal(output, expected, input);
+    assert.ok(!output.includes(sid), 'no part of the cookie value');
+  }
+  // Look-alikes: an empty array, and a list with no name=value in it.
+  for (const line of ["'set-cookie': []", "cookies: [ 'none' ]", 'cookie: [object Object] skipped']) {
+    assert.equal(scrubTaskOutput(line), line, line);
+  }
+});
+
+test('scrubTaskOutput: a colour code inside a credential does not hide it; the codes move to the line end', () => {
+  const anthropic = fake('sk-ant-', 'api03-AbCd', '\x1b[31m', 'EfGhIjKlMnOpQrSt', '\x1b[0m');
+  const tail = 'EfGhIjKlMnOpQrSt';
+  const outA = scrubTaskOutput(`key ${anthropic} rejected\nnext \x1b[32mok\x1b[39m`);
+  assert.equal(outA, 'key sk-[redacted] rejected\x1b[31m\x1b[0m\nnext \x1b[32mok\x1b[39m');
+  assert.ok(!stripSgr(outA).includes(tail));
+  const agentTail = 'MTIzNDU2Nzg5MGFi';
+  const agent = fake('oar', 'a1_', 's.Y29udi0x.', 'Zm9vYmFyYmF6', '\x1b[1m', agentTail, '\x1b[22m');
+  const outB = scrubTaskOutput(`401 for ${agent}\r\n`);
+  assert.equal(outB, '401 for oara1_[redacted]\x1b[1m\x1b[22m\r\n');
+  assert.ok(!outB.includes(agentTail));
+  // Colours at a credential's edges stay where they are.
+  assert.equal(scrubTaskOutput(`\x1b[2mtoken=\x1b[22m\x1b[33m${GH_TOKEN}\x1b[39m`), '\x1b[2mtoken=\x1b[22m\x1b[33mghp_[redacted]\x1b[39m');
+  assert.equal(scrubTaskOutput('\x1b[31mred\x1b[0m plain \x1b[1mbold\x1b[22m'), '\x1b[31mred\x1b[0m plain \x1b[1mbold\x1b[22m');
+});
+
+// Every kind of code a terminal can put inside a credential.
+const SPLIT_CODES = Object.freeze({
+  sgr: '\x1b[31m',
+  csi: '\x1b[2K',
+  colonSgr: '\x1b[38:5:196m',
+  osc: '\x1b]8;;https://example.test/docs\x1b\\',
+  oscBel: '\x1b]0;build\x07',
+});
+// [public part, secret part] of each shape.
+const SPLIT_TOKENS = Object.freeze({
+  oar: [fake('oar', 'a1_'), fake('s.Y29udi0x.', 'Zm9vYmFyYmF6', 'MTIzNDU2Nzg5MGFi')],
+  ghp: [fake('gh', 'p_'), fake('ABCDEFGHIJ', 'klmnopqrst', '0123456789')],
+  sk: [fake('sk-', 'ant-'), fake('api03-', 'QWERTYuiop', 'ASDFghjk7531')],
+  fc1: [fake('fc', '1.'), fake('c2Vzc2lvbg', '.lq8x2k.', 'TUFDbWFjRkFLRQ')],
+});
+const CODE_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const visible = (text) => text.replace(CODE_PATTERN, '');
+const codesOf = (text) => (text.match(CODE_PATTERN) || []).join('');
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+test('scrubTaskOutput: a credential split by any code at any position shows none of its secret part', () => {
+  for (const [shape, [pub, secret]] of Object.entries(SPLIT_TOKENS)) {
+    const token = `${pub}${secret}`;
+    const prefixes = Array.from({ length: pub.length + 1 }, (_value, at) => escapeRegExp(pub.slice(0, at))).reverse();
+    const line = new RegExp(`^pre (?:${prefixes.join('|')})\\[redacted\\] post$`);
+    for (const [kind, code] of Object.entries(SPLIT_CODES)) {
+      for (let at = 1; at < token.length; at += 1) {
+        const input = `pre ${token.slice(0, at)}${code}${token.slice(at)}\x1b[0m post\nnext \x1b[32mok\x1b[39m`;
+        const output = scrubTaskOutput(input);
+        const label = `${shape} split by ${kind} at ${at}: ${JSON.stringify(output)}`;
+        const [first, second] = visible(output).split('\n');
+        assert.match(first, line, label);
+        assert.equal(output.split('\n')[1], 'next \x1b[32mok\x1b[39m', label);
+        // Every code goes back, unchanged and in its order.
+        assert.equal(codesOf(output), codesOf(input), label);
+        assert.equal(second, 'next ok', label);
+        // A `[redacted]` marker is never scrubbed again.
+        assert.equal(scrubTaskOutput(output), output, label);
+        assert.equal(cleanTaskOutput(input).includes(secret.slice(-3)), false, label);
+      }
+    }
+  }
+});
+
+test('scrubTaskOutput: a line that codes split is never less hidden than its text without codes', () => {
+  // A seeded mix of words, credentials of several shapes, private keys and
+  // codes put down anywhere, inside a credential too; half the rounds put
+  // no space between the pieces, so one credential runs into the next.
+  let seed = 0x5eed;
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let value = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const run = (chars, length) => Array.from({ length }, () => pick(chars)).join('');
+  const UPPER = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.split('');
+  const DIGITS = '23456789'.split('');
+  const MIXED = [...UPPER, ...DIGITS, ...'abcdefghijkmnpqrstuvwxyz'.split('')];
+  const words = ['build', 'step', 'done', 'retry', 'with', 'the', 'value', 'ok', 'warn', '\n', 'x=1', 'token:', 'Bearer', 'AKIA'];
+  const privateKey = fake('-----BEGIN ', 'PRIVATE KEY-----\nMIIFAKEFAKE\n-----END ', 'PRIVATE KEY-----');
+  const shapes = [
+    (secret) => [fake('oar', 'k1_'), secret],
+    (secret) => [fake('gh', 'o_'), secret],
+    (secret) => [fake('sk-', 'proj-'), secret],
+    (secret) => ['API_TOKEN=', secret],
+    (secret) => ['password: ', secret],
+    (secret) => ['Bearer ', secret],
+    (secret) => ['', `${secret}${run(MIXED, 20)}`],
+    (secret) => ['AKIA', secret.slice(0, 16).toUpperCase()],
+  ];
+  const codes = Object.values(SPLIT_CODES);
+  for (let round = 0; round < 1500; round += 1) {
+    const secrets = [];
+    const pieces = [];
+    for (let count = 0; count < 8; count += 1) {
+      const roll = random();
+      if (roll < 0.45) {
+        pieces.push(pick(words));
+        continue;
+      }
+      if (roll < 0.5) {
+        pieces.push(privateKey);
+        continue;
+      }
+      const [pub, secret] = pick(shapes)(`${run(UPPER, 4)}${run(DIGITS, 2)}${run(MIXED, 18)}`);
+      secrets.push(secret);
+      pieces.push(`${pub}${secret}`);
+    }
+    // Codes go between characters of the text, never inside another code.
+    let input = pieces.join(random() < 0.5 ? ' ' : '');
+    const places = Array.from({ length: 1 + Math.floor(random() * 4) }, () => Math.floor(random() * (input.length + 1)));
+    for (const at of places.sort((a, b) => b - a)) input = `${input.slice(0, at)}${pick(codes)}${input.slice(at)}`;
+    const shown = visible(scrubTaskOutput(input));
+    const plainScrub = scrubTaskOutput(visible(input));
+    for (const secret of secrets) {
+      for (let at = 0; at + 3 <= secret.length; at += 1) {
+        const piece = secret.slice(at, at + 3);
+        if (!/[A-Z0-9]/.test(piece) || plainScrub.includes(piece)) continue;
+        assert.equal(shown.includes(piece), false, `${JSON.stringify(input)} shows ${piece}: ${JSON.stringify(shown)}`);
+      }
+    }
+  }
+});
+
+test('scrubTaskOutput: look-alikes with a code anywhere in them stay as they are', () => {
+  const lines = [
+    'oar1_ is not a credential prefix; oarx1_abc neither',
+    'commit 0123456789abcdef0123456789abcdef01234567',
+    'session f0e1d2c3-b4a5-4697-8879-6a5b4c3d2e1f resumed',
+    'model claude-opus-4-1-20250805 via anthropic',
+    'exit code=1 after 3 retries',
+    'refresh_token: null',
+    'the token expired; ghp_ and sk- are prefixes only',
+  ];
+  for (const line of lines) {
+    for (const [kind, code] of Object.entries(SPLIT_CODES)) {
+      for (let at = 0; at <= line.length; at += 1) {
+        const input = `${line.slice(0, at)}${code}${line.slice(at)}`;
+        assert.equal(scrubTaskOutput(input), input, `${kind} at ${at}`);
+      }
+    }
+  }
+});
+
+test('scrubTaskOutput: a line whose codes move keeps what its coloured pieces hid', () => {
+  const aws = fake('AKIA', 'QWERTYUIOP234567');
+  const [pub, secret] = SPLIT_TOKENS.oar;
+  const token = `${pub}${secret}`;
+  // The AWS id ends where its colour does: only the coloured piece is a
+  // whole key id. The relay token is split near its end.
+  const output = scrubTaskOutput(`${aws}\x1b[0mX and ${token.slice(0, -4)}\x1b[31m${token.slice(-4)}\x1b[0m`);
+  assert.equal(output, `AKIA[redacted]X and ${pub}[redacted]\x1b[0m\x1b[31m\x1b[0m`);
+});
+
+test('scrubTaskOutput: a private key that joins lines does not undo what a coloured piece hid', () => {
+  const gh = fake('gh', 'p_', 'FAKEfake0123456789Ab');
+  const privateKey = fake('-----BEGIN ', 'PRIVATE KEY-----\nMIIFAKE\n-----END ', 'PRIVATE KEY-----');
+  const [pub, secret] = SPLIT_TOKENS.oar;
+  const token = `${pub}${secret}`;
+  // Only the coloured piece is a whole GitHub token (`buildghp_…` is none).
+  assert.equal(
+    scrubTaskOutput(`build\x1b[32m${gh}\x1b[0m done\n${privateKey}`),
+    'build\x1b[32mghp_[redacted]\x1b[0m done\n[redacted private key]',
+  );
+  // A split token on the same text moves every code to the end.
+  assert.equal(
+    scrubTaskOutput(`build\x1b[32m${gh}\x1b[0m done ${token.slice(0, -4)}\x1b[1m${token.slice(-4)}\x1b[22m\n${privateKey}`),
+    `buildghp_[redacted] done ${pub}[redacted]\n[redacted private key]\x1b[32m\x1b[0m\x1b[1m\x1b[22m`,
+  );
+});
+
+test('scrubTaskOutput: a long line of credentials a code cuts stays fast', () => {
+  // 256 KB on one line, as much as one read passes: AWS key ids that a reset
+  // cuts off from the next word, and one split relay token.
+  const [pub, secret] = SPLIT_TOKENS.oar;
+  const token = `${pub}${secret}`;
+  const pieces = [`${token.slice(0, 16)}\x1b[31m${token.slice(16)}\x1b[0m `];
+  for (let length = 0, count = 0; length < 256 * 1024; count += 1) {
+    const id = fake('AK', 'IA', String(count).padStart(16, '0').replace(/[0-9]/g, (digit) => 'QWERTYUIOP'[digit]));
+    pieces.push(`${id}\x1b[0mX `);
+    length += id.length + 7;
+  }
+  const started = Date.now();
+  const output = cleanTaskOutput(pieces.join(''));
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  assert.equal(output.includes(secret.slice(-4)), false);
+  assert.equal(/AKIA[QWERTYUIOP]/.test(output), false);
+});
+
+test('scrubTaskOutput: a credential in a hyperlink\'s address is scrubbed, the link kept', () => {
+  const token = `${SPLIT_TOKENS.oar[0]}${SPLIT_TOKENS.oar[1]}`;
+  assert.equal(
+    scrubTaskOutput(`open \x1b]8;;https://relay.example.test/?token=${token}\x1b\\the chat\x1b]8;;\x1b\\ now`),
+    'open \x1b]8;;https://relay.example.test/?token=[redacted]\x1b\\the chat\x1b]8;;\x1b\\ now',
+  );
+});
+
+test('scrubTaskOutput leaves the look-alikes of the new shapes alone', () => {
+  for (const line of [
+    'cookie: missing',
+    'Set the cookie: banner shows once',
+    'model xai-grok-4 selected',
+    'eyJhbGciOi is how a JWT header starts',
+    'exit code=1 after 3 retries',
+    'refresh_token: null',
+    'the access_token expired; refreshing',
+    'oar1_ is not a credential prefix; oarx1_abc neither',
+    'commit 0123456789abcdef0123456789abcdef01234567',
+    'session f0e1d2c3-b4a5-4697-8879-6a5b4c3d2e1f resumed',
+    '[claude 2026-11-15T09:41:07.123Z] turn done in 4.2s',
+    'wrote /home/ann/.oar/logs/worker-f0e1d2c3.log',
+    'model claude-opus-4-1-20250805 via anthropic',
+    'mail ann@example.test about fc1 rollout',
+  ]) assert.equal(scrubTaskOutput(line), line, line);
+});
+
 test('scrubTaskOutput keeps the colour codes around a secret intact', () => {
   assert.equal(
     scrubTaskOutput(`\x1b[2mtoken=\x1b[22m\x1b[33m${GH_TOKEN}\x1b[39m`),
@@ -429,4 +698,69 @@ test('output paths: absolute, capped, no NUL; the kind follows the path', () => 
   assert.equal(normalizeTaskOutputKind('SPOOL', '/tmp/x.log'), 'spool');
   assert.equal(normalizeTaskOutputKind('snapshot', ''), 'snapshot');
   assert.equal(normalizeTaskOutputKind('weird', ''), 'none');
+});
+
+// Fake values; a finder of every occurrence of each one.
+function exactFinder(...values) {
+  return (text) => values.flatMap((value) => {
+    const ranges = [];
+    for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) ranges.push([at, at + value.length]);
+    return ranges;
+  });
+}
+
+test('replaceRangesAcrossEscapes finds a value across codes and keeps the codes inside it after the marker', () => {
+  const find = exactFinder('fakevalue1');
+  assert.equal(replaceRangesAcrossEscapes('a fake\x1b[31mval\x1b]8;;x\x07ue1 b', find), 'a [redacted]\x1b[31m\x1b]8;;x\x07 b');
+  assert.equal(replaceRangesAcrossEscapes('\x1b[1ma fakevalue1\x1b[0m', find, { marker: '#' }), '\x1b[1ma #\x1b[0m');
+  assert.equal(replaceRangesAcrossEscapes('no \x1b[31mvalue\x1b[0m here', find), 'no \x1b[31mvalue\x1b[0m here');
+  assert.equal(replaceRangesAcrossEscapes('plain fakevalue1', find), 'plain [redacted]');
+});
+
+test('replaceRangesAcrossEscapes joins touching ranges, across codes only, when asked', () => {
+  const find = exactFinder('fakevalue1', 'fakevalue2');
+  const text = 'fakevalue1\x1b[0mfakevalue2 fakevalue1 fakevalue2';
+  assert.equal(replaceRangesAcrossEscapes(text, find), '[redacted]\x1b[0m[redacted] [redacted] [redacted]');
+  assert.equal(replaceRangesAcrossEscapes(text, find, { mergeTouching: true }), '[redacted]\x1b[0m [redacted] [redacted]');
+  const overlapping = exactFinder('fakeAAAA11', 'AA11BBBBBB');
+  assert.equal(replaceRangesAcrossEscapes('x fakeAA\x1b[KAA11BBBBBB y', overlapping), 'x [redacted]\x1b[K y');
+});
+
+test('replaceRangesAcrossEscapes keeps every code whole and leaves no value, in codes or between them', () => {
+  // Fake values, and pieces of text, codes and string controls to mix them
+  // with, in an order a fixed seed picks.
+  const values = ['fakevalue1', 'fakevalue22', 'valueFAKE333'];
+  const codes = ['\x1b[31m', '\x1b[0m', '\x1b[38:5:196m', '\x1b[K', '\x1b(B', '\x1b7'];
+  const controls = (inner) => [`\x1b]8;;https://x.test/?k=${inner}\x07`, `\x1b]0;${inner}\x1b\\`];
+  let seed = 12345;
+  const pick = (list) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return list[seed % list.length];
+  };
+  const introducers = (text) => (text.match(/\x1b\]/g) || []).length;
+  for (const mergeTouching of [false, true]) {
+    for (let round = 0; round < 1500; round += 1) {
+      let text = '';
+      for (let part = 0; part < 6; part += 1) {
+        const value = pick(values);
+        const kind = pick(['cut', 'whole', 'code', 'control', 'text', 'control']);
+        if (kind === 'cut') {
+          const at = 1 + (seed % (value.length - 1));
+          text += `${value.slice(0, at)}${pick([...codes, ...controls(pick(['x', value]))])}${value.slice(at)}`;
+        } else if (kind === 'whole') text += value;
+        else if (kind === 'code') text += pick(codes);
+        else if (kind === 'control') text += pick(controls(pick([value, `a${value}b`, 'plain'])));
+        else text += pick([' ', 'ab', '\n']);
+      }
+      const output = replaceRangesAcrossEscapes(text, exactFinder(...values), { mergeTouching });
+      const context = JSON.stringify({ text, mergeTouching });
+      assert.equal(output.replace(/(\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]PX^_][^\x07\x1b\n]*(?:\x07|\x1b\\)|\x1b[ -/]*[0-~])/g, '').includes('\x1b'), false, context);
+      assert.equal(introducers(output), introducers(text), context);
+      const view = stripSgr(stripControlKeepSgr(output));
+      for (const value of values) {
+        assert.equal(output.includes(value), false, context);
+        assert.equal(view.includes(value), false, context);
+      }
+    }
+  }
 });

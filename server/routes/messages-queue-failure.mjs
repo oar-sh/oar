@@ -1,4 +1,6 @@
 import { deriveModelOrigin, normalizeSessionWorkerId } from './messages-helpers.mjs';
+import { createSubagentRunStatus } from './messages-subagent-status.mjs';
+import { createSessionWorkerTelemetry } from './messages-worker-telemetry.mjs';
 
 // The terminal failure of a queue row: the row is marked failed (fenced on
 // its attempt when one is named), a failure reply is stored with the turn's
@@ -28,6 +30,9 @@ export function createFailQueueMessage({
     responseText,
     failureRecord,
     markWorkerError = true,
+    // false: the caller has already stopped the worker and removed its
+    // registry entry, so the owner session's worker is left as it is.
+    settleWorker = true,
     executedProvider = null,
     attemptId = null,
     // Extra writes that must commit only with the (fenced) failure itself.
@@ -100,7 +105,10 @@ export function createFailQueueMessage({
       },
     });
     io.emit('message_status', { messageId, conversationId, status: 'failed' });
-    void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, sourceMessageId: messageId, text: responseText });
+    // The owner archived the chat themselves: no push for the turn it ended.
+    if (String(failureRecord?.code || '') !== 'conversation-archived') {
+      void pushDispatchService?.notifyTurnFailed?.({ conversationId, messageId: responseId, sourceMessageId: messageId, text: responseText });
+    }
     // A Stop from the relay ends the turn; anything else failed it.
     try {
       if (String(failureRecord?.code || '') === 'turn-aborted') {
@@ -116,7 +124,7 @@ export function createFailQueueMessage({
     } catch {}
     cancelPendingRelayQuestionsForMessage(messageId);
     const ownerSessionId = normalizeSessionWorkerId(queueRow?.owner_sdk_session_id);
-    if (ownerSessionId) {
+    if (ownerSessionId && settleWorker) {
       if (markWorkerError) {
         sessionWorkerSupervisor?.markError?.(ownerSessionId, `queue-failed:${failureRecord?.code || failureRecord?.error || 'unknown'}`);
         emitSessionWorkerTelemetry('queue.message.failed', {
@@ -167,4 +175,84 @@ export function createFailQueueMessage({
   }
 
   return failQueueMessage;
+}
+
+// Cancels the pending question cards of a row's superseded attempts and
+// announces each. Reads `deps.formatQuestionRow` at each call.
+// Questions carry the attempt_id of the row state they were created under,
+// so "stale" is exact: a pending card stamped with an attempt other than the
+// one the row currently records. Cards belonging to that attempt stay
+// pending — an answer may still be on its way in — and so do cards with no
+// attempt at all (created before attempts were stamped). A row with NO
+// current attempt (finalized by a legacy responder after a requeue cleared
+// it) makes every attempt-stamped card stale: the empty string matches none
+// of them.
+export function createCancelPendingRelayQuestions(deps) {
+  const { stmts, io } = deps;
+  function cancelPendingRelayQuestionsForMessage(messageId) {
+    const targetMessageId = String(messageId || '').trim();
+    if (!targetMessageId || typeof stmts.cancelPendingQuestionsForStaleAttempts?.all !== 'function') return 0;
+    // A failed turn calls this after its commit: nothing here may throw, or
+    // the caller takes the committed failure for one that did not happen.
+    let cancelledRows;
+    try {
+      const queueRow = stmts.findQById?.get(targetMessageId) || null;
+      const currentAttemptId = String(queueRow?.attempt_id || '').trim();
+      const now = new Date().toISOString();
+      cancelledRows = stmts.cancelPendingQuestionsForStaleAttempts.all(now, targetMessageId, currentAttemptId);
+    } catch (error) {
+      console.warn(`[questions] The cards of ${targetMessageId} were not cancelled: ${error?.message || error}`);
+      return 0;
+    }
+    // Each card on its own: one that cannot be announced leaves the next
+    // ones announced. The warning names the card, never its text.
+    for (const row of cancelledRows) {
+      try {
+        const updated = stmts.getQuestion?.get(row.id) || null;
+        if (updated && typeof deps.formatQuestionRow === 'function') {
+          io.emit('relay_question_updated', { question: deps.formatQuestionRow(updated) });
+        }
+      } catch (error) {
+        console.warn(`[questions] The cancelled card ${row.id} was not announced: ${error?.message || error}`);
+      }
+    }
+    return cancelledRows.length;
+  }
+
+  return cancelPendingRelayQuestionsForMessage;
+}
+
+// A failQueueMessage made from the route dependencies alone, with helpers of
+// its own: a route module outside registerMessagesRoutes ends a turn the same
+// way.
+export function createFailQueueMessageFromDeps(deps) {
+  const {
+    db,
+    stmts,
+    io,
+    uuidv4,
+    pushDispatchService,
+    relayEventService,
+    sessionWorkerRegistry,
+    sessionWorkerSupervisor,
+    queueCounts,
+    ts,
+    backgroundTaskStore,
+    sessionActivityTracker,
+  } = deps;
+  const { reconcileSubagentRunsForTerminalTurn } = createSubagentRunStatus({ io, stmts, backgroundTaskStore, sessionActivityTracker });
+  return createFailQueueMessage({
+    db,
+    stmts,
+    io,
+    uuidv4,
+    pushDispatchService,
+    relayEventService,
+    sessionWorkerRegistry,
+    sessionWorkerSupervisor,
+    queueCounts,
+    reconcileSubagentRunsForTerminalTurn,
+    cancelPendingRelayQuestionsForMessage: createCancelPendingRelayQuestions(deps),
+    emitSessionWorkerTelemetry: createSessionWorkerTelemetry({ queueCounts, ts }),
+  });
 }

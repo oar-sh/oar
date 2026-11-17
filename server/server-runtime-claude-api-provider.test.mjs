@@ -67,18 +67,7 @@ test('a Claude API delivery carries Claude\'s attribution and background command
   assert.match(deliverySource, /autoCompactWindow: parseAutoCompactWindow\(conv\?\.auto_compact_window\)/);
 });
 
-test('provider reconciliation and runtime binding know claude-api, never folded into claude', () => {
-  const reconcileSource = sliceBetween(
-    'async function reconcileUnstartedConversationProviders(',
-    '\nasync function rebindUnstartedOpenAIConversationModel(',
-  );
-  assert.match(reconcileSource, /managedProvider = \[[^\]]*'claude-api'\]/);
-  assert.match(reconcileSource, /managedProvider === 'claude-api'\s*\?\s*getClaudeApiProviderSettings\(\)\.model/);
-  assert.match(
-    reconcileSource,
-    /currentProvider === 'claude-api'\s*\?\s*getClaudeApiProviderSettings\(\)\.enabled === true/,
-    'rollback must only restore a claude-api binding while the provider is on',
-  );
+test('runtime binding knows claude-api, never folded into claude', () => {
   const bindingSource = sliceBetween('function ensureRuntimeSessionBinding(', '\nfunction bootstrapRuntimeSessionBindings(');
   assert.match(bindingSource, /normalizedRequestedProviderType === 'claude-api'\s*\?\s*'claude-api'/);
   assert.match(bindingSource, /\|\| resolvedProviderType === 'claude-api'\n/);
@@ -164,7 +153,8 @@ test('the primer launches no Claude API worker while Claude API cannot run a tur
   // The primer's loop is services/queue-waker.mjs (its test covers a throw
   // costing only that session its launch); the runtime hands it the check.
   const wiring = sliceBetween('const pendingWorkerPrimer = createPendingWorkerPrimer({', '\n});');
-  assert.match(wiring, /failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid\),/);
+  // Claude API first; a Copilot chat while Copilot is off is the other case.
+  assert.match(wiring, /failRowsWithoutLaunch: \(sid\) => failClaudeApiRowsWithoutLaunch\(sid\) \|\| failCopilotRowsWithoutLaunch\(sid\),/);
   const primerSource = fs.readFileSync(path.join(__dirname, 'services', 'queue-waker.mjs'), 'utf8');
   const loop = primerSource.slice(primerSource.indexOf('export function createPendingWorkerPrimer('), primerSource.indexOf('export function createQueueWaker('));
   assert.ok(loop.indexOf('failRowsWithoutLaunch(sdkSessionId)') < loop.indexOf('ensureWorker(sdkSessionId)'), 'checked before the launch');
@@ -175,4 +165,7 @@ test('the primer launches no Claude API worker while Claude API cannot run a tur
   assert.match(skip, /try \{\n    refusal = claudeApiClaimCheck\(\);\n  \} catch \(error\) \{/);
   assert.match(skip, /code: 'CLAUDE_API_NOT_CONFIGURED',/);
   assert.match(skip, /handleClaudeBillingFence\(\{ reason: 'claude-api-unavailable', messageId: row\.id, refusal \}\)/);
+  // The unarchive's wake asks the same check before its launch
+  // (conversation-lifecycle-routes.mjs, through the shared route deps).
+  assert.match(sliceBetween('const sharedRouteDeps = {', '\n};'), /\n  failClaudeApiRowsWithoutLaunch,\n/);
 });

@@ -39,7 +39,7 @@ const INSTALLED_VERSION = "9.9.9";
 // "already installed → Update" row without a first install.
 const OLDER_VERSION = "1.0.0";
 
-// The exact shape buildTerminalFailureTextForChat() (messages-routes.mjs)
+// The exact shape buildTerminalFailureTextForChat() (messages-helpers.mjs)
 // renders a `grok.cli_missing` turn failure as. The message half is verbatim
 // from classifyGrokError() (grok-sdk-adapter.mjs); the trailing stable code is
 // the only handle the client has for attaching a fix-it button.

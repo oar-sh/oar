@@ -19,6 +19,11 @@ import { requestHostOf } from '../services/request-boundary.mjs';
 import { createShareAccessLog, readShareRequestViewer } from '../services/share-access-log-service.mjs';
 import { publicRemoteRelayOrigin } from '../services/remote-relay-inbound.mjs';
 import { DEFAULT_SHARE_PATH_PRIVACY_MODE } from '../../shared/share-path-privacy.mjs';
+import {
+  buildConversationMessages,
+  resolveConversationTitle,
+  selectConversationHistoryPage,
+} from './sessions-helpers.mjs';
 
 // A shared attachment's URL names its bytes (sha256 or a fixed generated-image
 // path), so a kept answer stays right.
@@ -85,9 +90,6 @@ export function registerShareRoutes(app, deps, shared) {
     selectConversationHistoryPageRows,
     usageSnapshotsForPage,
     resendIndexForPage,
-    buildConversationMessages,
-    selectConversationHistoryPage,
-    resolveConversationTitle,
   } = shared;
 
   // Built on first use, over the same share repository.
@@ -234,7 +236,6 @@ export function registerShareRoutes(app, deps, shared) {
       titleSource: conv.title_source,
     });
     const inFlight = inFlightStateForConversation(resolvedConversationId);
-    const sdkSessionId = String(conv.sdk_session_id || resolvedConversationId || '').trim();
     const historyCursor = { limit, beforeMessageId, beforeTimestamp, afterMessageId, afterTimestamp, aroundMessageId };
     const sqlPage = selectConversationHistoryPageRows(resolvedConversationId, historyCursor, { sharedOnly: true });
     const dbMessages = filterMessagesVisibleToSharedView(sqlPage

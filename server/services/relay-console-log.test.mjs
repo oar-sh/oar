@@ -85,6 +85,102 @@ test('a token is never written: not the relay\'s own and not one in a link', () 
   }
 });
 
+test('a token that a terminal code splits is never written, and no code is', () => {
+  const { consoleImpl, installed, read, cleanup } = setup();
+  try {
+    // Put together at run time: the hygiene scan refuses token shapes.
+    const agentToken = ['oar', 'a1_', 'FAKEfake01', '23456789FAKEfake0123'].join('');
+    installed.setSecrets(['s3cret-relay-token']);
+    consoleImpl.log(`pairing failed for ${agentToken.slice(0, 12)}\x1b[K${agentToken.slice(12)}`);
+    consoleImpl.log(`see \x1b]8;;https://relay-a.example.test/\x1b\\${agentToken.slice(0, 8)}\x1b]8;;\x07${agentToken.slice(8)} now`);
+    consoleImpl.warn('owner token s3cret-\x1b[38:5:196mrelay-token\x1b[39m refused');
+    const text = read();
+    assert.equal(text.includes(agentToken.slice(-8)), false);
+    assert.equal(text.includes('relay-token'), false);
+    assert.equal(text.includes('\x1b'), false);
+    assert.match(text, /pairing failed for \[token\]\n/);
+    assert.match(text, /see \[token\] now\n/);
+    assert.match(text, /owner token \[token\] refused\n/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('no escape is written: two-byte ones, a lone ESC, an OSC never ended', () => {
+  const { consoleImpl, read, cleanup } = setup();
+  try {
+    const agentToken = ['oar', 'a1_', 'FAKEfake01', '23456789FAKEfake0123'].join('');
+    consoleImpl.log(`reset ${agentToken.slice(0, 12)}\x1b(B${agentToken.slice(12)} done`);
+    consoleImpl.log(`cursor \x1b7saved\x1b8 back \x1b`);
+    consoleImpl.log('title \x1b]0;relay window\nnext line');
+    const text = read();
+    assert.equal(text.includes(agentToken.slice(-8)), false);
+    assert.equal(text.includes('\x1b'), false);
+    assert.match(text, /reset \[token\] done\n/);
+    assert.match(text, /cursor saved back \n/);
+    assert.match(text, /title \n[^\n]* next line\n/);
+  } finally {
+    cleanup();
+  }
+});
+
+// Fake codes of each kind that can cut a token: none may leave a piece of it.
+const SPLIT_CODES = Object.freeze({
+  sgr: '\x1b[31m',
+  'colon sgr': '\x1b[38:5:196m',
+  'erase csi': '\x1b[K',
+  'cursor csi': '\x1b[2C',
+  'osc bel': '\x1b]8;;https://relay-a.example.test/\x07',
+  'osc st': '\x1b]0;title\x1b\\',
+  'osc bel, line break inside': '\x1b]0;relay\nwindow\x07',
+  'osc st, line break inside': '\x1b]0;relay\nwindow\x1b\\',
+  charset: '\x1b(B',
+  'save cursor': '\x1b7',
+  'keypad mode': '\x1b=',
+});
+
+test('a token cut at any place by any kind of code is never written, not even its last part', () => {
+  const { consoleImpl, read, cleanup } = setup();
+  try {
+    const agentToken = ['oar', 'a1_', 'FAKEfake01', '23456789FAKEfake0123'].join('');
+    const expected = [];
+    for (const [name, code] of Object.entries(SPLIT_CODES)) {
+      for (let at = 1; at < agentToken.length; at += 1) {
+        consoleImpl.log(`${name} ${at}: ${agentToken.slice(0, at)}${code}${agentToken.slice(at)} done`);
+        expected.push(`${name} ${at}: [token] done`);
+      }
+    }
+    const lines = read().split('\n').slice(0, -1).map((line) => line.replace(/^\S+ /, ''));
+    assert.deepEqual(lines, expected);
+  } finally {
+    cleanup();
+  }
+});
+
+test('a bare ESC goes alone and keeps the character after it; 7, 8 and characters no token holds go with it', () => {
+  const { consoleImpl, read, cleanup } = setup();
+  try {
+    const ownerToken = ['oar', 'o1_', 'FAKEfake01', '23456789FAKEfake0123'].join('');
+    consoleImpl.log(`stray \x1b${ownerToken} end`);
+    consoleImpl.log(`letter \x1bM${ownerToken} end`);
+    consoleImpl.log(`saved oar\x1b7${ownerToken.slice(3)} end`);
+    consoleImpl.log(`keypad ${ownerToken.slice(0, 10)}\x1b>${ownerToken.slice(10)} end`);
+    consoleImpl.log('cut csi \x1b[12');
+    consoleImpl.log('a last \x1b');
+    const text = read();
+    assert.equal(text.includes(ownerToken.slice(-8)), false);
+    assert.equal(text.includes('\x1b'), false);
+    assert.match(text, /stray \[token\] end\n/);
+    assert.match(text, /letter M\[token\] end\n/);
+    assert.match(text, /saved \[token\] end\n/);
+    assert.match(text, /keypad \[token\] end\n/);
+    assert.match(text, /cut csi 12\n/);
+    assert.match(text, /a last \n/);
+  } finally {
+    cleanup();
+  }
+});
+
 test('a file capability and a media tag are never written, in a link or on their own', () => {
   const { consoleImpl, read, cleanup } = setup();
   try {

@@ -88,6 +88,9 @@ const TABLE = [
   ['GET', '/api/relay/shutdown', A, D],
   ['GET', '/api/conversation/:conversationId/subagent/:subagentRunId', A, D],
   ['GET', '/api/conversation/:conversationId/background-task/:taskId/output', A, A],
+  // A whole conversation's worker trail: the agent of that conversation only
+  // (decided in the route); no paired relay.
+  ['GET', '/api/conversation/:conversationId/worker-log', R, D],
   ['GET', '/api/media', A, D],
   ['GET', '/api/media/counts', A, D],
   ['GET', '/api/media/facets', A, D],
@@ -366,6 +369,7 @@ export const PERSON_ONLY_ROUTES = Object.freeze([
   // Settings writes and provider logins
   'POST /api/settings/default-session-workspace-root',
   'POST /api/settings/openai',
+  'POST /api/settings/copilot',
   'PUT /api/openai-image-presets',
   'DELETE /api/openai-image-presets/:name',
   'POST /api/settings/claude',

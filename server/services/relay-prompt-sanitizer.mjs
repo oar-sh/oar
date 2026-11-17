@@ -6,6 +6,11 @@ import { fileURLToPath } from 'url';
 
 import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
+import {
+  compileWordSequence,
+  matchLeadingWordSequence,
+  removeWordSequences,
+} from '../public/app/whitespace-flexible-match.mjs';
 
 const DEFAULT_RELAY_TOOL_GUIDANCE = [
   '# Relay Tool Guidance',
@@ -93,43 +98,47 @@ const LEGACY_MODE_INSTRUCTIONS = {
   ].join(' '),
 };
 
-function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+// The prefixes are matched word by word (any whitespace between words, any
+// case), never through a RegExp built from them: the guidance runs to
+// thousands of words, and compiling such a regex overflows the stack.
+// They depend only on the mode, so they are built once per mode and reused:
+// a long conversation sanitises every message on each history load.
+const PROMPT_PREFIX_CACHE = new Map();
 
-function whitespaceFlexiblePattern(value) {
-  return String(value || '')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => escapeRegExp(part))
-    .join('\\s+');
-}
-
-// The patterns depend only on the mode, so they are built once per mode and
-// reused: a long conversation sanitises every message on each history load.
-const PROMPT_PREFIX_PATTERN_CACHE = new Map();
-
-function buildPromptPrefixPatterns(mode) {
+function promptPrefixCacheKey(mode) {
   const requestedMode = String(mode || '').trim().toLowerCase();
-  const cacheKey = requestedMode && MODE_MARKERS[requestedMode] ? requestedMode : '';
-  const cached = PROMPT_PREFIX_PATTERN_CACHE.get(cacheKey);
-  if (cached) return cached;
+  return requestedMode && MODE_MARKERS[requestedMode] ? requestedMode : '';
+}
+
+// The prefixes tried for a mode, in order: the full one with the current and
+// the legacy mode instructions, each with the current and then the previous
+// guidance, then the bare marker. No mode tries every mode's.
+function promptPrefixTexts(cacheKey) {
   const modes = cacheKey ? [cacheKey] : Object.keys(MODE_MARKERS);
-  const patterns = modes.flatMap((key) => {
+  return modes.flatMap((key) => {
     const marker = MODE_MARKERS[key];
-    const currentFullPrefix = `${marker} ${MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
-    const legacyFullPrefix = `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`;
     return [
-      new RegExp(`^${whitespaceFlexiblePattern(currentFullPrefix)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(legacyFullPrefix)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(`${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`)}\\s*`, 'i'),
-      new RegExp(`^${whitespaceFlexiblePattern(marker)}\\s*`, 'i'),
+      `${marker} ${MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`,
+      `${marker} ${LEGACY_MODE_INSTRUCTIONS[key]} ${PREVIOUS_RELAY_TOOL_GUIDANCE}`,
+      marker,
     ];
   });
-  PROMPT_PREFIX_PATTERN_CACHE.set(cacheKey, patterns);
-  return patterns;
+}
+
+function buildPromptPrefixes(mode) {
+  const cacheKey = promptPrefixCacheKey(mode);
+  const cached = PROMPT_PREFIX_CACHE.get(cacheKey);
+  if (cached) return cached;
+  const prefixes = promptPrefixTexts(cacheKey).map((text) => compileWordSequence(text));
+  PROMPT_PREFIX_CACHE.set(cacheKey, prefixes);
+  return prefixes;
+}
+
+/** The prefix texts stripRelayPromptContext tries for `mode`, in order. */
+export function relayPromptPrefixTextsForTests(mode = '') {
+  return promptPrefixTexts(promptPrefixCacheKey(mode));
 }
 
 function stripAttachmentPromptArtifacts(text) {
@@ -143,17 +152,12 @@ function stripAttachmentPromptArtifacts(text) {
 }
 
 // The once-per-worker media-embed guidance rides ahead of the mode marker on
-// the Cursor/Grok prompt paths, so it is dropped before the prefix-anchored
-// marker patterns run. Machine-injected verbatim, never user-authored.
-const MEDIA_EMBED_BLOCK_PATTERN = new RegExp(
-  whitespaceFlexiblePattern(renderMediaEmbedInstructionBlock()),
-  'gi',
-);
+// the Cursor/Grok prompt paths, so it is dropped before the prefixes are
+// matched. Machine-injected verbatim, never user-authored. Matched word by
+// word like the prefixes, every occurrence.
+const MEDIA_EMBED_BLOCK_WORDS = compileWordSequence(renderMediaEmbedInstructionBlock());
 // The formula guidance (shared/math-instructions.mjs) rides right behind it.
-const MATH_BLOCK_PATTERN = new RegExp(
-  whitespaceFlexiblePattern(renderMathInstructionBlock()),
-  'gi',
-);
+const MATH_BLOCK_WORDS = compileWordSequence(renderMathInstructionBlock());
 
 // A steered message's hidden note (shared/steer-note.mjs) leads the prompt the
 // runtime stored, right after any mode marker. Matched by its stable opening
@@ -171,14 +175,15 @@ function stripLeadingRelayNotes(text) {
 }
 
 export function stripRelayPromptContext(text, relayMode = '', attachments = []) {
-  const value = stripAttachmentPromptArtifacts(text)
-    .replace(MEDIA_EMBED_BLOCK_PATTERN, '')
-    .replace(MATH_BLOCK_PATTERN, '')
-    .trim();
+  const value = removeWordSequences(
+    removeWordSequences(stripAttachmentPromptArtifacts(text), MEDIA_EMBED_BLOCK_WORDS),
+    MATH_BLOCK_WORDS,
+  ).trim();
   if (!value) return '';
-  const patterns = buildPromptPrefixPatterns(relayMode);
-  for (const pattern of patterns) {
-    const stripped = value.replace(pattern, '').trim();
+  for (const prefix of buildPromptPrefixes(relayMode)) {
+    const end = matchLeadingWordSequence(value, prefix);
+    if (end < 0) continue;
+    const stripped = value.slice(end).trim();
     if (stripped && stripped !== value) return stripLeadingRelayNotes(stripped);
   }
   return stripLeadingRelayNotes(value);

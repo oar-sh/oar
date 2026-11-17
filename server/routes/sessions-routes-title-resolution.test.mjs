@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveConversationTitle } from './sessions-routes.mjs';
+import { resolveConversationTitle } from './sessions-helpers.mjs';
 
 test('resolveConversationTitle ignores poisoned discovered title for auto source', () => {
   const resolved = resolveConversationTitle({

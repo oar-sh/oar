@@ -20,15 +20,21 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const MAX_LINES = 3000;
 
 const CEILINGS = new Map([
-  ['server/routes/messages-routes.mjs', 3021],
-  ['server/server-runtime.mjs', 9412],
-  ['server/routes/sessions-routes.mjs', 4107],
-  ['server/public/app/bootstrap.js', 6491],
+  // The archive and unarchive fixes: +5 the dead-worker sweep's archived and Stop rows;
+  // +13 a failed row's cards and Stops end in its failure; -4 the shared liveness probe;
+  // -6 getOrCreateConversation's unreachable unarchive; +1 the unarchive wake's Claude API check;
+  // +2 the imports re-pointed from messages-routes.mjs's re-exports.
+  // The Copilot switch: -33 net from 9440. The empty-chat provider rebind
+  // went (-129); the switch's CLI detector, the boot, ledger and usage gates,
+  // the binding backstop, the claim fence and the launch checks came in.
+  ['server/server-runtime.mjs', 9407],
+  ['server/public/app/bootstrap.js', 6490],
   ['server/public/app/conversation-view.js', 5275],
   ['server/copilot-worker/copilot-sdk-session-process.mjs', 5204],
-  ['server/services/remote-relay-dispatcher.mjs', 4651],
+  // +6 for the local-relay branch of mapRemoteError.
+  ['server/services/remote-relay-dispatcher.mjs', 4641],
   ['server/claude-worker/claude-session-process.mjs', 4600],
-  ['server/public/app/journal-view.js', 3804],
+  ['server/public/app/journal-view.js', 3785],
   ['server/public/app/attachments-view.js', 3267],
 ]);
 

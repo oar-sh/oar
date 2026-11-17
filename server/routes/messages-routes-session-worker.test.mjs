@@ -4,13 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { dequeuePendingMessageForWorkerLoop } from './messages-worker-claim-routes.mjs';
+import { isTransientRequeue } from './messages-worker-claim-routes.mjs';
 import {
-  dequeuePendingMessageForWorkerLoop,
-  isTransientRequeue,
   resolveOpenAIReasoningEffort,
   shouldRequireNewOpenAIConversation,
-  validateSubagentRunBinding,
-} from './messages-routes.mjs';
+} from './messages-intake-routes.mjs';
+import { validateSubagentRunBinding } from './messages-worker-output-routes.mjs';
 import {
   normalizeOpenAIImageApiGeneratedImages,
   normalizeOpenAIImageGenerateRequestBody,

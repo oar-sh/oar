@@ -18,6 +18,7 @@ import {
   readTail,
   safeChunkLength,
   shapeSnapshot,
+  softLineCut,
   taskOutputSource,
 } from './task-output-service.mjs';
 
@@ -32,6 +33,51 @@ function writeLines(file, count, prefix = 'line') {
 }
 
 const fixture = (name) => fs.readFileSync(new URL(`../../shared/fixtures/task-output/${name}`, import.meta.url));
+
+test('softLineCut: before the word that crosses the limit and the two before it, else after , ; " \', else exact', () => {
+  const text = (value) => Buffer.from(value);
+  const line = text(`${'a'.repeat(40)} -H "Authorization: Bearer hunter2plainsecret`);
+  const cut = softLineCut(line, line.length);
+  assert.equal(line.subarray(cut).toString(), ' "Authorization: Bearer hunter2plainsecret');
+  const json = text(`${'b'.repeat(40)},"user":"ann","password": "hunter2plainsecret`);
+  assert.equal(json.subarray(softLineCut(json, json.length)).toString(), ',"password": "hunter2plainsecret', 'a JSON field with its key');
+  const noSpace = text(`${'c'.repeat(40)};k1=v1;password=hunter2plain`);
+  assert.equal(noSpace.subarray(softLineCut(noSpace, noSpace.length)).toString(), ';k1=v1;password=hunter2plain');
+  const quoted = text(`${'q'.repeat(40)}"x"${'y'.repeat(30)}`);
+  assert.equal(softLineCut(quoted, quoted.length), 43, 'no word break: after the last quote');
+  // Nothing to cut at in the second half: the exact length.
+  const solid = text('d'.repeat(64));
+  assert.equal(softLineCut(solid, solid.length), 64);
+  const early = text(`e ${'f'.repeat(62)}`);
+  assert.equal(softLineCut(early, early.length), 64, 'never in the first half');
+});
+
+test('readRange with softCut cuts a long open line between words; without it, at the exact byte', async (t) => {
+  const file = path.join(tempDir(t), 'long.log');
+  fs.writeFileSync(file, `${'w '.repeat(40)}Authorization: Bearer hunter2plainsecretvalue${'x'.repeat(20)}`);
+  const exact = await readRange(file, { start: 0, maxBytes: 100, holdOpenLine: true, longLineBytes: 100 });
+  assert.equal(exact.endOffset, 100);
+  const soft = await readRange(file, { start: 0, maxBytes: 100, holdOpenLine: true, longLineBytes: 100, softCut: true });
+  // Before "w Authorization: Beare…", the word the limit falls in and two before it.
+  assert.equal(soft.endOffset, 77);
+  assert.equal(soft.text, `${'w '.repeat(38)}w`);
+});
+
+test('readTail can hold back a fresh unterminated last line', async (t) => {
+  const file = path.join(tempDir(t), 'open.log');
+  fs.writeFileSync(file, 'done line\nAuthorization: Bearer hunter2');
+  const mtime = fs.statSync(file).mtimeMs;
+  const held = await readTail(file, { holdOpenLineMs: 5000, now: () => mtime + 1000 });
+  assert.equal(held.text, 'done line\n');
+  assert.equal(held.endOffset, 10);
+  const quiet = await readTail(file, { holdOpenLineMs: 5000, now: () => mtime + 6000 });
+  // Shown once quiet, scrubbed like any line.
+  assert.equal(quiet.text, 'done line\nAuthorization: Bearer [redacted]');
+  assert.equal((await readTail(file)).text, 'done line\nAuthorization: Bearer [redacted]', 'not held by default');
+  // A window that is one open line only is shown.
+  fs.writeFileSync(file, 'only an open line');
+  assert.equal((await readTail(file, { holdOpenLineMs: 5000, now: () => Date.now() })).text, 'only an open line');
+});
 
 test('readTail returns the last lines with byte offsets and the line model', async (t) => {
   const file = path.join(tempDir(t), 'out.log');

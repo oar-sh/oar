@@ -3,10 +3,8 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
-import {
-  buildDequeuedRelayMessage,
-  dequeuePendingMessage,
-} from './messages-routes.mjs';
+import { buildDequeuedRelayMessage } from './messages-worker-claim-routes.mjs';
+import { dequeuePendingMessage } from './messages-worker-claim-routes.mjs';
 import {
   makeRouteDeps as baseRouteDeps,
   captureRoutes,

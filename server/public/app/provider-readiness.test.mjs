@@ -14,7 +14,9 @@ import {
 
 const off = { enabled: false };
 const seedCatalog = { models: ['auto', 'gpt-5.4-mini'], source: SEED_CATALOG_SOURCE };
-const nothingReady = { openai: off, claude: off, claudeCloud: off, cursor: off, grok: off, catalog: seedCatalog };
+// Copilot switched on (its settings say so), as on every relay from before the switch.
+const copilotOn = { engine: 'sdk', engines: ['sdk'], enabled: true, cliFound: true };
+const nothingReady = { copilot: copilotOn, openai: off, claude: off, claudeCloud: off, cursor: off, grok: off, catalog: seedCatalog };
 
 test('a seed catalog with nothing enabled is known and not ready, Copilot unknown', () => {
   const readiness = resolveProviderReadiness(nothingReady);
@@ -67,7 +69,7 @@ test('ready providers are listed together', () => {
 });
 
 test('a payload that failed to load makes the answer unknown, and unknown is never a setup wall', () => {
-  for (const key of ['openai', 'claude', 'cursor', 'grok', 'catalog']) {
+  for (const key of ['copilot', 'openai', 'claude', 'cursor', 'grok', 'catalog']) {
     const readiness = resolveProviderReadiness({ ...nothingReady, [key]: null });
     assert.equal(readiness.known, false, key);
     assert.equal(isSetupRequired(readiness), false, key);
@@ -95,7 +97,7 @@ test('the live copy starts unknown, follows the inputs and tells listeners only 
   const unsubscribe = subscribeProviderReadiness((readiness) => seen.push(readiness));
 
   // Loads arrive one by one; nothing is known until the last one lands.
-  updateProviderReadinessInputs({ openai: off, claude: off, cursor: off });
+  updateProviderReadinessInputs({ copilot: copilotOn, openai: off, claude: off, cursor: off });
   assert.equal(seen.length, 0);
   updateProviderReadinessInputs({ grok: off, claudeCloud: null });
   assert.equal(seen.length, 0);
@@ -232,4 +234,60 @@ test('a listener that throws does not stop the others', () => {
   updateProviderReadinessInputs(nothingReady);
   assert.equal(reached, true);
   resetProviderReadinessForTests();
+});
+
+test('Copilot switched off is not ready, whatever the catalog says; a payload without `enabled` is on', () => {
+  const discovered = { ...seedCatalog, source: 'server-discovery:boot' };
+  const offAnswer = resolveProviderReadiness({ ...nothingReady, copilot: { ...copilotOn, enabled: false }, catalog: discovered });
+  assert.deepEqual(offAnswer, { known: true, anyReady: false, ready: [], copilot: 'off' });
+  assert.equal(isSetupRequired(offAnswer), true, 'nothing else on: the setup wall');
+  const older = resolveProviderReadiness({ ...nothingReady, copilot: { engine: 'sdk', engines: ['sdk'] }, catalog: discovered });
+  assert.equal(older.copilot, 'ready');
+  assert.deepEqual(older.ready, ['github']);
+});
+
+test('Copilot off and only Claude on: Claude alone is ready', () => {
+  const readiness = resolveProviderReadiness({
+    ...nothingReady,
+    copilot: { ...copilotOn, enabled: false },
+    claude: { enabled: true },
+    catalog: { ...seedCatalog, source: 'server-discovery:boot' },
+  });
+  assert.deepEqual(readiness.ready, ['claude']);
+  assert.equal(readiness.copilot, 'off');
+  assert.equal(isSetupRequired(readiness), false);
+});
+
+test('the live copy follows the Copilot switch', () => {
+  resetProviderReadinessForTests();
+  updateProviderReadinessInputs({ ...nothingReady, catalog: { ...seedCatalog, source: 'server-discovery:boot' } });
+  assert.deepEqual(getProviderReadiness().ready, ['github']);
+  const seen = [];
+  const unsubscribe = subscribeProviderReadiness((readiness) => seen.push(readiness.copilot));
+  updateProviderReadinessInputs({ copilot: { ...copilotOn, enabled: false } });
+  assert.equal(isProviderSetupRequired(), true);
+  updateProviderReadinessInputs({ copilot: copilotOn });
+  assert.deepEqual(seen, ['off', 'ready']);
+  unsubscribe();
+  resetProviderReadinessForTests();
+});
+
+test('composerLockReason: setup with no chat open, copilot-off in a Copilot chat while Copilot is off', async () => {
+  const { composerLockReason } = await import('./provider-readiness.mjs');
+  const offAnswer = resolveProviderReadiness({ ...nothingReady, copilot: { ...copilotOn, enabled: false }, claude: { enabled: true } });
+  const onAnswer = resolveProviderReadiness({ ...nothingReady, claude: { enabled: true } });
+  for (const providerType of ['github', '', null, undefined]) {
+    assert.equal(composerLockReason({ conversationId: 'conv-1', providerType }, offAnswer), 'copilot-off', String(providerType));
+    assert.equal(composerLockReason({ conversationId: 'conv-1', providerType }, onAnswer), null, String(providerType));
+  }
+  for (const providerType of ['openai', 'claude', 'cursor', 'claude-api']) {
+    assert.equal(composerLockReason({ conversationId: 'conv-1', providerType }, offAnswer), null, providerType);
+  }
+  // No chat open: Copilot off with Claude on points to New Chat; Copilot on
+  // leaves the composer as it was; nothing on is the setup lock.
+  assert.equal(composerLockReason({ conversationId: '' }, offAnswer), 'new-chat');
+  assert.equal(composerLockReason({ conversationId: '' }, onAnswer), null);
+  assert.equal(composerLockReason({ conversationId: '' }, resolveProviderReadiness(nothingReady)), 'setup');
+  const nothingOn = resolveProviderReadiness({ ...nothingReady, copilot: { ...copilotOn, enabled: false } });
+  assert.equal(composerLockReason({ conversationId: '' }, nothingOn), 'setup', 'Copilot off and nothing else on: the setup lock stays');
 });

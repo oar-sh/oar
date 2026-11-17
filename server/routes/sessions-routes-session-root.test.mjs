@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { buildConversationSessionRootPayload } from './sessions-routes.mjs';
+import { buildConversationSessionRootPayload } from './conversation-read-routes.mjs';
 
 const SDK_SESSION_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const CLAUDE_NATIVE_ID = '11111111-2222-4333-8444-555555555555';

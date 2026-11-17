@@ -73,20 +73,6 @@ test('worker launch env binds cursor sessions with the stored API key', () => {
   assert.match(launchSource, /apiKey: cursorSettings\.apiKey,/);
 });
 
-test('provider reconciliation manages cursor conversations', () => {
-  const reconcileSource = sliceBetween(
-    'async function reconcileUnstartedConversationProviders(',
-    '\nasync function rebindUnstartedOpenAIConversationModel(',
-  );
-  assert.match(reconcileSource, /\['claude', 'cursor', 'grok', 'deepseek', 'claude-api'\]\.includes\(normalizedProvider\)/);
-  assert.match(reconcileSource, /cursor: DEFAULT_CURSOR_MODEL,/);
-  assert.match(
-    reconcileSource,
-    /currentProvider === 'cursor'\s*\?\s*getCursorProviderSettings\(\)\.configured === true/,
-    'rollback must only restore a cursor binding while the key is still configured',
-  );
-});
-
 test('runtime session binding honors an explicit cursor provider type', () => {
   const bindingSource = sliceBetween(
     'function ensureRuntimeSessionBinding(',

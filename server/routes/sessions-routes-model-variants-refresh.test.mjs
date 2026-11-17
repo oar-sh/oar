@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { registerSessionsRoutes } from './sessions-routes.mjs';
-import { buildModelVariantCatalogPayload } from './sessions-routes.mjs';
+import { buildModelVariantCatalogPayload } from './model-routes.mjs';
 
 function createMockApp() {
   const routes = new Map();
@@ -241,10 +241,10 @@ test('POST /api/settings/openai does not rebind existing conversations when sett
 
   assert.equal(response.statusCode, 200);
   assert.equal(reconciliationCalls, 0);
-  assert.equal(response.body.reconciliation.updatedUnstartedConversations, 0);
+  assert.equal('reconciliation' in response.body, false);
 });
 
-test('POST /api/settings/openai rebinds empty OpenAI conversations when the key is removed', async () => {
+test('POST /api/settings/openai moves no empty OpenAI conversation when the key is removed', async () => {
   const rows = { current: [] };
   const modelState = {
     current: {
@@ -253,7 +253,7 @@ test('POST /api/settings/openai rebinds empty OpenAI conversations when the key 
       defaultModel: 'gpt-5.4',
     },
   };
-  let reconciliationArgs = null;
+  let reconciliationCalls = 0;
   const disabledSettings = {
     configured: false,
     enabled: false,
@@ -266,8 +266,8 @@ test('POST /api/settings/openai rebinds empty OpenAI conversations when the key 
     openAISettings: disabledSettings,
     onRefresh: async () => {},
     onSetOpenAISettings: () => ({ ok: true, ...disabledSettings }),
-    onReconcileOpenAIConversations: async (args) => {
-      reconciliationArgs = args;
+    onReconcileOpenAIConversations: async () => {
+      reconciliationCalls += 1;
       return { updatedUnstartedConversations: 2 };
     },
   });
@@ -280,11 +280,9 @@ test('POST /api/settings/openai rebinds empty OpenAI conversations when the key 
   });
 
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(reconciliationArgs, {
-    enabled: false,
-    model: 'gpt-5.4-mini',
-  });
-  assert.equal(response.body.reconciliation.updatedUnstartedConversations, 2);
+  assert.equal(reconciliationCalls, 0);
+  assert.equal('reconciliation' in response.body, false);
+  assert.equal(response.body.warning, null);
 });
 
 test('POST /api/model-variants/refresh keeps enabled unavailable variants and rpc-snapshot source', async () => {

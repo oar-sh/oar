@@ -62,6 +62,14 @@ export function providerDisplayName(providerType = '') {
   return PROVIDER_NAMES[String(providerType || '').trim().toLowerCase()] || '';
 }
 
+// A chat's SDK session as the title tooltip, its copy toast and the context
+// summary name it: "Claude session", or plain "Session" when the provider is
+// unknown. All three used to say "Copilot session" for every provider.
+export function providerSessionLabel(providerType = '') {
+  const name = providerDisplayName(providerType);
+  return name ? `${name} session` : 'Session';
+}
+
 function conversationProviderName(conversation = null) {
   return providerDisplayName(resolveConversationProviderType(conversation));
 }

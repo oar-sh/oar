@@ -5,6 +5,10 @@
 import { createClaudeAuthService } from '../services/claude-auth-service.mjs';
 import { createCliInstallService } from '../services/cli-install-service.mjs';
 import { createGrokAuthService } from '../services/grok-auth-service.mjs';
+import {
+  SESSION_WORKER_ACTIVE_STATUSES,
+  isPidAlive,
+} from './sessions-helpers.mjs';
 
 export function registerProviderAuthRoutes(app, deps, shared) {
   const {
@@ -27,8 +31,7 @@ export function registerProviderAuthRoutes(app, deps, shared) {
     refreshGrokProviderModels,
     getModelCatalogState,
     modelsUpdatedPayload,
-    isPidAlive,
-    SESSION_WORKER_ACTIVE_STATUSES,
+    isCopilotEnabled = () => true,
   } = shared;
 
   // --- Claude account (CLI OAuth) -----------------------------------------
@@ -261,7 +264,9 @@ export function registerProviderAuthRoutes(app, deps, shared) {
     if (providerId === 'copilot') {
       // The install found the SDK, so discovery can now start a Copilot
       // client; a catalog it publishes reaches clients through the
-      // setOnCatalogUpdated listener above.
+      // setOnCatalogUpdated listener above. Not while Copilot is switched
+      // off: switching it on runs one (settings-routes.mjs).
+      if (!isCopilotEnabled()) return;
       try {
         await copilotModelDiscoveryService?.refresh?.('cli-install');
       } catch (error) {

@@ -193,10 +193,11 @@ test('Auto and unknown models fall back to the bound provider', () => {
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'openai' }), 'Message OpenAI…');
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'cursor' }), 'Message Cursor…');
   assert.equal(composerPlaceholderFor({ modelId: 'auto', providerType: 'github' }), 'Message Copilot…');
-  assert.equal(composerPlaceholderFor({ modelId: '', providerType: '' }), 'Message Copilot…');
+  // No provider: the hint names none (Copilot may be switched off).
+  assert.equal(composerPlaceholderFor({ modelId: '', providerType: '' }), 'Send a message…');
   assert.equal(composerPlaceholderFor({ modelId: 'my-custom-endpoint-model', providerType: 'openai' }), 'Message OpenAI…');
   assert.equal(composerPlaceholderFor({ modelId: 'my-custom-endpoint-model', providerType: 'github' }), 'Message Copilot…');
-  assert.equal(composerPlaceholderFor(), 'Message Copilot…');
+  assert.equal(composerPlaceholderFor(), 'Send a message…');
 });
 
 test('DeepSeek ids get readable labels and their own composer placeholder', () => {

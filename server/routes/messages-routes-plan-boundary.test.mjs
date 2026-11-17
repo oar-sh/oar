@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 
-import { crossesPlanBoundaryOfLiveTurn, dequeuePendingMessage } from './messages-routes.mjs';
+import {
+  crossesPlanBoundaryOfLiveTurn,
+  dequeuePendingMessage,
+} from './messages-worker-claim-routes.mjs';
 import { createSessionRepository } from '../repositories/session-repository.mjs';
 import { createMessageRepository, PLAN_BOUNDARY_HOLD_MARK } from '../repositories/message-repository.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
@@ -156,6 +159,7 @@ test('every claim query carries the hold', () => {
     './messages-worker-claim-routes.mjs',
     './messages-worker-output-routes.mjs',
     './messages-intake-routes.mjs',
+    './file-routes.mjs',
   ]) {
     const routes = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.equal(routes.includes('planBoundaryHoldSql('), false, file);

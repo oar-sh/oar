@@ -61,7 +61,7 @@ test('merging is still a plain overlay for every other field', () => {
 
 test('the conversation list payload advertises activeTurn', () => {
   const routes = fs.readFileSync(
-    fileURLToPath(new URL('../../routes/sessions-routes.mjs', import.meta.url)),
+    fileURLToPath(new URL('../../routes/conversation-read-routes.mjs', import.meta.url)),
     'utf8',
   );
   assert.match(routes, /activeTurn:\s+activeTurnConversationIds\.has/);

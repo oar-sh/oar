@@ -47,6 +47,28 @@ test('cancelPendingQuestionsByMessage only closes pending rows for the target me
   ]);
 });
 
+test('cancelPendingQuestionsForRow closes every pending card of the row, with or without an attempt, and names them', () => {
+  const db = makeDb();
+  const repo = createQuestionRepository(db);
+  db.prepare(`
+    INSERT INTO relay_questions (id, queue_id, conversation_id, message_id, relay_mode, prompt, status, created_at, expires_at, attempt_id)
+    VALUES
+      ('q-legacy', 'queue-1', 'conv-1', 'msg-1', 'agent', 'First', 'pending', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', NULL),
+      ('q-current', 'queue-1', 'conv-1', 'msg-1', 'agent', 'Second', 'pending', '2026-01-01T00:01:00Z', '2026-01-01T01:01:00Z', 'attempt-2'),
+      ('q-answered', 'queue-1', 'conv-1', 'msg-1', 'agent', 'Done', 'answered', '2026-01-01T00:02:00Z', '2026-01-01T01:02:00Z', NULL),
+      ('q-other', 'queue-2', 'conv-1', 'msg-2', 'agent', 'Other', 'pending', '2026-01-01T00:03:00Z', '2026-01-01T01:03:00Z', NULL)
+  `).run();
+
+  const cancelled = repo.cancelPendingQuestionsForRow.all('2026-01-01T02:00:00Z', 'msg-1');
+  assert.deepEqual(cancelled.map((row) => row.id).sort(), ['q-current', 'q-legacy']);
+  assert.deepEqual(db.prepare(`SELECT id, status FROM relay_questions ORDER BY id`).all(), [
+    { id: 'q-answered', status: 'answered' },
+    { id: 'q-current', status: 'cancelled' },
+    { id: 'q-legacy', status: 'cancelled' },
+    { id: 'q-other', status: 'pending' },
+  ]);
+});
+
 test('updateThoughtByQueueAndReasoning updates snapshot without changing seq', () => {
   const db = makeDb();
   const repo = createQuestionRepository(db);

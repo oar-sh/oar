@@ -1159,6 +1159,9 @@ test("shows current context from the context button", async ({ page, request }) 
         conversationId: null,
         runtimeSessionId: "context-runtime-session",
         copilotSessionId: "context-copilot-session",
+        // As the relay sends it for a Copilot chat; without it the subtitle
+        // names no provider.
+        providerType: "github",
         snapshot: {
           used_percent: 42,
           used_total_tokens: 42000,
@@ -1523,7 +1526,8 @@ test("mobile chat title exposes and copies the sdk session id", async ({ page, r
 
     const title = page.locator("#chat-title");
 
-    await expect(title).toHaveAttribute("data-copilot-session-id", sdkSessionId);
+    await expect(title).toHaveAttribute("data-sdk-session-id", sdkSessionId);
+    await expect(title).toHaveAttribute("title", `Copilot session ${sdkSessionId} (click to copy)`);
     await title.evaluate((el) => el.click());
     await expect.poll(async () => page.evaluate(() => window.__copiedSessionId || "")).toBe(sdkSessionId);
   } finally {

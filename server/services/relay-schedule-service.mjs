@@ -45,6 +45,7 @@ import {
   normalizeRelayScheduleTitle,
 } from '../../shared/relay-schedules.mjs';
 import { relaySchedulesTableProblem } from '../migrations/0022-relay-schedules.mjs';
+import { queueIntoConversation, unarchivedConversationEvent } from '../repositories/queue-insert.mjs';
 
 const LOG_PREFIX = '[relay-schedules]';
 // setTimeout holds at most ~24.8 days; a schedule further out is looked at
@@ -446,10 +447,12 @@ export function createRelayScheduleService({
       null,
     ];
     if (stmts.queueHasImageOperationId || stmts.insertQ?.source?.includes?.('image_operation_id')) queueArgs.push(null);
-    stmts.insertQ.run(...queueArgs);
+    // The target is live (fireIfDue checked); were it archived, the row
+    // would bring it back rather than wait unseen.
+    const { unarchived } = queueIntoConversation(db, stmts, queueArgs);
     // Due since the schedule's time: the delivery takes it at once.
     sql.setNextAttempt.run(dueAt, messageId);
-    return { messageId, model, relayMode, owner, timestamp: at, text, origin };
+    return { messageId, model, relayMode, owner, timestamp: at, text, origin, unarchived };
   }
 
   function goneReason(row) {
@@ -531,6 +534,9 @@ export function createRelayScheduleService({
       log(`${row.id} skipped for conv=${shortId(row.conversation_id)}: the message before still waits; next ${next}`);
       broadcast();
       return { fired: false, skipped: true, held: false, ended: false, messageId: null };
+    }
+    if (queued.unarchived) {
+      try { emit(...unarchivedConversationEvent(target.id)); } catch {}
     }
     try {
       emit('user_message', {

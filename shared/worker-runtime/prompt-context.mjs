@@ -2,6 +2,10 @@ import {
   applyPreviewInstructions,
   createPreviewInstructionsProvider,
 } from "../preview-instructions.mjs";
+import {
+  compileWordSequence,
+  matchLeadingWordSequence,
+} from "../../server/public/app/whitespace-flexible-match.mjs";
 
 export { createPreviewInstructionsProvider };
 
@@ -121,25 +125,15 @@ export function stripPromptPrefix(text, promptPrefix = "") {
   return remainder || "";
 }
 
-function escapeRegExp(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function whitespaceFlexiblePattern(value) {
-  return String(value || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => escapeRegExp(part))
-    .join("\\s+");
-}
-
+// Word by word, never through a RegExp built from the prompt: the relay tool
+// guidance in it runs to thousands of words, and compiling such a regex
+// overflows the stack.
 function stripPromptPrefixFlexible(text, promptPrefix = "") {
   const value = String(text || "").trim();
   const prompt = String(promptPrefix || "").trim();
   if (!value || !prompt) return value;
-  const pattern = new RegExp(`^${whitespaceFlexiblePattern(prompt)}\\s*`, "i");
-  const stripped = value.replace(pattern, "").trim();
+  const end = matchLeadingWordSequence(value, compileWordSequence(prompt));
+  const stripped = (end < 0 ? value : value.slice(end)).trim();
   return stripped || "";
 }
 

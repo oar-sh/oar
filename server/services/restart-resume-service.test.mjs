@@ -315,3 +315,31 @@ test('on a plan-only session a cut turn goes on in plan, the "Approve plan" turn
     assert.equal(env.db.prepare(`SELECT preferred_relay_mode FROM conversations WHERE id = 'conv-a'`).get().preferred_relay_mode, 'plan');
   }
 });
+
+// The archive check goes stale: the conversation is archived inside the
+// note's write, after the check. The note's row brings it back, said once,
+// instead of waiting unseen in an archived chat.
+test('a note written into a conversation archived after its check unarchives it and says so once', () => {
+  const env = setup();
+  seedConversation(env.db, 'conv-a');
+  const cut = seedRow(env.db, 'q-cut', 'conv-a');
+  const updateConvTime = env.stmts.updateConvTime;
+  env.stmts.updateConvTime = {
+    run: (at, id) => {
+      const result = updateConvTime.run(at, id);
+      env.db.prepare(`UPDATE conversations SET archived = 1 WHERE id = ?`).run(id);
+      return result;
+    },
+  };
+  const service = env.make();
+  service.captureBoot();
+  env.settleRow('q-cut', 'failed');
+  service.noteOutcome(cut, 'cut');
+  const [note] = notes(env.db, 'conv-a');
+  assert.equal(note.status, 'pending');
+  assert.equal(env.db.prepare(`SELECT archived FROM conversations WHERE id = 'conv-a'`).get().archived, 0);
+  const events = env.emitted.map((entry) => entry.event);
+  assert.deepEqual(env.emitted.filter((entry) => entry.event === 'conversation_archived').map((entry) => entry.payload), [{ conversationId: 'conv-a', archived: false }]);
+  assert.ok(events.indexOf('conversation_archived') < events.indexOf('user_message'), events.join(','));
+  assert.equal(env.stmts.findPendingForWorker.get(new Date(T0).toISOString(), 'sdk-conv-a')?.id, note.id);
+});

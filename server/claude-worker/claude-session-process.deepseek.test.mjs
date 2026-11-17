@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { resolveTerminalFailurePayload } from '../routes/messages-routes.mjs';
+import { resolveTerminalFailurePayload } from '../routes/messages-helpers.mjs';
 import { relayErrorCtaActionsForCode } from '../public/app/relay-error-ctas.mjs';
 
 import {

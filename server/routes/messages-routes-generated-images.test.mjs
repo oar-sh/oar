@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
 
+import { registerMessagesRoutes } from './messages-routes.mjs';
 import {
   cleanupPersistedGeneratedImagesForAssistantResponse,
   normalizeGeneratedImageResponses,
-  registerMessagesRoutes,
   shouldAcceptAssistantResponsePayload,
   persistGeneratedImagesForAssistantResponse,
-} from './messages-routes.mjs';
+} from './messages-worker-output-routes.mjs';
 import { captureRoutes, invokeRoute, makeRouteDeps, recordingStmts } from './messages-routes-test-harness.mjs';
 
 const ONE_PIXEL_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Hh9kAAAAASUVORK5CYII=';

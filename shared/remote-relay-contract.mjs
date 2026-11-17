@@ -75,6 +75,7 @@ export const REMOTE_RELAY_ACTIONS = Object.freeze([
   'list_sessions',
   'read_session',
   'read_task_output',
+  'read_worker_log',
   'wait',
   'send',
   'create_session',
@@ -118,6 +119,8 @@ export const REMOTE_RELAY_ACTION_PERMISSION = Object.freeze({
   list_sessions: 'read',
   read_session: 'read',
   read_task_output: 'read',
+  // The caller's own conversation only, on this relay.
+  read_worker_log: 'read',
   wait: 'read',
   send: 'prompt',
   create_session: 'full',
@@ -520,6 +523,8 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   + 'read_task_output {session, task_id} reads the end of a background shell or Monitor task\'s output there '
   + '(task ids from read_session\'s tasks; also for an hour after the task ended): the last lines, minutes '
   + 'since its last output, and pass/fail counts when it is a test run; credentials are scrubbed. '
+  + 'read_worker_log reads the end of your own session worker\'s log on this relay, credentials scrubbed (relay "this"; '
+  + `lines, default ${REMOTE_RELAY_LIMITS.taskOutputLinesDefault}, at most ${REMOTE_RELAY_LIMITS.taskOutputLinesMax}). `
   + 'Event subscriptions: subscribe to sessions of this relay or of a paired relay (ids, or "all" for every '
   + 'session there, later ones too) and the relay wakes you with a message when something happens there: '
   + 'question_asked (with the question and its options; it brings question_answered too, when the user answers an ask there), '
@@ -588,7 +593,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       enum: [...REMOTE_RELAY_ACTIONS],
       description: 'list_relays: the relays (this one included when allowed) and whether each is unlocked here. relay_info: providers, models, '
         + 'workspaces of a relay. usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. '
-        + 'read_task_output: the end of a background shell task\'s output. send: prompt an '
+        + 'read_task_output: the end of a background shell task\'s output. read_worker_log: the end of your own session worker\'s log (this relay). send: prompt an '
         + 'existing session. create_session: start a new session with a first prompt. update_session: change '
         + 'another session\'s settings (model, effort, mode, auto-compact window, title, group, thinking, cwd, image defaults). wait: keep waiting for '
         + 'a reply. answer_question: refused, only the person answers questions (in the relay UI). stop: stop the running turn. '
@@ -840,7 +845,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       type: 'integer',
       minimum: 1,
       maximum: REMOTE_RELAY_LIMITS.taskOutputLinesMax,
-      description: `read_task_output: how many of the last output lines (default ${REMOTE_RELAY_LIMITS.taskOutputLinesDefault}).`,
+      description: `read_task_output / read_worker_log: how many of the last lines (default ${REMOTE_RELAY_LIMITS.taskOutputLinesDefault}).`,
     },
   },
   required: ['action'],
@@ -878,6 +883,7 @@ export const REMOTE_RELAY_ACTION_ARGUMENTS = Object.freeze({
   list_sessions: Object.freeze(['scope', 'limit', 'query', 'cursor']),
   read_session: Object.freeze(['session', 'last', 'before', 'include_activity', 'max_chars']),
   read_task_output: Object.freeze(['session', 'task_id', 'lines']),
+  read_worker_log: Object.freeze(['lines']),
   wait: Object.freeze(['session', 'message_id', 'wait_seconds']),
   send: Object.freeze(['session', 'text', 'wait_seconds', 'model', 'mode', 'effort', 'if_busy', 'provider', 'images', 'image']),
   create_session: Object.freeze(['text', 'provider', 'model', 'cwd', 'repo', 'branch', 'mode', 'effort', 'title', 'group', 'wait_seconds', 'planOnly', 'images', 'image']),
@@ -1008,7 +1014,8 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
   const args = {};
   const relayOptional = REMOTE_RELAY_EVENT_ACTIONS.includes(action)
     || REMOTE_RELAY_SCHEDULE_ACTIONS.includes(action)
-    || REMOTE_RELAY_ASK_ACTIONS.includes(action);
+    || REMOTE_RELAY_ASK_ACTIONS.includes(action)
+    || action === 'read_worker_log';
   const relay = toText(input?.relay) || (relayOptional ? REMOTE_RELAY_LOCAL_ALIAS : '');
   if (!relay) return invalid(`${action} needs relay (a name from list_relays)`);
   args.relay = relay;
@@ -1082,6 +1089,18 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
     if (!taskId) return invalid('read_task_output needs task_id (a taskId from read_session\'s tasks)');
     if (taskId.length > 200 || /[\s/\\]/.test(taskId)) return invalid('task_id is not a task id');
     args.task_id = taskId;
+    const lines = clampInteger(input?.lines, {
+      min: 1,
+      max: REMOTE_RELAY_LIMITS.taskOutputLinesMax,
+      fallback: REMOTE_RELAY_LIMITS.taskOutputLinesDefault,
+    });
+    if (lines === null) return invalid('lines must be a number');
+    args.lines = lines;
+  } else if (action === 'read_worker_log') {
+    // Always the caller's own conversation: naming one is refused, not ignored.
+    if (!isEmptyArgument(input?.session)) {
+      return invalid('read_worker_log reads your own session\'s worker log and takes no session: a worker log is read only by its own conversation.');
+    }
     const lines = clampInteger(input?.lines, {
       min: 1,
       max: REMOTE_RELAY_LIMITS.taskOutputLinesMax,
