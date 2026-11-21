@@ -27,6 +27,15 @@ import {
   describeActiveFilterTitle,
   activeFilterBadgeText,
   describeActiveMatchCount,
+  ACTIVE_WINDOW_STOPS_MIN,
+  ACTIVE_WINDOW_STORAGE_KEY,
+  activeWindowStopIndex,
+  activeWindowMsAtStop,
+  parseActiveWindowSetting,
+  readActiveWindowMs,
+  writeActiveWindowMs,
+  formatActiveWindow,
+  describeActiveWindow,
 } from './conversation-list-filter.mjs';
 
 test('normalizeConversationFilter trims and lowercases', () => {
@@ -430,9 +439,9 @@ test('the active filter setting survives a storage that throws', () => {
 
 test('the 🔥 button texts: a fixed name, a tooltip and a count only while on', () => {
   assert.equal(ACTIVE_FILTER_LABEL, 'Show active sessions only');
-  assert.match(describeActiveFilterTitle(false), /^Show active sessions only: .*5 minutes/);
-  assert.equal(describeActiveFilterTitle(true, 1), 'Showing 1 active session; click to show all');
-  assert.equal(describeActiveFilterTitle(true, 4), 'Showing 4 active sessions; click to show all');
+  assert.equal(describeActiveFilterTitle(false), 'Show active sessions only: working, active in the last 5 min, or waiting for you');
+  assert.equal(describeActiveFilterTitle(true, 1), 'Showing 1 active session (last 5 min); click to show all');
+  assert.equal(describeActiveFilterTitle(true, 4), 'Showing 4 active sessions (last 5 min); click to show all');
   assert.equal(activeFilterBadgeText(false, 7), '');
   assert.equal(activeFilterBadgeText(true, 0), '0');
   assert.equal(activeFilterBadgeText(true, 7), '7');
@@ -442,4 +451,121 @@ test('the 🔥 button texts: a fixed name, a tooltip and a count only while on',
   assert.equal(describeActiveMatchCount(3), '3 active sessions');
   assert.equal(describeActiveMatchCount(2, { loadedOnly: true }), '2 loaded active sessions');
   assert.equal(describeActiveMatchCount(0, { loadedOnly: true }), 'No loaded sessions are active');
+});
+
+// ── The 🔥 window slider ──
+
+const MINUTE = 60 * 1000;
+
+test('the window stops: 1 min to 24 h, the default five minutes among them', () => {
+  assert.deepEqual([...ACTIVE_WINDOW_STOPS_MIN], [1, 2, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440]);
+  assert.equal(Object.isFrozen(ACTIVE_WINDOW_STOPS_MIN), true);
+  assert.equal(ACTIVE_WINDOW_STOPS_MIN[activeWindowStopIndex(ACTIVE_WINDOW_MS)] * MINUTE, ACTIVE_WINDOW_MS);
+  assert.equal(activeWindowStopIndex(ACTIVE_WINDOW_MS), 2);
+  assert.equal(ACTIVE_WINDOW_STORAGE_KEY, 'copilot_conv_active_window');
+});
+
+test('activeWindowStopIndex snaps to the nearest stop, the smaller one on a tie', () => {
+  assert.equal(activeWindowStopIndex(MINUTE), 0);
+  assert.equal(activeWindowStopIndex(24 * HOUR), 11);
+  assert.equal(activeWindowStopIndex(3 * MINUTE), 1, '3 min: 2 is nearer than 5');
+  assert.equal(activeWindowStopIndex(4 * MINUTE), 2, '4 min: 5 is nearer than 2');
+  assert.equal(activeWindowStopIndex(90 * MINUTE), 6, '90 min: halfway between 1 h and 2 h');
+  assert.equal(activeWindowStopIndex(0), 0);
+  assert.equal(activeWindowStopIndex(7 * 24 * HOUR), 11, 'beyond the last stop');
+  assert.equal(activeWindowStopIndex('x'), 2, 'no number: the default');
+  assert.equal(activeWindowStopIndex(undefined), 2);
+});
+
+test('activeWindowMsAtStop maps a slider position to its window, clamped', () => {
+  assert.equal(activeWindowMsAtStop(0), MINUTE);
+  assert.equal(activeWindowMsAtStop('5'), 30 * MINUTE, 'the input hands over a string');
+  assert.equal(activeWindowMsAtStop(11), 24 * HOUR);
+  assert.equal(activeWindowMsAtStop(12), 24 * HOUR);
+  assert.equal(activeWindowMsAtStop(-3), MINUTE);
+  ACTIVE_WINDOW_STOPS_MIN.forEach((minutes, index) => {
+    assert.equal(activeWindowStopIndex(activeWindowMsAtStop(index)), index, `round trip at ${minutes} min`);
+  });
+});
+
+test('parseActiveWindowSetting: a stop as it is, a number snapped, anything else the default', () => {
+  assert.equal(parseActiveWindowSetting('30'), 30);
+  assert.equal(parseActiveWindowSetting(' 1440 '), 1440);
+  assert.equal(parseActiveWindowSetting('7'), 5, 'snapped to the nearest stop');
+  assert.equal(parseActiveWindowSetting('100'), 120);
+  assert.equal(parseActiveWindowSetting('100000'), 1440);
+  assert.equal(parseActiveWindowSetting('0.4'), 1);
+  for (const value of [null, undefined, '', 'abc', '{}', '0', '-10', 'NaN', 'Infinity']) {
+    assert.equal(parseActiveWindowSetting(value), 5, String(value));
+  }
+});
+
+test('the window setting persists in the given storage, in minutes', () => {
+  const map = new Map();
+  const store = { getItem: (key) => (map.has(key) ? map.get(key) : null), setItem: (key, value) => map.set(key, String(value)) };
+  assert.equal(readActiveWindowMs(store), ACTIVE_WINDOW_MS, 'the default until moved');
+  assert.equal(writeActiveWindowMs(30 * MINUTE, store), true);
+  assert.equal(map.get(ACTIVE_WINDOW_STORAGE_KEY), '30');
+  assert.equal(readActiveWindowMs(store), 30 * MINUTE);
+  writeActiveWindowMs(24 * HOUR, store);
+  assert.equal(map.get(ACTIVE_WINDOW_STORAGE_KEY), '1440');
+  // A value between stops is stored as its stop.
+  writeActiveWindowMs(13 * MINUTE, store);
+  assert.equal(map.get(ACTIVE_WINDOW_STORAGE_KEY), '15');
+  map.set(ACTIVE_WINDOW_STORAGE_KEY, '45');
+  assert.equal(readActiveWindowMs(store), 30 * MINUTE, 'a stored value off the stops snaps on read');
+  map.set(ACTIVE_WINDOW_STORAGE_KEY, 'garbage');
+  assert.equal(readActiveWindowMs(store), ACTIVE_WINDOW_MS);
+  const broken = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
+  assert.equal(readActiveWindowMs(broken), ACTIVE_WINDOW_MS);
+  assert.equal(writeActiveWindowMs(MINUTE, broken), false);
+  assert.equal(readActiveWindowMs(null), ACTIVE_WINDOW_MS);
+});
+
+test('describeActiveWindow names the window in minutes, then whole hours', () => {
+  assert.equal(formatActiveWindow(MINUTE), '1 min');
+  assert.equal(formatActiveWindow(30 * MINUTE), '30 min');
+  assert.equal(formatActiveWindow(HOUR), '1 h');
+  assert.equal(formatActiveWindow(24 * HOUR), '24 h');
+  assert.equal(formatActiveWindow(90 * MINUTE), '90 min');
+  assert.equal(formatActiveWindow(), '5 min');
+  assert.equal(describeActiveWindow(30 * MINUTE), 'Active in the last 30 min');
+  assert.equal(describeActiveWindow(MINUTE), 'Active in the last 1 min');
+  assert.equal(describeActiveWindow(12 * HOUR), 'Active in the last 12 h');
+  assert.equal(describeActiveWindow(), 'Active in the last 5 min');
+});
+
+test('the 🔥 tooltip names the chosen window, off and on', () => {
+  assert.equal(describeActiveFilterTitle(false, 0, MINUTE), 'Show active sessions only: working, active in the last 1 min, or waiting for you');
+  assert.equal(describeActiveFilterTitle(false, 0, 24 * HOUR), 'Show active sessions only: working, active in the last 24 h, or waiting for you');
+  assert.equal(describeActiveFilterTitle(true, 2, 2 * HOUR), 'Showing 2 active sessions (last 2 h); click to show all');
+});
+
+test('a 1 min window: a row idle for two minutes is out, one idle for 30 s is in; working and waiting rows stay', () => {
+  const windowMs = MINUTE;
+  const idle = { id: 'idle', updatedAt: iso(2 * MINUTE) };
+  const fresh = { id: 'fresh', updatedAt: iso(30 * 1000) };
+  assert.equal(isConversationActive(idle, { now: NOW, windowMs }), false);
+  assert.equal(isConversationActive(idle, { now: NOW }), true, 'inside the default five minutes');
+  assert.equal(isConversationActive(fresh, { now: NOW, windowMs }), true);
+  assert.equal(isConversationActive({ id: 'w', updatedAt: iso(HOUR) }, { now: NOW, windowMs, working: true }), true);
+  assert.equal(isConversationActive({ id: 'q', updatedAt: iso(HOUR) }, { now: NOW, windowMs, waiting: true }), true);
+  assert.equal(isConversationActive({ id: 'e', updatedAt: iso(MINUTE) }, { now: NOW, windowMs }), false, 'exactly a minute ago has aged out');
+  // The timer aims at the fresh row's edge, 30 s ahead.
+  assert.equal(nextActiveWindowEdgeMs([idle, fresh], { now: NOW, windowMs }), NOW + 30 * 1000);
+  assert.equal(nextActiveWindowEdgeMs([idle], { now: NOW, windowMs }), 0, 'nothing left to age out');
+  // Pages: a cursor two minutes back is past a 1 min window.
+  assert.equal(activeFilterNeedsMorePages({ hasMore: true, cursorTimeMs: NOW - 2 * MINUTE, now: NOW, windowMs }), false);
+});
+
+test('a 24 h window: a row idle for 23 h is in, one idle for 25 h is out; the pages load back a day', () => {
+  const windowMs = 24 * HOUR;
+  const dayOld = { id: 'd', updatedAt: iso(23 * HOUR) };
+  const older = { id: 'o', updatedAt: iso(25 * HOUR) };
+  assert.equal(isConversationActive(dayOld, { now: NOW, windowMs }), true);
+  assert.equal(isConversationActive(dayOld, { now: NOW }), false, 'out under the default');
+  assert.equal(isConversationActive(older, { now: NOW, windowMs }), false);
+  assert.equal(nextActiveWindowEdgeMs([dayOld, older], { now: NOW, windowMs }), NOW + HOUR, 'the 23 h row leaves in an hour');
+  assert.equal(activeFilterNeedsMorePages({ hasMore: true, cursorTimeMs: NOW - 20 * HOUR, now: NOW, windowMs }), true, 'the last loaded row is still inside the day');
+  assert.equal(activeFilterNeedsMorePages({ hasMore: true, cursorTimeMs: NOW - 25 * HOUR, now: NOW, windowMs }), false);
 });

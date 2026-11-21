@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  createPreviewMaxLiveSetting,
   createPreviewRegistry,
   createPreviewToken,
   isLoopbackHost,
   isPreviewToken,
   normalizePreviewsConfig,
+  parsePreviewMaxLiveUpdate,
   parsePreviewPath,
+  previewMaxLiveSliderValue,
+  readPreviewMaxLiveSetting,
   previewBasePath,
   PREVIEW_REDACT_MIN_HEX,
   previewLogId,
@@ -1285,4 +1289,174 @@ test('a late conversation delete also spares a preview whose own insert is still
   store.state.failing = false;
   assert.equal(registry.retryPendingWrites(), 0);
   assert.deepEqual(store.list().map((row) => row.token), [after.token]);
+});
+
+// ─── The live preview limit setting ─────────────────────────────────────────
+
+// A registry whose saved limit is a variable the test changes, as the relay's
+// reads app_settings on every create.
+function limitedRegistry({ configMaxLive, saved = null } = {}) {
+  const state = { saved };
+  const registry = createPreviewRegistry({
+    config: enabledConfig(configMaxLive === undefined ? {} : { maxLive: configMaxLive }),
+    randomBytes: fakeRandomBytes(),
+    maxLiveSetting: { read: () => state.saved, save: () => ({ ok: true }) },
+  });
+  return { registry, state };
+}
+
+test('the limit: creates up to it and refuses the next, naming the limit', () => {
+  const { registry } = limitedRegistry({ saved: 3 });
+  for (const port of [5001, 5002, 5003]) assert.equal(registry.create({ port }).ok, true);
+  const refused = registry.create({ port: 5004 });
+  assert.equal(refused.status, 429);
+  assert.match(refused.error, /^Too many live previews \(max 3, set in Settings → Previews\)/);
+  assert.equal(registry.size, 3);
+});
+
+test('a raised limit applies on the next create without rebuilding the registry', () => {
+  const { registry, state } = limitedRegistry({ saved: 1 });
+  assert.equal(registry.create({ port: 5001 }).ok, true);
+  assert.equal(registry.create({ port: 5002 }).status, 429);
+  state.saved = 2;
+  assert.equal(registry.maxLive, 2);
+  assert.equal(registry.create({ port: 5002 }).ok, true);
+  assert.equal(registry.size, 2);
+});
+
+test('a lowered limit closes nothing and refuses new previews until the count is under it', () => {
+  const { registry, state } = limitedRegistry({ saved: 4 });
+  const live = [5001, 5002, 5003, 5004].map((port) => registry.create({ port }).preview);
+  state.saved = 2;
+  assert.equal(registry.size, 4, 'every live preview stays');
+  assert.ok(live.every((preview) => registry.resolve(preview.token)), 'and keeps resolving');
+  const refused = registry.create({ port: 5005 });
+  assert.equal(refused.status, 429);
+  assert.match(refused.error, /max 2/);
+  assert.match(refused.error, /Close 3 in Settings/);
+  registry.close(live[0].token);
+  registry.close(live[1].token);
+  assert.equal(registry.create({ port: 5005 }).status, 429, 'two live, limit two');
+  registry.close(live[2].token);
+  assert.equal(registry.create({ port: 5005 }).ok, true);
+});
+
+test('a limit of 0 refuses every create with the no-new-previews message', () => {
+  const { registry, state } = limitedRegistry({ saved: 2 });
+  const kept = registry.create({ conversationId: 'conv-1', port: 5001 }).preview;
+  state.saved = 0;
+  for (const refused of [
+    registry.create({ conversationId: 'conv-1', port: 5002 }),
+    registry.createStatic({ conversationId: 'conv-1', rootDir: '/home/dev/site' }),
+  ]) {
+    assert.equal(refused.ok, false);
+    assert.equal(refused.status, 429);
+    assert.match(refused.error, /^No new previews: the maximum number of live previews is set to 0/);
+    assert.match(refused.error, /Settings → Previews/);
+  }
+  assert.ok(registry.resolve(kept.token), 'a published preview stays');
+  assert.equal(registry.size, 1);
+});
+
+test('unsaved, previews.maxLive from config is the limit; a saved value wins over it', () => {
+  const { registry, state } = limitedRegistry({ configMaxLive: 1 });
+  assert.equal(registry.maxLive, 1);
+  assert.equal(registry.create({ port: 5001 }).ok, true);
+  assert.equal(registry.create({ port: 5002 }).status, 429);
+  state.saved = 5;
+  assert.equal(registry.maxLive, 5);
+  assert.equal(registry.create({ port: 5002 }).ok, true);
+  state.saved = 0;
+  assert.equal(registry.maxLive, 0, 'a saved 0 wins too');
+
+  // Without the setting at all (a test registry, an older wiring) the config rules.
+  assert.equal(createPreviewRegistry({ config: enabledConfig({ maxLive: 3 }) }).maxLive, 3);
+  assert.equal(createPreviewRegistry({ config: enabledConfig() }).maxLive, 8);
+});
+
+test('previews.maxLive in config takes 0 and keeps a value above the slider range', () => {
+  assert.equal(enabledConfig({ maxLive: 0 }).maxLive, 0);
+  assert.equal(enabledConfig({ maxLive: 200 }).maxLive, 200);
+  assert.equal(enabledConfig({ maxLive: -1 }).maxLive, 8);
+  assert.equal(enabledConfig({ maxLive: 'many' }).maxLive, 8);
+  assert.equal(previewMaxLiveSliderValue(200), 128, 'the slider shows it clamped');
+});
+
+test('previews.maxLive in config is a non-negative whole number or the default', () => {
+  assert.equal(enabledConfig({ maxLive: '12' }).maxLive, 12, 'a plain number in a string still counts');
+  assert.equal(enabledConfig({ maxLive: 3.5 }).maxLive, 8);
+  for (const value of [[], [7], '0x20', '1e2', true, false, '', '  ', null, NaN, Infinity, {}, '-5', -0.4]) {
+    assert.equal(enabledConfig({ maxLive: value }).maxLive, 8, `config ${JSON.stringify(value)}`);
+  }
+});
+
+test('the slider value is the limit clamped into 0..128, the default for anything but a number', () => {
+  assert.equal(previewMaxLiveSliderValue(5), 5);
+  assert.equal(previewMaxLiveSliderValue(-2), 0);
+  assert.equal(previewMaxLiveSliderValue(null), 8);
+  assert.equal(previewMaxLiveSliderValue([]), 8);
+  assert.equal(previewMaxLiveSliderValue('0x20'), 8);
+});
+
+test('the saved setting: unset is null, a value is a whole number in 0..128', () => {
+  assert.equal(readPreviewMaxLiveSetting(''), null);
+  assert.equal(readPreviewMaxLiveSetting(undefined), null);
+  assert.equal(readPreviewMaxLiveSetting('junk'), null);
+  assert.equal(readPreviewMaxLiveSetting('0'), 0);
+  assert.equal(readPreviewMaxLiveSetting('12'), 12);
+  assert.equal(readPreviewMaxLiveSetting('12.6'), 13);
+  assert.equal(readPreviewMaxLiveSetting('300'), 128);
+});
+
+test('a stored value that is not a plain non-negative number reads as never saved, never as 0', () => {
+  for (const stored of ['-5', '-0', '0x20', '1e2', '+3', '1_000', '12abc', 'Infinity', 'NaN', '  ', null, '[]']) {
+    assert.equal(readPreviewMaxLiveSetting(stored), null, `stored ${JSON.stringify(stored)}`);
+  }
+});
+
+test('an update takes a number of 0 or more, rounded, and above 128 clamped to 128', () => {
+  const accepted = [
+    [0, 0], ['0', 0], [8, 8], ['12', 12], [' 12 ', 12], [12.4, 12], ['12.6', 13], ['7.6', 8],
+    [128, 128], [129, 128], [500, 128], [1000, 128],
+  ];
+  for (const [value, maxLive] of accepted) {
+    assert.deepEqual(parsePreviewMaxLiveUpdate(value), { ok: true, maxLive }, JSON.stringify(value));
+  }
+});
+
+test('an update refuses anything but a number', () => {
+  const refused = [
+    [], [7], '0x20', '1e2', '+5', '1_000', '12abc', 'Infinity', '', '  ', 'lots',
+    null, undefined, true, false, NaN, Infinity, -Infinity, {},
+  ];
+  for (const value of refused) {
+    assert.deepEqual(parsePreviewMaxLiveUpdate(value), { ok: false, error: 'maxLive must be a number' }, String(value));
+  }
+});
+
+test('an update refuses a negative instead of turning it into 0, which would switch previews off', () => {
+  for (const value of [-5, '-5', -0.4, ' -3 ', '-0.4']) {
+    assert.deepEqual(parsePreviewMaxLiveUpdate(value), { ok: false, error: 'maxLive must be 0 or more' }, String(value));
+  }
+});
+
+test('the setting reads and writes app_settings preview_max_live, and the registry takes it at once', () => {
+  const rows = new Map();
+  const stmts = {
+    getAppSetting: { get: (key) => (rows.has(key) ? { key, value: rows.get(key) } : undefined) },
+    upsertAppSetting: { run: (key, value) => { rows.set(key, value); } },
+  };
+  const registry = createPreviewRegistry({
+    config: enabledConfig({ maxLive: 1 }),
+    randomBytes: fakeRandomBytes(),
+    maxLiveSetting: createPreviewMaxLiveSetting(stmts),
+  });
+  assert.equal(registry.maxLive, 1, 'unsaved: the config value');
+  assert.deepEqual(registry.saveMaxLive(0), { ok: true, maxLive: 0 });
+  assert.equal(rows.get('preview_max_live'), '0');
+  assert.equal(registry.create({ port: 5001 }).status, 429);
+  registry.saveMaxLive(3);
+  assert.equal(registry.create({ port: 5001 }).ok, true);
+  assert.equal(createPreviewMaxLiveSetting({}).save(3).ok, false, 'no statements, nothing stored');
+  assert.equal(createPreviewRegistry({ config: enabledConfig() }).saveMaxLive(3).ok, false);
 });

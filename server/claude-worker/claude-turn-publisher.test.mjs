@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { createClaudeTurnPublisher } from './claude-turn-publisher.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
+import { createTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 
 const message = { id: 'q-1', conversationId: 'conv-1', relayMode: 'agent', attemptId: 'a-1' };
 
@@ -738,4 +739,46 @@ test('a hand-over outside plan mode gets no stand-in card from the reply', async
     message, state: replyState(bulletReply), responseModel: 'claude-sonnet-5', planBoardPosted: false, planBoardRequested: true,
   });
   assert.deepEqual(boards, []);
+});
+
+test('a turn the quiet-turn watchdog ended fails as stalled, with what was seen and what was done', async () => {
+  const bodies = [];
+  const api = async (method, routePath, body) => {
+    if (routePath === '/api/response') bodies.push(body);
+    return { ok: true };
+  };
+  const error = createTurnStalledError({ agentLabel: 'Claude', quietMs: 604_000, phase: 'tool', tools: ['Bash'] });
+
+  const publisher = createClaudeTurnPublisher({ api });
+  await publisher.publishTurnStalled({ message, error, partialText: 'Half an answer.', model: 'claude-sonnet-5' });
+  await publisher.publishTurnStalled({ message, error, cliStopped: true });
+  await publisher.publishTurnStalled({ message, error, cliStopped: true, lostTasks: 1 });
+  await publisher.publishTurnStalled({ message, error, cliStopped: true, lostTasks: 2 });
+  // A backend's turn is named after the backend, under its own code.
+  const deepseek = createClaudeTurnPublisher({ api, runtimeLabel: 'DeepSeek', failureCodePrefix: 'deepseek' });
+  await deepseek.publishTurnStalled({ message, error: createTurnStalledError({ quietMs: 600_000, phase: 'idle' }) });
+
+  const [asked, stopped, oneTask, twoTasks, backend] = bodies;
+  assert.equal(
+    asked.text,
+    'System note: the Claude runtime sent nothing for 604s while a tool was running (Bash), so the relay ended the turn. Send the message again to retry.',
+  );
+  assert.equal(asked.partialText, 'Half an answer.');
+  assert.equal(asked.model, 'claude-sonnet-5');
+  assert.equal(asked.attemptId, 'a-1');
+  assert.equal(asked.terminalError.kind, 'claude-turn-failed');
+  assert.equal(asked.terminalError.code, 'turn-stalled');
+  assert.equal(asked.terminalError.stableCode, 'claude.turn-stalled');
+  assert.equal(asked.terminalError.guidance, 'Send the message again to retry.');
+  assert.equal(asked.terminalError.queueMessageId, 'q-1');
+  assert.doesNotMatch(asked.terminalError.message, /Send the message again/, 'the guidance is not repeated in the message');
+
+  assert.match(stopped.text, /Claude Code did not end the turn when asked, so the relay stopped it; the next message starts it again on the same session\. Send the message again to retry\.$/);
+  assert.doesNotMatch(stopped.text, /background task/);
+  assert.ok(!('partialText' in stopped), 'nothing written, nothing kept');
+  assert.match(oneTask.text, /same session\. 1 background task of this session ended with it\. Send/);
+  assert.match(twoTasks.text, /2 background tasks of this session ended with it\./);
+
+  assert.match(backend.text, /^System note: the DeepSeek runtime sent nothing for 600s, so the relay ended the turn\./);
+  assert.match(backend.terminalError.code, /^deepseek-turn-stalled$/);
 });

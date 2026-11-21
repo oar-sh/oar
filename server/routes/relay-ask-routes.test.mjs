@@ -4,6 +4,7 @@ import Database from 'better-sqlite3';
 
 import { applySchema } from '../db-schema.mjs';
 import { createQuestionRepository } from '../repositories/question-repository.mjs';
+import { createConversationGroupRepository } from '../repositories/conversation-group-repository.mjs';
 import { createRelayAskService } from '../services/relay-ask-service.mjs';
 import { markRemoteRelayLoopbackRequest } from '../services/remote-relay-inbound.mjs';
 import { asAgent, asOwner, asPeer } from '../services/relay-principal-test-harness.mjs';
@@ -70,6 +71,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
   applySchema(db);
   seed(db);
   const stmts = createQuestionRepository(db);
+  const groups = createConversationGroupRepository(db);
   const told = [];
   const asks = createRelayAskService({
     db,
@@ -103,6 +105,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
     parseQuestionRequest: (value) => { try { return JSON.parse(value); } catch { return null; } },
     normalizeQuestionChoices: (choices) => (Array.isArray(choices) ? choices.map(String) : []),
     formatQuestionRow,
+    conversationGroups: groups,
     ...(boards ? { formatRelayBoardRow: (row) => formatBoardRow(db, row) } : {}),
     ...(questionNotice ? { questionNotice } : {}),
     normalizeRelayMode: (mode) => String(mode || '').trim() || null,
@@ -148,7 +151,7 @@ function boot({ inboundEnabled = true, client = null, boards = false, questionNo
     return captured;
   }
   const card = (id) => db.prepare(`SELECT status, answer FROM relay_questions WHERE id = ?`).get(id);
-  return { db, stmts, asks, told, calls, call, card };
+  return { db, stmts, groups, asks, told, calls, call, card };
 }
 
 // As server-runtime.mjs formats a board row, reduced to what the Inbox reads.
@@ -363,7 +366,7 @@ test('what a paired relay\'s Inbox gets of this relay: asks, cards to open here,
   assert.equal(byId.get('card-ask-user').question, 'Which theme?');
   assert.equal('sdkSessionId' in byId.get('card-ask-user'), false, 'nothing that routes an answer');
   assert.deepEqual(byId.get('card-approval'), {
-    id: 'card-approval', kind: 'approval', session: { id: SESSION, title: 'Cache layer', startedBy: 'owner' }, header: 'Remote relay', status: 'pending', createdAt: NOW, question: '',
+    id: 'card-approval', kind: 'approval', session: { id: SESSION, title: 'Cache layer', startedBy: 'owner', group: null }, header: 'Remote relay', status: 'pending', createdAt: NOW, question: '',
   });
 });
 
@@ -409,6 +412,92 @@ test('the Inbox lists this relay and every paired relay that answers; an ask the
   assert.equal(fx.calls.length, callsBefore, 'nothing is sent to that relay');
   assert.equal((await fx.call('POST', '/api/inbox/relays/:relayId/asks/:id/answer', { params: { relayId: 'r-nope', id: 'x' } })).status, 404);
   assert.equal((await fx.call('GET', '/api/inbox', { headers: FROM_PAIRED })).status, 403, 'another relay\'s agent reads no Inbox');
+});
+
+// ─── Groups ─────────────────────────────────────────────────────────
+
+test('each Inbox item names the group its session sits in, by the name the sidebar shows; a session in none says null', async () => {
+  const fx = boot({ boards: true });
+  const named = fx.groups.createGroup({ name: 'Storage work', conversationIds: [SESSION] });
+  const ask = fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
+  const leadAsk = fx.asks.create({ conversationId: LEAD, createdBy: LEAD, question: 'Split the module?' });
+  const board = seedBoard(fx.db, { createdAt: '2026-03-02T09:00:00.000Z' });
+  const own = await fx.call('GET', '/api/inbox');
+  const byId = new Map(own.body.relays[0].items.map((item) => [item.id, item]));
+  for (const id of [ask.id, 'card-ask-user', 'card-approval', board]) {
+    assert.deepEqual(byId.get(id).session.group, { id: named.id, name: 'Storage work' }, id);
+  }
+  assert.equal(byId.get(leadAsk.id).session.group, null);
+  // Unnamed, a group shows its head's title; renamed, the next read has it.
+  const headed = fx.groups.createGroup({ parentConversationId: LEAD, conversationIds: [LEAD] });
+  fx.groups.renameGroup(named.id, 'Cache rollout');
+  const again = new Map((await fx.call('GET', '/api/inbox')).body.relays[0].items.map((item) => [item.id, item]));
+  assert.deepEqual(again.get(leadAsk.id).session.group, { id: headed.id, name: 'Lead' });
+  assert.deepEqual(again.get(ask.id).session.group, { id: named.id, name: 'Cache rollout' });
+});
+
+test('one Inbox read looks up each session\'s group once and each group once, however many items share them', async () => {
+  const fx = boot({ boards: true });
+  const shared = fx.groups.createGroup({ name: 'Storage work', conversationIds: [SESSION, LEAD] });
+  fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
+  fx.asks.create({ conversationId: SESSION, createdBy: LEAD, question: 'Keep the old index?' });
+  fx.asks.create({ conversationId: LEAD, createdBy: LEAD, question: 'Split the module?' });
+  seedBoard(fx.db, { createdAt: '2026-03-02T09:00:00.000Z' });
+  const counted = { groupOfConversation: [], describeGroup: [] };
+  for (const name of Object.keys(counted)) {
+    const real = fx.groups[name].bind(fx.groups);
+    fx.groups[name] = (id) => {
+      counted[name].push(id);
+      return real(id);
+    };
+  }
+  const own = await fx.call('GET', '/api/inbox');
+  // Two asks, both cards and the plan card share SESSION; one ask is in LEAD.
+  assert.ok(own.body.relays[0].items.filter((item) => item.session.id === SESSION).length >= 4);
+  assert.deepEqual([...counted.groupOfConversation].sort(), [LEAD, SESSION].sort());
+  assert.deepEqual(counted.describeGroup, [shared.id]);
+  // The next read looks them up again: nothing is kept between requests.
+  await fx.call('GET', '/api/inbox');
+  assert.equal(counted.groupOfConversation.length, 4);
+  assert.equal(counted.describeGroup.length, 2);
+});
+
+test('a paired relay\'s Inbox read carries the groups; this relay\'s Inbox passes a paired relay\'s through as they came', async () => {
+  const fx = boot({
+    client: (_relay, method, path) => {
+      if (method === 'GET' && path === RELAY_ASK_REMOTE_PATHS.inbox) {
+        return { items: [
+          { id: 'ask_there01', kind: 'ask', session: { id: 'conv-there', title: 'Far worker', group: { id: 'grp-far', name: 'Night jobs' } }, question: 'Deploy?', status: 'pending', createdAt: NOW },
+          // A relay before 0.9.32 sends no group.
+          { id: 'ask_there02', kind: 'ask', session: { id: 'conv-old', title: 'Old relay' }, question: 'Rename?', status: 'pending', createdAt: NOW },
+        ] };
+      }
+      throw new Error('unexpected');
+    },
+  });
+  const group = fx.groups.createGroup({ name: 'Storage work', conversationIds: [SESSION] });
+  const ask = fx.asks.create({ conversationId: SESSION, createdBy: LEAD, ...QUESTION });
+  const read = await fx.call('GET', RELAY_ASK_REMOTE_PATHS.inbox, { headers: FROM_PAIRED });
+  assert.equal(read.status, 200);
+  for (const item of read.body.items) assert.deepEqual(item.session.group, { id: group.id, name: 'Storage work' }, item.id);
+  assert.ok(read.body.items.some((item) => item.id === ask.id));
+  const inbox = await fx.call('GET', '/api/inbox');
+  const lab = inbox.body.relays.find((relay) => relay.id === PAIRED.id);
+  assert.deepEqual(lab.items.map((item) => item.session.group ?? null), [{ id: 'grp-far', name: 'Night jobs' }, null]);
+});
+
+test('without the group repository (an older wiring) every item says null', async () => {
+  const db = new Database(':memory:');
+  applySchema(db);
+  seed(db);
+  const routes = new Map();
+  const app = { get: (path, ...handlers) => routes.set(path, handlers.at(-1)), post() {}, delete() {} };
+  registerRelayAskRoutes(app, { auth: (_req, _res, next) => next(), db, stmts: createQuestionRepository(db), formatQuestionRow, remoteRelayInbound: { listRelays: () => [], selfNames: () => [], inboundEnabled: () => true } });
+  const captured = {};
+  const req = asOwner({ headers: {}, query: {}, params: {}, body: {} });
+  await routes.get('/api/inbox')(req, { status() { return this; }, json(payload) { captured.body = payload; return this; } });
+  assert.ok(captured.body.relays[0].items.length >= 2);
+  for (const item of captured.body.relays[0].items) assert.equal(item.session.group, null, item.id);
 });
 
 // ─── Plan cards ─────────────────────────────────────────────────────

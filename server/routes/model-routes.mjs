@@ -417,6 +417,9 @@ export function registerModelRoutes(app, deps, shared) {
     copilot: null, // { summary, error, at }
     copilotBilling: null, // { value, at }
     grokBilling: null,
+    // Why the last Grok quota read had no figure, and when it ran: kept apart
+    // from `grokBilling` so a failed read never replaces a good answer there.
+    grokBillingLastTry: null, // { reason, httpStatus, keys, checkedAt }
     cursorBilling: null,
     deepseekBalance: null,
   };
@@ -520,7 +523,20 @@ export function registerModelRoutes(app, deps, shared) {
           : null
       )),
       cachedOrLive('grokBilling', live('grok'), () => (
-        grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function' ? fetchGrokBillingUsage() : null
+        grokSettings?.enabled === true && typeof fetchGrokBillingUsage === 'function'
+          ? fetchGrokBillingUsage({
+            onResult: (result) => {
+              usageLiveCache.grokBillingLastTry = result?.reason
+                ? {
+                  reason: result.reason,
+                  httpStatus: result.httpStatus ?? null,
+                  keys: Array.isArray(result.keys) ? result.keys : null,
+                  checkedAt: result.checkedAt || nowIso(),
+                }
+                : null;
+            },
+          })
+          : null
       )),
       cachedOrLive('cursorBilling', live('cursor'), () => (
         cursorSettings?.enabled === true && typeof fetchCursorDashboardUsage === 'function' ? fetchCursorDashboardUsage() : null
@@ -572,6 +588,8 @@ export function registerModelRoutes(app, deps, shared) {
       grokConfigured: grokSettings?.enabled === true,
       grokAllowances: getGrokPlanAllowanceSettings(),
       grokBilling: grokEntry.value,
+      // Only explains a card without a live figure.
+      grokBillingFailure: grokEntry.value ? null : usageLiveCache.grokBillingLastTry,
       deepseekConfigured: deepseekEnabled,
       deepseekBalance: deepseekEnabled ? deepseekEntry.value : null,
       deepseekMonthlyBudget: deepseekEnabled ? (deepseekSettings?.monthlyBudget ?? null) : null,

@@ -2,6 +2,20 @@
 
 import { originWeightedFor } from './remote-relay-inbound.mjs';
 import { createReadWorkerLog, plainTail, refuseWorkerLogElsewhere } from './remote-relay-worker-log.mjs';
+import {
+  buildProviders,
+  catalogEffortsFor,
+  clipLine,
+  createRemoteRelayInfo,
+  effortLevels,
+  isPlainObject,
+  listProviders,
+  matchOfferedModel,
+  nonNegativeInt,
+  normalizeEffort,
+  offeredModelList,
+  toText,
+} from './remote-relay-info.mjs';
 import { randomUUID as nodeRandomUUID } from 'crypto';
 
 import { isFailureNoteText } from '../../shared/failure-note-text.mjs';
@@ -9,7 +23,6 @@ import {
   REMOTE_RELAY_APPROVAL_MODES,
   REMOTE_RELAY_ASK_ACTIONS,
   REMOTE_RELAY_CLOUD_PROVIDER,
-  REMOTE_RELAY_EFFORT_PATTERN,
   REMOTE_RELAY_ERROR_CODES,
   REMOTE_RELAY_GROUP_LIMITS,
   REMOTE_RELAY_LIMITS,
@@ -47,7 +60,6 @@ import {
 } from '../../shared/openai-image-options.mjs';
 import {
   OPENAI_IMAGE_DAILY_CAP_REACHED_CODE,
-  OPENAI_IMAGE_PRESETS_PATH,
   OPENAI_IMAGE_USAGE_PATH,
   formatOpenAIImageUsd,
 } from '../../shared/openai-image-spend.mjs';
@@ -143,13 +155,9 @@ const REPLY_IMAGES_MAX = 8;
 const MIN_TRIMMED_MESSAGE_CHARS = 200;
 const TITLE_MAX = 80;
 
-// The provider settings routes a relay serves; github (Copilot) has none with
-// models — its catalogue is /api/models plus /api/status defaultModel.
-const SETTINGS_PROVIDERS = Object.freeze(['claude', 'cursor', 'grok', 'openai', 'claude-cloud', 'deepseek', 'claude-api']);
 // A Claude Cloud session clones a GitHub repository instead of opening a
 // folder: create_session takes `repo` and `branch` for it.
 const CLOUD_PROVIDER = REMOTE_RELAY_CLOUD_PROVIDER;
-const CLOUD_CREATE_NOTE = 'create_session needs repo (https://github.com/owner/repo or owner/repo) and takes branch instead of cwd. The session works on a fresh clone in a sandbox at Anthropic: write a self-contained prompt and name the branch to work on and to push.';
 // POST /api/conversation/bootstrap refuses a cloud session with this code
 // while the provider is switched off.
 const CLOUD_DISABLED_CODE = 'claude_cloud_disabled';
@@ -162,17 +170,6 @@ const SESSION_SETTINGS_CODES = Object.freeze({
   busy: 'SESSION_BUSY',
   groupNotFound: 'SESSION_GROUP_NOT_FOUND',
   groupAmbiguous: 'SESSION_GROUP_AMBIGUOUS',
-});
-// How /api/models `providersByModel` names each provider.
-const CATALOG_PROVIDER_LABELS = Object.freeze({
-  github: 'github-copilot',
-  openai: 'openai-byok',
-  claude: 'claude',
-  cursor: 'cursor',
-  grok: 'grok',
-  'claude-cloud': 'claude-cloud',
-  deepseek: 'deepseek',
-  'claude-api': 'claude-api',
 });
 // Worker statuses that mean "working on something right now" (scope active).
 const WORKING_WORKER_STATUSES = new Set(['starting', 'processing']);
@@ -190,7 +187,6 @@ const FAILURE_TEXT_PATTERNS = Object.freeze([
   /^relay recovery limit reached after \d+ attempts/i,
   /^relay timeout after \d+ attempts/i,
 ]);
-const CLAUDE_LONG_CONTEXT_SUFFIX = /\[1m\]$/i;
 // How many of a provider's model ids an unknown-model refusal carries.
 const UNKNOWN_MODEL_LIST_MAX = 50;
 // POST /api/conversation/bootstrap refuses an effort its model does not take
@@ -203,18 +199,6 @@ const EFFORT_SOURCES = Object.freeze({
   caller: 'same as this session',
   remote: 'remote default',
 });
-// relay_info: efforts per provider, as groups of models that take the same ones.
-const EFFORT_LEVELS_MAX = 12;
-const EFFORT_GROUPS_MAX = 8;
-const EFFORT_GROUP_MODELS_MAX = 40;
-
-function toText(value) {
-  return String(value ?? '').trim();
-}
-
-function isPlainObject(value) {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
 
 const SESSION_STATES = new Set(['running_turn', 'background_only', 'idle']);
 
@@ -231,11 +215,6 @@ function workerField(worker) {
   return worker ? { worker: { ...worker } } : {};
 }
 
-function nonNegativeInt(value) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 0 ? number : 0;
-}
-
 /** Keeps the head and the tail of a long text: the context and the conclusion. */
 function clipMiddle(value, max) {
   const text = String(value ?? '');
@@ -250,11 +229,6 @@ function clipMiddle(value, max) {
 function clipTail(value, max) {
   const text = String(value ?? '');
   return text.length <= max ? text : `…${text.slice(text.length - (max - 1))}`;
-}
-
-function clipLine(value, max) {
-  const text = toText(value).replace(/\s+/g, ' ');
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 function firstLine(value, max) {
@@ -299,138 +273,6 @@ function looksLikeFailureText(text) {
 function normalizeProvider(value) {
   const provider = toText(value).toLowerCase();
   return REMOTE_RELAY_PROVIDERS.includes(provider) ? provider : '';
-}
-
-function uniqueTexts(values) {
-  const seen = new Set();
-  const out = [];
-  for (const value of values) {
-    const text = toText(value);
-    if (!text || seen.has(text.toLowerCase())) continue;
-    seen.add(text.toLowerCase());
-    out.push(text);
-  }
-  return out;
-}
-
-/** The providers /api/models lists for a model id (keys may keep their casing). */
-function catalogProvidersFor(providersByModel, model) {
-  if (!isPlainObject(providersByModel)) return [];
-  const direct = providersByModel[model] || providersByModel[String(model).toLowerCase()];
-  const list = Array.isArray(direct)
-    ? direct
-    : (Object.entries(providersByModel).find(([key]) => key.toLowerCase() === String(model).toLowerCase())?.[1] || []);
-  return Array.isArray(list) ? list.map((entry) => toText(entry).toLowerCase()).filter(Boolean) : [];
-}
-
-/**
- * The remote's own id for `candidate` among `offered`: a case-insensitive
- * match, or the same Claude model without / with its "[1m]" long-context
- * suffix. '' when the remote does not offer it.
- */
-function matchOfferedModel(candidate, offered = []) {
-  const wanted = toText(candidate).toLowerCase();
-  if (!wanted) return '';
-  const exact = offered.find((model) => model.toLowerCase() === wanted);
-  if (exact) return exact;
-  const wantedBase = wanted.replace(CLAUDE_LONG_CONTEXT_SUFFIX, '');
-  return offered.find((model) => model.toLowerCase().replace(CLAUDE_LONG_CONTEXT_SUFFIX, '') === wantedBase) || '';
-}
-
-/** The models /api/models lists for a provider label ("openai-byok"). */
-function catalogModelsLabelled(catalog, label) {
-  const providersByModel = isPlainObject(catalog?.models?.providersByModel) ? catalog.models.providersByModel : {};
-  return Object.entries(providersByModel)
-    .filter(([, providers]) => Array.isArray(providers) && providers.some((entry) => toText(entry).toLowerCase() === label))
-    .map(([model]) => model);
-}
-
-/**
- * Copilot's catalogue: every model of /api/models no other provider claims
- * alone, without image ids (a relay that predates their filter lists them;
- * the Copilot runtime cannot serve them).
- */
-function catalogGithubModels(catalog) {
-  const models = catalog?.models || {};
-  const providersByModel = isPlainObject(models.providersByModel) ? models.providersByModel : {};
-  const catalogModels = Array.isArray(models.models) ? models.models.map(toText).filter(Boolean) : [];
-  return catalogModels.filter((model) => {
-    if (isOpenAIImageModelId(model)) return false;
-    const providers = catalogProvidersFor(providersByModel, model);
-    return providers.length === 0 || providers.includes(CATALOG_PROVIDER_LABELS.github);
-  });
-}
-
-/**
- * The models a provider's New Chat list offers on the target, which its
- * bootstrap and message routes accept, or null when the target has no list
- * for it yet (discovery has not run or failed, the route did not answer):
- * then a requested model cannot be checked here.
- */
-function offeredModelList(catalog, provider) {
-  if (provider === 'github') {
-    const listed = catalogGithubModels(catalog);
-    return listed.length ? listed : null;
-  }
-  if (provider === 'openai') {
-    const listed = catalogModelsLabelled(catalog, CATALOG_PROVIDER_LABELS.openai);
-    return listed.length ? listed : null;
-  }
-  const settings = catalog?.settings?.[provider];
-  const listed = Array.isArray(settings?.models) ? settings.models.map(toText).filter(Boolean) : [];
-  return listed.length ? listed : null;
-}
-
-/** A reasoning effort as the relays write it, or '' when the value is not one. */
-function normalizeEffort(value) {
-  const effort = toText(value).toLowerCase();
-  return REMOTE_RELAY_EFFORT_PATTERN.test(effort) ? effort : '';
-}
-
-function effortLevels(values) {
-  return uniqueTexts((Array.isArray(values) ? values : []).map(normalizeEffort)).slice(0, EFFORT_LEVELS_MAX);
-}
-
-/**
- * The efforts /api/models lists for a provider's model, or null when the
- * remote does not say. `reasoningByProvider` is the provider's own view;
- * `reasoningByModel` is keyed by model id alone, which providers share, so it
- * only decides where the provider has no entry of its own.
- */
-function catalogEffortsFor(models, provider, model) {
-  const key = toText(model).toLowerCase();
-  if (!key || !isPlainObject(models)) return null;
-  const keys = uniqueTexts([key, key.replace(CLAUDE_LONG_CONTEXT_SUFFIX, '')]);
-  const maps = [
-    isPlainObject(models.reasoningByProvider) ? models.reasoningByProvider[provider] : null,
-    models.reasoningByModel,
-  ];
-  for (const map of maps) {
-    if (!isPlainObject(map)) continue;
-    for (const candidate of keys) {
-      const levels = effortLevels(map[candidate]);
-      if (levels.length) return levels;
-    }
-  }
-  return null;
-}
-
-/** `[{ efforts, models }]`: the models of a provider grouped by the efforts they take. */
-function groupEffortsByModel(models, provider, offered = []) {
-  const groups = new Map();
-  for (const model of offered) {
-    const levels = catalogEffortsFor(models, provider, model);
-    if (!levels) continue;
-    const id = levels.join(' ');
-    if (!groups.has(id)) groups.set(id, { efforts: levels, models: [] });
-    groups.get(id).models.push(model);
-  }
-  return [...groups.values()]
-    .sort((a, b) => b.models.length - a.models.length)
-    .slice(0, EFFORT_GROUPS_MAX)
-    .map((group) => (group.models.length > EFFORT_GROUP_MODELS_MAX
-      ? { efforts: group.efforts, models: group.models.slice(0, EFFORT_GROUP_MODELS_MAX), more: group.models.length - EFFORT_GROUP_MODELS_MAX }
-      : group));
 }
 
 /** True when the remote answered 400 because its model does not take the effort we sent. */
@@ -1363,83 +1205,11 @@ export function createRemoteRelayDispatcher({
 
   // ─── Remote catalogue (relay_info, create_session) ─────────────────────────
 
-  async function loadCatalog(ctx) {
-    const [status, models, copilot, ...settings] = await Promise.allSettled([
-      call(ctx, 'GET', '/api/status'),
-      call(ctx, 'GET', '/api/models'),
-      call(ctx, 'GET', '/api/settings/copilot'),
-      ...SETTINGS_PROVIDERS.map((provider) => call(ctx, 'GET', `/api/settings/${provider}`)),
-    ]);
-    if (status.status === 'rejected') throw status.reason;
-    const value = (result) => (result.status === 'fulfilled' && isPlainObject(result.value) ? result.value : null);
-    return {
-      status: value(status) || {},
-      models: value(models),
-      copilot: value(copilot),
-      settings: Object.fromEntries(SETTINGS_PROVIDERS.map((provider, index) => [provider, value(settings[index])])),
-    };
-  }
-
-  /**
-   * `[{ provider, configured, defaultModel, models }]` in contract order, with
-   * `efforts` where the remote lists the reasoning efforts of those models.
-   */
-  function buildProviders(catalog) {
-    return listProviders(catalog).map((entry) => {
-      // A cloud session takes no effort; without this its models would be
-      // listed with the Claude provider's efforts (the ids are the same).
-      if (entry.provider === CLOUD_PROVIDER) return entry;
-      const efforts = groupEffortsByModel(catalog.models, entry.provider, entry.models);
-      return efforts.length ? { ...entry, efforts } : entry;
-    });
-  }
-
-  function listProviders(catalog) {
-    const models = catalog.models || {};
-    return REMOTE_RELAY_PROVIDERS.map((provider) => {
-      if (provider === 'github') {
-        const configured = catalog.copilot?.enabled !== false; // Copilot's switch; an older relay sends none: on
-        const defaultModel = (configured && (toText(catalog.status.defaultModel) || toText(models.defaultModel) || toText(models.currentModel))) || null;
-        return {
-          provider,
-          configured,
-          defaultModel,
-          models: configured ? uniqueTexts([...(defaultModel ? [defaultModel] : []), ...catalogGithubModels(catalog)]) : [],
-          ...(toText(catalog.copilot?.engine) ? { engine: toText(catalog.copilot.engine) } : {}),
-        };
-      }
-      const settings = catalog.settings[provider];
-      if (!settings) return { provider, configured: false, defaultModel: null, models: [] };
-      if (provider === CLOUD_PROVIDER) {
-        // Its settings route has its own shape: a switch and a default model.
-        // A relay that predates the provider answers 404 and lands above.
-        const enabled = settings.enabled === true;
-        const cloudDefault = toText(settings.defaultModel) || null;
-        return {
-          provider,
-          configured: enabled,
-          defaultModel: cloudDefault,
-          models: enabled
-            ? uniqueTexts([...(cloudDefault ? [cloudDefault] : []), ...(Array.isArray(settings.models) ? settings.models : [])])
-            : [],
-          ...(enabled ? { note: CLOUD_CREATE_NOTE } : {}),
-        };
-      }
-      // What POST /api/conversation/bootstrap requires, plus "not switched off".
-      const configured = settings.enabled === true
-        && (provider === 'claude' || provider === 'grok' || settings.configured === true);
-      const defaultModel = toText(settings.model) || null;
-      const listed = provider === 'openai'
-        ? catalogModelsLabelled(catalog, CATALOG_PROVIDER_LABELS.openai)
-        : (Array.isArray(settings.models) ? settings.models : []);
-      return {
-        provider,
-        configured,
-        defaultModel,
-        models: configured ? uniqueTexts([...(defaultModel ? [defaultModel] : []), ...listed]) : [],
-      };
-    });
-  }
+  const { loadCatalog, relayInfo } = createRemoteRelayInfo({
+    call,
+    relayGroups,
+    refuse: (status, code, message, extra) => new DispatchFailure(status, code, message, extra),
+  });
 
   // ─── Session groups (relay_info, create_session `group`) ───────────────────
 
@@ -1522,7 +1292,7 @@ export function createRemoteRelayDispatcher({
       groups: listed.slice(0, max).map((group) => ({ id: group.id, name: group.name })),
       ...(count > max ? { groupsTotal: count } : {}),
       note: groups.length
-        ? 'Pass one of these ids or names (relay_info lists them), or leave group out. Agents name existing groups only; making, renaming and dissolving groups is the owner\'s.'
+        ? 'Pass one of these ids or names (relay_info with verbose true lists them all), or leave group out. Agents name existing groups only; making, renaming and dissolving groups is the owner\'s.'
         : 'Leave group out; only the owner makes session groups.',
     });
   }
@@ -1727,66 +1497,6 @@ export function createRemoteRelayDispatcher({
       usageLimit,
       ...(notes.length ? { note: notes.join(' ') } : {}),
     };
-  }
-
-  async function relayInfo(ctx) {
-    const [identity, catalog, groups, presets] = await Promise.all([
-      call(ctx, 'GET', '/api/relay/identity').catch(() => null),
-      loadCatalog(ctx),
-      relayGroups(ctx),
-      // The image presets a send or create_session may name; an OAR from
-      // before them has no route, and then no list.
-      call(ctx, 'GET', OPENAI_IMAGE_PRESETS_PATH).catch(() => null),
-    ]);
-    const imagePresets = Array.isArray(presets?.presets) ? relayImagePresets(presets.presets) : null;
-    const status = catalog.status;
-    const providers = buildProviders(catalog);
-    const remoteRelays = isPlainObject(identity?.remoteRelays) ? identity.remoteRelays : null;
-    const configured = providers.filter((entry) => entry.configured).map((entry) => entry.provider);
-    const version = toText(status.version) || toText(identity?.version) || null;
-    return {
-      summary: `relay_info → ${ctx.relay.name}: OAR ${version || '?'}, providers ${configured.join(', ') || 'none'}`,
-      name: toText(identity?.name) || ctx.relay.name,
-      ...(ctx.relay.local ? { self: true } : {}),
-      url: ctx.relay.url,
-      openUrl: remoteConversationUrl(ctx.relay.url, '') || null,
-      version,
-      platform: toText(status.platform) || toText(identity?.platform) || null,
-      protocol: remoteRelays ? nonNegativeInt(remoteRelays.protocol) : 0,
-      // The inbound switch is about other relays' agents; this relay's own are
-      // let in by the agent-sessions setting, which is on or this would not run.
-      acceptsAgentPrompts: ctx.relay.local ? true : (remoteRelays ? remoteRelays.inbound !== false : null),
-      // Whether send and create_session may carry images and image there.
-      imageInputs: ctx.relay.local ? true : remoteRelays?.imageInputs === true,
-      ...(ctx.relay.local ? {
-        sessionRules: `create_session: at most ${REMOTE_RELAY_LIMITS.localActiveSessions} sessions you started may work at the same time; a session an agent created cannot create sessions unless the owner allowed it for that session (mayCreateSessions); sessions run on this relay's accounts. update_session: sessions you started freely, any other (the owner's, another agent's, your creator's) after the owner's Allow (once per conversation).`,
-      } : {}),
-      providers,
-      workspaces: {
-        default: toText(status.defaultSessionWorkspaceRootPath) || toText(status.workspaceRootPath) || null,
-        current: toText(status.workspaceRootPath) || null,
-        recent: Array.isArray(status.recentWorkspaceRoots) ? status.recentWorkspaceRoots.map(toText).filter(Boolean) : [],
-      },
-      relayModes: Array.isArray(status.supportedRelayModes) ? status.supportedRelayModes : [],
-      defaultRelayMode: toText(status.defaultRelayMode) || null,
-      // The session groups a create_session there may name (`group`).
-      ...groups,
-      ...(imagePresets ? { imagePresets } : {}),
-    };
-  }
-
-  /** A target's image presets as relay_info lists them: name, the values, builtIn. */
-  function relayImagePresets(list) {
-    return list.slice(0, 40).filter(isPlainObject).map((preset) => {
-      const name = toText(preset.name).slice(0, 40);
-      if (!name) return null;
-      const values = {};
-      for (const key of ['size', 'quality', 'count', 'output_format', 'background']) {
-        const value = preset[key];
-        if (key === 'count' ? Number.isInteger(value) : (typeof value === 'string' && value.trim())) values[key] = key === 'count' ? value : value.trim().slice(0, 40);
-      }
-      return { name, ...values, builtIn: preset.builtIn === true };
-    }).filter(Boolean);
   }
 
   /**
@@ -2640,7 +2350,7 @@ export function createRemoteRelayDispatcher({
     if (provider === 'github' && isOpenAIImageModelId(requested)) {
       throw new DispatchFailure(400, OPENAI_IMAGE_MODEL_NEEDS_OPENAI_CODE,
         `${openAIImageModelNeedsOpenAIText(requested)} ${creating ? 'No session was created.' : (updating ? 'Nothing was changed.' : 'Nothing was sent.')}`,
-        { provider, model: requested, note: 'Pass provider "openai" with this model (relay_info lists the openai models), or a Copilot model that writes text.' });
+        { provider, model: requested, note: 'Pass provider "openai" with this model (relay_info with provider "openai" lists its models), or a Copilot model that writes text.' });
     }
     const entry = catalog ? listProviders(catalog).find((candidate) => candidate.provider === provider) : null;
     const offered = catalog ? offeredModelList(catalog, provider) : null;
@@ -2663,7 +2373,7 @@ export function createRemoteRelayDispatcher({
           model: requested,
           suggestions: check.suggestions,
           models: check.models.slice(0, UNKNOWN_MODEL_LIST_MAX),
-          note: 'Pass one of these ids (relay_info lists them per provider), or leave model out.',
+          note: 'Pass one of these ids (relay_info with provider lists them), or leave model out.',
         });
     }
     if (check.status === 'unchecked') {
@@ -2772,7 +2482,7 @@ export function createRemoteRelayDispatcher({
     if (wantsImages && (provider !== 'openai' || !isOpenAIImageModelId(model))) {
       throw new DispatchFailure(400, REMOTE_RELAY_ERROR_CODES.invalidInput,
         `images and image go to an OpenAI image session (provider "openai" with a gpt-image or dall-e model); this one would run ${provider}${model ? ` ${model}` : ''}. `
-        + 'Pass provider "openai" and leave model out (the relay\'s image default) or name an image model relay_info lists. No session was created.',
+        + 'Pass provider "openai" and leave model out (the relay\'s image default) or name an image model relay_info with provider "openai" lists. No session was created.',
         { remoteCode: IMAGE_INPUT_REFUSED_CODE });
     }
     // planOnly starts the session locked in plan mode: with no mode named it
@@ -2859,7 +2569,7 @@ export function createRemoteRelayDispatcher({
     const group = groupReported ? bootstrapGroupField(bootstrap.group) : null;
     let groupWarning = null;
     if (args.group && !ctx.group && groupReported && !group) {
-      groupWarning = `The session was created in no group: ${groupWhere(ctx)} has no session group "${clipLine(args.group, 80)}", and only the owner makes groups. Tell the user; name an existing group next time (relay_info lists them).`;
+      groupWarning = `The session was created in no group: ${groupWhere(ctx)} has no session group "${clipLine(args.group, 80)}", and only the owner makes groups. Tell the user; name an existing group next time (relay_info with verbose true lists them all).`;
     } else if (args.group && !groupReported) {
       groupWarning = `The session was created WITHOUT a group: ${groupWhere(ctx)} ignored group "${clipLine(args.group, 80)}" (its OAR is older and does not take group on create_session). Tell the user; the owner can move the session into the group by hand.`;
     } else if (args.group && (!group || (ctx.group?.id && group.id !== ctx.group.id))) {

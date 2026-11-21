@@ -94,6 +94,23 @@ export function createSdkMessageNormalizer() {
   let lastUsage = null;
   const knownSubagentRuns = new Map();
   const seenToolFrames = new Set();
+  // Separate text runs (a preamble, then tool calls, then the answer) are
+  // joined with one blank line, as the Claude and Copilot workers join
+  // separate assistant messages. A boundary is only marked once the turn has
+  // visible text, so a turn that opens with a tool call gains no blank line.
+  const seenToolIds = new Set();
+  let hasVisibleText = false;
+  let boundaryPending = false;
+  let lastTextMessageId = '';
+  let lastContentWasText = false;
+
+  function markBoundary() {
+    if (hasVisibleText) boundaryPending = true;
+  }
+
+  function textMessageId(update) {
+    return String(update.messageId || update.message_id || update._meta?.messageId || '').trim();
+  }
 
   function allocateThoughtId() {
     const id = `grok-thought-main-${stepIndex}-${thoughtIndex}`;
@@ -126,8 +143,26 @@ export function createSdkMessageNormalizer() {
     if (kind === 'agent_message_chunk' || kind === 'agent_message') {
       const chunk = extractTextContent(update.content);
       if (!chunk) return actions;
-      streamText += chunk;
-      if (shouldEmitStreamUpdate(streamText, lastEmittedStreamText)) {
+      const messageId = textMessageId(update);
+      if (messageId && lastTextMessageId && messageId !== lastTextMessageId) markBoundary();
+      lastTextMessageId = messageId;
+      lastContentWasText = true;
+      const visible = chunk.trim() !== '';
+      let rewritten = false;
+      if (boundaryPending) {
+        // Whitespace between runs is dropped while the boundary waits, so a
+        // turn that ends after a tool call leaves nothing dangling.
+        if (!visible) return actions;
+        streamText = `${streamText.trimEnd()}\n\n${chunk.trimStart()}`;
+        boundaryPending = false;
+        // Trimming at the join can make the text stop extending what was
+        // last published; publish then, whatever the size of the delta.
+        rewritten = !streamText.startsWith(lastEmittedStreamText);
+      } else {
+        streamText += chunk;
+      }
+      if (visible) hasVisibleText = true;
+      if (rewritten || shouldEmitStreamUpdate(streamText, lastEmittedStreamText)) {
         lastEmittedStreamText = streamText;
         actions.push({
           channel: 'stream',
@@ -144,6 +179,10 @@ export function createSdkMessageNormalizer() {
     if (kind === 'agent_thought_chunk' || kind === 'agent_thought') {
       const chunk = extractTextContent(update.content);
       if (!chunk) return actions;
+      // The thought is one record for the whole turn, so "a new thought" is
+      // any thought that follows text.
+      if (lastContentWasText) markBoundary();
+      lastContentWasText = false;
       if (!openThought) {
         openThought = { reasoningId: allocateThoughtId(), text: '' };
       }
@@ -175,6 +214,16 @@ export function createSdkMessageNormalizer() {
       const explicitToolName = String(update.name || update.toolName || '').trim();
       const toolName = explicitToolName || title || toolCategory || 'tool';
       const status = String(update.status || (kind === 'tool_call' ? 'pending' : '')).trim().toLowerCase();
+      // Only the first frame of a call separates text runs: a background
+      // tool finishing while the model writes must not break a sentence.
+      if (toolCallId) {
+        if (!seenToolIds.has(toolCallId)) {
+          seenToolIds.add(toolCallId);
+          markBoundary();
+        }
+      } else if (kind === 'tool_call') {
+        markBoundary();
+      }
       const frameKey = `${toolCallId}\u0000${status || kind}`;
       if (toolCallId && seenToolFrames.has(frameKey)) return actions;
       if (toolCallId) seenToolFrames.add(frameKey);

@@ -5,6 +5,231 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.32] — 2026-11-21
+
+Highlights: a Claude turn whose Claude Code went silent (for example a
+request stuck after the computer woke from sleep) no longer holds the chat:
+it ends after 10 minutes, 30 while a tool runs, and a Stop that Claude Code
+ignores frees the chat a minute later. Claude's weekly and Fable bars no
+longer vanish after a turn that could not read them all, and Claude turns no
+longer scan every transcript when they end. 🔥 Active sessions only takes a
+window you choose, from 1 minute to 24 hours. The Inbox gets Unanswered,
+This relay, groups and fold-all, and it and 📓 no longer jump while you
+read them. Grok chats keep their text apart around tool calls, their first
+relay tool call works, and tool results up to 64 KB arrive whole.
+`relay_info` answers a summary; Settings → Previews sets how many previews
+can be live.
+
+### Added
+
+- **🔥 Active sessions only: a window you choose.** While 🔥 is on, a
+  slider under the sidebar's filter sets how recent a session's last
+  activity has to be for it to show: 1, 2, 5, 10, 15 or 30 minutes, or 1,
+  2, 4, 8, 12 or 24 hours. It starts at 5 minutes, as before, and is
+  remembered per browser. Working sessions and sessions with a card waiting
+  for you show whatever it is set to. The list, the count on the button and
+  its tooltip follow the slider at once.
+- **Inbox: Unanswered, This relay, groups and fold-all.** Two new filters
+  sit next to All / Mine / Agents: **Unanswered** hides what was answered
+  in the last day, **This relay** hides the paired relays. Within each
+  relay the questions are split by the group of their session, one
+  sub-heading per group by name, "No group" last, and **Groups ▾** shows
+  only the groups you tick. **➖** folds every card to one line (kind,
+  urgent, age, the question's first line, the session), **➕** opens them
+  again, and each card, relay and group has its own **›**. A session's 📓
+  list has **Unanswered** and **➖** too. Filters and folds are kept across
+  reloads (the old Mine / Agents choice carries over). A paired relay shows
+  its groups once it runs 0.9.32.
+- **Previews: you set how many can be live.** Settings → Previews has a
+  slider at its top, **Maximum live previews**, from 0 to 128. It was 8
+  unless `previews.maxLive` in `config.json` said otherwise, and changing
+  that took a restart; the slider applies at once. It starts at the value
+  in force (8, or your `previews.maxLive`). Lowering it closes nothing: new
+  previews are refused until fewer are live. 0 means no new previews, and
+  `previews.maxLive: 0` now means the same instead of 8. Only you can
+  change it; agents cannot.
+
+### Changed
+
+- **`relay_tool`: `relay_info` answers a summary.** It listed every model
+  of every provider twice, every session group and every recent folder: 20
+  KB and more on a relay with many models, which costs every agent that
+  calls it and is more than the Grok CLI passes on in one tool result. It
+  now answers, per provider, the default model, the efforts that model
+  takes and how many models there are; the 15 session groups with the
+  latest activity and how many more there are; eight recent folders.
+  `provider: "<name>"` lists that provider's models and efforts, and
+  `verbose: true` returns everything as before. An unknown provider is
+  refused with the list of names. Agents and scripts that read the model
+  lists from a plain `relay_info` need one of the two arguments. The
+  calling relay builds the answer, so the same holds toward a paired relay
+  that still runs 0.9.31.
+- **`relay_tool` results are compact JSON.** The same fields without
+  indentation, about a third smaller.
+- **Grok: OAR names itself `oar` to the Grok CLI.** The client name it
+  gives the CLI when a session starts was still `copilot-remote-grok`.
+  Nothing else changes; it only shows where the CLI logs or lists its
+  client.
+
+### Fixed
+
+- **Claude: a turn whose Claude Code went silent no longer holds the chat
+  for good.** After 10 minutes without a sign of life from Claude Code (30
+  while a tool runs), the relay asks it to interrupt the turn, and stops it
+  when the turn has not ended a minute later. The turn fails with a note
+  that says how long the silence was (`relay.claude-turn-stalled`), the
+  next message starts Claude Code again on the same session, and messages
+  that were steered into the silent turn go back to the queue and run (when
+  Claude Code ended the turn but keeps the session's background tasks and
+  opens no turn for them, they show as stopped, with **Resend**).
+  Before, such a turn stayed "running" until you pressed Stop (seen after a
+  computer woke from sleep). An open question, a compaction, a `relay_tool`
+  wait, an announced API retry and the time the computer slept are not
+  counted as silence. This also covers Claude API and DeepSeek chats.
+  `OAR_TURN_STALL_MODEL_MS` and `OAR_TURN_STALL_TOOL_MS` set the two
+  windows; `0` switches one off.
+- **Claude: Stop now frees the chat when Claude Code does not end the
+  turn.** Claude Code confirms a Stop at once, but a stuck turn never
+  ended: the reply was shown as stopped, and every later message stayed
+  queued behind it. A minute after a Stop that did not end the turn, the
+  relay stops Claude Code, and the next message starts it again on the
+  same session. Its background tasks end with it.
+- **Claude: a message sent to a Claude Code that hangs between turns no
+  longer fails, and no longer makes every later message fail.** When Claude
+  Code says nothing at all after a message reached it, the relay stops it
+  after 5 minutes and runs the message on a newly started one; before, the
+  message failed and the hung Claude Code stayed.
+- **Claude on Windows: stopping Claude Code also ends what it had
+  started.** When the relay stops a Claude Code that does not react,
+  commands it was still running (a build, a dev server) end with it instead
+  of running on.
+- **Claude's weekly and Fable bars no longer vanish.** A Claude turn whose
+  read of the plan limits timed out, or whose answer left some of them out,
+  replaced the bars of the turn before: the Plan usage card then lost the
+  Fable bar, or every bar, and said the session ran without plan limits.
+  Now a bar the last turn did not report stays, with a note saying how old
+  it is, until its window resets or a later reading replaces it. A reading
+  that says the login has no plan limits, or is another plan, replaces the
+  bars at once. A card without bars says why instead of blaming an API key.
+- **Claude turns no longer scan every transcript when they end.** Reading
+  the plan limits after each Claude turn also had Claude Code scan all
+  transcripts of the last seven days for "What is driving usage". With
+  large transcripts that took longer than the 10 seconds a turn waits, so
+  the limits were lost, and it loaded the machine on every turn. The limits
+  are now read without the scan. At most every half hour the relay has one
+  Claude worker run the scan in a Claude Code process of its own, so no
+  session waits for it; the card keeps the last result for up to an hour.
+- **The Inbox and 📓 no longer jump while you read them.** When the list
+  updates (a new question, one answered elsewhere, the minute's refresh, a
+  paired relay's change), the card you are reading stays where it is: a
+  question added or answered above it no longer moves it by a whole card.
+  Opening an answer box on a phone (the keyboard opens) no longer throws the
+  Inbox to another place or to its end. While the pointer or the focus is
+  in the 📓 list, it no longer moves when the header above it changes; it
+  is placed again once you leave it. In the transcript, a 📓 line above
+  you that changes (pending to "Answered: …") no longer moves the text you
+  read.
+- **Grok: the text before and after a tool call is no longer glued
+  together.** A reply that opened with a sentence, ran tools and then
+  answered came out as one run ("…relay discovery.[report] …"). The parts
+  are now separated by a blank line, as in Claude and Copilot chats.
+- **Grok: the first relay tool call of a new chat no longer fails.** The
+  Grok CLI connects its MCP servers in the background, and a prompt sent
+  right away told the model that the relay's server was still connecting;
+  its first `relay_tool` or `preview` call then failed and only a retry
+  worked. The first prompt now waits until the relay's server is connected
+  (10 seconds at most), and tells Grok the names its CLI wants,
+  `oar__relay_tool` and `oar__preview`.
+- **Grok: long tool results arrive whole.** The Grok CLI cuts a tool
+  result at 20,000 bytes and saves the rest to a file. OAR now starts it
+  with a limit of 65,536 bytes (`GROK_MAX_MCP_OUTPUT_BYTES`); a value in
+  the worker's environment wins (under tmux: the tmux server's or your
+  login profile's, see
+  [configuration](docs/configuration.md#environment-variables)).
+- **Grok usage: the card says why there is no plan quota.** It said only
+  that no live data was there. It now names the reason: Grok is not logged
+  in on this relay, xAI refused the request for this login (most likely no
+  subscription, or an expired login), the request failed or timed out, or
+  xAI answered in a format OAR does not know, with the time it last tried.
+  The cost and tokens of your turns are shown as before.
+- **A session that has just started no longer shows as running old
+  code.** For up to a minute after a session's first message, `relay_tool`
+  (`worker.stale`), the status and About counted its worker as "on other
+  code", because the relay did not yet know which build it runs. A worker
+  counts only when it runs another build, or says nothing about its build
+  after it had the time to. The relay also learns the build sooner: a step
+  of the worker's start no longer wipes what the worker had just reported.
+
+### Upgrade notes
+
+- No migration: 0.9.32 runs on a 0.9.31 database as it is.
+- One new setting, `preview_max_live` in `app_settings`. It is written only
+  when you save the **Maximum live previews** slider, and from then on it
+  wins over `previews.maxLive` in `config.json`; until then the limit is
+  `previews.maxLive`, or 8 without it, as before. `previews.maxLive: 0` now
+  means no new previews; before it meant 8. If your `config.json` has it,
+  remove it or put a number there to keep previews working.
+- On Claude, Claude API and DeepSeek chats, `OAR_TURN_STALL_MODEL_MS`
+  (default 10 minutes) and `OAR_TURN_STALL_TOOL_MS` (default 30 minutes) now
+  end a quiet turn; before, they only set when it was logged. `0` switches
+  that window off ([configuration](docs/configuration.md#environment-variables)).
+- Agents and scripts that read model ids or efforts from `relay_info` pass
+  `provider: "<name>"` (one provider) or `verbose: true` (everything, as
+  before); a plain `relay_info` now gives per provider only the default
+  model, its efforts and how many models there are. `relay_tool` results
+  are the same JSON without indentation.
+- Grok workers start the Grok CLI with `GROK_MAX_MCP_OUTPUT_BYTES=65536`
+  unless the worker's environment has `GROK_MAX_MCP_OUTPUT_BYTES` or
+  `MAX_MCP_OUTPUT_BYTES` already.
+- The stored Claude plan usage of 0.9.31 is read as it is; the first
+  Claude turn after the update keeps its bars as described above.
+- No dependency changes: `npm ci` after a pull in a git checkout installs
+  nothing new.
+- The Inbox's Mine / Agents choice carries over: the first load in a
+  browser moves it into the new Inbox view and removes the old key.
+
+### Downgrade notes
+
+Going back to 0.9.31 is safe: `oar update --to 0.9.31` or `npm install -g
+@oar-sh/oar@0.9.31` (in a git checkout: `git checkout v0.9.31`, `npm ci`,
+then a relay restart). 0.9.32 adds no migration and writes nothing to the
+database that 0.9.31 cannot read; a turn that failed as stalled keeps its
+note. What changes back:
+
+- **Previews:** 0.9.31 does not read `preview_max_live`; the row stays and
+  does nothing. The limit is `previews.maxLive` again (8 without it, and
+  also 8 for `previews.maxLive: 0`), read when the relay starts. Previews
+  already live stay until closed. Going up to 0.9.32 again brings back the
+  saved slider value.
+- **Claude plan usage:** 0.9.31 shows the stored snapshot as it is, with
+  every bar in it: also a bar kept from an earlier turn (without the note
+  on its age), and one whose window has reset, until the next Claude turn
+  replaces the snapshot. From then on a turn that reads only some of the
+  limits replaces the bars again, and every Claude turn runs the transcript
+  scan again when it ends. A card without bars again says the session
+  authenticates with an API key or a third-party provider, also when the
+  stored reading is one whose read of the plan limits failed or timed out.
+- **`relay_tool`:** `relay_info` lists everything again and names
+  `provider` and `verbose`, when passed, in `ignored`; results are
+  indented again.
+- **Grok:** the Grok CLI cuts tool results at 20,000 bytes again (unless
+  the worker's environment sets one of the two), the first relay
+  tool call of a new chat can fail again, text around tool calls is glued
+  again, and the usage card no longer says why it has no figure.
+- **Inbox:** 0.9.31 does not read the browser's `oar_inbox_view`, and the
+  `oar_inbox_filter` key it reads was removed by 0.9.32, so the Inbox opens
+  on **All**. Unanswered, This relay, groups and folds are not there. Going
+  up to 0.9.32 again brings back the view it had kept; a Mine / Agents
+  choice made under 0.9.31 in the meantime is dropped.
+- **🔥:** 0.9.31 ignores `copilot_conv_active_window` and uses its fixed 5
+  minutes; whether 🔥 is on is kept. Going up again brings back the window
+  you had set.
+- **Claude:** a silent turn holds the chat again until you press Stop (and,
+  when Claude Code ignores the Stop, until **☠️ Kill session**); 0.9.31 only
+  writes such a silence to the worker log.
+- **Paired relays:** a 0.9.32 Inbox lists a 0.9.31 relay's items without
+  groups, and a 0.9.31 Inbox ignores the groups a 0.9.32 relay sends.
+
 ## [0.9.31] — 2026-11-17
 
 Highlights: `/compact` keeps the chat on its own provider, model and

@@ -11,7 +11,9 @@ import { EMPTY_TURN_COMPLETION_NOTE } from '../../shared/empty-turn-completion.m
 import { buildSteerSettleFailure, steerSettleFailureText } from '../../shared/steer-settle-failure.mjs';
 import { buildUsageLimitFailure } from '../../shared/claude-usage-limit.mjs';
 import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
+import { TURN_STALLED_ERROR_CODE, describeTurnStall } from '../../shared/worker-runtime/turn-liveness.mjs';
 import { claudeBillingTotals, claudeSearchTotals, claudeTokenTotals, claudeToolRequests, claudeUsageTotals } from './claude-usage-totals.mjs';
+import { scanPlanBehaviors } from './claude-sdk-adapter.mjs';
 
 /**
  * The attempt-fencing echo for a row's write bodies. Every publish that names
@@ -31,6 +33,10 @@ export function isStaleAttemptError(error) {
 }
 
 export { buildSteerSettleFailure, steerSettleFailureText };
+
+// What a turn that went quiet is told: the prompt was not answered, and a
+// new attempt has every chance (the CLI is asked to stop, or replaced).
+export const CLAUDE_TURN_STALLED_GUIDANCE = 'Send the message again to retry.';
 export const STEER_SETTLE_FAILED_TEXT = steerSettleFailureText('folded');
 
 export function buildClaudePlanReadyBoardPayload({ message, planText = '', planFilePath = '' } = {}) {
@@ -88,6 +94,10 @@ export function createClaudeTurnPublisher({
   // The relay's id of a model the backend's CLI names ("deepseek-flash[1m]"
   // → "deepseek-flash"); identity for Claude, whose `[1m]` is a real tier.
   relayModel = (value) => value,
+  // The full `/usage` read with the transcript scan, in a Claude Code
+  // process of its own (claude-sdk-adapter.mjs), made only when the relay's
+  // reply hands this worker the scan.
+  scanPlanBehaviorsImpl = scanPlanBehaviors,
   // The Claude API booking (POST /api/claude-api-usage), which both Claude
   // workers report to after every turn, whatever else they report: a chat
   // moves between the subscription and the key and keeps its session.
@@ -233,6 +243,10 @@ export function createClaudeTurnPublisher({
    * relay. Falls back to the stable result fields when the experimental usage
    * control request is unavailable, so the card still gets session cost.
    * Advisory: a failure here must not disturb the turn's response.
+   * When the relay's reply carries `behaviorsDue: true`, the slow transcript
+   * scan runs in the background in a Claude Code process of its own (never
+   * the session's) and its answer is sent as soon as it is there; without
+   * that field (no reply, an older relay) nothing is scanned.
    */
   async function publishPlanUsage({ message, state, sdkSessionId, runId = '', resumedSessionId = '' }) {
     // Fire-and-forget: the token post never holds the reply (the counting
@@ -249,7 +263,7 @@ export function createClaudeTurnPublisher({
     // it has to count as a reason to publish or the card loses session cost on
     // any turn the SDK reports without `modelUsage`.
     if (!state.planUsage && !state.modelUsage && totalCostUsd === null) return;
-    await api('POST', '/api/claude-plan-usage', {
+    const reply = await api('POST', '/api/claude-plan-usage', {
       conversationId: message.conversationId,
       sdkSessionId,
       usage: state.planUsage,
@@ -257,6 +271,29 @@ export function createClaudeTurnPublisher({
       totalCostUsd,
     }).catch((error) => {
       dbg('plan usage publish failed', error?.message || String(error));
+      return null;
+    });
+    if (reply?.behaviorsDue === true) {
+      void Promise.resolve()
+        .then(() => scanPlanBehaviorsImpl(dbg))
+        .then((usage) => (usage && typeof usage === 'object' ? publishPlanBehaviors({ message, sdkSessionId, usage }) : null))
+        .catch((error) => dbg('usage transcript scan failed', error?.message || String(error)));
+    }
+  }
+
+  /**
+   * Ship a transcript scan's full usage answer (the relay asked for it with
+   * `behaviorsDue`). Only the plan usage route: the turn's tokens and cost
+   * were booked with the turn.
+   */
+  async function publishPlanBehaviors({ message, sdkSessionId, usage }) {
+    if (!reportsPlanUsage || usageRoute || !usage) return;
+    await api('POST', '/api/claude-plan-usage', {
+      conversationId: message.conversationId,
+      sdkSessionId,
+      usage,
+    }).catch((error) => {
+      dbg('plan behaviors publish failed', error?.message || String(error));
     });
   }
 
@@ -986,12 +1023,44 @@ export function createClaudeTurnPublisher({
     });
   }
 
+  /**
+   * A turn the quiet-turn watchdog ended (claude-session-process.mjs,
+   * endQuietTurn): the CLI sent nothing for longer than its phase allows.
+   * `error` is the watchdog's (turn-liveness.mjs); `cliStopped` says the CLI
+   * did not end the turn when asked and was stopped, with `lostTasks`
+   * background tasks. The turn is not known to be broken, only silent, and
+   * the note says that, as the other workers' does.
+   */
+  async function publishTurnStalled({ message, error, partialText = '', model = null, cliStopped = false, lostTasks = 0 }) {
+    const stall = { ...(error?.stall || {}), agentLabel: runtimeLabel };
+    const lost = Math.max(0, Number(lostTasks) || 0);
+    const note = describeTurnStall({ stall })
+      + (cliStopped
+        ? ' Claude Code did not end the turn when asked, so the relay stopped it; the next message starts it again on the same session.'
+          + (lost ? ` ${lost} background ${lost === 1 ? 'task' : 'tasks'} of this session ended with it.` : '')
+        : '');
+    await publishResponse(message, {
+      text: `${note} ${CLAUDE_TURN_STALLED_GUIDANCE}`,
+      model,
+      partialText,
+      terminalError: {
+        kind: 'claude-turn-failed',
+        ...failureCodes(TURN_STALLED_ERROR_CODE),
+        message: note,
+        guidance: CLAUDE_TURN_STALLED_GUIDANCE,
+        failedAt: new Date().toISOString(),
+        queueMessageId: String(message.id || '') || null,
+      },
+    });
+  }
+
   return {
     postActivity,
     drainWorkflowRuns,
     dispatchAction,
     publishContextUsage,
     publishPlanUsage,
+    publishPlanBehaviors,
     publishUsageLimitReport,
     publishFinalStream,
     publishResponse,
@@ -999,5 +1068,6 @@ export function createClaudeTurnPublisher({
     publishCompletedTurn,
     publishErrorResult,
     publishTurnException,
+    publishTurnStalled,
   };
 }

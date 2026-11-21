@@ -22,7 +22,7 @@
 import { currentConvId, isMessagesNearBottom, scrollBottom } from './store.js';
 import { getHeldBackLiveRowCount, isConversationWindowAtTail, releaseReadingAnchorHold } from './conversation-view.js';
 import { disarmThinkingFollow, getThinkingFollowMode, syncThinkingFollowButtons } from './thinking-follow.js';
-import { resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
+import { holdsTranscriptRows, resolveNearBottomThresholdPx } from './transcript-viewport-anchor.mjs';
 import {
   createViewportBaseline,
   isOnScreenKeyboardOpen,
@@ -414,6 +414,11 @@ function handleScroll() {
 function handleResize() {
   const el = scroller();
   if (!el) return;
+  // The Inbox, Status and Media views are drawn here too: no end to keep.
+  if (!holdsTranscriptRows(el)) {
+    observedClientHeight = el.clientHeight;
+    return;
+  }
   // A followed section of the live bubble pins itself (thinking-follow.js).
   if (!jump && !getThinkingFollowMode() && distanceFromBottom(el) > 0 && shouldRepinOnResize({
     pinned,

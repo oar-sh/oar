@@ -21,6 +21,8 @@ test.afterAll(() => settleFakeWorkers());
  *    takes it out again;
  *  - the setting survives a reload, and a session ages out of the
  *    five-minute window by itself;
+ *  - the window slider under the filter row narrows the window to a minute
+ *    or widens it to a day, and is kept across a reload;
  *  - on a phone the toggle and the field share the row.
  *
  * No model runs: the spec plays the worker (it dequeues a turn, posts a plan
@@ -223,6 +225,48 @@ test.describe.serial("the 🔥 active filter in the sidebar", () => {
     await expect(row(page, seeded.recent)).toHaveCount(1);
     await expect(row(page, seeded.recent)).toHaveCount(0, { timeout: 12_000 });
     await expect(row(page, seeded.plan)).toHaveCount(1);
+  });
+
+  test("the window slider: at 1 min a session idle for 2 min drops out, at 24 h one idle for 20 h shows; kept across a reload", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.addInitScript(() => { window.localStorage.setItem("copilot_conv_active_filter", "1"); });
+    setUpdatedAt(seeded.recent, 2 * MINUTE);
+    setUpdatedAt(seeded.old, 20 * 60 * MINUTE);
+    await openApp(page);
+    const sliderRow = page.locator("#conv-active-window-row");
+    const slider = page.locator("#conv-active-window");
+    const label = page.locator("#conv-active-window-label");
+    await expect(sliderRow).toBeVisible();
+    await expect(label).toHaveText("Active in the last 5 min");
+    await expect(row(page, seeded.recent)).toHaveCount(1);
+    await expect(row(page, seeded.old)).toHaveCount(0);
+
+    await slider.fill("0");
+    await expect(label).toHaveText("Active in the last 1 min");
+    await expect(slider).toHaveAttribute("aria-valuetext", "Active in the last 1 min");
+    await expect(row(page, seeded.recent)).toHaveCount(0);
+    // Working and waiting sessions show whatever the window.
+    await expect(row(page, seeded.working)).toHaveCount(1);
+    await expect(row(page, seeded.plan)).toHaveCount(1);
+    await expect(toggle(page)).toHaveAttribute("title", /\(last 1 min\)/);
+    await expect(toggle(page).locator(".conv-active-count")).toHaveText("2");
+
+    await slider.fill("11");
+    await expect(label).toHaveText("Active in the last 24 h");
+    await expect(row(page, seeded.recent)).toHaveCount(1);
+    await expect(row(page, seeded.old)).toHaveCount(1);
+    await expect(toggle(page).locator(".conv-active-count")).toHaveText("4");
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(slider).toHaveValue("11");
+    await expect(label).toHaveText("Active in the last 24 h");
+    await expect(row(page, seeded.old)).toHaveCount(1);
+
+    // 🔥 off: the slider row goes with it.
+    await toggle(page).click();
+    await expect(toggle(page)).toHaveAttribute("aria-pressed", "false");
+    await expect(sliderRow).toBeHidden();
   });
 
   test("on a phone the toggle and the field share the row", async ({ browser }) => {

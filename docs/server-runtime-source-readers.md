@@ -20,7 +20,7 @@ start marker a helper asserts. "other" is an assertion on the text that is neith
 a count, a value read out of it). Sections are the runtime's own `// ─── … ───` markers, each
 running to the next one, so they are coarse ("Web Push" also holds the worker launch code).
 
-Readers: 32 files, 530 assertions: 404 presence, 34 absence (6 without an anchor), 92 other.
+Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor), 92 other.
 
 ## Absence assertions without a positive anchor
 
@@ -49,7 +49,7 @@ Readers: 32 files, 530 assertions: 404 presence, 34 absence (6 without an anchor
 | Relay events | 1 | 1 | 0 | 0 |
 | Questions that don't block | 7 | 7 | 0 | 6 |
 | Express + Socket.io Setup | 8 | 31 | 1 | 2 |
-| Dead-worker detection | 11 | 111 | 3 | 6 |
+| Dead-worker detection | 11 | 113 | 3 | 6 |
 | CLI Status Tracking | 4 | 5 | 0 | 0 |
 | Remote Relays | 18 | 42 | 1 | 5 |
 | Auth Middleware | 2 | 4 | 0 | 0 |
@@ -649,86 +649,88 @@ Readers: 32 files, 530 assertions: 404 presence, 34 absence (6 without an anchor
 | 30 | presence | service (slice) | `listWorkers: \(\) => sessionWorkerRegistry\.listWorkers\(\),` | Dead-worker detection |  |
 | 31 | presence | service (slice) | `getWorker: \(sid\) => sessionWorkerRegistry\.getWorker\(sid\),` | Dead-worker detection |  |
 | 32 | presence | service (slice) | `hasRunningTurn: \(sid\) => \(stmts\.listProcessingRowsForOwner\?\.all…` | Dead-worker detection |  |
-| 35 | presence | service (slice) | `const lc = sessionWorkerSupervisor\.getLifecycleState\(sid\);\n    re…` | Dead-worker detection |  |
-| 36 | absence | service (slice) | `lc\?\.firstObservedHeartbeatAt` | Dead-worker detection | slice |
-| 37 | presence | service (slice) | `isArchived: \(sid\) => isWorkerSessionArchived\(sid\),` | Dead-worker detection |  |
-| 38 | presence | service (slice) | `stopWorker: recycleWorkerReplacement\.stopWorker,` | Dead-worker detection |  |
-| 39 | presence | service (slice) | `launchWorker: recycleWorkerReplacement\.launchWorker,` | Dead-worker detection |  |
-| 41 | presence | runtimeSource (file) | `const recycleWorkerReplacement = createRuntimeWorkerReplacement\('WOR…` | Dead-worker detection |  |
-| 46 | presence | service (slice) | `onStuck: \(stuck\) => noteWorkerRecycleStuck\(stuck\),` | Dead-worker detection |  |
-| 48 | presence | note (slice) | `if \(stuck\.archived\) return;` | Dead-worker detection |  |
-| 49 | presence | note (slice) | `const conversationId = workerSessionConversationId\(stuck\.sdkSession…` | Dead-worker detection |  |
-| 50 | presence | note (slice) | `const text = workerRecycleStuckNoteText\(stuck\);` | Dead-worker detection |  |
-| 51 | presence | note (slice) | `stmts\.insertMsg\.run\(messageId, conversationId, 'assistant', text,` | Dead-worker detection |  |
-| 52 | presence | note (slice) | `stmts\.setMessageKind\?\.run\?\.\('worker-recycle-stuck', messageId\);` | Dead-worker detection |  |
-| 53 | presence | note (slice) | `io\.emit\('assistant_message', \{` | Questions that don't block |  |
-| 54 | presence | note (slice) | `kind: 'worker-recycle-stuck'` | Dead-worker detection |  |
-| 56 | presence | conversation (slice) | `stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
-| 57 | presence | conversation (slice) | `stmts\.getConvBySdkSessionId\?\.get\?\.\(sid\)\?\.id` | Dead-worker detection |  |
-| 62 | presence | body (slice) | `stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
-| 63 | presence | body (slice) | `stmts\.getConvAnyStatus\?\.get\?\.\(runtime\.conversation_id\)` | Dead-worker detection |  |
-| 64 | presence | body (slice) | `stmts\.getConvBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
-| 65 | presence | body (slice) | `Number\(conversation\.archived \\|\\| 0\) !== 1` | Dead-worker detection |  |
-| 66 | presence | body (slice) | `!== 'deleted'` | Config |  |
-| 67 | presence | body (slice) | `return !inUse\(viaRuntime\) && !inUse\(viaSessionId\);` | Dead-worker detection |  |
-| 71 | presence | runtimeSource (file) | `\nworkerRecycleService\.start\(\);\n` | Dead-worker detection |  |
-| 72 | other | runtimeSource (file) | `workerRecycleService.start()` | Dead-worker detection |  |
-| 74 | presence | clear (slice) | `try \{ workerRecycleService\.stop\(\); \} catch \{\}` | Preview Lane |  |
-| 75 | presence | clear (slice) | `runtimeTimers\.archivedWorkerSweep = null;` | Preview Lane |  |
-| 77 | presence | shutdown (slice) | `clearRuntimeTimers\(\);` | Preview Lane |  |
-| 82 | presence | state (slice) | `workerRecycle: \(\) => workerRecycleService\.status\(\),` | CLI Status Tracking |  |
-| 87 | presence | listening (slice) | `\n  runtimeTimers\.archivedWorkerSweep = setTimeout\(\(\) => \{` | Start |  |
-| 88 | presence | listening (slice) | `sweepArchivedSessionWorkersAtStart\(\)\.catch\(` | Start |  |
-| 89 | presence | listening (slice) | `\}, 30_000\);\n  runtimeTimers\.archivedWorkerSweep\.unref\?\.\(\);` | Start |  |
-| 91 | presence | sweep (slice) | `if \(runtimeShutdownStarted\) return null;` | Dead-worker detection |  |
-| 92 | presence | sweep (slice) | `stmts\.listArchivedRuntimeSessionIds\?\.all\?\.\(\)` | Dead-worker detection |  |
-| 94 | presence | sweep (slice) | `isProcessAlive\(pid\)` | Config |  |
-| 95 | presence | sweep (slice) | `sessionWorkerProcessInspector\?\.findProcessForSessionAsync\?\.\(sid,…` | Dead-worker detection |  |
-| 96 | presence | sweep (slice) | `isArchived: \(sid\) => isWorkerSessionArchived\(sid\),` | Dead-worker detection |  |
-| 97 | presence | sweep (slice) | `stopWorker: recycleWorkerReplacement\.stopWorker,` | Dead-worker detection |  |
-| 102 | presence | sweep (slice) | `fence: workerReplacementFence,` | Dead-worker detection |  |
-| 103 | presence | sweep (slice) | `runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, f…` | Dead-worker detection |  |
-| 105 | presence | sweep (slice) | `workerPid: async \(sid\) => \{` | Dead-worker detection |  |
-| 106 | presence | sweep (slice) | `if \(Number\.isInteger\(pid\) && pid > 0 && isProcessAlive\(pid\)\) r…` | Dead-worker detection |  |
-| 107 | presence | sweep (slice) | `return Number\(found\?\.processId\) \\|\\| null;` | Dead-worker detection |  |
-| 116 | presence | killed (slice) |  | Express + Socket.io Setup |  |
-| 117 | presence | fenced (slice) |  | Express + Socket.io Setup |  |
-| 118 | other | killed (slice) | `after the killed check, before any row is claimed` | Express + Socket.io Setup |  |
-| 119 | presence | delivery (slice) | `blockedReason: 'worker-replacement',` | Express + Socket.io Setup |  |
-| 121 | presence | delivery (slice) | `isReplacementFenced: \(\) => workerReplacementFence\.isHeld\(requeste…` | Express + Socket.io Setup |  |
-| 126 | presence | runtimeSource (file) | `\nconst workerReplacementFence = \(\(\) => \{\n  const fence = create…` | Dead-worker detection |  |
-| 127 | other | runtimeSource (file) |  | (whole file) |  |
-| 129 | presence | factory (slice) | `fence: workerReplacementFence,` | Dead-worker detection |  |
-| 131 | presence | service (slice) | `fence: recycleWorkerReplacement\.fence,` | Dead-worker detection |  |
-| 133 | presence | routeDeps (slice) | `\n  workerReplacementFence,\n` | Remote Relays |  |
-| 137 | presence | runtimeSource (file) | `import \{ sessionLaunchMutex \} from '\.\/services\/session-launch-mu…` | (imports and paths) |  |
-| 139 | presence | service (slice) | `runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, f…` | Dead-worker detection |  |
-| 161 | presence | service (slice) | `isAgentSdkWorker: \(worker\) => staleWorkerLosesAgentSdk\(worker\?\.k…` | Dead-worker detection |  |
-| 162 | presence | runtimeSource (file) | `import \{ agentSdkForWorkerKind, [^}]*\} from '\.\/services\/session-…` | (imports and paths) |  |
-| 167 | presence | socket (slice) | `\n  onWorkerHello: noteSessionWorkerHello,\n` | Dead-worker detection |  |
-| 169 | presence | hello (slice) | `if \(runtimeShutdownStarted\) return;` | Dead-worker detection |  |
-| 170 | presence | hello (slice) | `if \(sessionWorkerSupervisor\?\.isKillBlocked\?\.\(sid\) !== true\) \{` | Dead-worker detection |  |
-| 173 | presence | hello (slice) | `if \(!worker \\|\\| worker\.status === 'new' \\|\\| \(!worker\.workerId &…` | Dead-worker detection |  |
-| 177 | other | register (slice) |  | Dead-worker detection |  |
-| 178 | other | register (slice) | `registered, then the kind and build id, then the sweep` | Dead-worker detection |  |
-| 186 | presence | service (slice) | `quietSince: \(sid\) => \{\n    const at = Date\.parse\(stmts\.getOwne…` | Dead-worker detection |  |
-| 191 | presence | spawn (slice) | `findProcessForSessionAsync\(normalizedTargetSessionId, \{ fresh: true…` | Web Push |  |
-| 193 | presence | spawn (slice) | `const liveIdentity = liveWorker\?\.processId\n      \? await identity…` | Web Push |  |
-| 194 | presence | spawn (slice) | `\? judgeListedSessionProcess\(\{\n        row: liveWorker,\n        c…` | Web Push |  |
-| 195 | presence | spawn (slice) | `if \(listed === 'worker'\) \{\n      const workerId = ` | Web Push |  |
-| 196 | absence | spawn (slice) | `liveWorker\?\.processId && isProcessAlive\(` | Web Push | slice |
-| 198 | presence | spawn (slice) | `readProcessIdentity: readWorkerProcessIdentity,` | Web Push |  |
-| 204 | presence | stop (slice) |  | Web Push |  |
-| 205 | other | stop (slice) | `const launched = await launchSessionCli({` | Web Push |  |
-| 206 | presence | spawn (slice) | `await stopLeftoverSessionProcess\(\{\n        sdkSessionId: normalize…` | Web Push |  |
-| 208 | absence | spawn (slice) | `buildSessionWorkerLaunchEnvForSession` | Web Push | slice |
-| 214 | presence | supervisor (slice) |  | Web Push |  |
-| 215 | other | runtimeSource (file) |  | (whole file) |  |
-| 220 | presence | supervisor (slice) | `\n  readProcessIdentity: readWorkerProcessIdentity,\n` | Web Push |  |
-| 221 | other | runtimeSource (file) | `const readWorkerProcessIdentity = createProcessIdentityReader({` | Web Push |  |
-| 229 | presence | runtimeSource (file) | `const readWorkerProcessIdentity = createProcessIdentityReader\(\{\n  …` | Web Push |  |
-| 231 | presence | replacement (slice) | `readProcessIdentity: readWorkerProcessIdentity,` | Web Push |  |
-| 233 | presence | service (slice) | `readProcessIdentity: \(pid\) => readWorkerProcessIdentity\(pid, \{ fr…` | Dead-worker detection |  |
+| 35 | presence | service (slice) | `hasHeartbeated: sessionWorkerHasHeartbeated,` | Dead-worker detection |  |
+| 37 | presence | heartbeated (slice) | `const lc = sessionWorkerSupervisor\.getLifecycleState\(sid\);\n  retu…` | Dead-worker detection |  |
+| 38 | absence | heartbeated (slice) | `firstObservedHeartbeatAt` | Dead-worker detection | slice |
+| 41 | presence | about (slice) | `hasHeartbeated: sessionWorkerHasHeartbeated,` | Dead-worker detection |  |
+| 42 | presence | service (slice) | `isArchived: \(sid\) => isWorkerSessionArchived\(sid\),` | Dead-worker detection |  |
+| 43 | presence | service (slice) | `stopWorker: recycleWorkerReplacement\.stopWorker,` | Dead-worker detection |  |
+| 44 | presence | service (slice) | `launchWorker: recycleWorkerReplacement\.launchWorker,` | Dead-worker detection |  |
+| 46 | presence | runtimeSource (file) | `const recycleWorkerReplacement = createRuntimeWorkerReplacement\('WOR…` | Dead-worker detection |  |
+| 51 | presence | service (slice) | `onStuck: \(stuck\) => noteWorkerRecycleStuck\(stuck\),` | Dead-worker detection |  |
+| 53 | presence | note (slice) | `if \(stuck\.archived\) return;` | Dead-worker detection |  |
+| 54 | presence | note (slice) | `const conversationId = workerSessionConversationId\(stuck\.sdkSession…` | Dead-worker detection |  |
+| 55 | presence | note (slice) | `const text = workerRecycleStuckNoteText\(stuck\);` | Dead-worker detection |  |
+| 56 | presence | note (slice) | `stmts\.insertMsg\.run\(messageId, conversationId, 'assistant', text,` | Dead-worker detection |  |
+| 57 | presence | note (slice) | `stmts\.setMessageKind\?\.run\?\.\('worker-recycle-stuck', messageId\);` | Dead-worker detection |  |
+| 58 | presence | note (slice) | `io\.emit\('assistant_message', \{` | Questions that don't block |  |
+| 59 | presence | note (slice) | `kind: 'worker-recycle-stuck'` | Dead-worker detection |  |
+| 61 | presence | conversation (slice) | `stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
+| 62 | presence | conversation (slice) | `stmts\.getConvBySdkSessionId\?\.get\?\.\(sid\)\?\.id` | Dead-worker detection |  |
+| 67 | presence | body (slice) | `stmts\.getRuntimeSessionBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
+| 68 | presence | body (slice) | `stmts\.getConvAnyStatus\?\.get\?\.\(runtime\.conversation_id\)` | Dead-worker detection |  |
+| 69 | presence | body (slice) | `stmts\.getConvBySdkSessionId\?\.get\?\.\(sid\)` | Dead-worker detection |  |
+| 70 | presence | body (slice) | `Number\(conversation\.archived \\|\\| 0\) !== 1` | Dead-worker detection |  |
+| 71 | presence | body (slice) | `!== 'deleted'` | Config |  |
+| 72 | presence | body (slice) | `return !inUse\(viaRuntime\) && !inUse\(viaSessionId\);` | Dead-worker detection |  |
+| 76 | presence | runtimeSource (file) | `\nworkerRecycleService\.start\(\);\n` | Dead-worker detection |  |
+| 77 | other | runtimeSource (file) | `workerRecycleService.start()` | Dead-worker detection |  |
+| 79 | presence | clear (slice) | `try \{ workerRecycleService\.stop\(\); \} catch \{\}` | Preview Lane |  |
+| 80 | presence | clear (slice) | `runtimeTimers\.archivedWorkerSweep = null;` | Preview Lane |  |
+| 82 | presence | shutdown (slice) | `clearRuntimeTimers\(\);` | Preview Lane |  |
+| 87 | presence | state (slice) | `workerRecycle: \(\) => workerRecycleService\.status\(\),` | CLI Status Tracking |  |
+| 92 | presence | listening (slice) | `\n  runtimeTimers\.archivedWorkerSweep = setTimeout\(\(\) => \{` | Start |  |
+| 93 | presence | listening (slice) | `sweepArchivedSessionWorkersAtStart\(\)\.catch\(` | Start |  |
+| 94 | presence | listening (slice) | `\}, 30_000\);\n  runtimeTimers\.archivedWorkerSweep\.unref\?\.\(\);` | Start |  |
+| 96 | presence | sweep (slice) | `if \(runtimeShutdownStarted\) return null;` | Dead-worker detection |  |
+| 97 | presence | sweep (slice) | `stmts\.listArchivedRuntimeSessionIds\?\.all\?\.\(\)` | Dead-worker detection |  |
+| 99 | presence | sweep (slice) | `isProcessAlive\(pid\)` | Config |  |
+| 100 | presence | sweep (slice) | `sessionWorkerProcessInspector\?\.findProcessForSessionAsync\?\.\(sid,…` | Dead-worker detection |  |
+| 101 | presence | sweep (slice) | `isArchived: \(sid\) => isWorkerSessionArchived\(sid\),` | Dead-worker detection |  |
+| 102 | presence | sweep (slice) | `stopWorker: recycleWorkerReplacement\.stopWorker,` | Dead-worker detection |  |
+| 107 | presence | sweep (slice) | `fence: workerReplacementFence,` | Dead-worker detection |  |
+| 108 | presence | sweep (slice) | `runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, f…` | Dead-worker detection |  |
+| 110 | presence | sweep (slice) | `workerPid: async \(sid\) => \{` | Dead-worker detection |  |
+| 111 | presence | sweep (slice) | `if \(Number\.isInteger\(pid\) && pid > 0 && isProcessAlive\(pid\)\) r…` | Dead-worker detection |  |
+| 112 | presence | sweep (slice) | `return Number\(found\?\.processId\) \\|\\| null;` | Dead-worker detection |  |
+| 121 | presence | killed (slice) |  | Express + Socket.io Setup |  |
+| 122 | presence | fenced (slice) |  | Express + Socket.io Setup |  |
+| 123 | other | killed (slice) | `after the killed check, before any row is claimed` | Express + Socket.io Setup |  |
+| 124 | presence | delivery (slice) | `blockedReason: 'worker-replacement',` | Express + Socket.io Setup |  |
+| 126 | presence | delivery (slice) | `isReplacementFenced: \(\) => workerReplacementFence\.isHeld\(requeste…` | Express + Socket.io Setup |  |
+| 131 | presence | runtimeSource (file) | `\nconst workerReplacementFence = \(\(\) => \{\n  const fence = create…` | Dead-worker detection |  |
+| 132 | other | runtimeSource (file) |  | (whole file) |  |
+| 134 | presence | factory (slice) | `fence: workerReplacementFence,` | Dead-worker detection |  |
+| 136 | presence | service (slice) | `fence: recycleWorkerReplacement\.fence,` | Dead-worker detection |  |
+| 138 | presence | routeDeps (slice) | `\n  workerReplacementFence,\n` | Remote Relays |  |
+| 142 | presence | runtimeSource (file) | `import \{ sessionLaunchMutex \} from '\.\/services\/session-launch-mu…` | (imports and paths) |  |
+| 144 | presence | service (slice) | `runExclusive: \(sid, fn\) => sessionLaunchMutex\.runExclusive\(sid, f…` | Dead-worker detection |  |
+| 166 | presence | service (slice) | `isAgentSdkWorker: \(worker\) => staleWorkerLosesAgentSdk\(worker\?\.k…` | Dead-worker detection |  |
+| 167 | presence | runtimeSource (file) | `import \{ agentSdkForWorkerKind, [^}]*\} from '\.\/services\/session-…` | (imports and paths) |  |
+| 172 | presence | socket (slice) | `\n  onWorkerHello: noteSessionWorkerHello,\n` | Dead-worker detection |  |
+| 174 | presence | hello (slice) | `if \(runtimeShutdownStarted\) return;` | Dead-worker detection |  |
+| 175 | presence | hello (slice) | `if \(sessionWorkerSupervisor\?\.isKillBlocked\?\.\(sid\) !== true\) \{` | Dead-worker detection |  |
+| 178 | presence | hello (slice) | `if \(!worker \\|\\| worker\.status === 'new' \\|\\| \(!worker\.workerId &…` | Dead-worker detection |  |
+| 182 | other | register (slice) |  | Dead-worker detection |  |
+| 183 | other | register (slice) | `registered, then the kind and build id, then the sweep` | Dead-worker detection |  |
+| 191 | presence | service (slice) | `quietSince: \(sid\) => \{\n    const at = Date\.parse\(stmts\.getOwne…` | Dead-worker detection |  |
+| 196 | presence | spawn (slice) | `findProcessForSessionAsync\(normalizedTargetSessionId, \{ fresh: true…` | Web Push |  |
+| 198 | presence | spawn (slice) | `const liveIdentity = liveWorker\?\.processId\n      \? await identity…` | Web Push |  |
+| 199 | presence | spawn (slice) | `\? judgeListedSessionProcess\(\{\n        row: liveWorker,\n        c…` | Web Push |  |
+| 200 | presence | spawn (slice) | `if \(listed === 'worker'\) \{\n      const workerId = ` | Web Push |  |
+| 201 | absence | spawn (slice) | `liveWorker\?\.processId && isProcessAlive\(` | Web Push | slice |
+| 203 | presence | spawn (slice) | `readProcessIdentity: readWorkerProcessIdentity,` | Web Push |  |
+| 209 | presence | stop (slice) |  | Web Push |  |
+| 210 | other | stop (slice) | `const launched = await launchSessionCli({` | Web Push |  |
+| 211 | presence | spawn (slice) | `await stopLeftoverSessionProcess\(\{\n        sdkSessionId: normalize…` | Web Push |  |
+| 213 | absence | spawn (slice) | `buildSessionWorkerLaunchEnvForSession` | Web Push | slice |
+| 219 | presence | supervisor (slice) |  | Web Push |  |
+| 220 | other | runtimeSource (file) |  | (whole file) |  |
+| 225 | presence | supervisor (slice) | `\n  readProcessIdentity: readWorkerProcessIdentity,\n` | Web Push |  |
+| 226 | other | runtimeSource (file) | `const readWorkerProcessIdentity = createProcessIdentityReader({` | Web Push |  |
+| 234 | presence | runtimeSource (file) | `const readWorkerProcessIdentity = createProcessIdentityReader\(\{\n  …` | Web Push |  |
+| 236 | presence | replacement (slice) | `readProcessIdentity: readWorkerProcessIdentity,` | Web Push |  |
+| 238 | presence | service (slice) | `readProcessIdentity: \(pid\) => readWorkerProcessIdentity\(pid, \{ fr…` | Dead-worker detection |  |
 
 ### server/services/session-worker-launch-service.cli-spawn-disabled.test.mjs
 

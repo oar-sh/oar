@@ -8,7 +8,7 @@ import {
   REMOTE_RELAY_PROVIDERS,
   validateRemoteRelayToolInput,
 } from '../../shared/remote-relay-contract.mjs';
-import { executeRemoteRelayTool } from '../../shared/remote-relay-tool-core.mjs';
+import { executeRemoteRelayTool, formatRemoteRelayToolResult } from '../../shared/remote-relay-tool-core.mjs';
 import { formatTokenSplit } from './plan-usage-tokens.mjs';
 import { tagPrincipal } from './relay-principal.mjs';
 import { RemoteRelayError, createRemoteRelayClient } from './remote-relay-client.mjs';
@@ -2058,7 +2058,7 @@ test('a Copilot session on an image model is refused with the way to an OpenAI I
   // A target that predates the filter still lists the id for Copilot.
   remote.models.models.push('gpt-image-1');
   remote.models.providersByModel['gpt-image-1'] = ['github-copilot', 'openai-byok'];
-  const info = await run('relay_info', { relay: 'linux-test' });
+  const info = await run('relay_info', { relay: 'linux-test', verbose: true });
   const byName = Object.fromEntries(info.body.providers.map((entry) => [entry.provider, entry]));
   assert.equal(byName.github.models.includes('gpt-image-1'), false);
   assert.ok(byName.openai.models.includes('gpt-image-1'));
@@ -2385,7 +2385,7 @@ test('relay_info lists the efforts of each provider\'s models, grouped and cappe
     },
     openai: { 'gpt-4o': [] },
   };
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', verbose: true });
   assert.equal(result.status, 200);
   const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
   assert.deepEqual(byName.github.efforts, [
@@ -2412,7 +2412,7 @@ test('relay_info describes providers, workspaces and modes, tolerating missing r
   const { run, remote } = setup();
   delete remote.settings.grok;
   remote.fail('GET', '/api/relay/identity', remoteError(CODES.notFound, 'not found', 404));
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', verbose: true });
   assert.equal(result.status, 200);
   assert.equal(result.body.version, '0.9.4');
   assert.equal(result.body.platform, 'linux');
@@ -2453,7 +2453,7 @@ test('relay_info lists DeepSeek with its models while the remote has it switched
     model: 'deepseek-flash',
     models: ['deepseek-flash', 'deepseek-v4-pro'],
   };
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', provider: 'deepseek' });
   const deepseek = result.body.providers.find((entry) => entry.provider === 'deepseek');
   assert.equal(deepseek.configured, true);
   assert.equal(deepseek.defaultModel, 'deepseek-flash');
@@ -2461,7 +2461,7 @@ test('relay_info lists DeepSeek with its models while the remote has it switched
 
   // Saved key, switched off: listed, but not as a provider to start with.
   remote.settings.deepseek = { ...remote.settings.deepseek, enabled: false };
-  const off = await run('relay_info', { relay: 'linux-test' });
+  const off = await run('relay_info', { relay: 'linux-test', provider: 'deepseek' });
   assert.equal(off.body.providers.find((entry) => entry.provider === 'deepseek').configured, false);
 });
 
@@ -2473,7 +2473,7 @@ test('relay_info lists Claude API with its models while the remote has it switch
     model: 'claude-sonnet-5-5',
     models: ['claude-sonnet-5-5', 'claude-opus-5-5'],
   };
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', provider: 'claude-api' });
   const claudeApi = result.body.providers.find((entry) => entry.provider === 'claude-api');
   assert.equal(claudeApi.configured, true);
   assert.equal(claudeApi.defaultModel, 'claude-sonnet-5-5');
@@ -2481,7 +2481,7 @@ test('relay_info lists Claude API with its models while the remote has it switch
 
   // Saved key, switched off: listed, but not as a provider to start with.
   remote.settings['claude-api'] = { ...remote.settings['claude-api'], enabled: false };
-  const off = await run('relay_info', { relay: 'linux-test' });
+  const off = await run('relay_info', { relay: 'linux-test', provider: 'claude-api' });
   assert.equal(off.body.providers.find((entry) => entry.provider === 'claude-api').configured, false);
 });
 
@@ -2526,7 +2526,7 @@ test('relay_info lists Claude Cloud when the remote has it switched on, without 
   };
   // The cloud's ids are the Claude provider's: its efforts must not leak over.
   remote.models.reasoningByModel = { 'claude-sonnet-5': ['none', 'low', 'high'] };
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', provider: 'claude-cloud' });
   assert.equal(result.status, 200);
   const cloud = result.body.providers.find((entry) => entry.provider === 'claude-cloud');
   assert.equal(cloud.configured, true);
@@ -2538,13 +2538,178 @@ test('relay_info lists Claude Cloud when the remote has it switched on, without 
   assert.equal(JSON.stringify(cloud).includes('env_01EXAMPLE'), false, 'the environment stays on its relay');
 
   remote.settings['claude-cloud'] = { enabled: false, defaultModel: 'claude-sonnet-5-5', models: ['claude-sonnet-5-5'] };
-  const off = await run('relay_info', { relay: 'linux-test' });
+  const off = await run('relay_info', { relay: 'linux-test', provider: 'claude-cloud' });
   assert.deepEqual(off.body.providers.find((entry) => entry.provider === 'claude-cloud'), {
     provider: 'claude-cloud',
     configured: false,
     defaultModel: 'claude-sonnet-5-5',
     models: [],
   });
+});
+
+/** A remote with every provider set up, many models on one of them and many groups. */
+function withLargeCatalog(remote, { groups = 45 } = {}) {
+  const many = Array.from({ length: 89 }, (_, index) => `demo-model-${index + 2}`);
+  remote.settings.claude = { configured: true, enabled: true, model: 'demo-model-1', models: ['demo-model-1', ...many], availableModels: [] };
+  remote.settings.cursor = { configured: true, enabled: true, model: 'demo-cursor-1', models: ['demo-cursor-1', 'demo-cursor-2'], availableModels: [] };
+  remote.settings.grok = { configured: true, enabled: true, model: 'demo-grok-1', models: ['demo-grok-1', 'demo-grok-2', 'demo-grok-3'], availableModels: [] };
+  remote.settings.deepseek = { configured: true, enabled: true, model: 'demo-deep-1', models: ['demo-deep-1', 'demo-deep-2'] };
+  remote.settings['claude-api'] = { configured: true, enabled: true, model: 'demo-api-1', models: ['demo-api-1', 'demo-api-2'] };
+  remote.settings['claude-cloud'] = { enabled: true, defaultModel: 'demo-model-1', models: ['demo-model-1', 'demo-model-2'] };
+  remote.models.reasoningByProvider = {
+    claude: Object.fromEntries(['demo-model-1', ...many].map((model, index) => [model, index % 3 ? ['low', 'high'] : ['none', 'low', 'medium', 'high', 'xhigh', 'max']])),
+    grok: { 'demo-grok-1': ['low', 'high'] },
+  };
+  remote.models.reasoningByModel = { 'gpt-5.6-luna': ['low', 'medium', 'high'] };
+  remote.status.recentWorkspaceRoots = Array.from({ length: 12 }, (_, index) => `/home/dev/work/demo-${index + 1}`);
+  remote.groupList = Array.from({ length: groups }, (_, index) => ({ id: `grp_${String(index).padStart(20, '0')}`, name: `Demo group ${index + 1}`, memberCount: index + 1 }));
+  return many;
+}
+
+test('relay_info answers a summary by default: per provider the counts and the default model\'s efforts, no model lists', async () => {
+  const { run, remote } = setup();
+  const many = withLargeCatalog(remote);
+  const result = await run('relay_info', { relay: 'linux-test' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
+  assert.deepEqual(Object.keys(byName), REMOTE_RELAY_PROVIDERS);
+  for (const entry of result.body.providers) {
+    assert.equal('models' in entry, false, entry.provider);
+    assert.equal(entry.efforts === undefined || entry.efforts.every((level) => typeof level === 'string'), true, entry.provider);
+  }
+  assert.deepEqual(byName.claude, {
+    provider: 'claude',
+    configured: true,
+    defaultModel: 'demo-model-1',
+    modelCount: 1 + many.length,
+    efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+  });
+  assert.deepEqual(byName.github, {
+    provider: 'github',
+    configured: true,
+    defaultModel: 'gpt-5.6-luna',
+    modelCount: 2,
+    efforts: ['low', 'medium', 'high'],
+    engine: 'sdk',
+  });
+  assert.deepEqual(byName.grok, { provider: 'grok', configured: true, defaultModel: 'demo-grok-1', modelCount: 3, efforts: ['low', 'high'] });
+  assert.deepEqual(byName.deepseek, { provider: 'deepseek', configured: true, defaultModel: 'demo-deep-1', modelCount: 2 }, 'no efforts known: none listed');
+  assert.equal('efforts' in byName['claude-cloud'], false, 'a cloud session takes no effort');
+  assert.equal(byName['claude-cloud'].modelCount, 2);
+  assert.match(byName['claude-cloud'].note, /create_session needs repo/);
+  assert.equal(result.body.hint, 'Pass provider "<name>" for that provider\'s models and efforts, verbose true for the full lists.');
+  assert.equal(result.body.workspaces.recent.length, 8);
+  assert.deepEqual(result.body.workspaces.recent, remote.status.recentWorkspaceRoots.slice(0, 8));
+  assert.equal(result.body.groups.length, 15);
+  assert.equal(result.body.moreGroups, 30);
+  assert.equal('groupsTotal' in result.body, false);
+  assert.match(result.body.summary, /providers github, openai, claude, cursor, grok, claude-cloud, deepseek, claude-api/);
+
+  // What the agent reads: compact JSON, far below a CLI's result cut.
+  const text = formatRemoteRelayToolResult({ ...result.body });
+  assert.ok(Buffer.byteLength(text) < 6000, `${Buffer.byteLength(text)} bytes`);
+  const full = await run('relay_info', { relay: 'linux-test', verbose: true });
+  assert.ok(Buffer.byteLength(formatRemoteRelayToolResult(full.body)) > Buffer.byteLength(text) * 2);
+});
+
+test('relay_info summary: an unconfigured provider has no count, and a remote without groups keeps its note', async () => {
+  const { run, remote } = setup();
+  remote.settings.copilot = { engine: 'sdk', engines: ['sdk'], enabled: false };
+  const result = await run('relay_info', { relay: 'linux-test' });
+  const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
+  assert.deepEqual(byName.cursor, { provider: 'cursor', configured: false, defaultModel: 'composer-2.5', modelCount: 0 });
+  assert.deepEqual(byName.deepseek, { provider: 'deepseek', configured: false, defaultModel: null, modelCount: 0 });
+  assert.deepEqual(byName.github, { provider: 'github', configured: false, defaultModel: null, modelCount: 0, engine: 'sdk' });
+  assert.equal(result.body.groups, null);
+  assert.match(result.body.groupsNote, /create_session cannot take group there\.$/);
+  assert.equal('moreGroups' in result.body, false);
+});
+
+test('relay_info summary lists the 15 groups with the latest activity and counts the rest', async () => {
+  const { run, remote } = setup();
+  withLargeCatalog(remote, { groups: 20 });
+  const many = await run('relay_info', { relay: 'linux-test' });
+  assert.deepEqual(many.body.groups, remote.groupList.slice(0, 15));
+  assert.equal(many.body.moreGroups, 5);
+
+  // More than the full list carries (50): the rest still counts them all.
+  withLargeCatalog(remote, { groups: 55 });
+  assert.equal((await run('relay_info', { relay: 'linux-test' })).body.moreGroups, 40);
+
+  for (const count of [15, 3]) {
+    withLargeCatalog(remote, { groups: count });
+    const few = await run('relay_info', { relay: 'linux-test' });
+    assert.equal(few.body.groups.length, count);
+    assert.equal('moreGroups' in few.body, false, String(count));
+  }
+});
+
+test('relay_info with provider lists that provider in full and keeps the rest a summary', async () => {
+  const { run, remote } = setup();
+  const many = withLargeCatalog(remote);
+  const full = await run('relay_info', { relay: 'linux-test', verbose: true });
+  const fullClaude = full.body.providers.find((entry) => entry.provider === 'claude');
+  assert.equal(fullClaude.models.length, 1 + many.length);
+  assert.ok(fullClaude.efforts.length > 1, 'grouped efforts');
+
+  const result = await run('relay_info', { relay: 'linux-test', provider: 'Claude' });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.deepEqual(result.body.providers, [fullClaude]);
+  assert.equal(result.body.groups.length, 15);
+  assert.equal(result.body.moreGroups, 30);
+  assert.equal(result.body.workspaces.recent.length, 8);
+  assert.equal(typeof result.body.hint, 'string');
+  assert.equal('ignored' in result.body, false);
+
+  const both = await run('relay_info', { relay: 'linux-test', provider: 'claude', verbose: true });
+  assert.deepEqual(both.body.providers, [fullClaude]);
+  assert.deepEqual(both.body.groups, full.body.groups);
+  assert.equal(both.body.groupsTotal, undefined, 'all 45 fit the full list');
+  assert.equal(both.body.groups.length, 45);
+  assert.equal(both.body.workspaces.recent.length, 12);
+  assert.equal('hint' in both.body, false);
+});
+
+test('relay_info refuses a provider it does not know, names the valid ones and asks the remote nothing', async () => {
+  const { run, remote } = setup();
+  const refused = await run('relay_info', { relay: 'linux-test', provider: 'nope' });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.code, CODES.invalidInput);
+  assert.equal(refused.body.error, `provider "nope" is not a provider relay_info knows; pass one of: ${REMOTE_RELAY_PROVIDERS.join(', ')}, or leave it out for all of them.`);
+  assert.deepEqual(refused.body.providers, REMOTE_RELAY_PROVIDERS);
+  assert.equal(remote.calls.length, 0);
+  assert.match((await run('relay_info', { relay: 'linux-test', provider: 'not a name!' })).body.error, /provider must be a provider id/);
+  assert.equal((await run('relay_info', { relay: 'linux-test', verbose: 'maybe' })).body.error, 'verbose must be true or false');
+});
+
+test('relay_info verbose answers the full output: every provider with its models and grouped efforts, all groups, no hint', async () => {
+  const { run, remote } = setup();
+  const many = withLargeCatalog(remote);
+  const result = await run('relay_info', { relay: 'linux-test', verbose: true });
+  assert.equal(result.status, 200);
+  assert.equal('hint' in result.body, false);
+  assert.equal('moreGroups' in result.body, false);
+  assert.equal(result.body.groups.length, 45);
+  assert.equal(result.body.workspaces.recent.length, 12);
+  const byName = Object.fromEntries(result.body.providers.map((entry) => [entry.provider, entry]));
+  assert.deepEqual(byName.claude.models, ['demo-model-1', ...many]);
+  assert.deepEqual(byName.claude.efforts.map((group) => group.efforts), [['low', 'high'], ['none', 'low', 'medium', 'high', 'xhigh', 'max']]);
+  assert.equal(byName.claude.efforts[0].more, 20, 'grouped and capped as before');
+  assert.deepEqual(byName.grok.models, ['demo-grok-1', 'demo-grok-2', 'demo-grok-3']);
+  assert.deepEqual(byName.grok.efforts, [{ efforts: ['low', 'high'], models: ['demo-grok-1'] }]);
+  assert.deepEqual(byName.github, {
+    provider: 'github', configured: true, defaultModel: 'gpt-5.6-luna', models: ['gpt-5.6-luna', 'claude-sonnet-5'],
+    efforts: [{ efforts: ['low', 'medium', 'high'], models: ['gpt-5.6-luna'] }], engine: 'sdk',
+  });
+  for (const entry of result.body.providers) assert.ok(Array.isArray(entry.models), entry.provider);
+});
+
+test('relay_info takes provider and verbose: neither comes back in ignored', async () => {
+  const { run } = setup();
+  const result = await run('relay_info', { relay: 'linux-test', provider: 'claude', verbose: true });
+  assert.equal(result.status, 200);
+  assert.equal('ignored' in result.body, false);
+  assert.deepEqual((await run('relay_info', { relay: 'linux-test', provider: 'claude', session: 'conv-1' })).body.ignored, ['session']);
 });
 
 test('create_session opens a Claude Cloud session on a paired relay from repo and branch', async () => {
@@ -4429,7 +4594,7 @@ const QA_GROUP = Object.freeze({ id: 'grp_qa000000000000000001', name: 'QA', mem
 test('relay_info lists the target\'s groups (id, name, member count), capped', async () => {
   const { run, remote } = setup();
   remote.groupList = Array.from({ length: 55 }, (_, index) => ({ id: `grp_${String(index).padStart(20, '0')}`, name: `Batch ${index}`, memberCount: index + 1 }));
-  const result = await run('relay_info', { relay: 'linux-test' });
+  const result = await run('relay_info', { relay: 'linux-test', verbose: true });
   assert.equal(result.status, 200);
   assert.equal(result.body.groups.length, 50);
   assert.equal(result.body.groupsTotal, 55);
@@ -4437,7 +4602,7 @@ test('relay_info lists the target\'s groups (id, name, member count), capped', a
   assert.equal('groupsNote' in result.body, false);
 
   remote.groupList = [DOCS_GROUP];
-  const few = await run('relay_info', { relay: 'linux-test' });
+  const few = await run('relay_info', { relay: 'linux-test', verbose: true });
   assert.deepEqual(few.body.groups, [{ id: DOCS_GROUP.id, name: 'Docs batch', memberCount: 3 }]);
   assert.equal('groupsTotal' in few.body, false);
 });
@@ -4470,7 +4635,7 @@ test('create_session with an unknown group starts the session in no group, with 
   assert.equal(result.status, 200, JSON.stringify(result.body));
   assert.equal(result.body.group, null);
   assert.equal(result.body.groupWarning,
-    'The session was created in no group: relay "linux-test" has no session group "Release", and only the owner makes groups. Tell the user; name an existing group next time (relay_info lists them).');
+    'The session was created in no group: relay "linux-test" has no session group "Release", and only the owner makes groups. Tell the user; name an existing group next time (relay_info with verbose true lists them all).');
   assert.equal(remote.conversations.size, 1);
   assert.equal(remote.groupList.length, 2, 'no group was made');
   assert.equal(approvals[0].group, undefined, 'the card names no group it will not use');
@@ -5804,7 +5969,7 @@ test('answer_question in ask mode shows the user no approval card: it is refused
 test('a remote with Copilot switched off lists github as not set up; one that says nothing (older) keeps it on', async () => {
   const { run, remote } = setup();
   remote.settings.copilot = { engine: 'sdk', engines: ['sdk'], enabled: false, cliFound: true };
-  const off = await run('relay_info', { relay: 'linux-test' });
+  const off = await run('relay_info', { relay: 'linux-test', verbose: true });
   const byName = Object.fromEntries(off.body.providers.map((entry) => [entry.provider, entry]));
   assert.deepEqual(byName.github, { provider: 'github', configured: false, defaultModel: null, models: [], engine: 'sdk' });
   assert.match(off.body.summary, /providers openai, claude/);

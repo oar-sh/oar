@@ -5,8 +5,8 @@
 // keeps and answers.
 //
 // The list comes from GET /api/inbox (this relay and every paired relay that
-// answers), again on every change of a question here (socket) and every
-// minute for the paired relays. Answering here is answering the card in its
+// answers), again on every change of a question here (socket), of a session
+// group here (its names and members), and every minute for the paired relays. Answering here is answering the card in its
 // session, through the question routes. A paired relay's asks and cards are
 // answered on that relay, by its person: they show read-only with "Open
 // there". Only while the relay says its pairing carries answers
@@ -18,6 +18,10 @@
 // a popup with the option preselected, where its person confirms (agent auth
 // §13.2, 1a). The popup has no opener, so the Inbox reloads when this window
 // is back in front.
+//
+// How it is shown (the filters, the Groups picker, folded cards and
+// sections) is one view, kept in `oar_inbox_view` (inbox-view-state.mjs) and
+// shared with the 📓 panel: Unanswered and the card folds apply there too.
 
 import { apiFetch, answerRelayQuestion, dismissRemoteRelayRefusalNotice } from './api-client.js';
 import { currentConvId, IS_SHARED_VIEW, setCurrentConv, showTransientRelayNotice } from './store.js';
@@ -34,8 +38,18 @@ import {
   renderInbox,
   restoreInboxFolds,
 } from './inbox-view.mjs';
+import { captureListAnchor, inboxItemSection, INBOX_ITEM_SELECTOR, restoreListAnchor } from './inbox-scroll-anchor.mjs';
+import {
+  inboxItemKey,
+  mergeInboxViewChange,
+  normalizeInboxView,
+  pruneInboxView,
+  readInboxView,
+  setItemsFolded,
+  toggleInList,
+  writeInboxView,
+} from './inbox-view-state.mjs';
 
-const FILTER_STORAGE_KEY = 'oar_inbox_filter';
 const REFRESH_MS = 60_000;
 const CHANGE_DEBOUNCE_MS = 400;
 
@@ -45,7 +59,9 @@ let relays = [];
 let loaded = false;
 // GET /api/inbox's `pairedAnswers`: whether a paired relay's asks are answered from here.
 let pairedAnswers = false;
-let filter = 'all';
+// The view (oar_inbox_view): who, Unanswered, This relay, the picked groups,
+// the folds; and, not stored, `groupsOpen` while the Groups picker is open.
+let filter = normalizeInboxView(null);
 let refreshTimer = null;
 // A popup to answer on a paired relay was opened: reload when back in front.
 let answerThereOpen = false;
@@ -66,7 +82,8 @@ let inboxScrollTop = 0;
 // The 📓 panel's side (questions-panel-ui.js), handed in so the two modules
 // do not import each other: an ask the answer routes returned, "open" on an
 // ask's session, and that open having run (or failed).
-let askHooks = { onAskUpdated: null, onOpenAsk: null, onOpenSettled: null };
+// `onViewChanged`: the view changed (a filter, a fold), the panel draws anew.
+let askHooks = { onAskUpdated: null, onOpenAsk: null, onOpenSettled: null, onViewChanged: null };
 
 export function setInboxAskHooks(hooks = {}) {
   askHooks = { ...askHooks, ...hooks };
@@ -74,11 +91,82 @@ export function setInboxAskHooks(hooks = {}) {
 
 function readFilter() {
   try {
-    const stored = String(localStorage.getItem(FILTER_STORAGE_KEY) || '');
-    return INBOX_FILTERS.includes(stored) ? stored : 'all';
+    return readInboxView(localStorage);
   } catch {
-    return 'all';
+    return normalizeInboxView(null);
   }
+}
+
+/** The view the Inbox and 📓 are shown with (a copy). */
+export function getInboxView() {
+  return normalizeInboxView(filter);
+}
+
+/** Whether the card of `itemId` on `relayId` is folded to one line. */
+export function isInboxItemFolded(relayId, itemId) {
+  return filter.foldedItems.includes(inboxItemKey(relayId, itemId));
+}
+
+// Stored as a change on what storage holds now: another tab's folds and
+// filters stay, only what changed here is written over them.
+function saveView(next) {
+  let stored = filter;
+  try { stored = readInboxView(localStorage); } catch {}
+  filter = { ...mergeInboxViewChange(stored, filter, next), groupsOpen: next.groupsOpen === true };
+  try { writeInboxView(localStorage, filter); } catch {}
+}
+
+/**
+ * The view changed: the Inbox and 📓 are drawn anew, and the control that
+ * was used keeps the focus (it is a new node now; `data-focus-key` finds it).
+ */
+function viewChanged(target) {
+  const focusKey = target?.dataset?.focusKey || '';
+  const hadFocus = !!target && document.activeElement === target;
+  renderInboxNow();
+  try { askHooks.onViewChanged?.(); } catch {}
+  if (!focusKey || !hadFocus) return;
+  const again = [...document.querySelectorAll('[data-focus-key]')].find((node) => node.dataset.focusKey === focusKey);
+  again?.focus?.({ preventScroll: true });
+}
+
+// The cards a ➖ acts on: those drawn where it sits (the Inbox, or 📓).
+function cardsInView(target) {
+  const root = target.closest('.inbox-view, .questions-panel');
+  return [...(root?.querySelectorAll('.inbox-item[data-item-id]') || [])];
+}
+
+function cardKey(card) {
+  return inboxItemKey(card?.dataset.relayId, card?.dataset.itemId);
+}
+
+/** A filter chip, ➖, a chevron: the view's next state, or null for another click. */
+function nextView(target) {
+  const action = target.dataset.inboxView;
+  if (action === 'unanswered') return { ...filter, unanswered: !filter.unanswered };
+  if (action === 'this-relay') return { ...filter, thisRelay: !filter.thisRelay };
+  if (action === 'fold-section') {
+    const key = String(target.dataset.sectionKey || '');
+    return key ? { ...filter, foldedSections: toggleInList(filter.foldedSections, key) } : null;
+  }
+  if (action === 'fold-item' || action === 'unfold-item') {
+    const card = target.closest('.inbox-item');
+    return card ? setItemsFolded(filter, [cardKey(card)], action === 'fold-item') : null;
+  }
+  if (action === 'fold-all') {
+    const cards = cardsInView(target);
+    const unfold = cards.length > 0 && cards.every((card) => card.classList.contains('is-folded'));
+    return setItemsFolded(filter, cards.map(cardKey), !unfold);
+  }
+  return null;
+}
+
+/** A Groups checkbox ticked or unticked: the list narrows to the ticked groups. */
+function pickGroup(box) {
+  const key = String(box.dataset.inboxGroupKey || '');
+  if (!key) return;
+  saveView({ ...filter, groups: toggleInList(filter.groups, key, box.checked) });
+  viewChanged(box);
 }
 
 export function isInboxViewActive() {
@@ -132,10 +220,18 @@ export function restoreDrafts(host, focusedKey) {
 }
 
 /**
- * Draws the Inbox into the transcript's place. A re-render keeps the scroll
- * height; the render that opens the view (`opening`) takes the height the
- * Inbox had when it was last left, not the one the transcript showed.
+ * Draws the Inbox into the transcript's place. A re-render keeps the cards
+ * the reader sees in place (inbox-scroll-anchor.mjs); the render that opens
+ * the view (`opening`) takes the height the Inbox had when it was last left,
+ * not the one the transcript showed.
  */
+// A card's section for the anchor: its relay, pending or closed, and its
+// session's group. A card whose session moved to another group went away
+// from the reader; a group's sub-heading coming or going changes nothing.
+function inboxCardSection(node) {
+  return `${inboxItemSection(node)}\n${node?.dataset?.groupId || ''}`;
+}
+
 function renderInboxNow({ opening = false } = {}) {
   if (!inboxActive) return;
   const host = document.getElementById('messages');
@@ -143,10 +239,13 @@ function renderInboxNow({ opening = false } = {}) {
   const focused = captureDrafts(host);
   if (host.querySelector('.inbox-view')) captureInboxFolds(openFolds, host);
   const top = opening ? inboxScrollTop : host.scrollTop;
+  // A refresh keeps the cards the reader sees where they were, not the pixels.
+  const anchor = opening ? null : captureListAnchor(host, INBOX_ITEM_SELECTOR, { sectionOf: inboxCardSection });
   host.replaceChildren(renderInbox(document, { relays, filter, now: Date.now(), loading: !loaded, pairedAnswers }));
   restoreDrafts(host, focused);
   restoreInboxFolds(openFolds, host);
   host.scrollTop = top;
+  restoreListAnchor(host, anchor);
   const title = document.getElementById('chat-title');
   if (title) {
     const { pending: count, urgentCount } = inboxBadge(relays);
@@ -184,6 +283,8 @@ async function loadInbox() {
     pairedAnswers = response.pairedAnswers === true;
     loaded = true;
     pruneInboxFolds(openFolds, relays);
+    const pruned = pruneInboxView(filter, relays);
+    if (pruned !== filter) saveView(pruned);
   }
   syncInboxBadge();
   renderInboxNow();
@@ -216,6 +317,11 @@ export function noteRelayAskUpdated() {
 
 /** Socket: a card a turn waits on came or went. */
 export function noteInboxQuestionsChanged() {
+  scheduleRefresh();
+}
+
+/** Socket (conversation_group_changed): a group's name or members changed here. */
+export function noteInboxGroupsChanged() {
   scheduleRefresh();
 }
 
@@ -396,9 +502,16 @@ async function handleAction(target) {
     return;
   }
   if (data.inboxFilter) {
-    filter = INBOX_FILTERS.includes(data.inboxFilter) ? data.inboxFilter : 'all';
-    try { localStorage.setItem(FILTER_STORAGE_KEY, filter); } catch {}
-    renderInboxNow();
+    saveView({ ...filter, who: INBOX_FILTERS.includes(data.inboxFilter) ? data.inboxFilter : 'all' });
+    viewChanged(target);
+    return;
+  }
+  if (data.inboxView) {
+    const next = nextView(target);
+    if (next) {
+      saveView(next);
+      viewChanged(target);
+    }
     return;
   }
   if (data.inboxAction === 'open') {
@@ -448,7 +561,7 @@ export function bindInboxActionHost(host, { scope = '.inbox-view' } = {}) {
   if (!host || host.dataset.inboxActionsBound === '1') return;
   host.dataset.inboxActionsBound = '1';
   host.addEventListener('click', (event) => {
-    const target = event.target instanceof Element ? event.target.closest('[data-inbox-action], [data-inbox-filter]') : null;
+    const target = event.target instanceof Element ? event.target.closest('[data-inbox-action], [data-inbox-filter], [data-inbox-view]') : null;
     if (!target || !target.closest(scope)) return;
     event.preventDefault();
     void handleAction(target);
@@ -462,17 +575,43 @@ export function bindInboxActionHost(host, { scope = '.inbox-view' } = {}) {
     }
   });
   // A fold opened or closed by hand. `toggle` does not bubble: caught on the
-  // way down.
+  // way down. The Groups picker's open state is kept the same way.
   host.addEventListener('toggle', (event) => {
-    const details = event.target instanceof Element && event.target.matches(INBOX_FOLD_SELECTOR) ? event.target : null;
+    const node = event.target instanceof Element ? event.target : null;
+    if (node?.matches('details.inbox-groups-picker') && node.isConnected) filter = { ...filter, groupsOpen: node.open };
+    const details = node?.matches(INBOX_FOLD_SELECTOR) ? node : null;
     if (details && details.isConnected) noteInboxFold(openFolds, details);
   }, true);
+  host.addEventListener('change', (event) => {
+    const box = event.target instanceof Element && event.target.matches('input[data-inbox-group-key]') ? event.target : null;
+    if (box && box.closest(scope)) pickGroup(box);
+  });
+  // Escape in the open Groups picker closes it, back on its toggle.
+  host.addEventListener('keydown', (event) => {
+    const picker = event.key === 'Escape' && event.target instanceof Element ? event.target.closest('details.inbox-groups-picker[open]') : null;
+    if (!picker) return;
+    event.preventDefault();
+    event.stopPropagation();
+    picker.open = false;
+    filter = { ...filter, groupsOpen: false };
+    picker.querySelector('summary')?.focus?.({ preventScroll: true });
+  });
+}
+
+// A click outside the open Groups picker closes it.
+function closeGroupsPickerOutside(event) {
+  if (!filter.groupsOpen) return;
+  const inside = event.target instanceof Element && event.target.closest('details.inbox-groups-picker');
+  if (inside) return;
+  filter = { ...filter, groupsOpen: false };
+  for (const picker of document.querySelectorAll('details.inbox-groups-picker[open]')) picker.open = false;
 }
 
 function bindClicks() {
   if (clickBound) return;
   clickBound = true;
   bindInboxActionHost(document.getElementById('messages'));
+  document.addEventListener('click', closeGroupsPickerOutside);
 }
 
 /** Boot: the count and a refresh every minute (paired relays). */

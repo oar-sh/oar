@@ -402,6 +402,7 @@ keyset K8 deepseekUsageImportService
 keyset K8 getCardCurrency
 keyset K8 remoteRelayInbound
 keyset K9 auth
+keyset K9 conversationGroups
 keyset K9 db
 keyset K9 formatQuestionRow
 keyset K9 formatRelayBoardRow
@@ -744,6 +745,8 @@ route POST /api/auth/notices/:id/dismiss
 route GET /api/previews
 route POST /api/previews
 route DELETE /api/previews/:token
+route GET /api/settings/preview-max-live
+route POST /api/settings/preview-max-live
 timer after-start setInterval 10000ms ref x1
 timer after-start setInterval 15000ms ref x1
 timer after-start setInterval 21600000ms unref x1

@@ -32,6 +32,44 @@ export const ACP_PROMPT_MAX_TURN_MS = 1_800_000;
 // the silence as a stall after all.
 export const ACP_HOLD_CHECK_TIMEOUT_MS = 10_000;
 
+// The Grok CLI connects a session's MCP servers in the background after
+// session/new or session/load has answered, and reports each one with this
+// notification: `{ sessionId, name, source, status, reason, tools }`, status
+// `ready` once the server has answered initialize and tools/list, or
+// `unavailable` when its handshake failed (the CLI then retries a few times).
+export const ACP_MCP_SERVER_STATUS_METHOD = '_x.ai/mcp/server_status';
+export const MCP_SERVER_READY_STATUS = 'ready';
+// Sent once all MCP servers of a session are connected: `{ sessionId,
+// mcpToolCount, elapsedMs }`. A wait for a server no status was reported for
+// ends with it, for a CLI build that sends this but not the per-server status.
+export const ACP_MCP_INITIALIZED_METHOD = '_x.ai/mcp_initialized';
+export const MCP_ALL_SERVERS_INITIALIZED_REASON = 'all servers initialized';
+// Statuses that end a wait without a ready server: the prompt need not keep
+// waiting on a server whose start has failed.
+const MCP_SERVER_FAILED_STATUSES = new Set(['unavailable', 'failed', 'error', 'disabled']);
+
+// The Grok CLI cuts an MCP tool result inline at 20,000 bytes unless its
+// environment raises the cap; a relay_tool answer (a session read, a long
+// reply) easily runs past that. The CLI reads either name; one the host set
+// itself wins over this default.
+export const GROK_MCP_OUTPUT_ENV_NAMES = Object.freeze(['GROK_MAX_MCP_OUTPUT_BYTES', 'MAX_MCP_OUTPUT_BYTES']);
+export const GROK_MAX_MCP_OUTPUT_BYTES = 65_536;
+
+/** The Grok CLI child's environment: the one passed on, plus OAR's defaults. */
+export function buildGrokChildEnv(env = process.env) {
+  const base = env && typeof env === 'object' ? env : {};
+  const hostSetsCap = GROK_MCP_OUTPUT_ENV_NAMES.some((name) => String(base[name] ?? '').trim() !== '');
+  return {
+    ...base,
+    GROK_DISABLE_AUTOUPDATER: base.GROK_DISABLE_AUTOUPDATER || '1',
+    ...(hostSetsCap ? {} : { [GROK_MCP_OUTPUT_ENV_NAMES[0]]: String(GROK_MAX_MCP_OUTPUT_BYTES) }),
+  };
+}
+
+function mcpServerStateKey(sessionId, name) {
+  return `${String(sessionId || '')}\u0000${String(name || '')}`;
+}
+
 /**
  * An MCP server launch (`{ command, args, env }`, see
  * server/mcp/oar-mcp-server.mjs `buildOarMcpServerLaunch`) in the ACP stdio
@@ -118,6 +156,89 @@ export class AcpClient extends EventEmitter {
     this.dead = false;
     this.initializeResult = null;
     this.lastActivityAt = Date.now();
+    // The latest ACP_MCP_SERVER_STATUS_METHOD report per session and server
+    // name. Kept from the first line on: a report can arrive before the
+    // session/new answer it belongs to has been read.
+    this.mcpServerStates = new Map();
+    // Sessions the agent reported ACP_MCP_INITIALIZED_METHOD for.
+    this.mcpInitializedSessions = new Set();
+  }
+
+  _noteMcpInitialized(params) {
+    const sessionId = String(params?.sessionId || '').trim();
+    if (!sessionId) return;
+    this.mcpInitializedSessions.add(sessionId);
+    this.emit('mcpInitialized', { sessionId });
+  }
+
+  _noteMcpServerStatus(params) {
+    const sessionId = String(params?.sessionId || '').trim();
+    const name = String(params?.name || '').trim();
+    if (!sessionId || !name) return;
+    const state = {
+      sessionId,
+      name,
+      status: String(params?.status || '').trim().toLowerCase(),
+      reason: String(params?.reason || '').trim(),
+      at: Date.now(),
+    };
+    this.mcpServerStates.set(mcpServerStateKey(sessionId, name), state);
+    this.emit('mcpServerStatus', state);
+  }
+
+  /** The latest status the agent reported for one MCP server of a session, or null. */
+  mcpServerState(sessionId, name) {
+    return this.mcpServerStates.get(mcpServerStateKey(sessionId, name)) || null;
+  }
+
+  /**
+   * Wait until the agent reports the named MCP server of a session as ready
+   * (connected, tools listed), its start as failed, or `timeoutMs` has
+   * passed. All servers of the session reported initialized also counts as
+   * ready while no status for this one has come. Never rejects and never
+   * hangs: an agent build that sends neither report costs the timeout, a dead
+   * agent ends the wait at once.
+   * Resolves `{ status: 'ready' | 'failed' | 'timeout' | 'closed', reason, waitedMs }`.
+   */
+  waitForMcpServer(sessionId, name, { timeoutMs = 10_000 } = {}) {
+    const startedAt = Date.now();
+    const verdict = (state) => {
+      if (!state) return '';
+      if (state.status === MCP_SERVER_READY_STATUS) return 'ready';
+      if (MCP_SERVER_FAILED_STATUSES.has(state.status)) return 'failed';
+      return '';
+    };
+    const finish = (status, reason = '') => ({ status, reason, waitedMs: Date.now() - startedAt });
+    const allInitialized = () => this.mcpInitializedSessions.has(String(sessionId || ''))
+      && !this.mcpServerState(sessionId, name);
+    const known = this.mcpServerState(sessionId, name);
+    if (verdict(known)) return Promise.resolve(finish(verdict(known), known.reason));
+    if (allInitialized()) return Promise.resolve(finish('ready', MCP_ALL_SERVERS_INITIALIZED_REASON));
+    if (this.dead) return Promise.resolve(finish('closed'));
+    return new Promise((resolve) => {
+      let timer = null;
+      const done = (result) => {
+        if (timer) clearTimeout(timer);
+        this.off('mcpServerStatus', onStatus);
+        this.off('mcpInitialized', onInitialized);
+        this.off('exit', onExit);
+        resolve(result);
+      };
+      const onStatus = (state) => {
+        if (state.sessionId !== String(sessionId || '') || state.name !== String(name || '')) return;
+        const status = verdict(state);
+        if (status) done(finish(status, state.reason));
+      };
+      const onInitialized = () => {
+        if (allInitialized()) done(finish('ready', MCP_ALL_SERVERS_INITIALIZED_REASON));
+      };
+      const onExit = () => done(finish('closed'));
+      this.on('mcpServerStatus', onStatus);
+      this.on('mcpInitialized', onInitialized);
+      this.on('exit', onExit);
+      timer = setTimeout(() => done(finish('timeout')), Math.max(0, Number(timeoutMs) || 0));
+      timer.unref?.();
+    });
   }
 
   _touchActivity() {
@@ -139,10 +260,7 @@ export class AcpClient extends EventEmitter {
 
     this.proc = this.spawnImpl(this.command, this.args, {
       cwd: this.spawnCwd,
-      env: {
-        ...this.env,
-        GROK_DISABLE_AUTOUPDATER: this.env.GROK_DISABLE_AUTOUPDATER || '1',
-      },
+      env: buildGrokChildEnv(this.env),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       shell: false,
@@ -200,6 +318,8 @@ export class AcpClient extends EventEmitter {
     }
 
     if (msg.method) {
+      if (msg.method === ACP_MCP_SERVER_STATUS_METHOD) this._noteMcpServerStatus(msg.params);
+      else if (msg.method === ACP_MCP_INITIALIZED_METHOD) this._noteMcpInitialized(msg.params);
       this.emit('notification', msg);
       // Method-named convenience events — except 'error', which EventEmitter
       // treats specially: an agent sending {"method":"error"} would otherwise
@@ -303,7 +423,7 @@ export class AcpClient extends EventEmitter {
     this.proc.stdin.write(`${payload}\n`, 'utf8');
   }
 
-  async initialize(clientInfo = { name: 'copilot-remote-grok', version: '1.0.0' }) {
+  async initialize(clientInfo = { name: 'oar', version: '1.0.0' }) {
     this.start();
     this.initializeResult = await this.request('initialize', {
       protocolVersion: 1,

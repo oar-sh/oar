@@ -365,7 +365,7 @@ test.describe.serial("the Inbox", () => {
     // ?answer= (capabilities.answerLink, stored when A added B): one button
     // per option opens B's page in a popup with it preselected; nothing is
     // answered from here.
-    const choices = item.locator("button[data-inbox-action]");
+    const choices = item.locator('button[data-inbox-action="answer-there"]');
     await expect(choices).toHaveText(["Tonight", "Tomorrow"]);
     for (const choice of await choices.all()) {
       await expect(choice).toHaveAttribute("data-inbox-action", "answer-there");
@@ -436,6 +436,132 @@ test.describe.serial("the Inbox", () => {
     await expect(card.locator("details.inbox-item-detail")).not.toHaveAttribute("open", "");
   });
 
+  // ─── Filters, groups and folds ─────────────────────────────────
+
+  test("Unanswered and This relay narrow the list; a grouped session's ask sits under its group, and Groups picks it", async ({ page }) => {
+    // On A: a group of the worker, an ask in it, one outside it answered.
+    const grouped = await apiA("/api/conversation-groups", { method: "POST", body: { name: "Harbour survey", conversationIds: [sessions.worker] } });
+    expect(grouped.status, JSON.stringify(grouped.payload)).toBe(200);
+    const groupId = grouped.payload.group.id;
+    const inGroup = await toolA(sessions.worker, "ask", { question: "Survey the north pier first?", options: ["Yes", "No"] });
+    expect(inGroup.status, JSON.stringify(inGroup.payload)).toBe(200);
+    const done = await toolA(sessions.lead, "ask", { question: "Keep the tide tables?", options: ["Yes", "No"] });
+    expect((await apiA(`/api/relay-question/${encodeURIComponent(done.payload.question_id)}/answer`, { method: "POST", body: { answer: "Yes" } })).status).toBe(200);
+    // On B: its session in a group of B's; A's Inbox learns it from B.
+    expect((await apiB("/api/conversation-groups", { method: "POST", body: { name: "Night shift", conversationIds: [sessions.far] } })).status).toBe(200);
+    const far = await toolA(sessions.lead, "ask", { relay: "linux-test", session: sessions.far, question: "Close the lock at dusk?" });
+    expect(far.status, JSON.stringify(far.payload)).toBe(200);
+
+    await openApp(page, DESKTOP);
+    await openInbox(page);
+    const inbox = page.locator(".inbox-view");
+    const here = inbox.locator('.inbox-relay[data-relay-id="self"]');
+    const there = page.locator('.inbox-relay:has(.inbox-relay-name:text-is("linux-test"))');
+    // The grouped ask under its group's sub-section, the rest under "No group".
+    const group = here.locator(`.inbox-group[data-group-id="${groupId}"]`);
+    await expect(group.locator("h3 .inbox-group-name")).toHaveText("Harbour survey");
+    await expect(group.locator(`.inbox-item[data-item-id="${inGroup.payload.question_id}"]`)).toBeVisible();
+    await expect(here.locator(".inbox-group.is-no-group h3 .inbox-group-name")).toHaveText("No group");
+    await expect(here.locator(`.inbox-group.is-no-group .inbox-item[data-item-id="${done.payload.question_id}"]`)).toHaveAttribute("data-status", "answered");
+    // B's items are all in one group: no sub-heading there.
+    await expect(there.locator(`.inbox-item[data-item-id="${far.payload.question_id}"]`)).toBeVisible();
+    await expect(there.locator(".inbox-group")).toHaveCount(0);
+
+    // Unanswered: what closed goes, everywhere.
+    const unanswered = inbox.locator('[data-inbox-view="unanswered"]');
+    await unanswered.click();
+    await expect(unanswered).toHaveAttribute("aria-pressed", "true");
+    await expect(inbox.locator('.inbox-item[data-status="answered"], .inbox-item[data-status="dismissed"]')).toHaveCount(0);
+    await expect(inbox.locator(".inbox-divider")).toHaveCount(0);
+    // This relay: B's section goes.
+    const thisRelay = inbox.locator('[data-inbox-view="this-relay"]');
+    await thisRelay.click();
+    await expect(there).toHaveCount(0);
+    await expect(here.locator(`.inbox-item[data-item-id="${inGroup.payload.question_id}"]`)).toBeVisible();
+    // Kept across a reload.
+    await page.reload();
+    await page.waitForFunction(() => typeof window.toggleInboxView === "function");
+    await openInbox(page);
+    await expect(thisRelay).toHaveAttribute("aria-pressed", "true");
+    await expect(there).toHaveCount(0);
+    await thisRelay.click();
+    await unanswered.click();
+    await expect(there).toBeVisible();
+
+    // Groups ▾: one group ticked, only its items; B's group is named with B.
+    const picker = inbox.locator("details.inbox-groups-picker");
+    await picker.locator("summary").click();
+    await expect(picker.locator(".inbox-groups-label", { hasText: "Night shift · linux-test" })).toBeVisible();
+    await picker.locator("label.inbox-groups-choice", { hasText: "Harbour survey" }).click();
+    await expect(picker.locator("summary")).toHaveText("Groups (1) ▾");
+    await expect(picker).toHaveAttribute("open", "");
+    // One group left: its items, without a sub-heading.
+    await expect(here.locator(`.inbox-item[data-item-id="${inGroup.payload.question_id}"]`)).toBeVisible();
+    await expect(here.locator(".inbox-group")).toHaveCount(0);
+    await expect.poll(() => here.locator(".inbox-item").evaluateAll((cards) => [...new Set(cards.map((card) => card.dataset.groupId))])).toEqual([groupId]);
+    await expect(here.locator(`.inbox-item[data-item-id="${done.payload.question_id}"]`)).toHaveCount(0);
+    // B's waiting asks are filtered out, and its section says so instead of vanishing.
+    await expect(there.locator(".inbox-item")).toHaveCount(0);
+    await expect(there.locator(".inbox-empty")).toHaveText("Nothing matches this filter.");
+    // Escape closes the picker; unticked, everything is back.
+    await page.keyboard.press("Escape");
+    await expect(picker).not.toHaveAttribute("open", "");
+    await picker.locator("summary").click();
+    await picker.locator("label.inbox-groups-choice", { hasText: "Harbour survey" }).click();
+    await expect(picker.locator("summary")).toHaveText("Groups ▾");
+    await expect(there).toBeVisible();
+  });
+
+  test("➖ folds every card to one line, ➕ unfolds them, and a section folds to its heading; the folds survive a reload", async ({ page }) => {
+    const asked = await toolA(sessions.lead, "ask", { question: "Paint the bridge railings green?", options: ["Yes", "No"], urgency: "now" });
+    expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
+    await openApp(page, DESKTOP);
+    await openInbox(page);
+    const inbox = page.locator(".inbox-view");
+    const foldAll = inbox.locator(".inbox-fold-all");
+    await expect(foldAll).toHaveText("➖");
+    await expect(foldAll).toHaveAttribute("aria-label", "Fold all questions");
+    await foldAll.click();
+    await expect(foldAll).toHaveText("➕");
+    await expect(foldAll).toHaveAttribute("aria-label", "Unfold all questions");
+    await expect(inbox.locator(".inbox-item:not(.is-folded)")).toHaveCount(0);
+    const row = inbox.locator(`.inbox-item[data-item-id="${asked.payload.question_id}"] .inbox-item-unfold`);
+    await expect(row).toHaveAttribute("aria-expanded", "false");
+    await expect(row.locator(".inbox-fold-part")).toHaveText(["Question", "urgent", /^(just now|\d+ min)$/, "Paint the bridge railings green?", /cache lead/]);
+    await expect(inbox.locator(".inbox-answer-text")).toHaveCount(0);
+
+    await page.reload();
+    await page.waitForFunction(() => typeof window.toggleInboxView === "function");
+    await openInbox(page);
+    await expect(inbox.locator(".inbox-item.is-folded").first()).toBeVisible();
+    await expect(inbox.locator(".inbox-item:not(.is-folded)")).toHaveCount(0);
+    // One unfolded by its row, then ➖ again; ➕ unfolds every card.
+    await row.click();
+    const card = inbox.locator(`.inbox-item[data-item-id="${asked.payload.question_id}"]`);
+    await expect(card.locator(".inbox-answer")).toBeVisible();
+    await expect(foldAll).toHaveText("➖");
+    await foldAll.click();
+    await foldAll.click();
+    await expect(inbox.locator(".inbox-item.is-folded")).toHaveCount(0);
+
+    // A relay section folds to its heading and counts.
+    const there = page.locator('.inbox-relay:has(.inbox-relay-name:text-is("linux-test"))');
+    const chevron = there.locator(".inbox-relay-heading .inbox-section-fold");
+    await chevron.click();
+    await expect(chevron).toHaveAttribute("aria-expanded", "false");
+    await expect(there.locator(".inbox-item")).toHaveCount(0);
+    await expect(there.locator(".inbox-section-count")).toHaveText(/waiting|answered/);
+    await page.reload();
+    await page.waitForFunction(() => typeof window.toggleInboxView === "function");
+    await openInbox(page);
+    await expect(there.locator(".inbox-relay-heading .inbox-section-fold")).toHaveAttribute("aria-expanded", "false");
+    await expect(there.locator(".inbox-item")).toHaveCount(0);
+    await there.locator(".inbox-relay-heading .inbox-section-fold").click();
+    await expect(there.locator(".inbox-item").first()).toBeVisible();
+    // An urgent ask left waiting would turn the badge into the urgent count for the next tests.
+    expect((await apiA(`/api/relay-question/${encodeURIComponent(asked.payload.question_id)}/dismiss`, { method: "POST", body: {} })).status).toBe(200);
+  });
+
   // ─── Other relays' approval cards ──────────────────────────────
 
   /** B knows A too, so an agent on B can act on A (and needs an approval card for it in ask mode). */
@@ -503,7 +629,8 @@ test.describe.serial("the Inbox", () => {
     await expect(item.locator(".inbox-open-there-button")).toHaveAttribute("href", `${relayB.baseUrl}/?conv=${card.conversationId}`);
     // B's page takes ?answer= (capabilities.answerLink): the approval gets one
     // "Answer there" (the choice is made on B, never here), not its choices.
-    const answerThere = item.locator("button");
+    // Its one answer button (the chevron beside its kind folds it).
+    const answerThere = item.locator("button[data-inbox-action]");
     await expect(answerThere).toHaveCount(1);
     await expect(answerThere).toHaveText("Answer there");
     await expect(answerThere).toHaveClass(/inbox-answer-there-choice/);
@@ -542,5 +669,52 @@ test.describe.serial("the Inbox", () => {
     expect(remote()).toHaveLength(1);
     if (process.env.INBOX_PUSH_PAYLOAD_OUT) fs.writeFileSync(process.env.INBOX_PUSH_PAYLOAD_OUT, `${JSON.stringify(payload, null, 2)}\n`);
     await denyOnB(card);
+  });
+
+  // Last in the file: its asks stay pending, which later counts would see.
+  test("steady scrolling: an ask added above the reader, or one answered there, does not move what they read", async ({ page }) => {
+    const reading = (await conversation(apiA, `harbour survey ${suffix}`)).conversationId;
+    const ids = [];
+    for (let n = 1; n <= 8; n += 1) {
+      const asked = await toolA(reading, "ask", { question: `Survey point ${n}: keep the buoy where it is?`, options: ["Keep", "Move"], detail: `Point ${n} (made up).` });
+      expect(asked.status, JSON.stringify(asked.payload)).toBe(200);
+      ids.push(asked.payload.question_id);
+    }
+    await openApp(page, { width: 1280, height: 600 });
+    await openInbox(page);
+    const messages = page.locator("#messages");
+    for (const id of ids) await expect(page.locator(`.inbox-item[data-item-id="${id}"]`)).toBeAttached();
+    // Newest first: the middle of the eight is point 4, under point 5. The
+    // reader has 10 px of point 4 scrolled past.
+    const reader = ids[3];
+    const above = ids[4];
+    await messages.evaluate((node, id) => {
+      const card = node.querySelector(`.inbox-item[data-item-id="${id}"]`);
+      node.scrollTop += card.getBoundingClientRect().top - node.getBoundingClientRect().top + 10;
+    }, reader);
+    const topOf = (id) => page.locator(`.inbox-item[data-item-id="${id}"]`).evaluate((node) => node.getBoundingClientRect().top);
+    const firstVisible = () => messages.evaluate((node) => {
+      const view = node.getBoundingClientRect();
+      return [...node.querySelectorAll(".inbox-item")].find((card) => card.getBoundingClientRect().bottom > view.top + 1)?.dataset.itemId || "";
+    });
+    expect(await firstVisible()).toBe(reader);
+    const before = await topOf(reader);
+    // Marks this drawing: a refresh replaces every card.
+    await messages.evaluate((node) => { node.querySelector(".inbox-view").dataset.drawing = "before"; });
+
+    // A new ask: listed first, above the reader.
+    const added = await toolA(reading, "ask", { question: "Survey point 9: keep the buoy where it is?", options: ["Keep", "Move"] });
+    expect(added.status, JSON.stringify(added.payload)).toBe(200);
+    await expect(page.locator(`.inbox-item[data-item-id="${added.payload.question_id}"]`)).toBeAttached();
+    await expect(page.locator(".inbox-view")).not.toHaveAttribute("data-drawing", "before");
+    expect(Math.abs((await topOf(reader)) - before)).toBeLessThanOrEqual(2);
+
+    // The card above the reader is answered (elsewhere): it moves under the
+    // divider, and the reader's card stays where it is.
+    const answered = await apiA(`/api/relay-question/${encodeURIComponent(above)}/answer`, { method: "POST", body: { choice: "Keep", answer: "Keep" } });
+    expect(answered.status, JSON.stringify(answered.payload)).toBe(200);
+    await expect(page.locator(`.inbox-item[data-item-id="${above}"]`)).toHaveAttribute("data-status", "answered");
+    expect(Math.abs((await topOf(reader)) - before)).toBeLessThanOrEqual(2);
+    expect(await firstVisible()).toBe(reader);
   });
 });

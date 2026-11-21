@@ -9,7 +9,8 @@ import { buildGrokContextUsage, resolveGrokContextWindow } from './grok-context-
 import { extractGrokUsageFromPromptResult, normalizeGrokTurnUsage } from '../services/plan-usage-grok.mjs';
 import { OAR_MCP_SERVER_NAME, buildOarMcpServerLaunch, isOarMcpServerDisabled } from '../mcp/oar-mcp-server.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
-import { fetchRemoteRelayInflight } from '../../shared/remote-relay-tool-core.mjs';
+import { REMOTE_RELAY_TOOL_NAME, fetchRemoteRelayInflight, remoteRelayToolOffered } from '../../shared/remote-relay-tool-core.mjs';
+import { PREVIEW_TOOL_NAME } from '../../shared/preview-tool-core.mjs';
 import { renderMathInstructionBlock } from '../../shared/math-instructions.mjs';
 import { renderMediaEmbedInstructionBlock } from '../../shared/media-embed-instructions.mjs';
 import { countPlanLikeLines } from '../../shared/plan-lines.mjs';
@@ -87,6 +88,34 @@ export function grokModeNudge(relayMode, previousMode = '') {
   return '';
 }
 
+// How often a worker asks whether the relay offers relay_tool while the
+// answer stays unknown; each ask can hold a prompt for the decision timeout.
+const RELAY_TOOL_OFFER_MAX_ASKS = 3;
+
+// The Grok CLI names an MCP tool `<server>__<tool>`, and its use_tool refuses
+// a bare tool name.
+const GROK_MCP_TOOL_NAME_SEPARATOR = '__';
+
+/**
+ * The one-line note on how Grok reaches the relay's tools on OAR's MCP
+ * server. Without it the model tends to guess the bare tool name first and
+ * only gets the call right on the retry. The CLI hides MCP tools from the
+ * model until it searches for them, so the note names only what the server
+ * lists: `relayTool` false leaves the relay tool out, or the model would
+ * spend a call on a tool that is not there; null (not known) names it as
+ * listed only sometimes.
+ */
+export function grokOarToolNamesNote(serverName = OAR_MCP_SERVER_NAME, { relayTool = true } = {}) {
+  const qualified = (tool) => `\`${serverName}${GROK_MCP_TOOL_NAME_SEPARATOR}${tool}\``;
+  const names = relayTool === null
+    ? `their qualified names, ${qualified(PREVIEW_TOOL_NAME)} and, when it is listed, ${qualified(REMOTE_RELAY_TOOL_NAME)}`
+    : relayTool
+      ? `their qualified names, ${qualified(PREVIEW_TOOL_NAME)} and ${qualified(REMOTE_RELAY_TOOL_NAME)}`
+      : `its qualified name, ${qualified(PREVIEW_TOOL_NAME)}`;
+  return `The relay's tools live on the MCP server \`${serverName}\`: call them through use_tool by ${names}. `
+    + `A bare name such as \`${PREVIEW_TOOL_NAME}\` is refused.`;
+}
+
 export function buildGrokUserText(message = {}) {
   const text = String(message?.text || message?.content || '').trim();
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
@@ -118,6 +147,10 @@ export function createGrokTurnRunner({
   // (shared/worker-runtime/working-directory.mjs).
   checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   getPreviewInstructions = createPreviewInstructionsProvider({ api }),
+  // Whether the relay offers relay_tool: the question OAR's MCP server asks
+  // before it lists its tools, asked here for the tool-names note. Answers
+  // true, false, or null when that is unknown.
+  remoteRelayToolOfferedImpl = remoteRelayToolOffered,
   env = process.env,
   nodePath = process.execPath,
   // The OAR MCP server launch (`{ command, args, env }`) every Grok session
@@ -157,6 +190,9 @@ export function createGrokTurnRunner({
   // the history it was told in.
   let previewInstructionsSent = false;
   let mediaInstructionsSent = false;
+  let oarToolNamesSent = false;
+  let relayToolOffered = null;
+  let relayToolUnknownAnswers = 0;
   // The user's max-turn-duration ceiling (0 = no limit), piggybacked on queue
   // deliveries; null means no delivery has told us yet and the ACP defaults
   // apply.
@@ -479,7 +515,27 @@ export function createGrokTurnRunner({
         .catch(() => '');
     // The formula notation rides with the media block, once per worker.
     const mediaBlock = mediaInstructionsSent ? '' : `${renderMediaEmbedInstructionBlock()}\n\n${renderMathInstructionBlock()}`;
-    const promptText = [previewBlock, mediaBlock, modeNudge, userText].filter(Boolean).join('\n\n');
+    // Only with OAR's MCP server attached, once per worker like the blocks above.
+    let oarToolNamesBlock = '';
+    let oarToolNamesHedged = false;
+    if (!oarToolNamesSent && acpMcpServers.length) {
+      // Never fatal: the answer only words the note. Only a definite answer is
+      // kept; an unknown one words this prompt's note with the relay tool
+      // hedged, and the next prompt asks again and sends the note once more.
+      relayToolOffered ??= Promise.resolve()
+        .then(() => remoteRelayToolOfferedImpl({ api }))
+        .then((offered) => (typeof offered === 'boolean' ? offered : null), () => null);
+      const offered = await relayToolOffered;
+      if (offered === null) {
+        relayToolOffered = null;
+        relayToolUnknownAnswers += 1;
+      }
+      // A relay that keeps not answering is not asked before every prompt:
+      // after a few tries the hedged note stands.
+      oarToolNamesHedged = offered === null && relayToolUnknownAnswers < RELAY_TOOL_OFFER_MAX_ASKS;
+      oarToolNamesBlock = grokOarToolNamesNote(OAR_MCP_SERVER_NAME, { relayTool: offered });
+    }
+    const promptText = [previewBlock, mediaBlock, oarToolNamesBlock, modeNudge, userText].filter(Boolean).join('\n\n');
     const pendingNudgedRelayMode = String(message.relayMode || 'agent').trim().toLowerCase();
 
     // The user's max-turn-duration setting overrides the worker-local
@@ -523,6 +579,7 @@ export function createGrokTurnRunner({
           lastNudgedRelayMode = pendingNudgedRelayMode;
           if (previewBlock) previewInstructionsSent = true;
           if (mediaBlock) mediaInstructionsSent = true;
+          if (oarToolNamesBlock && !oarToolNamesHedged) oarToolNamesSent = true;
           break;
         } catch (error) {
           // A stale agent whose previous prompt never settled reports busy;

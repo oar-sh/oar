@@ -92,29 +92,120 @@ export function normalizeGrokBillingCredits(payload = null) {
   return normalized;
 }
 
+const MAX_REPORTED_KEYS = 12;
+const MAX_REPORTED_KEY_LENGTH = 40;
+
+/**
+ * The field names of an answer the normalizer could not use, for the card's
+ * explanation. Names only, never values, capped in number and length, and
+ * stripped to plain identifier characters so nothing odd reaches the page.
+ * When the answer has the `config` wrapper, its inner names are the useful
+ * ones, since that is the level the normalizer reads.
+ */
+export function describeGrokBillingPayloadKeys(payload = null) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const level = payload.config && typeof payload.config === 'object' && !Array.isArray(payload.config)
+    ? payload.config
+    : payload;
+  return Object.keys(level)
+    .slice(0, MAX_REPORTED_KEYS)
+    .map((key) => String(key).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, MAX_REPORTED_KEY_LENGTH))
+    .filter(Boolean);
+}
+
+function isElapsed(isoText, nowMs) {
+  const parsed = Date.parse(String(isoText || ''));
+  return Number.isFinite(parsed) && parsed <= nowMs;
+}
+
 /**
  * Build the best-effort fetcher the usage route calls. Errors and missing
  * logins yield `null` so the card degrades to the local estimated view.
+ *
+ * The returned function also takes `{ onResult }`: a callback that receives
+ * the full outcome `{ usage, reason, httpStatus, keys, checkedAt }`, so the
+ * card can say why there is no figure. `reason` is a short stable code
+ * (null on success): `no-login`, `login-expired`, `not-authorized`,
+ * `http-<status>`, `timeout`, `network`, `unknown-format`. `keys` is set for
+ * `unknown-format` only. The outcome never carries the key, the answer body,
+ * header values or the URL.
  */
 export function createGrokBillingUsageFetcher({
   fetchImpl = globalThis.fetch,
   readAuthKeyImpl = readGrokCliAuthKey,
   url = GROK_BILLING_URL,
   timeoutMs = FETCH_TIMEOUT_MS,
+  now = () => Date.now(),
 } = {}) {
-  return async function fetchGrokBillingUsage() {
-    if (typeof fetchImpl !== 'function') return null;
-    const auth = readAuthKeyImpl();
-    if (!auth?.key) return null;
+  async function fetchGrokBillingUsageResult() {
+    const nowMs = now();
+    const outcome = (usage, reason, extra = {}) => ({
+      usage,
+      reason,
+      httpStatus: null,
+      keys: null,
+      checkedAt: new Date(nowMs).toISOString(),
+      ...extra,
+    });
+    if (typeof fetchImpl !== 'function') return outcome(null, 'network');
+    let auth = null;
     try {
-      const response = await fetchImpl(url, {
+      auth = readAuthKeyImpl();
+    } catch {
+      auth = null;
+    }
+    if (!auth?.key) return outcome(null, 'no-login');
+    let response;
+    try {
+      response = await fetchImpl(url, {
         headers: { Authorization: `Bearer ${auth.key}` },
         signal: AbortSignal.timeout?.(timeoutMs),
       });
-      if (!response?.ok) return null;
-      return normalizeGrokBillingCredits(await response.json());
-    } catch {
-      return null;
+    } catch (error) {
+      return outcome(null, isTimeoutError(error) ? 'timeout' : 'network');
     }
+    if (!response?.ok) {
+      const status = Number(response?.status);
+      const httpStatus = Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+      if (httpStatus === 401 || httpStatus === 403) {
+        // The CLI refreshes its key in place, so an elapsed expiry alone says
+        // little; together with a refusal it is the likeliest cause.
+        const reason = isElapsed(auth.expiresAt, nowMs) ? 'login-expired' : 'not-authorized';
+        return outcome(null, reason, { httpStatus });
+      }
+      return outcome(null, httpStatus ? `http-${httpStatus}` : 'network', { httpStatus });
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (isTimeoutError(error)) return outcome(null, 'timeout');
+      return outcome(null, 'unknown-format', { keys: [] });
+    }
+    const usage = normalizeGrokBillingCredits(payload);
+    if (!usage) return outcome(null, 'unknown-format', { keys: describeGrokBillingPayloadKeys(payload) });
+    return outcome(usage, null);
+  }
+
+  return async function fetchGrokBillingUsage({ onResult = null } = {}) {
+    let result;
+    try {
+      result = await fetchGrokBillingUsageResult();
+    } catch {
+      result = { usage: null, reason: 'network', httpStatus: null, keys: null, checkedAt: new Date(now()).toISOString() };
+    }
+    if (typeof onResult === 'function') {
+      try {
+        onResult(result);
+      } catch {
+        // A broken observer must not cost the caller its answer.
+      }
+    }
+    return result.usage;
   };
+}
+
+function isTimeoutError(error) {
+  const name = String(error?.name || '');
+  return name === 'TimeoutError' || name === 'AbortError';
 }

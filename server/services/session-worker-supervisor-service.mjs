@@ -648,7 +648,16 @@ export function createSessionWorkerSupervisor({
     // from an older copy of the entry — ensureWorker from the 'starting' one,
     // taken before the new process heartbeated — so passing theirs through
     // would overwrite the snapshot the worker sent in the meantime.
-    const { steering: _staleSteering, ...patch } = nextState;
+    // The kind, build id and start time likewise come from the current entry,
+    // stated, so a gone status cannot clear them; only a new pid changes them:
+    // the start time becomes now and a build id equal to the old one is dropped.
+    const {
+      steering: _staleSteering,
+      kind: _staleKind,
+      buildId: _staleBuildId,
+      startedAt: _staleStartedAt,
+      ...patch
+    } = nextState;
     const next = registry.upsertWorker({
       ...(current || {}),
       sdkSessionId: sessionId,

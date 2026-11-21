@@ -170,7 +170,6 @@ import {
   filterConversations,
   drainRemainingPages,
   describeFilterMatchCount,
-  ACTIVE_FILTER_LABEL,
   estimateRelayNowMs,
   noteActivityFirstSeen,
   noteMissingChase,
@@ -179,10 +178,9 @@ import {
   activeFilterNeedsMorePages,
   readActiveFilterSetting,
   writeActiveFilterSetting,
-  describeActiveFilterTitle,
-  activeFilterBadgeText,
   describeActiveMatchCount,
 } from './conversation-list-filter.mjs';
+import { activeWindowMs, initActiveWindowSlider, syncActiveFilterControls } from './active-window-slider.mjs';
 
 const LOCAL_PROCESSING_STALE_MS = 5 * 60 * 1000;
 const CONVERSATION_LIST_PAGE_SIZE = 40;
@@ -699,6 +697,7 @@ function paintConvList() {
   // show, the head as context.
   const activeOnly = isActiveFilterApplied();
   const now = Date.now();
+  const windowMs = activeWindowMs();
   const inboxWaiting = activeOnly ? getInboxWaitingConversationIds() : null;
   // A relay time ahead of this clock counts from when it was first seen.
   if (activeOnly) for (const row of inView) noteActivityFirstSeen(row, now);
@@ -708,6 +707,7 @@ function paintConvList() {
       working: conversationWorksForActiveFilter(row, view),
       waiting: view.pendingCount > 0 || inboxWaiting.has(String(row?.id || '')),
       now,
+      windowMs,
     });
   };
   const textMatches = (row) => !activeFilter
@@ -743,7 +743,7 @@ function paintConvList() {
   // Counted only for 🔥: the title filter alone shows no count.
   lastFilteredRowCount = activeOnly ? inView.filter(rowMatches).length : 0;
   syncActiveFilterButton(lastFilteredRowCount);
-  scheduleActiveFilterEdge(activeOnly ? nextActiveWindowEdgeMs(inView, { now }) : 0);
+  scheduleActiveFilterEdge(activeOnly ? nextActiveWindowEdgeMs(inView, { now, windowMs }) : 0);
   if (activeOnly) queueMicrotask(maybeDrainForActiveFilter);
   lastConvListDragItems = describeDragItems(items);
   syncConversationGroupsFoldAllButton(items, anyFilter);
@@ -2872,7 +2872,7 @@ export function initConversationListLazyLoading() {
 // ── 🔥 Active only ──
 // The toggle left of the title filter. A row shows while it works (the same
 // verdict as its colour and spinner, plus a queued turn), was active in the
-// last ACTIVE_WINDOW_MS, or a card waits in it for the person (the "N open"
+// slider's window, or a card waits in it for the person (the "N open"
 // questions and Safety checks this page holds, and the Inbox's list, which
 // adds plan cards and relay asks). Not applied in the Archived view.
 
@@ -2962,6 +2962,7 @@ function conversationListNeedsDrain() {
     missingCount: activeFilterChasedMissingIds().size,
     // The cursor is a relay time: measured on the relay's clock.
     now: estimateRelayNowMs(Object.values(conversations)),
+    windowMs: activeWindowMs(),
   });
 }
 
@@ -3001,23 +3002,22 @@ function scheduleActiveFilterEdge(edgeMs) {
 }
 
 function syncActiveFilterButton(count) {
-  const button = document.getElementById('conv-active-toggle');
-  if (!button) return;
-  const archivedView = conversationListArchivedView;
-  const on = conversationListActiveOnly && !archivedView;
-  const pressed = conversationListActiveOnly ? 'true' : 'false';
-  if (button.getAttribute('aria-pressed') !== pressed) button.setAttribute('aria-pressed', pressed);
-  if (button.disabled !== archivedView) button.disabled = archivedView;
-  if (button.getAttribute('aria-label') !== ACTIVE_FILTER_LABEL) button.setAttribute('aria-label', ACTIVE_FILTER_LABEL);
-  const title = archivedView ? 'The 🔥 filter applies to the live list, not the Archived view' : describeActiveFilterTitle(on, count);
-  if (button.title !== title) button.title = title;
-  const badge = button.querySelector('.conv-active-count');
-  if (badge) {
-    // No count before the list has arrived.
-    const text = conversationListFirstPageLoaded ? activeFilterBadgeText(on, count) : '';
-    if (badge.textContent !== text) badge.textContent = text;
-    badge.hidden = !text;
-  }
+  syncActiveFilterControls({ activeOnly: conversationListActiveOnly, archivedView: conversationListArchivedView, count, firstPageLoaded: conversationListFirstPageLoaded });
+}
+
+/**
+ * The list under a new 🔥 view (switched on or off, another window): a running
+ * drain restarts under it, and the pages are judged afresh. The paint starts
+ * what 🔥 needs: the drain for unloaded pages (in a microtask), the timer. The
+ * status speaks after that microtask, so it says "searching" while the drain
+ * runs rather than a partial count; the drain's end announces the result.
+ */
+function repaintForActiveFilterChange() {
+  conversationFilterGeneration += 1;
+  activeFilterDrainKey = '';
+  activeFilterChase = null;
+  renderConvList();
+  queueMicrotask(() => announceConversationFilterResults());
 }
 
 /** Turns 🔥 on or off, remembered in this browser. */
@@ -3026,20 +3026,11 @@ export function setConversationListActiveOnly(on) {
   if (next === conversationListActiveOnly) return;
   conversationListActiveOnly = next;
   writeActiveFilterSetting(next);
-  // A running title-filter drain restarts under the new filters.
-  conversationFilterGeneration += 1;
-  activeFilterDrainKey = '';
   // Switched on anew: what an earlier chase gave up on is looked for again.
-  activeFilterChase = null;
   activeFilterAbandonedIds.clear();
   const list = getConversationListElement();
   if (list) list.scrollTop = 0;
-  // The paint starts what 🔥 needs: the drain for unloaded pages (in a
-  // microtask), the timer. The status speaks after that microtask, so it
-  // says "searching" while the drain runs rather than a partial count; the
-  // drain's end announces the result.
-  renderConvList();
-  queueMicrotask(() => announceConversationFilterResults());
+  repaintForActiveFilterChange();
 }
 
 export function toggleConversationListActiveOnly() {
@@ -3161,6 +3152,7 @@ export function initConversationFilter() {
   // 🔥: a native button (Enter and Space work), and the empty state's way out.
   const activeToggle = document.getElementById('conv-active-toggle');
   activeToggle?.addEventListener('click', () => toggleConversationListActiveOnly());
+  initActiveWindowSlider({ onChange: () => repaintForActiveFilterChange() });
   getConversationListElement()?.addEventListener('click', (event) => {
     const off = event.target instanceof Element ? event.target.closest('[data-active-filter-off]') : null;
     if (!off) return;

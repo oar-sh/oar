@@ -19,6 +19,90 @@ const DEFAULT_MAX_LIVE = 8;
 const MIN_TARGET_PORT = 1024;
 const MAX_PORT = 65535;
 
+// "Maximum live previews" in Settings → Previews (app_settings key
+// preview_max_live). Unsaved, `previews.maxLive` from config.json is the
+// limit; once saved, the setting is. 0 lets no new preview be published.
+export const PREVIEW_MAX_LIVE_MIN = 0;
+export const PREVIEW_MAX_LIVE_MAX = 128;
+export const DEFAULT_PREVIEW_MAX_LIVE = DEFAULT_MAX_LIVE;
+export const PREVIEW_MAX_LIVE_SETTING_KEY = 'preview_max_live';
+
+// Longer than any plain number a person would type; the pattern below only
+// ever sees a string this short.
+const MAX_LIVE_TEXT_LENGTH = 32;
+const PLAIN_DECIMAL_RE = /^(?:\d+(?:\.\d*)?|\.\d+)$/;
+const NEGATIVE_DECIMAL_RE = /^-\s*(?:\d|\.\d)/;
+
+// Reads a limit strictly: a finite number, or a string that is a plain
+// decimal (no sign, exponent, hex or separators). `Number()` alone would turn
+// `[]` into 0 and `"0x20"` into 32, and 0 switches new previews off, so
+// nothing else may become a number here. A negative is told apart because it
+// must not quietly become 0 either.
+function readMaxLiveNumber(value) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return { kind: 'invalid' };
+    return value < 0 ? { kind: 'negative' } : { kind: 'number', number: value };
+  }
+  if (typeof value !== 'string') return { kind: 'invalid' };
+  const text = value.trim();
+  if (!text || text.length > MAX_LIVE_TEXT_LENGTH) return { kind: 'invalid' };
+  if (PLAIN_DECIMAL_RE.test(text)) return { kind: 'number', number: Number(text) };
+  if (NEGATIVE_DECIMAL_RE.test(text)) return { kind: 'negative' };
+  return { kind: 'invalid' };
+}
+
+function clampMaxLive(number) {
+  return Math.min(PREVIEW_MAX_LIVE_MAX, Math.max(PREVIEW_MAX_LIVE_MIN, Math.round(number)));
+}
+
+/**
+ * The saved limit, or null when it was never saved (or cannot be read). A
+ * stored value that is not a plain non-negative number reads as never saved,
+ * never as 0.
+ */
+export function readPreviewMaxLiveSetting(storedValue) {
+  const read = readMaxLiveNumber(storedValue);
+  return read.kind === 'number' ? clampMaxLive(read.number) : null;
+}
+
+/**
+ * A slider value: a number of 0 or more, rounded, and above 128 clamped to
+ * 128. Anything else, a negative included, is refused.
+ */
+export function parsePreviewMaxLiveUpdate(value) {
+  const read = readMaxLiveNumber(value);
+  if (read.kind === 'negative') return { ok: false, error: 'maxLive must be 0 or more' };
+  if (read.kind !== 'number') return { ok: false, error: 'maxLive must be a number' };
+  return { ok: true, maxLive: clampMaxLive(read.number) };
+}
+
+/**
+ * The setting on the relay's app_settings statements: `read` answers null
+ * while it was never saved, `save` stores a parsed value.
+ */
+export function createPreviewMaxLiveSetting(stmts) {
+  return {
+    read: () => readPreviewMaxLiveSetting(stmts?.getAppSetting?.get?.(PREVIEW_MAX_LIVE_SETTING_KEY)?.value),
+    save(maxLive) {
+      if (typeof stmts?.upsertAppSetting?.run !== 'function') {
+        return { ok: false, error: 'Preview limit settings are unavailable' };
+      }
+      stmts.upsertAppSetting.run(PREVIEW_MAX_LIVE_SETTING_KEY, String(maxLive), new Date().toISOString());
+      return { ok: true, maxLive };
+    },
+  };
+}
+
+/**
+ * What the slider shows: the limit in force (which a config value can put
+ * above 128), clamped into its range; the default for anything but a number.
+ */
+export function previewMaxLiveSliderValue(maxLive) {
+  const read = readMaxLiveNumber(maxLive);
+  if (read.kind === 'negative') return PREVIEW_MAX_LIVE_MIN;
+  return read.kind === 'number' ? clampMaxLive(read.number) : DEFAULT_PREVIEW_MAX_LIVE;
+}
+
 // Hostnames that always resolve back to this machine. A preview target is one of
 // these unless the operator has explicitly widened the allowlist.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -137,8 +221,12 @@ export function normalizePreviewsConfig(rawConfig = {}, {
     env?.COPILOT_PREVIEWS_ALLOWED_TARGET_HOSTS ?? raw.allowedTargetHosts,
   );
 
-  const maxLiveRaw = Number(raw.maxLive);
-  const maxLive = Number.isInteger(maxLiveRaw) && maxLiveRaw > 0 ? maxLiveRaw : DEFAULT_MAX_LIVE;
+  // 0 is allowed, as on the settings slider: no new previews. Read strictly,
+  // so that `[]` or `true` in the file cannot become a limit (0 or 1).
+  const maxLiveRead = readMaxLiveNumber(raw.maxLive);
+  const maxLive = maxLiveRead.kind === 'number' && Number.isInteger(maxLiveRead.number)
+    ? maxLiveRead.number
+    : DEFAULT_MAX_LIVE;
 
   const normalizedRelayHostnames = normalizeHostList(relayHostnames);
   const normalizedReservedPorts = (Array.isArray(reservedPorts) ? reservedPorts : [reservedPorts])
@@ -400,12 +488,28 @@ export function createPreviewRegistry({
   checkStaticRoot = null,
   hitPersistIntervalMs = DEFAULT_HIT_PERSIST_INTERVAL_MS,
   keptRowMaxAgeMs = DEFAULT_KEPT_ROW_MAX_AGE_MS,
+  // { read, save } of "Maximum live previews" (createPreviewMaxLiveSetting):
+  // `read` answers null while it was never saved. Read on every create, so a
+  // saved value applies without rebuilding the registry.
+  maxLiveSetting = null,
   logger = console,
 } = {}) {
   const entries = new Map();
   // token -> { row, since, reason }: stored rows no check could judge yet.
   const kept = new Map();
   const settings = config || normalizePreviewsConfig({});
+
+  function currentMaxLive() {
+    if (typeof maxLiveSetting?.read === 'function') {
+      try {
+        const saved = maxLiveSetting.read();
+        if (Number.isInteger(saved) && saved >= 0) return saved;
+      } catch (error) {
+        logger?.warn?.(`[preview] could not read the live preview limit: ${error?.message || error}`);
+      }
+    }
+    return settings.maxLive;
+  }
 
   function toPublicRecord(entry) {
     return {
@@ -675,18 +779,27 @@ export function createPreviewRegistry({
     return `port ${entry.targetPort}`;
   }
 
-  function tooManyError() {
+  function noNewPreviewsError() {
+    return {
+      ok: false,
+      status: 429,
+      error: 'No new previews: the maximum number of live previews is set to 0, so previews are switched off. '
+        + 'Previews already published stay until closed. The user can raise the limit in Settings → Previews.',
+    };
+  }
+
+  function tooManyError(maxLive) {
     const at = now();
     const oldest = list()
       .slice(0, 3)
       .map((entry) => `"${entry.label}" (${describeTarget(entry)}, published ${formatAge(at - entry.createdAt)}, `
         + `${entry.lastHitAt ? `last opened ${formatAge(at - entry.lastHitAt)}` : 'never opened'})`);
     // More can be live than the limit (rows restored after it was lowered).
-    const toClose = Math.max(1, entries.size + kept.size - settings.maxLive + 1);
+    const toClose = Math.max(1, entries.size + kept.size - maxLive + 1);
     return {
       ok: false,
       status: 429,
-      error: `Too many live previews (max ${settings.maxLive}); previews stay until closed. `
+      error: `Too many live previews (max ${maxLive}, set in Settings → Previews); previews stay until closed. `
         + `Oldest: ${oldest.join('; ')}. Close ${toClose === 1 ? 'one' : toClose} in Settings → Previews; an agent can close `
         + `its own conversation's with the preview tool's close action (list shows their tokens) or with `
         + `DELETE /api/previews/:token?conversationId=<conv>.`,
@@ -706,7 +819,9 @@ export function createPreviewRegistry({
     const revived = held ? reviveKept(held, fields) : null;
     if (revived) return revived;
     // Kept rows count: each of them may be a live link again at any moment.
-    if (entries.size + kept.size >= settings.maxLive) return tooManyError();
+    const maxLive = currentMaxLive();
+    if (maxLive === 0) return noNewPreviewsError();
+    if (entries.size + kept.size >= maxLive) return tooManyError(maxLive);
     return insertEntry(fields);
   }
 
@@ -1082,6 +1197,14 @@ export function createPreviewRegistry({
 
   return {
     settings,
+    // The limit in force: the saved setting, else previews.maxLive.
+    get maxLive() { return currentMaxLive(); },
+    saveMaxLive(maxLive) {
+      if (typeof maxLiveSetting?.save !== 'function') {
+        return { ok: false, error: 'Preview limit settings are unavailable' };
+      }
+      return maxLiveSetting.save(maxLive);
+    },
     get size() { return entries.size; },
     get keptCount() { return kept.size; },
     create,

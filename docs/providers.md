@@ -272,7 +272,11 @@ CLI straight into `~/.grok/auth.json`. Running `grok login` on the host still wo
 
 Grok conversations support live reply streaming, thoughts, plan boards, subagent lifecycle chips,
 **Stop**, session resume across worker restarts, per-turn context metrics, and the live weekly quota
-bar in **Check Usage**. The model is fixed per conversation (ACP has no mid-session switch; the default
+bar in **Check Usage**. The preview and `relay_tool` tools come from OAR's MCP server (the Grok CLI names
+them `oar__preview` and `oar__relay_tool`); a new chat's first prompt waits until that server is connected,
+10 seconds at most. The CLI cuts a tool result above a byte limit; OAR starts it with 65,536 bytes
+(`GROK_MAX_MCP_OUTPUT_BYTES`), and a value in the worker's environment wins (see
+[environment variables](configuration.md#environment-variables)). The model is fixed per conversation (ACP has no mid-session switch; the default
 is `grok-4.5`), and question cards are not available — the protocol has no ask-user surface.
 
 ## DeepSeek

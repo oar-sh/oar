@@ -77,7 +77,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // 699: compacting a conversation, now a module of its own
 // (server/services/conversation-compaction-service.mjs). 700: the PWA
 // shell version, moved out of the runtime (server/services/pwa-shell-version.mjs).
-const MAX_ENTRIES = 700;
+// 701 since 2026-11-18: the Claude worker's quiet-turn watchdog, a module of
+// its own (server/claude-worker/claude-quiet-turn.mjs). 702: the Claude CLI's
+// process tree on Windows (server/claude-worker/claude-cli-process.mjs).
+// 706: the Inbox's filters, groups, folds and steady scrolling, and the 🔥
+// window slider (server/public/app/inbox-sections.mjs, inbox-view-state.mjs,
+// inbox-scroll-anchor.mjs, active-window-slider.mjs).
+// 707 since 2026-11-20: relay_info and the catalogue reading it shares,
+// moved out of the dispatcher (server/services/remote-relay-info.mjs).
+const MAX_ENTRIES = 707;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and

@@ -205,6 +205,8 @@ export function registerRelayAskRoutes(app, deps) {
     formatQuestionRow,
     // Plan cards (relay boards) in the Inbox, formatted as their routes do.
     formatRelayBoardRow = null,
+    // conversation-group-repository.mjs: the group of each item's session.
+    conversationGroups = null,
     relayAskService = null,
     relayAskLinkService = null,
     remoteRelayInbound = null,
@@ -246,12 +248,38 @@ export function registerRelayAskRoutes(app, deps) {
     ORDER BY b.acted_at DESC LIMIT ?
   `) || null;
 
-  function sessionOf(id) {
+  /**
+   * The group a session sits in, as the Inbox sections it: `{ id, name }`
+   * (the name the sidebar shows), or null. One lookup per session and one
+   * per group for a whole list.
+   */
+  function groupLookup() {
+    const bySession = new Map();
+    const byGroup = new Map();
+    return (conversationId) => {
+      const id = toText(conversationId);
+      if (!id) return null;
+      if (bySession.has(id)) return bySession.get(id);
+      let group = null;
+      try {
+        const groupId = toText(conversationGroups?.groupOfConversation?.(id)?.id);
+        if (groupId && !byGroup.has(groupId)) {
+          const described = conversationGroups.describeGroup?.(groupId) || null;
+          byGroup.set(groupId, described ? { id: groupId, name: toText(described.displayName) || 'Group' } : null);
+        }
+        group = groupId ? byGroup.get(groupId) : null;
+      } catch {}
+      bySession.set(id, group);
+      return group;
+    };
+  }
+
+  function sessionOf(id, groupOf = groupLookup()) {
     let row = null;
     try {
       row = conversationStmt?.get(toText(id)) || null;
     } catch {}
-    return { id: toText(id), title: toText(row?.title) || null, startedBy: toText(row?.origin_json) ? 'agent' : 'owner' };
+    return { id: toText(id), title: toText(row?.title) || null, startedBy: toText(row?.origin_json) ? 'agent' : 'owner', group: groupOf(id) };
   }
 
   function available(res) {
@@ -324,7 +352,9 @@ export function registerRelayAskRoutes(app, deps) {
    * (`read.pendingCards`): a failed read lists none, which is not "none pending".
    */
   function localInboxItems({ forRemote = false, read = null } = {}) {
-    const items = (relayAskService?.isAvailable?.() ? relayAskService.listHere() : []).map(inboxItemOfAsk);
+    const groupOf = groupLookup();
+    const items = (relayAskService?.isAvailable?.() ? relayAskService.listHere() : [])
+      .map((ask) => inboxItemOfAsk({ ...ask, session: { ...ask.session, group: groupOf(ask.session?.id) } }));
     let pending = [];
     try {
       pending = stmts.listQuestions.all('pending', null, null).map(formatQuestionRow).filter(Boolean);
@@ -338,7 +368,7 @@ export function registerRelayAskRoutes(app, deps) {
       answered = (answeredCardsStmt?.all(since, INBOX_ANSWERED_CARDS_MAX) || []).map(formatQuestionRow).filter(Boolean);
     } catch {}
     for (const question of [...pending, ...answered]) {
-      items.push(inboxItemOfCard(question, sessionOf(question.conversationId), { forRemote }));
+      items.push(inboxItemOfCard(question, sessionOf(question.conversationId, groupOf), { forRemote }));
     }
     if (typeof formatRelayBoardRow === 'function') {
       let boards = [];
@@ -350,7 +380,7 @@ export function registerRelayAskRoutes(app, deps) {
         ].map(formatRelayBoardRow).filter(Boolean);
       } catch {}
       for (const board of boards) {
-        items.push(inboxItemOfPlanBoard(board, sessionOf(board.conversationId), { forRemote }));
+        items.push(inboxItemOfPlanBoard(board, sessionOf(board.conversationId, groupOf), { forRemote }));
       }
     }
     return items.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
@@ -586,7 +616,8 @@ export function registerRelayAskRoutes(app, deps) {
   }
 
   // GET /api/relay-asks/remote/inbox — what a paired relay's Inbox shows of
-  // this one. `?push=1`: the caller can push, and learns who pushes each card.
+  // this one, each session with its group (a relay before 0.9.32 sends none).
+  // `?push=1`: the caller can push, and learns who pushes each card.
   app.get('/api/relay-asks/remote/inbox', auth, (req, res) => {
     const caller = admitPairedRelay(req, res);
     if (!caller) return;

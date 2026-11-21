@@ -49,7 +49,8 @@ test('claude-plan-usage stores a normalized experimental payload', async () => {
     },
   });
   assert.equal(status, 200);
-  assert.deepEqual(body, { ok: true });
+  // A plan login with no transcript scan stored yet: this worker scans.
+  assert.deepEqual(body, { ok: true, behaviorsDue: true });
   const stored = planUsageService.readSnapshot('claude');
   assert.equal(stored.payload.subscriptionType, 'max');
   assert.equal(stored.payload.windows[0].utilization, 40);
@@ -65,6 +66,63 @@ test('claude-plan-usage falls back to the stable result fields', async () => {
   });
   assert.equal(status, 200);
   assert.equal(planUsageService.readSnapshot('claude').payload.session.totalCostUsd, 0.02);
+});
+
+test('claude-plan-usage keeps the stored plan bars when a later report cannot read them', async () => {
+  const { deps, planUsageService } = makePlanUsageDeps();
+  await invokePost('/api/claude-plan-usage', deps, {
+    conversationId: 'conv-1',
+    usage: {
+      session: { total_cost_usd: 2, model_usage: {} },
+      subscription_type: 'max',
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 40, resets_at: '2099-01-01T05:00:00.000Z' },
+        seven_day: { utilization: 55, resets_at: '2099-01-07T00:00:00.000Z' },
+        model_scoped: [{ display_name: 'Fable', utilization: 30, resets_at: '2099-01-07T00:00:00.000Z' }],
+      },
+    },
+  });
+  const { status } = await invokePost('/api/claude-plan-usage', deps, {
+    conversationId: 'conv-1',
+    usage: null,
+    modelUsage: { 'claude-sonnet-5': { inputTokens: 5, outputTokens: 6, costUSD: 0.02 } },
+    totalCostUsd: 0.02,
+  });
+  assert.equal(status, 200);
+  const stored = planUsageService.readSnapshot('claude').payload;
+  assert.equal(stored.session.totalCostUsd, 0.02);
+  assert.deepEqual(stored.windows.map((window) => window.id), ['five_hour', 'seven_day', 'model_scoped:fable']);
+  assert.equal(stored.windowsCarried, 3);
+  assert.equal(stored.subscriptionType, 'max');
+});
+
+test('claude-plan-usage hands the transcript scan to one of two workers posting together', async () => {
+  const { deps } = makePlanUsageDeps();
+  const report = (conversationId, behaviors = null) => invokePost('/api/claude-plan-usage', deps, {
+    conversationId,
+    usage: {
+      session: { total_cost_usd: 1, model_usage: {} },
+      subscription_type: 'max',
+      rate_limits_available: true,
+      rate_limits: { five_hour: { utilization: 10, resets_at: '2099-01-01T05:00:00.000Z' }, model_scoped: [] },
+      behaviors,
+    },
+  });
+  const [first, second] = await Promise.all([report('conv-1'), report('conv-claude')]);
+  assert.deepEqual([first.body.behaviorsDue, second.body.behaviorsDue].sort(), [false, true]);
+  const scanned = await report('conv-1', { day: { request_count: 2, session_count: 1, behaviors: [], agents: [], skills: [], plugins: [], mcp_servers: [] } });
+  assert.equal(scanned.body.behaviorsDue, false);
+  assert.equal((await report('conv-claude')).body.behaviorsDue, false, 'the stored scan is fresh');
+});
+
+test('claude-plan-usage asks a login without plan limits for no scan', async () => {
+  const { deps } = makePlanUsageDeps();
+  const { body } = await invokePost('/api/claude-plan-usage', deps, {
+    conversationId: 'conv-1',
+    usage: { session: { total_cost_usd: 1, model_usage: {} }, subscription_type: null, rate_limits_available: false, rate_limits: null },
+  });
+  assert.equal(body.behaviorsDue, false);
 });
 
 test('claude-plan-usage rejects a payload with nothing usable', async () => {

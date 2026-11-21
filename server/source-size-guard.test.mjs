@@ -35,9 +35,16 @@ const CEILINGS = new Map([
   ['server/public/app/conversation-view.js', 5272],
   ['server/copilot-worker/copilot-sdk-session-process.mjs', 5204],
   // +6 for the local-relay branch of mapRemoteError.
-  ['server/services/remote-relay-dispatcher.mjs', 4641],
-  ['server/claude-worker/claude-session-process.mjs', 4600],
-  ['server/public/app/journal-view.js', 3785],
+  // -346: relay_info and its catalogue shaping moved to remote-relay-info.mjs
+  // (after relay_info's summary had taken it to 4697).
+  ['server/services/remote-relay-dispatcher.mjs', 4351],
+  // -9: the quiet-turn watchdog went to claude-quiet-turn.mjs with what it grew
+  // by (ending a silent turn, the bound on an interrupt the CLI ignores);
+  // what is left here is its wiring.
+  ['server/claude-worker/claude-session-process.mjs', 4591],
+  // -8: the 🔥 toggle's DOM sync went to active-window-slider.mjs with the
+  // window slider; what is left here is its wiring.
+  ['server/public/app/journal-view.js', 3777],
   ['server/public/app/attachments-view.js', 3267],
 ]);
 

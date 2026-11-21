@@ -60,6 +60,7 @@ The modal is organised into eight tabs — **General**, **Appearance**, **Provid
 | Security | Browsers signed in | — | Every browser with a session here, with **Rename** and **Sign out**, **Sign out all other browsers** and **Sign out this browser** (see [Security](web-ui.md#security)) |
 | Security | Sign in another device | — | A link that signs one more browser in, once, within 10 minutes, with **Copy** and **Show QR code** |
 | Security | Relay token | — | Whether it is set (the relay keeps only its hash) and when it was last used by something other than a browser page; **Generate new relay token** shows a new one once, with its pairing link and the paired relays that still need it |
+| Previews | Maximum live previews | `8` | How many previews may be live at once (0 to 128; 0 = no new previews). Lowering it closes none: new ones are refused until fewer are live. Until saved, `previews.maxLive` from the config file is the value. Kept in the database (`preview_max_live`) |
 | Previews | Live previews | — | Lists the published previews with when each was published and last opened, each of which you can close, and those the relay could not check at its start as not served (see [Preview servers](preview-servers.md)) |
 | Sharing | Shared conversations | — | Every shared link with **Copy link**, **Renew link**, **Stop sharing** and its access log (see [Sharing](web-ui.md#sharing)) |
 | Sharing | Store viewer IP addresses | on | Whether the access log of shared links keeps the viewer's IP address |
@@ -127,7 +128,7 @@ The config file is `server/config.json` in a git checkout and `~/.oar/config.jso
 | `previews.allowPublicBind` | `false`              | `true` lets `previews.bindHost` be a non-loopback address                 |
 | `previews.publicBaseUrl`   | —                    | Public base URL on a hostname **different** from the relay's               |
 | `previews.allowedTargetHosts` | `[]`              | Upstreams allowed beyond loopback (container/VM IPs)                       |
-| `previews.maxLive`         | `8`                  | Maximum simultaneously published previews                                  |
+| `previews.maxLive`         | `8`                  | Maximum simultaneously published previews, until **Maximum live previews** in Settings → Previews is saved (0 = no new previews) |
 | `pushVapidSubject`         | `mailto:copilot-remote@example.com` | Contact URI the relay sends to push services with Web Push requests |
 | `sharedPresenceMaxPerConversation` | `200`        | Most live viewers counted per shared conversation; caps the watcher count only, not who can read the link |
 | `sharedPresenceMaxGlobal`  | `5000`               | Most live shared-link viewers counted in total; same, not an access limit  |
@@ -164,6 +165,7 @@ Earlier versions also read `restartGracefulTimeoutMs`, `restartReadyCooldownMs`,
 | `GH_TOKEN`, `GITHUB_TOKEN` | GitHub token for the Copilot usage card, instead of `gh auth token` |
 | `XAI_API_KEY` | Grok authentication instead of the Grok CLI login |
 | `GROK_CLI_COMMAND` | The Grok CLI to run, instead of `grok` on `PATH`; `GROK_COMMAND` is read when it is unset. Installing Grok from Settings sets it |
+| `GROK_MAX_MCP_OUTPUT_BYTES`, `MAX_MCP_OUTPUT_BYTES` | Bytes of an MCP tool result the Grok CLI passes on whole before it saves the rest to a file. OAR starts the CLI with `GROK_MAX_MCP_OUTPUT_BYTES=65536` unless the worker's environment has either one (under tmux, see below) |
 | `CURSOR_SESSION_TOKEN` | Cursor dashboard session token for live plan bars |
 | `CURSOR_AGENT_STORE_DIR` | Where Cursor sessions keep their local agent state, instead of `cursor-agents` in the relay's data folder (see `dataDir` and `COPILOT_WEB_RELAY_DATA_DIR`) |
 | `CLAUDE_CONFIG_DIR` | Claude configuration directory, instead of `~/.claude`; Claude and Claude API chats share it, and Claude Cloud reads the CLI's login (`.credentials.json`) from it |
@@ -173,7 +175,7 @@ Earlier versions also read `restartGracefulTimeoutMs`, `restartReadyCooldownMs`,
 | `OAR_ANTHROPIC_API_BASE_URL` | For OAR's own tests: a fake Anthropic API on the same machine that the relay's model listing for Claude API and the Claude API workers use instead of `https://api.anthropic.com`. Only a loopback address is accepted; any other value is ignored |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Overrides the Claude auto-compact window |
 | `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS` | Not read from the relay's environment: OAR sets them for every Claude session it starts, from **Claude background command limit** (the limit, 8 h and 2 min) |
-| `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS`, `OAR_TURN_STALL_TOOL_MS` | How long the runtime of a turn may stay silent before the Copilot, Cursor and Grok workers fail the turn: with nothing in flight (default `120000`), during a model request (`300000`), during a tool call (`1800000`). `0` is no limit for that phase, and an idle `0` switches the check off (not on Grok, which then ignores all three variables and uses its default windows); an idle window set alone scales the other two with it. Claude workers only log such a silence (model window `600000`) |
+| `OAR_TURN_STALL_IDLE_MS`, `OAR_TURN_STALL_MODEL_MS`, `OAR_TURN_STALL_TOOL_MS` | How long the runtime of a turn may stay silent before the Copilot, Cursor and Grok workers fail the turn: with nothing in flight (default `120000`), during a model request (`300000`), during a tool call (`1800000`). `0` is no limit for that phase, and an idle `0` switches the check off (not on Grok, which then ignores all three variables and uses its default windows); an idle window set alone scales the other two with it. Claude workers (Claude, Claude API, DeepSeek) use the model and tool windows only, with a model window of `600000`: they first ask Claude Code to interrupt the turn, and stop it when the turn has not ended a minute later |
 | `OAR_CLAUDE_CLOUD_BRANCH_LOOKUP=off` | Do not list a repository's branches with `git ls-remote` for a new Claude Cloud chat (`0`, `false` and `no` work too) |
 | `COPILOT_CLOUDFLARED_MODE`, `COPILOT_CLOUDFLARED_TOKEN`, `COPILOT_CLOUDFLARED_BINARY` | Override `cloudflaredTunnel.mode`, `.token`, and `.binary` |
 | `COPILOT_TUNNEL_MARKER_HEADERS` | Extra headers (comma-separated) that mark tunnel traffic, added to `tunnelMarkerHeaders` and `cf-ray` |

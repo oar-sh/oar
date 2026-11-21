@@ -618,7 +618,7 @@ export function registerConversationSettingsRoutes(app, deps, shared) {
           // Making a group is the person's (agent auth §0.2): an agent moves
           // a session into an existing group or out of one.
           const asked = String(wanted.group).replace(/["\r\n]+/g, ' ').slice(0, 80);
-          return fail(403, `Only the person makes session groups: there is no group "${asked}" here${groups.length ? ` (groups: ${formatSessionGroupList(groups)})` : ''}. Name an existing group (relay_info lists them), or ask the user to make it. Nothing was changed.`, {
+          return fail(403, `Only the person makes session groups: there is no group "${asked}" here${groups.length ? ` (groups: ${formatSessionGroupList(groups)})` : ''}. Name an existing group (relay_info with verbose true lists them all), or ask the user to make it. Nothing was changed.`, {
             code: AUTH_ERROR_CODES.personRequired,
             groups: groups.slice(0, REMOTE_RELAY_GROUP_LIMITS.refusalMax).map((group) => ({ id: group.id, name: group.name })),
           });

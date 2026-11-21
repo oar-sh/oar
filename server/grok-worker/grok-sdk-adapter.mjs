@@ -7,8 +7,17 @@ import { createAcpHostServices } from './acp-host-services.mjs';
 import { createSdkMessageNormalizer } from './sdk-message-normalizer.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
+import { OAR_MCP_SERVER_NAME } from '../mcp/oar-mcp-server.mjs';
 
 export { extractGrokModelsFromInitialize };
+
+// How long the first prompt of a fresh or loaded session waits for OAR's MCP
+// server to be connected with its tools listed. The CLI connects MCP servers
+// in the background after the session has opened; a prompt sent before then
+// tells the model the server is still connecting, and its first relay-tool
+// call fails. The prompt goes out when the time is up either way (the CLI's
+// own startup timeout is 30 s).
+export const OAR_MCP_READY_TIMEOUT_MS = 10_000;
 
 export function classifyGrokError(error) {
   const message = String(error?.message || error || '').trim();
@@ -101,6 +110,11 @@ export async function createGrokAgentHandle({
   createHostServicesImpl = createAcpHostServices,
   // Told about every terminal (the worker's background-tasks publisher).
   taskObserver = null,
+  // The MCP server the first prompt waits for (only when the session carries
+  // one by that name; other servers the host configured are never waited
+  // for), and for how long at most; 0 turns the wait off.
+  mcpReadyServerName = OAR_MCP_SERVER_NAME,
+  mcpReadyTimeoutMs = OAR_MCP_READY_TIMEOUT_MS,
   dbg = () => {},
 } = {}) {
   const client = new AcpClientImpl({
@@ -171,6 +185,38 @@ export async function createGrokAgentHandle({
     throw new Error('Grok session/new did not return sessionId');
   }
 
+  // Asked by every prompt; prompts wait until one wait has ended (ready,
+  // failed, timeout or closed), later ones go out at once. A turn cancelled
+  // meanwhile only stops listening: the wait goes on, and the next prompt
+  // joins it instead of skipping it.
+  const readyServer = String(mcpReadyServerName || '').trim();
+  const readyTimeoutMs = Number(mcpReadyTimeoutMs) > 0 ? Number(mcpReadyTimeoutMs) : 0;
+  let mcpReadyDone = false;
+  let mcpReadyWait = null;
+  const waitForReadyServer = async () => {
+    const servers = Array.isArray(client.mcpServers) ? client.mcpServers : [];
+    if (!readyServer || !readyTimeoutMs || typeof client.waitForMcpServer !== 'function') return null;
+    if (!servers.some((server) => String(server?.name || '').trim() === readyServer)) return null;
+    const result = await client.waitForMcpServer(sessionId, readyServer, { timeoutMs: readyTimeoutMs });
+    if (result.status === 'timeout') {
+      dbg('grok mcp server not ready in time; prompting anyway', `${readyServer} after ${result.waitedMs}ms`);
+    } else {
+      dbg('grok mcp server wait', `${readyServer} ${result.status}${result.reason ? ` (${result.reason})` : ''} after ${result.waitedMs}ms`);
+    }
+    return { server: readyServer, ...result };
+  };
+  const untilMcpReady = () => {
+    if (mcpReadyDone) return Promise.resolve(null);
+    if (!mcpReadyWait) {
+      mcpReadyWait = waitForReadyServer().catch(() => null).then((result) => {
+        mcpReadyDone = true;
+        mcpReadyWait = null;
+        return result;
+      });
+    }
+    return mcpReadyWait;
+  };
+
   return {
     client,
     sessionId,
@@ -178,6 +224,7 @@ export async function createGrokAgentHandle({
     discovered,
     hostServices,
     resumeFailed,
+    untilMcpReady,
     async close() {
       hostServices.disposeAll();
       await client.dispose();
@@ -231,8 +278,11 @@ export function startGrokTurn({
   });
 
   let cancelled = false;
+  let endReadyWait = () => {};
+  const readyWaitEnded = new Promise((resolve) => { endReadyWait = resolve; });
   const onAbort = () => {
     cancelled = true;
+    endReadyWait();
     try {
       handle.client.sessionCancel(handle.sessionId);
     } catch (error) {
@@ -266,22 +316,35 @@ export function startGrokTurn({
     ? { _meta: { reasoningEffort: effort } }
     : {};
 
-  const promptPromise = handle.client.sessionPrompt(
-    handle.sessionId,
-    [{ type: 'text', text: String(text || '') }],
-    (update) => {
-      for (const action of normalizer.normalizeAcpUpdate(update)) {
-        enqueue(action);
-      }
-    },
-    promptExtra,
-    {
-      // A running client-hosted terminal (or an in-flight terminal/fs request)
-      // means the agent is waiting on us, not stalled.
-      hasPendingWork: () => handle.hostServices?.hasPendingWork?.() === true,
-      ...(watchdog || {}),
-    },
-  ).then((promptResult) => {
+  // The first prompt of the session waits for OAR's MCP server (see
+  // createGrokAgentHandle); a turn cancelled meanwhile stops listening to the
+  // wait and sends no prompt. The prompt watchdog starts with the prompt, so the wait is not
+  // counted against it.
+  const mcpReady = typeof handle.untilMcpReady === 'function'
+    ? Promise.race([
+      Promise.resolve().then(() => handle.untilMcpReady()).catch(() => null),
+      readyWaitEnded,
+    ])
+    : Promise.resolve(null);
+  const promptPromise = mcpReady.then(() => {
+    if (cancelled) throw new Error('turn cancelled before the prompt was sent');
+    return handle.client.sessionPrompt(
+      handle.sessionId,
+      [{ type: 'text', text: String(text || '') }],
+      (update) => {
+        for (const action of normalizer.normalizeAcpUpdate(update)) {
+          enqueue(action);
+        }
+      },
+      promptExtra,
+      {
+        // A running client-hosted terminal (or an in-flight terminal/fs request)
+        // means the agent is waiting on us, not stalled.
+        hasPendingWork: () => handle.hostServices?.hasPendingWork?.() === true,
+        ...(watchdog || {}),
+      },
+    );
+  }).then((promptResult) => {
     const stopReason = String(promptResult?.stopReason || promptResult?.stop_reason || '').trim();
     const isError = stopReason.toLowerCase() === 'error' || promptResult?.isError === true;
     // Per-prompt usage lives on the result `_meta` (tokens + costUsdTicks).

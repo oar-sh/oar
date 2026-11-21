@@ -12,17 +12,22 @@
 // list, relay-event-subscriptions-ui.js): under 📓, or under ︙ when 📓 went
 // into the menu. On a phone it spans the width under the header over a dim
 // backdrop.
+//
+// Its head has the Inbox's Unanswered toggle and ➖ (fold every card to one
+// line); both are the Inbox's view (inbox-ui.js), kept with it.
 
 import { apiFetch } from './api-client.js';
 import { FONT_SCALE_CHANGE_EVENT, getUiScale } from './font-scaling.js';
 import { HEADER_ACTIONS_CHANGE_EVENT, notifyHeaderActionsChanged } from './header-priority-actions.mjs';
-import { buildAskCard } from './inbox-view.mjs';
-import { bindInboxActionHost, captureDrafts, restoreDrafts, setInboxAskHooks } from './inbox-ui.js';
+import { buildFilterChip, buildFoldAllButton, buildInboxCard, syncInboxFoldAll } from './inbox-view.mjs';
+import { captureListAnchor, restoreListAnchor } from './inbox-scroll-anchor.mjs';
+import { bindInboxActionHost, captureDrafts, getInboxView, isInboxItemFolded, restoreDrafts, setInboxAskHooks } from './inbox-ui.js';
 import { isOpeningGestureClick } from './tap-actions.js';
 import { currentConvId, IS_SHARED_VIEW } from './store.js';
 import { findTurnBubble } from './relay-board-view.js';
 import { isStatusViewActive } from './status-view.mjs';
 import { askStubHostKey, askStubKey, askStubText } from './questions-stub-view.mjs';
+import { captureTranscriptAnchor, restoreTranscriptAnchor } from './transcript-viewport-anchor.mjs';
 import {
   questionsAria,
   questionsBadge,
@@ -60,6 +65,10 @@ let renderedKey = '';
 let pendingOpen = null;
 // Details closed by hand in the panel (they open by default there).
 const foldedDetails = new Set();
+// The pointer is over the open list. While it is there or the focus is in
+// it, the list does not follow the header (placeHeld notes one owed).
+let pointerInPanel = false;
+let placeHeld = false;
 let started = false;
 
 function toText(value) {
@@ -261,6 +270,16 @@ function ensurePanel() {
     if (details.open) foldedDetails.delete(id);
     else foldedDetails.add(id);
   }, true);
+  panel.addEventListener('pointerenter', () => { pointerInPanel = true; });
+  panel.addEventListener('pointerleave', () => {
+    pointerInPanel = false;
+    placeHeldPanel();
+  });
+  panel.addEventListener('focusout', (event) => {
+    if (panel.contains(event.relatedTarget)) return;
+    // The focus has not landed yet: look once it has.
+    setTimeout(placeHeldPanel, 0);
+  });
   return panel;
 }
 
@@ -273,6 +292,7 @@ function drawnRect(element) {
 function placePanel() {
   const panel = document.getElementById('questions-panel');
   if (!panel || panel.hidden) return;
+  placeHeld = false;
   const scale = getUiScale();
   const margin = 8 * scale;
   const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
@@ -310,6 +330,28 @@ function placePanel() {
   panel.style.left = `${Math.round(left)}px`;
 }
 
+// The reader is in the list: pointing at it, or typing an answer.
+function panelInUse(panel) {
+  return pointerInPanel || panel.contains(document.activeElement);
+}
+
+// A move of the header (the banner's row, 📓's count) does not move the
+// list from under a reader in it: it is placed once they leave it.
+function placePanelUnlessInUse() {
+  const panel = document.getElementById('questions-panel');
+  if (panel && !panel.hidden && panelInUse(panel)) {
+    placeHeld = true;
+    return;
+  }
+  placePanel();
+}
+
+function placeHeldPanel() {
+  const panel = document.getElementById('questions-panel');
+  if (!placeHeld || !panelOpen || !panel || panelInUse(panel)) return;
+  placePanel();
+}
+
 function el(tag, className = '', text = null) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -329,16 +371,22 @@ function renderPanel({ force = false } = {}) {
     return;
   }
   const now = Date.now();
-  const { pending, urgent, answered } = currentQuestions(now);
+  const { pending, urgent, answered: closed } = currentQuestions(now);
+  const { unanswered } = getInboxView();
+  const answered = unanswered ? [] : closed;
+  const folded = (ask) => isInboxItemFolded('self', ask.id);
   const key = JSON.stringify([
     currentConversationId,
     focusAskId,
-    [...pending, ...answered].map((ask) => [ask.id, ask.status, ask.urgency, ask.updatedAt, ask.choice || '', ask.answer || '']),
+    unanswered,
+    [...pending, ...answered].map((ask) => [ask.id, ask.status, ask.urgency, ask.updatedAt, ask.choice || '', ask.answer || '', folded(ask)]),
   ]);
   if (!force && key === renderedKey && panel.childElementCount) return;
   renderedKey = key;
   const focused = captureDrafts(panel);
   const scrollTop = panel.scrollTop;
+  // The cards the reader sees stay where they are, whatever moved above them.
+  const anchor = captureListAnchor(panel);
   const head = el('div', 'questions-panel-head');
   head.append(el('span', 'questions-panel-title', questionsPanelTitle({ pending: pending.length, urgent })));
   const close = el('button', 'questions-panel-close', '✕');
@@ -346,16 +394,22 @@ function renderPanel({ force = false } = {}) {
   close.title = 'Close';
   close.setAttribute('aria-label', 'Close questions');
   head.append(close);
+  const tools = el('span', 'questions-panel-tools');
+  const foldAll = buildFoldAllButton(document, 'inbox-fold-all questions-panel-fold-all');
+  tools.append(buildFilterChip(document, 'Unanswered', 'unanswered', unanswered), foldAll);
+  close.before(tools);
   const body = el('div', 'questions-panel-body');
   const relay = { id: 'self', self: true };
-  for (const ask of pending) body.append(buildAskCard(document, ask, { relay, mode: 'panel', now }));
+  const card = (ask) => buildInboxCard(document, ask, { relay, mode: 'panel', now, folded: folded(ask) });
+  for (const ask of pending) body.append(card(ask));
   if (answered.length) {
     const divider = el('div', 'inbox-divider', 'Answered in the last day');
     divider.setAttribute('role', 'separator');
     body.append(divider);
-    for (const ask of answered) body.append(buildAskCard(document, ask, { relay, mode: 'panel', now }));
+    for (const ask of answered) body.append(card(ask));
   }
-  if (!pending.length && !answered.length) body.append(el('p', 'questions-panel-empty', 'No questions in this conversation.'));
+  if (!pending.length && !answered.length) body.append(el('p', 'questions-panel-empty', closed.length ? 'No unanswered questions in this conversation.' : 'No questions in this conversation.'));
+  syncInboxFoldAll(foldAll, body);
   for (const details of body.querySelectorAll('details.inbox-item-detail')) {
     if (foldedDetails.has(details.closest('.inbox-item')?.dataset.itemId || '')) details.open = false;
   }
@@ -363,7 +417,8 @@ function renderPanel({ force = false } = {}) {
   restoreDrafts(panel, focused);
   panel.hidden = false;
   panel.scrollTop = scrollTop;
-  placePanel();
+  restoreListAnchor(panel, anchor);
+  placePanelUnlessInUse();
   if (focusAskId) {
     const card = [...panel.querySelectorAll('.inbox-item')].find((node) => node.dataset.itemId === focusAskId);
     if (card) {
@@ -411,6 +466,8 @@ export function closeQuestionsPanel({ focus = true } = {}) {
   panelOpen = false;
   panelAnchor = null;
   lastAnchorRect = null;
+  pointerInPanel = false;
+  placeHeld = false;
   focusAskId = '';
   scrollToFocus = false;
   syncBackdrop();
@@ -488,18 +545,21 @@ const LIVE_TAIL = ':scope > .dots, :scope > #thinking-activity, :scope > .subage
 const REPLY_TAIL = ':scope > .msg-attachments, :scope > .msg-activity, :scope > .msg-workflow-runs, :scope > .msg-preview-cards, :scope > .msg-bubble-actions';
 
 /** The row of stubs in `host` (a bubble, or the standalone container), made when missing and kept in place. */
-function stubRowOf(host, { live = false, standalone = false } = {}) {
+function stubRowOf(host, { live = false, standalone = false } = {}, hold = () => {}) {
   let row = host.querySelector(`:scope > .${STUB_ROW_CLASS}`);
   if (!row) {
     row = document.createElement('div');
     row.className = STUB_ROW_CLASS;
   }
   const before = standalone ? null : host.querySelector(live ? LIVE_TAIL : REPLY_TAIL);
-  if (row.parentNode !== host || row.nextSibling !== before) host.insertBefore(row, before);
+  if (row.parentNode !== host || row.nextSibling !== before) {
+    hold();
+    host.insertBefore(row, before);
+  }
   return row;
 }
 
-function standaloneContainer(el) {
+function standaloneContainer(el, hold = () => {}) {
   let wrapper = el.querySelector(`:scope > .${STANDALONE_CLASS}`);
   if (!wrapper) {
     wrapper = document.createElement('div');
@@ -508,11 +568,32 @@ function standaloneContainer(el) {
   // At the end of the transcript, before the cards a turn waits on.
   const firstQuestion = el.querySelector(':scope > .relay-question-container');
   if (firstQuestion) {
-    if (wrapper.nextSibling !== firstQuestion) el.insertBefore(wrapper, firstQuestion);
+    if (wrapper.nextSibling !== firstQuestion) {
+      hold();
+      el.insertBefore(wrapper, firstQuestion);
+    }
   } else if (wrapper.parentNode !== el || wrapper.nextSibling) {
+    hold();
     el.appendChild(wrapper);
   }
   return wrapper;
+}
+
+// Keeps the reader's place while the stubs change: a stub that wraps to two
+// lines once answered, or one that goes, must not move the text above or at
+// the reader (Safari has no scroll anchoring). The place is taken just
+// before the first change, so only the stubs' own change is undone. A
+// reader at the end is left to the transcript's follow rule.
+function transcriptPlaceKeeper(el) {
+  let anchor;
+  return {
+    hold() {
+      if (anchor === undefined) anchor = captureTranscriptAnchor(el);
+    },
+    restore() {
+      if (anchor && !anchor.atBottom) restoreTranscriptAnchor(el, anchor);
+    },
+  };
 }
 
 /**
@@ -536,6 +617,7 @@ export function renderQuestionStubs() {
       .filter((ask) => toText(ask.conversationId) === conversationId && askStubText(ask))
       .sort((a, b) => timeOf(a.createdAt) - timeOf(b.createdAt) || toText(a.id).localeCompare(toText(b.id)))
     : [];
+  const place = transcriptPlaceKeeper(el);
   // Host element → where it is and the asks it shows, in order.
   const groups = new Map();
   for (const ask of asks) {
@@ -544,26 +626,34 @@ export function renderQuestionStubs() {
     let host = found?.bubble || null;
     if (!host) {
       if (ask.status !== 'pending') continue;
-      host = standaloneContainer(el);
+      host = standaloneContainer(el, place.hold);
     }
     if (!groups.has(host)) groups.set(host, { live: !!found?.live, standalone: !found, list: [] });
     groups.get(host).list.push(ask);
   }
   const keep = new Set();
   for (const [host, { live, standalone, list }] of groups) {
-    const row = stubRowOf(host, { live, standalone });
+    const row = stubRowOf(host, { live, standalone }, place.hold);
     keep.add(row);
     const rowKey = JSON.stringify(list.map((ask) => [ask.id, askStubKey(ask)]));
     if (row.dataset.stubsKey === rowKey && row.childElementCount === list.length) continue;
     row.dataset.stubsKey = rowKey;
+    place.hold();
     row.replaceChildren(...list.map(buildStub));
   }
   // A row no longer wanted (its asks moved, closed beyond the list or another
   // conversation's), then a standalone container left empty.
-  el.querySelectorAll(`.${STUB_ROW_CLASS}`).forEach((row) => { if (!keep.has(row)) row.remove(); });
-  el.querySelectorAll(`:scope > .${STANDALONE_CLASS}`).forEach((wrapper) => {
-    if (!wrapper.querySelector('.msg-ask-stub')) wrapper.remove();
+  el.querySelectorAll(`.${STUB_ROW_CLASS}`).forEach((row) => {
+    if (keep.has(row)) return;
+    place.hold();
+    row.remove();
   });
+  el.querySelectorAll(`:scope > .${STANDALONE_CLASS}`).forEach((wrapper) => {
+    if (wrapper.querySelector('.msg-ask-stub')) return;
+    place.hold();
+    wrapper.remove();
+  });
+  place.restore();
 }
 
 /** Boot: the icon's button, outside clicks, Escape, re-placing, the Inbox's hooks. */
@@ -574,6 +664,8 @@ export function initQuestionsPanel() {
     onAskUpdated: noteQuestionAskUpdated,
     onOpenAsk: requestQuestionsPanelAt,
     onOpenSettled: settleQuestionsPanelRequest,
+    // Unanswered or a fold changed, here or in the Inbox.
+    onViewChanged: () => { if (panelOpen) renderPanel({ force: true }); },
   });
   // A stub opens 📓 at its ask.
   document.getElementById('messages')?.addEventListener('click', (event) => {
@@ -620,7 +712,7 @@ export function initQuestionsPanel() {
   const followHeader = () => {
     if (!panelOpen) return;
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (panelOpen) placePanel();
+      if (panelOpen) placePanelUnlessInUse();
     }));
   };
   window.addEventListener(HEADER_ACTIONS_CHANGE_EVENT, followHeader);

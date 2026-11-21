@@ -12,6 +12,10 @@ import {
   RELAY_ASK_SOCKET_EVENT,
   buildAskCard,
   buildCardItem,
+  buildFoldedItem,
+  buildInboxCard,
+  inboxItemLine,
+  syncInboxFoldAll,
   buildPlanItem,
   answerThereUrl,
   canAnswerThere,
@@ -29,6 +33,7 @@ import {
   inboxSessionUrl,
   renderInbox,
 } from './inbox-view.mjs';
+import { inboxGroupChoices } from './inbox-sections.mjs';
 
 const NOW = Date.parse('2026-03-02T12:00:00.000Z');
 const doc = new JSDOM('<!doctype html><body></body>').window.document;
@@ -522,4 +527,173 @@ test('popup buttons: plain ask_user cards and approvals yes; plan, structured an
   // A relay entry with no usable address: "Open there"'s note, no buttons.
   const blind = buildCardItem(doc, card('q-2'), { relay: { ...LAB_LINK, url: '' }, now: NOW });
   assert.equal(blind.querySelectorAll('[data-inbox-action="answer-there"]').length, 0);
+});
+
+// ─── Filters, groups and folds ───────────────────────────────────────────────
+
+const STORAGE = { id: 'grp-storage', name: 'Storage work' };
+const DOCS = { id: 'grp-docs', name: 'docs pass' };
+const inGroup = (group, extra = {}) => ({ session: { id: `conv-${group?.id || 'none'}`, title: `In ${group?.name || 'no group'}`, startedBy: 'owner', group }, ...extra });
+
+function groupedRelays() {
+  return [
+    { ...SELF, items: [
+      ask('s1', inGroup(STORAGE, { createdAt: minutesAgo(3) })),
+      ask('s2', inGroup(STORAGE, { status: 'answered', answer: 'Yes', answeredAt: minutesAgo(20) })),
+      ask('d1', inGroup(DOCS, { createdAt: minutesAgo(4) })),
+      ask('n1', inGroup(null, { createdAt: minutesAgo(1) })),
+    ] },
+    // A paired relay before 0.9.32: no groups.
+    { ...LAB, items: [ask('l1'), ask('l2', { status: 'dismissed', answeredAt: minutesAgo(5) })] },
+  ];
+}
+
+test('Unanswered drops what closed; This relay keeps this relay alone; a plain string is still "who"', () => {
+  const relays = groupedRelays();
+  const unanswered = inboxSections(relays, { filter: { unanswered: true }, now: NOW });
+  assert.deepEqual(unanswered.map((section) => section.closed.length), [0, 0]);
+  assert.deepEqual(unanswered[0].pending.map((item) => item.id), ['n1', 's1', 'd1']);
+  const here = inboxSections(relays, { filter: { thisRelay: true }, now: NOW });
+  assert.deepEqual(here.map((section) => section.relay.id), ['self']);
+  assert.deepEqual(inboxSections(relays, { filter: { thisRelay: true, unanswered: true, who: 'agents' }, now: NOW })[0].pending, []);
+  assert.deepEqual(inboxSections(relays, { filter: 'agents', now: NOW }).map((section) => section.pending.length), [0, 0]);
+  // Rendered: the chips say whether they are on.
+  const root = renderInbox(doc, { relays, filter: { unanswered: true, thisRelay: true }, now: NOW });
+  const chips = [...root.querySelectorAll('.inbox-filter-chip[data-inbox-view]')];
+  assert.deepEqual(chips.map((chip) => [chip.textContent, chip.getAttribute('aria-pressed')]), [['Unanswered', 'true'], ['This relay', 'true']]);
+  assert.equal(root.querySelector('.inbox-relay[data-relay-id="r-lab"]'), null);
+  assert.equal(root.querySelector('.inbox-divider'), null);
+  // Only this relay listed: no "This relay" to press.
+  assert.equal(renderInbox(doc, { relays: [relays[0]], now: NOW }).querySelector('[data-inbox-view="this-relay"]'), null);
+});
+
+test('group sub-sections: by name, "No group" last, each with its own answered part; none for a single bucket', () => {
+  const relays = groupedRelays();
+  const [self, lab] = inboxSections(relays, { now: NOW });
+  assert.deepEqual(self.groups.map((group) => [group.name, group.pending.map((item) => item.id), group.closed.map((item) => item.id)]), [
+    ['docs pass', ['d1'], []],
+    ['Storage work', ['s1'], ['s2']],
+    ['No group', ['n1'], []],
+  ]);
+  assert.deepEqual(self.groups.map((group) => group.key), ['self\ngrp-docs', 'self\ngrp-storage', 'self\n']);
+  assert.equal(lab.groups.length, 1);
+  const root = renderInbox(doc, { relays, now: NOW });
+  const here = root.querySelector('.inbox-relay[data-relay-id="self"]');
+  assert.deepEqual([...here.querySelectorAll('.inbox-group')].map((node) => [
+    node.querySelector('h3 .inbox-group-name').textContent,
+    node.querySelector('.inbox-section-count').textContent,
+    node.querySelector('.inbox-section-fold').getAttribute('aria-expanded'),
+  ]), [['docs pass', '1 waiting'], ['Storage work', '1 waiting · 1 answered'], ['No group', '1 waiting']].map((row) => [...row, 'true']));
+  assert.equal(here.querySelector('.inbox-group[data-group-id="grp-storage"] .inbox-divider').textContent, 'Answered in the last day');
+  assert.equal(here.querySelector('.inbox-relay-heading .inbox-section-count').textContent, '3 waiting · 1 answered');
+  // The paired relay's items are all in one bucket: no sub-heading.
+  const there = root.querySelector('.inbox-relay[data-relay-id="r-lab"]');
+  assert.equal(there.querySelector('.inbox-group, h3'), null);
+  assert.deepEqual([...there.querySelectorAll('.inbox-item')].map((node) => node.dataset.itemId), ['l1', 'l2']);
+  // A group name is an agent's or another relay's text: shown literally.
+  const odd = renderInbox(doc, { relays: [{ ...SELF, items: [ask('x1', inGroup({ id: 'g-x', name: '<b>bold</b>' })), ask('x2')] }], now: NOW });
+  assert.equal(odd.querySelector('.inbox-group-name').textContent, '<b>bold</b>');
+  assert.equal(odd.querySelectorAll('b').length, 0);
+});
+
+test('the Groups picker lists the groups with items, a paired relay\'s named with it; ticked ones narrow the list, stale ones are ignored', () => {
+  const relays = groupedRelays();
+  relays[1].items.push(ask('l3', inGroup({ id: 'grp-far', name: 'Night jobs' })));
+  const choices = inboxGroupChoices(relays, { now: NOW });
+  assert.deepEqual(choices.map((choice) => choice.label), ['docs pass', 'Storage work', 'No group', 'Night jobs · lab-relay', 'No group · lab-relay']);
+  const picked = inboxSections(relays, { filter: { groups: ['self\ngrp-storage', 'r-lab\ngrp-far', 'self\ngrp-gone'] }, now: NOW });
+  assert.deepEqual(picked.map((section) => [...section.pending, ...section.closed].map((item) => item.id)), [['s1', 's2'], ['l3']]);
+  // Only stale keys: no group filter at all.
+  assert.equal(inboxSections(relays, { filter: { groups: ['self\ngrp-gone'] }, now: NOW })[0].pending.length, 3);
+  const root = renderInbox(doc, { relays, filter: { groups: ['self\ngrp-storage'], groupsOpen: true }, now: NOW });
+  const picker = root.querySelector('details.inbox-groups-picker');
+  assert.equal(picker.open, true);
+  assert.equal(picker.querySelector('summary').textContent, 'Groups (1) ▾');
+  const boxes = [...picker.querySelectorAll('input[type="checkbox"]')];
+  assert.deepEqual(boxes.map((box) => [box.dataset.inboxGroupKey, box.checked]), choices.map((choice) => [choice.key, choice.key === 'self\ngrp-storage']));
+  assert.equal(picker.querySelector('[role="group"]').getAttribute('aria-label'), 'Show these groups');
+  // Nothing grouped anywhere: no picker.
+  assert.equal(renderInbox(doc, { relays: [{ ...SELF, items: [ask('a1')] }], now: NOW }).querySelector('.inbox-groups-picker'), null);
+});
+
+test('empty states: a filter that hides everything says so; this relay\'s section stays', () => {
+  const relays = [{ ...SELF, items: [ask('a1', { status: 'answered', answeredAt: minutesAgo(5) })] }, { ...LAB, items: [ask('l1', { status: 'answered', answeredAt: minutesAgo(5) })] }];
+  const root = renderInbox(doc, { relays, filter: { unanswered: true }, now: NOW });
+  assert.equal(root.querySelector('.inbox-relay[data-relay-id="self"] .inbox-empty').textContent, 'Nothing matches this filter.');
+  assert.equal(root.querySelector('.inbox-relay[data-relay-id="r-lab"]'), null, 'a paired section a filter empties is hidden');
+  assert.equal(root.querySelectorAll('.inbox-empty').length, 1);
+  const none = renderInbox(doc, { relays: [{ ...SELF, items: [] }, relays[1]], filter: { unanswered: true }, now: NOW });
+  assert.deepEqual([...none.querySelectorAll('.inbox-empty')].map((node) => node.textContent), ['Nothing waits for you here.', 'Nothing matches this filter.']);
+});
+
+test('a "No group" tick filters nothing once no real group is listed, and a paired relay whose waiting item a filter hides says so', () => {
+  const grouped = ask('s1', { session: { id: 'conv-s1', title: 'Session s1', startedBy: 'owner', group: { id: 'grp-storage', name: 'Storage work' } } });
+  const relays = [{ ...SELF, items: [grouped, ask('s2')] }, { ...LAB, items: [ask('l1')] }];
+  // Picked while a real group was listed: the paired relay's ask is hidden, and its section says so.
+  const narrowed = renderInbox(doc, { relays, filter: { groups: ['self\n'] }, now: NOW });
+  assert.ok(narrowed.querySelector('.inbox-groups-picker'), 'the picker is there to undo it');
+  assert.equal(narrowed.querySelector('.inbox-relay[data-relay-id="r-lab"] .inbox-empty').textContent, 'Nothing matches this filter.');
+  // The grouped item closed and aged out: no real group, no picker, so the tick filters nothing.
+  const aged = [{ ...SELF, items: [ask('s2')] }, relays[1]];
+  assert.deepEqual(inboxSections(aged, { filter: { groups: ['self\n'] }, now: NOW }).map((section) => section.pending.map((item) => item.id)), [['s2'], ['l1']]);
+  const root = renderInbox(doc, { relays: aged, filter: { groups: ['self\n'] }, now: NOW });
+  assert.equal(root.querySelector('.inbox-groups-picker'), null);
+  assert.equal(root.querySelectorAll('.inbox-item').length, inboxBadge(aged).pending);
+  assert.equal(root.querySelector('.inbox-empty'), null);
+});
+
+test('a folded card is one button row: kind, urgent, age, the question\'s first line, the session; nothing answers on it', () => {
+  const item = ask('a1', { question: 'Which cache?\nMore lines here', urgency: 'now', options: ['Yes'], createdAt: minutesAgo(7) });
+  const card = buildInboxCard(doc, item, { relay: SELF, now: NOW, folded: true });
+  assert.ok(card.classList.contains('inbox-item') && card.classList.contains('is-folded'));
+  assert.deepEqual({ ...card.dataset }, { itemId: 'a1', kind: 'ask', relayId: 'self', status: 'pending' });
+  const row = card.querySelector('button.inbox-item-unfold');
+  assert.equal(row.getAttribute('aria-expanded'), 'false');
+  assert.equal(row.dataset.inboxView, 'unfold-item');
+  assert.deepEqual([...row.querySelectorAll('.inbox-fold-part')].map((node) => node.textContent), ['Question', 'urgent', '7 min', 'Which cache?', 'Session a1']);
+  assert.equal(card.querySelectorAll('button').length, 1);
+  assert.equal(card.querySelector('[data-inbox-action], textarea'), null);
+  // Unfolded: the whole card, a chevron first in its head.
+  const open = buildInboxCard(doc, item, { relay: SELF, now: NOW });
+  const fold = open.querySelector('.inbox-item-head > button.inbox-item-fold:first-child');
+  assert.equal(fold.getAttribute('aria-expanded'), 'true');
+  assert.equal(fold.getAttribute('aria-label'), 'Fold this question');
+  assert.ok(open.querySelector('.inbox-answer'));
+  // The 📓 panel's names no session; a plan card says Plan and its title.
+  assert.equal(buildFoldedItem(doc, item, { relay: SELF, mode: 'panel', now: NOW }).querySelector('.inbox-item-line-session'), null);
+  assert.equal(inboxItemLine(plan('p1', { title: 'Split the parser' })), 'Split the parser');
+  // Agent text in the row stays text.
+  const odd = buildFoldedItem(doc, ask('a2', { question: '<img src=x onerror=alert(1)>' }), { relay: SELF, now: NOW });
+  assert.equal(odd.querySelector('img'), null);
+});
+
+test('folds in the Inbox: folded cards and sections by key; ➖ while one is open, ➕ once all are folded', () => {
+  const relays = groupedRelays();
+  const all = ['self\ns1', 'self\ns2', 'self\nd1', 'self\nn1', 'r-lab\nl1', 'r-lab\nl2'];
+  const half = renderInbox(doc, { relays, filter: { foldedItems: ['self\ns1', 'r-lab\nl1'] }, now: NOW });
+  assert.deepEqual([...half.querySelectorAll('.inbox-item.is-folded')].map((node) => `${node.dataset.relayId}\n${node.dataset.itemId}`).sort(), ['r-lab\nl1', 'self\ns1']);
+  const foldAll = half.querySelector('.inbox-filter .inbox-fold-all');
+  assert.deepEqual([foldAll.textContent, foldAll.getAttribute('aria-label'), foldAll.disabled], ['➖', 'Fold all questions', false]);
+  const folded = renderInbox(doc, { relays, filter: { foldedItems: all }, now: NOW });
+  const unfold = folded.querySelector('.inbox-fold-all');
+  assert.deepEqual([unfold.textContent, unfold.getAttribute('aria-label'), unfold.title], ['➕', 'Unfold all questions', 'Unfold all questions']);
+  // A folded relay section and a folded group: their heading and counts only.
+  const sections = renderInbox(doc, { relays, filter: { foldedSections: ['r-lab', 'self\ngrp-storage'] }, now: NOW });
+  const lab = sections.querySelector('.inbox-relay[data-relay-id="r-lab"]');
+  assert.equal(lab.querySelector('.inbox-item'), null);
+  assert.equal(lab.querySelector('.inbox-section-fold').getAttribute('aria-expanded'), 'false');
+  assert.equal(lab.querySelector('.inbox-section-count').textContent, '1 waiting · 1 answered');
+  assert.equal(lab.querySelector('.inbox-relay-name').textContent, 'lab-relay');
+  const storage = sections.querySelector('.inbox-group[data-group-id="grp-storage"]');
+  assert.equal(storage.querySelector('.inbox-item'), null);
+  assert.equal(storage.querySelector('.inbox-section-fold').dataset.sectionKey, 'self\ngrp-storage');
+  // ➖ reads only the cards in view.
+  assert.equal(sections.querySelectorAll('.inbox-item').length, 2);
+  // Nothing at all: ➖ off.
+  assert.equal(renderInbox(doc, { relays: [{ ...SELF, items: [] }], now: NOW }).querySelector('.inbox-fold-all').disabled, true);
+  const button = doc.createElement('button');
+  const panel = doc.createElement('div');
+  panel.append(buildInboxCard(doc, ask('p1'), { relay: SELF, mode: 'panel', now: NOW, folded: true }));
+  syncInboxFoldAll(button, panel);
+  assert.equal(button.textContent, '➕');
 });

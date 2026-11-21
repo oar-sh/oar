@@ -513,3 +513,43 @@ test('the keeper lets go of the end when content lands unfollowed, so a resize d
   keeper.handleResize();
   assert.equal(el.scrollTop, 2400);
 });
+
+test('the Inbox in the transcript\'s place: a resize leaves its scroll alone', () => {
+  const el = makeScroller({ rowHeights: Array(10).fill(300), clientHeight: 600, scrollTop: 2400 });
+  const timers = [];
+  const keeper = createTranscriptResizeKeeper({
+    getElement: () => el,
+    setTimer: (fn) => { timers.push(fn); return timers.length; },
+    clearTimer: (id) => { timers[id - 1] = null; },
+  });
+  keeper.recordScroll();
+  const left = keeper.committedAnchor();
+  assert.equal(left.atBottom, true);
+  // The Inbox replaces the rows: cards, no `.msg` row. Its height is its own.
+  el.querySelectorAll = () => [];
+  el.scrollTop = 900;
+  // The keyboard opens for an answer box: the viewport resizes.
+  el.clientHeight = 300;
+  assert.equal(keeper.handleResize(), false);
+  assert.equal(el.scrollTop, 900);
+  assert.equal(keeper.isSettling(), false, 'no settle window either');
+  assert.equal(keeper.committedAnchor(), left, 'kept for the transcript\'s return');
+});
+
+test('a settle window still open when the Inbox replaces the rows ends without a restore', () => {
+  const el = makeScroller({ rowHeights: Array(10).fill(300), clientHeight: 600, scrollTop: 2400 });
+  const timers = [];
+  const keeper = createTranscriptResizeKeeper({
+    getElement: () => el,
+    setTimer: (fn) => { timers.push(fn); return timers.length; },
+    clearTimer: (id) => { timers[id - 1] = null; },
+  });
+  keeper.recordScroll();
+  keeper.handleResize();
+  assert.equal(keeper.isSettling(), true);
+  el.querySelectorAll = () => [];
+  el.scrollTop = 450;
+  timers.filter(Boolean).forEach((fn) => fn());
+  assert.equal(keeper.isSettling(), false);
+  assert.equal(el.scrollTop, 450);
+});

@@ -49,7 +49,9 @@ Environment overrides: `COPILOT_PREVIEWS_ENABLED` (`1`/`true` or `0`/`false`),
 `COPILOT_PREVIEWS_PORT`, `COPILOT_PREVIEWS_BIND_HOST`,
 `COPILOT_PREVIEWS_PUBLIC_BASE_URL`, `COPILOT_PREVIEWS_ALLOWED_TARGET_HOSTS`
 (comma-separated). `previews.allowPublicBind` and `previews.maxLive` are read
-from the config file only.
+from the config file only. `previews.maxLive` is only the starting value of
+**Maximum live previews** in Settings → Previews: once that slider is saved, its
+value is the limit.
 
 `publicHostnames` is what the same-hostname interlock checks against, so list
 every hostname the relay itself answers on.
@@ -184,15 +186,26 @@ memory only, until a restart — and the log says so once.
 
 Publishing the same port or folder again in the same conversation returns the
 existing preview (same link, label unchanged) instead of a new one. At most
-`previews.maxLive` (default 8) previews are live at once; the refusal names the
-oldest ones and how to close them. A restart restores every stored preview even
-after the limit was lowered; new ones are refused until enough are closed.
+**Maximum live previews** (Settings → Previews, 0 to 128, default 8 or
+`previews.maxLive` until saved) are live at once; a change applies to the next
+new preview, without a restart. The refusal (429) names the limit, the oldest
+previews and how to close them. Lowering the limit closes nothing, and a restart
+restores every stored preview even after it was lowered; new ones are refused
+until enough are closed. At 0 no new preview is published: the refusal says the
+limit is 0 and where to raise it. A saved value must be a number (or a plain
+decimal like `"12"`) of 0 or more; anything else, a negative included, is
+refused with 400. Decimals are rounded, and above 128 becomes 128. Only the
+owner can change the setting; an agent token can read it
+(`GET /api/settings/preview-max-live`) but not save it, and a paired relay's
+key can do neither.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/previews` | `{conversationId?, port \| dir, host?, label?}` → `{url, basePath, preview, existing}` |
 | `GET /api/previews` | All live previews; scoped to one conversation by `?conversationId=` or the `X-Relay-Conversation-Id` header |
 | `DELETE /api/previews/:token` | Close one. The dev server is untouched. Scoped like `GET`: another conversation's preview is refused with 403 |
+| `GET /api/settings/preview-max-live` | `{maxLive, min, max, default}`: the limit in force, shown clamped into 0..128 |
+| `POST /api/settings/preview-max-live` | `{maxLive}`: not a number, or below 0, refused (400); decimals rounded, above 128 saved as 128; owner only (403 for an agent token or a paired relay's key) |
 
 A preview published while an agent turn is running is also pinned into the
 transcript as a compact link card on that response (it shows a `closed` badge

@@ -20,10 +20,12 @@ Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, co
 window.matchMedia ??= () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
 globalThis.requestAnimationFrame ??= (fn) => setTimeout(fn, 0);
 
-// The relay: an Inbox with nothing in it, every other request empty.
+// The relay: an Inbox with `inboxRelays` in it (nothing at first), every
+// other request empty.
+let inboxRelays = [];
 globalThis.fetch = async (rawUrl) => {
   const url = new URL(String(rawUrl), 'http://localhost/');
-  const body = url.pathname.endsWith('/api/inbox') ? { relays: [] } : {};
+  const body = url.pathname.endsWith('/api/inbox') ? { relays: inboxRelays } : {};
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
 };
 // The transcript the Inbox replaces, and what reopening it restores.
@@ -31,7 +33,7 @@ const opened = [];
 window.openConversation = async (id) => { opened.push(id); };
 window.renderConvList = () => {};
 
-const { toggleInboxView, isInboxViewActive } = await import('./inbox-ui.js');
+const { refreshInbox, toggleInboxView, isInboxViewActive } = await import('./inbox-ui.js');
 const messages = document.getElementById('messages');
 
 test('the Inbox opens at the top, not at the transcript\'s scroll height', async () => {
@@ -55,4 +57,48 @@ test('left and opened again, the Inbox comes back where it was scrolled', async 
   assert.equal(isInboxViewActive(), true);
   assert.equal(messages.scrollTop, 240);
   await toggleInboxView();
+});
+
+test('a refresh that brings a new ask above the reader leaves the cards they read in place', async () => {
+  const minutesAgo = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const ask = (id, minutes) => ({
+    id,
+    kind: 'ask',
+    status: 'pending',
+    question: `Which trail for ${id}?`,
+    options: ['North', 'South'],
+    session: { id: 'conv-marsh', title: 'Marsh walk' },
+    createdAt: minutesAgo(minutes),
+    updatedAt: minutesAgo(minutes),
+  });
+  // Newest first: a1 on top.
+  inboxRelays = [{ id: 'self', name: 'bench-relay', self: true, reachable: true, items: [1, 2, 3, 4, 5, 6].map((n) => ask(`a${n}`, n)) }];
+  // JSDOM lays nothing out: #messages shows 600 px from y=100, the cards
+  // are 200 px each under a 50 px filter bar.
+  const original = window.HTMLElement.prototype.getBoundingClientRect;
+  window.HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+    if (this === messages) return { top: 100, bottom: 700 };
+    const cards = [...messages.querySelectorAll('.inbox-item')];
+    const index = cards.indexOf(this);
+    if (index < 0) return original.call(this);
+    const top = 100 + 50 + index * 200 - messages.scrollTop;
+    return { top, bottom: top + 200 };
+  };
+  const topOf = (id) => messages.querySelector(`.inbox-item[data-item-id="${id}"]`).getBoundingClientRect().top;
+  try {
+    await toggleInboxView();
+    assert.equal(isInboxViewActive(), true);
+    // The reader is at a4.
+    messages.scrollTop = 700;
+    const before = topOf('a4');
+    inboxRelays = [{ ...inboxRelays[0], items: [ask('a0', 0), ...inboxRelays[0].items] }];
+    await refreshInbox();
+    assert.equal(messages.querySelectorAll('.inbox-item')[0].dataset.itemId, 'a0', 'the new ask is listed first');
+    assert.equal(topOf('a4'), before);
+    assert.equal(messages.scrollTop, 900);
+    await toggleInboxView();
+  } finally {
+    window.HTMLElement.prototype.getBoundingClientRect = original;
+    inboxRelays = [];
+  }
 });

@@ -366,7 +366,16 @@ every chat does when a provider is switched off or loses its key.
   non-image files are passed as absolute path references for Claude's `Read` tool.
 - **Subagents** — `forwardSubagentText` is on, so subagent text, thoughts, and activity stream into
   their own nested bubbles. `abort_subagent` maps to `query.stopTask()` for a backgrounded subagent;
-  one running inside the current turn is still answered "not supported". Full-turn **Stop** works.
+  one running inside the current turn is still answered "not supported". Full-turn **Stop** works;
+  a turn the CLI has not ended 60 s after a Stop is ended by stopping the CLI (with its background
+  tasks), and the next message starts a new one on the same session.
+- **A turn that goes quiet** — 10 minutes without a frame from the CLI (`OAR_TURN_STALL_MODEL_MS`),
+  30 while a tool runs (`OAR_TURN_STALL_TOOL_MS`) — is interrupted, and the CLI is stopped when the
+  turn has not ended 60 s later; the turn fails as `claude.turn-stalled` and messages steered into
+  it go back to the queue (`unansweredSteer`: when the CLI obeyed the interrupt, still has live
+  background tasks and opens no turn for them, they settle as stopped, with Resend). Question cards, compactions, relay tool waits, announced API retries and
+  host sleep do not count (`claude-quiet-turn.mjs`; DEVELOPING.md has the details). The same holds
+  for Claude API and DeepSeek chats.
 - **Thinking** — the worker requests summarized thinking *display* without passing a `thinking`
   option, so it never switches thinking on for a session that has it off, and never changes a budget.
 
@@ -1548,7 +1557,11 @@ alone, false with `every_minutes`), `title`. The session is the caller's own con
   the last day) and every paired relay not known to be offline (5 s each). The sidebar's **Inbox**
   (`inbox-ui.js`, `inbox-view.mjs`) shows the count and opens the list in the transcript's place;
   a session shows its pending asks as cards before the cards it waits on. Agent text is set with
-  `textContent` only.
+  `textContent` only. Each item's `session` carries its `group` (`{ id, name }` or null), and the
+  browser sections a relay's items by it (`inbox-sections.mjs`). The filters (All / Mine / Agents,
+  Unanswered, This relay, the ticked groups) and the folded cards and sections are one view, kept
+  per browser in `localStorage` `oar_inbox_view` (`inbox-view-state.mjs`) and shared with the 📓
+  panel; the `oar_inbox_filter` key of 0.9.31 and older is read once into it and removed.
 
 ## Image conversations (OpenAI BYOK)
 
@@ -2055,9 +2068,11 @@ Queue metrics include `parkedCount`: turns an earlier version parked behind its 
 | POST | `/api/settings/relay-restart-max-wait` | `{ maxWaitMinutes }` → the GET body; anything but one of `choices` is `400`. A queued request measures its current period against the new value at once |
 | GET | `/api/settings/subagent-record-retention` | How long sub-agent records keep tool inputs and output: `{ retentionDays, choices: [0, 7, 14, 30, 90], defaultDays: 90 }`; `0` = keep for good |
 | POST | `/api/settings/subagent-record-retention` | `{ retentionDays }` → the GET body; anything but one of `choices` is `400`. Runs a retention sweep 5 s later |
+| GET | `/api/settings/preview-max-live` | **Maximum live previews**: `{ maxLive, min: 0, max: 128, default: 8 }`, the limit in force (the saved `preview_max_live`, else `previews.maxLive`) clamped into the range |
+| POST | `/api/settings/preview-max-live` | `{ maxLive }` → the GET body; owner only (`403` for an agent token or a paired relay's key). Not a number or below 0 is `400`; decimals are rounded, above 128 is saved as 128; `0` lets no new preview be published. See [docs/preview-servers.md](../docs/preview-servers.md) |
 | POST | `/api/claude-native-session` | (Claude, DeepSeek and Claude API workers) Persist the native Agent SDK session id for resume |
 | POST | `/api/claude-context-usage` | (Claude, Claude Cloud, DeepSeek and Claude API workers) Report the session's context-window breakdown after a turn; `409` for a conversation of any other provider |
-| POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Stored as the latest Claude snapshot; a Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
+| POST | `/api/claude-plan-usage` | (Claude and Claude Cloud workers) Report the session's structured `/usage` data — plan rate-limit windows plus session cost totals — falling back to the stable `modelUsage`/`totalCostUsd` result fields. Merged into the stored Claude snapshot: the session figures are the report's; a plan window the report lacks is kept, marked `carried`, while its known reset is ahead, but only when the report is a failed read (`rateLimitsUnknown`) or a plan answer of the same subscription type that did not list `model_scoped`; any other answer replaces the windows; `behaviors` are kept for an hour after their scan (`behaviorsAt`). Answers `{ ok, behaviorsDue }`: `true` hands this worker, and no other, the slow transcript scan (when the stored scan is older than 30 min and no claim is open; a claim lapses after 30 min); the worker then runs the scan in a Claude Code process of its own, never a session's, and posts the full answer. A Claude Cloud conversation's report is stored under its own snapshot key, `claude-cloud` |
 | POST | `/api/claude-cloud-session` | (Claude Cloud worker) Report the cloud session a conversation is bound to: `{ conversationId, cloudSessionId, sessionUrl?, lastSequence, pushedBranch?, costUsd?, model? }` → `{ ok, cloud }`. Sent after the session was created, after every `result` and on a push; emits `claude_cloud_session`. `404` without a runtime session, `409` for a conversation that is not a cloud one |
 | POST | `/api/cursor-plan-usage` | (Cursor worker) Report the agent's cumulative billed usage; the relay diffs it against a per-agent checkpoint and books the increase into the current billing cycle under the pool implied by the turn's model |
 | POST | `/api/claude-api-usage` | (Claude and Claude API workers) Report, after every turn, what the turn's Claude Code process ran: `{ conversationId, claudeNativeSessionId, runId, at, turnId?, firstResultOfRun?, resumedSessionId?, billing, runCounts: [{ model, hitTokens, missTokens, outputTokens, costUsd, costUnknown? }], sessionTotals: [ … ] }` → `{ ok, billing, basis, models }`. The billing is the posting worker's registered kind (the body's only without one); only `claude-api` reports book spend, a subscription report keeps the session's mark. See [Usage and the monthly cap](#usage-and-the-monthly-cap). `400` on a malformed body, `404` without a runtime session, `409` for a conversation that is not a Claude one, `501` without the usage service |
@@ -2543,7 +2558,7 @@ service).
 | `trustProxy` | `"loopback"` | Express `trust proxy`: which proxies may set `X-Forwarded-*` |
 | `workspaceRootAllowList` | unset | Folders conversations may start in; see [Changing the launch CWD](#changing-the-launch-cwd) |
 | `publicHostnames` | `[]` | The relay's own public hostnames; the preview lane refuses them |
-| `previews.enabled`, `.port`, `.bindHost`, `.allowPublicBind`, `.publicBaseUrl`, `.allowedTargetHosts`, `.maxLive` | `false`, `port + 1`, `127.0.0.1`, `false`, —, `[]`, `8` | The preview listener (`services/preview-registry-service.mjs`, [docs/preview-servers.md](../docs/preview-servers.md)) |
+| `previews.enabled`, `.port`, `.bindHost`, `.allowPublicBind`, `.publicBaseUrl`, `.allowedTargetHosts`, `.maxLive` | `false`, `port + 1`, `127.0.0.1`, `false`, —, `[]`, `8` | The preview listener (`services/preview-registry-service.mjs`, [docs/preview-servers.md](../docs/preview-servers.md)); `.maxLive` only until **Maximum live previews** in Settings → Previews is saved; `0` = no new previews |
 | `pushVapidSubject` | `mailto:copilot-remote@example.com` | Contact URI sent to push services |
 | `sharedPresenceMaxPerConversation`, `sharedPresenceMaxGlobal` | `200`, `5000` | Caps of the shared-view watcher count |
 | `cliBinaries` | *(written by the relay)* | Provider CLI paths resolved by an install from Settings, applied at startup |

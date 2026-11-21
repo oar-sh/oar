@@ -18,8 +18,15 @@
 // view is the person's (agent auth §2.2).
 
 import { validateStaticRoot } from '../services/preview-static-handler.mjs';
+import {
+  DEFAULT_PREVIEW_MAX_LIVE,
+  PREVIEW_MAX_LIVE_MAX,
+  PREVIEW_MAX_LIVE_MIN,
+  parsePreviewMaxLiveUpdate,
+  previewMaxLiveSliderValue,
+} from '../services/preview-registry-service.mjs';
 import { agentConversationOf, notPerson } from '../services/relay-principal.mjs';
-import { AUTH_ERROR_CODES } from '../../shared/relay-route-policy.mjs';
+import { AUTH_ERROR_CODES, AUTH_PERSON_REQUIRED_MESSAGE } from '../../shared/relay-route-policy.mjs';
 
 /**
  * The conversation ids a named scope covers: the id itself, and — when it
@@ -220,5 +227,35 @@ export function registerPreviewRoutes(app, deps) {
     const closed = previewRegistry.close(req.params?.token);
     if (!closed.ok) return res.status(closed.status || 404).json({ error: closed.error });
     res.json({ ok: true, preview: closed.preview });
+  });
+
+  // "Maximum live previews" (Settings → Previews): the limit in force, as the
+  // slider shows it. A previews.maxLive above the range keeps working until
+  // the slider is saved; the slider shows it clamped.
+  const maxLivePayload = () => ({
+    maxLive: previewMaxLiveSliderValue(previewRegistry?.maxLive ?? previewRegistry?.settings?.maxLive),
+    min: PREVIEW_MAX_LIVE_MIN,
+    max: PREVIEW_MAX_LIVE_MAX,
+    default: DEFAULT_PREVIEW_MAX_LIVE,
+  });
+
+  app.get('/api/settings/preview-max-live', auth, (_req, res) => {
+    res.json(maxLivePayload());
+  });
+
+  // Saved whether or not the lane is on: it applies once previews are.
+  // Person-only in the route policy; checked here as well, since an agent
+  // that could raise the limit could publish without one.
+  app.post('/api/settings/preview-max-live', auth, (req, res) => {
+    if (notPerson(req)) {
+      return res.status(403).json({ error: AUTH_PERSON_REQUIRED_MESSAGE, code: AUTH_ERROR_CODES.personRequired });
+    }
+    const parsed = parsePreviewMaxLiveUpdate(req.body?.maxLive);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    // Stored in app_settings (preview_max_live); the registry reads it back
+    // on every create.
+    const result = previewRegistry?.saveMaxLive?.(parsed.maxLive);
+    if (!result?.ok) return res.status(500).json({ error: result?.error || 'Could not save the preview limit' });
+    return res.json(maxLivePayload());
   });
 }

@@ -6,8 +6,9 @@ import { JSDOM } from 'jsdom';
 // The sidebar's 🔥 toggle (active sessions only), on the real index.html in
 // JSDOM (harness as in journal-view.archive.test.mjs): the three conditions
 // with their live signals, AND with the title filter, the count, the empty
-// state, the per-browser setting, the timer for the five-minute edge, and the
-// drain that loads only as many pages as the active sessions need.
+// state, the per-browser setting, the timer for the five-minute edge, the
+// drain that loads only as many pages as the active sessions need, and the
+// window slider under the filter row.
 const nativeSetInterval = globalThis.setInterval;
 globalThis.setInterval = (...args) => {
   const timer = nativeSetInterval(...args);
@@ -261,4 +262,76 @@ test('switching 🔥 on announces the search, not a partial "loaded" count, unti
   assert.doesNotMatch(spoken.at(-1), /searching|loaded/);
   store.relayQuestions.delete('q-elsewhere');
   journal.setConversationListActiveOnly(false);
+});
+
+test('the window slider: under the filter row only while 🔥 applies; moving it re-filters at once and is stored', async () => {
+  const sliderRow = el('conv-active-window-row');
+  const slider = el('conv-active-window');
+  const label = el('conv-active-window-label');
+  assert.equal(sliderRow.previousElementSibling, el('conv-filter-row'), 'right under the filter row');
+  assert.deepEqual([slider.type, slider.min, slider.max, slider.step], ['range', '0', '11', '1']);
+  assert.equal(journal.isConversationListActiveOnly(), false);
+  assert.equal(sliderRow.hidden, true, 'hidden while 🔥 is off');
+  assert.equal(slider.value, '2', 'five minutes until moved');
+  assert.equal(label.textContent, 'Active in the last 5 min');
+  assert.equal(slider.getAttribute('aria-valuetext'), 'Active in the last 5 min');
+  assert.match(toggle().title, /active in the last 5 min,/);
+
+  journal.setConversationListActiveOnly(true);
+  assert.equal(sliderRow.hidden, false, 'shown with 🔥 on');
+  await journal.toggleArchivedConversations(true);
+  assert.equal(sliderRow.hidden, true, 'hidden in the Archived view');
+  await journal.toggleArchivedConversations(false);
+  assert.equal(sliderRow.hidden, false);
+  await settle();
+
+  // Known ages, nothing working or waiting: 30 s, 2 min and 20 h idle.
+  const rows = store.conversations;
+  rows['conv-recent'].updatedAt = ago(30 * 1000);
+  rows['conv-old'].updatedAt = ago(2 * MINUTE);
+  rows['conv-plan'].updatedAt = ago(20 * 60 * MINUTE);
+  for (const id of ['conv-recent', 'conv-old', 'conv-plan']) {
+    Object.assign(rows[id], { activeTurn: false, sessionState: 'idle' });
+    delete rows[id].localActivityAt;
+  }
+  journal.renderConvList();
+  assert.ok(listedIds().includes('conv-recent'));
+  assert.ok(listedIds().includes('conv-old'), 'two minutes idle: inside five');
+  assert.equal(listedIds().includes('conv-plan'), false);
+
+  // A drag fires 'input' at every stop; letting go fires 'change'.
+  const drag = (index) => {
+    slider.value = String(index);
+    slider.dispatchEvent(new window.Event('input', { bubbles: true }));
+  };
+  const moveTo = (index) => {
+    drag(index);
+    slider.dispatchEvent(new window.Event('change', { bubbles: true }));
+  };
+  // Mid-drag the label and the stored window follow at once; the list waits
+  // for the next frame (or the release).
+  drag(0);
+  assert.equal(label.textContent, 'Active in the last 1 min');
+  assert.ok(listedIds().includes('conv-old'), 'not repainted at every stop of a drag');
+  moveTo(0);
+  assert.equal(label.textContent, 'Active in the last 1 min');
+  assert.equal(slider.getAttribute('aria-valuetext'), 'Active in the last 1 min');
+  assert.equal(window.localStorage.getItem('copilot_conv_active_window'), '1');
+  assert.ok(listedIds().includes('conv-recent'));
+  assert.equal(listedIds().includes('conv-old'), false, 'two minutes idle: out of a one-minute window');
+  assert.match(toggle().title, /\(last 1 min\)/);
+  assert.equal(badge().textContent, String(listedIds().length));
+
+  moveTo(11);
+  assert.equal(label.textContent, 'Active in the last 24 h');
+  assert.equal(window.localStorage.getItem('copilot_conv_active_window'), '1440');
+  for (const id of ['conv-recent', 'conv-old', 'conv-plan']) assert.ok(listedIds().includes(id), id);
+  assert.match(toggle().title, /\(last 24 h\)/);
+  await settle();
+
+  moveTo(2);
+  assert.equal(window.localStorage.getItem('copilot_conv_active_window'), '5');
+  assert.equal(listedIds().includes('conv-plan'), false);
+  journal.setConversationListActiveOnly(false);
+  assert.equal(sliderRow.hidden, true);
 });

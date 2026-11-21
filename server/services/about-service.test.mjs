@@ -453,19 +453,22 @@ test('About counts the running workers on the relay\'s build and on another one'
   const listWorkers = () => [
     { conversationId: 'conv-fixture-report', status: 'ready', pid: 101, buildId: relayBuildId },
     { conversationId: 'conv-fixture-report', status: 'processing', pid: 104, buildId: '1.2.2+0123456789ab' },
-    // Too old to state a build id at all: another build too.
-    { conversationId: null, status: 'starting', pid: 103, buildId: null },
+    // Too old to state a build id at all, heartbeating and past the grace:
+    // another build too.
+    { sdkSessionId: 'sid-fixture-silent', conversationId: null, status: 'ready', pid: 103, buildId: null, startedAt: '2026-03-02T11:00:00.000Z' },
+    // Still starting, no id stated yet: not counted as another build.
+    { sdkSessionId: 'sid-fixture-fresh', conversationId: null, status: 'starting', pid: 106, buildId: null, startedAt: '2026-03-02T11:59:58.000Z' },
     // Gone or exited workers are not running, whatever their build.
     { conversationId: 'conv-fixture-export', status: 'processing', pid: 999, buildId: '1.2.2+0123456789ab' },
     { conversationId: 'conv-fixture-export', status: 'exited', pid: 105, buildId: null },
   ];
-  const { service } = aboutService({ buildId: relayBuildId, listWorkers });
-  assert.deepEqual((await service.describe()).workers, { total: 3, onThisBuild: 1, onOtherBuild: 2 });
+  const { service } = aboutService({ buildId: relayBuildId, listWorkers, hasHeartbeated: (sid) => sid === 'sid-fixture-silent' });
+  assert.deepEqual((await service.describe()).workers, { total: 4, onThisBuild: 2, onOtherBuild: 2 });
 
   const unknown = aboutService({ listWorkers });
   assert.deepEqual(
     (await unknown.service.describe()).workers,
-    { total: 3, onThisBuild: null, onOtherBuild: null },
+    { total: 4, onThisBuild: null, onOtherBuild: null },
     'a relay that does not know its own build id does not guess',
   );
 

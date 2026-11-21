@@ -20,14 +20,22 @@ import {
   summarizeBillingUsageItems,
 } from './plan-usage-copilot.mjs';
 import {
-  buildClaudePlanCard,
+  buildClaudePlanCard as buildClaudePlanCardAt,
   buildClaudeSessionSections,
   claudePlanUsageFromResult,
+  createClaudeBehaviorScanClaims,
+  CLAUDE_BEHAVIORS_EVERY_MS,
   formatClaudeMoney,
+  mergeClaudePlanUsage,
   normalizeClaudeAccountUsage,
   normalizeClaudePlanUsage,
   normalizeClaudePrepaidCredits,
 } from './plan-usage-claude.mjs';
+
+// The Claude fixtures are dated August 2026; the card hides a window past
+// its reset, so it is drawn at the fixtures' time unless a test names one.
+const CLAUDE_CARD_NOW = new Date('2026-08-08T12:00:00.000Z');
+const buildClaudePlanCard = (options = {}) => buildClaudePlanCardAt({ now: CLAUDE_CARD_NOW, ...options });
 import {
   applyCursorUsageDelta,
   buildCursorPlanCard,
@@ -456,6 +464,222 @@ test('normalizeClaudePlanUsage rejects unusable payloads and tolerates partial o
   const partial = normalizeClaudePlanUsage({ rate_limits_available: true, rate_limits: { five_hour: { utilization: 5 } } });
   assert.equal(partial.windows.length, 1);
   assert.equal(partial.windows[0].resetsAt, null);
+});
+
+// ─── A report that cannot read every plan window ─────────────────────────────
+
+const MERGE_NOW = new Date('2026-08-08T13:00:00.000Z');
+const EARLIER = '2026-08-08T12:00:00.000Z';
+
+function fullClaudeSnapshot() {
+  return mergeClaudePlanUsage(null, normalizeClaudePlanUsage(claudeUsageResponse), { now: new Date(EARLIER) });
+}
+
+test('a turn whose usage read failed keeps the plan bars of the turn before', () => {
+  const previous = fullClaudeSnapshot();
+  const fallback = claudePlanUsageFromResult({
+    modelUsage: { 'claude-opus-5': { inputTokens: 7, outputTokens: 8, costUSD: 0.4 } },
+    totalCostUsd: 0.4,
+  });
+  const merged = mergeClaudePlanUsage(previous, fallback, { now: MERGE_NOW, previousCapturedAt: EARLIER });
+  assert.deepEqual(merged.windows.map((window) => window.id), ['five_hour', 'seven_day', 'seven_day_opus', 'model_scoped:fable']);
+  assert.ok(merged.windows.every((window) => window.readAt === EARLIER));
+  assert.equal(merged.windowsCarried, 4);
+  assert.equal(merged.session.totalCostUsd, 0.4);
+  assert.equal(merged.subscriptionType, 'max');
+  assert.equal(merged.extraUsage.usedCredits, 1250);
+
+  const card = buildClaudePlanCard({ usage: merged, stale: true, now: MERGE_NOW });
+  assert.equal(card.status, 'ok');
+  assert.equal(card.message, null);
+  assert.ok(card.meters.some((meter) => meter.id === 'claude-model_scoped:fable'));
+  assert.ok(card.notes.some((note) => note.id === 'claude-windows-carried'));
+});
+
+test('an answer without model_scoped keeps the Fable bar; a listed empty array drops it', () => {
+  const previous = fullClaudeSnapshot();
+  const { model_scoped: _dropped, ...limitsWithoutScoped } = claudeUsageResponse.rate_limits;
+  const cachedAnswer = normalizeClaudePlanUsage({
+    ...claudeUsageResponse,
+    rate_limits: { ...limitsWithoutScoped, seven_day: { utilization: 70, resets_at: '2026-08-12T00:00:00.000Z' } },
+  });
+  const kept = mergeClaudePlanUsage(previous, cachedAnswer, { now: MERGE_NOW, previousCapturedAt: EARLIER });
+  assert.deepEqual(kept.windows.map((window) => window.id), ['five_hour', 'seven_day', 'seven_day_opus', 'model_scoped:fable']);
+  assert.equal(kept.windows.find((window) => window.id === 'seven_day').utilization, 70);
+  assert.equal(kept.windows.find((window) => window.id === 'seven_day').readAt, MERGE_NOW.toISOString());
+  assert.equal(kept.windows.find((window) => window.id === 'model_scoped:fable').readAt, EARLIER);
+  assert.equal(kept.windowsCarried, 1);
+
+  const fullAnswer = normalizeClaudePlanUsage({
+    ...claudeUsageResponse,
+    rate_limits: { ...limitsWithoutScoped, model_scoped: [] },
+  });
+  const replaced = mergeClaudePlanUsage(kept, fullAnswer, { now: MERGE_NOW });
+  assert.ok(!replaced.windows.some((window) => window.id === 'model_scoped:fable'));
+  assert.equal(replaced.windowsCarried, undefined);
+});
+
+test('a kept window that has reset is dropped instead of shown with its old figure', () => {
+  const previous = fullClaudeSnapshot();
+  const fallback = claudePlanUsageFromResult({ totalCostUsd: 0.1 });
+  const afterFiveHourReset = new Date('2026-08-08T21:00:00.000Z');
+  const merged = mergeClaudePlanUsage(previous, fallback, { now: afterFiveHourReset, previousCapturedAt: EARLIER });
+  assert.deepEqual(merged.windows.map((window) => window.id), ['seven_day', 'seven_day_opus', 'model_scoped:fable']);
+  const afterWeek = mergeClaudePlanUsage(previous, fallback, { now: new Date('2026-08-13T00:00:00.000Z') });
+  assert.deepEqual(afterWeek.windows, []);
+  assert.equal(afterWeek.windowsCarried, undefined);
+});
+
+test('a report without behaviors keeps the stored ones; a new scan replaces them', () => {
+  const previous = fullClaudeSnapshot();
+  const { behaviors: _scan, ...withoutScan } = claudeUsageResponse;
+  const halfHourLater = new Date('2026-08-08T12:30:00.000Z');
+  const kept = mergeClaudePlanUsage(previous, normalizeClaudePlanUsage(withoutScan), { now: halfHourLater });
+  assert.deepEqual(kept.behaviors, previous.behaviors);
+  assert.equal(kept.behaviorsAt, EARLIER);
+  const rescanned = normalizeClaudePlanUsage({
+    ...claudeUsageResponse,
+    behaviors: { day: { request_count: 2, session_count: 1, behaviors: [], agents: [], skills: [], plugins: [], mcp_servers: [] } },
+  });
+  assert.equal(mergeClaudePlanUsage(previous, rescanned, { now: MERGE_NOW }).behaviors.day.requestCount, 2);
+});
+
+test('an answer that says the login has no plan limits replaces the bars', () => {
+  const previous = fullClaudeSnapshot();
+  const noPlan = normalizeClaudePlanUsage({
+    session: { total_cost_usd: 0.2, model_usage: {} },
+    subscription_type: null,
+    rate_limits_available: false,
+    rate_limits: null,
+  });
+  const merged = mergeClaudePlanUsage(previous, noPlan, { now: MERGE_NOW, previousCapturedAt: EARLIER });
+  assert.deepEqual(merged.windows, []);
+  assert.equal(merged.windowsCarried, undefined);
+  assert.equal(merged.rateLimitsAvailable, false);
+  assert.equal(merged.subscriptionType, null);
+  assert.equal(merged.behaviors, null, 'another login keeps no scan of the plan login');
+  const card = buildClaudePlanCard({ usage: merged, now: MERGE_NOW });
+  assert.equal(card.status, 'partial');
+  assert.equal(card.meters.length, 0);
+  assert.match(card.message, /API key or third-party provider/);
+});
+
+test('a plan login without the profile scope replaces the bars too', () => {
+  const previous = fullClaudeSnapshot();
+  const noScope = normalizeClaudePlanUsage({
+    session: { total_cost_usd: 0.2, model_usage: {} },
+    subscription_type: 'max',
+    rate_limits_available: false,
+    rate_limits: null,
+  });
+  const merged = mergeClaudePlanUsage(previous, noScope, { now: MERGE_NOW, previousCapturedAt: EARLIER });
+  assert.deepEqual(merged.windows, []);
+  assert.equal(merged.rateLimitsAvailable, false);
+  const card = buildClaudePlanCard({ usage: merged, now: MERGE_NOW });
+  assert.match(card.message, /does not grant access to the plan limits/);
+});
+
+test('another subscription type takes its own bars only', () => {
+  const previous = fullClaudeSnapshot();
+  const otherAccount = normalizeClaudePlanUsage({
+    session: { total_cost_usd: 0.2, model_usage: {} },
+    subscription_type: 'pro',
+    rate_limits_available: true,
+    rate_limits: { five_hour: { utilization: 3, resets_at: '2026-08-08T17:00:00.000Z' } },
+  });
+  const merged = mergeClaudePlanUsage(previous, otherAccount, { now: MERGE_NOW, previousCapturedAt: EARLIER });
+  assert.deepEqual(merged.windows.map((window) => [window.id, window.utilization]), [['five_hour', 3]]);
+  assert.equal(merged.subscriptionType, 'pro');
+  assert.equal(merged.windowsCarried, undefined);
+  assert.equal(merged.extraUsage, null);
+  assert.equal(merged.behaviors, null);
+});
+
+test('a window without a known reset is never kept', () => {
+  const previous = mergeClaudePlanUsage(null, normalizeClaudePlanUsage({
+    subscription_type: 'max',
+    rate_limits_available: true,
+    rate_limits: {
+      five_hour: { utilization: 40, resets_at: null },
+      seven_day: { utilization: 20, resets_at: '2026-08-12T00:00:00.000Z' },
+    },
+  }), { now: new Date(EARLIER) });
+  const merged = mergeClaudePlanUsage(previous, claudePlanUsageFromResult({ totalCostUsd: 0.1 }), { now: MERGE_NOW });
+  assert.deepEqual(merged.windows.map((window) => window.id), ['seven_day']);
+});
+
+test('kept behaviors go after an hour, and with a new subscription type', () => {
+  const previous = fullClaudeSnapshot();
+  const fallback = claudePlanUsageFromResult({ totalCostUsd: 0.1 });
+  const atFiftyNine = new Date(Date.parse(EARLIER) + 59 * 60_000);
+  assert.ok(mergeClaudePlanUsage(previous, fallback, { now: atFiftyNine }).behaviors, 'still kept just under an hour');
+  assert.equal(mergeClaudePlanUsage(previous, fallback, { now: MERGE_NOW }).behaviors, null, 'an hour after the scan');
+  const team = normalizeClaudePlanUsage({ subscription_type: 'team', rate_limits_available: true, rate_limits: null });
+  assert.equal(mergeClaudePlanUsage(previous, team, { now: atFiftyNine }).behaviors, null);
+});
+
+test('the card hides a bar whose window has reset, and the note names the age of a kept bar', () => {
+  const previous = fullClaudeSnapshot();
+  const merged = mergeClaudePlanUsage(previous, claudePlanUsageFromResult({ totalCostUsd: 0.1 }), {
+    now: MERGE_NOW,
+    previousCapturedAt: EARLIER,
+  });
+  const beforeReset = buildClaudePlanCard({ usage: merged, stale: true, now: new Date('2026-08-08T19:59:00.000Z') });
+  assert.ok(beforeReset.meters.some((meter) => meter.id === 'claude-five_hour'));
+  const note = beforeReset.notes.find((entry) => entry.id === 'claude-windows-carried');
+  assert.match(note.text, /4 bars are from turns up to 7 h 59 min ago/);
+
+  // 25 s after the 5 h window reset, no report has come in yet.
+  const afterReset = buildClaudePlanCard({ usage: merged, stale: true, now: new Date('2026-08-08T20:00:25.000Z') });
+  assert.ok(!afterReset.meters.some((meter) => meter.id === 'claude-five_hour'));
+  assert.ok(afterReset.meters.some((meter) => meter.id === 'claude-seven_day'));
+  assert.match(afterReset.notes.find((entry) => entry.id === 'claude-windows-carried').text, /3 bars/);
+});
+
+test('the transcript scan is handed to one worker at a time, relay-wide', () => {
+  let clock = Date.parse(EARLIER);
+  const claims = createClaudeBehaviorScanClaims({ now: () => clock });
+  const plan = { subscriptionType: 'max', rateLimitsAvailable: true, behaviors: null };
+  assert.equal(claims.due('claude', plan), true, 'the first worker gets the scan');
+  assert.equal(claims.due('claude', plan), false, 'a second worker posting at once does not');
+
+  const scanned = { ...plan, behaviors: { day: {} }, behaviorsAt: new Date(clock).toISOString() };
+  assert.equal(claims.due('claude', scanned, { reportedBehaviors: true }), false, 'a fresh scan is stored');
+  clock += CLAUDE_BEHAVIORS_EVERY_MS - 1;
+  assert.equal(claims.due('claude', scanned), false);
+  clock += 1;
+  assert.equal(claims.due('claude', scanned), true, 'half an hour after the scan');
+
+  assert.equal(claims.due('claude', { subscriptionType: null, rateLimitsAvailable: false }), false, 'no scan for a login without a plan');
+});
+
+test('a scan that failed or found nothing is not handed out again within half an hour', () => {
+  let clock = Date.parse(EARLIER);
+  const claims = createClaudeBehaviorScanClaims({ now: () => clock });
+  const plan = { subscriptionType: 'max', rateLimitsAvailable: true, behaviors: null };
+  assert.equal(claims.due('claude', plan), true);
+  // The scan timed out, or answered without behaviors: no report frees the claim.
+  for (const minutes of [5, 10, 29]) {
+    clock = Date.parse(EARLIER) + minutes * 60_000;
+    assert.equal(claims.due('claude', plan), false, `not again after ${minutes} min`);
+  }
+  clock = Date.parse(EARLIER) + CLAUDE_BEHAVIORS_EVERY_MS;
+  assert.equal(claims.due('claude', plan), true, 'the claim lapses after half an hour');
+});
+
+test('the Claude card names why plan limits are missing', () => {
+  const unknown = buildClaudePlanCard({ usage: claudePlanUsageFromResult({ totalCostUsd: 0.1 }) });
+  assert.match(unknown.message, /could not read the plan limits/);
+  assert.doesNotMatch(unknown.message, /API key/);
+  const noScope = buildClaudePlanCard({
+    usage: normalizeClaudePlanUsage({
+      session: { total_cost_usd: 0.1, model_usage: {} },
+      subscription_type: 'max',
+      rate_limits_available: false,
+      rate_limits: null,
+    }),
+  });
+  assert.match(noScope.message, /does not grant access to the plan limits/);
 });
 
 test('a Claude session with no captured usage explains that no hidden turn is run', () => {

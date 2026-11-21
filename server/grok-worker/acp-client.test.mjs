@@ -3,8 +3,16 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
-import { AcpClient, toAcpStdioMcpServer, withAcpMcpServers } from './acp-client.mjs';
-import { createGrokAgentHandle } from './grok-sdk-adapter.mjs';
+import {
+  ACP_MCP_INITIALIZED_METHOD,
+  ACP_MCP_SERVER_STATUS_METHOD,
+  AcpClient,
+  GROK_MAX_MCP_OUTPUT_BYTES,
+  buildGrokChildEnv,
+  toAcpStdioMcpServer,
+  withAcpMcpServers,
+} from './acp-client.mjs';
+import { createGrokAgentHandle, startGrokTurn } from './grok-sdk-adapter.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 
 function createFakeProc() {
@@ -363,6 +371,249 @@ test('createGrokAgentHandle opens the session with the MCP servers of the client
   assert.deepEqual(sent.find((entry) => entry.method === 'session/load').params.mcpServers, [OAR_SERVER]);
   await fresh.close();
   await resumed.close();
+});
+
+// ─── waiting for the OAR MCP server before the first prompt ──────────────────
+
+function mcpStatus(sessionId, name, status, reason = 'initialized') {
+  return { jsonrpc: '2.0', method: ACP_MCP_SERVER_STATUS_METHOD, params: { sessionId, name, source: 'local', status, reason, tools: null } };
+}
+
+test('the client keeps the latest MCP server status per session and name', async () => {
+  const { client, pushLine } = startClientWithCapturedWrites();
+  const seen = [];
+  client.on('notification', (msg) => seen.push(msg.method));
+  pushLine(mcpStatus('sess-a', 'oar', 'unavailable', 'handshake_failed'));
+  pushLine(mcpStatus('sess-a', 'oar', 'ready'));
+  pushLine(mcpStatus('sess-b', 'tools-x', 'ready'));
+  await waitFor(() => seen.length === 3);
+  assert.equal(client.mcpServerState('sess-a', 'oar').status, 'ready');
+  assert.equal(client.mcpServerState('sess-b', 'tools-x').status, 'ready');
+  assert.equal(client.mcpServerState('sess-b', 'oar'), null);
+});
+
+test('waitForMcpServer ends on ready, on a failed start, on timeout and on exit, never by rejecting', async () => {
+  const { client, proc, pushLine } = startClientWithCapturedWrites();
+  const ready = client.waitForMcpServer('sess-a', 'oar', { timeoutMs: 5_000 });
+  // Another server, or the same name in another session, does not count.
+  pushLine(mcpStatus('sess-a', 'tools-x', 'ready'));
+  pushLine(mcpStatus('sess-z', 'oar', 'ready'));
+  pushLine(mcpStatus('sess-a', 'oar', 'starting'));
+  pushLine(mcpStatus('sess-a', 'oar', 'ready'));
+  assert.equal((await ready).status, 'ready');
+  // Already known: at once.
+  const known = await client.waitForMcpServer('sess-a', 'oar', { timeoutMs: 5_000 });
+  assert.equal(known.status, 'ready');
+  assert.ok(known.waitedMs < 50);
+
+  const failed = client.waitForMcpServer('sess-b', 'oar', { timeoutMs: 5_000 });
+  pushLine(mcpStatus('sess-b', 'oar', 'unavailable', 'handshake_failed'));
+  assert.deepEqual({ ...(await failed), waitedMs: 0 }, { status: 'failed', reason: 'handshake_failed', waitedMs: 0 });
+
+  const timedOut = await client.waitForMcpServer('sess-c', 'oar', { timeoutMs: 60 });
+  assert.equal(timedOut.status, 'timeout');
+  assert.ok(timedOut.waitedMs >= 50);
+
+  const closed = client.waitForMcpServer('sess-d', 'oar', { timeoutMs: 5_000 });
+  proc.emit('exit', 1, null);
+  assert.equal((await closed).status, 'closed');
+  assert.equal((await client.waitForMcpServer('sess-e', 'oar', { timeoutMs: 5_000 })).status, 'closed');
+});
+
+test('all servers initialized ends the wait for a server no status was reported for', async () => {
+  const { client, pushLine } = startClientWithCapturedWrites();
+  const initialized = (sessionId) => ({ jsonrpc: '2.0', method: ACP_MCP_INITIALIZED_METHOD, params: { sessionId, mcpToolCount: 3, elapsedMs: 120 } });
+
+  const pending = client.waitForMcpServer('sess-a', 'oar', { timeoutMs: 5_000 });
+  pushLine(initialized('sess-z'));
+  pushLine(initialized('sess-a'));
+  assert.deepEqual({ ...(await pending), waitedMs: 0 }, { status: 'ready', reason: 'all servers initialized', waitedMs: 0 });
+  // Already initialized before the wait: at once.
+  assert.equal((await client.waitForMcpServer('sess-a', 'oar', { timeoutMs: 5_000 })).status, 'ready');
+
+  // A status that was reported for the server keeps deciding.
+  const seen = [];
+  client.on('mcpServerStatus', (state) => seen.push(state));
+  pushLine(mcpStatus('sess-b', 'oar', 'starting'));
+  await waitFor(() => seen.length === 1);
+  const stillWaiting = client.waitForMcpServer('sess-b', 'oar', { timeoutMs: 80 });
+  pushLine(initialized('sess-b'));
+  assert.equal((await stillWaiting).status, 'timeout');
+});
+
+test('the Grok CLI child gets a larger MCP result cap unless the host set one', () => {
+  const plain = buildGrokChildEnv({ PATH: '/usr/bin' });
+  assert.equal(plain.GROK_MAX_MCP_OUTPUT_BYTES, String(GROK_MAX_MCP_OUTPUT_BYTES));
+  assert.equal(plain.GROK_DISABLE_AUTOUPDATER, '1');
+  assert.equal(plain.PATH, '/usr/bin');
+  assert.equal('MAX_MCP_OUTPUT_BYTES' in plain, false);
+
+  const nativeName = buildGrokChildEnv({ GROK_MAX_MCP_OUTPUT_BYTES: '30000' });
+  assert.equal(nativeName.GROK_MAX_MCP_OUTPUT_BYTES, '30000');
+  const genericName = buildGrokChildEnv({ MAX_MCP_OUTPUT_BYTES: '40000' });
+  assert.equal(genericName.MAX_MCP_OUTPUT_BYTES, '40000');
+  assert.equal('GROK_MAX_MCP_OUTPUT_BYTES' in genericName, false, 'the host\'s own choice wins');
+
+  // The spawn uses it.
+  let spawnedEnv = null;
+  const client = new AcpClient({
+    env: { PATH: '/usr/bin' },
+    spawnImpl: (command, args, options) => { spawnedEnv = options.env; return createFakeProc(); },
+  });
+  client.start();
+  assert.equal(spawnedEnv.GROK_MAX_MCP_OUTPUT_BYTES, String(GROK_MAX_MCP_OUTPUT_BYTES));
+});
+
+/**
+ * A handle over a fake CLI: session/new answers `sess-live`, every
+ * session/prompt is recorded with its time and ends the turn at once.
+ * `pushLine` sends a line as the CLI would.
+ */
+async function createPromptRecordingHandle({ mcpServers = [OAR_SERVER], ...options } = {}) {
+  let proc = null;
+  const prompts = [];
+  class FakeClient extends AcpClient {
+    constructor(opts) {
+      super({ ...opts, spawnImpl: () => { proc = createFakeProc(); return proc; } });
+    }
+    async request(method, params) {
+      this.start();
+      if (method === 'initialize') return {};
+      if (method === 'session/new') return { sessionId: 'sess-live' };
+      if (method === 'session/prompt') {
+        prompts.push({ at: Date.now(), text: params.prompt?.[0]?.text });
+        return { stopReason: 'end_turn' };
+      }
+      return {};
+    }
+  }
+  const logs = [];
+  const handle = await createGrokAgentHandle({
+    cwd: '/home/dev/app',
+    AcpClientImpl: withAcpMcpServers(FakeClient, mcpServers),
+    createHostServicesImpl: () => ({ attach() {}, hasPendingWork: () => false, disposeAll() {} }),
+    dbg: (...parts) => logs.push(parts.join(' ')),
+    ...options,
+  });
+  const pushLine = (msg) => proc.stdout.write(`${JSON.stringify(msg)}\n`);
+  return { handle, prompts, logs, pushLine };
+}
+
+async function runTurn(handle, text, options = {}) {
+  const actions = [];
+  for await (const action of startGrokTurn({ handle, text, ...options })) actions.push(action);
+  return actions;
+}
+
+test('the first prompt waits until the OAR MCP server is ready', async () => {
+  const { handle, prompts, logs, pushLine } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 5_000 });
+  const turn = runTurn(handle, 'first');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(prompts.length, 0, 'no prompt while the server is connecting');
+  // A server the host configured itself is never waited for.
+  pushLine(mcpStatus('sess-live', 'tools-x', 'ready'));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(prompts.length, 0);
+  const readyAt = Date.now();
+  pushLine(mcpStatus('sess-live', 'oar', 'ready'));
+  await turn;
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].at >= readyAt);
+  assert.ok(logs.some((line) => /grok mcp server wait oar ready \(initialized\) after \d+ms/.test(line)), logs.join('\n'));
+  await handle.close();
+});
+
+test('the first prompt goes out at once when the server was ready before it', async () => {
+  const { handle, prompts, pushLine } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 5_000 });
+  pushLine(mcpStatus('sess-live', 'oar', 'ready'));
+  await waitFor(() => handle.client.mcpServerState('sess-live', 'oar'));
+  const startedAt = Date.now();
+  await runTurn(handle, 'first');
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].at - startedAt < 100);
+  await handle.close();
+});
+
+test('the first prompt goes out after the timeout without a ready report; the second does not wait', async () => {
+  const { handle, prompts, logs } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 120 });
+  const startedAt = Date.now();
+  await runTurn(handle, 'first');
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].at - startedAt >= 100, 'waited for the timeout');
+  assert.ok(logs.some((line) => /not ready in time; prompting anyway oar after \d+ms/.test(line)), logs.join('\n'));
+
+  const secondAt = Date.now();
+  await runTurn(handle, 'second');
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[1].at - secondAt < 60, 'a later prompt of the handle does not wait');
+  await handle.close();
+});
+
+test('a session without the OAR MCP server does not wait', async () => {
+  const { handle, prompts } = await createPromptRecordingHandle({
+    mcpServers: [{ ...OAR_SERVER, name: 'tools-x' }],
+    mcpReadyTimeoutMs: 5_000,
+  });
+  const startedAt = Date.now();
+  await runTurn(handle, 'first');
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].at - startedAt < 100);
+  await handle.close();
+
+  const bare = await createPromptRecordingHandle({ mcpServers: [], mcpReadyTimeoutMs: 5_000 });
+  const bareAt = Date.now();
+  await runTurn(bare.handle, 'first');
+  assert.ok(bare.prompts[0].at - bareAt < 100);
+  await bare.handle.close();
+});
+
+test('a failed start of the OAR MCP server ends the wait early', async () => {
+  const { handle, prompts, pushLine } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 5_000 });
+  const startedAt = Date.now();
+  const turn = runTurn(handle, 'first');
+  pushLine(mcpStatus('sess-live', 'oar', 'unavailable', 'handshake_failed'));
+  await turn;
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].at - startedAt < 1_000);
+  await handle.close();
+});
+
+test('a turn cancelled while waiting for the server sends no prompt', async () => {
+  const { handle, prompts } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 5_000 });
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const turn = runTurn(handle, 'first', { abortSignal: controller.signal });
+  setTimeout(() => controller.abort(), 30);
+  const actions = await turn;
+  assert.equal(prompts.length, 0);
+  assert.ok(Date.now() - startedAt < 1_000, 'the cancel ends the wait');
+  assert.ok(actions.some((action) => JSON.stringify(action).includes('cancelled')), JSON.stringify(actions));
+  await handle.close();
+});
+
+test('after a turn cancelled while waiting, the next prompt waits again', async () => {
+  const { handle, prompts, logs, pushLine } = await createPromptRecordingHandle({ mcpReadyTimeoutMs: 5_000 });
+  const controller = new AbortController();
+  const cancelledTurn = runTurn(handle, 'first', { abortSignal: controller.signal });
+  setTimeout(() => controller.abort(), 30);
+  await cancelledTurn;
+  assert.equal(prompts.length, 0, 'the cancelled turn sends no prompt');
+
+  const turn = runTurn(handle, 'second');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(prompts.length, 0, 'the next prompt waits for the server too');
+  const readyAt = Date.now();
+  pushLine(mcpStatus('sess-live', 'oar', 'ready'));
+  await turn;
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0].text, 'second');
+  assert.ok(prompts[0].at >= readyAt);
+  assert.equal(logs.filter((line) => line.includes('grok mcp server wait')).length, 1, logs.join('\n'));
+
+  const thirdAt = Date.now();
+  await runTurn(handle, 'third');
+  assert.ok(prompts[1].at - thirdAt < 60, 'a prompt after the ended wait does not wait');
+  await handle.close();
 });
 
 // ─── the inactivity hold ─────────────────────────────────────────────────────

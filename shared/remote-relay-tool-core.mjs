@@ -191,13 +191,13 @@ export function withIgnoredArguments(result, ignored) {
 }
 
 /**
- * Whether a worker should register the tool: at least one remote is paired,
- * or this relay lets agents start and use sessions on it (the local target).
- * Fails closed — any error, a malformed answer or a slow relay leaves the tool
- * out, and the next worker start asks again.
+ * Whether this relay offers the tool: at least one remote is paired, or this
+ * relay lets agents start and use sessions on it (the local target). Answers
+ * true or false when the relay answered, null when that is unknown: no `api`,
+ * a failed request or a relay that did not answer in time.
  */
-export async function shouldRegisterRemoteRelayTool({ api, timeoutMs = REMOTE_RELAY_DECISION_TIMEOUT_MS } = {}) {
-  if (typeof api !== 'function') return false;
+export async function remoteRelayToolOffered({ api, timeoutMs = REMOTE_RELAY_DECISION_TIMEOUT_MS } = {}) {
+  if (typeof api !== 'function') return null;
   try {
     const response = await withTimeout(
       Promise.resolve().then(() => api('GET', REMOTE_RELAY_SUMMARY_PATH)),
@@ -206,8 +206,17 @@ export async function shouldRegisterRemoteRelayTool({ api, timeoutMs = REMOTE_RE
     );
     return Number(response?.count) > 0 || response?.localEnabled === true;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * Whether a worker should register the tool. Fails closed — any error, a
+ * malformed answer or a slow relay leaves the tool out, and the next worker
+ * start asks again.
+ */
+export async function shouldRegisterRemoteRelayTool(options = {}) {
+  return (await remoteRelayToolOffered(options)) === true;
 }
 
 /**
@@ -281,10 +290,15 @@ export async function fetchRemoteRelayInflight({ api, conversationId = '', timeo
   }
 }
 
-/** The text every adapter hands the model: the relay's JSON, pretty-printed. */
+/**
+ * The text every adapter hands the model: the relay's JSON, compact. Some
+ * provider CLIs cut a tool result at a fixed size, and indentation alone made
+ * a large answer a third longer. Transcripts from before hold the indented
+ * form; both parse the same.
+ */
 export function formatRemoteRelayToolResult(result) {
   try {
-    const text = JSON.stringify(result ?? null, null, 2);
+    const text = JSON.stringify(result ?? null);
     return text === undefined ? 'null' : text;
   } catch {
     return String(result);

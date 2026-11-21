@@ -1,3 +1,4 @@
+import os from 'node:os';
 import { loadAgentSdk } from '../agent-sdk-loader.mjs';
 
 import { formatClaudeBackgroundCommandLimitLabel } from '../../shared/claude-background-command-limit.mjs';
@@ -8,6 +9,7 @@ import { MEDIA_EMBED_INSTRUCTION_TEXT } from '../../shared/media-embed-instructi
 import { REMOTE_RELAY_TOOL_CALL_TIMEOUT_MS } from '../../shared/remote-relay-tool-core.mjs';
 import { createPreviewToolDefinition } from './claude-preview-tool.mjs';
 import { createRemoteRelayToolDefinition } from './claude-remote-relay-tool.mjs';
+import { watchCliChild } from './claude-cli-process.mjs';
 import { CLAUDE_LIVE_FLAG_SETTINGS_CODE, CLAUDE_LIVE_FLAG_SETTINGS_GUIDANCE } from './claude-turn-failure.mjs';
 
 // The SDK the relay installed for this worker (agent-sdk-loader.mjs).
@@ -408,6 +410,9 @@ export function startClaudeSession({
   backend = null,
   liveFlagSettingsTimeoutMs = LIVE_FLAG_SETTINGS_TIMEOUT_MS,
   queryImpl = query,
+  // Windows only: which child process the CLI is (claude-cli-process.mjs).
+  platform = process.platform,
+  watchCliChildImpl = watchCliChild,
   dbg = () => {},
 } = {}) {
   const normalizedModel = String(model || '').trim().toLowerCase();
@@ -477,7 +482,12 @@ export function startClaudeSession({
       : {}),
   };
   const { stream, push, end, release, fail } = createPushableUserMessageStream({ held: Boolean(live) });
+  // Asked before the SDK starts the CLI, so the child it announces is this one.
+  const cliChild = platform === 'win32' ? watchCliChildImpl() : null;
   const turn = queryImpl({ prompt: stream, options });
+  // The CLI's pid while it runs: the session process ends its process tree
+  // with it when it stops the CLI (the SDK's abort ends claude.exe alone).
+  if (cliChild) turn.cliPid = () => cliChild.pid();
   if (live) {
     // The wait ends with the answer, the timeout or the session's abort,
     // whichever comes first; each one clears the others.
@@ -613,28 +623,101 @@ export async function readContextUsage(turn, dbg = () => {}, { timeoutMs = 10000
  * The SDK marks this API EXPERIMENTAL and says the method name will change
  * when it stabilizes, so the call is feature-detected and every failure is
  * swallowed — plan limits are a nice-to-have, never a reason to fail a turn.
+ *
+ * The answer's `behaviors` section comes from a scan of every local
+ * transcript of the last seven days, and that scan is what makes the call
+ * slow: 17-19 s on a host with 1.8 GB of recent transcripts, where the plan
+ * limits alone answer in milliseconds. While it runs, the CLI answers no
+ * other control request (a usage or context read sent meanwhile waits for
+ * it). So a turn's read always asks with `skipBehaviors`, and the scan runs
+ * in a Claude Code process of its own (`scanPlanBehaviors`), never in a
+ * session's: a worker starts it only when the relay hands it the scan
+ * (`behaviorsDue` in the reply to its plan usage report).
  */
 const CLAUDE_USAGE_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
+export const PLAN_BEHAVIORS_TIMEOUT_MS = 120_000;
+
+function withTimeout(request, timeoutMs, label) {
+  let timer = null;
+  // The race leaves the losing promise unobserved on timeout; swallow its
+  // rejection so it cannot surface as an unhandledRejection.
+  request.catch?.(() => {});
+  return Promise.race([
+    request,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 export async function readPlanUsage(turn, dbg = () => {}, { timeoutMs = 10000 } = {}) {
   if (typeof turn?.[CLAUDE_USAGE_METHOD] !== 'function') return null;
-  let timer = null;
   try {
-    const request = turn[CLAUDE_USAGE_METHOD]();
-    // The race leaves the losing promise unobserved on timeout; swallow its
-    // rejection so it cannot surface as an unhandledRejection.
-    request.catch?.(() => {});
-    return await Promise.race([
-      request,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`plan usage timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
+    return await withTimeout(turn[CLAUDE_USAGE_METHOD]({ skipBehaviors: true }), timeoutMs, 'plan usage');
   } catch (error) {
     dbg('plan usage request failed', error?.message || String(error));
     return null;
+  }
+}
+
+// One transcript scan per worker process at a time.
+let planScanRunning = false;
+
+/**
+ * The full `/usage` answer, transcript scan included, or null, read in a
+ * Claude Code process started for it alone: the worker's own environment
+ * (so the same login and config dir as its sessions) and Claude Code
+ * executable, no settings sources, no MCP servers, and a prompt that never
+ * yields, so no model turn runs. The SDK's request takes no abort signal, so
+ * after `timeoutMs` this only stops waiting; the process is closed in every
+ * case, which ends the scan with it.
+ */
+export async function scanPlanBehaviors(dbg = () => {}, {
+  timeoutMs = PLAN_BEHAVIORS_TIMEOUT_MS,
+  queryImpl = query,
+  env = process.env,
+  cwd = os.tmpdir(),
+  pathToClaudeCodeExecutable = String(process.env.CLAUDE_CODE_EXECUTABLE || '').trim(),
+} = {}) {
+  if (planScanRunning) return null;
+  planScanRunning = true;
+  let releasePrompt = () => {};
+  const promptDone = new Promise((resolve) => { releasePrompt = resolve; });
+  async function* noPrompt() {
+    await promptDone;
+  }
+  let scanQuery = null;
+  try {
+    scanQuery = queryImpl({
+      prompt: noPrompt(),
+      options: {
+        cwd,
+        env,
+        settingSources: [],
+        permissionMode: 'default',
+        ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+      },
+    });
+    if (typeof scanQuery?.[CLAUDE_USAGE_METHOD] !== 'function') return null;
+    const answer = Promise.resolve().then(async () => {
+      await scanQuery.initializationResult?.();
+      return scanQuery[CLAUDE_USAGE_METHOD]();
+    });
+    return await withTimeout(answer, timeoutMs, 'usage transcript scan');
+  } catch (error) {
+    dbg('usage transcript scan failed', error?.message || String(error));
+    return null;
   } finally {
-    if (timer) clearTimeout(timer);
+    releasePrompt();
+    try {
+      scanQuery?.close?.();
+    } catch (error) {
+      dbg('usage transcript scan close failed', error?.message || String(error));
+    }
+    planScanRunning = false;
   }
 }
 

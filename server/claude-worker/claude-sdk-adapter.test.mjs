@@ -1475,3 +1475,31 @@ test('the Claude API backend changes the environment and adds its settings pins,
   assert.equal(await turn.liveFlagSettingsApplied, true);
   turn.endInput();
 });
+
+test('on Windows the session knows which child process its CLI is; elsewhere nothing is watched', () => {
+  const order = [];
+  const win = startClaudeSession({
+    cwd: '/tmp',
+    platform: 'win32',
+    watchCliChildImpl: () => {
+      order.push('watch');
+      return { pid: () => 4242 };
+    },
+    queryImpl: () => {
+      order.push('query');
+      return {};
+    },
+  });
+  assert.deepEqual(order, ['watch', 'query'], 'asked before the SDK starts the CLI');
+  assert.equal(win.cliPid(), 4242);
+
+  for (const platform of ['linux', 'darwin']) {
+    const turn = startClaudeSession({
+      cwd: '/tmp',
+      platform,
+      watchCliChildImpl: () => assert.fail('only on Windows'),
+      queryImpl: () => ({}),
+    });
+    assert.equal(turn.cliPid, undefined);
+  }
+});

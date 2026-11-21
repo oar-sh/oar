@@ -93,13 +93,19 @@ export async function drainRemainingPages(loader, shouldContinue = () => true, {
 //  1. it works: a turn runs or is queued, or background work runs (the same
 //     signal the row's colour and spinner use; the caller passes it in);
 //  2. its last activity (a turn's end, a stream, the list's updatedAt) lies
-//     less than ACTIVE_WINDOW_MS back;
+//     less than the window back (the slider under the filter row, one of
+//     ACTIVE_WINDOW_STOPS_MIN; ACTIVE_WINDOW_MS until it is moved);
 //  3. a card waits on the person in it (an ask_user question, a Safety
 //     check, a plan card, a relay ask; the caller passes it in).
 // Archived sessions never count: the 🔥 filter is a view of the live list.
 
 export const ACTIVE_WINDOW_MS = 5 * 60 * 1000;
 export const ACTIVE_FILTER_STORAGE_KEY = 'copilot_conv_active_filter';
+// The slider's stops, in minutes: 1 min to 24 h. The window is kept per
+// browser, in minutes, under ACTIVE_WINDOW_STORAGE_KEY.
+export const ACTIVE_WINDOW_STOPS_MIN = Object.freeze([1, 2, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440]);
+export const ACTIVE_WINDOW_STORAGE_KEY = 'copilot_conv_active_window';
+const MINUTE_MS = 60 * 1000;
 // A relay time further ahead of this page's clock than this is a clock that
 // runs ahead, not activity to come: the row counts from when the page first
 // saw that time (noteActivityFirstSeen).
@@ -285,15 +291,74 @@ export function writeActiveFilterSetting(on, store = globalThis.localStorage) {
   }
 }
 
+/** The index of the stop nearest to `ms` (the smaller one on a tie); the default's for no number. */
+export function activeWindowStopIndex(ms) {
+  const minutes = Number(ms) / MINUTE_MS;
+  if (!Number.isFinite(minutes)) return ACTIVE_WINDOW_STOPS_MIN.indexOf(ACTIVE_WINDOW_MS / MINUTE_MS);
+  let best = 0;
+  ACTIVE_WINDOW_STOPS_MIN.forEach((stop, index) => {
+    if (Math.abs(stop - minutes) < Math.abs(ACTIVE_WINDOW_STOPS_MIN[best] - minutes)) best = index;
+  });
+  return best;
+}
+
+/** The window at a slider position, in ms; a position out of range is clamped. */
+export function activeWindowMsAtStop(index) {
+  const last = ACTIVE_WINDOW_STOPS_MIN.length - 1;
+  const at = Math.min(last, Math.max(0, Math.round(Number(index) || 0)));
+  return ACTIVE_WINDOW_STOPS_MIN[at] * MINUTE_MS;
+}
+
+/**
+ * The stored window in minutes, always a stop: a number snaps to the nearest
+ * one; a missing, damaged or non-positive value reads as the default.
+ */
+export function parseActiveWindowSetting(stored) {
+  const text = String(stored ?? '').trim();
+  const minutes = text === '' ? Number.NaN : Number(text);
+  if (!Number.isFinite(minutes) || minutes <= 0) return ACTIVE_WINDOW_MS / MINUTE_MS;
+  return ACTIVE_WINDOW_STOPS_MIN[activeWindowStopIndex(minutes * MINUTE_MS)];
+}
+
+export function readActiveWindowMs(store = globalThis.localStorage) {
+  try {
+    return parseActiveWindowSetting(store?.getItem(ACTIVE_WINDOW_STORAGE_KEY)) * MINUTE_MS;
+  } catch {
+    return ACTIVE_WINDOW_MS;
+  }
+}
+
+/** Stores the stop nearest to `windowMs`, in minutes. */
+export function writeActiveWindowMs(windowMs, store = globalThis.localStorage) {
+  try {
+    store?.setItem(ACTIVE_WINDOW_STORAGE_KEY, String(ACTIVE_WINDOW_STOPS_MIN[activeWindowStopIndex(windowMs)]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** "5 min", "1 h", "24 h": whole hours from an hour on. */
+export function formatActiveWindow(windowMs = ACTIVE_WINDOW_MS) {
+  const minutes = Math.max(1, Math.round((Number(windowMs) || ACTIVE_WINDOW_MS) / MINUTE_MS));
+  return minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60} h` : `${minutes} min`;
+}
+
+/** The slider's label and aria-valuetext. */
+export function describeActiveWindow(windowMs = ACTIVE_WINDOW_MS) {
+  return `Active in the last ${formatActiveWindow(windowMs)}`;
+}
+
 // The 🔥 button's accessible name. It stays the same: aria-pressed carries
 // the state, the status region the count.
 export const ACTIVE_FILTER_LABEL = 'Show active sessions only';
 
-/** The 🔥 button's tooltip: what a click does, and while on, how many rows show. */
-export function describeActiveFilterTitle(on, count = 0) {
-  if (!on) return `${ACTIVE_FILTER_LABEL}: working, active in the last ${Math.round(ACTIVE_WINDOW_MS / 60000)} minutes, or waiting for you`;
+/** The 🔥 button's tooltip: what a click does, the window, and while on, how many rows show. */
+export function describeActiveFilterTitle(on, count = 0, windowMs = ACTIVE_WINDOW_MS) {
+  const span = formatActiveWindow(windowMs);
+  if (!on) return `${ACTIVE_FILTER_LABEL}: working, active in the last ${span}, or waiting for you`;
   const n = Math.max(0, Number(count) || 0);
-  return `Showing ${n} active session${n === 1 ? '' : 's'}; click to show all`;
+  return `Showing ${n} active session${n === 1 ? '' : 's'} (last ${span}); click to show all`;
 }
 
 /** The count on the 🔥 button: up to 99, then "99+"; nothing while off. */

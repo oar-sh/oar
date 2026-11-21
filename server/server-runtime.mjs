@@ -190,10 +190,7 @@ import { createProcessIdentityReader, createSessionWorkerProcessInspector, ident
 import { agentSdkForWorkerKind, applyClaudeApiProviderEnvironment, applyClaudeCloudProviderEnvironment, applyClaudeProviderEnvironment, applyCopilotSdkProviderEnvironment, applyCursorProviderEnvironment, applyDeepSeekProviderEnvironment, applyGrokProviderEnvironment, applyOpenAIProviderEnvironment, createCliSpawnDisabledDeferral, isCliSpawnDisabled, killTmuxSession, launchSessionCli, resolveWorkerKind } from './services/session-worker-launch-service.mjs';
 import { createSshTunnelManager } from './services/ssh-tunnel-manager-service.mjs';
 import { createCloudflaredTunnelManager } from './services/cloudflared-tunnel-service.mjs';
-import {
-  createPreviewRegistry,
-  normalizePreviewsConfig,
-} from './services/preview-registry-service.mjs';
+import { createPreviewMaxLiveSetting, createPreviewRegistry, normalizePreviewsConfig } from './services/preview-registry-service.mjs';
 import { createPreviewProxyServer } from './services/preview-proxy-server.mjs';
 import { createPreviewHealthProbe } from './services/preview-health-probe.mjs';
 import { createSqlitePreviewStore, isSameHostBoot, readHostBootId } from './services/preview-store.mjs';
@@ -6962,19 +6959,20 @@ function noteWorkerRecycleStuck(stuck = {}) {
     message: { id: messageId, role: 'assistant', text, kind: 'worker-recycle-stuck', model: null, mode: null, attachments: [], timestamp: at },
   });
 }
+// From the supervisor's lifecycle, not its firstObservedHeartbeatAt: that is
+// set only for a worker it launched itself, and the workers that reconnect
+// after a relay restart (the ones most likely stale) never get it.
+function sessionWorkerHasHeartbeated(sid) {
+  const lc = sessionWorkerSupervisor.getLifecycleState(sid);
+  return !!lc?.lastHeartbeatAt && !lc?.awaitingHeartbeat;
+}
 const workerRecycleService = createWorkerRecycleService({
   relayBuildId: BUILD_ID,
   listWorkers: () => sessionWorkerRegistry.listWorkers(),
   getWorker: (sid) => sessionWorkerRegistry.getWorker(sid),
   // A row the session claimed and has not finished: never stopped under it.
   hasRunningTurn: (sid) => (stmts.listProcessingRowsForOwner?.all?.(sid) || []).length > 0,
-  // From the supervisor's lifecycle, not its firstObservedHeartbeatAt: that
-  // is set only for a worker it launched itself, and the workers that
-  // reconnect after a relay restart (the ones most likely stale) never get it.
-  hasHeartbeated: (sid) => {
-    const lc = sessionWorkerSupervisor.getLifecycleState(sid);
-    return !!lc?.lastHeartbeatAt && !lc?.awaitingHeartbeat;
-  },
+  hasHeartbeated: sessionWorkerHasHeartbeated,
   isArchived: (sid) => isWorkerSessionArchived(sid),
   // The session's last delivery or turn end, for a worker that does not say
   // whether its CLI child runs (message-repository getOwnerLastActivityAt).
@@ -8210,9 +8208,9 @@ registerDeepSeekUsageImportRoutes(app, {
   getCardCurrency: async () => deepseekCardCurrency(await deepseekBalanceService.getBalance()),
 });
 registerRelayAskRoutes(app, {
-  auth,
-  db,
-  stmts,
+  auth, db, stmts,
+  // The group each Inbox item's session sits in.
+  conversationGroups,
   formatQuestionRow,
   formatRelayBoardRow,
   relayAskService,
@@ -8257,6 +8255,7 @@ registerAboutRoutes(app, {
     }),
     getCachedCliProviders: () => cliInstallService.getCachedStatusSnapshot()?.providers || {},
     listWorkers: () => sessionWorkerRegistry.listWorkers(),
+    hasHeartbeated: sessionWorkerHasHeartbeated,
     getUpdateState: () => buildUpdateStatePayload(),
     getAgentSdkStatus: () => agentSdkStore.snapshot(),
     describeBackups: () => describeBackups({ layout: STATE_LAYOUT, serverDir: __dirname, dataDir: DATA_DIR, config, sizes: false }),
@@ -8954,6 +8953,7 @@ const resolvePreviewWorkspaceRoot = (conversationId) => {
 // with the registration rules (see createPreviewRegistry).
 const previewRegistry = createPreviewRegistry({
   config: previewsConfig,
+  maxLiveSetting: createPreviewMaxLiveSetting(stmts),
   onChange: ({ previews }) => {
     try { io.emit('previews', { previews }); } catch {}
   },

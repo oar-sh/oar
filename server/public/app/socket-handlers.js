@@ -43,7 +43,7 @@ import { clearOpenConversation, renderConvList, refreshConversations, scheduleLo
 import { applyBackgroundTasksToConversation, applyTurnStatusToConversation } from './conversation-turn-state.mjs';
 import { applyRelayEventSubscriptions, loadRelayEventSubscriptions } from './relay-event-subscriptions-ui.js';
 import { applyRelaySchedules, loadRelaySchedules } from './relay-schedules-ui.js';
-import { noteInboxQuestionsChanged, noteRelayAskUpdated, refreshInbox } from './inbox-ui.js';
+import { noteInboxGroupsChanged, noteInboxQuestionsChanged, noteRelayAskUpdated, refreshInbox } from './inbox-ui.js';
 import { INBOX_REMOTE_CHANGED_EVENT, RELAY_ASK_SOCKET_EVENT } from './inbox-view.mjs';
 import {
   upsertRelayQuestion,
@@ -1078,9 +1078,11 @@ export async function connectSocket(overrideDeps) {
   });
   // A session group changed (a member joined or left, a name, a dissolve,
   // here or from another device): every loaded page is fetched again with
-  // its groups, so a row far down the list changes too.
+  // its groups, so a row far down the list changes too. The Inbox sections
+  // its items by group: it loads again (debounced).
   socket.on('conversation_group_changed', (payload) => {
     applyConversationGroupEvent(payload);
+    noteInboxGroupsChanged();
   });
   socket.on('conversation_archived', ({ conversationId, archived }) => {
     const id = String(conversationId || '').trim();

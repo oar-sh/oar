@@ -23,8 +23,21 @@ function distanceFromBottom(el) {
   return Math.max(0, Number(el.scrollHeight || 0) - Number(el.clientHeight || 0) - Number(el.scrollTop || 0));
 }
 
+const TRANSCRIPT_ROW_SELECTOR = '.msg[data-message-id]';
+
 function transcriptRows(el) {
-  return Array.from(el.querySelectorAll('.msg[data-message-id]'));
+  return Array.from(el.querySelectorAll(TRANSCRIPT_ROW_SELECTOR));
+}
+
+/**
+ * Whether the scroller shows a transcript. The Inbox, Status and Media
+ * views are drawn into #messages too and hold no rows: a position taken in
+ * the transcript means nothing there.
+ */
+export function holdsTranscriptRows(el) {
+  if (!el) return false;
+  if (typeof el.querySelector === 'function') return Boolean(el.querySelector(TRANSCRIPT_ROW_SELECTOR));
+  return transcriptRows(el).length > 0;
 }
 
 /**
@@ -323,6 +336,8 @@ export function createTranscriptResizeKeeper({
   }
 
   function apply(el) {
+    // Another view in the transcript's place (the Inbox): its scroll is its own.
+    if (!holdsTranscriptRows(el)) return false;
     const restored = committed ? restore(el, committed) : false;
     let field = null;
     try { field = getFocusedField(el); } catch { field = null; }
@@ -338,7 +353,7 @@ export function createTranscriptResizeKeeper({
 
   function handleResize() {
     const el = element();
-    if (!el) return false;
+    if (!el || !holdsTranscriptRows(el)) return false;
     if (!committed) {
       // Nothing committed yet (no scroll since load): the current position
       // is the best description we have.

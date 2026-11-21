@@ -6851,7 +6851,7 @@ test('the settle window can be switched off', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// A running turn that went quiet (observed, never failed)
+// A running turn that went quiet: the worker ends it
 
 function toolUse(id, name = 'Bash') {
   return { type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id, name, input: {} }] } };
@@ -6861,39 +6861,941 @@ function toolResult(id) {
   return { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } };
 }
 
-test('a running turn that goes quiet is written to the log and left running', async () => {
+function interruptedResult(sessionId = 'native-1') {
+  return { ...resultMessage('', sessionId), is_interrupt: true };
+}
+
+function apiRetryMessage(attempt, retryDelayMs) {
+  return { type: 'system', subtype: 'api_retry', attempt, max_retries: 9, retry_delay_ms: retryDelayMs, error_status: 0 };
+}
+
+/**
+ * CLI stand-ins that end the way the SDK's do when the session's abort
+ * controller fires (the worker's way of stopping the CLI): the stream ends.
+ * `spawns` holds what each one was started with.
+ */
+function abortableTurns({ echoPushes = false } = {}) {
+  const turns = [];
+  const spawns = [];
+  return {
+    turns,
+    spawns,
+    startImpl: (params) => {
+      const turn = scriptedTurn({ echoPushes });
+      params.abortController?.signal.addEventListener('abort', () => turn.close());
+      turns.push(turn);
+      spawns.push(params);
+      return turn;
+    },
+  };
+}
+
+const responsesOf = (stub, id) => stub.calls.filter((call) => call.routePath === '/api/response' && call.body.messageId === id);
+const requeuesOf = (stub, id) => stub.calls.filter((call) => call.routePath === '/api/requeue' && call.body.messageId === id);
+
+test('a running turn that goes quiet is interrupted and fails as stalled, and the idle CLI is replaced', async () => {
   const stub = makeApiStub();
-  const turn = scriptedTurn({ echoPushes: true });
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
   const lines = [];
   const runner = makeRunner({
     stub,
-    startImpl: () => turn,
+    startImpl,
     lifecyclePollMs: 5,
     quietTurnWindowsMs: { model: 40, tool: 5_000 },
     dbg: (...parts) => lines.push(parts.join(' ')),
   });
 
   const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
-  turn.emit(initMessage('native-1'));
-  turn.emit(assistantText('Looking into it.'));
-  await waitFor(() => lines.some((line) => /running turn quiet for/.test(line)), { label: 'quiet turn logged' });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit({
+    type: 'stream_event',
+    parent_tool_use_id: null,
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Looking into it.' } },
+  });
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
 
   const logged = lines.filter((line) => /running turn quiet for/.test(line));
-  assert.match(logged[0], /left running/);
+  assert.equal(logged.length, 1, 'once per silence');
+  assert.match(logged[0], /ending it/);
   assert.match(logged[0], /q-1/);
-  assert.match(logged[0], /phase=idle|phase=model/);
-  // Nothing was failed or published over it, and the turn still ends normally.
-  assert.equal(stub.calls.filter((call) => call.routePath === '/api/response').length, 0);
-  await tick(60);
-  assert.equal(lines.filter((line) => /running turn quiet for/.test(line)).length, 1, 'once per silence');
+  // Not failed before the CLI had its chance to end the turn itself.
+  assert.equal(responsesOf(stub, 'q-1').length, 0);
+  assert.equal(runner.canAcceptSteering(), false, 'nothing is steered into a turn that is being ended');
 
-  turn.emit(resultMessage('Done.', 'native-1'));
+  // A CLI that still works ends the turn; the row fails with what was seen.
+  turns[0].emit(interruptedResult());
   assert.equal(await pending, true);
   assert.ok(lines.some((line) => /the CLI spoke again after/.test(line)));
-  const response = stub.calls.find((call) => call.routePath === '/api/response');
-  assert.equal(response.body.text, 'Done.');
-  assert.ok(!response.body.terminalError);
-  turn.endInput();
+  const [response] = responsesOf(stub, 'q-1');
+  assert.equal(response.body.terminalError.code, 'turn-stalled');
+  assert.equal(response.body.terminalError.stableCode, 'claude.turn-stalled');
+  assert.equal(response.body.terminalError.kind, 'claude-turn-failed');
+  assert.match(response.body.text, /the Claude runtime sent nothing for \d+s/);
+  assert.match(response.body.text, /Send the message again to retry\./);
+  assert.doesNotMatch(response.body.text, /did not end the turn/);
+  assert.equal(response.body.partialText, 'Looking into it.', 'what the turn had written stays above the note');
+  assert.equal(turns[0].interrupts, 1);
+  assert.equal(turns[0].closed, false, 'a CLI that ended the turn is not stopped');
+
+  // Nothing lives in the process: it is released, and the next message gets
+  // a new CLI on the same session.
+  await waitFor(() => turns[0].endInputCalls >= 1, { label: 'the idle CLI is released' });
+  await settled(runner);
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'again' } });
+  await waitFor(() => turns.length === 2, { label: 'a new CLI' });
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(resultMessage('Done.', 'native-1'));
+  assert.equal(await second, true);
+  assert.equal(responsesOf(stub, 'q-2')[0].body.text, 'Done.');
+  turns[1].endInput();
+  await settled(runner);
+});
+
+test('a quiet turn the CLI ends keeps the process when background tasks live in it', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 5_000 },
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'suite' }]));
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await pending, true);
+  assert.equal(responsesOf(stub, 'q-1')[0].body.terminalError.code, 'turn-stalled');
+
+  await tick(60);
+  assert.equal(turns[0].closed, false, 'the CLI is not stopped');
+  assert.equal(turns[0].endInputCalls, 0, 'nor released: its background task goes on');
+  assert.ok(runner._getProcess(), 'the process is still there');
+  turns[0].emit(backgroundTasksMessage([]));
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('a quiet turn the CLI does not end is stopped with the CLI; steered messages go back to the queue and run on a new one', async () => {
+  // 2026-11-18: the CLI's request after a wake never connected. Three
+  // messages had been steered into the turn; nothing ended it but a person.
+  const stub = makeApiStub();
+  const { turns, spawns, startImpl } = abortableTurns();
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    interruptGraceMs: 40,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  turns[0].emit(apiRetryMessage(4, 1));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const steers = ['q-2', 'q-3'].map((id) => runner.handlePendingPayload({ message: { ...baseMessage, id, text: `steer ${id}` } }));
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === 2, { label: 'steers pushed' });
+
+  // The CLI acknowledges the interrupt and ends nothing.
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
+  await waitFor(() => turns[0].closed, { label: 'the CLI is stopped after the grace' });
+  assert.equal(await first, true);
+  assert.deepEqual(await Promise.all(steers), [false, false], 'handed back, not handled');
+  await settled(runner);
+
+  assert.ok(lines.some((line) => /did not end the interrupted turn within/.test(line)));
+  const [response] = responsesOf(stub, 'q-1');
+  assert.equal(response.body.terminalError.stableCode, 'claude.turn-stalled');
+  assert.match(response.body.text, /sent nothing for \d+s/);
+  assert.match(response.body.text, /did not end the turn when asked, so the relay stopped it/);
+  for (const id of ['q-2', 'q-3']) {
+    assert.deepEqual(requeuesOf(stub, id).map((call) => call.body.class), ['steering-held'], `${id} goes back without a retry penalty`);
+    assert.equal(responsesOf(stub, id).length, 0, `${id} is neither answered nor failed`);
+  }
+  assert.equal(stub.calls.some((call) => call.routePath === '/api/queue-consumed'), false, 'nothing is marked consumed');
+  assert.deepEqual(runner.getActiveQueueMessageIds(), [], 'no row is still reported as owned');
+
+  // The relay delivers q-2 again: a new CLI resumes the session and runs it.
+  const again = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steer q-2' } });
+  await waitFor(() => turns.length === 2, { label: 'a new CLI' });
+  assert.equal(spawns[1].resume, 'native-1', 'on the same session');
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(userReplay('steer q-2'));
+  turns[1].emit(resultMessage('Answered.', 'native-1'));
+  assert.equal(await again, true);
+  assert.equal(responsesOf(stub, 'q-2')[0].body.text, 'Answered.');
+  turns[1].endInput();
+  await settled(runner);
+});
+
+test('what was steered into a quiet turn runs on the turn the CLI opens for it', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const steer = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and this' } });
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === 1, { label: 'steer pushed' });
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
+
+  // The CLI ends the turn and dequeues the steer into a turn of its own.
+  turns[0].emit(interruptedResult());
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('and this'));
+  turns[0].emit(assistantText('Here it is.'));
+  turns[0].emit(resultMessage('Here it is.', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await steer, true);
+  assert.equal(responsesOf(stub, 'q-1')[0].body.terminalError.code, 'turn-stalled');
+  const [answer] = responsesOf(stub, 'q-2');
+  assert.equal(answer.body.text, 'Here it is.');
+  assert.ok(!answer.body.terminalError && !answer.body.kind, 'an ordinary answer, not a merge marker');
+  assert.equal(requeuesOf(stub, 'q-2').length, 0);
+  assert.equal(turns[0].interrupts, 1, 'the follow-up turn is not interrupted');
+  assert.equal(turns[0].closed, false);
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('steered messages the CLI opens no turn for after a quiet turn go back to the queue, on a stopped CLI', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    steeredFoldGraceMs: 30,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const steer = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and this' } });
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === 1, { label: 'steer pushed' });
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await first, true);
+
+  // No turn opens for q-2. It is not settled as merged into a turn that
+  // answered nothing: the CLI, which still holds it, is stopped instead.
+  assert.equal(await steer, false);
+  assert.equal(turns[0].closed, true);
+  assert.deepEqual(requeuesOf(stub, 'q-2').map((call) => call.body.class), ['steering-held']);
+  assert.equal(responsesOf(stub, 'q-2').length, 0);
+  await settled(runner);
+});
+
+/** q-1 live and silent with `steers` pushed into it, until the watchdog interrupts it. */
+async function quietTurnWithSteers(runner, turns, steers) {
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  const turn = turns[0];
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const pending = steers.map((text, index) => runner.handlePendingPayload({
+    message: { ...baseMessage, id: `q-${index + 2}`, text },
+  }));
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === steers.length, { label: 'steers pushed' });
+  await waitFor(() => turn.interrupts === 1, { label: 'the quiet turn is interrupted' });
+  return [first, ...pending];
+}
+
+test('a steer folded into the turn that follows a quiet one settles as merged, on a CLI that stays', async () => {
+  // Two steers: the CLI opens a turn for the first and folds the second into
+  // it without a replay. That turn answered it; the mark the watchdog left on
+  // it must not stop a CLI that works again.
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    steeredFoldGraceMs: 30,
+  });
+
+  const [first, second, third] = await quietTurnWithSteers(runner, turns, ['and this', 'and that']);
+  turns[0].emit(interruptedResult());
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('and this'));
+  turns[0].emit(assistantText('Both done.'));
+  turns[0].emit(resultMessage('Both done.', 'native-1'));
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(await third, true);
+
+  assert.equal(responsesOf(stub, 'q-1')[0].body.terminalError.code, 'turn-stalled');
+  assert.equal(responsesOf(stub, 'q-2')[0].body.text, 'Both done.');
+  assert.equal(responsesOf(stub, 'q-3')[0].body.kind, 'folded');
+  assert.equal(requeuesOf(stub, 'q-3').length, 0);
+  await tick(60);
+  assert.equal(turns[0].closed, false, 'the CLI is not stopped');
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('a steer the CLI takes into the turn while the interrupt is on its way carries the stall', async () => {
+  // The CLI was only slow: it replays the steer before the interrupt lands.
+  // It is one turn, and the interrupt ends it under the steer's row.
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+  });
+
+  const [first, second] = await quietTurnWithSteers(runner, turns, ['and this']);
+  turns[0].emit(userReplay('and this'));
+  assert.equal(await first, true);
+  const [handedOff] = await waitFor(() => responsesOf(stub, 'q-1'), { label: 'q-1 settled' }).then((list) => list);
+  assert.equal(handedOff.body.absorbed, true, 'its reply continues through the next message');
+  assert.ok(!handedOff.body.terminalError);
+  assert.equal(runner.canAcceptSteering(), false, 'the turn is still being ended');
+
+  turns[0].emit(interruptedResult());
+  assert.equal(await second, true);
+  const [response] = responsesOf(stub, 'q-2');
+  assert.equal(response.body.terminalError.code, 'turn-stalled');
+  assert.equal(turns[0].interrupts, 1);
+  assert.equal(turns[0].closed, false);
+  await settled(runner);
+});
+
+test('a Stop on a turn the watchdog is already ending settles its steers as stopped, on a CLI that stays', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const { controlPoller, getAbort } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    controlPoller,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    steeredFoldGraceMs: 30,
+    stopFollowUpWindowMs: 60,
+  });
+
+  const [first, second] = await quietTurnWithSteers(runner, turns, ['and this']);
+  await getAbort()();
+  turns[0].emit(interruptedResult());
+  assert.equal(await first, true);
+  assert.equal(await second, true);
+  assert.equal(responsesOf(stub, 'q-2')[0].body.kind, 'stopped', 'the user stopped it with the turn');
+  assert.equal(requeuesOf(stub, 'q-2').length, 0);
+  await tick(60);
+  assert.equal(turns[0].closed, false, 'a CLI that obeyed is not stopped');
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('a delivery waiting behind a continuation that went quiet goes back to the queue too', async () => {
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      params.abortController.signal.addEventListener('abort', () => turn.close());
+      return turn;
+    },
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 80, tool: 5_000 },
+    interruptGraceMs: 40,
+    // Not this test's subject: the row must still wait when the turn ends.
+    strandedSettleMs: 0,
+    pendingDeliveredTimeoutMs: 0,
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  // A message arrives, and the CLI opens a turn of its own over it (a replay
+  // that is not the message's). Then nothing.
+  const waiting = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turn.pushed.length === 2, { label: 'q-2 pushed' });
+  turn.emit(userReplay('<cli-record>something the CLI noted for itself</cli-record>'));
+  turn.emit(initMessage('native-1'));
+  turn.emit(assistantText('Looking at that.'));
+  await waitFor(() => runner._getProcess()?.activeCtx?.kind === 'continuation', { label: 'continuation open' });
+  assert.equal(runner._getProcess().pendingDelivered.length, 1, 'q-2 still waits unattached');
+
+  await waitFor(() => turn.closed, { label: 'the CLI is stopped after window and grace' });
+  assert.equal(await waiting, false, 'handed back');
+  assert.deepEqual(requeuesOf(stub, 'q-2').map((call) => call.body.class), ['steering-held']);
+  assert.equal(responsesOf(stub, 'q-2').length, 0);
+  const [continuation] = responsesOf(stub, 'cont-1');
+  assert.equal(continuation.body.terminalError.code, 'turn-stalled');
+  await settled(runner);
+});
+
+test('a context opened for a question card between turns is not ended for the CLI being quiet', async () => {
+  // A background agent asks while no turn runs. The card's context has no
+  // turn of the CLI behind it: an interrupt would end nothing, and the grace
+  // would stop an idle CLI that works.
+  const calls = [];
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/continuation-turn') return { messageId: 'cont-1', attemptId: 'attempt-cont-1' };
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') return { question: { id: 'rq-1', status: 'answered', answer: 'option A' } };
+    return { ok: true };
+  };
+  const { turns, spawns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub: { api },
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 40 },
+    interruptGraceMs: 40,
+    askUserBridgeOptions: { questionPollMs: 5 },
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  turns[0].emit(backgroundTasksMessage([{ task_id: 'agent-1', task_type: 'local_agent', description: 'research' }]));
+  turns[0].emit(resultMessage('Started.', 'native-1'));
+  assert.equal(await first, true);
+
+  const decision = await spawns[0].canUseTool('AskUserQuestion', {
+    questions: [{ question: 'Proceed?', options: [{ label: 'option A' }, { label: 'option B' }] }],
+  }, {});
+  assert.equal(decision.behavior, 'allow');
+  assert.equal(runner._getProcess().activeCtx?.kind, 'continuation', 'the card got a row of its own');
+  await tick(200);
+  assert.equal(turns[0].interrupts, 0, 'no turn to interrupt');
+  assert.equal(turns[0].closed, false);
+
+  // Once the main agent works under it, it is a turn like any other.
+  turns[0].emit(backgroundTasksMessage([]));
+  turns[0].emit(taskNotificationReplay());
+  await waitFor(() => turns[0].interrupts === 1, { label: 'a quiet turn again' });
+  turns[0].emit(interruptedResult());
+  await waitFor(() => !runner._getProcess()?.activeCtx, { label: 'continuation closed' });
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('with background tasks in the CLI, steered messages it opens no turn for settle as stopped and the CLI stays', async () => {
+  // The CLI obeyed the interrupt. Stopping it for the messages it did not
+  // pick up would end its background tasks, after a note that said it stays.
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    steeredFoldGraceMs: 30,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  turns[0].emit(backgroundTasksMessage([{ task_id: 'bash-1', task_type: 'local_bash', description: 'suite' }]));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const steer = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'and this' } });
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === 1, { label: 'steer pushed' });
+  await waitFor(() => turns[0].interrupts === 1, { label: 'the quiet turn is interrupted' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await first, true);
+  assert.doesNotMatch(responsesOf(stub, 'q-1')[0].body.text, /did not end the turn/);
+
+  assert.equal(await steer, true);
+  const [marker] = responsesOf(stub, 'q-2');
+  assert.equal(marker.body.kind, 'stopped', 'unanswered, with Resend');
+  assert.match(marker.body.text, /Stopped with the turn — not answered/);
+  assert.equal(requeuesOf(stub, 'q-2').length, 0);
+  assert.ok(lines.some((line) => /settling it as stopped.*background tasks kept: 1/.test(line)));
+  await tick(60);
+  assert.equal(turns[0].closed, false, 'the CLI is not stopped');
+  assert.equal(turns[0].endInputCalls, 0, 'nor released');
+  assert.equal(runner._getProcess().liveTasks.size, 1, 'its background task goes on');
+  turns[0].emit(backgroundTasksMessage([]));
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('a Stop the CLI acknowledges without ending the turn stops the CLI, and the next message runs on a new one', async () => {
+  // The second half of 2026-11-18: 0.4 s after the Stop the CLI sent one
+  // system message and no result. The row was shown as stopped, the context
+  // stayed open, and the three messages behind it never ran.
+  const stub = makeApiStub();
+  const { turns, spawns, startImpl } = abortableTurns();
+  const { controlPoller, getAbort } = abortCapturingPoller();
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    controlPoller,
+    lifecyclePollMs: 5,
+    // The quiet-turn watchdog is off: this is the Stop's own bound.
+    quietTurnWindowsMs: { model: 0, tool: 0 },
+    interruptGraceMs: 60,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
+  const steer = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'steered before the Stop' } });
+  await waitFor(() => runner._getProcess()?.pendingDelivered.length === 1, { label: 'steer pushed' });
+
+  await getAbort()();
+  assert.equal(turns[0].interrupts, 1);
+  turns[0].emit({ type: 'system', subtype: 'session_state_changed', state: 'idle' });
+  await tick(20);
+  assert.equal(runner.isDeliveryHeld(), true, 'held while the CLI may still end the turn');
+  assert.equal(turns[0].closed, false, 'not stopped inside the grace');
+
+  await waitFor(() => turns[0].closed, { label: 'the CLI is stopped after the grace' });
+  assert.equal(await first, true);
+  assert.equal(await steer, true);
+  await settled(runner);
+  assert.ok(lines.some((line) => /did not end the interrupted turn within/.test(line)));
+  // The Stop owns the stopped row; the steer went with the turn, as it does
+  // when the CLI ends a stopped turn itself.
+  assert.equal(responsesOf(stub, 'q-1').length, 0);
+  assert.equal(responsesOf(stub, 'q-2')[0].body.kind, 'stopped');
+  assert.equal(requeuesOf(stub, 'q-2').length, 0);
+
+  // The next message is neither held nor pushed into the dead process.
+  assert.equal(runner.isDeliveryHeld(), false);
+  const next = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'after the Stop' } });
+  await waitFor(() => turns.length === 2, { label: 'a new CLI' });
+  assert.equal(spawns[1].resume, 'native-1', 'on the same session');
+  assert.equal(turns[0].pushed.length, 2, 'nothing more went to the stopped CLI');
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(userReplay('after the Stop'));
+  turns[1].emit(resultMessage('Running again.', 'native-1'));
+  assert.equal(await next, true);
+  assert.equal(responsesOf(stub, 'q-3')[0].body.text, 'Running again.');
+  turns[1].endInput();
+  await settled(runner);
+});
+
+test('a follow-up turn of stopped steers that the CLI never ends stops the CLI too', async () => {
+  // The Stop guard interrupts the turn the CLI opens for stopped steers at
+  // its init. That turn has no context of its own, and a CLI that does not
+  // end it would hold the session like an unended stopped turn.
+  const stub = makeApiStub();
+  const turn = scriptedTurn();
+  const { getAbort, controlPoller } = abortCapturingPoller();
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      params.abortController.signal.addEventListener('abort', () => turn.close());
+      return turn;
+    },
+    controlPoller,
+    steeredFoldGraceMs: 30,
+    lifecyclePollMs: 5,
+    stopFollowUpWindowMs: 500,
+    interruptGraceMs: 60,
+  });
+
+  const [second] = await stopTurnWithSteers(runner, turn, getAbort, ['and then X']);
+  turn.emit(initMessage('native-1'));
+  await waitFor(() => turn.interrupts === 2, { label: 'the follow-up turn is interrupted' });
+  assert.equal(turn.closed, false, 'not stopped inside the grace');
+  await waitFor(() => turn.closed, { label: 'the CLI is stopped after the grace' });
+  assert.equal(await second, true);
+  assert.equal(responsesOf(stub, 'q-2')[0].body.kind, 'stopped');
+  await settled(runner);
+  assert.equal(runner.isDeliveryHeld(), false);
+});
+
+test('a message pushed to a CLI that says nothing more is handed back and runs on a new CLI, once', async () => {
+  // Between turns there is no turn to watch. A CLI that hangs there (live: a
+  // suspended one) used to fail the row after the timeout and stay, so every
+  // later message waited the timeout out and failed the same way.
+  const stub = makeApiStub();
+  const { turns, spawns, startImpl } = abortableTurns();
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    pendingDeliveredTimeoutMs: 60,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  // q-2 reaches the idle CLI, which never speaks again.
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turns[0].pushed.length === 2, { label: 'q-2 pushed' });
+  assert.equal(await second, false, 'handed back, not failed');
+  assert.equal(turns[0].closed, true, 'the silent CLI is stopped');
+  assert.deepEqual(requeuesOf(stub, 'q-2').map((call) => call.body.class), ['steering-held']);
+  assert.equal(responsesOf(stub, 'q-2').length, 0);
+  assert.ok(lines.some((line) => /the CLI has said nothing since a message was pushed; stopping it q-2/.test(line)));
+  await settled(runner);
+  assert.deepEqual(runner.getActiveQueueMessageIds(), []);
+
+  // The relay delivers again. Another message runs first on the new CLI, so
+  // that q-2 once more reaches a CLI that is up, and this one hangs too.
+  const third = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-3', text: 'third question' } });
+  await waitFor(() => turns.length === 2, { label: 'a new CLI' });
+  assert.equal(spawns[1].resume, 'native-1', 'on the same session');
+  turns[1].emit(initMessage('native-1'));
+  turns[1].emit(userReplay('third question'));
+  turns[1].emit(resultMessage('third answer', 'native-1'));
+  assert.equal(await third, true);
+  assert.equal(responsesOf(stub, 'q-3')[0].body.text, 'third answer');
+
+  const again = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turns[1].pushed.length === 2, { label: 'q-2 pushed again' });
+  assert.equal(await again, true, 'no second round: the row fails as it always did');
+  const [failure] = responsesOf(stub, 'q-2');
+  assert.match(failure.body.terminalError.message, /never opened a turn for this message/);
+  assert.equal(requeuesOf(stub, 'q-2').length, 1, 'handed back once only');
+  assert.equal(turns[1].closed, true, 'a silent CLI is not kept either way');
+  await settled(runner);
+});
+
+test('a CLI that spoke after the push and then dropped the message is kept, and the row fails as before', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const runner = makeRunner({ stub, startImpl, lifecyclePollMs: 5, pendingDeliveredTimeoutMs: 60 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(resultMessage('first answer', 'native-1'));
+  assert.equal(await first, true);
+
+  const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'second question' } });
+  await waitFor(() => turns[0].pushed.length === 2, { label: 'q-2 pushed' });
+  // A sign of life, but no turn for q-2.
+  turns[0].emit({ type: 'system', subtype: 'status', status: null });
+  assert.equal(await second, true);
+  assert.match(responsesOf(stub, 'q-2')[0].body.terminalError.message, /never opened a turn for this message/);
+  assert.equal(requeuesOf(stub, 'q-2').length, 0);
+  assert.equal(turns[0].closed, false, 'the CLI stays');
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('on Windows a stopped CLI takes its process tree with it, and its own echo is not logged as a failure', async () => {
+  // The abort ends claude.exe alone there; a build or a dev server it had
+  // started would run on. The interrupt the CLI never answered rejects when
+  // the CLI is stopped: that is the stop itself, not a second failure.
+  const stub = makeApiStub();
+  const { controlPoller, getAbort } = abortCapturingPoller();
+  const lines = [];
+  const killed = [];
+  let turn = null;
+  let releaseKill = null;
+  const runner = makeRunner({
+    stub,
+    controlPoller,
+    startImpl: (params) => {
+      turn = scriptedTurn();
+      turn.cliPid = () => 4242;
+      const { signal } = params.abortController;
+      signal.addEventListener('abort', () => turn.close());
+      turn.interrupt = () => new Promise((resolve, reject) => {
+        turn.interrupts += 1;
+        signal.addEventListener('abort', () => reject(new Error('Operation aborted')));
+      });
+      return turn;
+    },
+    platform: 'win32',
+    killCliTreeImpl: (pid) => new Promise((resolve) => {
+      killed.push({ pid, cliClosed: turn.closed });
+      releaseKill = () => resolve(true);
+    }),
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 0, tool: 0 },
+    interruptGraceMs: 40,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => getAbort(), { label: 'abort control wired' });
+  const stopped = getAbort()();
+  await waitFor(() => killed.length === 1, { label: 'the tree is ended after the grace' });
+  assert.deepEqual(killed, [{ pid: 4242, cliClosed: false }], 'before the abort, while the CLI still leads to its children');
+  await tick(30);
+  assert.equal(turn.closed, false, 'the abort waits for the tree');
+  assert.equal(killed.length, 1, 'once');
+
+  releaseKill();
+  await waitFor(() => turn.closed, { label: 'then the abort' });
+  await stopped;
+  assert.equal(await first, true);
+  await settled(runner);
+  assert.equal(lines.some((line) => /interrupt failed, aborting process/.test(line)), false);
+});
+
+test('the quiet turn\'s interrupt ending with the worker\'s own stop is not logged as a failure', async () => {
+  const stub = makeApiStub();
+  const lines = [];
+  let turn = null;
+  const runner = makeRunner({
+    stub,
+    startImpl: (params) => {
+      turn = scriptedTurn();
+      const { signal } = params.abortController;
+      signal.addEventListener('abort', () => turn.close());
+      turn.interrupt = () => new Promise((resolve, reject) => {
+        turn.interrupts += 1;
+        signal.addEventListener('abort', () => reject(new Error('Operation aborted')));
+      });
+      return turn;
+    },
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 60, tool: 5_000 },
+    interruptGraceMs: 40,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turn.emit(initMessage('native-1'));
+  turn.emit(userReplay('hello'));
+  await waitFor(() => turn.closed, { label: 'the CLI is stopped after window and grace' });
+  assert.equal(await first, true);
+  await settled(runner);
+  await tick(20);
+  assert.ok(lines.some((line) => /did not end the interrupted turn within/.test(line)));
+  assert.equal(lines.some((line) => /interrupt of the quiet turn failed/.test(line)), false);
+  assert.equal(responsesOf(stub, 'q-1')[0].body.terminalError.code, 'turn-stalled');
+});
+
+test('a stopped turn the CLI ends inside the grace keeps its process', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns();
+  const { controlPoller, getAbort } = abortCapturingPoller();
+  const runner = makeRunner({ stub, startImpl, controlPoller, lifecyclePollMs: 5, interruptGraceMs: 40 });
+
+  const first = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  await waitFor(() => getAbort(), { label: 'abort control wired' });
+  await getAbort()();
+  turns[0].emit(interruptedResult());
+  assert.equal(await first, true);
+  await tick(120);
+  assert.equal(turns[0].closed, false, 'the grace ended with the turn');
+  assert.ok(runner._getProcess());
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('an API retry holds the quiet clock for the wait it announces', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 5_000 },
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(apiRetryMessage(1, 300));
+  await tick(200);
+  assert.equal(turns[0].interrupts, 0, 'silent by its own announcement');
+  // The wait is over and the CLI says nothing more: now the window counts.
+  await waitFor(() => turns[0].interrupts === 1, { label: 'ended after the announced wait and the window' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await pending, true);
+  await settled(runner);
+});
+
+test('a relay tool call the worker is waiting on holds the quiet clock', async () => {
+  let releaseTool = null;
+  const stub = makeApiStub({
+    routeResponses: {
+      '/api/remote-relays/tool': () => new Promise((resolve) => { releaseTool = () => resolve({ ok: true }); }),
+    },
+  });
+  const { turns, spawns, startImpl } = abortableTurns({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 40 },
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(toolUse('tool-1', 'mcp__relay__relay_tool'));
+  // The CLI's relay tools reach the relay through the helper the spawn got.
+  const call = spawns[0].api('POST', '/api/remote-relays/tool', { action: 'wait' });
+  await waitFor(() => releaseTool, { label: 'the tool call is open' });
+  await tick(150);
+  assert.equal(turns[0].interrupts, 0, 'the silence is the worker waiting on the relay');
+
+  releaseTool();
+  assert.deepEqual(await call, { ok: true });
+  turns[0].emit(toolResult('tool-1'));
+  turns[0].emit(resultMessage('Done.', 'native-1'));
+  assert.equal(await pending, true);
+  assert.ok(!responsesOf(stub, 'q-1')[0].body.terminalError);
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('a compaction holds the quiet clock', async () => {
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 5_000 },
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(assistantText('Working.'));
+  turns[0].emit(compactingStatusMessage());
+  await tick(150);
+  assert.equal(turns[0].interrupts, 0);
+  turns[0].emit(compactBoundaryMessage());
+  turns[0].emit(resultMessage('Done.', 'native-1'));
+  assert.equal(await pending, true);
+  assert.ok(!responsesOf(stub, 'q-1')[0].body.terminalError);
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('an open question card holds the quiet clock', async () => {
+  const calls = [];
+  let questionPolls = 0;
+  const api = async (method, routePath, body) => {
+    calls.push({ method, routePath, body });
+    if (routePath === '/api/relay-question') return { question: { id: 'rq-1' } };
+    if (routePath === '/api/relay-question/rq-1') {
+      questionPolls += 1;
+      return { question: { id: 'rq-1', status: questionPolls >= 15 ? 'answered' : 'pending', answer: 'option A' } };
+    }
+    return { ok: true };
+  };
+  const { turns, spawns, startImpl } = abortableTurns();
+  const runner = makeRunner({
+    stub: { api },
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 40, tool: 40 },
+    askUserBridgeOptions: { questionPollMs: 10 },
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(userReplay('hello'));
+  await waitFor(() => runner._getProcess()?.activeCtx, { label: 'turn open' });
+  const decision = await spawns[0].canUseTool('AskUserQuestion', {
+    questions: [{ question: 'Proceed?', options: [{ label: 'option A' }, { label: 'option B' }] }],
+  }, {});
+  assert.equal(decision.behavior, 'allow');
+  assert.ok(questionPolls >= 15, 'the card stayed open well past the window');
+  assert.equal(turns[0].interrupts, 0, 'a person deciding is not a quiet CLI');
+  turns[0].emit(resultMessage('acted on option A', 'native-1'));
+  assert.equal(await pending, true);
+  turns[0].endInput();
+  await settled(runner);
+});
+
+test('time the host slept is not counted as the CLI being quiet', async () => {
+  // Seven healthy turns were open across a suspend; each spoke within
+  // two seconds of the wake. A wall clock that jumped must not end them.
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 600, tool: 5_000 },
+    clockJumpMs: 150,
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  turns[0].emit(assistantText('Working.'));
+  await waitFor(() => runner._getProcess()?.activeCtx, { label: 'turn open' });
+  await tick(20);
+  // No timer of this process runs for longer than the window, as in a sleep.
+  const wake = Date.now() + 750;
+  while (Date.now() < wake) { /* blocked */ }
+  await tick(40);
+  assert.ok(lines.some((line) => /passed between two lifecycle ticks/.test(line)), 'the jump is noticed');
+  assert.equal(turns[0].interrupts, 0, 'the turn is not ended on the wake');
+  assert.equal(lines.filter((line) => /running turn quiet for/.test(line)).length, 0);
+
+  // Awake and still silent for the whole window: now it is the CLI.
+  await waitFor(() => turns[0].interrupts === 1, { label: 'ended after a full window awake' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await pending, true);
+  await settled(runner);
+});
+
+test('a wall clock set back does not postpone the quiet-turn check', async (t) => {
+  const realNow = Date.now;
+  let offsetMs = 0;
+  Date.now = () => realNow() + offsetMs;
+  t.after(() => { Date.now = realNow; });
+
+  const stub = makeApiStub();
+  const { turns, startImpl } = abortableTurns({ echoPushes: true });
+  const lines = [];
+  const runner = makeRunner({
+    stub,
+    startImpl,
+    lifecyclePollMs: 5,
+    quietTurnWindowsMs: { model: 80, tool: 5_000 },
+    dbg: (...parts) => lines.push(parts.join(' ')),
+  });
+
+  const pending = runner.handlePendingPayload({ message: { ...baseMessage } });
+  turns[0].emit(initMessage('native-1'));
+  // An announced wait far beyond its cap, held at one hour.
+  turns[0].emit(apiRetryMessage(1, 10 * 3_600_000));
+  await waitFor(() => runner._getProcess()?.quietHoldUntil > Date.now(), { label: 'retry wait held' });
+
+  // Two hours back: counted from the old time, the hold would now last three
+  // hours and the silence would not start counting for two.
+  offsetMs = -2 * 3_600_000;
+  await waitFor(() => lines.some((line) => /the wall clock went back 7200s/.test(line)), { label: 'the jump back is noticed' });
+  const proc = runner._getProcess();
+  assert.ok(proc.quietHoldUntil <= Date.now() + 3_600_000, 'the retry wait is at most its cap from now');
+  assert.ok(proc.liveness.quietMs() < 1_000, 'the silence counts from now');
+
+  // With the announced wait over, the window runs as usual.
+  proc.quietHoldUntil = 0;
+  await waitFor(() => turns[0].interrupts === 1, { label: 'ended one window after the jump' });
+  turns[0].emit(interruptedResult());
+  assert.equal(await pending, true);
   await settled(runner);
 });
 
@@ -6914,15 +7816,16 @@ test('a tool that runs in silence is given the tool window, not the model one', 
   turn.emit(toolUse('tool-1'));
   await tick(120);
   assert.equal(lines.filter((line) => /running turn quiet for/.test(line)).length, 0);
+  assert.equal(turn.interrupts, 0);
 
   // The tool returns and the model stays silent: now it is the model's window.
   turn.emit(toolResult('tool-1'));
-  await waitFor(() => lines.some((line) => /running turn quiet for/.test(line)), { label: 'quiet model logged' });
+  await waitFor(() => turn.interrupts === 1, { label: 'quiet model request ended' });
   assert.match(lines.find((line) => /running turn quiet for/.test(line)), /tools=0/);
 
-  turn.emit(resultMessage('Done.', 'native-1'));
+  turn.emit(interruptedResult());
   assert.equal(await pending, true);
-  turn.endInput();
+  assert.match(responsesOf(stub, 'q-1')[0].body.text, /sent nothing for \d+s/);
   await settled(runner);
 });
 

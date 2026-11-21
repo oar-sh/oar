@@ -140,7 +140,8 @@ an unschedule it stays until you answer or dismiss it.
 **What agents can do.** Every provider gets the same `relay_tool` tool (Claude, Claude API, DeepSeek, Cursor
 and Copilot directly; Grok through OAR's MCP server). Before 0.9.18
 it was called `remote_relay`; OAR's MCP server still runs a call to the old name but lists only the
-new one, and Claude's tool is `mcp__relay__relay_tool`. Sessions get it
+new one, and Claude's tool is `mcp__relay__relay_tool` (Grok's `oar__relay_tool`). Its results are compact
+JSON (no indentation). Sessions get it
 while at least one relay is paired or [agent sessions](#agent-sessions) are switched on. Per paired
 relay, **Agents may** limits it to *read only*, *read and prompt* (existing sessions) or *full*
 (also create sessions, change their settings, stop turns, archive). No setting lets an agent answer a
@@ -153,7 +154,9 @@ can set the provider, model, relay mode and reasoning effort; what it leaves out
 session it works in, as far as the other relay offers it. A `send` sets a session's mode only
 when it names one; without a mode the session keeps its own (before 0.9.20 it got the caller's
 mode). The approval card shows a mode for a `send` only when one was named. The providers to choose from are the
-other relay's, as `relay_info` lists them; an unknown one is refused with that list. A session
+other relay's, as `relay_info` lists them; an unknown one is refused with that list. `relay_info`
+answers a summary (per provider the default model, its efforts and a model count; the 15 groups with the
+latest activity); with `provider` it lists that provider's models and efforts, with `verbose: true` everything. A session
 started before a relay update can use the providers the update added, without a restart. A `send` that names no model or effort
 keeps the ones the session there uses. A model in `create_session` or `send` that the provider
 does not list there (the list New Chat offers) is refused before anything is created or sent,
@@ -186,7 +189,8 @@ Copilot and Grok where they are tracked, OpenAI images against the daily cap; ne
 addresses or tokens), and
 `list_sessions` / `read_session` give each session's `state` (`running_turn`, `background_only` or
 `idle`) with its background agents and shell tasks, and the [session group](web-ui.md#session-groups)
-it is in. An agent can name an existing group (`group`, an id or name `relay_info` lists) when it
+it is in. An agent can name an existing group (`group`, an id or name `relay_info` lists: the summary has the 15 with
+the latest activity, `verbose: true` lists them all) when it
 creates a session, here or on a paired relay; for a group that is not there the session starts in no
 group and the agent is told so. Making, renaming, dissolving and rearranging groups stays yours.
 
@@ -588,7 +592,11 @@ one place: the asks, and the cards sessions wait on (questions and approval card
 and on every paired relay that answers. They are grouped by relay, newest first, each with its
 session (a link that opens it), its age and its relay. **Mine** narrows the list to the sessions
 you started, **Agents** to the ones an agent started. What you answered or dismissed stays for a
-day under a divider. Plan cards are listed too (see [the web UI](web-ui.md#relay-modes)); a paired
+day under a divider; **Unanswered** hides it, and **This relay** hides the paired relays. Within a
+relay the items are split by their session's group, by name with **No group** last, and
+**Groups ▾** narrows the list to the groups you tick. A paired relay's groups show when it runs OAR
+0.9.32 or later; an older one lists its items without groups. **➖** folds every card to one line
+and **➕** opens them again; a relay or a group folds to its heading and counts. Plan cards are listed too (see [the web UI](web-ui.md#relay-modes)); a paired
 relay's plan card shows only its title and status, with **Open there**, and is never answered
 over the pairing.
 

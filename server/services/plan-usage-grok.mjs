@@ -263,12 +263,51 @@ function formatDuration(ms) {
 }
 
 /**
+ * A plain sentence for why the live plan-quota read had no figure, from the
+ * reason code grok-billing-usage.mjs records, with the time of that read when
+ * known. Null without a reason, so callers fall back to the general wording.
+ */
+export function describeGrokBillingFailure(failure = null) {
+  const reason = toTrimmedString(failure?.reason);
+  if (!reason) return null;
+  let sentence;
+  if (reason === 'no-login') {
+    sentence = 'Grok is not logged in on this relay, so there is no plan quota to read.';
+  } else if (reason === 'login-expired') {
+    sentence = 'xAI refused the plan-quota request because the Grok login on this relay has expired; log in again.';
+  } else if (reason === 'not-authorized') {
+    const status = toFiniteNumber(failure?.httpStatus);
+    sentence = `xAI refused the plan-quota request for this login (HTTP ${status || '401/403'}): the login most likely has no subscription, or it has expired.`;
+  } else if (reason === 'timeout') {
+    sentence = "xAI's plan-quota request did not answer in time.";
+  } else if (reason === 'network') {
+    sentence = "xAI's plan-quota request could not be reached.";
+  } else if (reason === 'unknown-format') {
+    const keys = (Array.isArray(failure?.keys) ? failure.keys : [])
+      .map((key) => toTrimmedString(key))
+      .filter(Boolean)
+      .slice(0, 12);
+    sentence = keys.length
+      ? `xAI answered the plan-quota request in a format OAR does not know (fields: ${keys.join(', ')}).`
+      : 'xAI answered the plan-quota request in a format OAR does not know.';
+  } else if (/^http-\d{3}$/.test(reason)) {
+    sentence = `xAI's plan-quota request failed (HTTP ${reason.slice(5)}).`;
+  } else {
+    sentence = "xAI's plan-quota request failed.";
+  }
+  const checkedAt = toIsoTimestamp(failure?.checkedAt);
+  return checkedAt ? `${sentence} (Checked ${checkedAt.slice(11, 16)} UTC.)` : sentence;
+}
+
+/**
  * @param {object} options
  * @param {object|null} options.usage         last-turn snapshot (normalizeGrokTurnUsage)
  * @param {object|null} options.cycleTotals   { costUsd, inputTokens, outputTokens, totalTokens, turnCount }
  * @param {object|null} options.allowances    normalizeGrokAllowanceSettings()
  * @param {object|null} options.cycle         resolveGrokBillingCycle()
  * @param {object|null} options.billing       normalizeGrokBillingCredits() — live plan quota
+ * @param {object|null} options.billingFailure why the live quota read had no figure
+ *                                            ({ reason, httpStatus, keys, checkedAt })
  * @param {string|null} options.capturedAt
  * @param {boolean} options.configured        Grok provider enabled
  * @param {string|null} options.message
@@ -279,6 +318,7 @@ export function buildGrokPlanCard({
   allowances = null,
   cycle = null,
   billing = null,
+  billingFailure = null,
   capturedAt = null,
   configured = true,
   message = null,
@@ -303,6 +343,7 @@ export function buildGrokPlanCard({
 
   const liveQuotaPercent = toFiniteNumber(billing?.usagePercent);
   const hasLiveQuota = liveQuotaPercent !== null;
+  const failureSentence = hasLiveQuota ? null : describeGrokBillingFailure(billingFailure);
 
   if (!hasLiveQuota && !usage && totals.turnCount <= 0 && totals.costUsd <= 0) {
     return buildUnavailableCard({
@@ -310,7 +351,9 @@ export function buildGrokPlanCard({
       label: GROK_LABEL,
       status: STATUS_UNAVAILABLE,
       message: toTrimmedString(message)
-        || 'No Grok usage captured yet. Run a Grok turn — per-prompt tokens and cost come from the agent result (there is no live plan-quota API).',
+        || (failureSentence
+          ? `${failureSentence} No Grok turn has been recorded yet either; run one to see per-prompt tokens and cost.`
+          : 'No Grok usage captured yet. Run a Grok turn — per-prompt tokens and cost come from the agent result (there is no live plan-quota API).'),
       links: [{ label: 'xAI console / billing', url: GROK_BILLING_URL }],
     });
   }
@@ -422,8 +465,11 @@ export function buildGrokPlanCard({
     label: GROK_LABEL,
     status: hasMeter ? STATUS_OK : STATUS_PARTIAL,
     message: hasMeter
-      ? null
-      : 'No live plan-quota data for Grok right now. Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.',
+      // Only the estimated budget meter is here: say why the live one is not.
+      ? (failureSentence ? `${failureSentence} The budget meter is a local estimate from relay turns.` : null)
+      : (failureSentence
+        ? `${failureSentence} Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.`
+        : 'No live plan-quota data for Grok right now. Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.'),
     source: hasLiveQuota
       ? SOURCE_LIVE
       : (settings.monthlyUsd !== null ? SOURCE_MANUAL : (stale ? SOURCE_CACHE : SOURCE_WORKER)),

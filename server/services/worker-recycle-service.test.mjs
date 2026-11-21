@@ -1517,14 +1517,44 @@ test('sweepNow (a worker hello) judges and fences synchronously while started, a
   app.service.stop();
 });
 
-test('isWorkerOnOtherBuild: a different or absent build id is another build; an equal one is not; an unknown relay id compares nothing', () => {
+test('isWorkerOnOtherBuild: a different build id is another build; an equal one is not; an unknown relay id compares nothing', () => {
   assert.equal(isWorkerOnOtherBuild({ buildId: OLD }, RELAY), true);
-  assert.equal(isWorkerOnOtherBuild({ buildId: null }, RELAY), true);
-  assert.equal(isWorkerOnOtherBuild({}, RELAY), true);
   assert.equal(isWorkerOnOtherBuild({ buildId: ` ${RELAY} ` }, RELAY), false);
   assert.equal(isWorkerOnOtherBuild({ buildId: OLD }, null), false);
   assert.equal(isWorkerOnOtherBuild({ buildId: null }, ''), false);
   assert.equal(isWorkerOnOtherBuild(null, RELAY), false);
+});
+
+test('isWorkerOnOtherBuild: an absent build id counts only for a live, heartbeating worker past the grace', () => {
+  const at = Date.parse('2026-03-02T12:00:00.000Z');
+  const old = '2026-03-02T11:00:00.000Z';
+  const fresh = '2026-03-02T11:59:50.000Z';
+  const silent = (fields = {}) => ({ sdkSessionId: 'sid-fixture-silent', pid: 4300, status: 'ready', buildId: null, startedAt: old, lastHeartbeatAt: old, ...fields });
+  const judge = (worker, options = {}) => isWorkerOnOtherBuild(worker, RELAY, { now: at, ...options });
+
+  // A worker from before build ids: heartbeats, never states one.
+  assert.equal(judge(silent()), true);
+  assert.equal(judge(silent({ status: 'processing' })), true);
+  assert.equal(judge(silent({ buildId: undefined })), true);
+  // A fresh worker that has not stated its id yet.
+  assert.equal(judge(silent({ startedAt: fresh })), false);
+  assert.equal(judge(silent({ startedAt: fresh }), { graceMs: 5_000 }), true, 'the grace is the caller\'s');
+  // No heartbeat seen, or one still awaited after a launch.
+  assert.equal(judge(silent({ lastHeartbeatAt: null })), false);
+  assert.equal(judge(silent({ awaitingHeartbeat: true })), false);
+  // A stopped, new, starting or errored entry, or one without a pid or a start time.
+  for (const status of ['stopped', 'new', 'starting', 'error']) {
+    assert.equal(judge(silent({ status })), false, status);
+  }
+  assert.equal(judge(silent({ pid: null })), false);
+  assert.equal(judge(silent({ startedAt: null })), false);
+  // A caller's own heartbeat check replaces the snapshot's; one that throws is no evidence.
+  assert.equal(judge(silent({ lastHeartbeatAt: null }), { hasHeartbeated: () => true }), true);
+  assert.equal(judge(silent(), { hasHeartbeated: () => false }), false);
+  assert.equal(judge(silent(), { hasHeartbeated: () => { throw new Error('unknown'); } }), false);
+  // A known id is judged by itself, whatever the status or age.
+  assert.equal(judge(silent({ buildId: OLD, status: 'starting', startedAt: fresh, lastHeartbeatAt: null })), true);
+  assert.equal(judge(silent({ buildId: RELAY, startedAt: old })), false);
 });
 
 // The archived sweep at relay start, over fakes: which sessions are archived,

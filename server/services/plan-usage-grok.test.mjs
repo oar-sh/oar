@@ -228,3 +228,80 @@ test('buildGrokPlanCard reports worker source for a fresh snapshot without allow
   assert.equal(card.source, 'worker');
   assert.equal(card.stale, false);
 });
+
+const GENERIC_PARTIAL_MESSAGE = 'No live plan-quota data for Grok right now. Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.';
+const GENERIC_EMPTY_MESSAGE = 'No Grok usage captured yet. Run a Grok turn — per-prompt tokens and cost come from the agent result (there is no live plan-quota API).';
+const ONE_TURN_TOTALS = { costUsd: 0.15, inputTokens: 13972, outputTokens: 36, totalTokens: 14008, turnCount: 1 };
+
+function partialCardWith(billingFailure) {
+  return buildGrokPlanCard({
+    configured: true,
+    usage: extractGrokUsageFromPromptResult({ _meta: LIVE_PROMPT_META }),
+    cycleTotals: ONE_TURN_TOTALS,
+    ...(billingFailure === undefined ? {} : { billingFailure }),
+  });
+}
+
+test('buildGrokPlanCard keeps the general wording when no reason is known', () => {
+  assert.equal(partialCardWith(undefined).message, GENERIC_PARTIAL_MESSAGE);
+  assert.equal(partialCardWith(null).message, GENERIC_PARTIAL_MESSAGE);
+  assert.equal(buildGrokPlanCard({ configured: true }).message, GENERIC_EMPTY_MESSAGE);
+  const withAllowance = buildGrokPlanCard({
+    configured: true,
+    cycleTotals: ONE_TURN_TOTALS,
+    allowances: { monthlyUsd: 30, resetDay: 1 },
+  });
+  assert.equal(withAllowance.message, null);
+});
+
+test('buildGrokPlanCard says why there is no live quota, for each reason', () => {
+  const checkedAt = '2026-03-14T09:26:41.000Z';
+  const cases = [
+    [{ reason: 'no-login' }, 'Grok is not logged in on this relay, so there is no plan quota to read.'],
+    [{ reason: 'login-expired', httpStatus: 401 }, 'xAI refused the plan-quota request because the Grok login on this relay has expired; log in again.'],
+    [{ reason: 'not-authorized', httpStatus: 403 }, 'xAI refused the plan-quota request for this login (HTTP 403): the login most likely has no subscription, or it has expired.'],
+    [{ reason: 'http-502', httpStatus: 502 }, "xAI's plan-quota request failed (HTTP 502)."],
+    [{ reason: 'timeout' }, "xAI's plan-quota request did not answer in time."],
+    [{ reason: 'network' }, "xAI's plan-quota request could not be reached."],
+    [{ reason: 'unknown-format', keys: ['planState', 'region'] }, 'xAI answered the plan-quota request in a format OAR does not know (fields: planState, region).'],
+    [{ reason: 'unknown-format', keys: [] }, 'xAI answered the plan-quota request in a format OAR does not know.'],
+  ];
+  for (const [failure, sentence] of cases) {
+    const card = partialCardWith({ ...failure, checkedAt });
+    assert.equal(card.status, 'partial');
+    assert.equal(
+      card.message,
+      `${sentence} (Checked 09:26 UTC.) Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.`,
+    );
+  }
+  assert.equal(
+    partialCardWith({ reason: 'no-login' }).message,
+    'Grok is not logged in on this relay, so there is no plan quota to read. Showing last-turn cost/tokens; set a monthly allowance in Settings for an estimated budget meter.',
+  );
+});
+
+test('buildGrokPlanCard puts the reason on an empty card and beside an estimated meter', () => {
+  const empty = buildGrokPlanCard({ configured: true, billingFailure: { reason: 'no-login' } });
+  assert.equal(empty.status, 'unavailable');
+  assert.equal(
+    empty.message,
+    'Grok is not logged in on this relay, so there is no plan quota to read. No Grok turn has been recorded yet either; run one to see per-prompt tokens and cost.',
+  );
+
+  const withAllowance = buildGrokPlanCard({
+    configured: true,
+    cycleTotals: ONE_TURN_TOTALS,
+    allowances: { monthlyUsd: 30, resetDay: 1 },
+    billingFailure: { reason: 'timeout' },
+  });
+  assert.equal(withAllowance.status, 'ok');
+  assert.equal(withAllowance.message, "xAI's plan-quota request did not answer in time. The budget meter is a local estimate from relay turns.");
+
+  // A live figure wins: no explanation is needed.
+  const live = buildGrokPlanCard({
+    configured: true,
+    billing: { usagePercent: 10, periodType: 'weekly', products: [] },
+    billingFailure: { reason: 'network' },
+  });
+  assert.equal(live.message, null);
+});

@@ -114,6 +114,34 @@ test('a steering snapshot the new worker sends while it spawns survives the read
   assert.equal(registry.getWorker('spawn-beat').steering, null);
 });
 
+test('the build id, kind and start time the new worker states while it spawns survive the ready update', async () => {
+  // The worker's hello can land while the launcher still looks for its pid;
+  // the ready update is built from the 'starting' copy, whose empty fields
+  // used to overwrite what the hello had just stored until the next heartbeat.
+  const registry = createSessionWorkerRegistry();
+  let stated = null;
+  const supervisor = createSessionWorkerSupervisor({
+    registry,
+    isPidAlive: () => true,
+    spawnWorker: async (sessionId) => {
+      // What the hello does for the new process: adopt its pid, then store
+      // its kind and build id.
+      registry.upsertWorker({ ...registry.getWorker(sessionId), pid: 6161 });
+      stated = registry.upsertWorker({ ...registry.getWorker(sessionId), kind: 'copilot-sdk', buildId: '1.2.3+aaaaaaaaaaaa' });
+      return { workerId: 'worker-spawn-hello', pid: 6161 };
+    },
+  });
+
+  const result = await supervisor.ensureWorker('spawn-hello');
+  assert.equal(result.ok, true);
+  const worker = registry.getWorker('spawn-hello');
+  assert.equal(worker.status, 'ready');
+  assert.equal(worker.buildId, '1.2.3+aaaaaaaaaaaa');
+  assert.equal(worker.kind, 'copilot-sdk');
+  assert.ok(stated.startedAt);
+  assert.equal(worker.startedAt, stated.startedAt);
+});
+
 test('supervisor marks stale pid when known launched pid is dead and work is pending', async () => {
   const registry = createSessionWorkerRegistry();
   const supervisor = createSessionWorkerSupervisor({

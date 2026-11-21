@@ -434,6 +434,68 @@ test.describe("tabbed settings modal", () => {
       await writeLimit(120);
     }
   });
+
+  test("the maximum live previews slider leads the Previews tab, saves on change and survives a reload", async ({ page }) => {
+    const authorization = { Authorization: `Bearer ${relayToken()}` };
+    const isMaxLive = (response, method) => new URL(response.url()).pathname === "/api/settings/preview-max-live"
+      && response.request().method() === method;
+    const readMaxLive = async () => {
+      const response = await page.request.get("/api/settings/preview-max-live", { headers: authorization });
+      expect(response.ok()).toBe(true);
+      return (await response.json()).maxLive;
+    };
+    const writeMaxLive = (maxLive) => page.request.post("/api/settings/preview-max-live", {
+      headers: authorization,
+      data: { maxLive },
+    });
+    // The relay is shared by every spec: whatever this finds, it puts back.
+    const found = await readMaxLive();
+
+    try {
+      // Nothing saved yet and no previews.maxLive in the test config: the default.
+      expect(found).toBe(8);
+      await loadApp(page);
+      const loaded = page.waitForResponse((response) => isMaxLive(response, "GET"));
+      await openSettings(page, "previews");
+      await expectActiveTab(page, "previews");
+      expect(await (await loaded).json()).toEqual({ maxLive: 8, min: 0, max: 128, default: 8 });
+
+      const slider = page.locator("#preview-max-live-slider");
+      const value = page.locator("#preview-max-live-value");
+      await expect(panel(page, "previews").locator("input, select, textarea, button").first()).toHaveId("preview-max-live-slider");
+      await expect(slider).toBeVisible();
+      await expect(slider).toHaveValue("8");
+      await expect(value).toHaveText("8");
+
+      // fill() sets a range input and fires input and change, as a drag that ends does.
+      const posted = page.waitForResponse((response) => isMaxLive(response, "POST"));
+      await slider.fill("20");
+      const saved = await posted;
+      expect(saved.request().postDataJSON()).toEqual({ maxLive: 20 });
+      expect(saved.status()).toBe(200);
+      expect((await saved.json()).maxLive).toBe(20);
+      await expect(value).toHaveText("20");
+      await expect(page.locator("#relay-toast")).toContainText("Up to 20 previews can be live at once.");
+      await expect.poll(readMaxLive).toBe(20);
+
+      await loadApp(page);
+      await openSettings(page, "previews");
+      await expect(slider).toHaveValue("20");
+      await expect(value).toHaveText("20");
+
+      // 0 lets no new preview be published, and the label says so.
+      const postedOff = page.waitForResponse((response) => isMaxLive(response, "POST"));
+      await slider.fill("0");
+      const savedOff = await postedOff;
+      expect(savedOff.request().postDataJSON()).toEqual({ maxLive: 0 });
+      expect(savedOff.status()).toBe(200);
+      await expect(value).toHaveText("0: no new previews");
+      await expect(page.locator("#relay-toast")).toContainText("No new previews can be published.");
+      await expect.poll(readMaxLive).toBe(0);
+    } finally {
+      await writeMaxLive(found);
+    }
+  });
 });
 
 // The strip scrolls sideways on a phone, with no scrollbar: the side with

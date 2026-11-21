@@ -766,6 +766,30 @@ test('group is not an argument of send (taken by create_session and update_sessi
   }
 });
 
+test('relay_info takes provider (its shape; the relay names the valid ones) and verbose, neither ignored', () => {
+  assert.deepEqual(REMOTE_RELAY_ACTION_ARGUMENTS.relay_info, ['provider', 'verbose']);
+  assert.equal(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.verbose.type, 'boolean');
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.verbose.description, /^relay_info:/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.provider.description, /relay_info: list that provider's models/);
+  assert.match(REMOTE_RELAY_TOOL_INPUT_SCHEMA.properties.action.description, /relay_info: a summary .*provider: that provider's models and efforts; verbose: everything in full/);
+  assert.match(REMOTE_RELAY_TOOL_DESCRIPTION, /relay_info answers a summary; pass provider for that provider's model ids and efforts, verbose:true for every list in full\./);
+
+  const plain = validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r' });
+  assert.deepEqual(plain, { ok: true, action: 'relay_info', args: { relay: 'r' } });
+  const both = validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', provider: 'Demo-Provider', verbose: true });
+  assert.deepEqual(both, { ok: true, action: 'relay_info', args: { relay: 'r', provider: 'demo-provider', verbose: true } });
+  assert.equal('ignored' in both, false);
+  // The relay passes its lists; relay_info still hands any id-shaped name on.
+  const lists = { providers: REMOTE_RELAY_PROVIDERS, sendProviders: REMOTE_RELAY_SEND_PROVIDERS };
+  assert.equal(validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', provider: 'nope' }, lists).args.provider, 'nope');
+  assert.equal(validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', verbose: 'true' }).args.verbose, true);
+  assert.equal('verbose' in validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', verbose: false }).args, false);
+  assert.equal(validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', verbose: 'maybe' }).error, 'verbose must be true or false');
+  assert.match(validateRemoteRelayToolInput({ action: 'relay_info', relay: 'r', provider: 'not a name!' }).error, /provider must be a provider id/);
+  // Other actions still name them as ignored.
+  assert.deepEqual(validateRemoteRelayToolInput({ action: 'usage', relay: 'r', provider: 'claude', verbose: true }).ignored, ['provider', 'verbose']);
+});
+
 test('create_session refuses an argument it does not take and lists its arguments', () => {
   const refused = validateRemoteRelayToolInput({
     action: 'create_session', relay: 'this', text: 'go', session: 'conv-a', scope: 'recent', groupId: 'grp_1',

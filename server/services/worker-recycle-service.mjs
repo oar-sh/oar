@@ -118,18 +118,48 @@ function errorText(error, fallback) {
   return String(error?.message || error || fallback);
 }
 
+// How long a worker entry without a build id may be before the missing id
+// counts as old code (nullBuildIdGraceMs below).
+export const NULL_BUILD_ID_GRACE_MS = 30_000;
+
+// Whether a worker row from the supervisor's snapshot has heartbeated to this
+// relay: the same lifecycle facts the runtime's hasHeartbeated reads.
+function snapshotHeartbeated(worker) {
+  return !!worker?.lastHeartbeatAt && worker?.awaitingHeartbeat !== true;
+}
+
 /**
  * Whether a worker runs other code than the relay, for display (/api/status,
- * /api/about, relay_tool rows): its build id differs from the relay's, or it
- * states none, which only a worker older than the build id does. Unlike
- * isStale it knows no grace, status or heartbeat: it answers "which build",
- * not "recycle now". A relay that does not know its own id compares nothing.
+ * /api/about, relay_tool rows) and for the recycle: its build id differs from
+ * the relay's, or it states none although it had its chance to. A worker on
+ * current code states its id in its first hello or heartbeat, but the
+ * registry clears the id whenever the pid or the status changes, so a fresh
+ * or booting worker has none for a while. A missing id counts only for a live
+ * status (ready, processing) with a pid, an entry at least `graceMs` old, and
+ * a heartbeat seen: unknown is not evidence. A worker from before build ids
+ * meets all three and still reads as another build.
+ * `hasHeartbeated(worker)` defaults to the snapshot's lastHeartbeatAt and
+ * awaitingHeartbeat; a caller with registry entries passes its own.
+ * A relay that does not know its own id compares nothing.
  */
-export function isWorkerOnOtherBuild(worker, relayBuildId) {
+export function isWorkerOnOtherBuild(worker, relayBuildId, {
+  now = Date.now(),
+  graceMs = NULL_BUILD_ID_GRACE_MS,
+  hasHeartbeated = snapshotHeartbeated,
+} = {}) {
   const relayId = normalizeBuildId(relayBuildId);
   if (!relayId || !worker) return false;
   const workerId = normalizeBuildId(worker.buildId);
-  return workerId ? buildIdsDiffer(workerId, relayId) : true;
+  if (workerId) return buildIdsDiffer(workerId, relayId);
+  if (!toPid(worker.pid)) return false;
+  if (!RECYCLABLE_STATUSES.has(String(worker.status || '').trim().toLowerCase())) return false;
+  const startedAtMs = toTimeMs(worker.startedAt);
+  if (startedAtMs === null || now - startedAtMs < graceMs) return false;
+  try {
+    return hasHeartbeated(worker) === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -206,7 +236,7 @@ export function createWorkerRecycleService({
   // stem from the previous pid; a worker on current code states its build id
   // in its first hello, within a second of starting, so an id still absent
   // after this long is old code.
-  nullBuildIdGraceMs = 30_000,
+  nullBuildIdGraceMs = NULL_BUILD_ID_GRACE_MS,
   // How long a worker that does not report its CLI child must have been
   // without a delivery or a turn end: the Claude and Copilot runners'
   // idleShutdownMs, after which they stop the child themselves.
@@ -323,18 +353,13 @@ export function createWorkerRecycleService({
     const sid = String(worker.sdkSessionId || '').trim();
     if (!sid || !toPid(worker.pid)) return false;
     if (!RECYCLABLE_STATUSES.has(String(worker.status || ''))) return false;
-    const workerId = normalizeBuildId(worker.buildId);
-    if (workerId) return buildIdsDiffer(workerId, relayId);
-    const startedAtMs = toTimeMs(worker.startedAt);
-    // No start time, no age: unknown is not evidence.
-    if (startedAtMs === null || now() - startedAtMs < nullBuildIdGraceMs) return false;
-    try {
-      return hasHeartbeated(sid) === true;
-    } catch {
-      // Unknown is not evidence: a process that may still be booting is
-      // never stopped on a guess.
-      return false;
-    }
+    // The same rule the status payload shows; a process that may still be
+    // booting is never stopped on a guess.
+    return isWorkerOnOtherBuild(worker, relayId, {
+      now: now(),
+      graceMs: nullBuildIdGraceMs,
+      hasHeartbeated: () => hasHeartbeated(sid),
+    });
   }
 
   function backoffMs(failures) {

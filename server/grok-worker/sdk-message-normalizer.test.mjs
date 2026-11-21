@@ -190,3 +190,123 @@ test('a long thought streamed one token at a time is gated and stops at the cap'
   assert.equal(final.payload.done, true);
   assert.equal(final.payload.text.length, MAX_THOUGHT_CHARS);
 });
+
+// Feeds ACP updates through one normalizer and returns every action plus the
+// finalized ones, so a test can check the streamed and the final text.
+function runTurn(updates, finalizeArgs = {}) {
+  const normalizer = createSdkMessageNormalizer();
+  const actions = [];
+  for (const update of updates) actions.push(...normalizer.normalizeAcpUpdate(update));
+  const finalized = normalizer.finalizeResult(finalizeArgs);
+  const streams = [...actions, ...finalized].filter((action) => action.channel === 'stream');
+  return {
+    normalizer,
+    actions,
+    finalized,
+    lastStream: streams.at(-1)?.payload.text,
+    resultText: finalized.find((action) => action.channel === 'result').payload.text,
+  };
+}
+
+const text = (value, extra = {}) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: value }, ...extra });
+const toolCall = (id) => ({ sessionUpdate: 'tool_call', toolCallId: id, title: 'Read file', kind: 'read', status: 'pending', rawInput: { path: 'notes/plan.txt' } });
+const toolUpdate = (id, status) => ({ sessionUpdate: 'tool_call_update', toolCallId: id, status });
+const thought = (value) => ({ sessionUpdate: 'agent_thought_chunk', content: { text: value } });
+
+test('text runs either side of a tool call are joined by one blank line', () => {
+  const turn = runTurn([
+    text('Let me look at the folder first.'),
+    toolCall('tc-a'),
+    toolUpdate('tc-a', 'in_progress'),
+    toolUpdate('tc-a', 'completed'),
+    text('The folder holds two files.'),
+  ]);
+  assert.equal(turn.resultText, 'Let me look at the folder first.\n\nThe folder holds two files.');
+  assert.equal(turn.lastStream, turn.resultText);
+  assert.equal(turn.normalizer.finalStreamText(), turn.resultText);
+});
+
+test('a turn without tool calls is the plain concatenation of its chunks', () => {
+  const turn = runTurn([text('First line,'), text(' same line.\nSecond'), text(' line.\n\nThird.')]);
+  assert.equal(turn.resultText, 'First line, same line.\nSecond line.\n\nThird.');
+  assert.equal(turn.normalizer.finalStreamText(), 'First line, same line.\nSecond line.\n\nThird.');
+});
+
+test('newlines already around a tool call still give exactly one blank line', () => {
+  for (const preamble of ['Checking.\n', 'Checking.\n\n', 'Checking.  \n ']) {
+    const turn = runTurn([text(preamble), toolCall('tc-b'), text('\nAll good.'), text(' Done.')]);
+    assert.equal(turn.resultText, 'Checking.\n\nAll good. Done.', JSON.stringify(preamble));
+    assert.equal(turn.lastStream, turn.resultText);
+  }
+});
+
+test('whitespace after a final tool call leaves nothing dangling', () => {
+  const turn = runTurn([text('Writing the report now. '), toolCall('tc-c'), toolUpdate('tc-c', 'completed'), text('\n\n'), text(' ')]);
+  assert.equal(turn.resultText, 'Writing the report now.');
+  assert.equal(turn.lastStream, 'Writing the report now.');
+  assert.equal(turn.normalizer.finalStreamText(), 'Writing the report now.');
+});
+
+test('a late update of a known tool call does not break a sentence', () => {
+  const turn = runTurn([
+    toolCall('tc-d'),
+    text('The build is still'),
+    toolUpdate('tc-d', 'completed'),
+    text(' running in the background.'),
+  ]);
+  assert.equal(turn.resultText, 'The build is still running in the background.');
+});
+
+test('an update for a tool call never seen before counts as a new call', () => {
+  const turn = runTurn([text('Before.'), toolUpdate('tc-e', 'in_progress'), text('After.')]);
+  assert.equal(turn.resultText, 'Before.\n\nAfter.');
+});
+
+test('a thought between two text runs gives one blank line', () => {
+  const turn = runTurn([text('Part one.'), thought('weighing the options'), text('Part two.')]);
+  assert.equal(turn.resultText, 'Part one.\n\nPart two.');
+  assert.equal(turn.lastStream, turn.resultText);
+});
+
+test('two tool calls in a row still give exactly one blank line', () => {
+  const turn = runTurn([
+    text('Opening both files.'),
+    toolCall('tc-f'),
+    toolCall('tc-g'),
+    toolUpdate('tc-f', 'completed'),
+    toolUpdate('tc-g', 'completed'),
+    text('Both files match.'),
+  ]);
+  assert.equal(turn.resultText, 'Opening both files.\n\nBoth files match.');
+});
+
+test('a change of message id between text chunks starts a new run', () => {
+  const turn = runTurn([
+    text('One', { messageId: 'msg-1' }),
+    text(' sentence.', { messageId: 'msg-1' }),
+    text('Another.', { messageId: 'msg-2' }),
+  ]);
+  assert.equal(turn.resultText, 'One sentence.\n\nAnother.');
+});
+
+test('a join that trims published whitespace still streams the joined text', () => {
+  const normalizer = createSdkMessageNormalizer();
+  const first = normalizer.normalizeAcpUpdate(text('Short. '));
+  assert.equal(first[0].payload.text, 'Short. ');
+  normalizer.normalizeAcpUpdate(toolCall('tc-h'));
+  const joined = normalizer.normalizeAcpUpdate(text('Ok'));
+  assert.equal(joined.length, 1);
+  assert.equal(joined[0].payload.text, 'Short.\n\nOk');
+  const final = normalizer.finalizeResult({}).filter((action) => action.channel === 'stream');
+  assert.equal(final.length, 1);
+  assert.equal(final[0].payload.done, true);
+  assert.equal(final[0].payload.text, 'Short.\n\nOk');
+});
+
+test('finalizeResult with an explicit text keeps that text', () => {
+  const turn = runTurn([text('Streamed part.'), toolCall('tc-i'), text('More.')], { text: '  Given reply.  ' });
+  assert.equal(turn.resultText, 'Given reply.');
+  const done = turn.finalized.find((action) => action.channel === 'stream');
+  assert.equal(done.payload.text, 'Given reply.');
+  assert.equal(done.payload.done, true);
+});

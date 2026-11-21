@@ -32,8 +32,13 @@ test('the recycle compares with the relay build id and asks the registry, the qu
   assert.match(service, /hasRunningTurn: \(sid\) => \(stmts\.listProcessingRowsForOwner\?\.all\?\.\(sid\) \|\| \[\]\)\.length > 0,/);
   // Any heartbeat counts, not the supervisor's first-observed one: the
   // workers that reconnect after a restart never get that.
-  assert.match(service, /const lc = sessionWorkerSupervisor\.getLifecycleState\(sid\);\n    return !!lc\?\.lastHeartbeatAt && !lc\?\.awaitingHeartbeat;/);
-  assert.doesNotMatch(service, /lc\?\.firstObservedHeartbeatAt/);
+  assert.match(service, /hasHeartbeated: sessionWorkerHasHeartbeated,/);
+  const heartbeated = sliceBetween('function sessionWorkerHasHeartbeated(sid) {', '\n}\n');
+  assert.match(heartbeated, /const lc = sessionWorkerSupervisor\.getLifecycleState\(sid\);\n  return !!lc\?\.lastHeartbeatAt && !lc\?\.awaitingHeartbeat;/);
+  assert.doesNotMatch(heartbeated, /firstObservedHeartbeatAt/);
+  // The About modal reads a heartbeat the same way.
+  const about = sliceBetween('aboutService: createAboutService({', '\n  }),\n});');
+  assert.match(about, /hasHeartbeated: sessionWorkerHasHeartbeated,/);
   assert.match(service, /isArchived: \(sid\) => isWorkerSessionArchived\(sid\),/);
   assert.match(service, /stopWorker: recycleWorkerReplacement\.stopWorker,/);
   assert.match(service, /launchWorker: recycleWorkerReplacement\.launchWorker,/);

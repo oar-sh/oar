@@ -29,6 +29,8 @@ import {
   updateBackgroundTaskTimeoutSetting as requestBackgroundTaskTimeoutSetting,
   loadTaskStallMinutesSetting,
   updateTaskStallMinutesSetting as requestTaskStallMinutesSetting,
+  loadPreviewMaxLiveSetting,
+  updatePreviewMaxLiveSetting as requestPreviewMaxLiveSetting,
   loadRestartResumeSetting,
   updateRestartResumeSetting as requestRestartResumeSetting,
   loadSubagentRecordRetentionSetting,
@@ -310,6 +312,81 @@ export async function updateTaskStallMinutesSetting(value) {
     syncTaskStallMinutesSlider();
   }
 }
+
+// "Maximum live previews" in Settings › Previews: a relay setting the relay
+// enforces on every new preview. Starts at the relay's default; the value in
+// force and the bounds come from the API response.
+const DEFAULT_PREVIEW_MAX_LIVE = 8;
+let previewMaxLive = DEFAULT_PREVIEW_MAX_LIVE;
+let previewMaxLiveUpdateInFlight = false;
+
+export function formatPreviewMaxLiveLabel(value) {
+  const number = Number(value);
+  const count = Number.isFinite(number) ? Math.max(0, Math.round(number)) : DEFAULT_PREVIEW_MAX_LIVE;
+  return count === 0 ? '0: no new previews' : String(count);
+}
+
+function syncPreviewMaxLiveSlider() {
+  const slider = document.getElementById('preview-max-live-slider');
+  const label = document.getElementById('preview-max-live-value');
+  if (slider instanceof HTMLInputElement) {
+    slider.value = String(previewMaxLive);
+    slider.disabled = previewMaxLiveUpdateInFlight;
+  }
+  if (label) label.textContent = formatPreviewMaxLiveLabel(previewMaxLive);
+}
+
+/** Live label feedback while dragging; nothing is persisted until change fires. */
+export function previewPreviewMaxLiveSetting(value) {
+  const label = document.getElementById('preview-max-live-value');
+  if (label) label.textContent = formatPreviewMaxLiveLabel(value);
+}
+
+export async function refreshPreviewMaxLiveSetting() {
+  syncPreviewMaxLiveSlider();
+  try {
+    const result = await loadPreviewMaxLiveSetting();
+    if (!result || !Number.isFinite(Number(result.maxLive))) return;
+    const slider = document.getElementById('preview-max-live-slider');
+    if (slider instanceof HTMLInputElement) {
+      if (Number.isFinite(Number(result.min))) slider.min = String(result.min);
+      if (Number.isFinite(Number(result.max))) slider.max = String(result.max);
+    }
+    previewMaxLive = Number(result.maxLive);
+  } catch {
+    // Keep the last known value; the relay enforces its own.
+  } finally {
+    syncPreviewMaxLiveSlider();
+  }
+}
+
+export async function updatePreviewMaxLiveSetting(value) {
+  if (previewMaxLiveUpdateInFlight) {
+    syncPreviewMaxLiveSlider();
+    return;
+  }
+  const number = Number(value);
+  const requested = Number.isFinite(number) ? Math.max(0, Math.round(number)) : DEFAULT_PREVIEW_MAX_LIVE;
+  previewMaxLiveUpdateInFlight = true;
+  syncPreviewMaxLiveSlider();
+  try {
+    const result = await requestPreviewMaxLiveSetting(requested);
+    if (!result) throw new Error('Failed to update the maximum number of live previews.');
+    previewMaxLive = Number.isFinite(Number(result.maxLive)) ? Number(result.maxLive) : requested;
+    showTransientRelayNotice(previewMaxLive === 0
+      ? 'No new previews can be published.'
+      : `Up to ${previewMaxLive} previews can be live at once.`);
+  } catch (error) {
+    alert(error?.message || 'Failed to update the maximum number of live previews.');
+  } finally {
+    previewMaxLiveUpdateInFlight = false;
+    syncPreviewMaxLiveSlider();
+  }
+}
+
+// The slider's inline handlers (bootstrap.js is at its size ceiling).
+window.previewPreviewMaxLiveSetting = previewPreviewMaxLiveSetting;
+window.updatePreviewMaxLiveSetting = updatePreviewMaxLiveSetting;
 
 // "After a relay restart, tell interrupted sessions to carry on": a relay
 // setting, off by default (server/services/restart-resume-service.mjs).
@@ -1933,6 +2010,8 @@ export function openSettingsModal(tab, providerTab) {
   void refreshModelRefreshSettings();
   void refreshRelayRestartMaxWaitSetting();
   void refreshPushSettingsSection();
+  syncPreviewMaxLiveSlider();
+  void refreshPreviewMaxLiveSetting();
   void refreshPreviewsSection();
   void refreshSharedConversationsSection();
   void refreshRemoteRelaysSection();

@@ -66,6 +66,7 @@ export const REMOTE_RELAY_TOOL_ZOD_SHAPE = {
   max_chars: number('max_chars'),
   // Free text: the worker outlives relay updates, the relay checks the id.
   provider: text('provider'),
+  verbose: z.boolean().optional().describe(FIELDS.verbose.description),
   model: text('model'),
   cwd: text('cwd'),
   repo: text('repo'),

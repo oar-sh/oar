@@ -125,7 +125,46 @@ test('the list: urgent first with its Details open, answered under the divider; 
   assert.deepEqual(cardIds(), ['q3', 'q1', 'q2']);
   assert.equal(panel().querySelector('.inbox-divider').textContent, 'Answered in the last day');
   assert.equal(panel().querySelector('.inbox-item[data-item-id="q2"] .inbox-item-outcome').textContent, 'Answered: Option B');
-  assert.equal(panel().querySelector('.inbox-item[data-item-id="q2"] button'), null);
+  assert.equal(panel().querySelector('.inbox-item[data-item-id="q2"] button:not(.inbox-item-fold)'), null, 'nothing answers it again');
+  ui.closeQuestionsPanel();
+});
+
+test('the head\'s Unanswered hides what closed, and ➖ folds every card to one line, ➕ unfolds; both are kept with the Inbox\'s view', async () => {
+  await show('conv-heron', [ask('u1'), ask('u2', { createdAt: minutesAgo(2) }), ask('u3', { status: 'answered', answer: 'Option A', choice: 'Option A', answeredAt: minutesAgo(1) })]);
+  ui.openQuestionsPanel({ anchor: button() });
+  const head = () => panel().querySelector('.questions-panel-head');
+  // Beside ✕: Unanswered, then ➖.
+  assert.deepEqual([...head().querySelectorAll('button')].map((node) => node.textContent), ['Unanswered', '➖', '✕']);
+  const chip = () => head().querySelector('[data-inbox-view="unanswered"]');
+  chip().click();
+  assert.equal(chip().getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(cardIds(), ['u2', 'u1']);
+  assert.equal(panel().querySelector('.inbox-divider'), null);
+  assert.equal(JSON.parse(localStorage.getItem('oar_inbox_view')).unanswered, true);
+  const foldAll = () => head().querySelector('.inbox-fold-all');
+  assert.equal(foldAll().getAttribute('aria-label'), 'Fold all questions');
+  foldAll().click();
+  assert.equal(ui.isQuestionsPanelOpen(), true, 'a click in the head keeps it open');
+  assert.equal(panel().querySelectorAll('.inbox-item.is-folded').length, 2);
+  assert.equal(foldAll().textContent, '➕');
+  assert.equal(foldAll().getAttribute('aria-label'), 'Unfold all questions');
+  assert.equal(panel().querySelector('.inbox-item[data-item-id="u1"] .inbox-item-unfold').getAttribute('aria-expanded'), 'false');
+  // A socket update keeps them folded.
+  ui.noteQuestionAskUpdated(ask('u2', { createdAt: minutesAgo(2), updatedAt: minutesAgo(0), urgency: 'now' }));
+  assert.equal(panel().querySelectorAll('.inbox-item.is-folded').length, 2);
+  // Only answered left: it says so.
+  chip().click();
+  assert.deepEqual(cardIds(), ['u2', 'u1', 'u3']);
+  assert.equal(foldAll().textContent, '➖', 'the answered one is open');
+  foldAll().click();
+  foldAll().click();
+  assert.equal(panel().querySelectorAll('.inbox-item.is-folded').length, 0);
+  ui.closeQuestionsPanel();
+  await show('conv-heron', [ask('u3', { status: 'answered', answer: 'Option A', choice: 'Option A', answeredAt: minutesAgo(1) })]);
+  ui.openQuestionsPanel({ anchor: button() });
+  chip().click();
+  assert.equal(panel().querySelector('.questions-panel-empty').textContent, 'No unanswered questions in this conversation.');
+  chip().click();
   ui.closeQuestionsPanel();
 });
 
@@ -485,4 +524,129 @@ test('an open request for a conversation that did not open is dropped', async ()
   ui.setQuestionsConversation('conv-gannet');
   await wait(10);
   assert.equal(ui.isQuestionsPanelOpen(), false);
+});
+
+// ─── Steady scrolling: the list and the transcript hold still ─────────────────
+
+test('a card answered above the reader: the cards they read stay where they are in the list', async () => {
+  // JSDOM lays nothing out: the list shows 400 px from y=50; its head is 40
+  // px, every card 150, the divider 30, stacked in order.
+  const heights = { 'questions-panel-head': 40, 'inbox-item': 150, 'inbox-divider': 30 };
+  const original = window.HTMLElement.prototype.getBoundingClientRect;
+  window.HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+    const list = panel();
+    if (this === list) return { top: 50, bottom: 450 };
+    if (!list?.contains(this)) return original.call(this);
+    let offset = 0;
+    for (const node of list.querySelectorAll('.questions-panel-head, .inbox-item, .inbox-divider')) {
+      const height = heights[[...node.classList].find((name) => heights[name])] || 0;
+      if (node === this) return { top: 50 + offset - list.scrollTop, bottom: 50 + offset + height - list.scrollTop };
+      offset += height;
+    }
+    return original.call(this);
+  };
+  const topOf = (id) => panel().querySelector(`.inbox-item[data-item-id="${id}"]`).getBoundingClientRect().top;
+  try {
+    // Newest first: k1 on top.
+    await show('conv-heron', [1, 2, 3, 4, 5, 6].map((n) => ask(`k${n}`, { createdAt: minutesAgo(n), updatedAt: minutesAgo(n) })));
+    ui.openQuestionsPanel({ anchor: button() });
+    assert.deepEqual(cardIds(), ['k1', 'k2', 'k3', 'k4', 'k5', 'k6']);
+    // The reader is at k3, 10 px of it scrolled past.
+    panel().scrollTop = 350;
+    const before = topOf('k3');
+    ui.noteQuestionAskUpdated(ask('k1', { createdAt: minutesAgo(1), status: 'answered', choice: 'Option A', answer: 'Option A', answeredAt: minutesAgo(0), updatedAt: minutesAgo(0) }));
+    assert.deepEqual(cardIds(), ['k2', 'k3', 'k4', 'k5', 'k6', 'k1']);
+    assert.equal(topOf('k3'), before);
+    assert.equal(panel().scrollTop, 200);
+    ui.closeQuestionsPanel({ focus: false });
+  } finally {
+    window.HTMLElement.prototype.getBoundingClientRect = original;
+  }
+});
+
+test('📓 does not follow the header while the pointer or the focus is in it; a viewport resize places it at once', async () => {
+  const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height, x: left, y: top });
+  let buttonTop = 10;
+  button().getBoundingClientRect = () => rect(900, buttonTop, 40, 28);
+  const frames = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 5))));
+  const headerChanged = () => window.dispatchEvent(new window.CustomEvent('oar:header-actions-change'));
+  const top = () => parseFloat(panel().style.top);
+  try {
+    await show('conv-heron', [ask('d1')]);
+    ui.openQuestionsPanel({ anchor: button() });
+    await frames();
+    const placed = top();
+    // The banner gains its row while the pointer is in the list: it stays.
+    panel().dispatchEvent(new window.Event('pointerenter'));
+    buttonTop = 40;
+    headerChanged();
+    await frames();
+    assert.equal(top(), placed, 'held while the pointer is in it');
+    // The pointer leaves: placed under 📓 again.
+    panel().dispatchEvent(new window.Event('pointerleave'));
+    assert.equal(top() - placed, 30);
+    // Typing an answer holds it too, until the focus leaves the list.
+    panel().querySelector('.inbox-answer-text').focus();
+    buttonTop = 10;
+    headerChanged();
+    await frames();
+    assert.equal(top() - placed, 30, 'held while the focus is in it');
+    button().focus();
+    await wait(5);
+    assert.equal(top(), placed);
+    // The keyboard or a rotation: placed at once, pointer in it or not.
+    panel().dispatchEvent(new window.Event('pointerenter'));
+    buttonTop = 40;
+    window.dispatchEvent(new window.Event('resize'));
+    assert.equal(top() - placed, 30);
+    ui.closeQuestionsPanel({ focus: false });
+  } finally {
+    delete button().getBoundingClientRect;
+  }
+});
+
+test('a stub above the reader that grows once answered leaves the text they read in place', async () => {
+  const el = messages();
+  // Ten replies; a reply is 200 px, plus 30 for a stub, 60 for a closed one
+  // (its "Answered: …" wraps).
+  const rows = Array.from({ length: 10 }, (_, index) => {
+    const row = reply(`q-row-${index}`);
+    row.dataset.messageId = `m-row-${index}`;
+    return row;
+  });
+  el.replaceChildren(...rows);
+  const heightOf = (row) => 200 + [...row.querySelectorAll('.msg-ask-stub')].reduce((sum, stub) => sum + (stub.classList.contains('is-closed') ? 60 : 30), 0);
+  const original = window.HTMLElement.prototype.getBoundingClientRect;
+  window.HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+    if (this === el) return { top: 0, bottom: 600 };
+    let offset = 0;
+    for (const row of rows) {
+      if (row === this) return { top: offset - el.scrollTop, bottom: offset + heightOf(row) - el.scrollTop };
+      offset += heightOf(row);
+    }
+    return original.call(this);
+  };
+  Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => 600 });
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => rows.reduce((sum, row) => sum + heightOf(row), 0) });
+  try {
+    await show('conv-heron', [ask('x1', { queueId: 'q-row-0' })]);
+    ui.renderQuestionStubs();
+    assert.equal(stubsOf('x1').length, 1);
+    // The reader is in the fourth reply, far from the end.
+    el.scrollTop = 650;
+    const before = rows[3].getBoundingClientRect().top;
+    ui.noteQuestionAskUpdated(ask('x1', { queueId: 'q-row-0', status: 'answered', choice: 'Option A', answer: 'Option A', answeredAt: minutesAgo(0), updatedAt: minutesAgo(0) }));
+    assert.equal(stubsOf('x1')[0].classList.contains('is-closed'), true);
+    assert.equal(rows[3].getBoundingClientRect().top, before);
+    assert.equal(el.scrollTop, 680);
+    // A reader at the end is left to the follow rule: nothing is put back.
+    el.scrollTop = 1460;
+    ui.noteQuestionAskUpdated(ask('x1', { queueId: 'q-row-0', status: 'dismissed', answeredAt: minutesAgo(0), updatedAt: new Date().toISOString() }));
+    assert.equal(el.scrollTop, 1460);
+  } finally {
+    window.HTMLElement.prototype.getBoundingClientRect = original;
+    delete el.clientHeight;
+    delete el.scrollHeight;
+    el.replaceChildren();
+  }
 });

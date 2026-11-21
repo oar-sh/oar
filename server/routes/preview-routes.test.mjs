@@ -9,7 +9,8 @@ import {
 } from '../services/preview-registry-service.mjs';
 import { createMemoryPreviewStore } from '../services/preview-store.mjs';
 import { createPreviewScopeResolver, registerPreviewRoutes } from './preview-routes.mjs';
-import { CLI_AGENT_PRINCIPAL, asAgent, asOwner, withPrincipal } from '../services/relay-principal-test-harness.mjs';
+import { routePolicyFor } from '../../shared/relay-route-policy.mjs';
+import { CLI_AGENT_PRINCIPAL, asAgent, asOwner, asPeer, withPrincipal } from '../services/relay-principal-test-harness.mjs';
 
 const AUTH_TOKEN = 'test-relay-token';
 
@@ -34,7 +35,8 @@ async function startApi({
   // Stand-in for the runtime's auth middleware: same contract (bearer token or
   // 401, the request tagged with who it is), without pulling the whole server
   // runtime into a route test. `agent:<conversation>` stands for that
-  // session's agent token, `agent:` for the cli one.
+  // session's agent token, `agent:` for the cli one, `peer:<relay>` for a
+  // paired relay signed in with its own key.
   const auth = (req, res, next) => {
     const presented = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (presented === AUTH_TOKEN) {
@@ -45,6 +47,11 @@ async function startApi({
       const conversationId = presented.slice('agent:'.length);
       if (conversationId) asAgent(req, conversationId);
       else withPrincipal(req, CLI_AGENT_PRINCIPAL);
+      return next();
+    }
+    if (presented.startsWith('peer:')) {
+      const relayId = presented.slice('peer:'.length);
+      asPeer(req, { id: `entry-${relayId}`, relayId, name: 'Paired relay', url: 'https://paired.example.net' });
       return next();
     }
     return res.status(401).json({ error: 'Unauthorized' });
@@ -498,4 +505,130 @@ test('the cli agent token (no conversation) gets no previews; the owner keeps th
   assert.equal((await api.call('/api/previews', { method: 'POST', token: 'agent:', body: { conversationId: 'conv-1', port: 5009 } })).status, 403);
   const owner = await api.call('/api/previews');
   assert.deepEqual(owner.body.previews.map((entry) => entry.targetPort), [5001, 5002]);
+});
+
+// ─── "Maximum live previews" ────────────────────────────────────────────────
+
+// The relay's wiring in small: the saved value in a variable (app_settings in
+// the relay), read back by the registry on every create.
+async function startLimitApi({ configMaxLive, saved = null, config } = {}) {
+  const state = { saved, writes: [] };
+  const registry = createPreviewRegistry({
+    config: config || previewConfig(configMaxLive === undefined ? {} : { maxLive: configMaxLive }),
+    maxLiveSetting: {
+      read: () => state.saved,
+      save: (maxLive) => {
+        state.saved = maxLive;
+        state.writes.push(maxLive);
+        return { ok: true, maxLive };
+      },
+    },
+  });
+  const api = await startApi({ registry });
+  return { api, state };
+}
+
+const MAX_LIVE_PATH = '/api/settings/preview-max-live';
+
+test('GET reports the limit in force with the slider range', async (t) => {
+  const { api } = await startLimitApi({ configMaxLive: 5 });
+  t.after(() => api.close());
+  assert.deepEqual((await api.call(MAX_LIVE_PATH)).body, { maxLive: 5, min: 0, max: 128, default: 8 });
+  assert.equal((await api.call(MAX_LIVE_PATH, { token: '' })).status, 401);
+});
+
+test('GET shows a config value above the range clamped to 128 while the registry keeps it', async (t) => {
+  const { api } = await startLimitApi({ configMaxLive: 300 });
+  t.after(() => api.close());
+  assert.equal((await api.call(MAX_LIVE_PATH)).body.maxLive, 128);
+  assert.equal(api.registry.maxLive, 300);
+});
+
+test('POST stores the value, clamps it into 0..128, and applies it to the next create', async (t) => {
+  const { api, state } = await startLimitApi({ configMaxLive: 1 });
+  t.after(() => api.close());
+  assert.equal((await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5001 } })).status, 200);
+  assert.equal((await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5002 } })).status, 429);
+
+  const saved = await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: 2 } });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body, { maxLive: 2, min: 0, max: 128, default: 8 });
+  assert.equal((await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5002 } })).status, 200,
+    'the raised limit applies without a restart');
+
+  assert.equal((await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: 500 } })).body.maxLive, 128);
+  assert.equal((await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: 0 } })).body.maxLive, 0);
+  assert.equal((await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: '6.4' } })).body.maxLive, 6);
+  assert.deepEqual(state.writes, [2, 128, 0, 6]);
+  assert.equal((await api.call(MAX_LIVE_PATH)).body.maxLive, 6);
+});
+
+test('POST refuses anything but a number and stores nothing', async (t) => {
+  const { api, state } = await startLimitApi();
+  t.after(() => api.close());
+  // JSON carries no undefined, NaN or Infinity: the first is a missing field,
+  // the other two arrive as null.
+  const junk = [[], [7], '0x20', '1e2', '', '  ', 'plenty', null, undefined, true, false, {}, 'Infinity'];
+  for (const maxLive of junk) {
+    const response = await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive } });
+    assert.equal(response.status, 400, JSON.stringify(maxLive));
+    assert.equal(response.body.error, 'maxLive must be a number', JSON.stringify(maxLive));
+  }
+  assert.deepEqual(state.writes, []);
+});
+
+test('POST refuses a negative rather than saving 0, which would switch previews off', async (t) => {
+  const { api, state } = await startLimitApi();
+  t.after(() => api.close());
+  for (const maxLive of [-5, '-5', -0.4]) {
+    const response = await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive } });
+    assert.equal(response.status, 400, JSON.stringify(maxLive));
+    assert.equal(response.body.error, 'maxLive must be 0 or more');
+  }
+  assert.deepEqual(state.writes, []);
+});
+
+test('a saved 0 refuses every new preview with the no-new-previews message', async (t) => {
+  const { api } = await startLimitApi();
+  t.after(() => api.close());
+  await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: 0 } });
+  const refused = await api.call('/api/previews', { method: 'POST', body: { conversationId: 'conv-1', port: 5001 } });
+  assert.equal(refused.status, 429);
+  assert.match(refused.body.error, /^No new previews: .*Settings → Previews/);
+  assert.equal(api.registry.size, 0);
+});
+
+test('the limit saves while the preview lane is off and applies once it is on', async (t) => {
+  const { api, state } = await startLimitApi({ config: normalizePreviewsConfig({}, { env: {}, relayPort: 3333 }) });
+  t.after(() => api.close());
+  const saved = await api.call(MAX_LIVE_PATH, { method: 'POST', body: { maxLive: 3 } });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(state.writes, [3]);
+  assert.equal(api.registry.maxLive, 3);
+});
+
+test('an agent token reads the limit but cannot change it', async (t) => {
+  const { api, state } = await startLimitApi();
+  t.after(() => api.close());
+  assert.equal((await api.call(MAX_LIVE_PATH, { token: 'agent:conv-1' })).status, 200);
+  for (const token of ['agent:conv-1', 'agent:']) {
+    const refused = await api.call(MAX_LIVE_PATH, { method: 'POST', token, body: { maxLive: 64 } });
+    assert.equal(refused.status, 403, token);
+    assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
+  }
+  assert.deepEqual(state.writes, []);
+  // And the relay's own auth refuses it before the route: person-only.
+  assert.equal(routePolicyFor('POST', MAX_LIVE_PATH).agent, 'deny');
+  assert.equal(routePolicyFor('POST', MAX_LIVE_PATH).peer, 'deny');
+  assert.equal(routePolicyFor('GET', MAX_LIVE_PATH).agent, 'allow');
+});
+
+test('a paired relay\'s key cannot change the limit', async (t) => {
+  const { api, state } = await startLimitApi();
+  t.after(() => api.close());
+  const refused = await api.call(MAX_LIVE_PATH, { method: 'POST', token: 'peer:relay-b', body: { maxLive: 64 } });
+  assert.equal(refused.status, 403);
+  assert.equal(refused.body.code, 'AUTH_PERSON_REQUIRED');
+  assert.deepEqual(state.writes, []);
+  assert.equal(api.registry.maxLive, 8, 'the limit in force is unchanged');
 });

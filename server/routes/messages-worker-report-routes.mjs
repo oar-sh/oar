@@ -716,11 +716,18 @@ export function registerMessagesWorkerReportRoutes(app, deps, shared) {
         totalCostUsd: req.body?.totalCostUsd,
       });
     if (!usage) return res.status(400).json({ error: 'Missing usable usage payload' });
-    planUsageService.saveSnapshot(snapshotProvider, usage, {
-      source: 'worker',
-      error: String(req.body?.error || '').trim() || null,
-    });
-    res.json({ ok: true });
+    // The service merges the report with the stored snapshot (a report that
+    // could not read every plan window keeps the ones it has) and says
+    // whether this worker, and no other, runs the slow transcript scan; a
+    // worker that does not see `behaviorsDue` never scans.
+    const error = String(req.body?.error || '').trim() || null;
+    let behaviorsDue = false;
+    if (typeof planUsageService.saveClaudeReport === 'function') {
+      ({ behaviorsDue } = planUsageService.saveClaudeReport(snapshotProvider, usage, { error }));
+    } else {
+      planUsageService.saveSnapshot(snapshotProvider, usage, { source: 'worker', error });
+    }
+    res.json({ ok: true, behaviorsDue });
   });
 
   // POST /api/claude-usage-limit — the Claude worker forwards what the CLI

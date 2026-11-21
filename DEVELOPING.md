@@ -840,9 +840,9 @@ Everything else belongs in the unit suites, which drive the worker against a fak
 
 ## The stall watchdog
 
-The Copilot, Cursor and Grok workers fail a turn whose runtime has sent nothing for too long. How
-long depends on what the runtime is doing, which the worker reads off the events it already gets
-(`shared/worker-runtime/turn-liveness.mjs`):
+The Copilot, Cursor, Grok and Claude workers fail a turn whose runtime has sent nothing for too
+long. How long depends on what the runtime is doing, which the worker reads off the events it
+already gets (`shared/worker-runtime/turn-liveness.mjs`):
 
 | Phase | Default | Meaning |
 | ----- | ------- | ------- |
@@ -876,12 +876,57 @@ whether it is still there (`ping`, 5 s to answer). A runtime that does not answe
 once. The other two runtimes have no such request; a dead Grok agent is noticed by its process
 exiting.
 
-The Claude worker only observes. Its CLI sends a heartbeat every 30 s while a tool runs in
-silence and a frame about every second while the model works (SDK 0.3.283, measured), but how
-long its silent stretches get in real sessions is not known (a compaction, the backoff of an API
-retry), and failing a turn there means killing the CLI and its background tasks. So a running
-turn the CLI has said nothing in for 10 minutes (30 minutes with a tool open) is written to the
-worker's log with what was in flight, `running turn quiet for …`, and left running.
+The Claude worker (and the Claude API and DeepSeek workers, which run the same CLI) has its own
+numbers and its own way to end the turn. Its CLI sends a heartbeat every 30 s while a tool runs in
+silence, a frame about every second while the model works and an `api_retry` before each backoff
+(SDK 0.3.283, measured), so the model window is 10 minutes (`OAR_TURN_STALL_MODEL_MS`), the tool
+window 30, and there is no idle phase: inside a turn the CLI waits for the model unless a tool is
+open. From 2026-09-29 to 0.9.31 the worker only logged such a turn, to measure the silences first:
+on two relays in seven weeks, every turn that went on after a silence past the window had been
+open while the host slept, and the two that were silent while the host was awake never spoke
+again (one held its session and three queued messages until Stop was pressed 48 minutes later;
+the section *A running turn that went quiet* in `claude-session-process.mjs` has the account).
+
+A turn past its window is written to the worker's log (`running turn quiet for …; ending it`,
+with what was in flight) and ended in two steps, because ending it means more here than for the
+other workers: the CLI process also carries the session's background tasks.
+
+1. The worker asks the CLI to interrupt the turn. A CLI that still works ends it, and the turn
+   fails with `claude.turn-stalled` above what it had written. The process and its background
+   tasks stay; with nothing left in it, the process is released, so the next message starts a new
+   CLI on the same session.
+2. A CLI that has not ended the turn 60 s after the interrupt (`interruptGraceMs`) is stopped,
+   with its background tasks. The turn fails with the same code and a note that says so.
+
+Messages steered into the turn were not answered by it. The CLI normally opens a turn of their own
+for them after the interrupt; when it was stopped, or opens none, they go back to the queue
+without a retry penalty and run on the new CLI.
+
+Between turns there is no turn to watch, but the same thing can happen: a message is pushed to an
+idle CLI that never speaks again. The pending-delivered watchdog (5 minutes) used to fail that row
+and keep the CLI, so every later message failed the same way. Now a CLI that has sent nothing at
+all since the push is stopped and the row goes back to the queue, once per row; a CLI that did
+speak and then dropped the message is kept and the row fails as before.
+
+Stopping the CLI is the SDK's abort. On Windows that ends `claude.exe` alone, so the worker ends
+the CLI's process tree first (`taskkill /PID <pid> /T /F`, `claude-cli-process.mjs`); it knows the
+pid from Node's `child_process` diagnostics channel, since the SDK does not say which process it
+started. The watchdog itself lives in `claude-quiet-turn.mjs`.
+
+The same 60 s bound a Stop: the CLI acknowledges an interrupt at once, but only the turn's result
+closes it, and a CLI whose turn is stuck sends none. Before, such a turn was shown as stopped
+while the worker went on holding it, with every message behind it. Now the CLI is stopped after
+the grace, the steered messages settle as stopped with the turn (as after any Stop), and the next
+message starts a new CLI.
+
+Not counted as silence: an open question or permission card, a compaction, a relay tool call the
+worker itself is waiting on (`relay_tool` with a long `wait_seconds`, an approval card), a
+publish the relay is slow to take, and the wait an `api_retry` announces (`retry_delay_ms`). Nor
+the time the host slept: when two ticks of the worker's lifecycle timer are more than 30 s apart
+(a suspend, a blocked process), the clocks start over, and the turn has the whole window after
+the wake. Two contexts are left alone altogether: a provisional adoption after a compaction, which
+has its own way out of silence, and a row opened for a background agent's question between turns,
+which has no turn of the CLI behind it until the main agent works again.
 
 The Claude Cloud worker has no stall watchdog either, and does not use `turn-liveness.mjs`. What
 it watches is its connection, not the agent: an event stream that delivers no byte for 120 s,
@@ -892,7 +937,7 @@ is quiet while its stream is alive is left running; the worker cannot stop the s
 it to (`interrupt`).
 
 A question card, a `relay_tool` call and a compaction hold the watchdog whatever the phase. What
-bounds a turn that stays quiet and alive is the relay's turn ceiling.
+bounds a turn that stays quiet and alive under such a hold is the relay's turn ceiling.
 
 A `relay_tool` call can be quiet for long: `wait_seconds` goes up to the relay's **Longest wait
 per tool call** (`remote_relay_max_wait_seconds`, 600 s by default, 120 to 3600 s), and an

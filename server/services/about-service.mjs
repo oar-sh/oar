@@ -301,6 +301,7 @@ async function fileSize(fsImpl, filePath) {
  * @param {() => object} [deps.getProviderSettings] `{ github: { enabled }, claude: { enabled }, … }`
  * @param {() => object} [deps.getCachedCliProviders] the CLI install service's cached rows, by CLI id
  * @param {() => object[]} [deps.listWorkers] the session worker registry's entries
+ * @param {(sdkSessionId: string) => boolean} [deps.hasHeartbeated] whether the session's worker has heartbeated to this relay; a worker without a build id counts as on other code only once it has
  * @param {() => object|null} [deps.getUpdateState] buildUpdateStatePayload()
  * @param {() => object|null} [deps.getAgentSdkStatus] the agent SDK store's snapshot(); its `installed` versions come first
  * @param {object} [deps.sdkVersions] package version by provider id; read from node_modules when absent
@@ -319,6 +320,7 @@ export function createAboutService({
   getProviderSettings = () => ({}),
   getCachedCliProviders = () => ({}),
   listWorkers = () => [],
+  hasHeartbeated = () => false,
   getUpdateState = () => null,
   getAgentSdkStatus = null,
   sdkVersions = null,
@@ -385,7 +387,10 @@ export function createAboutService({
       const status = String(worker?.status || '').trim().toLowerCase();
       if (!ACTIVE_WORKER_STATUSES.has(status) || !isPidAlive(worker?.pid)) continue;
       total += 1;
-      if (isWorkerOnOtherBuild(worker, relayBuildId)) onOtherBuild += 1;
+      if (isWorkerOnOtherBuild(worker, relayBuildId, {
+        now: now(),
+        hasHeartbeated: (entry) => hasHeartbeated(String(entry?.sdkSessionId || '').trim()),
+      })) onOtherBuild += 1;
       const conversationId = String(worker?.conversationId || '').trim();
       const provider = conversationId
         ? normalizeProviderId(providerForConversation.get(conversationId)?.provider_type)

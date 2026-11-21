@@ -208,7 +208,8 @@ export function remoteRelayProviderDescription(providers = REMOTE_RELAY_PROVIDER
   return `create_session: provider, one of: ${providers.join(', ')} (relay_info lists what the target relay offers; `
     + 'default: the same provider as this session). '
     + `send to a Claude session: one of ${sendProviders.join(', ')} (the subscription or the API key) switches its billing from the next turn, `
-    + 'together with this message; the other billing must be set up there. Omit it to keep the session\'s billing.';
+    + 'together with this message; the other billing must be set up there. Omit it to keep the session\'s billing. '
+    + 'relay_info: list that provider\'s models and the efforts each takes in full (without it: a count and the default model\'s efforts per provider).';
 }
 
 export const REMOTE_RELAY_RESULT_STATUSES = Object.freeze([
@@ -467,7 +468,8 @@ export const REMOTE_RELAY_TOOL_DESCRIPTION =
   'Work with sessions on OAR relays: the other relays this relay is paired with ("remote relays") '
   + 'and, when its owner allows it, this relay itself. List the relays, list or read their '
   + 'sessions, prompt a session, start a new one, wait for its reply, and answer or stop it. '
-  + 'Start with {action:"list_relays"}. A paired relay stays locked until '
+  + 'Start with {action:"list_relays"}. relay_info answers a summary; pass provider for that provider\'s '
+  + 'model ids and efforts, verbose:true for every list in full. A paired relay stays locked until '
   + 'the user mentions it in this conversation (for example @name) or an agent on that '
   + 'relay writes to it; from then on it stays open for the whole conversation. A '
   + 'locked relay refuses everything except list_relays, so ask the user to mention it. '
@@ -591,8 +593,8 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     action: {
       type: 'string',
       enum: [...REMOTE_RELAY_ACTIONS],
-      description: 'list_relays: the relays (this one included when allowed) and whether each is unlocked here. relay_info: providers, models, '
-        + 'workspaces of a relay. usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. '
+      description: 'list_relays: the relays (this one included when allowed) and whether each is unlocked here. relay_info: a summary of a relay\'s providers, '
+        + 'groups and workspaces (provider: that provider\'s models and efforts; verbose: everything in full). usage: what each provider\'s plan has left there and any usage-limit pause. list_sessions / read_session: discover and read sessions. '
         + 'read_task_output: the end of a background shell task\'s output. read_worker_log: the end of your own session worker\'s log (this relay). send: prompt an '
         + 'existing session. create_session: start a new session with a first prompt. update_session: change '
         + 'another session\'s settings (model, effort, mode, auto-compact window, title, group, thinking, cwd, image defaults). wait: keep waiting for '
@@ -639,11 +641,16 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
       type: 'string',
       description: remoteRelayProviderDescription(),
     },
+    verbose: {
+      type: 'boolean',
+      description: 'relay_info: true lists everything in full (every provider\'s models and efforts, all groups and recent workspaces) '
+        + 'instead of the summary.',
+    },
     model: {
       type: 'string',
       description: 'create_session: model id (default: this session\'s model when the remote offers it, else the remote\'s default). '
         + 'send: switch the remote session to this model (default: it keeps its own). update_session: the session\'s model from now on. '
-        + 'Must be an id relay_info lists for the provider (Claude and Claude API also take "opus", "sonnet", "haiku"): '
+        + 'Must be an id relay_info with provider lists (Claude and Claude API also take "opus", "sonnet", "haiku"): '
         + 'an unknown id is refused with the close matches, nothing created or sent.',
     },
     cwd: {
@@ -668,7 +675,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     },
     effort: {
       type: 'string',
-      description: 'send / create_session: reasoning effort for the remote turn, e.g. low, medium, high (relay_info lists '
+      description: 'send / create_session: reasoning effort for the remote turn, e.g. low, medium, high (relay_info with provider lists '
         + 'what each model takes). create_session default: this session\'s effort when the remote model supports it, '
         + 'else the remote\'s default. send default: the remote session keeps its own. update_session: the session\'s '
         + 'effort from now on (one its model takes).',
@@ -681,7 +688,7 @@ export const REMOTE_RELAY_TOOL_INPUT_SCHEMA = Object.freeze({
     group: {
       type: 'string',
       description: 'create_session: an existing session group on the target relay to put the new session in: its id (grp_…) '
-        + 'or its exact name, case-insensitive (relay_info lists them). Default: a session started on this relay joins '
+        + 'or its exact name, case-insensitive (relay_info lists the latest, with verbose true all). Default: a session started on this relay joins '
         + 'your own group, one on a paired relay none. A group that is not there: the session starts in no group, with a warning. '
         + `update_session: move the session into an existing group (id or name) or out of its group ("${REMOTE_RELAY_NO_GROUP}"). Only the owner makes groups. `
         + 'A group the owner made is never removed this way: it stays, empty if the session was its last member; one update_session made goes once empty. '
@@ -878,7 +885,7 @@ const STRICT_ARGUMENT_ACTIONS = new Set(['create_session', 'update_session']);
 // the others.
 export const REMOTE_RELAY_ACTION_ARGUMENTS = Object.freeze({
   list_relays: Object.freeze([]),
-  relay_info: Object.freeze([]),
+  relay_info: Object.freeze(['provider', 'verbose']),
   usage: Object.freeze([]),
   list_sessions: Object.freeze(['scope', 'limit', 'query', 'cursor']),
   read_session: Object.freeze(['session', 'last', 'before', 'include_activity', 'max_chars']),
@@ -1066,7 +1073,18 @@ function validateToolInput(input, { maxWaitSeconds, now, providers, sendProvider
     if (value) args[key] = value.slice(0, max);
   };
 
-  if (action === 'list_sessions') {
+  if (action === 'relay_info') {
+    // The shape only: which providers there are is the target relay's, and
+    // the relay names them when it refuses one.
+    const providerCheck = optionalProvider(null, () => '');
+    if (!providerCheck.ok) return providerCheck;
+    const verbose = input?.verbose;
+    if (verbose !== undefined && verbose !== null && toText(verbose) !== '') {
+      const flag = readBoolean(verbose);
+      if (flag === null) return invalid('verbose must be true or false');
+      if (flag) args.verbose = true;
+    }
+  } else if (action === 'list_sessions') {
     const scopeCheck = optionalEnum('scope', REMOTE_RELAY_SESSION_SCOPES);
     if (!scopeCheck.ok) return scopeCheck;
     args.scope = args.scope || 'recent';

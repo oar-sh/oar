@@ -23,6 +23,7 @@ import {
   remoteRelayActivitySummary,
   remoteRelayCancelledResult,
   remoteRelayErrorResult,
+  remoteRelayToolOffered,
   shouldRegisterRemoteRelayTool,
   validateRemoteRelayTool,
 } from './remote-relay-tool-core.mjs';
@@ -278,6 +279,24 @@ test('registration fails closed when the relay does not answer in time', async (
   assert.ok(Date.now() - started < 2_000);
 });
 
+test('the offer question tells a definite answer from an unknown one', async () => {
+  const ask = (reply, extra = {}) => remoteRelayToolOffered({
+    api: async () => {
+      if (reply instanceof Error) throw reply;
+      return reply;
+    },
+    ...extra,
+  });
+  assert.equal(await ask({ count: 1 }), true);
+  assert.equal(await ask({ count: 0, localEnabled: true }), true);
+  assert.equal(await ask({ count: 0, localEnabled: false }), false);
+  assert.equal(await ask(null), false, 'an answer without a pairing is a no');
+  assert.equal(await ask(new Error('HTTP 503')), null, 'a failed request is unknown');
+  assert.equal(await remoteRelayToolOffered({}), null, 'no api is unknown');
+  assert.equal(await remoteRelayToolOffered({ api: () => new Promise(() => {}), timeoutMs: 30 }), null, 'no answer in time is unknown');
+  assert.equal(await shouldRegisterRemoteRelayTool({ api: async () => { throw new Error('HTTP 503'); } }), false);
+});
+
 test('the gate asks once, is readable synchronously, and can be pinned', async () => {
   let asked = 0;
   const gate = createRemoteRelayToolGate({
@@ -312,8 +331,17 @@ test('inflight: the count of running calls, 0 on any failure', async () => {
   assert.equal(await fetchRemoteRelayInflight({ api: stub.api }), 0, 'no conversation, no question');
 });
 
-test('results are pretty JSON for every adapter', () => {
-  assert.equal(formatRemoteRelayToolResult({ ok: true, a: 1 }), '{\n  "ok": true,\n  "a": 1\n}');
+test('results are compact JSON for every adapter, and parse back to the same object', () => {
+  assert.equal(formatRemoteRelayToolResult({ ok: true, a: 1 }), '{"ok":true,"a":1}');
+  const result = {
+    ok: true,
+    summary: 'relay_info → demo-relay: OAR 9.9.9',
+    providers: [{ provider: 'demo', configured: true, defaultModel: 'demo-model-1', modelCount: 2, efforts: ['low', 'high'] }],
+    note: 'two lines\nof text',
+  };
+  const text = formatRemoteRelayToolResult(result);
+  assert.equal(text.includes('\n'), false, 'no line break, not even from a text that holds one');
+  assert.deepEqual(JSON.parse(text), result);
   assert.equal(formatRemoteRelayToolResult(undefined), 'null');
   const circular = {};
   circular.self = circular;

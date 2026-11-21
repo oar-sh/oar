@@ -1035,6 +1035,18 @@ export async function updateTaskStallMinutesSetting(minutes) {
   });
 }
 
+// "Maximum live previews" in Settings › Previews (0: no new previews).
+export async function loadPreviewMaxLiveSetting() {
+  return apiFetch('/api/settings/preview-max-live');
+}
+
+export async function updatePreviewMaxLiveSetting(maxLive) {
+  return apiFetch('/api/settings/preview-max-live', {
+    method: 'POST',
+    body: JSON.stringify({ maxLive: Number(maxLive) }),
+  });
+}
+
 // "After a relay restart, tell interrupted sessions to carry on" (off by default).
 export async function loadRestartResumeSetting() {
   return apiFetch('/api/settings/restart-resume');

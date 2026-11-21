@@ -28,7 +28,11 @@ import {
   toTrimmedString,
 } from './plan-usage-contract.mjs';
 import { buildCopilotPlanCard } from './plan-usage-copilot.mjs';
-import { buildClaudePlanCard } from './plan-usage-claude.mjs';
+import {
+  buildClaudePlanCard,
+  createClaudeBehaviorScanClaims,
+  mergeClaudePlanUsage,
+} from './plan-usage-claude.mjs';
 import { CLAUDE_CLOUD_PROVIDER_ID, buildClaudeCloudPlanCard } from './plan-usage-claude-cloud.mjs';
 import {
   CURSOR_POOLS,
@@ -361,6 +365,29 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
       toTrimmedString(error),
     );
     return true;
+  }
+
+  // Which Claude worker scans the transcripts next: relay-wide, in memory.
+  const claudeBehaviorScanClaims = createClaudeBehaviorScanClaims({ now: () => now() });
+
+  /**
+   * Store a Claude worker's plan usage report, merged with the stored
+   * snapshot (mergeClaudePlanUsage keeps what the report could not read).
+   * `behaviorsDue` is true when this worker, and no other, should run the
+   * slow transcript scan now.
+   */
+  function saveClaudeReport(provider, usage, { error = null } = {}) {
+    const key = toTrimmedString(provider);
+    if (!key || !usage) return { snapshot: null, behaviorsDue: false };
+    const previous = readSnapshot(key);
+    const snapshot = mergeClaudePlanUsage(previous?.payload || null, usage, {
+      now: now(),
+      previousCapturedAt: previous?.capturedAt || null,
+    });
+    saveSnapshot(key, snapshot, { source: 'worker', error });
+    const behaviorsDue = key === 'claude'
+      && claudeBehaviorScanClaims.due(key, snapshot, { reportedBehaviors: !!usage.behaviors });
+    return { snapshot, behaviorsDue };
   }
 
   function readSnapshot(provider) {
@@ -852,6 +879,9 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
     grokConfigured = false,
     grokAllowances = null,
     grokBilling = null,
+    // Why the live Grok quota read had no figure ({ reason, httpStatus, keys,
+    // checkedAt } from grok-billing-usage.mjs), or null.
+    grokBillingFailure = null,
     deepseekConfigured = false,
     // The balance service's answer (deepseek-balance-service.mjs), or null.
     deepseekBalance = null,
@@ -906,6 +936,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         // account usage, where there is any, takes the meters over.
         stale: !!claudeSnapshot?.payload,
         account: claudeAccount,
+        now: now(),
       }),
       // Opt-in like Grok (no card while the provider is off), and placed next
       // to the Claude card because both are the same account.
@@ -940,6 +971,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
         allowances: grokSettings,
         cycle: grokCycle.cycle,
         billing: grokBilling,
+        billingFailure: grokBillingFailure,
         capturedAt: grokSnapshot?.capturedAt || grokCycle.capturedAt || null,
         configured: true,
         message: grokSnapshot?.error || null,
@@ -989,6 +1021,7 @@ export function createPlanUsageService({ db, now = () => new Date(), dbg = () =>
   return {
     saveSnapshot,
     readSnapshot,
+    saveClaudeReport,
     recordCursorUsageReport,
     readCursorCycleTotals,
     resetCursorAccounting,

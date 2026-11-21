@@ -564,6 +564,9 @@ export function buildSessionWorkerStatusPayload({
   // The worker recycle's status() (stale count, recycles in flight and done,
   // who waits on what), or null while the recycle is not wired.
   recycleStatus = null,
+  // Epoch ms, for a worker's age: one without a build id reads stale only
+  // once its entry is past the recycle's grace (isWorkerOnOtherBuild).
+  now = Date.now(),
 } = {}) {
   const snapshot = supervisorSnapshot && typeof supervisorSnapshot === 'object'
     ? supervisorSnapshot
@@ -575,7 +578,7 @@ export function buildSessionWorkerStatusPayload({
         ...worker,
         buildId: typeof worker.buildId === 'string' && worker.buildId ? worker.buildId : null,
         startedAt: worker.startedAt || null,
-        stale: isWorkerOnOtherBuild(worker, relayBuild),
+        stale: isWorkerOnOtherBuild(worker, relayBuild, { now }),
       }
       : worker
   ));

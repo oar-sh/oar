@@ -185,6 +185,10 @@ export function normalizeClaudePlanUsage(raw) {
     extraUsage,
     session,
     behaviors: behaviors && (behaviors.day || behaviors.week) ? behaviors : null,
+    // The CLI leaves `model_scoped` out when it knows nothing about those
+    // windows (an answer served from cached data or from response headers);
+    // only a listed array, even an empty one, is the endpoint's own word.
+    ...(rawLimits && Array.isArray(rawLimits.model_scoped) ? { modelScopedReported: true } : {}),
   };
   const hasSignal = payload.windows.length
     || payload.extraUsage
@@ -271,6 +275,9 @@ export function claudePlanUsageFromResult({ modelUsage = null, totalCostUsd = nu
   return {
     subscriptionType: null,
     rateLimitsAvailable: false,
+    // The usage request failed or timed out: nothing is known about the
+    // login, which is not the same as a login without plan limits.
+    rateLimitsUnknown: true,
     windows: [],
     extraUsage: null,
     session: {
@@ -283,6 +290,138 @@ export function claudePlanUsageFromResult({ modelUsage = null, totalCostUsd = nu
     },
     behaviors: null,
   };
+}
+
+function windowStillRuns(window, nowMs) {
+  if (!window || typeof window !== 'object' || !toTrimmedString(window.id)) return false;
+  const resetsAt = toIsoTimestamp(window.resetsAt);
+  // A window past its reset would show the old figure for a fresh window.
+  return !resetsAt || Date.parse(resetsAt) > nowMs;
+}
+
+/** A window may be kept from an earlier reading only while its reset is known and ahead. */
+function windowCarriable(window, nowMs) {
+  return windowStillRuns(window, nowMs) && !!toIsoTimestamp(window.resetsAt);
+}
+
+// How long a transcript scan's `behaviors` are kept when later reports
+// bring none (the relay asks for a new scan every half hour).
+export const CLAUDE_BEHAVIORS_KEEP_MS = 60 * 60_000;
+
+function toMs(value) {
+  const ms = value instanceof Date ? value.getTime() : Number(value);
+  return Number.isFinite(ms) ? ms : Date.now();
+}
+
+/**
+ * The snapshot a Claude report leaves behind, given the one stored before.
+ *
+ * Every Claude turn reports, and not every report knows the plan windows: a
+ * usage request that failed or timed out brings only the session cost
+ * (`rateLimitsUnknown`), and an answer the CLI served from cached data or
+ * response headers leaves out the model-scoped weekly windows (Fable) and
+ * sometimes the weekly one. Such a report must not wipe the bars the turn
+ * before read. So the session figures always come from `next`, and a window
+ * `next` does not carry is kept from `previous` while its known reset is
+ * ahead, but only when `next` is a timeout fallback or a plan answer of the
+ * same subscription type, and not the endpoint's full answer (it listed
+ * `model_scoped`). Any other answer (no plan limits, no profile scope,
+ * another subscription) replaces the bars as it is.
+ * Kept windows keep the time they were read (`readAt`) and are marked
+ * `carried`; `windowsCarried` counts them. A report without `behaviors`
+ * keeps the stored ones for an hour after their scan (`behaviorsAt`), unless
+ * the subscription type changed.
+ */
+export function mergeClaudePlanUsage(previous, next, { now = Date.now(), previousCapturedAt = null } = {}) {
+  if (!next || typeof next !== 'object') return next || null;
+  const nowMs = toMs(now);
+  const readAt = new Date(nowMs).toISOString();
+  const nextWindows = (Array.isArray(next.windows) ? next.windows : [])
+    .map(({ carried: _carried, ...window }) => ({ ...window, readAt }));
+  const merged = { ...next, windows: nextWindows };
+  delete merged.windowsCarried;
+  delete merged.behaviorsAt;
+  if (merged.behaviors) merged.behaviorsAt = readAt;
+  if (!previous || typeof previous !== 'object') return merged;
+
+  const unknown = next.rateLimitsUnknown === true;
+  const nextType = toTrimmedString(next.subscriptionType);
+  const previousType = toTrimmedString(previous.subscriptionType);
+  const sameType = nextType === previousType;
+  const previousReadAt = toIsoTimestamp(previousCapturedAt);
+
+  const behaviorsAt = toIsoTimestamp(previous.behaviorsAt) || previousReadAt;
+  if (!merged.behaviors && previous.behaviors && (unknown || sameType)
+    && behaviorsAt && nowMs - Date.parse(behaviorsAt) < CLAUDE_BEHAVIORS_KEEP_MS) {
+    merged.behaviors = previous.behaviors;
+    merged.behaviorsAt = behaviorsAt;
+  }
+
+  // The answer names no account: two accounts of the same type look alike.
+  const sameLogin = next.rateLimitsAvailable === true && sameType;
+  if (next.modelScopedReported === true || !(unknown || sameLogin)) return merged;
+
+  const present = new Set(nextWindows.map((window) => window.id));
+  const carried = (Array.isArray(previous.windows) ? previous.windows : [])
+    .filter((window) => windowCarriable(window, nowMs) && !present.has(window.id))
+    .map((window) => ({ ...window, readAt: toIsoTimestamp(window.readAt) || previousReadAt, carried: true }));
+  if (!carried.length) return merged;
+
+  const rank = (window) => {
+    const index = WINDOW_LABELS.findIndex(([key]) => key === window.id);
+    return index === -1 ? WINDOW_LABELS.length : index;
+  };
+  merged.windows = [...nextWindows, ...carried].sort((a, b) => rank(a) - rank(b));
+  merged.windowsCarried = carried.length;
+  merged.rateLimitsAvailable = next.rateLimitsAvailable === true || previous.rateLimitsAvailable === true;
+  if (!merged.subscriptionType) merged.subscriptionType = previousType;
+  if (!merged.extraUsage && previous.extraUsage) merged.extraUsage = previous.extraUsage;
+  return merged;
+}
+
+// The transcript scan behind `behaviors` takes many seconds, so the relay
+// asks for one at most every half hour, of one worker at a time. A claim
+// lapses after the same half hour: a scan that failed or found nothing is
+// not asked for again sooner.
+export const CLAUDE_BEHAVIORS_EVERY_MS = 30 * 60_000;
+
+/**
+ * Which worker scans the transcripts, relay-wide. `due(provider, snapshot,
+ * { reportedBehaviors })` is asked after each report is stored: true hands
+ * the scan to that worker (and records the claim), false to all others while
+ * the stored behaviors are recent or a claim is open (it lapses after
+ * `everyMs`). A report with behaviors frees the claim. Only a plan login is
+ * asked to scan: the CLI has no behaviors for any other.
+ */
+export function createClaudeBehaviorScanClaims({
+  everyMs = CLAUDE_BEHAVIORS_EVERY_MS,
+  now = Date.now,
+} = {}) {
+  const claims = new Map();
+  function due(provider, snapshot, { reportedBehaviors = false } = {}) {
+    const key = toTrimmedString(provider);
+    if (!key || !snapshot || typeof snapshot !== 'object') return false;
+    if (reportedBehaviors) claims.delete(key);
+    if (snapshot.rateLimitsAvailable !== true && !toTrimmedString(snapshot.subscriptionType)) return false;
+    const nowMs = toMs(now());
+    const scannedAt = Date.parse(toIsoTimestamp(snapshot.behaviorsAt) || '');
+    if (Number.isFinite(scannedAt) && nowMs - scannedAt < everyMs) return false;
+    const claimedAt = claims.get(key);
+    if (claimedAt !== undefined && nowMs - claimedAt < everyMs) return false;
+    claims.set(key, nowMs);
+    return true;
+  }
+  return { due };
+}
+
+/** "25 min", "3 h 5 min", "2 d 4 h": how long ago, in plain words. */
+function formatAge(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`;
+  const days = Math.floor(hours / 24);
+  return hours % 24 ? `${days} d ${hours % 24} h` : `${days} d`;
 }
 
 function formatDuration(ms) {
@@ -435,7 +574,9 @@ export function buildClaudePlanCard({
   configured = true,
   message = null,
   account = null,
+  now = Date.now(),
 } = {}) {
+  const nowMs = toMs(now);
   if (!configured) {
     return buildUnavailableCard({
       provider: CLAUDE_PROVIDER_ID,
@@ -460,7 +601,10 @@ export function buildClaudePlanCard({
   }
 
   const meters = [];
-  const windows = hasLive ? live.windows : (Array.isArray(usage.windows) ? usage.windows : []);
+  // A window past its reset is not drawn: its figure belongs to the window
+  // before (a kept bar of an earlier turn goes when its window resets).
+  const windows = (hasLive ? live.windows : (Array.isArray(usage.windows) ? usage.windows : []))
+    .filter((window) => windowStillRuns(window, nowMs));
   for (const window of windows) {
     meters.push(buildMeter({
       id: `claude-${window.id}`,
@@ -516,16 +660,43 @@ export function buildClaudePlanCard({
       text: 'Limit resets (full / 5-hour) are shown on claude.ai only.',
       link: { label: 'Open the usage page', url: CLAUDE_USAGE_URL },
     });
-  } else if (toTrimmedString(account?.error)) {
-    notes.push({
-      id: 'claude-live-unavailable',
-      text: `Live account usage could not be read, so this is the reading of the last Claude turn. ${toTrimmedString(account.error)}`,
-    });
+  } else {
+    if (toTrimmedString(account?.error)) {
+      notes.push({
+        id: 'claude-live-unavailable',
+        text: `Live account usage could not be read, so this is the reading of the last Claude turn. ${toTrimmedString(account.error)}`,
+      });
+    }
+    const carriedReads = windows
+      .filter((window) => window.carried === true)
+      .map((window) => Date.parse(toIsoTimestamp(window.readAt) || ''))
+      .filter(Number.isFinite);
+    if (carriedReads.length) {
+      const age = formatAge(nowMs - Math.min(...carriedReads));
+      notes.push({
+        id: 'claude-windows-carried',
+        text: carriedReads.length === 1
+          ? `The last Claude turn did not report every plan limit; one bar is from a turn ${age} ago.`
+          : `The last Claude turn did not report every plan limit; ${carriedReads.length} bars are from turns up to ${age} ago.`,
+      });
+    }
   }
 
   const resolvedMeters = meters.filter(Boolean);
   const planLimitsMissing = !resolvedMeters.length;
   const subscriptionType = toTrimmedString(usage?.subscriptionType);
+  let missingMessage = null;
+  if (planLimitsMissing) {
+    if (hasLive || usage?.rateLimitsAvailable) {
+      missingMessage = 'Plan rate limits were not reported for this session.';
+    } else if (usage?.rateLimitsUnknown) {
+      missingMessage = 'The last Claude turn could not read the plan limits; they show again after a turn that does.';
+    } else if (subscriptionType) {
+      missingMessage = 'The Claude login does not grant access to the plan limits (no profile scope), so only session cost is available.';
+    } else {
+      missingMessage = 'This session authenticates without claude.ai plan limits (API key or third-party provider), so only session cost is available.';
+    }
+  }
   return buildProviderCard({
     provider: CLAUDE_PROVIDER_ID,
     label: CLAUDE_LABEL,
@@ -533,11 +704,7 @@ export function buildClaudePlanCard({
     planName: subscriptionType
       ? `${subscriptionType.charAt(0).toUpperCase()}${subscriptionType.slice(1)}`
       : null,
-    message: planLimitsMissing
-      ? (hasLive || usage?.rateLimitsAvailable
-        ? 'Plan rate limits were not reported for this session.'
-        : 'This session authenticates without claude.ai plan limits (API key or third-party provider), so only session cost is available.')
-      : null,
+    message: missingMessage,
     source: hasLive ? SOURCE_LIVE : (stale ? SOURCE_CACHE : SOURCE_WORKER),
     stale: hasLive ? false : stale,
     capturedAt: hasLive ? (toIsoTimestamp(account?.fetchedAt) || capturedAt) : capturedAt,

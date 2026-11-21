@@ -141,11 +141,19 @@ test('the session-worker status payload names each worker\'s build, its start an
       workers: [
         statusWorker('same', { buildId: RELAY_BUILD, startedAt: '2026-10-30T21:00:00.000Z' }),
         statusWorker('old', { buildId: OLD_BUILD, startedAt: '2026-10-29T08:00:00.000Z' }),
-        statusWorker('silent'),
+        // Never states a build id, heartbeats, past the grace: older code.
+        statusWorker('silent', { startedAt: '2026-10-30T20:00:00.000Z', lastHeartbeatAt: '2026-10-30T21:59:00.000Z' }),
+        // Started seconds ago and has not stated its id yet: not known stale.
+        statusWorker('fresh', { startedAt: '2026-10-30T21:59:55.000Z', lastHeartbeatAt: '2026-10-30T21:59:58.000Z' }),
+        // Past the grace but no heartbeat seen: not known stale.
+        statusWorker('mute', { startedAt: '2026-10-30T20:00:00.000Z' }),
+        // A stopped entry without an id is never stale.
+        statusWorker('stopped', { status: 'stopped', startedAt: '2026-10-30T20:00:00.000Z', lastHeartbeatAt: '2026-10-30T21:00:00.000Z' }),
       ],
     },
     relayBuildId: RELAY_BUILD,
     recycleStatus: recycle,
+    now: Date.parse('2026-10-30T22:00:00.000Z'),
   });
   assert.equal(payload.buildId, RELAY_BUILD);
   assert.deepEqual(payload.recycle, recycle);
@@ -154,7 +162,10 @@ test('the session-worker status payload names each worker\'s build, its start an
     [
       { sdkSessionId: 'same', buildId: RELAY_BUILD, startedAt: '2026-10-30T21:00:00.000Z', stale: false },
       { sdkSessionId: 'old', buildId: OLD_BUILD, startedAt: '2026-10-29T08:00:00.000Z', stale: true },
-      { sdkSessionId: 'silent', buildId: null, startedAt: null, stale: true },
+      { sdkSessionId: 'silent', buildId: null, startedAt: '2026-10-30T20:00:00.000Z', stale: true },
+      { sdkSessionId: 'fresh', buildId: null, startedAt: '2026-10-30T21:59:55.000Z', stale: false },
+      { sdkSessionId: 'mute', buildId: null, startedAt: '2026-10-30T20:00:00.000Z', stale: false },
+      { sdkSessionId: 'stopped', buildId: null, startedAt: '2026-10-30T20:00:00.000Z', stale: false },
     ],
   );
   assert.equal(payload.workers[0].kind, 'claude', 'the registry fields still pass through');

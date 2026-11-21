@@ -31,7 +31,7 @@ test('the definition is the contract tool, approved by the relay rather than the
   assert.equal(typeof tool.handler, 'function');
 });
 
-test('the handler forwards through runCall and answers with pretty JSON text', async () => {
+test('the handler forwards through runCall and answers with compact JSON text', async () => {
   const calls = [];
   const reply = { ok: true, status: 'queued', relay: 'linux-test', session: 's-1', message_id: 'm-1' };
   const wrapped = [];

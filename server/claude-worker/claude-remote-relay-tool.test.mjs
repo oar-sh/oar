@@ -290,7 +290,7 @@ test('the zod mirror takes repo and branch, and the handler sends a cloud create
   assert.equal(stub.calls.length, 1, 'repo with another provider never reaches the relay');
 });
 
-test('the handler forwards the call with the live conversation id and returns pretty JSON text', async () => {
+test('the handler forwards the call with the live conversation id and returns compact JSON text', async () => {
   const reply = { ok: true, relays: [{ name: 'linux-test', unlocked: false }], summary: 'list_relays' };
   const stub = recordingApi(reply);
   let conversationId = 'conv-1';
@@ -309,7 +309,7 @@ test('the handler forwards the call with the live conversation id and returns pr
   assert.equal(first.content.length, 1);
   assert.equal(first.content[0].type, 'text');
   assert.deepEqual(JSON.parse(first.content[0].text), reply);
-  assert.match(first.content[0].text, /\n {2}"ok": true/, 'pretty-printed');
+  assert.equal(first.content[0].text.includes('\n'), false, 'compact, on one line');
   assert.equal(first.isError, undefined, 'a result is never flagged as a failed tool call');
 });
 

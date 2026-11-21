@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import nodePath from 'node:path';
-import { createGrokTurnRunner } from './grok-turn-runner.mjs';
+import { createGrokTurnRunner, grokOarToolNamesNote } from './grok-turn-runner.mjs';
 import { PLAN_BOARD_ACTIONS } from '../../shared/plan-board-actions.mjs';
 import { classifyGrokError } from './grok-sdk-adapter.mjs';
 import { createPreviewInstructionsProvider } from '../../shared/preview-instructions.mjs';
-import { PREVIEW_TOOL_DESCRIPTION } from '../../shared/preview-tool-core.mjs';
+import { PREVIEW_TOOL_DESCRIPTION, PREVIEW_TOOL_NAME } from '../../shared/preview-tool-core.mjs';
+import { REMOTE_RELAY_TOOL_NAME } from '../../shared/remote-relay-tool-core.mjs';
 
 function createMockApi() {
   const calls = [];
@@ -691,6 +692,97 @@ test('with the MCP server wired in, the preview instruction block is neither loo
   assert.match(turnOptions[0].text, /^## Embedding media in replies[\s\S]*show me the app$/);
   assert.equal(api.calls.some((call) => call.path === '/api/previews'), false);
   await runner.dispose();
+});
+
+test('with the MCP server wired in, the first prompt names the qualified tool names once', async () => {
+  const note = grokOarToolNamesNote();
+  assert.ok(note.includes(`\`oar__${PREVIEW_TOOL_NAME}\``));
+  assert.ok(note.includes(`\`oar__${REMOTE_RELAY_TOOL_NAME}\``));
+
+  const { runner, turnOptions } = createMcpRunner({ remoteRelayToolOfferedImpl: async () => true });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-q1', conversationId: 'conv-mcp', text: 'first', relayMode: 'agent' },
+  });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-q2', conversationId: 'conv-mcp', text: 'second', relayMode: 'agent' },
+  });
+  assert.ok(turnOptions[0].text.includes(note));
+  assert.ok(turnOptions[0].text.endsWith('first'));
+  assert.equal(turnOptions[1].text, 'second', 'not repeated on the second prompt');
+  await runner.dispose();
+
+  const off = createMcpRunner({ env: { OAR_MCP_SERVER: '0' } });
+  await off.runner.handlePendingPayload({
+    message: { id: 'msg-q3', conversationId: 'conv-mcp', text: 'first', relayMode: 'agent' },
+  });
+  assert.equal(off.turnOptions[0].text.includes(`oar__${PREVIEW_TOOL_NAME}`), false, 'absent without the server');
+  await off.runner.dispose();
+});
+
+test('the tool-names note leaves the relay tool out when the relay does not offer it', async () => {
+  const previewOnly = grokOarToolNamesNote(undefined, { relayTool: false });
+  assert.ok(previewOnly.includes(`\`oar__${PREVIEW_TOOL_NAME}\``));
+  assert.equal(previewOnly.includes(REMOTE_RELAY_TOOL_NAME), false);
+
+  let asked = 0;
+  const { runner, turnOptions } = createMcpRunner({
+    remoteRelayToolOfferedImpl: async () => { asked += 1; return false; },
+  });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-r1', conversationId: 'conv-mcp', text: 'first', relayMode: 'agent' },
+  });
+  await runner.handlePendingPayload({
+    message: { id: 'msg-r2', conversationId: 'conv-mcp', text: 'second', relayMode: 'agent' },
+  });
+  assert.ok(turnOptions[0].text.includes(previewOnly));
+  assert.equal(turnOptions[0].text.includes(`oar__${REMOTE_RELAY_TOOL_NAME}`), false);
+  assert.equal(turnOptions[1].text, 'second', 'a definite answer sends the note once');
+  assert.equal(asked, 1, 'asked once per worker');
+  await runner.dispose();
+});
+
+test('an unknown answer hedges the note and asks again on the next prompt', async () => {
+  const hedged = grokOarToolNamesNote(undefined, { relayTool: null });
+  assert.ok(hedged.includes(`\`oar__${PREVIEW_TOOL_NAME}\``));
+  assert.ok(hedged.includes(`when it is listed, \`oar__${REMOTE_RELAY_TOOL_NAME}\``));
+  const definite = grokOarToolNamesNote();
+
+  const answers = [null, true];
+  let asked = 0;
+  const { runner, turnOptions } = createMcpRunner({
+    remoteRelayToolOfferedImpl: async () => answers[asked++],
+  });
+  for (const [index, text] of ['first', 'second', 'third'].entries()) {
+    await runner.handlePendingPayload({
+      message: { id: `msg-u${index}`, conversationId: 'conv-mcp', text, relayMode: 'agent' },
+    });
+  }
+  assert.ok(turnOptions[0].text.includes(hedged));
+  assert.ok(turnOptions[1].text.includes(definite), 'asked again, and the note comes once more');
+  assert.equal(turnOptions[1].text.includes('when it is listed'), false);
+  assert.equal(turnOptions[2].text, 'third', 'not repeated after a definite answer');
+  assert.equal(asked, 2, 'not asked after a definite answer');
+  await runner.dispose();
+
+  // A question that throws counts as unknown and costs no turn.
+  let thrown = 0;
+  const failing = createMcpRunner({
+    remoteRelayToolOfferedImpl: async () => { thrown += 1; throw new Error('summary unavailable'); },
+  });
+  for (const [index, text] of ['first', 'second', 'third', 'fourth', 'fifth'].entries()) {
+    await failing.runner.handlePendingPayload({
+      message: { id: `msg-f${index}`, conversationId: 'conv-mcp', text, relayMode: 'agent' },
+    });
+  }
+  assert.ok(failing.turnOptions[0].text.includes(hedged));
+  assert.ok(failing.turnOptions[1].text.includes(hedged));
+  assert.ok(failing.turnOptions[2].text.includes(hedged));
+  // A relay that keeps not answering is asked three times, then the hedged
+  // note stands and prompts go out without the question.
+  assert.equal(failing.turnOptions[3].text, 'fourth');
+  assert.equal(failing.turnOptions[4].text, 'fifth');
+  assert.equal(thrown, 3);
+  await failing.runner.dispose();
 });
 
 test('OAR_MCP_SERVER=0 turns the wiring off and brings the preview block back', async () => {

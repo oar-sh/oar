@@ -45,7 +45,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.31 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.32 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).

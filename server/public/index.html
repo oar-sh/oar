@@ -793,6 +793,36 @@
     cursor: pointer;
   }
   .conv-active-empty-off:hover { border-color: var(--accent); }
+  /* The 🔥 window slider, under the filter row while 🔥 applies. */
+  #conv-active-window-row {
+    display: flex;
+    align-items: center;
+    gap: calc(6px * var(--ui-scale));
+    height: calc(28px * var(--ui-scale));
+    margin-top: calc(-3px * var(--ui-scale));
+    padding: 0 calc(10px * var(--ui-scale));
+    color: var(--muted);
+    font-size: var(--fs-meta-sm);
+  }
+  /* The display rule above outranks the UA [hidden] rule. */
+  #conv-active-window-row[hidden] { display: none; }
+  #conv-active-window {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: calc(20px * var(--ui-scale));
+    margin: 0;
+    accent-color: var(--accent);
+    background: transparent;
+    cursor: pointer;
+  }
+  #conv-active-window:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #conv-active-window-label {
+    flex: 0 0 auto;
+    min-width: 13ch;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
   #conv-filter-input {
     flex: 1 1 0;
     min-width: 0;
@@ -983,8 +1013,10 @@
   body.media-view-active #input-area { display: none; }
   body.media-view-active #pending-question-banner { display: none; }
   .inbox-view { display: grid; gap: calc(7px * var(--ui-scale)); padding: calc(4px * var(--ui-scale)) 0 calc(12px * var(--ui-scale)); }
-  .inbox-filter { display: flex; gap: calc(3px * var(--ui-scale)); flex-wrap: wrap; }
-  .inbox-filter-option {
+  .inbox-filter { display: flex; gap: calc(3px * var(--ui-scale)); flex-wrap: wrap; align-items: center; }
+  .inbox-filter-who { display: flex; gap: calc(3px * var(--ui-scale)); flex-wrap: wrap; }
+  .inbox-filter-option, .inbox-filter-chip {
+    min-height: calc(28px * var(--ui-scale));
     padding: calc(3px * var(--ui-scale)) calc(7px * var(--ui-scale));
     border: 1px solid var(--border);
     border-radius: 999px;
@@ -993,9 +1025,81 @@
     cursor: pointer;
     font-size: var(--fs-meta-sm);
   }
-  .inbox-filter-option.active { border-color: var(--accent); color: var(--accent); }
-  .inbox-relay { display: grid; gap: calc(5px * var(--ui-scale)); }
-  .inbox-relay-name { margin: calc(3px * var(--ui-scale)) 0 0; font-size: var(--fs-meta-md); color: var(--muted); font-weight: 600; }
+  .inbox-filter-option.active, .inbox-filter-chip.active { border-color: var(--accent); color: var(--accent); }
+  .inbox-filter-chip:focus-visible, .inbox-section-fold:focus-visible, .inbox-item-fold:focus-visible,
+  .inbox-item-unfold:focus-visible, .inbox-fold-all:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Groups ▾: a checklist dropped under its chip. */
+  .inbox-groups-picker { position: relative; }
+  .inbox-groups-picker > summary { display: inline-flex; align-items: center; list-style: none; user-select: none; }
+  .inbox-groups-picker > summary::-webkit-details-marker { display: none; }
+  .inbox-groups-popover {
+    position: absolute; z-index: 20; top: calc(100% + calc(4px * var(--ui-scale))); left: 0;
+    display: grid; gap: calc(2px * var(--ui-scale)); min-width: calc(200px * var(--ui-scale)); max-width: min(calc(360px * var(--ui-scale)), 80vw);
+    max-height: 50vh; overflow-y: auto; padding: calc(5px * var(--ui-scale));
+    background: var(--bg2); border: 1px solid var(--border); border-radius: calc(8px * var(--ui-scale));
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25); font-size: var(--fs-meta-sm);
+  }
+  .inbox-groups-choice {
+    display: flex; align-items: center; gap: calc(6px * var(--ui-scale)); min-height: calc(28px * var(--ui-scale));
+    cursor: pointer; overflow-wrap: anywhere;
+  }
+  .inbox-groups-choice.is-no-group { color: var(--muted); }
+  .inbox-groups-hint { margin: calc(2px * var(--ui-scale)) 0 0; color: var(--muted); font-size: var(--fs-meta-xs); }
+  /* ➖ / ➕ for every card, as the sidebar's fold-all; right-aligned in the bar. */
+  .inbox-fold-all {
+    margin-left: auto; width: calc(28px * var(--ui-scale)); height: calc(28px * var(--ui-scale));
+    display: inline-flex; align-items: center; justify-content: center; padding: 0;
+    border: 1px solid transparent; border-radius: calc(6px * var(--ui-scale)); background: transparent;
+    color: var(--muted); cursor: pointer; font-size: 1.05rem; line-height: 1;
+  }
+  .inbox-fold-all:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
+  .inbox-fold-all:disabled { opacity: 0.4; cursor: default; }
+  .inbox-relay, .inbox-group { display: grid; gap: calc(5px * var(--ui-scale)); }
+  .inbox-section-heading {
+    display: flex; align-items: center; flex-wrap: wrap; gap: calc(6px * var(--ui-scale));
+    margin: calc(3px * var(--ui-scale)) 0 0; font-size: var(--fs-meta-md); color: var(--muted); font-weight: 600;
+  }
+  .inbox-group-heading { font-size: var(--fs-meta-sm); margin: 0; padding-left: calc(6px * var(--ui-scale)); }
+  .inbox-section-count { font-weight: 400; font-size: var(--fs-meta-xs); }
+  .inbox-section-fold {
+    display: inline-flex; align-items: center; gap: calc(4px * var(--ui-scale)); min-height: calc(28px * var(--ui-scale));
+    padding: 0 calc(4px * var(--ui-scale)) 0 0; border: 0; border-radius: calc(6px * var(--ui-scale));
+    background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  }
+  .inbox-section-fold:hover { color: var(--text); }
+  /* One chevron, as the sidebar's groups: › folded, turned down open. */
+  .inbox-fold-chevron {
+    display: inline-flex; align-items: center; justify-content: center; width: calc(14px * var(--ui-scale));
+    font-size: 1.25em; line-height: 1; font-weight: 600; transform-origin: 50% 55%;
+  }
+  [aria-expanded="true"] > .inbox-fold-chevron { transform: rotate(90deg); }
+  .inbox-section-fold, .inbox-item-fold, .inbox-item-unfold { -webkit-tap-highlight-color: transparent; }
+  .inbox-item-fold {
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
+    width: calc(20px * var(--ui-scale)); height: calc(20px * var(--ui-scale)); margin: 0; padding: 0;
+    border: 0; border-radius: calc(6px * var(--ui-scale)); background: transparent; color: var(--muted);
+    font: inherit; font-size: var(--fs-meta-md); line-height: 1; cursor: pointer; align-self: center;
+  }
+  /* The 28px target around the small chevron. */
+  .inbox-item-fold::before {
+    content: ''; position: absolute; left: 50%; top: 50%;
+    width: calc(28px * var(--ui-scale)); height: calc(28px * var(--ui-scale)); transform: translate(-50%, -50%);
+  }
+  .inbox-item-fold:hover { background: var(--bg3); color: var(--text); }
+  /* A card folded to one line: the whole row unfolds it. */
+  .inbox-item.is-folded { padding: 0; }
+  .inbox-item-unfold {
+    display: flex; align-items: center; gap: calc(4px * var(--ui-scale)); min-width: 0; width: 100%;
+    min-height: calc(28px * var(--ui-scale)); padding: calc(2px * var(--ui-scale)) calc(8px * var(--ui-scale));
+    border: 0; border-radius: inherit; background: transparent; color: var(--muted); font: inherit;
+    font-size: var(--fs-meta-xs); text-align: left; cursor: pointer; white-space: nowrap; overflow: hidden;
+  }
+  .inbox-item-unfold:hover { color: var(--text); }
+  .inbox-item-unfold > .inbox-fold-chevron { flex: none; color: var(--muted); }
+  .inbox-fold-part { flex: none; }
+  .inbox-fold-part + .inbox-fold-part::before { content: '·'; margin-right: calc(4px * var(--ui-scale)); color: var(--muted); font-weight: 400; }
+  .inbox-item-unfold > .inbox-item-line { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: var(--fs-meta-sm); }
+  .inbox-item-unfold > .inbox-item-line-session { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .inbox-relay-unreachable, .inbox-empty { margin: 0; color: var(--muted); font-size: var(--fs-meta-sm); }
   .inbox-divider {
     margin-top: calc(3px * var(--ui-scale));
@@ -5538,6 +5642,8 @@
     display: flex; align-items: center; justify-content: space-between; gap: calc(6px * var(--ui-scale));
     font-size: var(--fs-meta-md); font-weight: 600; padding: 0 0 calc(4px * var(--ui-scale));
   }
+  .questions-panel-tools { display: inline-flex; align-items: center; gap: calc(4px * var(--ui-scale)); margin-left: auto; font-weight: 400; }
+  .questions-panel-tools .inbox-fold-all { margin-left: 0; }
   .questions-panel-close {
     min-width: calc(28px * var(--ui-scale)); min-height: calc(28px * var(--ui-scale));
     font: inherit; color: var(--muted); background: transparent; border: 1px solid var(--border);
@@ -8041,6 +8147,8 @@
     #new-conv-btn { padding: calc(5px * var(--ui-scale)) calc(7px * var(--ui-scale)); border-radius: calc(8px * var(--ui-scale)); font-size: var(--fs-meta-md); }
     #status-btn { min-width: calc(72px * var(--ui-scale)); padding: calc(5px * var(--ui-scale)) calc(6px * var(--ui-scale)); font-size: var(--fs-meta-md); }
     #conv-filter-row { padding: calc(4px * var(--ui-scale)) calc(7px * var(--ui-scale)); }
+    #conv-active-window-row { padding: 0 calc(7px * var(--ui-scale)); margin-top: calc(-2px * var(--ui-scale)); }
+    #conv-active-window { height: calc(28px * var(--ui-scale)); }
     #conv-filter-clear { right: calc(16px * var(--ui-scale)); }
     #conv-groups-fold-all { right: calc(42px * var(--ui-scale)); }
     #conv-archived-toggle { right: calc(68px * var(--ui-scale)); }
@@ -8804,6 +8912,10 @@
       <button id="conv-archived-toggle" type="button" title="Show archived conversations" aria-label="Show archived conversations" aria-pressed="false" onclick="toggleArchivedConversations()">🗄️</button>
       <button id="conv-groups-fold-all" type="button" title="Fold all groups" aria-label="Fold all groups" onclick="toggleAllConversationGroupFolds(event)" hidden>➖</button>
       <div id="conv-filter-status" role="status" aria-live="polite"></div>
+    </div>
+    <div id="conv-active-window-row" hidden>
+      <input id="conv-active-window" type="range" min="0" max="11" step="1" value="2" aria-label="Active sessions window" aria-valuetext="Active in the last 5 min">
+      <output id="conv-active-window-label" for="conv-active-window">Active in the last 5 min</output>
     </div>
     <div id="conv-archived-banner" hidden>Archived conversations <button type="button" class="conv-archived-back" onclick="toggleArchivedConversations()">Back to the list</button></div>
     <div id="conv-list"></div>
@@ -10429,6 +10541,21 @@
         data-settings-panel="previews"
         hidden
       >
+        <div class="settings-row settings-row-column settings-gap">
+          <label for="preview-max-live-slider">Maximum live previews <span id="preview-max-live-value">8</span></label>
+          <input
+            id="preview-max-live-slider"
+            type="range"
+            min="0"
+            max="128"
+            step="1"
+            value="8"
+            aria-label="Maximum number of live previews"
+            oninput="previewPreviewMaxLiveSetting(this.value)"
+            onchange="updatePreviewMaxLiveSetting(this.value)"
+          >
+        </div>
+        <div class="settings-help settings-gap-xs">How many previews may be live at once. Lowering it closes none: new ones are refused until fewer are live. Set to 0 for no new previews. A setting of this relay.</div>
         <div id="previews-settings-section" class="settings-row settings-row-column settings-gap">
           <label>Live previews</label>
           <div id="settings-previews-list"></div>
