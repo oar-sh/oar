@@ -112,7 +112,7 @@ test('an open question card holds steering; a delivery is handed back steering-h
   assert.deepEqual(readiness, [false, true]);
 
   // The runtime blocks in the ask_user handler.
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] });
   await waitFor(() => runner.isDeliveryHeld() === true, { label: 'card holds' });
   assert.equal(runner.steeringState().holdReason, 'question');
   assert.deepEqual(readiness, [false, true, false], 'the hold withdrew readiness at once');
@@ -147,7 +147,7 @@ test('against a relay without the hand-back, a held delivery is pushed the legac
     scripts: [(id) => [userMessage(id, 'steering', 'also X'), assistantText('m2', 'and X'), { type: 'assistant.idle', data: {} }]],
     canHandBackHeldDelivery: () => false,
   });
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?' });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?' });
   await waitFor(() => runner.isDeliveryHeld() === true, { label: 'card holds' });
   const second = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', text: 'also X' } });
   await waitFor(() => client.session.sends.length === 2, { label: 'pushed despite the hold' });
@@ -756,7 +756,7 @@ test('a turn holds the release from the delivery on, and so does an open questio
   const card = new Promise((resolve) => { answer = resolve; });
   const questionBridge = makeFakeQuestionBridge({ userInputAnswer: 'staging', onAsk: () => card });
   const live = await openLiveTurn({ questionBridge });
-  const asked = live.client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] });
+  const asked = live.client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] });
   await waitFor(() => live.runner.steeringState().releaseHold === 'question', { label: 'card holds the release' });
   assert.equal(live.runner.steeringState().releasable, false);
   answer();

@@ -60,7 +60,8 @@ import {
   startCopilotClient,
 } from './copilot-sdk-adapter.mjs';
 import { buildCopilotMessageOptions } from './copilot-attachments.mjs';
-import { resolveCopilotProviderConfig } from './copilot-byok-provider.mjs';
+import { byokRebuildReason, resolveByokSession, resolveCopilotProviderConfig } from './copilot-byok-provider.mjs';
+import { assertSupportedCopilotSdk, copilotSessionOptions } from '../copilot-sdk-runtime.mjs';
 import {
   createBackgroundShellTracker,
   createReplayGate,
@@ -380,8 +381,8 @@ export function createCopilotSdkSessionRunner({
   checkWorkingDirectoryImpl = missingWorkingDirectoryError,
   createNormalizerImpl = createCopilotEventNormalizer,
   buildMessageOptionsImpl = buildCopilotMessageOptions,
-  // BYOK: `COPILOT_PROVIDER_*` in this worker's env become
-  // `SessionConfig.provider`. Injected so tests can drive the branch without
+  // BYOK: `COPILOT_PROVIDER_*` in this worker's env become the session's
+  // `inference.providers`. Injected so tests can drive the branch without
   // mutating process.env.
   resolveProviderConfigImpl = resolveCopilotProviderConfig,
   // Threading seam for `MessageOptions.mode` ("enqueue" | "immediate").
@@ -721,13 +722,11 @@ export function createCopilotSdkSessionRunner({
   // next session picks up a remote paired in the meantime.
   const remoteRelayGate = remoteRelayToolGate || createRemoteRelayToolGate({ api });
   void remoteRelayGate.refresh();
-  // The `SessionConfig.provider` block this session was BUILT with, or null for
-  // a hosted (`github`) session. Set by `buildSessionConfig` rather than by a
-  // second throwaway resolve here, so "is this BYOK?" and "what did the runtime
-  // actually get?" can never disagree — which matters because the block's token
-  // ceilings are model-specific and the session is rebuilt when the model
-  // changes.
+  // The BYOK provider block and model this session was BUILT with (null and ''
+  // for a hosted session), set by `buildSessionConfig` so "is this BYOK?" and
+  // "what did the runtime get?" never disagree. See `resolveByokSession`.
   let byokProvider = null;
+  let byokModel = '';
   // Drops the history a `session.resume` replays through the live callback, so
   // a two-day-old `assistant.message` can never mint a continuation row.
   const replayGate = createReplayGate();
@@ -2456,17 +2455,14 @@ export function createCopilotSdkSessionRunner({
       getSignal: () => activeTurn?.abortController?.signal || null,
       dbg,
     });
-    // BYOK sessions must carry their provider IN the session config: the
-    // runtime's `COPILOT_PROVIDER_*` startup layer does not run for
-    // SDK-created sessions, so without this an OpenAI-provider conversation
-    // would silently run on hosted Copilot models instead. Null for every
-    // hosted (`github`) session, which is the common case.
-    //
-    // The resolved block is remembered: its token ceilings describe THIS model,
-    // and no model-switch RPC can update them (see `applySelection`).
-    const provider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
-    byokProvider = provider;
     const effort = normalizeRelayEffort(reasoningEffort);
+    // BYOK: the provider and the model it was built for are remembered for
+    // `applySelection` (see `resolveByokSession`; nothing for hosted sessions).
+    const byok = resolveByokSession({
+      resolve: resolveProviderConfigImpl, env, model: model || defaultModel, reasoningEffort: effort, dbg,
+    });
+    byokProvider = byok.provider;
+    byokModel = byok.model;
     const tools = relaySessionTools();
     return {
       // The relay session id IS the SDK session id, so the runtime's own state
@@ -2474,14 +2470,7 @@ export function createCopilotSdkSessionRunner({
       // survives worker restarts without a side table.
       sessionId: sdkSessionId,
       ...(model ? { model } : {}),
-      ...(provider ? { provider } : {}),
-      // BYOK only: the rebuilt config is the switch mechanism for these
-      // sessions, so the effort must ride in it or a dispose+resume model
-      // switch silently drops it. Hosted sessions apply effort through the
-      // validated RPC path instead (`SessionConfigBase.reasoningEffort` is
-      // only valid for models that support it, which cannot be checked before
-      // the session exists).
-      ...(provider && effort ? { reasoningEffort: effort } : {}),
+      ...byok.options,
       // Not a default: without this the SDK emits no deltas at all and the
       // transcript only updates when the whole message lands.
       streaming: true,
@@ -2695,7 +2684,10 @@ export function createCopilotSdkSessionRunner({
       let started;
       try {
         started = await startClientImpl({ paths: sdkPaths, cwd, clientName, logLevel, dbg });
+        // An SDK older than 1.0.113 fails the turn with the update hint.
+        assertSupportedCopilotSdk(started.sdk, sdkPaths.version);
       } catch (error) {
+        Promise.resolve().then(() => started?.client?.stop?.()).catch(() => {});
         throw explainLaunchFailure(error, cwd, { check: checkWorkingDirectoryImpl });
       }
       client = started.client;
@@ -2728,30 +2720,27 @@ export function createCopilotSdkSessionRunner({
    * fails the row terminally before the prompt is ever sent. The common path
    * (same model, same effort) costs zero RPCs.
    *
-   * BYOK sessions try the same RPCs first, but only when the freshly resolved
-   * `SessionConfig.provider` block for the target model matches the one the
-   * session was built with: the block carries MODEL-SPECIFIC token ceilings
-   * that no RPC can update (runtime 1.0.82 has no setProvider, and the
-   * registry surface is rejected alongside the singular whole-session
-   * `provider`), so an in-place switch is only sufficient when the ceilings do
-   * not move. A block that differs — or an RPC the runtime rejects — falls
-   * back to the dispose+resume rebuild, which carries the effort in the
-   * rebuilt config. Nothing is lost either way: the relay session id IS the
-   * SDK session id, so the rebuild takes the ordinary resume path.
+   * BYOK sessions try the same RPCs first unless `byokRebuildReason` says the
+   * built session cannot describe the target model; that, or an RPC the
+   * runtime rejects, falls back to the dispose+resume rebuild, which resumes
+   * the same session id with the effort in the rebuilt config.
    */
   async function applySelection(model, effort) {
     if (!byokProvider) {
       await modelSwitch.apply(session, { model, effort, byok: false });
       return session;
     }
-    const nextProvider = resolveProviderConfigImpl({ env, model: model || defaultModel, dbg });
-    const ceilingsMatch = JSON.stringify(nextProvider) === JSON.stringify(byokProvider);
-    if (ceilingsMatch) {
+    const target = model || defaultModel;
+    const reason = byokRebuildReason({
+      built: { provider: byokProvider, model: byokModel },
+      next: { provider: resolveProviderConfigImpl({ env, model: target, dbg }), model: target },
+    });
+    if (!reason) {
       const attempt = await modelSwitch.apply(session, { model, effort, byok: true });
       if (attempt.ok) return session;
       dbg('BYOK model RPC not honoured, rebuilding the session', model, attempt.detail || '');
     } else {
-      dbg('BYOK ceilings differ for the target model; rebuilding the session', model);
+      dbg(`BYOK ${reason}; rebuilding the session`, model);
     }
     return rebuildByokSession(model, effort);
   }
@@ -2759,10 +2748,10 @@ export function createCopilotSdkSessionRunner({
   /**
    * Dispose the BYOK session and rebuild it with freshly resolved ceilings —
    * the switch mechanism of last resort for a session whose
-   * `SessionConfig.provider` is immutable. The rebuilt config carries the
-   * requested model AND effort, and the resumed session is trusted to be on
-   * them by construction (`ProviderConfig.modelId` falls back to
-   * `SessionConfig.model`), so this path never re-enters the RPC attempt —
+   * `inference.providers` and `inference.models` are fixed. The rebuilt config
+   * carries the requested model AND effort, and the resumed session is trusted
+   * to be on them by construction (its `model`, registered in
+   * `inference.models`), so this path never re-enters the RPC attempt —
    * which is also what makes it terminate: RPC refusal → rebuild → done.
    */
   async function rebuildByokSession(model, effort) {
@@ -2830,7 +2819,7 @@ export function createCopilotSdkSessionRunner({
         throw new Error('the Copilot runtime was stopped while its session was opening');
       };
       try {
-        session = adopt(await openSession((cfg) => client.resumeSession(sdkSessionId, cfg), config));
+        session = adopt(await openSession((cfg) => client.resumeSession(sdkSessionId, copilotSessionOptions(cfg)), config));
         resumed = true;
         dbg(`resumed copilot session ${sdkSessionId.slice(0, 8)}`);
       } catch (error) {
@@ -2844,7 +2833,7 @@ export function createCopilotSdkSessionRunner({
           throw error;
         }
         dbg('copilot session state not found, creating', error?.message || String(error));
-        session = adopt(await openSession((cfg) => client.createSession(cfg), config));
+        session = adopt(await openSession((cfg) => client.createSession(copilotSessionOptions(cfg)), config));
         dbg(`created copilot session ${sdkSessionId.slice(0, 8)}`);
       }
       liveTurnTraffic('session-open');
@@ -2863,9 +2852,9 @@ export function createCopilotSdkSessionRunner({
         await modelSwitch.apply(session, { model, effort, byok: false });
       } else {
         // A created session is on `config.model` by construction; a resumed
-        // BYOK session is trusted the same way because `config.model` feeds
-        // `ProviderConfig.modelId` — and an RPC attempt here would recurse
-        // through the rebuild path that just built this config.
+        // BYOK session is trusted the same way because `config.model` is the
+        // one `inference.models` registers — and an RPC attempt here would
+        // recurse through the rebuild path that just built this config.
         modelSwitch.noteApplied(model || '', byokProvider ? effort : null);
         if (!byokProvider) {
           // A hosted CREATE carries no effort in the config (the field is only

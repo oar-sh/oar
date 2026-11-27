@@ -78,21 +78,20 @@ test("a picture from another port of the relay host never gets the session's pro
     await page.waitForLoadState("networkidle");
     expect(await page.evaluate(() => !!window.localStorage.getItem("oar_session_proof")), "the page holds a key").toBe(true);
 
-    const picture = page.locator(`.msg.assistant .msg-bubble img[src="${pictureUrl}"]`).last();
-    await expect(picture).toBeVisible({ timeout: 15_000 });
-    await expect.poll(() => foreign.requests.some((entry) => entry.method === "GET"), { message: "the picture was loaded from the other port" }).toBe(true);
+    // Another port is another origin: the page shows the picture as a link
+    // and never loads it (the app shell's policy allows images from its own
+    // origin only), so the other port gets no request at all, neither the
+    // cookie nor the key.
+    const link = page.locator(`.msg.assistant .msg-bubble a[href="${pictureUrl}"]`).last();
+    await expect(link).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator(`.msg.assistant .msg-bubble img[src="${pictureUrl}"]`)).toHaveCount(0);
 
-    // Open it in the viewer and try to mark it up.
-    await picture.click();
-    await expect(page.locator("#file-preview-modal")).toHaveClass(/visible/);
-    const annotate = page.locator("#file-preview-annotate-btn");
-    // The choice: a picture from another address has no 🖍️ (the editor
-    // would have to fetch it).
-    await expect(annotate).toBeHidden();
-    // Even forced, the editor does not fetch it with the key.
+    // Even forced, the 🖍️ editor does not fetch it (nothing is open in the
+    // viewer, and the policy refuses a connection to another origin).
     await page.evaluate(() => window.openAnnotateEditorForPreview?.());
     await sleep(1_000);
 
+    expect(foreign.requests, "the page sent no request to the other port").toEqual([]);
     expect(foreign.sawProofHeader(), "no request to the other port carried the session's proof key").toBe(false);
   } finally {
     await foreign.close();

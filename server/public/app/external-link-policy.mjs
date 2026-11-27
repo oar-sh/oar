@@ -11,6 +11,25 @@ export function isExternalNavigationHref(rawHref, baseHref) {
   }
 }
 
+// A picture, clip or sound from another origin. The page's Content-Security-
+// Policy (server/services/app-shell-csp.mjs) loads nothing but its own, and a
+// remote address in an agent's reply is a way to send data out in the URL; so
+// such a source is never loaded. The chat (router.js, sanitizePreviewHtml)
+// shows a link in its place and the media gallery a placeholder that links out.
+// Parsed rather than matched on the text, so `//host/x.png` and `/\host/x.png`
+// (both another host) count, and an absolute address of this very origin does not.
+export function isRemotePreviewSource(src, pageOrigin = globalThis.window?.location?.origin) {
+  const value = String(src || '').trim();
+  if (!value || value.startsWith('#')) return false;
+  try {
+    const parsed = new URL(value, pageOrigin);
+    const protocol = String(parsed.protocol || '').toLowerCase();
+    return (protocol === 'http:' || protocol === 'https:') && parsed.origin !== pageOrigin;
+  } catch {
+    return false;
+  }
+}
+
 function isInAppLink(anchor) {
   return anchor.matches('a.workspace-file-link[data-workspace-path]')
     || Boolean(anchor.closest('.file-preview-markdown'));

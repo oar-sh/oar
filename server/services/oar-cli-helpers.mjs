@@ -457,14 +457,26 @@ export function buildServicePath({ nodeBin, envPath = '', homeDir = '' } = {}) {
 
 /**
  * The dependencies whose install scripts OAR needs (they fetch or build a
- * native binary): none. npm 12 runs no install script it was not told to
- * allow, so a package that gains one must be added here and passed to npm
- * again; `npm-install-scripts.test.mjs` holds this list to the lockfile.
+ * native binary): none, and it has to stay none. The self-update installs
+ * with `--ignore-scripts` (selfUpdateInstallArgs), as npm 12 would skip them
+ * anyway, so a shipped dependency that gains an install script would install
+ * without what that script makes and only fail at runtime.
+ * `npm-install-scripts.test.mjs` holds this list to the lockfile and to empty.
  * better-sqlite3 13 has no install script (where it ships no binary, OAR
  * builds it: native-addon-build-service.mjs), and koffi, whose script the
  * list held, is installed on demand on Windows (agent-sdk-store.mjs).
  */
 export const NPM_INSTALL_SCRIPT_PACKAGES = Object.freeze([]);
+
+/**
+ * The args of the self-update's `npm install -g` (the Update button and
+ * `oar update`). `--ignore-scripts`: no dependency of OAR needs one (see
+ * NPM_INSTALL_SCRIPT_PACKAGES), and a newly compromised dependency would
+ * otherwise run its code during the install, as the user the relay runs as.
+ */
+export function selfUpdateInstallArgs({ prefixArgs = [] } = {}, spec) {
+  return ['install', '-g', '--ignore-scripts', ...prefixArgs, String(spec)];
+}
 
 /**
  * How to run `npm install -g` so the update lands in the install that is

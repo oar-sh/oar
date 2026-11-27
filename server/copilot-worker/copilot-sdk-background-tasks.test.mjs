@@ -681,7 +681,7 @@ test('an ask-mode approval from a background agent after the turn settled gets a
   assert.equal(runner.isTurnActive(), false, 'q-1 settled on assistant.idle; the agent runs on');
 
   // The agent wants to write: the runtime calls the handler with no turn open.
-  const decision = client.createAttempts[0].onPermissionRequest({ kind: 'write', fileName: 'notes.md' });
+  const decision = client.createAttempts[0].permissions.onRequest({ kind: 'write', fileName: 'notes.md' });
   await waitFor(() => relay.cards.length === 1, { label: 'card created' });
   const card = relay.cards[0].body;
   assert.equal(card.queueId, 'cont-1');
@@ -704,7 +704,7 @@ test('ask_user from a background agent after the turn settled reaches the human,
   const { relay, stub, client, runner } = setupQuestions();
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
   const config = client.createAttempts[0];
-  const tool = config.tools.find((entry) => entry.name === 'ask_user');
+  const tool = config.tools.definitions.find((entry) => entry.name === 'ask_user');
 
   const viaTool = tool.handler({ question: 'Which env?', choices: ['prod', 'staging'] }, { toolCallId: 'c1' });
   await waitFor(() => relay.cards.length === 1, { label: 'tool card' });
@@ -713,7 +713,7 @@ test('ask_user from a background agent after the turn settled reaches the human,
   assert.equal(await viaTool, 'User selected: staging');
   await waitFor(() => responsesFor(stub, 'cont-1').length === 1, { label: 'first question row settled' });
 
-  const viaBuiltIn = config.onUserInputRequest({ requestId: 'r2', question: 'Proceed?', choices: ['yes', 'no'] });
+  const viaBuiltIn = config.interaction.onUserInputRequest({ requestId: 'r2', question: 'Proceed?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 2, { label: 'built-in card' });
   assert.equal(relay.cards[1].body.queueId, 'cont-2');
   relay.answer('rq-2', 'yes');
@@ -728,7 +728,7 @@ test('a card a background agent raises during a live turn keeps that row open pa
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
 
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep the old file?', choices: ['yes', 'no'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Keep the old file?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
   assert.equal(relay.cards[0].body.queueId, 'q-1');
 
@@ -758,7 +758,7 @@ test('a Stop while a settled row waits on a background card ends the card and in
   });
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
   client.session.emit({ type: 'assistant.idle', data: {} });
   await tick(20);
@@ -787,7 +787,7 @@ test('a Stop naming a row that waits on a background card ends that card, even w
   });
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
   client.session.emit({ type: 'assistant.idle', data: {} });
   // Root work of its own opens a continuation, whose poller is the newest.
@@ -828,7 +828,7 @@ test('a Stop for a row that waits on a card is still polled for after a newer tu
   });
   const first = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 live' });
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Keep?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 1, { label: 'card on q-1' });
   client.session.emit({ type: 'assistant.idle', data: {} });
   // Root work of its own runs as a continuation, from its start to its end,
@@ -855,7 +855,7 @@ test('a Stop for a row that waits on a card is still polled for after a newer tu
 test('root work that starts while a background question is open merges into its row and ends on assistant.idle', async () => {
   const { relay, stub, client, runner } = setupQuestions();
   assert.equal(await runner.handlePendingPayload({ message: baseMessage }), true);
-  const asked = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Proceed?', choices: ['yes', 'no'] });
+  const asked = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Proceed?', choices: ['yes', 'no'] });
   await waitFor(() => relay.cards.length === 1, { label: 'card' });
   assert.equal(relay.cards[0].body.queueId, 'cont-1');
 

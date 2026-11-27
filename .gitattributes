@@ -11,3 +11,7 @@ scripts/git-hooks/* text eol=lf
 
 # The DeepSeek usage export as the platform writes it: BOM and CRLF, kept as is.
 tests/fixtures/deepseek-usage-export/*.csv -text
+
+# Vendored browser libraries: byte-for-byte copies of the npm packages
+# (server/vendor-browser-libs.test.mjs compares hashes), never normalised.
+server/public/vendor/** -text

@@ -56,7 +56,7 @@ quartet moved to `shared/worker-runtime/` ahead of extension deletion.
 | `copilot-model-switch.mjs` | Observed model/effort switching: drives `rpc.model.switchTo` / `rpc.model.setReasoningEffort` directly (the `setModel` facade discards results), caches one `rpc.model.list()` per session, waits out `deferred` switches on the `session.model_change` drain, and fails unconfirmed explicit selections (`relay.model-switch-unconfirmed`) instead of running on the wrong model. Relay effort `none` maps to the model's `defaultReasoningEffort` (the SDK union has no `none`). | `createCopilotModelSwitcher` |
 | `copilot-plan-board.mjs` | `plan_ready` board payload, when the text-shape fallback may post one, and the exit-plan feedback strings. The board offers **Approve plan** (`approve_only`), **Implement in autopilot** (`autopilot`), **Stop here and prompt myself** (`interactive`) and **Stop here** (`exit_only`), in that order, with the same follow-ups as every provider (no plan summary in them). | `buildCopilotPlanReadyBoardPayload`, `shouldPostPlanBoard`, `planTextFromExitRequest`, `PLAN_BOARD_ACTIONS`, `PLAN_LINE_THRESHOLD` |
 | `copilot-prompt-context.mjs` | Per-turn relay prompt prefix: mode marker, mode instructions (only on change), `server/relay-tools.md` guidance, live preview block. | `createCopilotPromptContextBuilder`, `withRelayContext`, `loadDefaultRelayToolInstructions` |
-| `copilot-byok-provider.mjs` | `SessionConfig.provider` for OpenAI-compatible BYOK, built from `COPILOT_PROVIDER_*`. | `resolveCopilotProviderConfig`, `resolveOpenAiModelTokenLimits` |
+| `copilot-byok-provider.mjs` | The OpenAI-compatible BYOK session options (`inference.providers`, `inference.models`, `github.capi` off), built from `COPILOT_PROVIDER_*`, and when a model switch must rebuild the session. | `resolveCopilotProviderConfig`, `resolveOpenAiModelTokenLimits`, `resolveByokSession`, `byokRebuildReason` |
 | `copilot-attachments.mjs` | Relay message → `MessageOptions` (`prompt` + typed attachments: inline `blob` for small images, `file` refs otherwise). | `buildCopilotMessageOptions`, `MAX_INLINE_IMAGE_BYTES` |
 | `copilot-sdk-test-harness.mjs` | Fakes and helpers shared by the worker's unit tests (fake client/session, fixture loader, runner factory). | `createFakeCopilotClient`, `createFakeCopilotSession`, `makeRunner`, `loadFixture`, … |
 
@@ -138,19 +138,22 @@ collapses the *parent's* tool-call argument streaming (live-reproduced twice eac
 
 ## BYOK (OpenAI-compatible)
 
-`resolveCopilotProviderConfig({ env, model })` builds `SessionConfig.provider`
+`resolveCopilotProviderConfig({ env, model })` resolves the provider block
 (`{ type:'openai', baseUrl, apiKey, wireApi?, maxPromptTokens?, maxOutputTokens? }`) when
-`COPILOT_PROVIDER_TYPE === 'openai'` and a key is present. `modelId` is deliberately left unset so
-`setModel()` stays authoritative.
+`COPILOT_PROVIDER_TYPE === 'openai'` and a key is present. `copilotProviderSessionOptions` puts it
+in the session options: the connection in `inference.providers` (named `openai`), the token
+ceilings in an `inference.models` entry for the session's model, `inference.defaultProvider`
+routing OAR's unqualified model ids to it, and `github.capi.enabled: false`.
 
 - **Model switch is a different mechanism per session type.** Hosted sessions go through
   `copilot-model-switch.mjs` (`rpc.model.switchTo` with the result observed — deferred switches
   wait on the `session.model_change` drain, unconfirmed ones fail the row). BYOK sessions try the
-  same RPCs only when the freshly resolved provider ceilings are unchanged; otherwise they
-  **dispose and resume** — `session.disconnect()`, then `ensureSession()` rebuilds the config
-  (now carrying `reasoningEffort`) with freshly resolved ceilings — because
-  `SessionConfig.provider` is immutable mid-session in runtime 1.0.82. Nothing is lost: the SDK
-  session id is the relay session id, so the rebuild takes the ordinary resume path.
+  same RPCs only for an effort change on the same model; another model, or other ceilings, makes
+  them **dispose and resume** — `session.disconnect()`, then `ensureSession()` rebuilds the config
+  (now carrying `inference.reasoningEffort`) with freshly resolved ceilings — because the
+  provider and `inference.models` are fixed at session creation and no RPC updates them, and
+  `inference.models` registers only the model the session was built with. Nothing is lost: the
+  SDK session id is the relay session id, so the rebuild takes the ordinary resume path.
 - **Token ceilings** come from `resolveModelTokenCeilings(model)` in
   `shared/context-window-fallbacks.mjs` (`maxPromptTokens = contextWindow − maxOutputTokens`), the
   single table also read — through its sibling export `resolveFallbackContextLimitTokens` — by

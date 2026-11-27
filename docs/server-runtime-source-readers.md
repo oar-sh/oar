@@ -20,7 +20,7 @@ start marker a helper asserts. "other" is an assertion on the text that is neith
 a count, a value read out of it). Sections are the runtime's own `// ─── … ───` markers, each
 running to the next one, so they are coarse ("Web Push" also holds the worker launch code).
 
-Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor), 92 other.
+Readers: 33 files, 535 assertions: 409 presence, 34 absence (6 without an anchor), 92 other.
 
 ## Absence assertions without a positive anchor
 
@@ -37,7 +37,7 @@ Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor
 
 | Section | Files | Presence | Absence | Other |
 | --- | ---: | ---: | ---: | ---: |
-| (imports and paths) | 7 | 7 | 0 | 2 |
+| (imports and paths) | 7 | 8 | 0 | 2 |
 | Config | 14 | 52 | 2 | 10 |
 | SQLite Setup | 2 | 3 | 0 | 2 |
 | Prepared Statements | 3 | 3 | 0 | 2 |
@@ -49,7 +49,7 @@ Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor
 | Relay events | 1 | 1 | 0 | 0 |
 | Questions that don't block | 7 | 7 | 0 | 6 |
 | Express + Socket.io Setup | 8 | 31 | 1 | 2 |
-| Dead-worker detection | 11 | 113 | 3 | 6 |
+| Dead-worker detection | 12 | 114 | 3 | 6 |
 | CLI Status Tracking | 4 | 5 | 0 | 0 |
 | Remote Relays | 18 | 42 | 1 | 5 |
 | Auth Middleware | 2 | 4 | 0 | 0 |
@@ -60,7 +60,7 @@ Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor
 | Cloudflare Tunnel | 1 | 1 | 0 | 0 |
 | Preview Lane | 5 | 7 | 0 | 1 |
 | Start | 3 | 5 | 0 | 2 |
-| (whole file) | 16 | 6 | 21 | 23 |
+| (whole file) | 17 | 7 | 21 | 23 |
 
 ## Every assertion, by file
 
@@ -126,18 +126,18 @@ Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor
 | 48 | presence | source (file) | `res\.setHeader\('X-Content-Type-Options', 'nosniff'\)` | Dead-worker detection |  |
 | 49 | presence | source (file) | `res\.setHeader\('X-Frame-Options', 'SAMEORIGIN'\)` | Dead-worker detection |  |
 | 50 | presence | source (file) | `res\.setHeader\('Referrer-Policy', 'no-referrer'\)` | Dead-worker detection |  |
-| 54 | presence | source (file) | `const APP_SHELL_CSP = "frame-ancestors 'self'";` | Dead-worker detection |  |
-| 55 | presence | source (file) | `res\.setHeader\('Content-Security-Policy', APP_SHELL_CSP\)` | Dead-worker detection |  |
-| 58 | other | shellRenders (slice) |  | (imports and paths) |  |
-| 61 | presence | source (file) |  | (whole file) |  |
-| 70 | presence | source (file) | `isRealPathWithinRoot\(absolutePath, activeWorkspaceRoot\)` | Queued relay restart / shutdown |  |
-| 74 | presence | source (file) | `app\.set\('trust proxy', config\.trustProxy \?\? 'loopback'\)` | Express + Socket.io Setup |  |
-| 79 | presence | source (file) | `resolveTunnelMarkerHeaders\(\s*config\.tunnelMarkerHeaders,\s*process…` | Express + Socket.io Setup |  |
-| 80 | absence | source (file) | `config\.tunnelMarkerHeaders\s*\\|\\|` | (whole file) | same test (line 79) |
-| 82 | presence | source (file) | `createTunnelWorkerPathGuard\(\{\s*pathPrefix: remotePath,\s*localRequ…` | Express + Socket.io Setup |  |
-| 83 | presence | source (file) | `isTrulyLocalRequest: localRequestCheck\.isTrulyLocal,` | Remote Relays |  |
-| 87 | absence | source (file) | `cors: \{ origin: '\*' \}` | (whole file) | same test (line 88) |
-| 88 | presence | source (file) | `allowRequest: \(req, callback\) => \{\s*if \(isSameOriginRequest\(exp…` | Express + Socket.io Setup |  |
+| 55 | presence | source (file) | `import \{ APP_SHELL_CSP \} from '\.\/services\/app-shell-csp\.mjs';` | (imports and paths) |  |
+| 56 | presence | source (file) | `res\.setHeader\('Content-Security-Policy', APP_SHELL_CSP\)` | Dead-worker detection |  |
+| 61 | other | shellRenders (slice) |  | (imports and paths) |  |
+| 64 | presence | source (file) |  | (whole file) |  |
+| 73 | presence | source (file) | `isRealPathWithinRoot\(absolutePath, activeWorkspaceRoot\)` | Queued relay restart / shutdown |  |
+| 77 | presence | source (file) | `app\.set\('trust proxy', config\.trustProxy \?\? 'loopback'\)` | Express + Socket.io Setup |  |
+| 82 | presence | source (file) | `resolveTunnelMarkerHeaders\(\s*config\.tunnelMarkerHeaders,\s*process…` | Express + Socket.io Setup |  |
+| 83 | absence | source (file) | `config\.tunnelMarkerHeaders\s*\\|\\|` | (whole file) | same test (line 82) |
+| 85 | presence | source (file) | `createTunnelWorkerPathGuard\(\{\s*pathPrefix: remotePath,\s*localRequ…` | Express + Socket.io Setup |  |
+| 86 | presence | source (file) | `isTrulyLocalRequest: localRequestCheck\.isTrulyLocal,` | Remote Relays |  |
+| 90 | absence | source (file) | `cors: \{ origin: '\*' \}` | (whole file) | same test (line 91) |
+| 91 | presence | source (file) | `allowRequest: \(req, callback\) => \{\s*if \(isSameOriginRequest\(exp…` | Express + Socket.io Setup |  |
 
 ### server/server-runtime-claude-api-provider.test.mjs
 
@@ -731,6 +731,14 @@ Readers: 32 files, 532 assertions: 406 presence, 34 absence (6 without an anchor
 | 234 | presence | runtimeSource (file) | `const readWorkerProcessIdentity = createProcessIdentityReader\(\{\n  …` | Web Push |  |
 | 236 | presence | replacement (slice) | `readProcessIdentity: readWorkerProcessIdentity,` | Web Push |  |
 | 238 | presence | service (slice) | `readProcessIdentity: \(pid\) => readWorkerProcessIdentity\(pid, \{ fr…` | Dead-worker detection |  |
+
+### server/services/app-shell-csp.test.mjs
+
+| Line | Kind | Reads | Pattern | Section | Anchor |
+| ---: | --- | --- | --- | --- | --- |
+| 60 | presence | runtime (file) | `function applyAppShellHeaders\(res\) \{\s*res\.setHeader\('Content-Se…` | Dead-worker detection |  |
+| 67 | presence | start (slice) |  | (whole file) |  |
+| 69 | presence | body (slice) | `applyAppShellHeaders\(res\);` | Dead-worker detection |  |
 
 ### server/services/session-worker-launch-service.cli-spawn-disabled.test.mjs
 

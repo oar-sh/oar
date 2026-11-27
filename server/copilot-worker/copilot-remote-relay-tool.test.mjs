@@ -108,13 +108,13 @@ async function openTurn(client, runner, message = baseMessage) {
 }
 
 function remoteTool(config) {
-  return (config.tools || []).find((tool) => tool.name === 'relay_tool') || null;
+  return (config.tools?.definitions || []).find((tool) => tool.name === 'relay_tool') || null;
 }
 
 test('sessions carry relay_tool next to ask_user when the relay reported a paired remote', async () => {
   const { client, runner, stub } = setup({ summary: { count: 1 } });
   const { pending } = await openTurn(client, runner);
-  const tools = client.createAttempts[0].tools;
+  const tools = client.createAttempts[0].tools.definitions;
   assert.deepEqual(tools.map((tool) => tool.name), ['ask_user', 'relay_tool']);
   assert.equal(remoteTool(client.createAttempts[0]).skipPermission, true);
   assert.equal(stub.calls.some((call) => call.routePath === '/api/remote-relays/summary'), true);
@@ -130,7 +130,7 @@ test('no paired remote, a failing summary, or a pinned-off gate leave the tool o
   ]) {
     const { client, runner } = setup(options);
     const { pending } = await openTurn(client, runner);
-    assert.deepEqual(client.createAttempts[0].tools.map((tool) => tool.name), ['ask_user']);
+    assert.deepEqual(client.createAttempts[0].tools.definitions.map((tool) => tool.name), ['ask_user']);
     client.session.emit({ type: 'session.idle', data: {} });
     await pending;
   }
@@ -139,7 +139,7 @@ test('no paired remote, a failing summary, or a pinned-off gate leave the tool o
 test('without the ask_user override the session still carries relay_tool alone', async () => {
   const { client, runner } = setup({ relayAskUserTool: false });
   const { pending } = await openTurn(client, runner);
-  assert.deepEqual(client.createAttempts[0].tools.map((tool) => tool.name), ['relay_tool']);
+  assert.deepEqual(client.createAttempts[0].tools.definitions.map((tool) => tool.name), ['relay_tool']);
   client.session.emit({ type: 'session.idle', data: {} });
   await pending;
 });
@@ -149,7 +149,7 @@ test('a runtime that refuses the ask_user override keeps relay_tool in the fallb
   const createSession = client.createSession.bind(client);
   let refusals = 0;
   client.createSession = async (config) => {
-    if (config.tools?.some((tool) => tool.name === 'ask_user')) {
+    if (config.tools?.definitions?.some((tool) => tool.name === 'ask_user')) {
       refusals += 1;
       client.createAttempts.push(config);
       throw new Error('Tool "ask_user" clashes with a built-in tool');
@@ -159,8 +159,8 @@ test('a runtime that refuses the ask_user override keeps relay_tool in the fallb
   const { pending } = await openTurn(client, runner);
   assert.equal(refusals, 1);
   const fallback = client.session.config;
-  assert.deepEqual(fallback.tools.map((tool) => tool.name), ['relay_tool'], 'only the override is dropped');
-  assert.equal(typeof fallback.onUserInputRequest, 'function', 'the built-in ask_user path answers instead');
+  assert.deepEqual(fallback.tools.definitions.map((tool) => tool.name), ['relay_tool'], 'only the override is dropped');
+  assert.equal(typeof fallback.interaction.onUserInputRequest, 'function', 'the built-in ask_user path answers instead');
   client.session.emit({ type: 'session.idle', data: {} });
   await pending;
 });

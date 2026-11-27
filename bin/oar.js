@@ -13,7 +13,9 @@ import {
 import { readConfiguredDataDir, resolveDataDir, resolveUploadDir } from '../server/services/data-dir-resolution.mjs';
 import { RELAY_STOP_EXIT_CODE } from '../server/relay-exit-codes.mjs';
 import { RESCUE_DIR_NAME, TAKEOVER_PROGRESS_FILE } from '../server/services/earlier-database-service.mjs';
-import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from '../server/services/native-addon-build-service.mjs';
+import {
+  NATIVE_BUILD_COMMAND, buildBetterSqlite3, discardSavedSqliteBinding, finishSelfUpdateBuild, needsSourceBuild, prepareSelfUpdateBuild,
+} from '../server/services/native-addon-build-service.mjs';
 import { DB_FILE_NAME, DB_FILE_NAMES, LEGACY_DB_FILE_NAME, resolveDatabaseFile } from '../server/services/database-file.mjs';
 import { BACKUP_PROGRESS_FILE, BACKUP_WAIT_FILE, backupDatabase, configWarnings, describeBackups, sanitizeReason } from '../server/services/db-backup-service.mjs';
 import { defaultIsProcessAlive, lockHolderMayRun, processIdentity } from '../server/services/relay-singleton-guard.mjs';
@@ -31,7 +33,7 @@ import {
   describeAgentSdks, describeRelayAddress, DOCTOR_PROBE_TIMEOUT_MS, DOCTOR_PROBES,
   listSystemdDropIns, ownerTokenState, parseCliArgs, parseSystemdVersion, primaryLanAddress, removeGeneratedCopilotWrapper, renderAgentSdkLines,
   renderDoctorReport,
-  resolveNpmInvocation, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
+  resolveNpmInvocation, selfUpdateInstallArgs, systemdUnitMarkerRoot, systemdUnitRunsCheckout, usageText,
 } from '../server/services/oar-cli-helpers.mjs';
 import { describeConfiguredTunnel, describeTunnelState } from '../server/services/cloudflared-tunnel-service.mjs';
 import { createPrompter, PromptAborted, runMenu } from '../server/services/oar-cli-menu.mjs';
@@ -2620,6 +2622,8 @@ export async function runBackup(options = {}) {
 async function runUpdate({
   argv = [], env = process.env, logger = console, fetchImpl = globalThis.fetch, spawnImpl = spawn,
   packageRoot = resolvePackageRoot(), homeDir = os.homedir(),
+  platform = process.platform, arch = process.arch,
+  selfUpdateNative = { prepare: prepareSelfUpdateBuild, finish: finishSelfUpdateBuild, discard: discardSavedSqliteBinding },
 } = {}) {
   const { channelForVersion, compareSemverIsh, parseSemverIsh } = await import('../shared/update-semver.mjs');
   const runningVersion = readPackageVersion(packageRoot);
@@ -2671,28 +2675,57 @@ async function runUpdate({
 
   logger.log(`[oar] Updating @oar-sh/oar ${runningVersion} -> ${target} ...`);
   const npm = resolveNpmInvocation({ packageRoot, env });
-  const exitCode = await new Promise((resolve) => {
-    const child = spawnImpl(npm.command, ['install', '-g', ...npm.prefixArgs, `@oar-sh/oar@${target}`], {
+  const npmInstall = (version) => new Promise((resolve) => {
+    const child = spawnImpl(npm.command, selfUpdateInstallArgs(npm, `@oar-sh/oar@${version}`), {
       stdio: 'inherit',
       env: npm.env,
       ...(process.platform === 'win32' ? { shell: true, windowsHide: true } : {}),
     });
     child.on('error', (error) => {
       logger.error(`[oar] npm spawn failed: ${error?.message || error}`);
-      resolve(1);
+      resolve({ ok: false, error: error?.message || String(error) });
     });
-    child.on('close', (code) => resolve(code ?? 1));
+    child.on('close', (code) => resolve(code === 0 ? { ok: true } : { ok: false, error: `npm exited with code ${code ?? 1}` }));
   });
-  if (exitCode !== 0) {
+  // No prebuilt SQLite binding here: the new version's is built after the
+  // install, which replaces the one the relay runs on. Refuse up front when
+  // that build cannot run; after a failed build, keep the install whole
+  // (native-addon-build-service.mjs).
+  const sourceBuild = needsSourceBuild({ platform, arch });
+  let saved = null;
+  if (sourceBuild) {
+    const prepared = await selfUpdateNative.prepare({ packageRoot, platform, arch, env: npm.env });
+    if (!prepared.ok) {
+      logger.error(`[oar] Not updated to ${target}: ${prepared.reason}.`);
+      logger.error(`[oar] ${prepared.hint} The running install is unchanged.`);
+      return { code: 1, reason: 'native-preflight' };
+    }
+    saved = prepared.saved;
+  }
+  if (!(await npmInstall(target)).ok) {
+    selfUpdateNative.discard(saved);
     logger.error('[oar] npm install failed; the running install is unchanged.');
     return { code: 1, reason: 'npm-failed' };
   }
   logger.log(`[oar] Installed @oar-sh/oar@${target}.`);
-  // No prebuilt SQLite binding here: build it before the relay restarts on
-  // the new version (native-addon-build-service.mjs).
-  if (needsSourceBuild()) {
-    const build = await buildBetterSqlite3({ packageRoot, env: npm.env, spawnImpl, logger, onOutput: (text) => process.stdout.write(text) });
-    if (!build.ok) {
+  if (sourceBuild) {
+    const finished = await selfUpdateNative.finish({
+      saved,
+      packageRoot,
+      runningVersion,
+      env: npm.env,
+      spawnImpl,
+      logger,
+      build: () => buildBetterSqlite3({ packageRoot, platform, arch, env: npm.env, spawnImpl, logger, onOutput: (text) => process.stdout.write(text) }),
+      reinstallRunning: () => npmInstall(runningVersion),
+    });
+    if (finished.status === 'rolled-back') {
+      logger.error(`[oar] Not updated: ${target} cannot run here without that build, so ${runningVersion} is installed again, whole. The relay keeps running it.`);
+      return { code: 1, reason: 'native-build-rolled-back' };
+    }
+    if (!finished.ok) {
+      if (finished.installed === 'running') logger.error(`[oar] Not updated: ${runningVersion} is installed again, but its SQLite binding could not be put back (${finished.rollbackError}).`);
+      else if (finished.rollbackError) logger.error(`[oar] Installing ${runningVersion} again failed too (${finished.rollbackError}).`);
       logger.error(`[oar] The relay keeps running the version it has loaded. Run ${NATIVE_BUILD_COMMAND}, then restart it.`);
       return { code: 1, reason: 'native-build-failed' };
     }

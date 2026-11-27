@@ -5,6 +5,102 @@ All notable changes to OAR are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.33] — 2026-11-27
+
+Highlights: Copilot turns work again on Copilot CLI 1.0.113 and 1.0.114,
+OpenAI-key sessions included, and Copilot now needs 1.0.113 or later. The web
+UI loads only from its own relay: marked, KaTeX and highlight.js come with
+OAR instead of from CDNs, a Content-Security-Policy keeps the page on its own
+origin, and a picture an agent links from another site is a link instead of
+being loaded. A crafted link can no longer make the page load scripts from
+another site. Updates run no install scripts, and on Termux, 32-bit ARM and
+FreeBSD an update checks for its build tools first and no longer leaves an
+install the relay cannot start on.
+
+The supply-chain hardening in this release (the page policy, the bundled
+libraries, the template serving fix, the remote media placeholders, CI, the
+update without install scripts, the test reporter) is the work of
+[d2x](https://github.com/d2x). Thank you!
+
+### Changed
+
+- The web UI no longer loads marked, KaTeX (with mhchem) or highlight.js from jsDelivr and cdnjs: the same files, at the same versions, come with OAR and are served by the relay, each with an integrity hash. Markdown, code colours and formulas now work without internet access in the browser. The browser caches them for good: their paths carry the version.
+- Pictures and videos an agent links from another site no longer load by themselves. In a chat they show as a link; in **🖼️ Media** they are a 🌐 tile with the site's name, and the viewer offers **Open on <site>** and **Copy link**. Uploads, generated images, local files and `data:` images are unchanged.
+- **Updates run no install scripts.** `oar update` and the Update button install with `--ignore-scripts`; no dependency of OAR needs one. Where better-sqlite3 ships no prebuilt binary (Termux, 32-bit ARM, FreeBSD), the relay still builds it after the update with npm's own node-gyp; it no longer downloads node-gyp through `npx` when that is missing, and says how to install it instead (`npm install -g --ignore-scripts node-gyp`, then `oar build-native`).
+- **An update there no longer leaves an install the relay cannot start on**, unless reinstalling the running version fails too. Before installing anything, `oar update` and the Update button check for node-gyp, Python 3, make and a C++ compiler, and when one is missing they refuse with what to install; the relay runs on unchanged. When the build fails anyway, the new version keeps the binding the relay runs on if it comes with the same better-sqlite3; otherwise the running version is installed again, with its binding, and the update says it was not kept. Should reinstalling the running version fail too, it says so and names `oar build-native`.
+- **Copilot needs Copilot CLI 1.0.113 or later.** The Copilot SDK groups its session options since 1.0.113, and OAR now sets sessions up only that way. With an older CLI, a Copilot, OpenAI (BYOK) or OpenAI Image turn fails with a message that names its version and says to update the Copilot CLI; model discovery and the session import stop with the same message. A CLI newer than 1.0.114 is used too, and the worker log notes when a worker starts that OAR was not checked against it.
+- **For contributors:** `npm test` prints only failing tests and a summary, with a progress line while it runs (`npm run test:verbose` shows every test). CI pins its GitHub Actions to commit SHAs, runs with a read-only token and keeps no stored credentials, and runs on Node 24.
+
+### Fixed
+
+- Copilot turns work again on Copilot CLI 1.0.113 and 1.0.114, sessions with an OpenAI key included.
+- A relay start that finds an agent SDK ready no longer writes an empty SDK status row to the database. A database written only by a start then looked like real work beside another database file, and the relay refused to start.
+
+### Security
+
+- **The page loads, frames and connects to its own origin only.** The app shell (and `/shared/…` pages) now send a Content-Security-Policy that names no host, so it works the same on an IP address, a single-word host name, self-signed HTTPS or a path prefix. A picture URL chosen by an agent can no longer send data to another site just by being shown (see above).
+- **The relay serves its page only through the app's own routes**, and the page no longer takes a base path from the address that names another host. Before, a crafted link to a relay could make the page load its scripts from another site. Updating is recommended.
+
+
+### Upgrade notes
+
+- No migration and no new setting: 0.9.33 runs on a 0.9.32 database as it
+  is. Runtime dependencies are unchanged; the one new package,
+  `@highlightjs/cdn-assets`, is a devDependency that only a git checkout
+  installs (`npm ci`).
+- **Copilot CLI 1.0.113 or later is required** for Copilot, OpenAI (BYOK)
+  and OpenAI Image chats. Update it before or right after the update:
+  **Update** in **⚙️ Settings → Providers → Copilot**, or `copilot update` on
+  the relay host. The relay finds the new CLI without a restart.
+- A reverse proxy or tunnel that rewrites or injects into JavaScript
+  responses now breaks Markdown rendering: every library the page loads is
+  checked against its integrity hash. Pass them unchanged.
+- **The update into 0.9.33 is still run by 0.9.32's updater**, the **Update**
+  button and `oar update` alike: it installs with `npm install -g` without
+  `--ignore-scripts`. No package OAR installs has an install script, so none
+  runs either way. On Termux, 32-bit ARM and FreeBSD, 0.9.32 then builds the
+  SQLite binding as before (with npm's node-gyp, or one it fetches with
+  `npx`), with no check beforehand and no way back: when the build fails, the
+  relay runs on until its next start, which stops and asks for
+  `oar build-native`. 0.9.33's `oar build-native` fetches no node-gyp; where
+  npm has none, run `npm install -g --ignore-scripts node-gyp` first. The
+  check for build tools, `--ignore-scripts` and keeping a startable install
+  apply from the first update 0.9.33 runs itself (the next release, or going
+  back).
+- On Termux, 32-bit ARM and FreeBSD, an update run by 0.9.33 is refused
+  until node-gyp, Python 3, make (`gmake` on FreeBSD) and a C++ compiler are
+  installed. A host that relied on 0.9.32's `npx` download of node-gyp
+  installs it once with `npm install -g --ignore-scripts node-gyp`.
+
+### Downgrade notes
+
+Going back to 0.9.32 is safe: `oar update --to 0.9.32` or `npm install -g
+@oar-sh/oar@0.9.32` (in a git checkout: `git checkout v0.9.32`, `npm ci`,
+then a relay restart). 0.9.33 adds no migration, no setting and no stored
+Copilot field: it builds the grouped Copilot options when a session starts
+and stores them nowhere. What changes back:
+
+- **Copilot breaks again on Copilot CLI 1.0.113 and later.** 0.9.32 starts
+  the Copilot runtime the old way, which these CLIs refuse: every Copilot,
+  OpenAI (BYOK) and OpenAI Image turn fails, and model discovery and the
+  session import fail too. Only a Copilot CLI of 1.0.112 or older works with
+  0.9.32, and 0.9.33 refuses that one again.
+- **`oar update --to 0.9.32` is run by 0.9.33**: with `--ignore-scripts`, and
+  on Termux, 32-bit ARM and FreeBSD with the check for build tools first.
+  When 0.9.32's binding does not build, 0.9.33 keeps the binding the relay
+  runs on, since both releases come with better-sqlite3 13.0.3, and 0.9.32
+  starts on it. Updates after that are run by 0.9.32 again, without that
+  check or a way back. With `npm install -g @oar-sh/oar@0.9.32` instead, run
+  `oar build-native` afterwards on Termux, 32-bit ARM and FreeBSD.
+- **The page loads marked, KaTeX and highlight.js from jsDelivr and cdnjs
+  again**, without a Content-Security-Policy beyond `frame-ancestors`, and
+  pictures and videos an agent links from another site load again, in the
+  chat and in **🖼️ Media**. Files 0.9.33 left in the browser's caches under
+  `vendor/` are never asked for.
+- **SDK status:** a 0.9.32 start that finds an agent SDK ready may write an
+  empty status row again; 0.9.32 reads a missing row as empty, so nothing
+  stored by 0.9.33 is misread.
+
 ## [0.9.32] — 2026-11-21
 
 Highlights: a Claude turn whose Claude Code went silent (for example a

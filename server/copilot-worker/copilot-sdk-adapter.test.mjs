@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import {
   buildRuntimeConnection,
+  buildWorkerCopilotClientOptions,
   classifyCopilotSessionError,
   COPILOT_TURN_FAILURE_GUIDANCE,
   classifyCopilotTurnException,
@@ -21,6 +22,23 @@ import {
 import { loadFixture } from './copilot-sdk-test-harness.mjs';
 
 const SDK_DIR = path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.82', 'copilot-sdk');
+
+// Factory shapes copied from the bundles: 1.0.92-1.0.112 export `forStdio`,
+// 1.0.113 replaced it with `forSpawnedStdio` (and a `spawned-stdio` kind).
+const LEGACY_FACTORIES = Object.freeze({
+  forStdio: (opts = {}) => ({ kind: 'stdio', path: opts.path, args: opts.args, env: opts.env }),
+});
+const SPAWNED_FACTORIES = Object.freeze({
+  forSpawnedStdio: (opts = {}) => ({
+    kind: 'spawned-stdio',
+    path: opts.path,
+    args: opts.args,
+    env: opts.env,
+    workingDirectory: opts.workingDirectory,
+    baseDirectory: opts.baseDirectory,
+    sessionIdleTimeoutSeconds: opts.sessionIdleTimeoutSeconds,
+  }),
+});
 
 test('the runtime is derived from the SDK bundle, never from PATH', () => {
   const paths = resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: SDK_DIR } });
@@ -78,13 +96,13 @@ test('startCopilotClient pins the runtime to the SDK bundle and reports skew', a
     cwd: '/tmp/relay-fixture-workspace',
     importImpl: async (href) => {
       assert.match(href, /^file:\/\/.*copilot-sdk\/index\.js$/);
-      return { CopilotClient: FakeCopilotClient };
+      return { CopilotClient: FakeCopilotClient, RuntimeConnection: SPAWNED_FACTORIES };
     },
   });
   assert.equal(started, 1);
-  assert.equal(constructed[0].connection.kind, 'stdio');
-  assert.equal(constructed[0].connection.path, path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.82', 'app.js'));
-  assert.equal(constructed[0].workingDirectory, '/tmp/relay-fixture-workspace');
+  assert.equal(constructed[0].runtime.kind, 'spawned-stdio');
+  assert.equal(constructed[0].runtime.path, path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.82', 'app.js'));
+  assert.equal(constructed[0].runtime.workingDirectory, '/tmp/relay-fixture-workspace');
   const version = await result.versionReady;
   assert.equal(version.runtimeVersion, '1.0.78');
   assert.match(version.versionSkewWarning, /version skew/);
@@ -100,7 +118,7 @@ test('the version probe never blocks the first turn on an RPC round trip', async
   }
   const result = await startCopilotClient({
     paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: SDK_DIR } }),
-    importImpl: async () => ({ CopilotClient: FakeCopilotClient }),
+    importImpl: async () => ({ CopilotClient: FakeCopilotClient, RuntimeConnection: SPAWNED_FACTORIES }),
   });
   // The client is usable while `getStatus` is still in flight — a diagnostic
   // must never gate readiness.
@@ -109,23 +127,116 @@ test('the version probe never blocks the first turn on an RPC round trip', async
   assert.equal((await result.versionReady).versionSkewWarning, null);
 });
 
-test('startCopilotClient prefers RuntimeConnection.forStdio when the SDK exports it', async () => {
-  const sdk = {
-    CopilotClient: class { async start() {} },
-    RuntimeConnection: { forStdio: (options) => ({ tag: 'forStdio', ...options }) },
-  };
-  assert.deepEqual(buildRuntimeConnection(sdk, '/runtime/index.js'), { tag: 'forStdio', path: '/runtime/index.js' });
-  assert.deepEqual(buildRuntimeConnection({}, '/runtime/index.js'), { kind: 'stdio', path: '/runtime/index.js' });
+test('buildRuntimeConnection prefers forSpawnedStdio and puts the working directory on it', () => {
+  const sdk = { RuntimeConnection: { ...SPAWNED_FACTORIES, forStdio: () => assert.fail('forStdio must not be used') } };
+  const connection = buildRuntimeConnection(sdk, '/runtime/app.js', { cwd: '/tmp/relay-fixture-workspace' });
+  assert.equal(connection.kind, 'spawned-stdio');
+  assert.equal(connection.path, '/runtime/app.js');
+  assert.equal(connection.workingDirectory, '/tmp/relay-fixture-workspace');
+});
+
+test('buildRuntimeConnection refuses a bundle with only forStdio (older than 1.0.113)', () => {
+  assert.throws(
+    () => buildRuntimeConnection({ RuntimeConnection: LEGACY_FACTORIES }, '/runtime/app.js', { version: '1.0.112' }),
+    { code: 'copilot-sdk-too-old', message: /Copilot SDK 1\.0\.112 is older than 1\.0\.113.*Update the Copilot CLI/ },
+  );
+});
+
+test('buildRuntimeConnection names the SDK version when neither factory exists', () => {
+  assert.throws(
+    () => buildRuntimeConnection({ RuntimeConnection: { forTcp() {}, forInProcess() {} } }, '/runtime/app.js', { version: '1.0.999' }),
+    (error) => /1\.0\.999/.test(error.message)
+      && /forSpawnedStdio/.test(error.message)
+      && /forStdio/.test(error.message)
+      && /forTcp, forInProcess/.test(error.message),
+  );
+  assert.throws(() => buildRuntimeConnection({}, '/runtime/app.js'), /no RuntimeConnection export/);
+});
+
+test('buildWorkerCopilotClientOptions uses the grouped client options', () => {
+  const options = buildWorkerCopilotClientOptions({ RuntimeConnection: SPAWNED_FACTORIES }, {
+    runtimeEntry: '/runtime/app.js',
+    cwd: '/tmp/relay-fixture-workspace',
+    clientName: 'copilot-web-relay',
+    logLevel: 'error',
+  });
+  // The client requires `mode` and throws on a client-level
+  // `workingDirectory` or `env`; the connection is `runtime` and the log
+  // level `observability.logLevel`. The client name goes on each session.
+  assert.equal(options.mode, 'coding-agent');
+  assert.equal(options.runtime.kind, 'spawned-stdio');
+  assert.equal(options.runtime.workingDirectory, '/tmp/relay-fixture-workspace');
+  assert.deepEqual(options.observability, { logLevel: 'error' });
+  for (const key of ['connection', 'workingDirectory', 'env', 'logLevel', 'clientName']) {
+    assert.equal(key in options, false, `${key} must not be on the client options`);
+  }
+});
+
+test('startCopilotClient hands the bundle the spawned-stdio connection', async () => {
+  const constructed = [];
+  class FakeCopilotClient {
+    constructor(options) { constructed.push(options); }
+
+    async start() {}
+  }
+  await startCopilotClient({
+    paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: SDK_DIR } }),
+    cwd: '/tmp/relay-fixture-workspace',
+    importImpl: async () => ({ CopilotClient: FakeCopilotClient, RuntimeConnection: SPAWNED_FACTORIES }),
+  });
+  assert.equal(constructed[0].runtime.kind, 'spawned-stdio');
+  assert.equal(constructed[0].runtime.path, path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.82', 'app.js'));
+  assert.equal(constructed[0].mode, 'coding-agent');
 });
 
 test('startCopilotClient fails loudly when the bundle has no CopilotClient', async () => {
   await assert.rejects(
     startCopilotClient({
       paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: SDK_DIR } }),
-      importImpl: async () => ({}),
+      importImpl: async () => ({ RuntimeConnection: SPAWNED_FACTORIES }),
     }),
     /CopilotClient not found/,
   );
+});
+
+test('startCopilotClient refuses an SDK older than 1.0.113 before it builds a client', async () => {
+  let constructed = 0;
+  class FakeCopilotClient {
+    constructor() { constructed += 1; }
+
+    async start() {}
+  }
+  const legacyDir = path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.112', 'copilot-sdk');
+  await assert.rejects(
+    startCopilotClient({
+      paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: legacyDir } }),
+      importImpl: async () => ({ CopilotClient: FakeCopilotClient, RuntimeConnection: LEGACY_FACTORIES }),
+    }),
+    { code: 'copilot-sdk-too-old', message: /Copilot SDK 1\.0\.112 is older than 1\.0\.113.*Update the Copilot CLI/ },
+  );
+  assert.equal(constructed, 0);
+});
+
+test('startCopilotClient logs a bundle newer than the newest verified one, and starts it all the same', async () => {
+  const logged = [];
+  class FakeCopilotClient {
+    async start() {}
+  }
+  const newerDir = path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.200', 'copilot-sdk');
+  const result = await startCopilotClient({
+    paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: newerDir } }),
+    importImpl: async () => ({ CopilotClient: FakeCopilotClient, RuntimeConnection: SPAWNED_FACTORIES }),
+    dbg: (...parts) => logged.push(parts.join(' ')),
+  });
+  assert.ok(result.client);
+  assert.equal(logged.filter((line) => /Copilot SDK 1\.0\.200 is newer than 1\.0\.114/.test(line)).length, 1);
+  const quiet = [];
+  await startCopilotClient({
+    paths: resolveCopilotSdkPaths({ env: { COPILOT_SDK_PATH: path.join('/opt', 'copilot', 'pkg', 'linux-x64', '1.0.114', 'copilot-sdk') } }),
+    importImpl: async () => ({ CopilotClient: FakeCopilotClient, RuntimeConnection: SPAWNED_FACTORIES }),
+    dbg: (...parts) => quiet.push(parts.join(' ')),
+  });
+  assert.equal(quiet.some((line) => /newer than/.test(line)), false);
 });
 
 test('an unavailable or throwing getStatus degrades to an unknown version', async () => {

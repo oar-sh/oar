@@ -85,7 +85,13 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // inbox-scroll-anchor.mjs, active-window-slider.mjs).
 // 707 since 2026-11-20: relay_info and the catalogue reading it shares,
 // moved out of the dispatcher (server/services/remote-relay-info.mjs).
-const MAX_ENTRIES = 707;
+// 781 since 2026-11-23: the app shell page policy module
+// (server/services/app-shell-csp.mjs), and the browser libraries the page
+// used to load from CDNs, which now ship in server/public/vendor (73 files:
+// marked, KaTeX with its 60 font files, highlight.js, their licences and the
+// manifest).
+// 782: server/public/app/app-base.mjs, the base path the app takes from the address.
+const MAX_ENTRIES = 782;
 // 6.25 MiB until 2026-10-07; the pinned messages and the fullscreen file
 // viewer (seven small modules) took the unpacked size to 6.27 MiB. 6.5 MiB
 // until 2026-10-11; the sub-agent records, the event subscriptions and
@@ -115,8 +121,9 @@ const MAX_ENTRIES = 707;
 // 11 MiB since 2026-11-11: agent auth took it to 10,894,931 (98.9 % of
 // 10.5 MiB), and the peer keys that follow it would go over. 12 MiB since
 // 2026-11-12: 0.9.27 features (auth, peer keys, security UI); 99.0 % at
-// 11 MiB (11,414,620 bytes).
-const MAX_UNPACKED_BYTES = 12 * 1024 * 1024;
+// 11 MiB (11,414,620 bytes). 14 MiB since 2026-11-23: server/public/vendor
+// adds about 1.6 MB (KaTeX's fonts are 1.2 MB of it), 13,177,404 bytes in all.
+const MAX_UNPACKED_BYTES = 14 * 1024 * 1024;
 
 const FORBIDDEN = [
   { name: 'config file', pattern: /(^|\/)config\.json$/ },
@@ -163,6 +170,14 @@ test('npm tarball contains no secrets, state, or tests, and stays lean', () => {
 
   for (const required of ['bin/oar.js', 'server/server.js', 'README.md', 'CHANGELOG.md', 'LICENSE', 'package.json']) {
     assert.ok(paths.includes(required), `tarball is missing ${required}`);
+  }
+  // The browser libraries the page loads from this relay, not from a CDN:
+  // every file the vendor manifest lists, and the manifest itself.
+  const vendorManifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'server/public/vendor/manifest.json'), 'utf8'));
+  assert.ok(vendorManifest.files.length > 0, 'the vendor manifest lists no files');
+  for (const entry of [{ package: '.', version: '', path: 'manifest.json' }, ...vendorManifest.files]) {
+    const rel = entry.package === '.' ? 'manifest.json' : `${entry.package}@${entry.version}/${entry.path}`;
+    assert.ok(paths.includes(`server/public/vendor/${rel}`), `tarball is missing server/public/vendor/${rel}`);
   }
   // The pins the relay installs the agent SDKs (and koffi) from.
   for (const required of [

@@ -11,8 +11,15 @@ import {
   stripTerminalEscapes,
   tailOf,
 } from './cli-process-runner.mjs';
-import { NATIVE_BUILD_COMMAND, buildBetterSqlite3, needsSourceBuild } from './native-addon-build-service.mjs';
-import { resolveNpmInvocation } from './oar-cli-helpers.mjs';
+import {
+  NATIVE_BUILD_COMMAND,
+  buildBetterSqlite3,
+  discardSavedSqliteBinding,
+  finishSelfUpdateBuild,
+  needsSourceBuild,
+  prepareSelfUpdateBuild,
+} from './native-addon-build-service.mjs';
+import { resolveNpmInvocation, selfUpdateInstallArgs } from './oar-cli-helpers.mjs';
 import { compareSemverIsh, parseSemverIsh } from '../../shared/update-semver.mjs';
 
 // Applies an OAR self-update: `npm i -g @oar-sh/oar@<version>` with the log
@@ -110,6 +117,11 @@ export function createUpdateInstallService({
   platform = process.platform,
   arch = process.arch,
   buildNativeAddons = buildBetterSqlite3,
+  // Where no binding ships: the checks before the install and what keeps the
+  // install whole after a failed build (native-addon-build-service.mjs).
+  prepareNativeBuild = prepareSelfUpdateBuild,
+  finishNativeBuild = finishSelfUpdateBuild,
+  discardNativeBuild = discardSavedSqliteBinding,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
   nowImpl = Date.now,
@@ -223,61 +235,102 @@ export function createUpdateInstallService({
       }
     }
 
+    const fail = (error) => {
+      finishedAt = new Date(nowImpl()).toISOString();
+      state = UPDATE_INSTALL_STATES.ERROR;
+      lastError = error;
+      broadcast();
+      return { ok: false, statusCode: 500, error: lastError };
+    };
     // npm itself is a shim on Windows; spawn npm.cmd through a shell there
     // (args are fixed strings + a validated semver, so no injection surface).
     const npm = resolveNpmInvocation({ execPath, packageRoot, platform, env, existsImpl });
-    const command = npm.command;
-    const args = ['install', '-g', ...npm.prefixArgs, `${UPDATE_PACKAGE_NAME}@${target}`];
-    const result = await runToCompletion(
-      () => spawnImpl(command, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: npm.env,
-        ...(platform === 'win32' ? { windowsHide: true, shell: true } : { detached: true }),
-      }),
-      {
-        timeoutMs: UPDATE_INSTALL_TIMEOUT_MS,
-        setTimeoutImpl,
-        clearTimeoutImpl,
-        killChild: (child, signal) => killTree(child, signal, { platform }),
-        onChild: (child) => { activeChild = child; },
-        onOutput: (text) => appendLog(text),
-      },
-    );
-    activeChild = null;
-    flushLogNow();
+    const npmInstall = async (version) => {
+      const outcome = await runToCompletion(
+        () => spawnImpl(npm.command, selfUpdateInstallArgs(npm, `${UPDATE_PACKAGE_NAME}@${version}`), {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: npm.env,
+          ...(platform === 'win32' ? { windowsHide: true, shell: true } : { detached: true }),
+        }),
+        {
+          timeoutMs: UPDATE_INSTALL_TIMEOUT_MS,
+          setTimeoutImpl,
+          clearTimeoutImpl,
+          killChild: (child, signal) => killTree(child, signal, { platform }),
+          onChild: (child) => { activeChild = child; },
+          onOutput: (text) => appendLog(text),
+        },
+      );
+      activeChild = null;
+      flushLogNow();
+      return outcome.ok ? outcome : { ...outcome, error: outcome.error || `npm exited with code ${outcome.code}` };
+    };
 
-    if (!result.ok) {
-      finishedAt = new Date(nowImpl()).toISOString();
-      state = UPDATE_INSTALL_STATES.ERROR;
-      lastError = result.error || `npm exited with code ${result.code}`;
-      broadcast();
-      return { ok: false, statusCode: 500, error: lastError };
+    // No prebuilt SQLite binding here: the new version's is built after the
+    // install, which replaces the one this relay runs on. Refuse up front
+    // when that build cannot run, and keep a copy of the running binding.
+    const sourceBuild = needsSourceBuild({ platform, arch });
+    const toLog = (line) => appendLog(`${line}\n`);
+    let saved = null;
+    if (sourceBuild) {
+      const prepared = await prepareNativeBuild({ packageRoot, platform, arch, execPath, env: npm.env, existsImpl });
+      if (!prepared.ok) {
+        toLog(`[oar] Not installing ${target}: ${prepared.reason}.`);
+        flushLogNow();
+        return fail(`${UPDATE_PACKAGE_NAME}@${target} was not installed: ${prepared.reason}. ${prepared.hint} ${UPDATE_PACKAGE_NAME}@${runningVersion} keeps running, unchanged.`);
+      }
+      saved = prepared.saved;
     }
 
-    // No prebuilt SQLite binding here: build it before the restart, which
-    // would start on none (native-addon-build-service.mjs). A failed build
-    // keeps this relay running on the binding it has loaded.
-    if (needsSourceBuild({ platform, arch })) {
-      const toLog = (line) => appendLog(`${line}\n`);
-      const build = await buildNativeAddons({
+    const result = await npmInstall(target);
+    if (!result.ok) {
+      discardNativeBuild(saved);
+      return fail(result.error);
+    }
+
+    // A failed build keeps this relay running on the binding it has loaded,
+    // and the install whole: the saved binding where better-sqlite3 is the
+    // same version, else the running version installed again.
+    if (sourceBuild) {
+      const finished = await finishNativeBuild({
+        saved,
         packageRoot,
-        platform,
-        arch,
+        runningVersion,
         execPath,
         env: npm.env,
         spawnImpl,
-        onOutput: (text) => appendLog(text),
-        onChild: (child) => { activeChild = child; },
         logger: { log: toLog, error: toLog },
+        build: () => buildNativeAddons({
+          packageRoot,
+          platform,
+          arch,
+          execPath,
+          env: npm.env,
+          spawnImpl,
+          onOutput: (text) => appendLog(text),
+          onChild: (child) => { activeChild = child; },
+          logger: { log: toLog, error: toLog },
+        }),
+        reinstallRunning: () => npmInstall(runningVersion),
       });
       activeChild = null;
       flushLogNow();
-      if (!build.ok) {
-        finishedAt = new Date(nowImpl()).toISOString();
-        state = UPDATE_INSTALL_STATES.ERROR;
-        lastError = `${UPDATE_PACKAGE_NAME}@${target} is installed, but its SQLite binding did not build (${build.error}). Run ${NATIVE_BUILD_COMMAND}, then restart the relay.`;
-        broadcast();
-        return { ok: false, statusCode: 500, error: lastError };
+      if (!finished.ok) {
+        const build = finished.build || {};
+        if (finished.status === 'rolled-back') {
+          // Not `oar build-native` now: it would rebuild, and on a failure
+          // remove, the binding the reinstalled version runs on.
+          const next = build.hint ? build.hint.replace(`, then run ${NATIVE_BUILD_COMMAND} again.`, ', then update again.') : 'The build\'s output is in the log above.';
+          return fail(`${UPDATE_PACKAGE_NAME}@${target} was not kept: its SQLite binding did not build (${build.error}), so ${UPDATE_PACKAGE_NAME}@${runningVersion} is installed again and keeps running. ${next}`);
+        }
+        // The hint (install node-gyp, or the build tools) says what to do first.
+        const next = build.hint ? `${build.hint} Then restart the relay.` : `Run ${NATIVE_BUILD_COMMAND}, then restart the relay.`;
+        if (finished.installed === 'running') {
+          // Installed again, but its binding could not be put back.
+          return fail(`${UPDATE_PACKAGE_NAME}@${target} was not kept: its SQLite binding did not build (${build.error}). ${UPDATE_PACKAGE_NAME}@${runningVersion} is installed again, but its SQLite binding could not be put back (${finished.rollbackError}). This relay keeps running on the binding it has loaded. ${next}`);
+        }
+        const rollback = finished.rollbackError ? ` Installing ${UPDATE_PACKAGE_NAME}@${runningVersion} again failed too (${finished.rollbackError}).` : '';
+        return fail(`${UPDATE_PACKAGE_NAME}@${target} is installed, but its SQLite binding did not build (${build.error}).${rollback} ${next}`);
       }
     }
     finishedAt = new Date(nowImpl()).toISOString();

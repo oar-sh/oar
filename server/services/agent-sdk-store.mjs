@@ -273,6 +273,10 @@ export function createAgentSdkStore({
   function persist(id, record) {
     try {
       const all = readPersisted();
+      // Clearing what was never saved writes nothing: a start that finds a
+      // ready folder must leave no settings row, or a database a bare start
+      // wrote would no longer read as start-up only (database-file.mjs).
+      if (!record && !Object.hasOwn(all, id)) return;
       if (record) all[id] = record;
       else delete all[id];
       writeSetting(AGENT_SDK_STATUS_SETTING_KEY, JSON.stringify(all));

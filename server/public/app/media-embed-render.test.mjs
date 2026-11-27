@@ -86,10 +86,10 @@ test('unsafe srcs are still stripped and data images still allowed', () => {
 test('raw video/audio tags pass with a whitelisted attribute set only', () => {
   setServerPlatform('linux');
   const video = sanitizedElement(
-    '<video src="https://example.com/clip.mp4" controls preload="metadata" autoplay onclick="x()" width="320"></video>',
+    '<video src="/home/dev/clip.mp4" controls preload="metadata" autoplay onclick="x()" width="320"></video>',
   );
   assert.equal(video.tagName, 'VIDEO');
-  assert.equal(video.getAttribute('src'), 'https://example.com/clip.mp4');
+  assert.equal(video.getAttribute('src'), '/home/dev/clip.mp4');
   assert.equal(video.getAttribute('controls'), '');
   assert.equal(video.getAttribute('width'), '320');
   assert.equal(video.getAttribute('autoplay'), null);
@@ -97,6 +97,72 @@ test('raw video/audio tags pass with a whitelisted attribute set only', () => {
 
   const badSrc = sanitizedElement('<audio src="javascript:alert(1)" controls></audio>');
   assert.equal(badSrc.getAttribute('src'), null);
+});
+
+// The page's Content-Security-Policy loads nothing from another origin, and a
+// remote address in a reply is a way to send data out: a remote picture, clip
+// or sound is a link, never an element that loads.
+test('a remote image becomes a link with its alt text, never an <img>', () => {
+  setServerPlatform('linux');
+  const host = document.createElement('div');
+  host.innerHTML = sanitizePreviewHtml('<p><img src="https://tracker.example.test/p.png?d=secret" alt="build chart"></p>');
+  assert.equal(host.querySelector('img'), null);
+  const link = host.querySelector('p > a');
+  assert.equal(link.getAttribute('href'), 'https://tracker.example.test/p.png?d=secret');
+  assert.equal(link.textContent, 'build chart');
+  assert.equal(link.getAttribute('target'), '_blank');
+  assert.equal(link.getAttribute('rel'), 'noopener noreferrer');
+});
+
+test('a remote image without alt text shows its address as the link text', () => {
+  const link = sanitizedElement('<img src="http://images.example.test/a.jpg">');
+  assert.equal(link.tagName, 'A');
+  assert.equal(link.textContent, 'http://images.example.test/a.jpg');
+  assert.equal(link.getAttribute('href'), 'http://images.example.test/a.jpg');
+});
+
+test('remote video, audio and media-extension images are links too', () => {
+  for (const html of [
+    '<video src="https://example.com/clip.mp4" controls></video>',
+    '<audio src="https://example.com/note.mp3" controls></audio>',
+    '<img src="https://example.com/demo.mp4" alt="demo clip">',
+  ]) {
+    const host = document.createElement('div');
+    host.innerHTML = sanitizePreviewHtml(html);
+    assert.equal(host.querySelector('img, video, audio'), null, html);
+    const link = host.querySelector('a');
+    assert.ok(link, html);
+    assert.match(link.getAttribute('href'), /^https:\/\/example\.com\//);
+  }
+});
+
+test('protocol-relative and backslash addresses of another host are remote', () => {
+  for (const src of ['//cdn.example.test/x.png', '/\\cdn.example.test/x.png', 'HTTPS://CDN.EXAMPLE.TEST/x.png']) {
+    const host = document.createElement('div');
+    host.innerHTML = sanitizePreviewHtml(`<img src="${src}" alt="x">`);
+    assert.equal(host.querySelector('img'), null, src);
+    assert.equal(host.querySelectorAll('a').length, 1, src);
+  }
+});
+
+test('a remote image inside a link leaves the link and shows the text', () => {
+  const host = document.createElement('div');
+  host.innerHTML = sanitizePreviewHtml('<a href="https://example.com/docs"><img src="https://img.example.test/badge.svg" alt="docs badge"></a>');
+  assert.equal(host.querySelector('img'), null);
+  assert.equal(host.querySelectorAll('a').length, 1);
+  assert.equal(host.querySelector('a').getAttribute('href'), 'https://example.com/docs');
+  assert.equal(host.querySelector('a').textContent, 'docs badge');
+});
+
+test('own-origin, relative and data: sources stay media', () => {
+  setServerPlatform('linux');
+  for (const src of ['/home/dev/a.png', './a.png', 'a.png', 'http://localhost/home/dev/a.png', 'data:image/png;base64,AAAA']) {
+    const img = sanitizedElement(`<img src="${src}" alt="a">`);
+    assert.equal(img.tagName, 'IMG', src);
+    assert.equal(img.getAttribute('src'), src, src);
+  }
+  assert.equal(sanitizedElement('<img src="/home/dev/demo.mp4">').tagName, 'VIDEO');
+  assert.equal(sanitizedElement('<video src="http://localhost/clip.mp4"></video>').tagName, 'VIDEO');
 });
 
 test('disallowed tags are still flattened to text', () => {

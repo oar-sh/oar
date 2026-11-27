@@ -61,7 +61,7 @@ oar/
 │   ├── deepseek-worker/            # DeepSeek session worker (the Claude worker against DeepSeek's Anthropic-compatible API)
 │   ├── grok-worker/                # Grok CLI session worker over ACP
 │   ├── migrations/                 # Database migrations
-│   ├── public/                     # Browser app (index.html, app/ modules, PWA shell)
+│   ├── public/                     # Browser app (index.html, app/ modules, PWA shell, vendor/ browser libraries)
 │   ├── repositories/               # SQLite data access
 │   ├── routes/                     # Express route registration
 │   ├── services/                   # Relay services (workers, usage, images, tunnels, previews, updates)
@@ -813,7 +813,7 @@ Run the worker manually against a live relay:
 COPILOT_WEB_RELAY_WORKER_KIND=copilot-sdk \
 COPILOT_SDK_PATH=~/.cache/copilot/pkg/linux-x64/<version>/copilot-sdk \
 COPILOT_WORKSPACE_ROOT=/path/to/workspace \
-COPILOT_RELAY_MODEL=gpt-5.4-mini \
+COPILOT_RELAY_MODEL=gpt-6-luna \
 node server/copilot-worker/copilot-sdk-session-worker.mjs --session-id <sdk-session-id>
 ```
 
@@ -834,8 +834,9 @@ bundles) fall back to the event-scraped detached-shell tracking: non-stoppable s
 expiry that forgets the shell (the runner's `DEFAULT_BACKGROUND_TASK_TIMEOUT_MS`, 30 min, applies only
 when no getter is supplied, i.e. in tests). Stopping the runtime still kills its detached children.
 
-Live testing spends real Copilot quota: **`gpt-5.4-mini` is the only sanctioned model for live
-relay tests**, per the standing live-testing policy, and only with the user's explicit go-ahead.
+Live testing spends real Copilot quota: **the cheapest Copilot model the runtime lists
+(`gpt-6-luna` as of 11/2026) is the only sanctioned model for live relay tests**, per the standing
+live-testing policy, and only with the user's explicit go-ahead.
 Everything else belongs in the unit suites, which drive the worker against a fake SDK client.
 
 ## The stall watchdog
@@ -1094,8 +1095,14 @@ using `/usr/bin/node`.
 Unit tests are colocated as `*.test.mjs` and run with the Node test runner:
 
 ```bash
-npm test
+npm test           # quiet: prints only failing tests (with their file's stderr) and a summary line
+npm run test:verbose   # the same run with Node's spec reporter: every test, passing or not
 ```
+
+`npm test` uses `scripts/node-test-failures-reporter.mjs`, so a green run is a single line. That
+keeps the output short where a tool or an agent reads it; use `test:verbose` to watch a run. While it
+runs, a progress line (`… N tests done, F failed (Ts)`) shows that it moves: rewritten in place on a
+terminal, a new line every 30 seconds in a log or a pipe. `OAR_TEST_PROGRESS=0` turns it off.
 
 Expected: **0 fail** everywhere; **9724 pass / 11 skip on Linux (0.9.27, 2026-11-12)** — the count
 grows with every change, so treat it as a floor. The Linux skips are Windows-only checks (drives, the generated
@@ -1295,6 +1302,17 @@ relay, and no test can turn them off.
 Each is escaped file-wide by naming `path.posix` / `path.win32` / `win32`, gating with `skip`, or
 annotating a line `host-platform:` (real host behavior is under test) or `platform-agnostic:` (the
 value never reaches path semantics — e.g. an HTTP route path, which is `/`-separated everywhere).
+
+## Browser libraries
+
+The page loads no code from a third-party server. marked, KaTeX (with mhchem and its fonts) and
+highlight.js are exact-version devDependencies (`marked`, `katex`, `@highlightjs/cdn-assets`, the
+package that holds highlight.js's prebuilt browser files), and `scripts/vendor-browser-libs.mjs`
+copies the files the page needs, unchanged, from `node_modules` into `server/public/vendor/<package>@<version>/`
+with a `manifest.json` (SHA-256 and the SRI hash `index.html` uses). To upgrade one: change its
+version in `package.json`, `npm ci --ignore-scripts`, run `node scripts/vendor-browser-libs.mjs`,
+then update the paths and `integrity` values in `index.html` and the vendor entries in
+`server/public/sw.js`; `server/vendor-browser-libs.test.mjs` fails until all of them agree.
 
 ## Notes
 

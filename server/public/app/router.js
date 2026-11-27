@@ -8,6 +8,7 @@ import {
   WORKSPACE_FILE_EXTENSIONS,
   serverPlatform,
 } from './store.js';
+import { isRemotePreviewSource } from './external-link-policy.mjs';
 import { mathAppliesTo, setMathEnabled, texForKatex } from './markdown-math.mjs';
 
 export function workspaceMentionRegex() {
@@ -289,6 +290,23 @@ function isAllowedPreviewAttribute(tagName, name, value) {
   return false;
 }
 
+// A picture, clip or sound from another origin is never loaded (see
+// external-link-policy.mjs): sanitizePreviewHtml shows a link instead.
+
+// What a remote picture, clip or sound becomes: a link to it (opens in a new
+// tab, no opener, no referrer) saying what it was, the alt text or the address.
+// Inside a link already, only the text: links do not nest.
+function remoteMediaLinkReplacement(element, src) {
+  const label = String(element.getAttribute('alt') || element.getAttribute('title') || '').trim() || src;
+  if (element.closest('a')) return document.createTextNode(label);
+  const link = document.createElement('a');
+  link.setAttribute('href', src);
+  link.setAttribute('target', '_blank');
+  link.setAttribute('rel', 'noopener noreferrer');
+  link.textContent = label;
+  return link;
+}
+
 const EMBED_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'm4v', 'mov']);
 const EMBED_AUDIO_EXTENSIONS = new Set(['mp3', 'm4a', 'ogg', 'opus', 'wav', 'flac']);
 
@@ -339,6 +357,12 @@ export function sanitizePreviewHtml(html) {
       // attribute filter would strip them — this is what lets agents embed
       // media by plain path instead of a hand-encoded /api/drives/file URL.
       const rawSrc = String(element.getAttribute('src') || '').trim();
+      // Another origin's picture, clip or sound is never loaded (see
+      // isRemotePreviewSource): a link to it stands in its place.
+      if (isSafePreviewUrl(rawSrc, tagName === 'img') && isRemotePreviewSource(rawSrc)) {
+        element.replaceWith(remoteMediaLinkReplacement(element, rawSrc));
+        continue;
+      }
       // Only genuine local-path shapes may be resolved; anything else that
       // fails the safe-URL check (javascript:, vbscript:, …) must simply die,
       // not be laundered into a workspace href by the resolver.

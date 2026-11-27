@@ -140,7 +140,7 @@ async function bootLiveTurn(t, { WebSocketServerImpl, laterSends = null } = {}) 
   await waitFor(() => delivered.includes('q-1'), { label: 'q-1 delivered over the socket' });
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'q-1 is live' });
   await waitFor(() => relay.service.status().readyCount === 1, { label: 'the steerable turn re-armed the relay' });
-  const openCard = () => client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'Proceed?', choices: ['yes', 'no'] });
+  const openCard = () => client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'Proceed?', choices: ['yes', 'no'] });
   return { offers, relay, stub, client, runner, bridge, delivered, openCard, answer };
 }
 

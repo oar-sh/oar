@@ -34,8 +34,8 @@
 //     (`relay.model-switch-unconfirmed`, naming requested vs actual), and the
 //     prompt is never sent on the wrong model.
 //   * BYOK — `apply` returns `{ ok: false }` instead of throwing, because the
-//     caller has a second mechanism (dispose + resume with a rebuilt
-//     `SessionConfig.provider`) that this module knows nothing about. An
+//     caller has a second mechanism (dispose + resume with rebuilt
+//     `inference.providers`/`inference.models`) that this module knows nothing about. An
 //     effort the model is known not to support is skipped SILENTLY for BYOK
 //     (openai-compatible ceilings and effort vocabularies differ per provider).
 //

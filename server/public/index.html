@@ -23,21 +23,33 @@
 <script>
   window.__COPILOT_APP_CONFIG = { basePath: '' };
   const __APP_CONFIG = window.__COPILOT_APP_CONFIG;
-  const __deriveBasePathFromLocation = () => {
-    const path = String(window.location.pathname || '/');
-    const sharedIdx = path.indexOf('/shared/');
-    if (sharedIdx >= 0) {
-      return path.slice(0, sharedIdx).replace(/\/+$/, '');
+  // The same functions as app/app-base.mjs (app-base.test.mjs keeps them
+  // identical): a base taken from the address stays a plain path on this
+  // origin, and the base goes into written HTML only escaped.
+  // app-base:start
+  function appBaseFromPathname(pathname) {
+    const path = String(pathname || '/');
+    const sharedIndex = path.indexOf('/shared/');
+    const previewIndex = path.indexOf('/share-preview/');
+    const end = sharedIndex >= 0 ? sharedIndex : previewIndex >= 0 ? previewIndex : path.length;
+    const base = path.slice(0, end).replace(/\/+$/, '');
+    if (!/^(?:\/[A-Za-z0-9._~%-]+)*$/.test(base)) return '';
+    try {
+      const decoded = decodeURIComponent(base);
+      return decoded.includes('//') || decoded.includes('\\') ? '' : base;
+    } catch {
+      return '';
     }
-    const previewIdx = path.indexOf('/share-preview/');
-    if (previewIdx >= 0) {
-      return path.slice(0, previewIdx).replace(/\/+$/, '');
-    }
-    return path.replace(/\/+$/, '');
-  };
+  }
+  function escapeHtmlAttribute(value) {
+    return String(value).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  }
+  // app-base:end
   const __APP_BASE = typeof __APP_CONFIG?.basePath === 'string' && __APP_CONFIG.basePath.trim()
     ? __APP_CONFIG.basePath.replace(/\/+$/, '')
-    : __deriveBasePathFromLocation();
+    : appBaseFromPathname(window.location.pathname);
+  // The base as it goes into an attribute of document.write'd HTML.
+  const __APP_BASE_ATTR = escapeHtmlAttribute(__APP_BASE);
   const __IS_SHARED_ROUTE = typeof __APP_CONFIG?.sharedToken === 'string' && __APP_CONFIG.sharedToken.trim().length > 0;
   const __PWA_VERSION = '1';
   __APP_CONFIG.pwaVersion = __PWA_VERSION;
@@ -206,13 +218,17 @@
     ];
   };
   const __themeAssetLinkHtml = (theme) => __themeAssetLinks(theme)
-    .map((link) => `<link data-theme-asset="1" ${Object.entries(link).map(([key, value]) => `${key}="${value}"`).join(' ')}>`)
+    .map((link) => `<link data-theme-asset="1" ${Object.entries(link).map(([key, value]) => `${key}="${escapeHtmlAttribute(value)}"`).join(' ')}>`)
     .join('');
   document.write(__themeAssetLinkHtml(__STORED_THEME));
-  document.write(`<style>
-    .brand-logo { background-image: url("${__APP_BASE}/app-icon.svg?${__PWA_BUST}"); }
-    :root[data-theme="light"] .brand-logo { background-image: url("${__APP_BASE}/app-icon-light.svg?${__PWA_BUST}"); }
-  </style>`);
+  // Built as an element, not written HTML: the base goes into CSS strings,
+  // where only CSS escaping holds (and textContent cannot end the element).
+  const __brandLogoStyle = document.createElement('style');
+  __brandLogoStyle.textContent = `
+    .brand-logo { background-image: url("${CSS.escape(`${__APP_BASE}/app-icon.svg?${__PWA_BUST}`)}"); }
+    :root[data-theme="light"] .brand-logo { background-image: url("${CSS.escape(`${__APP_BASE}/app-icon-light.svg?${__PWA_BUST}`)}"); }
+  `;
+  document.head.appendChild(__brandLogoStyle);
   // A Theme change swaps them in place (settings-modal's updateTheme).
   window.__applyThemeAssets = (theme) => {
     const next = theme === 'light' ? 'light' : 'dark';
@@ -221,16 +237,16 @@
   };
 </script>
 <title>OAR — Open Agent Relay</title>
-<script>document.write('<scr'+'ipt src="'+__APP_BASE+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
-<script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/katex.min.css" integrity="sha384-WwGtaC6ywCHxA5cstpj/3+xIZvTez8dq2IcBQaXRkenHZ7FVVq1ZROtURwfbtTlG" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/katex.min.js" integrity="sha384-a1WQdjRj162i159OYq041X6I4K8NenkrI09LlPmiHg0YOb7CR+wJOraXwK9abpnE" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/contrib/mhchem.min.js" integrity="sha384-fB8BH//9nBzROkMUsu/Dr35jWHIbnKesUo9rW0hfEgw8mZGnkAyBAjKX9F98OVuo" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/nginx.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/powershell.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/x86asm.min.js"></script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/socket.io/socket.io.js"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/marked@15.0.12/marked.min.js" integrity="sha384-948ahk4ZmxYVYOc+rxN1H2gM1EJ2Duhp7uHtZ4WSLkV4Vtx5MUqnV+l7u9B+jFv+"><\/scr'+'ipt>');</script>
+<script>document.write('<link rel="stylesheet" href="'+__APP_BASE_ATTR+'/vendor/katex@0.19.1/dist/katex.min.css" integrity="sha384-WwGtaC6ywCHxA5cstpj/3+xIZvTez8dq2IcBQaXRkenHZ7FVVq1ZROtURwfbtTlG">');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/katex@0.19.1/dist/katex.min.js" integrity="sha384-a1WQdjRj162i159OYq041X6I4K8NenkrI09LlPmiHg0YOb7CR+wJOraXwK9abpnE"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/katex@0.19.1/dist/contrib/mhchem.min.js" integrity="sha384-fB8BH//9nBzROkMUsu/Dr35jWHIbnKesUo9rW0hfEgw8mZGnkAyBAjKX9F98OVuo"><\/scr'+'ipt>');</script>
+<script>document.write('<link rel="stylesheet" href="'+__APP_BASE_ATTR+'/vendor/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css" integrity="sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH">');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/@highlightjs/cdn-assets@11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/@highlightjs/cdn-assets@11.9.0/languages/nginx.min.js" integrity="sha384-p6UV3HZc7zs9wUF6j4Knk3bpx1/JnhlwDoFnKJAOogB1cUi32u31NlnZ2s2dW8IR"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/@highlightjs/cdn-assets@11.9.0/languages/powershell.min.js" integrity="sha384-LWJZQx0dgGhEK7snfNYrQs5K+QKD1sOmE02sOQCz4br9UmqSJDvPLoUVFaUyFnjq"><\/scr'+'ipt>');</script>
+<script>document.write('<scr'+'ipt src="'+__APP_BASE_ATTR+'/vendor/@highlightjs/cdn-assets@11.9.0/languages/x86asm.min.js" integrity="sha384-eKsHYF6apOh4wN/zUOnYUx5s4086rCTH2ZG0R09R49HLu6/1Kn/6J7Zn6M8++8On"><\/scr'+'ipt>');</script>
 <script>
   if (window.hljs && typeof window.hljs.registerAliases === 'function') {
     window.hljs.registerAliases(['pwsh', 'ps1'], { languageName: 'powershell' });
@@ -3700,6 +3716,25 @@
   .media-tile-archived img,
   .media-tile-archived video {
     opacity: 0.6;
+  }
+  /* A picture or video on another site is not loaded: its place says where it lives. */
+  .media-tile-remote {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: calc(4px * var(--ui-scale));
+    padding: calc(6px * var(--ui-scale));
+    color: var(--muted);
+    border: 1px dashed var(--border);
+  }
+  .media-tile-remote-icon { font-size: calc(28px * var(--ui-scale)); line-height: 1; }
+  .media-tile-remote-host {
+    max-width: 100%;
+    font-size: var(--fs-meta-md);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .media-tile-badge,
   .media-tile-play {

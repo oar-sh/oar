@@ -88,10 +88,80 @@ test('the Media tab is a grid under month headers; tiles are lazy pictures or vi
   assert.ok(tiles[1].querySelector('.media-tile-play'));
   assert.equal(tiles[2].querySelector('.media-tile-badge').textContent, '✨');
   assert.ok(tiles[2].classList.contains('media-tile-archived'));
-  assert.equal(tiles[3].querySelector('img').getAttribute('src'), 'https://images.example.test/r.jpg');
-  assert.equal(tiles[3].querySelector('img').referrerPolicy, 'no-referrer');
+  // A picture on another site is a placeholder: nothing to request.
+  assert.equal(tiles[3].querySelector('img, video, source'), null);
+  assert.ok(tiles[3].classList.contains('media-tile-remote'));
+  assert.equal(tiles[3].querySelector('.media-tile-remote-host').textContent, 'images.example.test');
+  assert.equal(tiles[3].querySelector('.media-tile-badge').textContent, '🤖 🌐');
   assert.match(host.querySelector('.media-gallery-status').textContent, /2 missing files are not shown\./);
   assert.equal(host.querySelector('.media-gallery-filters'), null, 'a session gallery has no filters');
+});
+
+test('a remote picture or video is a placeholder tile: the host as text, nothing that requests the address', async () => {
+  const host = document.createElement('div');
+  const evil = 'https://evil.example.test/a"b<c>.png?x=<script>alert(1)</script>';
+  const api = fakeApi({
+    'media:': {
+      items: [
+        item(1, { contentUrl: null, remoteUrl: 'https://images.example.test:8443/r.jpg?leak=secret', path: null }),
+        item(2, { contentUrl: null, remoteUrl: 'https://clips.example.test/c.mp4', mediaKind: 'video', mime: 'video/mp4', path: null }),
+        item(3, { contentUrl: null, remoteUrl: evil, path: null }),
+        item(4, { contentUrl: null, remoteUrl: 'javascript:alert(1)', path: null }),
+        item(5),
+        item(6, { contentUrl: null, remoteUrl: 'http://localhost/api/media/6/content?t=abc', path: null }),
+      ],
+      nextCursor: null,
+      missingHidden: 0,
+      indexing: { pending: 0 },
+    },
+  });
+  const gallery = mountMediaGallery(host, { fetchJson: api.fetchJson, observe: false });
+  await gallery.firstPage;
+  const tiles = [...host.querySelectorAll('.media-tile')];
+  assert.equal(tiles.length, 6);
+  // Only the relay's own pictures (its route, or an address of this origin) have an element with an address.
+  assert.deepEqual([...host.querySelectorAll('[src], [data-src], [srcset], [poster], source, link')].map((n) => `${n.tagName} ${n.getAttribute('src')}`), [`IMG ${mediaUrl(5)}`, 'IMG http://localhost/api/media/6/content?t=abc']);
+  assert.equal(tiles[5].classList.contains('media-tile-remote'), false);
+  assert.equal(host.innerHTML.includes('secret'), false);
+  assert.equal(host.innerHTML.includes('leak='), false);
+  assert.equal(tiles[0].querySelector('.media-tile-remote-host').textContent, 'images.example.test:8443');
+  assert.equal(tiles[0].querySelector('.media-tile-remote-icon').textContent, '🖼️');
+  assert.equal(tiles[1].querySelector('.media-tile-remote-icon').textContent, '🎞️');
+  assert.equal(tiles[1].querySelector('.media-tile-remote-host').textContent, 'clips.example.test');
+  assert.equal(tiles[2].querySelector('.media-tile-remote-host').textContent, 'evil.example.test');
+  // Not an address of the web: its text, as text.
+  assert.equal(tiles[3].querySelector('.media-tile-remote-host').textContent, 'javascript:alert(1)');
+  assert.equal(host.querySelector('a, script'), null);
+  // Still a button that opens the viewer, in the grid like the others.
+  assert.equal(tiles[0].tagName, 'BUTTON');
+  assert.equal(tiles[0].dataset.mediaIndex, '0');
+  assert.equal(tiles[4].classList.contains('media-tile-remote'), false);
+});
+
+test('the remote placeholder is styled with the theme variables', () => {
+  const rule = /\.media-tile-remote \{([^}]*)\}/.exec(indexHtml);
+  assert.ok(rule, 'a rule for remote tiles');
+  assert.match(rule[1], /color: var\(--muted\)/);
+  assert.match(rule[1], /border: 1px dashed var\(--border\)/);
+  assert.doesNotMatch(rule[1], /#[0-9a-f]{3,6}\b/i, 'no fixed colours: dark and light both follow the variables');
+});
+
+test('opening a remote tile gives the viewer an item with no address to load', async () => {
+  const host = document.createElement('div');
+  const api = fakeApi({ 'media:': { items: [item(1, { contentUrl: null, remoteUrl: 'https://images.example.test/r.jpg', path: null }), item(2)], nextCursor: null, missingHidden: 0, indexing: { pending: 0 } } });
+  const opened = [];
+  const gallery = mountMediaGallery(host, {
+    fetchJson: api.fetchJson,
+    observe: false,
+    viewer: async () => ({ openGalleryItem: async (viewerItem, viewerGallery) => opened.push({ viewerItem, viewerGallery }), closeFilePreview() {} }),
+  });
+  await gallery.firstPage;
+  host.querySelectorAll('.media-tile')[0].click();
+  await settle();
+  await settle();
+  assert.equal(opened[0].viewerItem.href, '');
+  assert.deepEqual(opened[0].viewerItem.remote, { text: 'https://images.example.test/r.jpg', href: 'https://images.example.test/r.jpg', host: 'images.example.test' });
+  assert.equal(opened[0].viewerGallery.items[1].remote, null, 'its neighbour is a relay file');
 });
 
 test('pages append into the month already shown; the Files tab is a list', async () => {

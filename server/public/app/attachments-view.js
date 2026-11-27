@@ -69,9 +69,10 @@ import {
   eventClosest,
 } from './router.js';
 import { buildDownloadLink } from './file-version.mjs';
+import { mediaRemoteCard } from './media-gallery-model.mjs';
 import { fileSrcAttribute, signFileUrls, withCachedFileCapability } from './file-capability.mjs';
 import { markdownHeadingId, resolveFilePreviewLink } from './file-preview-navigation.mjs';
-import { openExternalNavigation } from './external-link-policy.mjs';
+import { isRemotePreviewSource, openExternalNavigation } from './external-link-policy.mjs';
 import { attachCodeCopyButtons } from './code-copy.mjs';
 import { createControlsState } from './viewer-controls-state.mjs';
 import { createTapRecognizer } from './viewer-tap.mjs';
@@ -85,6 +86,7 @@ import {
   galleryPositionLabel,
   galleryCanStep,
   extendGallery,
+  normalizeVideoPreviewOptions,
 } from './viewer-gallery.mjs';
 import {
   deepestExistingAncestor,
@@ -118,16 +120,6 @@ function isAudioMimeType(mimeType) {
 // column; the others are shown edge to edge on black, or as a card.
 const TEXT_PREVIEW_KINDS = new Set(['markdown', 'code', 'text']);
 const DARK_PREVIEW_KINDS = new Set(['image', 'video', 'audio']);
-
-function normalizeVideoPreviewOptions(options = {}) {
-  const startSeconds = Math.max(0, Number(options?.startSeconds ?? options?.startAtSeconds ?? 0) || 0);
-  const preload = String(options?.preload || 'metadata').toLowerCase();
-  return {
-    startSeconds,
-    preload: preload === 'auto' ? 'auto' : 'metadata',
-    autoplay: options?.autoplay === true,
-  };
-}
 
 function currentWorkspaceRootPathForSelection() {
   return String(getConversationCurrentWorkspaceRootPath(currentConversationId()) || workspaceRootPath || '').trim();
@@ -239,7 +231,7 @@ export function renderAttachmentMarkup(attachments, { messageId = '' } = {}) {
           </div>`
         : '';
       const isAudio = isAudioMimeType(att?.type);
-      if ((isImage || isVideo || isAudio) && rawUrl) {
+      if ((isImage || isVideo || isAudio) && rawUrl && !isRemotePreviewSource(rawUrl)) {
         // Opened by the conversation's click handler (see
         // viewer-chat-gallery.mjs), which also finds the other media around it.
         const mediaKind = isVideo ? 'video' : (isAudio ? 'audio' : 'image');
@@ -1240,11 +1232,12 @@ export function openUploadedAttachmentViewer(name, contentUrl, mimeType, options
     viewerOptions,
     gallery: options?.gallery || null,
     payload: {
-      kind: uploadPreviewKind(mimeType),
+      kind: options?.remote ? 'remote' : uploadPreviewKind(mimeType), // another site's picture: a card, never loaded
       name: String(name || 'attachment'),
-      rawUrl: String(contentUrl || ''),
+      rawUrl: options?.remote ? '' : String(contentUrl || ''),
       size: Number(options?.size) > 0 ? Number(options.size) : 0,
       contentType: String(mimeType || '').toLowerCase(),
+      remote: options?.remote || null,
     },
   });
   showFilePreviewModal();
@@ -1261,7 +1254,7 @@ export function openGalleryItem(item, gallery) {
   if (!item) return Promise.resolve(false);
   const source = item.source || gallery?.source || 'workspace';
   if (source === 'upload') {
-    openUploadedAttachmentViewer(item.name, item.href, item.mime, { gallery, size: item.size });
+    openUploadedAttachmentViewer(item.name, item.href, item.mime, { gallery, size: item.size, remote: item.remote || null });
     return Promise.resolve(true);
   }
   const open = source === 'workspace' ? openWorkspaceFilePreview : openDriveFilePreview;
@@ -1309,6 +1302,7 @@ export function renderFilePreview() {
   const download = filePreviewState.source === 'upload'
     ? { href: rawHref, downloadName: plainName }
     : buildDownloadLink({ href: rawHref, name: plainName, version: payload?.version, mtimeMs: payload?.mtimeMs });
+  rawLink.style.display = filePreviewState.payload?.kind === 'remote' ? 'none' : '';
   rawLink.href = download.href || '#';
   rawLink.setAttribute('download', download.downloadName || plainName);
   rawLink.textContent = 'Download';
@@ -1346,7 +1340,7 @@ export function renderFilePreview() {
     return;
   }
 
-  const kindLabel = String(payload.kind || 'text').toUpperCase();
+  const kindLabel = payload.kind === 'remote' ? mediaRemoteCard(payload.remote).title : String(payload.kind || 'text').toUpperCase();
   const langLabel = payload.language ? ` · ${payload.language}` : '';
   const truncatedLabel = payload.truncated ? ` · truncated to ${formatBytes(FILE_PREVIEW_MAX_BYTES)}` : '';
   // An attachment opened by its address may come without a size: no "0 B" then.
@@ -1355,6 +1349,12 @@ export function renderFilePreview() {
 
   const cardMeta = payload.size > 0 ? formatBytes(payload.size) : '';
 
+  if (payload.kind === 'remote') {
+    const card = mediaRemoteCard(payload.remote);
+    bodyEl.innerHTML = fileCardMarkup({ icon: '🌐', name: card.name, meta: card.meta, actions: card.href ? `<a class="file-preview-btn" href="${escHtml(card.href)}" target="_blank" rel="noopener noreferrer">${escHtml(card.label)}</a>` : '' });
+    bodyEl.classList.add('card-preview-mode');
+    return;
+  }
   if (payload.kind === 'binary') {
     bodyEl.innerHTML = fileCardMarkup({
       icon: '📦',
@@ -1665,7 +1665,7 @@ function prefetchGalleryNeighbors() {
     const source = item.source || gallery.source;
     if (source === 'upload') {
       // An attachment has no preview to fetch; its picture can be primed.
-      if (String(item.mime || '').startsWith('image/') && item.href) {
+      if (!item.remote && String(item.mime || '').startsWith('image/') && item.href) {
         const image = new Image();
         image.src = item.href;
       }

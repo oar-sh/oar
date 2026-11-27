@@ -4,10 +4,16 @@ import test from 'node:test';
 import {
   mediaCaption,
   mediaCopyTarget,
+  mediaHref,
+  mediaRemote,
+  mediaRemoteCard,
   mediaViewerGallery,
   mediaViewerItem,
 } from './media-gallery-model.mjs';
 import { extendGallery, galleryCanStep, galleryPositionLabel } from './viewer-gallery.mjs';
+
+// The page's origin, as the browser has it (relative and protocol-relative addresses resolve against it).
+globalThis.window = { location: { origin: 'http://localhost' } };
 
 // The address the relay hands out: the route with the item's tag (a made-up one here).
 const mediaUrl = (id) => `/api/media/${id}/content?t=${`tag${id}`.padEnd(22, 'x')}`;
@@ -36,14 +42,38 @@ test('a media item becomes an upload-style viewer item with its own address', ()
     key: 'media:3',
     source: 'upload',
     href: `/base${mediaUrl(3)}`,
+    remote: null,
     name: 'p3.png',
     mime: 'image/png',
     size: 0,
     media: item(3),
   });
   const remote = mediaViewerItem(item(4, { contentUrl: null, remoteUrl: 'https://images.example.test/a.jpg', mime: null }));
-  assert.equal(remote.href, 'https://images.example.test/a.jpg');
-  assert.equal(remote.mime, 'image/png', 'a remote picture still opens as a picture');
+  assert.equal(remote.href, '', 'a picture on another site has no address to load');
+  assert.deepEqual(remote.remote, { text: 'https://images.example.test/a.jpg', href: 'https://images.example.test/a.jpg', host: 'images.example.test' });
+  assert.equal(remote.mime, 'image/png');
+  assert.equal(mediaViewerItem(item(3)).remote, null);
+});
+
+test('mediaRemote: a link only for an http(s) address of another site, normalized; anything else is text', () => {
+  const remote = (remoteUrl) => mediaRemote(item(9, { contentUrl: null, remoteUrl }));
+  const quoted = remote('https://evil.example.test/a"b<c>.png');
+  assert.equal(quoted.host, 'evil.example.test');
+  assert.equal(quoted.href, 'https://evil.example.test/a%22b%3Cc%3E.png', 'quotes and angle brackets are encoded in the link');
+  assert.deepEqual(remote('javascript:alert(1)'), { text: 'javascript:alert(1)', href: '', host: '' });
+  assert.deepEqual(remote('data:text/html,<b>x</b>'), { text: 'data:text/html,<b>x</b>', href: '', host: '' });
+  assert.deepEqual(remote('ftp://files.example.test/a.png'), { text: 'ftp://files.example.test/a.png', href: '', host: '' });
+  assert.equal(remote('//cdn.example.test/a.png').host, 'cdn.example.test', 'protocol-relative is another host');
+  assert.equal(remote(''), null);
+  // An absolute address of this very origin is a relay file like any other: loaded.
+  const own = item(9, { contentUrl: null, remoteUrl: 'http://localhost/api/media/9/content?t=abc' });
+  assert.equal(mediaRemote(own), null);
+  assert.equal(mediaHref(own), 'http://localhost/api/media/9/content?t=abc');
+  assert.equal(mediaViewerItem(own).remote, null);
+  assert.equal(mediaRemoteCard(remote('https://x.example.test/a.png')).title, 'Hosted on x.example.test');
+  assert.equal(mediaRemoteCard(remote('javascript:alert(1)')).title, 'Not a web address');
+  assert.equal(mediaRemote(item(1)), null, 'a relay file is not remote');
+  assert.equal(mediaHref(item(9, { contentUrl: null, remoteUrl: 'https://x.example.test/a.png' })), '');
 });
 
 test('the caption names the session, the date, the sender and repeats', () => {

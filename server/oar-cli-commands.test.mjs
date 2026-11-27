@@ -820,6 +820,8 @@ test('oar update removes the Copilot CLI wrapper an earlier version wrote, and l
     const result = await main({ ...options, argv: ['update', '--to', '9.9.10'] });
     assert.deepEqual(result, { code: 0, reason: 'updated' });
     assert.ok(npm.some((args) => args.includes('@oar-sh/oar@9.9.10')), 'npm installs the new version');
+    // No install script of OAR or of a dependency runs during the update.
+    assert.ok(npm.some((args) => /^install -g --ignore-scripts (.* )?@oar-sh\/oar@9\.9\.10$/.test(args)), `npm installs with --ignore-scripts: ${npm.join(' | ')}`);
     if (handMade) {
       assert.equal(fs.readFileSync(wrapper, 'utf8'), source, 'byte-identical');
       assert.doesNotMatch(install.output(), /Copilot CLI wrapper/);
@@ -828,6 +830,62 @@ test('oar update removes the Copilot CLI wrapper an earlier version wrote, and l
       assert.match(install.output(), /Removed the Copilot CLI wrapper an earlier version wrote: .*web-relay[\\/]extension\.mjs/);
     }
   }
+});
+
+// Where no SQLite binding ships (here: an injected Termux), with the checks
+// before the install and the fallback after it faked.
+function sourceBuildUpdate(install, selfUpdateNative) {
+  const npm = [];
+  const options = install.options({
+    platform: 'android',
+    arch: 'arm64',
+    selfUpdateNative,
+    spawnImpl: (command, args) => {
+      npm.push(args.join(' '));
+      const child = {
+        on(event, listener) {
+          if (event === 'close') setImmediate(() => listener(0));
+          return child;
+        },
+      };
+      return child;
+    },
+  });
+  return { npm, run: () => main({ ...options, argv: ['update', '--to', '9.9.10'] }) };
+}
+
+test('oar update where the binding cannot be built refuses before npm installs anything', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const { npm, run } = sourceBuildUpdate(install, {
+    prepare: async () => ({ ok: false, error: 'node-gyp was not found', reason: 'its SQLite binding could not be built here (node-gyp was not found)', hint: 'Install node-gyp: npm install -g --ignore-scripts node-gyp, then update again.' }),
+    finish: async () => assert.fail('no build'),
+    discard: () => {},
+  });
+  assert.deepEqual(await run(), { code: 1, reason: 'native-preflight' });
+  assert.deepEqual(npm, []);
+  assert.match(install.output(), /Not updated to 9\.9\.10: its SQLite binding could not be built here \(node-gyp was not found\)\./);
+  assert.match(install.output(), /npm install -g --ignore-scripts node-gyp, then update again\. The running install is unchanged\./);
+});
+
+test('oar update whose build fails on a new better-sqlite3 installs the running version again', async (t) => {
+  const install = makeInstall(t, { config: EXISTING });
+  const finishes = [];
+  const { npm, run } = sourceBuildUpdate(install, {
+    prepare: async () => ({ ok: true, saved: { version: '13.0.0' } }),
+    finish: async (options) => {
+      finishes.push(options);
+      assert.equal((await options.reinstallRunning()).ok, true);
+      return { ok: false, status: 'rolled-back', build: { ok: false, error: 'make: not found' } };
+    },
+    discard: () => assert.fail('finish discards'),
+  });
+  assert.deepEqual(await run(), { code: 1, reason: 'native-build-rolled-back' });
+  const running = JSON.parse(fs.readFileSync(path.join(install.packageRoot, 'package.json'), 'utf8')).version;
+  assert.deepEqual(finishes[0].saved, { version: '13.0.0' });
+  assert.equal(finishes[0].runningVersion, running);
+  assert.deepEqual(npm.map((args) => args.split(' ').at(-1)), ['@oar-sh/oar@9.9.10', `@oar-sh/oar@${running}`]);
+  assert.ok(npm.every((args) => args.startsWith('install -g --ignore-scripts')));
+  assert.match(install.output(), new RegExp(`Not updated: 9\\.9\\.10 cannot run here without that build, so ${running.replace(/\./g, '\\.')} is installed again, whole`));
 });
 
 // ─── WSL ─────────────────────────────────────────────────────────────────────

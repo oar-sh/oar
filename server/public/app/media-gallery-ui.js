@@ -8,6 +8,7 @@ import {
   mediaFileIcon,
   mediaHref,
   mediaQuery,
+  mediaRemote,
   mediaSourceBadge,
   mediaViewerGallery,
 } from './media-gallery-model.mjs';
@@ -78,25 +79,29 @@ function inView(node) {
 
 function tileFor(item, index) {
   const href = mediaHref(item, BASE);
+  const remote = mediaRemote(item);
   const title = [formatMediaDate(item.timestamp), item.conversationTitle].filter(Boolean).join(' · ');
   const tile = el('button', {
     type: 'button',
-    class: `media-tile${item.archived ? ' media-tile-archived' : ''}`,
+    class: `media-tile${item.archived ? ' media-tile-archived' : ''}${remote ? ' media-tile-remote' : ''}`,
     'data-media-index': index,
     title,
     'aria-label': item.alt || item.name || MEDIA_TEXT.title,
   });
-  if (item.mediaKind === 'video') {
+  if (remote) {
+    // A picture or video on another site is never requested: a placeholder
+    // with where it lives. Opening it shows the same in the viewer, with a link.
+    tile.append(el('span', { class: 'media-tile-remote-icon', 'aria-hidden': 'true', text: item.mediaKind === 'video' ? '🎞️' : '🖼️' }));
+    tile.append(el('span', { class: 'media-tile-remote-host', text: remote.host || remote.text }));
+  } else if (item.mediaKind === 'video') {
     // The address is set when the tile comes into view (videoObserver): a
     // video's metadata is a request of its own, unlike a lazy picture.
     tile.append(el('video', { 'data-src': `${href}#t=0.1`, preload: 'metadata', muted: true, playsInline: true, tabIndex: -1 }));
     tile.append(el('span', { class: 'media-tile-play', 'aria-hidden': 'true', text: '▶' }));
   } else {
-    const img = el('img', { src: href, alt: item.alt || '', loading: 'lazy', decoding: 'async' });
-    if (item.remoteUrl) img.referrerPolicy = 'no-referrer';
-    tile.append(img);
+    tile.append(el('img', { src: href, alt: item.alt || '', loading: 'lazy', decoding: 'async' }));
   }
-  const badge = mediaSourceBadge(item).split(' ')[0] + (item.remoteUrl ? ` ${MEDIA_TEXT.remote}` : '');
+  const badge = mediaSourceBadge(item).split(' ')[0] + (remote ? ` ${MEDIA_TEXT.remote}` : '');
   tile.append(el('span', { class: 'media-tile-badge', 'aria-hidden': 'true', text: badge }));
   return tile;
 }

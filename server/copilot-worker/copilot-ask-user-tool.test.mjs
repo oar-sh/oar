@@ -78,14 +78,14 @@ async function openTurn(client, runner, message = baseMessage) {
 test('the session registers the relay ask_user as an override of the built-in', async () => {
   const { client, runner } = setup();
   const { pending } = await openTurn(client, runner);
-  const tools = client.createAttempts[0].tools;
+  const tools = client.createAttempts[0].tools.definitions;
   assert.equal(tools.length, 1);
   assert.equal(tools[0].name, 'ask_user');
   assert.equal(tools[0].overridesBuiltInTool, true);
   assert.equal(tools[0].skipPermission, true);
   assert.equal(typeof tools[0].handler, 'function');
   // The built-in path stays wired for a runtime that refuses the override.
-  assert.equal(typeof client.createAttempts[0].onUserInputRequest, 'function');
+  assert.equal(typeof client.createAttempts[0].interaction.onUserInputRequest, 'function');
   client.session.emit({ type: 'assistant.idle', data: {} });
   await pending;
 });
@@ -98,7 +98,7 @@ test('a multi_select call raises a multi-select card, holds steering while it is
   const { pending } = await openTurn(client, runner);
   await waitFor(() => runner.canAcceptSteering() === true, { label: 'steerable' });
 
-  const handler = client.createAttempts[0].tools[0].handler;
+  const handler = client.createAttempts[0].tools.definitions[0].handler;
   const result = handler({ question: 'Which toppings?', choices: ['cheese', 'ham', 'mushrooms'], multi_select: true }, { toolCallId: 'c1' });
   await waitFor(() => questionBridge.userInputCalls.length === 1, { label: 'card raised' });
   const request = questionBridge.userInputCalls[0].request;
@@ -123,7 +123,7 @@ test('a failing card answers in-band instead of throwing into the runtime', asyn
   questionBridge.askUserInput = async () => { throw new Error('relay down'); };
   const { client, runner } = setup({ questionBridge });
   const { pending } = await openTurn(client, runner);
-  const handler = client.createAttempts[0].tools[0].handler;
+  const handler = client.createAttempts[0].tools.definitions[0].handler;
   assert.equal(await handler({ question: 'q?' }), USER_INPUT_UNSUPPORTED_ANSWER);
   client.session.emit({ type: 'assistant.idle', data: {} });
   await pending;
@@ -136,12 +136,12 @@ test('a runtime that refuses the override gets a session without it; the next ru
   const resumeSession = client.resumeSession.bind(client);
   let refusals = 0;
   const refuseTools = (config) => {
-    if (!config.tools?.length) return;
+    if (!config.tools?.definitions?.length) return;
     refusals += 1;
     throw new Error('Tool "ask_user" clashes with a built-in tool');
   };
   client.createSession = async (config) => {
-    if (config.tools?.length) client.createAttempts.push(config);
+    if (config.tools?.definitions?.length) client.createAttempts.push(config);
     refuseTools(config);
     return createSession(config);
   };
@@ -152,7 +152,7 @@ test('a runtime that refuses the override gets a session without it; the next ru
   const { pending } = await openTurn(client, runner);
   assert.equal(refusals, 1);
   assert.equal('tools' in client.session.config, false, 'the fallback session has no custom tools');
-  assert.equal(typeof client.session.config.onUserInputRequest, 'function', 'the built-in path answers instead');
+  assert.equal(typeof client.session.config.interaction.onUserInputRequest, 'function', 'the built-in path answers instead');
   client.session.emit({ type: 'assistant.idle', data: {} });
   await pending;
   await runner.dispose();
@@ -179,7 +179,7 @@ test('a card is cancelled when the runtime aborts the tool call, not only when t
   const { client, runner } = setup({ questionBridge });
   const { pending } = await openTurn(client, runner);
   const invocationAbort = new AbortController();
-  const handler = client.createAttempts[0].tools[0].handler;
+  const handler = client.createAttempts[0].tools.definitions[0].handler;
   const result = handler({ question: 'q?', choices: ['a', 'b'] }, { toolCallId: 'c1', signal: invocationAbort.signal });
   await waitFor(() => questionBridge.userInputCalls.length === 1, { label: 'card raised' });
   const cardSignal = questionBridge.userInputCalls[0].options.signal;

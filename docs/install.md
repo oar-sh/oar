@@ -20,7 +20,7 @@ You need Node.js plus whatever the runtimes you actually use need. Nothing else 
 | Grok CLI, signed in | Grok chats | Install it and sign in from **⚙️ Settings → Providers → Grok**, or set `XAI_API_KEY` in the relay's environment |
 | `cloudflared` (optional) | the built-in Cloudflare tunnel | Not included; install it yourself (see [Cloudflare Tunnel](remote-access.md#optional-remote-internet-access-cloudflare-tunnel)) |
 | Python 3, make and a C++ compiler | only where better-sqlite3 ships no SQLite binding: Android (Termux), 32-bit ARM, FreeBSD | OAR builds the binding there with `oar build-native` (see [npm](#npm)). On Termux: `pkg install python clang make` |
-| Internet access in the browser (optional) | Markdown, code colours and formulas | The page loads marked, highlight.js and KaTeX 0.19.1 from jsDelivr and cdnjs, KaTeX with integrity hashes; none of them comes with OAR, and the relay host needs no access for them. A browser that cannot reach them shows replies as plain text, code without colours and formulas as they were written |
+| Internet access in the browser | nothing: Markdown, code colours and formulas work offline | marked, highlight.js and KaTeX 0.19.1 (with its fonts) come with OAR and the page loads them from the relay itself, with integrity hashes, so neither the browser nor the relay host needs internet access for them |
 | tmux (optional) | Linux and macOS | Session workers run in detached tmux sessions. Without tmux they run as plain background processes |
 
 ## macOS and Linux
@@ -45,7 +45,7 @@ The relay is started as a systemd user service where a systemd user session exis
 
 ```bash
 curl -fsSL oar.sh/install | sh -s -- --yes
-curl -fsSL oar.sh/install | OAR_VERSION=0.9.32 OAR_PORT=3400 sh
+curl -fsSL oar.sh/install | OAR_VERSION=0.9.33 OAR_PORT=3400 sh
 ```
 
 The installer needs `curl` or `wget`, and `tar` when it fetches Node.js. It has no Node.js build for musl systems (Alpine) or for CPUs other than x64 and arm64; there, install Node.js yourself first. Releases before 0.9.8 are installed the same way, but their `oar setup` cannot start the relay: see [Start the relay](#start-the-relay).
@@ -69,7 +69,7 @@ oar setup
 
 Neither OAR nor any of its dependencies has an install script, so npm 12 needs no `--allow-scripts`. The agent SDKs are not in the package: the relay downloads them when a provider needs one (see [Agent SDKs](#agent-sdks)).
 
-better-sqlite3 ships its SQLite binding for Linux, macOS and Windows on x64 and arm64. Anywhere else (Android under Termux, 32-bit ARM, FreeBSD) run `oar build-native` once after the install: it compiles the binding in the installed package and needs Python 3, make and a C++ compiler (on Termux, `pkg install python clang make` first). The relay says so when it starts without one. `oar update` and the **Update** button build it themselves on those platforms; on the others `oar build-native` has nothing to do.
+better-sqlite3 ships its SQLite binding for Linux, macOS and Windows on x64 and arm64. Anywhere else (Android under Termux, 32-bit ARM, FreeBSD) run `oar build-native` once after the install: it compiles the binding in the installed package and needs Python 3, make and a C++ compiler (on Termux, `pkg install python clang make` first). The relay says so when it starts without one. It builds with the node-gyp that comes with npm; where your npm has none, install it with `npm install -g --ignore-scripts node-gyp` (OAR does not download one itself). `oar update` and the **Update** button build it themselves on those platforms; on the others `oar build-native` has nothing to do. Before they install anything there, they check that node-gyp, Python 3, make (GNU make as `gmake` on FreeBSD) and a C++ compiler are present, and refuse the update with what to install when one is missing. If the build still fails, the new version keeps the binding the relay runs on when it comes with the same better-sqlite3; otherwise the running version is installed again, with its binding, and the update reports that it was not kept. Either way the installed package is one whole version the relay can start on, unless reinstalling the running version fails too; then the update says so and names `oar build-native`. `oar update` and the **Update** button install the new version with `npm install -g --ignore-scripts`: no dependency of OAR needs an install script, so none runs during an update.
 
 ## From a git checkout
 

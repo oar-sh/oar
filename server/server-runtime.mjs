@@ -25,7 +25,8 @@ import {
 } from './services/workspace-root-path-policy.mjs';
 import { stopSessionWorkerProcesses } from './services/session-worker-stop-service.mjs';
 import { createDetachedWorkerWatch } from './services/detached-worker-watch-service.mjs';
-import { applyCdnNoStoreHeaders, sendOwnFile } from './services/file-serving.mjs';
+import { applyCdnNoStoreHeaders, publicStaticMiddleware, sendOwnFile } from './services/file-serving.mjs';
+import { APP_SHELL_CSP } from './services/app-shell-csp.mjs';
 import { pickLiveTurnRowId } from './services/live-turn-picker.mjs';
 import { buildSteerSettleFailure, steerAgentLabelForProvider } from '../shared/steer-settle-failure.mjs';
 import { PLAN_BOARD_APPROVE_ONLY, planBoardShownActions } from '../shared/plan-board-actions.mjs';
@@ -3364,8 +3365,8 @@ function buildSessionWorkerLaunchEnvForSession(targetSessionId) {
   const settings = getOpenAIProviderSettings();
   const model = String(runtimeSession?.provider_model || runtimeSession?.model || settings.model).trim();
   // BYOK first, worker kind second: the OpenAI applier owns the
-  // COPILOT_PROVIDER_* family (the SDK worker re-expresses it as
-  // SessionConfig.provider because the runtime ignores it for SDK-created
+  // COPILOT_PROVIDER_* family (the SDK worker re-expresses it as the session's
+  // inference.providers because the runtime ignores it for SDK-created
   // sessions), and the SDK applier adds the worker kind on top.
   const openAiEnv = applyOpenAIProviderEnvironment(cleared, {
     enabled: true,
@@ -7411,9 +7412,9 @@ function isApiRequestPath(requestPath) {
 }
 
 // Baseline security headers on every response. Served-file/attachment endpoints
-// layer a stricter sandbox CSP on top (see applySafeServedContentHeaders). A
-// global script-src CSP is intentionally omitted for now: the SPA relies on
-// inline event handlers, so a strict policy needs a refactor first (follow-up).
+// layer a stricter sandbox CSP on top (see applySafeServedContentHeaders). The
+// shell's page policy (applyAppShellHeaders) still allows inline script: the
+// SPA relies on inline event handlers (dropping that is a follow-up).
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -7429,12 +7430,11 @@ app.use((req, res, next) => {
   next();
 });
 // The app shell (the page itself, a shared link's reader, "Preview as
-// shared") may be framed by this origin only: the CSP form of the
-// X-Frame-Options above, which browsers that honour CSP prefer (agent auth
-// §13.4, clickjacking). Only on the shell's HTML: a served file carries its
-// own CSP (safe-served-content.mjs; a PDF may be framed by this origin), and
-// the preview proxy is another listener with its own headers.
-const APP_SHELL_CSP = "frame-ancestors 'self'";
+// shared") gets the page policy (services/app-shell-csp.mjs): its own origin
+// only, framed by this origin only (agent auth §13.4, clickjacking). Only on
+// the shell's HTML: a served file carries its own CSP (safe-served-content.mjs;
+// a PDF may be framed by this origin), and the preview proxy is another
+// listener with its own headers.
 function applyAppShellHeaders(res) {
   res.setHeader('Content-Security-Policy', APP_SHELL_CSP);
 }
@@ -7500,7 +7500,7 @@ app.get(['/share-preview/:conversationId', '/share-preview/:conversationId/'], (
     next(error);
   }
 });
-app.use(express.static(PUBLIC_DIR, { etag: false, setHeaders: (res) => res.setHeader('Cache-Control', 'no-store') }));
+app.use(...publicStaticMiddleware(PUBLIC_DIR));
 
 // ─── CLI Status Tracking ──────────────────────────────────────────────────────
 // When the workers were last heard from, without a polling timer: the window

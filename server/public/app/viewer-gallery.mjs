@@ -66,3 +66,14 @@ export function galleryNeighbors(gallery) {
   }
   return out;
 }
+
+/** The options a video viewer opens with: where to start, how much to load, whether to play. */
+export function normalizeVideoPreviewOptions(options = {}) {
+  const startSeconds = Math.max(0, Number(options?.startSeconds ?? options?.startAtSeconds ?? 0) || 0);
+  const preload = String(options?.preload || 'metadata').toLowerCase();
+  return {
+    startSeconds,
+    preload: preload === 'auto' ? 'auto' : 'metadata',
+    autoplay: options?.autoplay === true,
+  };
+}

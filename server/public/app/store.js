@@ -12,6 +12,7 @@ import { parseGroupFoldChoices, pruneGroupFoldChoices } from './conversation-gro
 import { isPhoneLandscapeLayout, shouldCollapseListAfterPick, syncPhoneLandscapeAttribute } from './phone-landscape.mjs';
 import { FONT_SCALE_CHANGE_EVENT } from './font-scaling.js';
 import { providerSessionLabel, resolveConversationProviderType } from './conversation-provider-indicator.mjs';
+import { appBaseFromPathname } from './app-base.mjs';
 
 function resolveAppBase() {
   const configuredBase = typeof window.__COPILOT_APP_CONFIG?.basePath === 'string'
@@ -20,12 +21,7 @@ function resolveAppBase() {
   if (configuredBase && configuredBase !== '/') {
     return configuredBase.startsWith('/') ? configuredBase.replace(/\/+$/, '') : `/${configuredBase.replace(/\/+$/, '')}`;
   }
-  const pathname = String(window.location.pathname || '/');
-  const sharedIndex = pathname.indexOf('/shared/');
-  if (sharedIndex >= 0) return pathname.slice(0, sharedIndex).replace(/\/+$/, '');
-  const previewIndex = pathname.indexOf('/share-preview/');
-  if (previewIndex >= 0) return pathname.slice(0, previewIndex).replace(/\/+$/, '');
-  return pathname.replace(/\/+$/, '');
+  return appBaseFromPathname(window.location.pathname);
 }
 
 export const BASE = resolveAppBase();

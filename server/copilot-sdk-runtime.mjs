@@ -180,27 +180,216 @@ export function resolveCopilotSdkLaunchPath({
   return path.dirname(sdkPath);
 }
 
-export function buildInstalledCopilotClientOptions({
+/** The oldest Copilot SDK OAR drives: the first with the grouped options. */
+export const COPILOT_SDK_MIN_VERSION = '1.0.113';
+/** The newest Copilot SDK the grouped options were checked against. */
+export const COPILOT_SDK_NEWEST_VERIFIED = '1.0.114';
+/** Error code of `assertSupportedCopilotSdk` for an SDK older than the minimum. */
+export const COPILOT_SDK_TOO_OLD = 'copilot-sdk-too-old';
+
+/**
+ * Throw unless the imported SDK is one OAR can drive: 1.0.113 or later, read
+ * off `RuntimeConnection.forSpawnedStdio`, the connection factory 1.0.113
+ * introduced together with the grouped client and session options.
+ *
+ * - Only the older `forStdio`: the SDK is older than 1.0.113, and the error
+ *   (code COPILOT_SDK_TOO_OLD) says to update the Copilot CLI.
+ * - Neither: not an SDK OAR knows; the error names its exports.
+ *
+ * Both name the version of the bundle when it is known.
+ */
+export function assertSupportedCopilotSdk(sdk, version = '') {
+  const factories = sdk?.RuntimeConnection;
+  if (typeof factories?.forSpawnedStdio === 'function') return;
+  const named = version ? ` ${version}` : '';
+  if (typeof factories?.forStdio === 'function') {
+    const error = new Error(
+      `The installed Copilot SDK${named} is older than ${COPILOT_SDK_MIN_VERSION}, which this OAR needs. `
+      + 'Update the Copilot CLI (run `copilot` once, or install it from the relay\'s Copilot settings).',
+    );
+    error.code = COPILOT_SDK_TOO_OLD;
+    throw error;
+  }
+  const available = factories && typeof factories === 'object' ? Object.keys(factories).join(', ') : '';
+  throw new Error(
+    `The installed Copilot SDK${named} has neither RuntimeConnection.forSpawnedStdio `
+    + `nor RuntimeConnection.forStdio${available ? ` (it exports: ${available})` : ' (no RuntimeConnection export)'}; `
+    + 'this relay cannot start its runtime. Update OAR or reinstall a supported Copilot CLI.',
+  );
+}
+
+function versionParts(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version || '').trim());
+  return match ? match.slice(1).map(Number) : null;
+}
+
+/**
+ * A one-line note when the SDK bundle is newer than COPILOT_SDK_NEWEST_VERIFIED,
+ * or null. Such a bundle is driven all the same; the note is what a log reader
+ * looks for when its grouped option names have drifted.
+ */
+export function describeUnverifiedSdk(version) {
+  const bundle = versionParts(version);
+  const verified = versionParts(COPILOT_SDK_NEWEST_VERIFIED);
+  if (!bundle) return null;
+  const newer = bundle[0] - verified[0] || bundle[1] - verified[1] || bundle[2] - verified[2];
+  if (newer <= 0) return null;
+  return `Copilot SDK ${String(version).trim()} is newer than ${COPILOT_SDK_NEWEST_VERIFIED}, the newest this OAR `
+    + 'was checked against; if Copilot turns lose events, permissions or tools, its session options may have moved.';
+}
+
+/**
+ * Build the stdio connection descriptor for the runtime:
+ * `RuntimeConnection.forSpawnedStdio({ path, workingDirectory, baseDirectory })`,
+ * producing `{ kind: 'spawned-stdio', … }`. The working and base directories
+ * belong on the connection, not on the client options.
+ *
+ * `forDefault` is deliberately not used: it picks in-process hosting unless
+ * COPILOT_SDK_DEFAULT_CONNECTION says otherwise, which would load the runtime
+ * library into this process instead of spawning the pinned `app.js`.
+ *
+ * Throws as `assertSupportedCopilotSdk` does for an SDK OAR cannot drive.
+ */
+export function buildRuntimeConnection(sdk, runtimeEntry, { cwd = '', baseDirectory = '', version = '' } = {}) {
+  assertSupportedCopilotSdk(sdk, version);
+  return sdk.RuntimeConnection.forSpawnedStdio({
+    path: runtimeEntry,
+    ...(cwd ? { workingDirectory: cwd } : {}),
+    ...(baseDirectory ? { baseDirectory } : {}),
+  });
+}
+
+/**
+ * The `CopilotClient` constructor options, shared by the session worker and
+ * the relay's own clients (model discovery, session import) so the two cannot
+ * drift apart.
+ *
+ * The connection is `runtime`, `logLevel` sits under `observability`,
+ * `useLoggedInUser` under `github`, and `mode` is required (`coding-agent`
+ * unless asked otherwise). A client-level `workingDirectory` or `env` throws,
+ * and the client takes no `clientName`: that goes on each session.
+ *
+ * Unset fields are left out rather than passed as `undefined`.
+ */
+export function buildCopilotClientOptions(sdk, {
+  runtimeEntry,
+  cwd = '',
+  baseDirectory = '',
+  logLevel = '',
+  mode = '',
+  useLoggedInUser,
+  version = '',
+} = {}) {
+  return {
+    mode: mode || 'coding-agent',
+    runtime: buildRuntimeConnection(sdk, runtimeEntry, { cwd, baseDirectory, version }),
+    ...(logLevel ? { observability: { logLevel } } : {}),
+    ...(typeof useLoggedInUser === 'boolean' ? { github: { useLoggedInUser } } : {}),
+  };
+}
+
+/**
+ * Where each session option OAR builds goes in the SDK's grouped session
+ * options: `null` for a key that stays at the top level, else its
+ * `<group>.<name>`. OAR's own map, of exactly the options OAR passes; the
+ * SDK's own compatibility table for flat names is not relied on.
+ */
+export const COPILOT_SESSION_OPTION_GROUPS = Object.freeze({
+  sessionId: null,
+  model: null,
+  workingDirectory: null,
+  clientName: null,
+  suppressResumeEvent: null,
+  streaming: 'events.streaming',
+  onEvent: 'events.onEvent',
+  tools: 'tools.definitions',
+  availableTools: 'tools.availableTools',
+  onPermissionRequest: 'permissions.onRequest',
+  onUserInputRequest: 'interaction.onUserInputRequest',
+  onExitPlanModeRequest: 'interaction.onExitPlanModeRequest',
+  onElicitationRequest: 'interaction.onElicitationRequest',
+  infiniteSessions: 'state.infiniteSessions',
+});
+
+// Keys OAR may already pass as a group object (BYOK's `inference` and
+// `github`, or `tools` as an object); their fields are merged into the group.
+const COPILOT_SESSION_OPTION_GROUP_NAMES = new Set([
+  ...Object.values(COPILOT_SESSION_OPTION_GROUPS).filter(Boolean).map((leaf) => leaf.split('.')[0]),
+  'inference',
+  'github',
+]);
+
+const isPlainObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Translate OAR's flat session config into the SDK's grouped session options
+ * (see COPILOT_SESSION_OPTION_GROUPS), right before `createSession` or
+ * `resumeSession`.
+ *
+ * - Top-level keys are copied as they are; mapped keys move into their group.
+ * - `tools` as an array is the tool definitions; as an object, the group.
+ * - A group object (`inference`, `github`) is merged field by field.
+ * - `undefined` values are left out.
+ *
+ * Throws on a field set twice, and a TypeError on a key with no grouped name,
+ * so an option OAR adds later cannot be dropped silently.
+ */
+export function copilotSessionOptions(options = {}) {
+  const grouped = {};
+  const setLeaf = (group, name, value, from) => {
+    const target = grouped[group] || (grouped[group] = {});
+    if (Object.hasOwn(target, name)) throw new Error(`Copilot session option ${group}.${name} is set twice (by ${from})`);
+    target[name] = value;
+  };
+  for (const [key, value] of Object.entries(options || {})) {
+    if (value === undefined) continue;
+    const isGroupObject = COPILOT_SESSION_OPTION_GROUP_NAMES.has(key) && isPlainObject(value);
+    if (Object.hasOwn(COPILOT_SESSION_OPTION_GROUPS, key) && !isGroupObject) {
+      const leaf = COPILOT_SESSION_OPTION_GROUPS[key];
+      if (!leaf) {
+        grouped[key] = value;
+        continue;
+      }
+      const [group, name] = leaf.split('.');
+      setLeaf(group, name, value, key);
+      continue;
+    }
+    if (isGroupObject) {
+      for (const [name, field] of Object.entries(value)) {
+        if (field !== undefined) setLeaf(key, name, field, key);
+      }
+      continue;
+    }
+    throw new TypeError(`Copilot session option "${key}" has no grouped name in COPILOT_SESSION_OPTION_GROUPS`);
+  }
+  return grouped;
+}
+
+/**
+ * Options for the relay's own restricted client (model discovery and the
+ * session import sweep): `empty` mode, the logged-in user, and the CLI's
+ * session state as its persistence location.
+ */
+export function buildInstalledCopilotClientOptions(sdk, {
   cliPath,
   cwd,
   baseDirectory,
   logLevel = 'debug',
+  version = '',
 } = {}) {
-  return {
-    connection: {
-      kind: 'stdio',
-      path: cliPath,
-    },
+  return buildCopilotClientOptions(sdk, {
+    runtimeEntry: cliPath,
+    cwd,
     mode: 'empty',
-    // Runtime 1.0.83 made 'empty' mode refuse to construct without an explicit
-    // per-session persistence location. ~/.copilot is exactly what the runtime
-    // defaulted to before (baseDirectory sets COPILOT_HOME), so the import
-    // sweep keeps seeing the CLI's real session state.
+    // 'empty' mode refuses to construct without an explicit per-session
+    // persistence location, which it reads off the connection. ~/.copilot is exactly what the runtime defaulted to before
+    // (baseDirectory sets COPILOT_HOME), so the import sweep keeps seeing the
+    // CLI's real session state.
     baseDirectory: String(baseDirectory || '').trim() || path.join(os.homedir(), '.copilot'),
     useLoggedInUser: true,
     logLevel,
-    workingDirectory: cwd,
-  };
+    version,
+  });
 }
 
 export async function createInstalledCopilotClient({
@@ -211,12 +400,14 @@ export async function createInstalledCopilotClient({
 } = {}) {
   const paths = resolveInstalledCopilotPaths({ config });
   const sdk = await import(pathToFileURL(paths.sdkPath).href);
+  assertSupportedCopilotSdk(sdk, paths.version);
   if (typeof sdk.CopilotClient !== 'function') throw new Error('CopilotClient not found in installed Copilot SDK exports');
-  const client = new sdk.CopilotClient(buildInstalledCopilotClientOptions({
+  const client = new sdk.CopilotClient(buildInstalledCopilotClientOptions(sdk, {
     cliPath: paths.cliPath,
     cwd,
     baseDirectory,
     logLevel,
+    version: paths.version,
   }));
   await client.start();
   return {

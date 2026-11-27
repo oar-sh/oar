@@ -787,6 +787,18 @@ test('persisted row: cleared once the folder turns valid', (t) => {
   assert.equal(h.row().cursor.error, 'kept', 'other SDKs keep their row');
 });
 
+// A start on a store that already holds a ready folder writes no settings
+// row: a database such a start alone wrote still reads as start-up only
+// (database-file.mjs STARTUP_SETTING_KEYS has no agent_sdk_status).
+test('persisted row: a ready folder with nothing saved writes no row', (t) => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  writeInstall(h.root, h.pin('claude'));
+  const store = h.createStore();
+  assert.equal(store.status('claude').state, 'ready');
+  assert.equal(h.settings.has(AGENT_SDK_STATUS_SETTING_KEY), false);
+});
+
 // ─── Reconcile ───────────────────────────────────────────────────────────────
 
 test('reconcile: removes partial and trash folders and a final-named folder without a marker', async (t) => {

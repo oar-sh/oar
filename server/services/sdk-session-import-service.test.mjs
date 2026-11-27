@@ -120,9 +120,11 @@ test('imports all SDK sessions sequentially and skips unchanged ledger rows', as
   const first = await service.runStartupImport();
   assert.deepEqual(first, { listed: 2, new: 2, changed: 0, unchanged: 0, failed: 0, tombstoned: 0, 'relay-owned': 0, 'bound-elsewhere': 0 });
   assert.deepEqual(resumed, ['first', 'second']);
+  // Grouped options: 'empty' mode refuses a resume without `tools.availableTools`,
+  // and the flat name is not read since 1.0.113.
   assert.deepEqual(resumeConfigs, [
-    { suppressResumeEvent: true, availableTools: [] },
-    { suppressResumeEvent: true, availableTools: [] },
+    { suppressResumeEvent: true, tools: { availableTools: [] } },
+    { suppressResumeEvent: true, tools: { availableTools: [] } },
   ]);
   assert.equal(replaced.length, 2);
   // Every resumed session must be released with the SDK's disconnect() API.

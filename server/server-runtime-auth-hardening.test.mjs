@@ -50,9 +50,12 @@ test('baseline security headers are set on every response (M7)', () => {
   assert.match(source, /res\.setHeader\('Referrer-Policy', 'no-referrer'\)/);
 });
 
-test('the app shell carries CSP frame-ancestors \'self\': the page, a shared link\'s reader and "Preview as shared" (§13.4)', () => {
-  assert.match(source, /const APP_SHELL_CSP = "frame-ancestors 'self'";/);
+test('the app shell carries the page CSP (frame-ancestors \'self\' among it): the page, a shared link\'s reader and "Preview as shared" (§13.4)', () => {
+  // The policy itself is app-shell-csp.mjs (app-shell-csp.test.mjs pins its text).
+  assert.match(source, /import \{ APP_SHELL_CSP \} from '\.\/services\/app-shell-csp\.mjs';/);
   assert.match(source, /res\.setHeader\('Content-Security-Policy', APP_SHELL_CSP\)/);
+  const shellCsp = fs.readFileSync(fileURLToPath(new URL('./services/app-shell-csp.mjs', import.meta.url)), 'utf8');
+  assert.match(shellCsp, /"frame-ancestors 'self'"/);
   // Every response that renders the shell sets it.
   const shellRenders = source.match(/renderIndexHtmlWithPwaVersion\([^)]*\);[\s\S]{0,240}?res\.type\('html'\)\.send\(html\)/g) || [];
   assert.equal(shellRenders.length, 3);

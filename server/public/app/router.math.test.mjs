@@ -240,7 +240,7 @@ test('a command KaTeX does not trust is set in the text colour, not in red', () 
 });
 
 test('an image\'s alternative text is an attribute, with no formula in it', () => {
-  const box = render('![cost $x$ here](https://example.com/b.png) and $y$.');
+  const box = render('![cost $x$ here](b.png) and $y$.');
   assert.equal(box.querySelector('img').getAttribute('alt'), 'cost $x$ here');
   assert.deepEqual(rendered(box), ['y']);
   assert.equal(text(box), 'and y.'.replace('y', box.querySelector('.katex').textContent));
@@ -308,7 +308,7 @@ test('the page loads the versions the tests run on', async () => {
   const read = (relative) => readFile(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
   const indexHtml = await read('../index.html');
   const { devDependencies } = JSON.parse(await read('../../../package.json'));
-  const loaded = (name) => [...new Set([...indexHtml.matchAll(new RegExp(`/npm/${name}@([^/"]+)/`, 'g'))].map((match) => match[1]))];
+  const loaded = (name) => [...new Set([...indexHtml.matchAll(new RegExp(`/vendor/${name}@([^/"]+)/`, 'g'))].map((match) => match[1]))];
 
   // Exact pins, so a test run and the page cannot drift apart unnoticed.
   assert.deepEqual(loaded('marked'), [devDependencies.marked]);
@@ -320,15 +320,16 @@ test('the page loads the versions the tests run on', async () => {
   assert.equal(installedMarked.version, devDependencies.marked, 'the installed Markdown library is the pinned one');
   assert.ok(!indexHtml.includes('auto-render'), 'formulas are read by markdown-math.mjs, not by auto-render');
 
-  // Each KaTeX tag carries the hash of the file the pinned package holds:
-  // the CDN serves the package's files, so the browser refuses anything else.
+  // Each KaTeX tag carries the hash of the file the pinned package holds
+  // (the page serves its own copy, server/public/vendor, byte for byte), so
+  // the browser refuses anything else.
   const readBytes = (relative) => readFile(fileURLToPath(new URL(relative, import.meta.url)));
   for (const file of ['dist/katex.min.css', 'dist/katex.min.js', 'dist/contrib/mhchem.min.js']) {
-    const tag = indexHtml.split('\n').find((line) => line.includes(`/npm/katex@${devDependencies.katex}/${file}"`));
+    const tag = indexHtml.split('\n').find((line) => line.includes(`/vendor/katex@${devDependencies.katex}/${file}"`));
     assert.ok(tag, `${file} is loaded`);
     const sha384 = createHash('sha384').update(await readBytes(`../../../node_modules/katex/${file}`)).digest('base64');
     assert.ok(tag.includes(`integrity="sha384-${sha384}"`), `${file}: integrity is the installed file's sha384`);
-    assert.ok(tag.includes('crossorigin="anonymous"'), `${file}: a cross-origin integrity check needs crossorigin`);
+    assert.ok(!tag.includes('crossorigin'), `${file}: same-origin, so no crossorigin attribute`);
   }
 });
 

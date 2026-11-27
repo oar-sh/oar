@@ -147,7 +147,9 @@ test("tiles: a video gets its address in view, remote and archived are marked, a
   const video = view.locator(".media-tile video");
   await expect(video).toHaveAttribute("src", /\/api\/media\/\d+\/content\?t=[A-Za-z0-9_-]{22}#t=0\.1$/);
   await expect(view.locator(".media-tile-play")).toHaveCount(1);
-  await expect(view.locator(".media-tile img")).toHaveAttribute("src", "http://127.0.0.1:9/remote-sketch.png");
+  // The picture on another site is not loaded: a placeholder naming its host.
+  await expect(view.locator(".media-tile img")).toHaveCount(0);
+  await expect(view.locator(".media-tile-remote .media-tile-remote-host")).toHaveText("127.0.0.1:9");
   await expect(view.locator(".media-tile-badge").filter({ hasText: "🌐" })).toHaveCount(1);
   await expect(view.locator(".media-gallery-status")).toContainText("1 missing file is not shown.");
 
@@ -156,6 +158,33 @@ test("tiles: a video gets its address in view, remote and archived are marked, a
   await expect(view.locator(".media-tile").first()).toHaveClass(/media-tile-archived/);
   await view.locator('[data-media-filter="archived"]').check();
   await expect(view.locator(".media-tile")).toHaveCount(0);
+});
+
+test("a picture on another site opens as a card with a link out; stepping through never asks the other site", async ({ page }) => {
+  const asked = [];
+  page.on("request", (request) => { if (request.url().includes("127.0.0.1:9")) asked.push(request.url()); });
+  const view = await openMediaView(page);
+  await view.locator('[data-media-filter="session"]').selectOption(sessions.kinds);
+  await expect(view.locator(".media-tile")).toHaveCount(2);
+  const tile = view.locator(".media-tile-remote");
+  await expect(tile).toBeVisible();
+  await tile.click();
+  const body = page.locator("#file-preview-body");
+  const link = body.getByRole("link", { name: "Open on 127.0.0.1:9" });
+  await expect(link).toHaveAttribute("href", "http://127.0.0.1:9/remote-sketch.png");
+  await expect(link).toHaveAttribute("target", "_blank");
+  await expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(body.locator("img, video")).toHaveCount(0);
+  await expect(page.locator("#file-preview-open-raw")).toBeHidden();
+  // Copy link stays; the arrows move on to the video and back.
+  await expect(page.locator('[data-gallery-action="copy-location"]')).toHaveText("Copy link");
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#file-preview-position")).toHaveText("2 / 2");
+  await expect(body.locator("video")).toHaveCount(1);
+  await page.keyboard.press("ArrowLeft");
+  await expect(link).toBeVisible();
+  await page.keyboard.press("Escape");
+  expect(asked).toEqual([]);
 });
 
 test("the viewer moves past the last loaded picture into the next page", async ({ page }) => {

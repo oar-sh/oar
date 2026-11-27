@@ -30,7 +30,9 @@ import {
   isModelSwitchUnconfirmedError,
   isRuntimeTransportError,
 } from './copilot-model-switch.mjs';
-import { copilotRuntimeEntry } from '../copilot-sdk-runtime.mjs';
+import {
+  assertSupportedCopilotSdk, buildCopilotClientOptions, copilotRuntimeEntry, describeUnverifiedSdk,
+} from '../copilot-sdk-runtime.mjs';
 import { describeTurnStall, isTurnStalledError } from '../../shared/worker-runtime/turn-liveness.mjs';
 import { WORKING_DIRECTORY_MISSING_CODE, isWorkingDirectoryMissingError } from '../../shared/worker-runtime/working-directory.mjs';
 
@@ -108,17 +110,16 @@ export async function readRuntimeVersion(client, dbg = () => {}) {
   }
 }
 
+// The connection and client-option shapes live with the relay's own client
+// in copilot-sdk-runtime.mjs; re-exported for the worker.
+export { buildRuntimeConnection } from '../copilot-sdk-runtime.mjs';
+
 /**
- * Build the stdio connection descriptor for the runtime. `RuntimeConnection`
- * is the documented constructor; the plain object literal is the shape it
- * produces and is accepted directly by older bundles, so it stands in when the
- * export is missing rather than hard-failing on a version difference.
+ * The worker's `CopilotClient` options; see `buildCopilotClientOptions`. The
+ * client name goes on each session, not on the client.
  */
-export function buildRuntimeConnection(sdk, runtimeEntry) {
-  if (typeof sdk?.RuntimeConnection?.forStdio === 'function') {
-    return sdk.RuntimeConnection.forStdio({ path: runtimeEntry });
-  }
-  return { kind: 'stdio', path: runtimeEntry };
+export function buildWorkerCopilotClientOptions(sdk, { runtimeEntry, cwd, logLevel, version = '' } = {}) {
+  return buildCopilotClientOptions(sdk, { runtimeEntry, cwd, logLevel, version });
 }
 
 /**
@@ -193,20 +194,23 @@ export async function startCopilotClient({
   paths,
   cwd,
   logLevel = 'error',
-  clientName = 'copilot-web-relay',
   importImpl = (href) => import(href),
   dbg = () => {},
 } = {}) {
   const sdk = await importImpl(pathToFileURL(paths.sdkEntry).href);
+  // An SDK older than 1.0.113 fails here, with the update hint.
+  assertSupportedCopilotSdk(sdk, paths.version);
   if (typeof sdk?.CopilotClient !== 'function') {
     throw new Error(`CopilotClient not found in the installed Copilot SDK (${paths.sdkEntry})`);
   }
-  const client = new sdk.CopilotClient({
-    connection: buildRuntimeConnection(sdk, paths.runtimeEntry),
-    workingDirectory: cwd,
-    clientName,
+  const unverified = describeUnverifiedSdk(paths.version);
+  if (unverified) dbg(unverified);
+  const client = new sdk.CopilotClient(buildWorkerCopilotClientOptions(sdk, {
+    runtimeEntry: paths.runtimeEntry,
+    cwd,
     logLevel,
-  });
+    version: paths.version,
+  }));
   await client.start();
   const versionReady = readRuntimeVersion(client, dbg).then((runtimeVersion) => ({
     runtimeVersion,

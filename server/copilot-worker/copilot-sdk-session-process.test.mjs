@@ -12,6 +12,7 @@ import {
   makeFakeQuestionBridge,
   makeRunner,
   promptWithPrefix,
+  SPAWNED_SDK,
   tick,
   waitFor,
 } from './copilot-sdk-test-harness.mjs';
@@ -48,7 +49,7 @@ test('a happy turn publishes streamed text and a completed response', async () =
   // Streaming has to be requested explicitly — the SDK default is off and
   // yields no deltas at all.
   const config = client.createAttempts[0];
-  assert.equal(config.streaming, true);
+  assert.equal(config.events.streaming, true);
   assert.equal(config.sessionId, 'conv-1');
   assert.equal(config.model, 'gpt-5-mini');
   assert.equal(config.workingDirectory, '/tmp/relay-fixture-workspace');
@@ -343,7 +344,7 @@ test('a session that already exists is resumed with the relay session id', async
   assert.equal(client.resumeAttempts.length, 1);
   assert.equal(client.createAttempts.length, 0);
   assert.equal(client.session.resumed, true);
-  assert.equal(client.resumeAttempts[0].config.streaming, true);
+  assert.equal(client.resumeAttempts[0].config.events.streaming, true);
   assert.equal(client.resumeAttempts[0].config.sessionId, 'conv-1');
 });
 
@@ -418,7 +419,7 @@ test('agent and autopilot turns auto-approve every permission request', async ()
   const { client, runner } = setup();
   await runner.handlePendingPayload({ message: baseMessage });
 
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
   // `{kind:"allow"}` is rejected by the runtime ("unknown variant `allow`")
   // and silently fails the tool call, so only `approve-once` is ever emitted.
   assert.deepEqual(await onPermissionRequest({ kind: 'write', fileName: 'a.txt' }), { kind: 'approve-once' });
@@ -430,7 +431,7 @@ test('agent and autopilot turns auto-approve every permission request', async ()
 test('plan mode denies non-read tools locally, without asking the user', async () => {
   const { client, runner, questionBridge } = setup();
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
 
   // The handler reads the mode off the LIVE turn: one session serves every
   // turn of a conversation and the user can switch modes between them.
@@ -458,7 +459,7 @@ test('ask mode routes a mutating tool to the user and honours the answer', async
   const approving = makeFakeQuestionBridge({ approve: true });
   const { client, runner } = setup({ questionBridge: approving });
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
 
   assert.deepEqual(
     await onPermissionRequest({ kind: 'write', fileName: 'src/app.js' }),
@@ -476,7 +477,7 @@ test('a denied ask-mode approval carries the human reason back as feedback', asy
   const denying = makeFakeQuestionBridge({ approve: false, approvalFeedback: 'not on the prod config' });
   const { client, runner } = setup({ questionBridge: denying });
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
 
   const decision = await onPermissionRequest({ kind: 'write', fileName: 'prod.json' });
   assert.deepEqual(decision, { kind: 'reject', feedback: 'not on the prod config' });
@@ -488,7 +489,7 @@ test('an unanswered ask-mode card is user-not-available, never a reject', async 
   const silent = makeFakeQuestionBridge({ approvalTimedOut: true });
   const { client, runner } = setup({ questionBridge: silent });
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
 
   assert.deepEqual(
     await onPermissionRequest({ kind: 'write', fileName: 'a.js' }),
@@ -503,7 +504,7 @@ test('a question bridge failure falls back to the local policy instead of throwi
   broken.askToolApproval = async () => { throw new Error('relay unreachable'); };
   const { client, runner } = setup({ questionBridge: broken });
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
 
   const decision = await onPermissionRequest({ kind: 'write', fileName: 'a.js' });
   assert.equal(decision.kind, 'reject');
@@ -517,7 +518,7 @@ test('between turns the permission policy follows the mode of the last delivered
   const { client, runner } = setup({ questionBridge: bridge });
   await runner.handlePendingPayload({ message: baseMessage });
   await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'ask' } });
-  const { onPermissionRequest } = client.createAttempts[0];
+  const { onRequest: onPermissionRequest } = client.createAttempts[0].permissions;
   assert.deepEqual(await onPermissionRequest({ kind: 'write', fileName: 'a.txt' }), { kind: 'approve-once' });
   assert.equal(bridge.approvalCalls.length, 1, 'an ask-mode conversation asks');
 
@@ -527,7 +528,7 @@ test('between turns the permission policy follows the mode of the last delivered
   await other.runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'ask' } });
   await other.runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'agent' } });
   assert.deepEqual(
-    await other.client.createAttempts[0].onPermissionRequest({ kind: 'write', fileName: 'a.txt' }),
+    await other.client.createAttempts[0].permissions.onRequest({ kind: 'write', fileName: 'a.txt' }),
     { kind: 'approve-once' },
   );
   assert.equal(quiet.approvalCalls.length, 0);
@@ -552,7 +553,7 @@ test('ask_user reaches the human and the answer goes back to the runtime', async
   // `wasFreeform` is REQUIRED by UserInputResponse and the runtime's
   // deserializer is strict — omitting it fails the tool call silently.
   assert.deepEqual(
-    await config.onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] }),
+    await config.interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'] }),
     { answer: 'staging', wasFreeform: false },
   );
   assert.equal(bridge.userInputCalls[0].request.question, 'which env?');
@@ -567,12 +568,12 @@ test('a question bridge failure answers in-band rather than failing the tool cal
   await runner.handlePendingPayload({ message: baseMessage });
 
   const config = client.createAttempts[0];
-  assert.deepEqual(await config.onUserInputRequest({ requestId: 'r1', question: 'which env?' }), {
+  assert.deepEqual(await config.interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?' }), {
     answer: USER_INPUT_UNSUPPORTED_ANSWER,
     wasFreeform: true,
   });
   // No schema, no card: a request that cannot round-trip declines in-band.
-  assert.deepEqual(await config.onElicitationRequest({}), { action: 'decline' });
+  assert.deepEqual(await config.interaction.onElicitationRequest({}), { action: 'decline' });
 });
 
 test('attachments travel as MessageOptions.attachments, with paths in the prompt', async () => {
@@ -1043,7 +1044,7 @@ test('the next delivery waits for the previous runtime to stop before it starts 
     startClientImpl: async (options) => {
       const client = clients[started.length];
       started.push(client);
-      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+      return { sdk: SPAWNED_SDK, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
     },
   });
 
@@ -1278,7 +1279,7 @@ test('a session that opens after its runtime was stopped is let go, not adopted'
     startClientImpl: async (options) => {
       const client = clients[started.length];
       started.push(client);
-      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+      return { sdk: SPAWNED_SDK, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
     },
   });
 
@@ -1353,7 +1354,7 @@ test('events of a runtime that is being stopped do not reach the next turn', asy
     startClientImpl: async (options) => {
       const client = clients[started.length];
       started.push(client);
-      return { sdk: {}, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
+      return { sdk: SPAWNED_SDK, client, paths: options.paths, versionReady: Promise.resolve({ runtimeVersion: '1.0.88', versionSkewWarning: null }) };
     },
   });
 
@@ -1813,7 +1814,7 @@ test('an exit-plan request posts the board and refuses to exit plan mode', async
   const { stub, client, runner } = setup();
   await runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
 
-  const { onExitPlanModeRequest } = client.createAttempts[0];
+  const { onExitPlanModeRequest } = client.createAttempts[0].interaction;
   // A turn has to be active for the board to bind to a queue row.
   const pending = runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', relayMode: 'plan' } });
   await waitFor(() => runner.isTurnActive(), { label: 'turn active' });
@@ -2176,7 +2177,7 @@ test('compaction is configured explicitly rather than left to the runtime defaul
   const { client, runner } = setup();
   await runner.handlePendingPayload({ message: baseMessage });
 
-  assert.deepEqual(client.createAttempts[0].infiniteSessions, {
+  assert.deepEqual(client.createAttempts[0].state.infiniteSessions, {
     enabled: true,
     backgroundCompactionThreshold: 0.8,
     bufferExhaustionThreshold: 0.95,
@@ -2280,40 +2281,154 @@ test('the worker names one run for its whole life; a second worker names another
   assert.notEqual(a.runId, b.runId);
 });
 
-test('a hosted session carries no BYOK provider block', async () => {
-  const { client, runner } = setup({ env: {} });
-  await runner.handlePendingPayload({ message: baseMessage });
+// The keys OAR builds flat; the SDK (1.0.113+) only reads them in their
+// groups, so none of them may reach createSession/resumeSession at top level.
+const FLAT_SESSION_KEYS = [
+  'streaming', 'onEvent', 'onPermissionRequest', 'onUserInputRequest', 'onExitPlanModeRequest',
+  'onElicitationRequest', 'infiniteSessions', 'provider', 'reasoningEffort', 'availableTools',
+];
 
-  assert.equal('provider' in client.createAttempts[0], false);
+function assertGroupedSessionOptions(config, label) {
+  for (const key of FLAT_SESSION_KEYS) {
+    assert.equal(key in config, false, `${label}: ${key} must not be at top level`);
+  }
+  if ('tools' in config) {
+    assert.equal(Array.isArray(config.tools), false, `${label}: tools is the group, not the array`);
+    assert.ok(Array.isArray(config.tools.definitions), `${label}: tools.definitions`);
+  }
+  assert.equal(typeof config.events.onEvent, 'function', `${label}: events.onEvent`);
+  assert.equal(config.events.streaming, true, `${label}: events.streaming`);
+  assert.equal(typeof config.permissions.onRequest, 'function', `${label}: permissions.onRequest`);
+  for (const name of ['onUserInputRequest', 'onExitPlanModeRequest', 'onElicitationRequest']) {
+    assert.equal(typeof config.interaction[name], 'function', `${label}: interaction.${name}`);
+  }
+}
+
+test('create and resume hand the SDK grouped options only, no flat key', async () => {
+  const created = setup();
+  await created.runner.handlePendingPayload({ message: baseMessage });
+  assertGroupedSessionOptions(created.client.createAttempts[0], 'create');
+  assert.deepEqual(created.client.createAttempts[0].tools.definitions.map((tool) => tool.name), ['ask_user']);
+  assert.equal(typeof created.client.createAttempts[0].state.infiniteSessions, 'object');
+
+  const resumed = setup({ clientOptions: { resumeAvailable: true } });
+  await resumed.runner.handlePendingPayload({ message: baseMessage });
+  assert.equal(resumed.client.createAttempts.length, 0);
+  assertGroupedSessionOptions(resumed.client.resumeAttempts[0].config, 'resume');
+  assert.equal(resumed.client.resumeAttempts[0].config.sessionId, 'conv-1');
 });
 
-test('an openai-provider session carries its BYOK provider into the session config', async () => {
+test('an SDK older than 1.0.113 fails the turn with the update hint and starts no session', async () => {
+  const stub = makeApiStub();
+  const client = createFakeCopilotClient();
+  const { runner } = makeRunner({ stub, client, sdk: { RuntimeConnection: { forStdio() {} } } });
+
+  await runner.handlePendingPayload({ message: baseMessage });
+  const response = bodyOf(stub, '/api/response');
+  assert.ok(response.terminalError, 'the turn failed');
+  const shown = `${response.text} ${response.terminalError.message}`;
+  assert.match(shown, /older than 1\.0\.113/);
+  assert.match(shown, /Update the Copilot CLI/);
+  assert.equal(client.createAttempts.length, 0);
+  assert.equal(client.resumeAttempts.length, 0);
+  await waitFor(() => client.stopped >= 1, { label: 'the refused client stopped' });
+  assert.equal(runner._getState().hasClient, false);
+});
+
+test('an openai-provider session registers its BYOK provider under inference', async () => {
   // The runtime ignores COPILOT_PROVIDER_* for SDK-created sessions, so the
   // same relay configuration the extension path reads from the environment has
-  // to be re-expressed here or the conversation silently runs on hosted models.
+  // to be re-expressed here or the conversation silently runs on hosted
+  // models. The SDK throws on the whole-session `provider` ("provider is no
+  // longer supported; use inference.providers and inference.models").
   const { client, runner } = setup({
     env: {
       COPILOT_PROVIDER_TYPE: 'openai',
       COPILOT_PROVIDER_BASE_URL: 'https://example.test/v1',
-      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_PROVIDER_API_KEY: 'test-key',
       COPILOT_PROVIDER_WIRE_API: 'responses',
       COPILOT_MODEL: 'gpt-5.4-mini',
     },
   });
   await runner.handlePendingPayload({ message: baseMessage });
 
-  const { provider } = client.createAttempts[0];
-  assert.deepEqual(provider, {
-    type: 'openai',
-    baseUrl: 'https://example.test/v1',
-    apiKey: 'sk-test',
-    wireApi: 'responses',
-    // gpt-5.4-mini's 256k window, minus the completion that has to fit in it.
-    maxPromptTokens: 128_000,
-    maxOutputTokens: 128_000,
+  const config = client.createAttempts[0];
+  assert.equal('provider' in config, false);
+  assert.deepEqual(config.inference, {
+    // No modelId on the provider: the session's model stays authoritative.
+    providers: [{
+      name: 'openai',
+      type: 'openai',
+      baseUrl: 'https://example.test/v1',
+      apiKey: 'test-key',
+      wireApi: 'responses',
+    }],
+    // The message's model (`baseMessage`), not COPILOT_MODEL.
+    models: [{ id: 'gpt-5-mini', provider: 'openai', maxPromptTokens: 128_000, maxOutputTokens: 128_000 }],
+    defaultProvider: 'openai',
   });
-  // Leaving modelId unset is what keeps setModel authoritative for the session.
-  assert.equal('modelId' in provider, false);
+  assert.deepEqual(config.github, { capi: { enabled: false } });
+});
+
+test('a BYOK create and a model-switch rebuild keep inference, github and the grouped handlers', async () => {
+  const { client, runner } = setup({
+    env: { COPILOT_PROVIDER_TYPE: 'openai', COPILOT_PROVIDER_API_KEY: 'test-key', COPILOT_MODEL: 'gpt-4o' },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-4o' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1' } });
+
+  const created = client.createAttempts[0];
+  const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
+  for (const [label, config] of [['create', created], ['rebuild', rebuilt]]) {
+    assertGroupedSessionOptions(config, label);
+    assert.deepEqual(config.inference.providers.map((entry) => entry.name), ['openai'], `${label}: inference.providers`);
+    assert.equal(config.inference.defaultProvider, 'openai', `${label}: inference.defaultProvider`);
+    assert.deepEqual(config.github, { capi: { enabled: false } }, `${label}: github`);
+  }
+  assert.deepEqual(created.inference.models.map((entry) => entry.id), ['gpt-4o']);
+  assert.deepEqual(rebuilt.inference.models.map((entry) => entry.id), ['gpt-4.1']);
+});
+
+test('a BYOK switch to a model with equal ceilings still rebuilds', async () => {
+  // gpt-5 and gpt-5.4 resolve to the same ceilings, but inference.models only
+  // registers the model the session was built with: an in-place RPC would leave
+  // gpt-5.4 unregistered, on inferred metadata without its ceilings.
+  const { client, runner } = setup({
+    env: { COPILOT_PROVIDER_TYPE: 'openai', COPILOT_PROVIDER_API_KEY: 'test-key', COPILOT_MODEL: 'gpt-5' },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-5' } });
+  const firstSession = client.session;
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5.4' } });
+
+  assert.equal(firstSession.rpc.model.switchToCalls.length, 0);
+  assert.equal(firstSession.disconnected, true);
+  const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
+  assert.deepEqual(rebuilt.inference.models.map((entry) => entry.id), ['gpt-5.4']);
+  assert.deepEqual(
+    [rebuilt.inference.models[0].maxPromptTokens, rebuilt.inference.models[0].maxOutputTokens],
+    [client.createAttempts[0].inference.models[0].maxPromptTokens, client.createAttempts[0].inference.models[0].maxOutputTokens],
+  );
+});
+
+test('a BYOK effort change on the same model stays in place', async () => {
+  const { client, runner } = setup({
+    env: { COPILOT_PROVIDER_TYPE: 'openai', COPILOT_PROVIDER_API_KEY: 'test-key', COPILOT_MODEL: 'gpt-5' },
+  });
+  await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-5' } });
+  const firstSession = client.session;
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-5', reasoningEffort: 'high' } });
+
+  assert.equal(client.session, firstSession);
+  assert.equal(firstSession.disconnected, false);
+  assert.equal(client.sessions.length, 1);
+});
+
+test('a hosted session carries no BYOK options', async () => {
+  const { client, runner } = setup({ env: {} });
+  await runner.handlePendingPayload({ message: baseMessage });
+  for (const key of ['provider', 'inference', 'github']) {
+    assert.equal(key in client.createAttempts[0], false, `${key} must not be set on a hosted session`);
+  }
 });
 
 test('a hosted model switch uses the observed switchTo RPC and keeps the one session', async () => {
@@ -2329,81 +2444,87 @@ test('a hosted model switch uses the observed switchTo RPC and keeps the one ses
   assert.equal(client.session.disconnected, false);
 });
 
-test('a BYOK model switch rebuilds the session so the ceilings follow the model', async () => {
-  // `SessionConfig.provider` carries the model's token ceilings and runtime
-  // 1.0.82 has no way to update it mid-session — setModel takes no provider,
-  // there is no setProvider, and the registry-add RPC belongs to the named
-  // multi-provider surface, which the runtime rejects alongside the singular
-  // `provider` this worker uses. A bare setModel would therefore leave gpt-4o's
-  // ceilings describing a gpt-4.1 session.
+test('a BYOK model switch rebuilds the session so the ceilings follow the model and keeps the effort', async () => {
+  // The provider and its `inference.models` entry carry the model's token
+  // ceilings and are fixed at session creation: there is no setProvider, and
+  // `inference.models` lists only the model the session was built with. A bare
+  // switchTo would therefore leave gpt-4o's ceilings describing a gpt-4.1
+  // session.
   const { client, runner } = setup({
     env: {
       COPILOT_PROVIDER_TYPE: 'openai',
-      COPILOT_PROVIDER_API_KEY: 'sk-test',
+      COPILOT_PROVIDER_API_KEY: 'test-key',
       COPILOT_MODEL: 'gpt-4o',
     },
   });
   await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-4o' } });
-  assert.equal(client.createAttempts[0].provider.maxPromptTokens, 111_616);
+  assert.equal(client.createAttempts[0].inference.models[0].maxPromptTokens, 111_616);
   const firstSession = client.session;
 
-  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1', reasoningEffort: 'high' } });
 
   // The old session was disposed and a NEW one built for the new model...
   assert.equal(firstSession.disconnected, true);
   assert.equal(client.sessions.length, 2);
   assert.notEqual(client.session, firstSession);
-  // ...with ceilings that describe gpt-4.1 rather than gpt-4o.
+  // ...with ceilings that describe gpt-4.1 rather than gpt-4o, and the effort
+  // inside `inference`.
   const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
-  assert.equal(rebuilt.provider.maxPromptTokens, 1_014_808);
-  assert.equal(rebuilt.provider.maxOutputTokens, 32_768);
+  assert.deepEqual(rebuilt.inference.models, [
+    { id: 'gpt-4.1', provider: 'openai', maxPromptTokens: 1_014_808, maxOutputTokens: 32_768 },
+  ]);
+  assert.equal('provider' in rebuilt, false);
+  assert.equal('reasoningEffort' in rebuilt, false);
+  assert.equal(rebuilt.inference.reasoningEffort, 'high');
   // History is preserved: the rebuild RESUMES the same session id rather than
   // creating a blank second one.
   assert.equal(rebuilt.sessionId, 'conv-1');
   assert.equal(client.createAttempts.length, 1);
   // Both turns still published their reply.
   assert.equal(client.sessions[1].sends.length, 1);
-  // No RPC attempt preceded the rebuild: the two models' provider blocks
-  // differ (ceilings follow the model) and no RPC can carry ceilings, so an
+  // No RPC attempt preceded the rebuild: no RPC can carry ceilings, so an
   // in-place switch could never be sufficient.
   assert.equal(firstSession.rpc.model.switchToCalls.length, 0);
 });
 
-test('a BYOK switch with unchanged ceilings tries the RPC first and rebuilds only on rejection', async () => {
-  // Explicit ceiling overrides make the provider block model-independent, so
-  // an in-place switch IS sufficient — the live RPC is tried first and a
-  // confirmed switch keeps the one session.
+test('a BYOK effort change tries the RPC first and rebuilds only on rejection', async () => {
+  // Same model: the session's provider and inference.models still describe
+  // it, so the live RPC is tried first and a confirmed change keeps the one
+  // session.
   const { client, runner } = setup({
     env: {
       COPILOT_PROVIDER_TYPE: 'openai',
-      COPILOT_PROVIDER_API_KEY: 'sk-test',
-      COPILOT_PROVIDER_MAX_PROMPT_TOKENS: '100000',
-      COPILOT_PROVIDER_MAX_OUTPUT_TOKENS: '20000',
+      COPILOT_PROVIDER_API_KEY: 'test-key',
       COPILOT_MODEL: 'gpt-4o',
     },
   });
   await runner.handlePendingPayload({ message: { ...baseMessage, model: 'gpt-4o' } });
-  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4.1' } });
+  await runner.handlePendingPayload({ message: { ...baseMessage, id: 'q-2', model: 'gpt-4o', reasoningEffort: 'low' } });
 
-  assert.deepEqual(client.session.rpc.model.switchToCalls, [{ modelId: 'gpt-4.1' }]);
   assert.equal(client.sessions.length, 1);
   assert.equal(client.session.disconnected, false);
+  assert.deepEqual(client.session.rpc.model.effortCalls.map((call) => call.reasoningEffort), ['low']);
 
-  // The runtime rejects the next switch (a singular-provider session may not
-  // accept bare model ids at all) → the dispose+resume fallback, carrying the
-  // row's effort into the rebuilt config. Never a terminal failure: BYOK has
-  // this second mechanism, so an RPC refusal is not an unhonoured selection.
+  // The runtime rejects the next change → the dispose+resume fallback,
+  // carrying the row's effort into the rebuilt config. Never a terminal
+  // failure: BYOK has this second mechanism, so an RPC refusal is not an
+  // unhonoured selection.
   const firstSession = client.session;
-  firstSession.rpc.model.switchTo = async () => { throw new Error('registry rejected the model'); };
+  firstSession.rpc.model.setReasoningEffort = async (params) => {
+    firstSession.rpc.model.effortCalls.push(params);
+    throw new Error('registry rejected the effort');
+  };
   await runner.handlePendingPayload({
     message: { ...baseMessage, id: 'q-3', model: 'gpt-4o', reasoningEffort: 'high' },
   });
 
+  assert.deepEqual(firstSession.rpc.model.effortCalls.map((call) => call.reasoningEffort), ['low', 'high']);
   assert.equal(firstSession.disconnected, true);
   assert.equal(client.sessions.length, 2);
   const rebuilt = client.resumeAttempts[client.resumeAttempts.length - 1].config;
   assert.equal(rebuilt.model, 'gpt-4o');
-  assert.equal(rebuilt.reasoningEffort, 'high');
+  assert.equal('reasoningEffort' in rebuilt, false);
+  assert.equal(rebuilt.inference.reasoningEffort, 'high');
   assert.equal(rebuilt.sessionId, 'conv-1');
   // All three turns answered.
   assert.equal(client.sessions[1].sends.length, 1);
@@ -2444,7 +2565,7 @@ test('an elicitation with a schema round-trips as a structured card and accepts'
     properties: { env: { type: 'string' }, replicas: { type: 'number' } },
     required: ['env'],
   };
-  const result = await config.onElicitationRequest({
+  const result = await config.interaction.onElicitationRequest({
     sessionId: 'conv-1',
     message: 'Deployment details?',
     requestedSchema: schema,
@@ -2470,16 +2591,16 @@ test('an elicitation declines on timeout, on url mode, and without a schema', as
 
   // An unanswered card declines — the current behaviour, preserved.
   assert.deepEqual(
-    await config.onElicitationRequest({ message: 'x', requestedSchema: schema }),
+    await config.interaction.onElicitationRequest({ message: 'x', requestedSchema: schema }),
     { action: 'decline' },
   );
   // A browser redirect cannot render as a relay card.
   assert.deepEqual(
-    await config.onElicitationRequest({ mode: 'url', url: 'https://example.test/auth' }),
+    await config.interaction.onElicitationRequest({ mode: 'url', url: 'https://example.test/auth' }),
     { action: 'decline' },
   );
   // No schema, no form.
-  assert.deepEqual(await config.onElicitationRequest({ message: 'x' }), { action: 'decline' });
+  assert.deepEqual(await config.interaction.onElicitationRequest({ message: 'x' }), { action: 'decline' });
   // Only the schema-carrying form request reached the bridge at all.
   assert.equal(bridge.structuredCalls.length, 1);
 });
@@ -2661,7 +2782,7 @@ test('the stall watchdog waits for a human instead of failing the row under them
 
   const pending = runner.handlePendingPayload({ message: baseMessage });
   await waitFor(() => !!client.session, { label: 'session' });
-  const answer = client.createAttempts[0].onUserInputRequest({ requestId: 'r1', question: 'which env?' });
+  const answer = client.createAttempts[0].interaction.onUserInputRequest({ requestId: 'r1', question: 'which env?' });
   await askedOnce;
 
   // Well past the 25ms ceiling with the human still thinking.
@@ -2686,7 +2807,7 @@ test('a plan board the relay refused is reported as not posted', async () => {
   });
   const pending = runner.handlePendingPayload({ message: { ...baseMessage, relayMode: 'plan' } });
   await waitFor(() => client.createAttempts.length > 0, { label: 'session created' });
-  const result = await client.createAttempts[0].onExitPlanModeRequest({ summary: '- a\n- b' });
+  const result = await client.createAttempts[0].interaction.onExitPlanModeRequest({ summary: '- a\n- b' });
   client.session.emit({ type: 'session.idle', data: {} });
   await pending;
 

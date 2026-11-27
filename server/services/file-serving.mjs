@@ -6,6 +6,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import express from 'express';
+
+import { APP_SHELL_CSP } from './app-shell-csp.mjs';
 import { applySafeServedContentHeaders } from './safe-served-content.mjs';
 import { FILE_CAPABILITY_REQUEST_KEY } from './file-capability.mjs';
 import { AUTH_ERROR_CODES, AUTH_FILE_CAPABILITY_MESSAGE } from '../../shared/relay-route-policy.mjs';
@@ -36,6 +39,91 @@ export function applyNoStoreHeaders(res) {
 export function applyCdnNoStoreHeaders(res) {
   res.setHeader('CDN-Cache-Control', 'no-store');
   res.setHeader('Cloudflare-CDN-Cache-Control', 'no-store');
+}
+
+// A file under vendor/<package>@<version>/ never changes: a new version is a
+// new path. Nothing else in the public folder is versioned that way.
+const VERSIONED_VENDOR_FILE = /^vendor\/(?:@[^/]+\/)?[^/@]+@\d+\.\d+\.\d+\//;
+
+/**
+ * The `setHeaders` of the static handler for the public folder: the page,
+ * the service worker and the app's modules are never kept (the app shell
+ * upgrades by fetching them), the versioned browser libraries are kept for a
+ * year. The decision is made from the file's place on disk, so it holds
+ * under any base path. Only the browser's cache changes: the CDN headers the
+ * relay sets on every response still say no-store.
+ */
+export function publicStaticHeaders(publicDir) {
+  const root = path.resolve(publicDir);
+  return (res, filePath) => {
+    const resolved = path.resolve(String(filePath || ''));
+    const relative = path.relative(root, resolved).split(path.sep).join('/');
+    res.setHeader(
+      'Cache-Control',
+      VERSIONED_VENDOR_FILE.test(relative) ? 'public, max-age=31536000, immutable' : 'no-store',
+    );
+    // The page is only ever sent by the app shell routes. Should an HTML file
+    // still leave through here, it gets the shell's page policy.
+    if (/\.html?$/i.test(resolved)) res.setHeader('Content-Security-Policy', APP_SHELL_CSP);
+  };
+}
+
+/**
+ * Whether a request path would reach an HTML file in the public folder, read
+ * the way the static handler reads it: percent-decoded once, backslashes as
+ * separators (Windows), dot segments resolved, a trailing slash ignored, and
+ * the file looked up on disk (so a case-insensitive disk is covered). Other
+ * paths, the API's files among them, are not its business.
+ */
+export function isPublicHtmlRequest(publicDir, requestPath, { statImpl = fs.statSync } = {}) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(String(requestPath || '/'));
+  } catch {
+    return false; // the static handler refuses it (400)
+  }
+  if (decoded.includes('\0')) return false;
+  const normalized = path.posix.normalize(`/${decoded.replace(/\\/g, '/')}`);
+  if (!/\.html?$/i.test(path.posix.basename(normalized))) return false;
+  const root = path.resolve(publicDir);
+  const target = path.resolve(root, `.${normalized}`);
+  if (target !== root && !target.startsWith(`${root}${path.sep}`)) return false;
+  try {
+    return statImpl(target).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The static handler for the public folder. The page is the template the
+ * shell routes render (base path, configuration, page policy); served raw
+ * from the folder it has none of them and works out its base path from the
+ * address, so no HTML file and no directory index leaves through here: a
+ * request for one is a 404, whatever spelling of the path it uses.
+ */
+export function publicStaticMiddleware(publicDir) {
+  const serveStatic = express.static(publicDir, { etag: false, index: false, setHeaders: publicStaticHeaders(publicDir) });
+  const refuseHtml = (req, res, next) => {
+    if ((req.method !== 'GET' && req.method !== 'HEAD') || !isPublicHtmlRequest(publicDir, req.path)) return next();
+    res.status(404).type('text/plain').send('Not Found');
+  };
+  // No public file has a colon in its path. On Windows one names a stream of
+  // a file (`index.html::$DATA` is index.html itself), which the HTML check
+  // above would not take for the page: such a path is not served from here
+  // and goes on to the routes after it.
+  const serveFiles = (req, res, next) => (hasColonAfterDecoding(req.path) ? next() : serveStatic(req, res, next));
+  return [refuseHtml, serveFiles];
+}
+
+function hasColonAfterDecoding(requestPath) {
+  const raw = String(requestPath || '');
+  if (raw.includes(':')) return true;
+  try {
+    return decodeURIComponent(raw).includes(':');
+  } catch {
+    return false; // the static handler refuses it (400)
+  }
 }
 
 /**

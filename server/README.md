@@ -1732,12 +1732,20 @@ checks; `OAR_UPDATE_MANIFEST_URL` points the check at a different manifest
 When a newer version is available, Settings shows a dismissible-per-version
 card (not dismissible if the release is marked critical — it still never
 auto-applies). On npm-global installs, **Update** runs
-`npm i -g @oar-sh/oar@<version>` with the log streamed into the card, then the
+`npm install -g --ignore-scripts @oar-sh/oar@<version>` (no dependency of OAR
+needs an install script) with the log streamed into the card, then the
 relay restarts once the running turns finish (queued messages wait for it). After the restart the relay
 verifies the running version actually changed; if not, the npm log is surfaced
 as a failure. Git checkouts are detect-only — the card shows a "pull to
 update" hint instead of the button. `oar update [--beta] [--to X.Y.Z]` does
 the same from a terminal, and rollback is `oar update --to <previous>`.
+Where better-sqlite3 ships no prebuilt binding (Termux, 32-bit ARM, FreeBSD),
+both first check for node-gyp (npm's own; OAR never fetches one with `npx`),
+Python 3, make and a C++ compiler and refuse with what to install when one is
+missing; after the install they build the binding, and when that fails they
+keep the running binding (same better-sqlite3) or install the running version
+again (`services/update-install-service.mjs`,
+`services/native-addon-build-service.mjs`; `oar build-native` builds it by hand).
 
 ## Feature flags
 
@@ -2612,6 +2620,9 @@ installed or updated while the relay runs is found without a restart.
 - A version folder counts only with both `copilot-sdk/index.js` and `app.js`. The newest version
   across all bases wins; a tie goes to the earlier base.
 - Optional config pin: set `sdkVersion` to ask for one exact version.
+- The SDK must be 1.0.113 or later (`COPILOT_SDK_MIN_VERSION`, `assertSupportedCopilotSdk`): an
+  older one fails the turn, model discovery and the session import with a message that names its
+  version and says to update the Copilot CLI.
 - Without an SDK a Copilot, OpenAI BYOK or OpenAI image session does not start: "Copilot SDK not
   found. Install the GitHub Copilot CLI and run it once (copilot --version); no relay restart is
   needed. Looked in: …" (see [Launch failures and backoff](#launch-failures-and-backoff)).

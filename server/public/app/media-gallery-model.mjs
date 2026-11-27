@@ -2,6 +2,8 @@
 // GET /api/media with, month sections, how a gallery item becomes an item of
 // the file viewer, what the viewer says about it, and which buttons it gets.
 
+import { isRemotePreviewSource } from './external-link-policy.mjs';
+
 export const MEDIA_TEXT = Object.freeze({
   title: 'Media',
   tabMedia: 'Media',
@@ -36,6 +38,9 @@ export const MEDIA_TEXT = Object.freeze({
   fromAgent: '🤖 Agent',
   generated: '✨ Generated',
   remote: '🌐',
+  remoteOpen: (host) => `Open on ${host}`,
+  remoteOpenGeneric: 'Open link',
+  remoteNote: 'Not loaded here: pictures and videos from other sites stay on their site.',
   archived: 'archived',
   inMessages: (count) => `in ${count} messages`,
 });
@@ -110,12 +115,48 @@ export function mediaSourceBadge(item) {
   return item?.sender === 'me' ? MEDIA_TEXT.fromYou : MEDIA_TEXT.fromAgent;
 }
 
-/** The address the viewer loads an item from (the relay's route, or the remote picture itself). */
+// An absolute address of this very origin: loaded like a relay file.
+function isOwnWebAddress(text) {
+  const origin = globalThis.window?.location?.origin;
+  if (!origin || !/^https?:\/\//i.test(text)) return false;
+  try { return new URL(text).origin === origin; } catch { return false; }
+}
+
+/**
+ * What a picture or video that lives on a web address becomes: never loaded
+ * (the page's policy, server/services/app-shell-csp.mjs, allows its own origin
+ * only, and a URL an agent picks can carry data out), so a placeholder that
+ * says where it lives. `href` is set only for an address of another http(s)
+ * origin (the helper the chat's markdown images use), which becomes a link; any
+ * other address (a `javascript:` URL, say) is text only. Null for an item that
+ * has no web address or has a relay route.
+ */
+export function mediaRemote(item) {
+  if (!item || item.contentUrl) return null;
+  const text = String(item.remoteUrl || '').trim();
+  if (!text) return null;
+  if (!isRemotePreviewSource(text)) return isOwnWebAddress(text) ? null : { text, href: '', host: '' };
+  const parsed = new URL(text, globalThis.window?.location?.origin);
+  return { text, href: parsed.href, host: parsed.host };
+}
+
+/** What the viewer says for a remote item: its title, name, a line, and the link out (none for a non-web address). */
+export function mediaRemoteCard(remote) {
+  const { text = '', href = '', host = '' } = remote || {};
+  return {
+    title: host ? `Hosted on ${host}` : 'Not a web address',
+    name: host || text,
+    meta: href ? MEDIA_TEXT.remoteNote : text,
+    href,
+    label: host ? MEDIA_TEXT.remoteOpen(host) : MEDIA_TEXT.remoteOpenGeneric,
+  };
+}
+
+/** The address the viewer loads an item from: the relay's route or an address of this origin; '' for another site's picture (never loaded). */
 export function mediaHref(item, base = '') {
   if (item?.contentUrl) return `${base}${item.contentUrl}`;
-  // Only a web address is loaded from elsewhere (the server sends no other kind).
-  const remote = String(item?.remoteUrl || '');
-  return /^https?:\/\//i.test(remote) ? remote : '';
+  const own = String(item?.remoteUrl || '').trim();
+  return mediaRemote(item) === null && isOwnWebAddress(own) ? own : '';
 }
 
 /** A file viewer gallery item for a media item. */
@@ -124,6 +165,8 @@ export function mediaViewerItem(item, base = '') {
     key: `media:${item.id}`,
     source: 'upload',
     href: mediaHref(item, base),
+    // A picture on another site: the viewer says where it lives and loads nothing.
+    remote: mediaRemote(item),
     name: String(item?.name || item?.alt || MEDIA_TEXT.untitled),
     mime: String(item?.mime || (item?.mediaKind === 'video' ? 'video/mp4' : item?.mediaKind === 'image' ? 'image/png' : '')),
     size: Number.isFinite(item?.sizeBytes) ? item.sizeBytes : 0,

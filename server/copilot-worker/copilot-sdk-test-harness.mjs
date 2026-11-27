@@ -144,8 +144,10 @@ export function createFakeCopilotSession({
     taskProgress: taskProgress && typeof taskProgress === 'object' ? taskProgress : {},
     cancelledTasks: [],
     removedTasks: [],
+    // Grouped options only, as the SDK reads them: a flat `onEvent` is
+    // never called, and the turn stalls.
     emit(event) {
-      config?.onEvent?.(event);
+      config?.events?.onEvent?.(event);
     },
     replay(events) {
       for (const event of events) session.emit(event);
@@ -477,12 +479,23 @@ export function createMemorySpool({ root = '/tmp/oar-task-output-fixture/conv-1'
   return spool;
 }
 
+/**
+ * The imported SDK module as far as `assertSupportedCopilotSdk` looks at it:
+ * one with the 1.0.113 connection factory. `{}` would be refused.
+ */
+export const SPAWNED_SDK = Object.freeze({
+  RuntimeConnection: Object.freeze({ forSpawnedStdio: () => ({ kind: 'spawned-stdio' }) }),
+});
+
 export function makeRunner({
   stub,
   client,
   startWarning = null,
   runtimeVersion = '1.0.82',
   questionBridge = makeFakeQuestionBridge(),
+  // The imported SDK module the fake start hands back; see
+  // `assertSupportedCopilotSdk`.
+  sdk = SPAWNED_SDK,
   ...overrides
 } = {}) {
   const started = [];
@@ -510,7 +523,7 @@ export function makeRunner({
       startClientImpl: async (options) => {
         started.push(options);
         return {
-          sdk: {},
+          sdk,
           client,
           paths: options.paths,
           // The real adapter never blocks client start on the version probe;

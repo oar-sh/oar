@@ -4,42 +4,249 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
+  assertSupportedCopilotSdk,
+  buildCopilotClientOptions,
   buildInstalledCopilotClientOptions,
+  buildRuntimeConnection,
+  COPILOT_SDK_NEWEST_VERIFIED,
   COPILOT_SDK_NOT_FOUND,
+  COPILOT_SDK_TOO_OLD,
+  COPILOT_SESSION_OPTION_GROUPS,
+  copilotSessionOptions,
+  createInstalledCopilotClient,
+  describeUnverifiedSdk,
   getCopilotBaseDirs,
   resolveCopilotSdkLaunchPath,
   resolveInstalledCopilotPaths,
 } from './copilot-sdk-runtime.mjs';
 
-test('buildInstalledCopilotClientOptions configures a restricted importer client', () => {
+// Factory shapes copied from the bundles: 1.0.92-1.0.112 export `forStdio`,
+// 1.0.113 replaced it with `forSpawnedStdio` (and a `spawned-stdio` kind).
+const LEGACY_SDK = Object.freeze({
+  RuntimeConnection: {
+    forStdio: (opts = {}) => ({ kind: 'stdio', path: opts.path, args: opts.args, env: opts.env }),
+  },
+});
+const SPAWNED_SDK = Object.freeze({
+  RuntimeConnection: {
+    forSpawnedStdio: (opts = {}) => ({
+      kind: 'spawned-stdio',
+      path: opts.path,
+      args: opts.args,
+      env: opts.env,
+      workingDirectory: opts.workingDirectory,
+      baseDirectory: opts.baseDirectory,
+      sessionIdleTimeoutSeconds: opts.sessionIdleTimeoutSeconds,
+    }),
+  },
+});
+
+test('buildInstalledCopilotClientOptions uses the grouped client options', () => {
+  // The directories go on the spawned connection (a client-level
+  // workingDirectory throws, and empty mode reads baseDirectory off the
+  // connection), useLoggedInUser under github, logLevel under observability.
   assert.deepEqual(
-    buildInstalledCopilotClientOptions({
+    buildInstalledCopilotClientOptions(SPAWNED_SDK, {
       cliPath: '/opt/copilot/app.js',
       cwd: '/workspace/project',
       baseDirectory: '/home/tester/.copilot',
       logLevel: 'error',
     }),
     {
-      connection: {
-        kind: 'stdio',
-        path: '/opt/copilot/app.js',
-      },
       mode: 'empty',
-      baseDirectory: '/home/tester/.copilot',
-      useLoggedInUser: true,
-      logLevel: 'error',
-      workingDirectory: '/workspace/project',
+      runtime: {
+        kind: 'spawned-stdio',
+        path: '/opt/copilot/app.js',
+        args: undefined,
+        env: undefined,
+        workingDirectory: '/workspace/project',
+        baseDirectory: '/home/tester/.copilot',
+        sessionIdleTimeoutSeconds: undefined,
+      },
+      observability: { logLevel: 'error' },
+      github: { useLoggedInUser: true },
     },
   );
 });
 
-test('an omitted baseDirectory defaults to ~/.copilot (runtime 1.0.83 refuses empty mode without one)', () => {
-  const options = buildInstalledCopilotClientOptions({ cliPath: '/opt/copilot/app.js' });
-  // The runtime's own pre-1.0.83 default, made explicit: the import sweep and
-  // model discovery must keep seeing the CLI's real session state.
-  assert.equal(options.baseDirectory, path.join(os.homedir(), '.copilot'));
+test('an omitted baseDirectory defaults to ~/.copilot (empty mode refuses to start without one)', () => {
+  // The import sweep and model discovery must keep seeing the CLI's real
+  // session state.
+  const spawned = buildInstalledCopilotClientOptions(SPAWNED_SDK, { cliPath: '/opt/copilot/app.js' });
+  assert.equal(spawned.runtime.baseDirectory, path.join(os.homedir(), '.copilot'));
+});
+
+test('buildCopilotClientOptions is grouped only and defaults the mode to coding-agent', () => {
+  const options = buildCopilotClientOptions(SPAWNED_SDK, { runtimeEntry: '/opt/copilot/app.js', cwd: '/workspace/project' });
+  assert.equal(options.mode, 'coding-agent');
+  assert.deepEqual(Object.keys(options).sort(), ['mode', 'runtime']);
+  for (const key of ['connection', 'workingDirectory', 'env', 'logLevel', 'baseDirectory', 'useLoggedInUser', 'clientName']) {
+    assert.equal(key in options, false, `${key} must not be on the client options`);
+  }
+  assert.equal(options.runtime.workingDirectory, '/workspace/project');
+});
+
+test('the client options of an SDK older than 1.0.113 are refused with the update hint', () => {
+  for (const build of [
+    () => buildCopilotClientOptions(LEGACY_SDK, { runtimeEntry: '/opt/copilot/app.js', version: '1.0.112' }),
+    () => buildInstalledCopilotClientOptions(LEGACY_SDK, { cliPath: '/opt/copilot/app.js', version: '1.0.112' }),
+  ]) {
+    assert.throws(build, { code: COPILOT_SDK_TOO_OLD, message: /Copilot SDK 1\.0\.112 is older than 1\.0\.113/ });
+  }
+});
+
+test('buildRuntimeConnection names the SDK version when neither factory exists', () => {
+  assert.throws(
+    () => buildRuntimeConnection({ RuntimeConnection: { forTcp() {} } }, '/opt/copilot/app.js', { version: '1.0.999' }),
+    /Copilot SDK 1\.0\.999 has neither RuntimeConnection\.forSpawnedStdio nor RuntimeConnection\.forStdio \(it exports: forTcp\)/,
+  );
+});
+
+test('assertSupportedCopilotSdk: 1.0.113 and later pass, older ones get the update hint, others their exports', () => {
+  assert.equal(assertSupportedCopilotSdk(SPAWNED_SDK, '1.0.114'), undefined);
+  // Both factories: still the new one that counts.
+  assert.equal(assertSupportedCopilotSdk({ RuntimeConnection: { forStdio() {}, forSpawnedStdio() {} } }), undefined);
+  assert.throws(() => assertSupportedCopilotSdk(LEGACY_SDK, '1.0.112'), (error) => {
+    assert.equal(error.code, COPILOT_SDK_TOO_OLD);
+    assert.equal(
+      error.message,
+      'The installed Copilot SDK 1.0.112 is older than 1.0.113, which this OAR needs. '
+      + 'Update the Copilot CLI (run `copilot` once, or install it from the relay\'s Copilot settings).',
+    );
+    return true;
+  });
+  assert.throws(() => assertSupportedCopilotSdk(LEGACY_SDK), /^Error: The installed Copilot SDK is older than 1\.0\.113/);
+  assert.throws(
+    () => assertSupportedCopilotSdk({ RuntimeConnection: { forTcp() {}, forInProcess() {} } }, '1.0.999'),
+    (error) => error.code === undefined && /SDK 1\.0\.999 has neither .*\(it exports: forTcp, forInProcess\)/.test(error.message),
+  );
+  assert.throws(() => assertSupportedCopilotSdk({}), /no RuntimeConnection export/);
+  assert.throws(() => assertSupportedCopilotSdk(null, '1.0.50'), /SDK 1\.0\.50 has neither/);
+});
+
+test('describeUnverifiedSdk notes only a bundle newer than the newest verified one', () => {
+  assert.equal(COPILOT_SDK_NEWEST_VERIFIED, '1.0.114');
+  for (const version of ['1.0.113', '1.0.114', 'configured', '', undefined, '1.0.115-beta']) {
+    assert.equal(describeUnverifiedSdk(version), null, String(version));
+  }
+  for (const version of ['1.0.115', '1.1.0', '2.0.0', '1.0.1000']) {
+    const note = describeUnverifiedSdk(version);
+    assert.match(note, new RegExp(`^Copilot SDK ${version.replace(/\./g, '\\.')} is newer than 1\\.0\\.114`));
+    assert.equal(note.includes('\n'), false);
+  }
+});
+
+// OAR's flat session config, as `buildSessionConfig` builds it, with a stand-in per value.
+const handler = (name) => Object.defineProperty(() => {}, 'name', { value: name });
+const FLAT_ROWS = [
+  ['sessionId', 'conv-1', ['sessionId']],
+  ['model', 'gpt-x', ['model']],
+  ['workingDirectory', '/workspace/project', ['workingDirectory']],
+  ['clientName', 'relay-client', ['clientName']],
+  ['suppressResumeEvent', true, ['suppressResumeEvent']],
+  ['streaming', true, ['events', 'streaming']],
+  ['onEvent', handler('onEvent'), ['events', 'onEvent']],
+  ['tools', [{ name: 'ask_user' }, { name: 'relay_tool' }], ['tools', 'definitions']],
+  ['availableTools', [], ['tools', 'availableTools']],
+  ['onPermissionRequest', handler('onPermissionRequest'), ['permissions', 'onRequest']],
+  ['onUserInputRequest', handler('onUserInputRequest'), ['interaction', 'onUserInputRequest']],
+  ['onExitPlanModeRequest', handler('onExitPlanModeRequest'), ['interaction', 'onExitPlanModeRequest']],
+  ['onElicitationRequest', handler('onElicitationRequest'), ['interaction', 'onElicitationRequest']],
+  ['infiniteSessions', { enabled: true }, ['state', 'infiniteSessions']],
+];
+
+test('copilotSessionOptions moves each flat option to its grouped name, row by row', () => {
+  assert.deepEqual(FLAT_ROWS.map(([key]) => key).sort(), Object.keys(COPILOT_SESSION_OPTION_GROUPS).sort());
+  assert.equal(Object.isFrozen(COPILOT_SESSION_OPTION_GROUPS), true);
+  for (const [key, value, leafPath] of FLAT_ROWS) {
+    const grouped = copilotSessionOptions({ [key]: value });
+    const expected = leafPath.length === 1 ? { [key]: value } : { [leafPath[0]]: { [leafPath[1]]: value } };
+    assert.deepEqual(grouped, expected, key);
+    // The very value, not a copy: handlers and tool definitions stay callable.
+    assert.equal(leafPath.reduce((node, name) => node[name], grouped), value, key);
+  }
+});
+
+test('copilotSessionOptions translates a whole config in one go and leaves no flat key', () => {
+  const flat = Object.fromEntries(FLAT_ROWS.map(([key, value]) => [key, value]));
+  const grouped = copilotSessionOptions(flat);
+  assert.deepEqual(Object.keys(grouped).sort(), [
+    'clientName', 'events', 'interaction', 'model', 'permissions', 'sessionId', 'state', 'suppressResumeEvent', 'tools',
+    'workingDirectory',
+  ]);
+  assert.deepEqual(Object.keys(grouped.interaction).sort(), ['onElicitationRequest', 'onExitPlanModeRequest', 'onUserInputRequest']);
+  assert.deepEqual(Object.keys(grouped.tools).sort(), ['availableTools', 'definitions']);
+  // The input is left as it was.
+  assert.equal(flat.onEvent, FLAT_ROWS[6][1]);
+});
+
+test('copilotSessionOptions merges the BYOK group objects beside the mapped options', () => {
+  const grouped = copilotSessionOptions({
+    sessionId: 'conv-1',
+    inference: { providers: [{ name: 'openai' }], defaultProvider: 'openai', reasoningEffort: 'high' },
+    github: { capi: { enabled: false } },
+    streaming: true,
+  });
+  assert.deepEqual(grouped, {
+    sessionId: 'conv-1',
+    inference: { providers: [{ name: 'openai' }], defaultProvider: 'openai', reasoningEffort: 'high' },
+    github: { capi: { enabled: false } },
+    events: { streaming: true },
+  });
+  // `tools` as an object is the group, merged with the definitions of an array.
+  assert.deepEqual(
+    copilotSessionOptions({ tools: { availableTools: ['view'] }, onEvent: undefined }),
+    { tools: { availableTools: ['view'] } },
+  );
+  assert.deepEqual(
+    copilotSessionOptions({ availableTools: [], tools: { definitions: [{ name: 'relay_tool' }] } }),
+    { tools: { availableTools: [], definitions: [{ name: 'relay_tool' }] } },
+  );
+});
+
+test('copilotSessionOptions leaves out undefined values, at the top and in groups', () => {
+  const grouped = copilotSessionOptions({
+    sessionId: 'conv-1',
+    model: undefined,
+    onEvent: undefined,
+    infiniteSessions: undefined,
+    inference: { reasoningEffort: undefined, defaultProvider: 'openai' },
+  });
+  assert.deepEqual(grouped, { sessionId: 'conv-1', inference: { defaultProvider: 'openai' } });
+  const leaves = [];
+  const walk = (node) => {
+    for (const value of Object.values(node)) {
+      leaves.push(value);
+      if (value && typeof value === 'object' && !Array.isArray(value)) walk(value);
+    }
+  };
+  walk(copilotSessionOptions(Object.fromEntries(FLAT_ROWS.map(([key, value]) => [key, value]))));
+  assert.equal(leaves.includes(undefined), false);
+  assert.deepEqual(copilotSessionOptions({}), {});
+  assert.deepEqual(copilotSessionOptions(), {});
+});
+
+test('copilotSessionOptions throws on a key it has no grouped name for, and on a field set twice', () => {
+  assert.throws(() => copilotSessionOptions({ sessionId: 'conv-1', provider: { type: 'openai' } }), (error) => {
+    assert.equal(error instanceof TypeError, true);
+    assert.match(error.message, /"provider" has no grouped name/);
+    return true;
+  });
+  assert.throws(() => copilotSessionOptions({ reasoningEffort: 'high' }), TypeError);
+  assert.throws(() => copilotSessionOptions({ someFutureOption: 1 }), /"someFutureOption" has no grouped name/);
+  // A group name with a non-object value is no group.
+  assert.throws(() => copilotSessionOptions({ inference: 'openai' }), TypeError);
+  assert.throws(
+    () => copilotSessionOptions({ streaming: true, events: { streaming: false } }),
+    /events\.streaming is set twice/,
+  );
+  assert.throws(
+    () => copilotSessionOptions({ availableTools: [], tools: { availableTools: ['view'] } }),
+    /tools\.availableTools is set twice/,
+  );
 });
 
 // A home folder with Copilot CLI version folders in it, as the CLI lays them
@@ -277,4 +484,23 @@ test('a launch takes COPILOT_SDK_PATH from the environment as given, a configure
   // starts the app.js beside its SDK, so the launch looks the SDK up.
   assert.equal(launchPath({ config: { sdkPath: '/opt/sdk/index.js', cliPath: '/opt/cli/app.js' } }), path.join(newest, 'copilot-sdk'));
   assert.equal(launchPath({ config: { sdkPath: pathsOf(pinned).sdkPath, cliPath: '/opt/cli/app.js' } }), path.join(pinned, 'copilot-sdk'));
+});
+
+test('the relay\'s own client refuses an SDK older than 1.0.113 before it builds a CopilotClient', async (t) => {
+  const home = fakeHome(t);
+  const versionDir = home.install(path.join(home.homeDir, 'pinned'), '1.0.112');
+  const { sdkPath } = pathsOf(versionDir);
+  // A stand-in SDK of the older shape: only `forStdio`, and a client that
+  // records being built.
+  fs.writeFileSync(sdkPath, [
+    'export const constructed = [];',
+    'export class CopilotClient { constructor(options) { constructed.push(options); } async start() {} }',
+    'export const RuntimeConnection = { forStdio: (opts) => ({ kind: \'stdio\', path: opts.path }) };',
+  ].join('\n'));
+  await assert.rejects(
+    createInstalledCopilotClient({ config: { sdkPath } }),
+    { code: COPILOT_SDK_TOO_OLD, message: /Copilot SDK 1\.0\.112 is older than 1\.0\.113.*Update the Copilot CLI/ },
+  );
+  const { constructed } = await import(pathToFileURL(sdkPath).href);
+  assert.deepEqual(constructed, []);
 });

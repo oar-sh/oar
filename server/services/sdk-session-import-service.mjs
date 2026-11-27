@@ -1,5 +1,7 @@
 'use strict';
 
+import { copilotSessionOptions } from '../copilot-sdk-runtime.mjs';
+
 function text(value) {
   return String(value || '').trim();
 }
@@ -267,10 +269,11 @@ export function createSdkSessionImportService({
     let resumed = null;
     try {
       const client = await getRuntime();
-      resumed = await client.client.resumeSession(sdkSessionId, {
+      // Grouped: 'empty' mode refuses a resume without `tools.availableTools`.
+      resumed = await client.client.resumeSession(sdkSessionId, copilotSessionOptions({
         suppressResumeEvent: true,
         availableTools: [],
-      });
+      }));
       const events = await normalizeEvents(await resumed.getEvents());
       const messages = parseSessionEventsToMessages?.(events);
       if (!Array.isArray(messages)) throw new Error('SDK session import returned an invalid history snapshot');

@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  BYOK_PROVIDER_NAME,
+  byokRebuildReason,
+  resolveByokSession,
+  copilotProviderSessionOptions,
   resolveCopilotProviderConfig,
   resolveOpenAiModelTokenLimits,
 } from './copilot-byok-provider.mjs';
@@ -133,4 +137,77 @@ test('model ceilings match on the longest prefix and tolerate an openai/ prefix'
     maxOutputTokens: 32_768,
   });
   assert.deepEqual(resolveOpenAiModelTokenLimits(''), {});
+});
+
+const RESOLVED = Object.freeze({
+  type: 'openai',
+  baseUrl: 'https://example.test/v1',
+  apiKey: 'test-key',
+  wireApi: 'responses',
+  maxPromptTokens: 128_000,
+  maxOutputTokens: 64_000,
+});
+
+test('copilotProviderSessionOptions registers a named provider and the model ceilings', () => {
+  assert.deepEqual(copilotProviderSessionOptions(RESOLVED, { model: 'gpt-x', reasoningEffort: 'high' }), {
+    inference: {
+      providers: [{
+        name: BYOK_PROVIDER_NAME,
+        type: 'openai',
+        baseUrl: 'https://example.test/v1',
+        apiKey: 'test-key',
+        wireApi: 'responses',
+      }],
+      models: [{ id: 'gpt-x', provider: BYOK_PROVIDER_NAME, maxPromptTokens: 128_000, maxOutputTokens: 64_000 }],
+      defaultProvider: BYOK_PROVIDER_NAME,
+      reasoningEffort: 'high',
+    },
+    github: { capi: { enabled: false } },
+  });
+  // The whole-session `provider` the SDK refuses is never built.
+  assert.equal('provider' in copilotProviderSessionOptions(RESOLVED, { model: 'gpt-x' }), false);
+  // The name is a selection-id prefix (`<provider>/<id>`), so it must not hold a slash.
+  assert.equal(BYOK_PROVIDER_NAME.includes('/'), false);
+});
+
+test('copilotProviderSessionOptions leaves out ceilings and models it does not know', () => {
+  const bare = { type: 'openai', baseUrl: 'https://example.test/v1', apiKey: 'test-key' };
+  const withModel = copilotProviderSessionOptions(bare, { model: 'gpt-x' });
+  assert.deepEqual(withModel.inference.models, [{ id: 'gpt-x', provider: BYOK_PROVIDER_NAME }]);
+  const noModel = copilotProviderSessionOptions(bare);
+  assert.equal('models' in noModel.inference, false);
+  assert.equal('reasoningEffort' in noModel.inference, false);
+  assert.equal(noModel.inference.defaultProvider, BYOK_PROVIDER_NAME);
+});
+
+test('copilotProviderSessionOptions adds nothing to a hosted session', () => {
+  assert.deepEqual(copilotProviderSessionOptions(null, { model: 'gpt-x', reasoningEffort: 'high' }), {});
+});
+
+test('resolveByokSession remembers the provider and model, and is empty for hosted sessions', () => {
+  const hosted = resolveByokSession({ env: {}, model: 'gpt-x', reasoningEffort: 'high' });
+  assert.deepEqual(hosted, { provider: null, model: '', options: {} });
+  const byok = resolveByokSession({
+    env: { COPILOT_PROVIDER_TYPE: 'openai', COPILOT_PROVIDER_API_KEY: 'test-key' },
+    model: 'gpt-4o',
+    reasoningEffort: 'high',
+  });
+  assert.equal(byok.model, 'gpt-4o');
+  assert.equal(byok.provider.maxPromptTokens, 111_616);
+  assert.deepEqual(Object.keys(byok.options).sort(), ['github', 'inference']);
+  assert.equal(byok.options.inference.models[0].id, 'gpt-4o');
+  assert.equal(byok.options.inference.reasoningEffort, 'high');
+});
+
+test('byokRebuildReason: other ceilings or another model rebuild; the same model stays in place', () => {
+  const same = { ...RESOLVED };
+  const wider = { ...RESOLVED, maxPromptTokens: 256_000 };
+  const built = { provider: RESOLVED, model: 'gpt-5' };
+  // Equal ceilings, other model: `inference.models` registers only the built one.
+  assert.match(byokRebuildReason({ built, next: { provider: same, model: 'gpt-5.4' } }), /model/);
+  // Same model (an effort change): in place.
+  assert.equal(byokRebuildReason({ built, next: { provider: same, model: 'gpt-5' } }), '');
+  // Other ceilings: a rebuild.
+  assert.match(byokRebuildReason({ built, next: { provider: wider, model: 'gpt-5' } }), /ceilings/);
+  assert.match(byokRebuildReason({ built, next: { provider: wider, model: 'gpt-5.4' } }), /ceilings/);
 });

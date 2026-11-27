@@ -236,7 +236,12 @@ test('placeholder helpers: elapsed time, aspect ratio, details line, preview add
   assert.equal(mirror.resolveImagePreviewUrl('/api/files/p.png', ''), '/api/files/p.png');
   assert.equal(mirror.resolveImagePreviewUrl('/api/files/p.png', '/relay'), '/relay/api/files/p.png');
   assert.equal(mirror.resolveImagePreviewUrl('/relay/api/files/p.png', '/relay'), '/relay/api/files/p.png');
-  assert.equal(mirror.resolveImagePreviewUrl('https://example.test/p.png'), 'https://example.test/p.png');
+  assert.equal(mirror.resolveImagePreviewUrl('https://example.test/p.png'), '', 'another site is never loaded');
+  // What the browser would load must be this origin: a backslash or a second slash names another host.
+  for (const evil of ['/\\evil.test/x.png', '//evil.test/x.png', '\\\\evil.test/x.png', '/\\\\evil.test/x.png']) {
+    assert.equal(mirror.resolveImagePreviewUrl(evil, ''), '', evil);
+  }
+  assert.equal(mirror.resolveImagePreviewUrl('/%5C%5Cevil.test/x.png', ''), '/%5C%5Cevil.test/x.png', 'encoded backslashes stay a path of this origin');
   assert.equal(mirror.resolveImagePreviewUrl('javascript:alert(1)'), '');
   assert.equal(mirror.resolveImagePreviewUrl('//example.test/p.png'), '');
   assert.equal(mirror.resolveImagePreviewUrl('p.png'), '');

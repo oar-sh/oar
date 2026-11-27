@@ -872,7 +872,7 @@ test('user input raised the instant a continuation opens waits for its row', asy
   await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
 
   const config = client.createAttempts[0];
-  const answer = await config.onUserInputRequest({
+  const answer = await config.interaction.onUserInputRequest({
     requestId: 'r1', question: 'which env?', choices: ['prod', 'staging'],
   });
   assert.deepEqual(answer, { answer: 'prod', wasFreeform: false });
@@ -904,7 +904,7 @@ test('an ask-mode approval raised before the continuation row exists waits for i
   await waitFor(() => runner._getState().activeTurnKind === 'continuation', { label: 'continuation open' });
 
   const config = client.createAttempts[0];
-  const decision = await config.onPermissionRequest({ kind: 'write', fileName: 'notes.md' });
+  const decision = await config.permissions.onRequest({ kind: 'write', fileName: 'notes.md' });
   assert.deepEqual(decision, { kind: 'approve-once' });
 
   const created = bodiesFor(stub, '/api/relay-question')[0];

@@ -403,16 +403,23 @@ export function imagePlaceholderDetails({ size = '', quality = '', count = 1, mo
 
 /**
  * The address a preview's `contentUrl` is loaded from: a relay path gets the
- * app's base; http(s) addresses pass; anything else is refused ('').
+ * app's base; an http(s) address of this very origin passes; anything else,
+ * another site's address included (never loaded: page policy), is refused ('').
  */
 export function resolveImagePreviewUrl(contentUrl, base = '') {
   const value = String(contentUrl || '').trim();
   if (!value) return '';
-  if (/^https?:\/\//i.test(value)) return value;
+  // What the browser would load is the parsed address (`/\\host/x` and
+  // `//host/x` are another host): it must be this page's origin.
+  const origin = globalThis.window?.location?.origin || 'http://relay.invalid';
+  const own = (address) => {
+    try { return new URL(address, origin).origin === origin ? address : ''; } catch { return ''; }
+  };
+  if (/^https?:\/\//i.test(value)) return own(value);
   if (!value.startsWith('/') || value.startsWith('//')) return '';
   const normalizedBase = String(base || '').trim().replace(/\/+$/, '');
-  if (normalizedBase && value.startsWith(`${normalizedBase}/`)) return value;
-  return `${normalizedBase}${value}`;
+  if (normalizedBase && value.startsWith(`${normalizedBase}/`)) return own(value);
+  return own(`${normalizedBase}${value}`);
 }
 
 function startedAtMs(value) {

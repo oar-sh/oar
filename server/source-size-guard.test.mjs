@@ -33,7 +33,11 @@ const CEILINGS = new Map([
   ['server/server-runtime.mjs', 9291],
   ['server/public/app/bootstrap.js', 6490],
   ['server/public/app/conversation-view.js', 5272],
-  ['server/copilot-worker/copilot-sdk-session-process.mjs', 5204],
+  // -9: the BYOK session options and the switch's rebuild decision moved to
+  // copilot-byok-provider.mjs (resolveByokSession, byokRebuildReason).
+  // -2: the SDK generation went (1.0.113 or later only); the session options
+  // are translated to their grouped names at the SDK call.
+  ['server/copilot-worker/copilot-sdk-session-process.mjs', 5193],
   // +6 for the local-relay branch of mapRemoteError.
   // -346: relay_info and its catalogue shaping moved to remote-relay-info.mjs
   // (after relay_info's summary had taken it to 4697).

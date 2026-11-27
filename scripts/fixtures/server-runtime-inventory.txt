@@ -456,7 +456,7 @@ route GET /sw.js
 route GET /,/index.html
 route GET /shared/:token,/shared/:token/
 route GET /share-preview/:conversationId,/share-preview/:conversationId/
-route USE / [serveStatic]
+route USE / [refuseHtml, serveFiles]
 route POST /api/session-worker/:sdkSessionId/kill
 route POST /api/conversation/:conversationId/cancel-turn
 route POST /api/conversation-groups/:id/stop

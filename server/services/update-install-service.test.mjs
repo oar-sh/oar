@@ -8,6 +8,7 @@ import {
   createUpdateInstallService,
   reconcileUpdateAttempt,
 } from './update-install-service.mjs';
+import { finishSelfUpdateBuild } from './native-addon-build-service.mjs';
 
 function settingsStore(initial = {}) {
   const rows = new Map(Object.entries(initial));
@@ -64,6 +65,9 @@ function createService(store, { exitCode = 0, output = ['added 1 package'], ...o
       return child;
     },
     logger: { warn: () => {} },
+    // Where no binding ships: the build can run, and no binding is saved (the
+    // tests of the fallback below set their own).
+    prepareNativeBuild: async () => { events.push('prepare'); return { ok: true, saved: null }; },
     ...overrides,
   });
   return { service, spawned, shutdowns, events };
@@ -89,7 +93,7 @@ test('where no SQLite binary ships, the binding is built after npm and before th
   assert.equal(builds.length, 1);
   assert.equal(builds[0].packageRoot, '/data/prefix/lib/node_modules/@oar-sh/oar');
   assert.equal(builds[0].platform, 'android');
-  assert.deepEqual(events, ['build', `write:${UPDATE_ATTEMPT_SETTING_KEY}`, 'shutdown']);
+  assert.deepEqual(events, ['prepare', 'build', `write:${UPDATE_ATTEMPT_SETTING_KEY}`, 'shutdown']);
   assert.equal(shutdowns.length, 1);
   assert.match(service.getSnapshot().log, /gyp info ok\n\[oar\] The SQLite binding is built\.\n$/);
 });
@@ -109,12 +113,204 @@ test('a binding that does not build ends the update in an error and keeps the re
   assert.equal(store.rows.has(UPDATE_ATTEMPT_SETTING_KEY), false);
 });
 
+test('a build that fails with a hint (no node-gyp) puts the hint in the error the UI shows', async () => {
+  const { service } = createService(settingsStore(), {
+    platform: 'android',
+    arch: 'arm64',
+    buildNativeAddons: async () => ({
+      ok: false,
+      status: 'failed',
+      error: 'node-gyp was not found',
+      hint: 'Install node-gyp: npm install -g --ignore-scripts node-gyp, then run oar build-native again.',
+    }),
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 is installed, but its SQLite binding did not build (node-gyp was not found). Install node-gyp: npm install -g --ignore-scripts node-gyp, then run oar build-native again. Then restart the relay.');
+  assert.equal(service.getSnapshot().error, result.error);
+});
+
+test('where the binding cannot be built (no node-gyp), the update is refused before npm installs anything', async () => {
+  const store = settingsStore();
+  const prepared = [];
+  const { service, spawned, shutdowns } = createService(store, {
+    platform: 'android',
+    arch: 'arm64',
+    packageRoot: '/data/prefix/lib/node_modules/@oar-sh/oar',
+    prepareNativeBuild: async (options) => {
+      prepared.push(options);
+      return { ok: false, error: 'node-gyp was not found', reason: 'its SQLite binding could not be built here (node-gyp was not found)', hint: 'Install node-gyp: npm install -g --ignore-scripts node-gyp, then update again.' };
+    },
+    buildNativeAddons: async () => assert.fail('no build'),
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 was not installed: its SQLite binding could not be built here (node-gyp was not found). Install node-gyp: npm install -g --ignore-scripts node-gyp, then update again. @oar-sh/oar@0.9.1 keeps running, unchanged.');
+  assert.deepEqual(spawned, [], 'npm never ran');
+  assert.equal(prepared[0].packageRoot, '/data/prefix/lib/node_modules/@oar-sh/oar');
+  assert.equal(prepared[0].platform, 'android');
+  const snapshot = service.getSnapshot();
+  assert.equal(snapshot.state, 'error');
+  assert.equal(snapshot.error, result.error);
+  assert.match(snapshot.log, /\[oar\] Not installing 0\.9\.2: its SQLite binding could not be built here \(node-gyp was not found\)\./);
+  assert.equal(shutdowns.length, 0);
+  assert.equal(store.rows.has(UPDATE_ATTEMPT_SETTING_KEY), false);
+});
+
+// The fallback after a failed build, with the real finishSelfUpdateBuild and
+// a fake restore (its folder work has its own tests).
+function fallback({ restores }) {
+  const discarded = [];
+  return {
+    discarded,
+    finishNativeBuild: (options) => finishSelfUpdateBuild({
+      ...options,
+      restoreImpl: async () => restores.shift(),
+      discardImpl: (saved) => discarded.push(saved),
+    }),
+  };
+}
+
+test('fallback: a failed build on the same better-sqlite3 keeps the running binding; the update goes on to the restart', async () => {
+  const store = settingsStore();
+  const saved = { version: '13.0.0', file: '/tmp/b/better_sqlite3.node', holder: '/tmp/b' };
+  const { finishNativeBuild, discarded } = fallback({ restores: [{ ok: true, version: '13.0.0' }] });
+  const { service, spawned, shutdowns } = createService(store, {
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({ ok: true, saved }),
+    buildNativeAddons: async () => ({ ok: false, status: 'failed', error: 'node-gyp exited with code 1' }),
+    finishNativeBuild,
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, true);
+  assert.equal(spawned.length, 1, 'one npm install, no reinstall');
+  assert.equal(shutdowns.length, 1);
+  assert.equal(JSON.parse(store.rows.get(UPDATE_ATTEMPT_SETTING_KEY)).attemptedVersion, '0.9.2');
+  assert.match(service.getSnapshot().log, /same better-sqlite3 \(13\.0\.0\): it keeps the SQLite binding this relay runs on/);
+  assert.deepEqual(discarded, [saved]);
+});
+
+test('fallback: a failed build on a new better-sqlite3 installs the running version again and restarts nothing', async () => {
+  const store = settingsStore();
+  const saved = { version: '13.0.0', file: '/tmp/b/better_sqlite3.node', holder: '/tmp/b' };
+  const { finishNativeBuild, discarded } = fallback({ restores: [
+    { ok: false, reason: 'it comes with better-sqlite3 13.1.0, not 13.0.0' },
+    { ok: true, version: '13.0.0' },
+  ] });
+  const { service, spawned, shutdowns } = createService(store, {
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({ ok: true, saved }),
+    buildNativeAddons: async () => ({
+      ok: false,
+      status: 'failed',
+      error: 'make: not found',
+      hint: 'Install the build tools first: pkg install python clang make, then run oar build-native again.',
+    }),
+    finishNativeBuild,
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.deepEqual(spawned.map((args) => args.at(-1)), ['@oar-sh/oar@0.9.2', '@oar-sh/oar@0.9.1']);
+  assert.ok(spawned.every((args) => args.includes('--ignore-scripts')), 'the reinstall runs no script either');
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 was not kept: its SQLite binding did not build (make: not found), so @oar-sh/oar@0.9.1 is installed again and keeps running. Install the build tools first: pkg install python clang make, then update again.');
+  assert.equal(service.getSnapshot().state, 'error');
+  assert.equal(shutdowns.length, 0);
+  assert.equal(store.rows.has(UPDATE_ATTEMPT_SETTING_KEY), false);
+  assert.match(service.getSnapshot().log, /Installing 0\.9\.1 again \.\.\.[\s\S]*0\.9\.1 is installed again, with the SQLite binding it runs on\./);
+  assert.deepEqual(discarded, [saved]);
+});
+
+test('fallback: when the reinstall fails too, the error says so and still names oar build-native', async () => {
+  const saved = { version: '13.0.0', file: '/tmp/b/better_sqlite3.node', holder: '/tmp/b' };
+  const { finishNativeBuild } = fallback({ restores: [{ ok: false, reason: 'other version' }] });
+  let installs = 0;
+  const { service } = createService(settingsStore(), {
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({ ok: true, saved }),
+    buildNativeAddons: async () => ({ ok: false, status: 'failed', error: 'node-gyp exited with code 1' }),
+    finishNativeBuild,
+    // The update installs; the reinstall of 0.9.1 fails (registry gone).
+    spawnImpl: () => {
+      installs += 1;
+      const code = installs === 1 ? 0 : 1;
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      queueMicrotask(() => { child.exitCode = code; child.emit('close', code); });
+      return child;
+    },
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.equal(installs, 2);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 is installed, but its SQLite binding did not build (node-gyp exited with code 1). Installing @oar-sh/oar@0.9.1 again failed too (npm exited with code 1). Run oar build-native, then restart the relay.');
+});
+
+test('fallback: reinstalled, but its binding could not be put back: the error names the running version', async () => {
+  const saved = { version: '13.0.0', file: '/tmp/b/better_sqlite3.node', holder: '/tmp/b' };
+  const { finishNativeBuild } = fallback({ restores: [
+    { ok: false, reason: 'it comes with better-sqlite3 13.1.0, not 13.0.0' },
+    { ok: false, reason: 'the saved binding does not load: invalid ELF header' },
+  ] });
+  const { service, spawned, shutdowns } = createService(settingsStore(), {
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({ ok: true, saved }),
+    buildNativeAddons: async () => ({ ok: false, status: 'failed', error: 'node-gyp exited with code 1' }),
+    finishNativeBuild,
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.deepEqual(spawned.map((args) => args.at(-1)), ['@oar-sh/oar@0.9.2', '@oar-sh/oar@0.9.1']);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 was not kept: its SQLite binding did not build (node-gyp exited with code 1). @oar-sh/oar@0.9.1 is installed again, but its SQLite binding could not be put back (the saved binding does not load: invalid ELF header). This relay keeps running on the binding it has loaded. Run oar build-native, then restart the relay.');
+  assert.doesNotMatch(result.error, /0\.9\.2 is installed/);
+  assert.equal(shutdowns.length, 0);
+});
+
+test('a binding that could not be copied aside refuses the update in its own words, before npm', async () => {
+  const { service, spawned } = createService(settingsStore(), {
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({
+      ok: false,
+      error: 'ENOSPC: no space left on device, mkdtemp \'/tmp/oar-sqlite-binding-XXXXXX\'',
+      reason: 'the SQLite binding this relay runs on could not be copied aside (ENOSPC: no space left on device, mkdtemp \'/tmp/oar-sqlite-binding-XXXXXX\')',
+      hint: 'Make room in the temporary folder (or point TMPDIR at one with room), then update again.',
+    }),
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.deepEqual(spawned, []);
+  assert.equal(result.error, '@oar-sh/oar@0.9.2 was not installed: the SQLite binding this relay runs on could not be copied aside (ENOSPC: no space left on device, mkdtemp \'/tmp/oar-sqlite-binding-XXXXXX\'). Make room in the temporary folder (or point TMPDIR at one with room), then update again. @oar-sh/oar@0.9.1 keeps running, unchanged.');
+  assert.doesNotMatch(result.error, /could not be built/);
+});
+
+test('an npm failure after the binding was saved discards the copy', async () => {
+  const saved = { version: '13.0.0', file: '/tmp/b/better_sqlite3.node', holder: '/tmp/b' };
+  const discarded = [];
+  const { service } = createService(settingsStore(), {
+    exitCode: 1,
+    platform: 'android',
+    arch: 'arm64',
+    prepareNativeBuild: async () => ({ ok: true, saved }),
+    discardNativeBuild: (copy) => discarded.push(copy),
+    buildNativeAddons: async () => assert.fail('no build after a failed install'),
+  });
+  const result = await service.startUpdate({ version: '0.9.2' });
+  assert.equal(result.ok, false);
+  assert.deepEqual(discarded, [saved]);
+});
+
 test('a successful update persists the attempt before requesting the restart', async () => {
   const store = settingsStore();
   const { service, spawned, shutdowns, events } = createService(store);
   const result = await service.startUpdate({ version: '0.9.2' });
   assert.equal(result.ok, true);
-  assert.deepEqual(spawned, [['npm', 'install', '-g', '@oar-sh/oar@0.9.2']]);
+  assert.deepEqual(spawned, [['npm', 'install', '-g', '--ignore-scripts', '@oar-sh/oar@0.9.2']]);
   assert.equal(shutdowns.length, 1);
   assert.equal(shutdowns[0].restart, true);
 
@@ -215,7 +411,7 @@ test('the update runs the npm beside this Node, into the prefix the package sits
   await service.startUpdate({ version: '0.9.2' });
   assert.deepEqual(calls, [{
     command: '/home/dev/.oar/runtime/node/bin/npm',
-    args: ['install', '-g', '--prefix', '/home/dev/.oar/npm', '@oar-sh/oar@0.9.2'],
+    args: ['install', '-g', '--ignore-scripts', '--prefix', '/home/dev/.oar/npm', '@oar-sh/oar@0.9.2'],
     path: '/home/dev/.oar/runtime/node/bin:/usr/bin:/bin',
   }]);
 });

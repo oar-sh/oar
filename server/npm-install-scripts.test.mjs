@@ -1,8 +1,8 @@
-// npm 12 runs no install script it was not told to allow. No shipped
-// dependency has one now (NPM_INSTALL_SCRIPT_PACKAGES is empty), so the
-// updater and the installers on oar.sh pass no allow list; a dependency that
-// gains an install script without being added there would install without
-// its binary on npm 12 and only fail at runtime.
+// The self-update runs `npm install -g --ignore-scripts`, and npm 12 runs no
+// install script it was not told to allow. No shipped dependency has one now
+// (NPM_INSTALL_SCRIPT_PACKAGES is empty), so the updater and the installers
+// on oar.sh pass no allow list; a dependency that gains an install script
+// would install without what that script makes and only fail at runtime.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -33,4 +33,12 @@ test('the lock keeps "gypfile": false on better-sqlite3', () => {
   const entry = lock.packages['node_modules/better-sqlite3'];
   assert.ok(entry, 'better-sqlite3 is in the lock');
   assert.equal(entry.gypfile, false, 'add "gypfile": false to the node_modules/better-sqlite3 entry of package-lock.json');
+});
+
+// The self-update passes --ignore-scripts, so an allow list could not help:
+// a shipped dependency that needs its install script has to be replaced, or
+// its build done by OAR itself, as native-addon-build-service.mjs does for
+// better-sqlite3 where it ships no binary.
+test('no shipped dependency needs an install script', () => {
+  assert.deepEqual([...NPM_INSTALL_SCRIPT_PACKAGES], []);
 });

@@ -36,3 +36,20 @@ test('a gallery can describe its open item: a caption line and its own buttons',
   assert.match(details, /querySelectorAll\('\[data-gallery-action\]'\)\.forEach\(\(button\) => button\.remove\(\)\)/, 'buttons of the previous item go');
   assert.match(source, /renderGalleryDetails\(gallery\);/);
 });
+
+test('a picture or video on another site opens as a card with a link out: never an <img>/<video>, never prefetched', () => {
+  const open = functionBody('openUploadedAttachmentViewer');
+  assert.match(open, /kind: options\?\.remote \? 'remote' : uploadPreviewKind\(mimeType\)/);
+  assert.match(open, /rawUrl: options\?\.remote \? '' : String\(contentUrl \|\| ''\)/, 'no address to load is kept for it');
+  assert.match(functionBody('openGalleryItem'), /remote: item\.remote \|\| null/);
+  const render = functionBody('renderFilePreview');
+  const card = render.slice(render.indexOf("payload.kind === 'remote'"), render.indexOf("payload.kind === 'binary'"));
+  assert.match(card, /mediaRemoteCard\(payload\.remote\)/);
+  assert.match(card, /target="_blank" rel="noopener noreferrer"/);
+  assert.match(card, /href="\$\{escHtml\(card\.href\)\}"/, 'the address is escaped into the attribute');
+  assert.match(card, /card\.href \? `<a /, 'only an address with an href becomes a link');
+  assert.doesNotMatch(card, /<img|<video|<audio|fileSrcAttribute/);
+  assert.match(render, /payload\.kind === 'remote' \? mediaRemoteCard\(payload\.remote\)\.title/, 'the meta line names the host, not "REMOTE"');
+  assert.match(functionBody('prefetchGalleryNeighbors'), /!item\.remote && String\(item\.mime/);
+  assert.match(functionBody('renderAttachmentMarkup'), /isRemotePreviewSource\(rawUrl\)/, 'a message attachment on another site is a link, not an <img>');
+});
